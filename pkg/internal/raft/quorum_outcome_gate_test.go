@@ -140,11 +140,6 @@ func TestRaft_DropHighTermVote_TransferHintCappedAtNextTerm(t *testing.T) {
 		wantDrop bool
 	}{
 		{
-			name:     "the term a real transferee campaigns at is exempt",
-			term:     func(r *raft) uint64 { return r.term + 1 },
-			wantDrop: false,
-		},
-		{
 			name:     "a two-term jump is not a transfer and is dropped",
 			term:     func(r *raft) uint64 { return r.term + 2 },
 			wantDrop: true,

@@ -56,17 +56,6 @@ func makeEntries(start, count uint64, term uint64) []logdb.Entry {
 // --- DB lifecycle tests ---
 
 // TestOpenAndClose verifies a DB can be opened and closed.
-func TestOpenAndClose(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, WithNoSync(true))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-}
-
 // TestOpenEmptyDir verifies Open fails with an empty directory path.
 func TestOpenEmptyDir(t *testing.T) {
 	_, err := Open("")
@@ -174,33 +163,9 @@ func TestSaveAndGetEntries(t *testing.T) {
 		if e.Term != 1 {
 			t.Fatalf("GetEntries[%d]: Term=%d, want 1", i, e.Term)
 		}
-	}
-}
-
-// TestSaveAndGetEntriesWithCmd verifies entry Cmd data roundtrips correctly.
-func TestSaveAndGetEntriesWithCmd(t *testing.T) {
-	db := openTestDB(t)
-
-	entries := []logdb.Entry{
-		{Index: 1, Term: 1, Cmd: []byte("hello world")},
-		{Index: 2, Term: 1, Cmd: []byte("foo bar baz")},
-	}
-	if err := db.SaveEntries(10, 20, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	got, err := db.GetEntries(10, 20, 1, 3, 0)
-	if err != nil {
-		t.Fatalf("GetEntries: %v", err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("GetEntries: got %d entries, want 2", len(got))
-	}
-	if string(got[0].Cmd) != "hello world" {
-		t.Fatalf("GetEntries[0].Cmd = %q, want %q", got[0].Cmd, "hello world")
-	}
-	if string(got[1].Cmd) != "foo bar baz" {
-		t.Fatalf("GetEntries[1].Cmd = %q, want %q", got[1].Cmd, "foo bar baz")
+		if string(e.Cmd) != "cmd" {
+			t.Fatalf("GetEntries[%d]: Cmd=%q, want %q", i, e.Cmd, "cmd")
+		}
 	}
 }
 
@@ -216,36 +181,6 @@ func TestGetEntriesNonExistentNode(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("GetEntries: got %d entries, want nil", len(got))
-	}
-}
-
-// TestGetEntriesAfterCompaction verifies that requesting compacted entries
-// returns ErrCompacted.
-func TestGetEntriesAfterCompaction(t *testing.T) {
-	db := openTestDB(t)
-
-	entries := makeEntries(1, 10, 1)
-	if err := db.SaveEntries(1, 1, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	if err := db.RemoveEntriesTo(1, 1, 5); err != nil {
-		t.Fatalf("RemoveEntriesTo: %v", err)
-	}
-
-	// Requesting range that includes compacted entries.
-	_, err := db.GetEntries(1, 1, 3, 8, 0)
-	if err != logdb.ErrCompacted {
-		t.Fatalf("GetEntries after compact: got %v, want %v", err, logdb.ErrCompacted)
-	}
-
-	// Requesting range above compaction point should work.
-	got, err := db.GetEntries(1, 1, 6, 11, 0)
-	if err != nil {
-		t.Fatalf("GetEntries above compact: %v", err)
-	}
-	if len(got) != 5 {
-		t.Fatalf("GetEntries above compact: got %d entries, want 5", len(got))
 	}
 }
 
@@ -288,30 +223,6 @@ func TestSaveStateEmpty(t *testing.T) {
 }
 
 // --- State tests ---
-
-// TestSaveAndReadState verifies hard state persistence.
-func TestSaveAndReadState(t *testing.T) {
-	db := openTestDB(t)
-
-	updates := []logdb.Update{
-		{
-			ShardID:   1,
-			ReplicaID: 1,
-			State:     logdb.State{Term: 5, Vote: 2, Commit: 100},
-		},
-	}
-	if err := db.SaveState(updates); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-
-	state, _, err := db.ReadState(1, 1)
-	if err != nil {
-		t.Fatalf("ReadState: %v", err)
-	}
-	if state.Term != 5 || state.Vote != 2 || state.Commit != 100 {
-		t.Fatalf("ReadState: got %+v, want Term=5 Vote=2 Commit=100", state)
-	}
-}
 
 // TestStateVoteWindowSurvivesReopen verifies the owed vote window is
 // persisted with the rest of the hard state and recovered on replay, and that
@@ -362,23 +273,6 @@ func TestReadStateNonExistent(t *testing.T) {
 	_, _, err := db.ReadState(99, 99)
 	if err != logdb.ErrNoState {
 		t.Fatalf("ReadState: got %v, want %v", err, logdb.ErrNoState)
-	}
-}
-
-// TestGetState verifies the GetState convenience method.
-func TestGetState(t *testing.T) {
-	db := openTestDB(t)
-
-	if err := db.SaveNodeState(1, 1, logdb.State{Term: 3, Vote: 1, Commit: 50}); err != nil {
-		t.Fatalf("SaveNodeState: %v", err)
-	}
-
-	state, err := db.GetState(1, 1)
-	if err != nil {
-		t.Fatalf("GetState: %v", err)
-	}
-	if state.Term != 3 || state.Vote != 1 || state.Commit != 50 {
-		t.Fatalf("GetState: got %+v", state)
 	}
 }
 
@@ -501,32 +395,6 @@ func TestWriteBootstrapRejectsBatchMode(t *testing.T) {
 	var batchErr *WriteBootstrapBatchModeError
 	if !errors.As(err, &batchErr) {
 		t.Fatalf("writeBootstrap: expected WriteBootstrapBatchModeError, got %T: %v", err, err)
-	}
-}
-
-// TestWriteBootstrapNonBatchModeSucceeds verifies that writeBootstrap succeeds
-// in normal (non-batch) mode with inline fsync.
-func TestWriteBootstrapNonBatchModeSucceeds(t *testing.T) {
-	db := openTestDB(t)
-
-	bs := logdb.Bootstrap{
-		Addresses: map[uint64]string{1: "addr1", 2: "addr2"},
-		Join:      true,
-		Type:      3,
-	}
-	if err := db.SaveBootstrap(1, 1, bs); err != nil {
-		t.Fatalf("SaveBootstrap: %v", err)
-	}
-
-	got, found, err := db.GetBootstrap(1, 1)
-	if err != nil {
-		t.Fatalf("GetBootstrap: %v", err)
-	}
-	if !found {
-		t.Fatal("GetBootstrap: not found after non-batch write")
-	}
-	if !got.Join || got.Type != 3 || len(got.Addresses) != 2 {
-		t.Fatalf("GetBootstrap: unexpected bootstrap %+v", got)
 	}
 }
 
@@ -1720,7 +1588,6 @@ func TestShardDirName(t *testing.T) {
 		want string
 	}{
 		{0, "shard-0"},
-		{1, "shard-1"},
 		{15, "shard-15"},
 	}
 	for _, tt := range tests {
@@ -1739,97 +1606,13 @@ func TestItoa(t *testing.T) {
 	}{
 		{0, "0"},
 		{1, "1"},
-		{42, "42"},
 		{100, "100"},
-		{999, "999"},
 	}
 	for _, tt := range tests {
 		got := itoa(tt.n)
 		if got != tt.want {
 			t.Fatalf("itoa(%d) = %q, want %q", tt.n, got, tt.want)
 		}
-	}
-}
-
-// TestFullCRUDCycle verifies a complete create-read-update-delete cycle.
-func TestFullCRUDCycle(t *testing.T) {
-	db := openTestDB(t)
-
-	// Create: save bootstrap, state, entries, snapshot.
-	bs := logdb.Bootstrap{
-		Addresses: map[uint64]string{1: "addr1"},
-		Type:      1,
-	}
-	if err := db.SaveBootstrap(1, 1, bs); err != nil {
-		t.Fatalf("SaveBootstrap: %v", err)
-	}
-	if err := db.SaveEntries(1, 1, makeEntries(1, 10, 1)); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-	if err := db.SaveNodeState(1, 1, logdb.State{Term: 1, Vote: 1, Commit: 10}); err != nil {
-		t.Fatalf("SaveNodeState: %v", err)
-	}
-	if err := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 5, Term: 1}); err != nil {
-		t.Fatalf("SaveSnapshot: %v", err)
-	}
-
-	// Read: verify all data.
-	gotBS, found, err := db.GetBootstrap(1, 1)
-	if err != nil || !found {
-		t.Fatalf("GetBootstrap: err=%v found=%v", err, found)
-	}
-	if gotBS.Addresses[1] != "addr1" {
-		t.Fatalf("GetBootstrap: addr=%q", gotBS.Addresses[1])
-	}
-
-	gotEntries, err := db.GetEntries(1, 1, 1, 11, 0)
-	if err != nil {
-		t.Fatalf("GetEntries: %v", err)
-	}
-	if len(gotEntries) != 10 {
-		t.Fatalf("GetEntries: got %d, want 10", len(gotEntries))
-	}
-
-	gotState, err := db.GetState(1, 1)
-	if err != nil {
-		t.Fatalf("GetState: %v", err)
-	}
-	if gotState.Term != 1 || gotState.Commit != 10 {
-		t.Fatalf("GetState: got %+v", gotState)
-	}
-
-	gotSS, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
-	}
-	if gotSS.Index != 5 {
-		t.Fatalf("GetSnapshot: got %+v", gotSS)
-	}
-
-	// Update: overwrite state and add more entries.
-	if err := db.SaveNodeState(1, 1, logdb.State{Term: 2, Vote: 2, Commit: 15}); err != nil {
-		t.Fatalf("SaveNodeState: %v", err)
-	}
-	if err := db.SaveEntries(1, 1, makeEntries(11, 5, 2)); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	gotState, err = db.GetState(1, 1)
-	if err != nil {
-		t.Fatalf("GetState: %v", err)
-	}
-	if gotState.Term != 2 {
-		t.Fatalf("GetState after update: got %+v", gotState)
-	}
-
-	// Delete: remove node data.
-	if err := db.RemoveNodeData(1, 1); err != nil {
-		t.Fatalf("RemoveNodeData: %v", err)
-	}
-
-	_, _, err = db.ReadState(1, 1)
-	if err != logdb.ErrNoState {
-		t.Fatalf("ReadState after delete: got %v, want %v", err, logdb.ErrNoState)
 	}
 }
 

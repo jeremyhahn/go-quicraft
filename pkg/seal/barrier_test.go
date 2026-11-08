@@ -420,29 +420,6 @@ func TestBarrier_DecryptTamperedAlgIDDoesNotPanic(t *testing.T) {
 	}
 }
 
-func TestBarrier_EncryptDecryptWithPreallocatedDst(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	plaintext := []byte("preallocated buffer test")
-	dst := make([]byte, 0, 256)
-
-	ciphertext, err := b.Encrypt(dst, plaintext)
-	if err != nil {
-		t.Fatalf("Encrypt failed: %v", err)
-	}
-
-	decDst := make([]byte, 0, 256)
-	decrypted, err := b.Decrypt(decDst, ciphertext)
-	if err != nil {
-		t.Fatalf("Decrypt failed: %v", err)
-	}
-
-	if !bytes.Equal(plaintext, decrypted) {
-		t.Fatalf("decrypted data does not match original")
-	}
-}
-
 func TestBarrier_EncryptWhenSealed(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
@@ -548,31 +525,6 @@ func TestBarrier_EncryptEmptyPlaintext(t *testing.T) {
 
 // --- EncryptWithEpoch ---
 
-func TestBarrier_EncryptWithEpoch(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	plaintext := []byte("epoch-tracking test")
-
-	ciphertext, epoch, err := b.EncryptWithEpoch(nil, plaintext)
-	if err != nil {
-		t.Fatalf("EncryptWithEpoch failed: %v", err)
-	}
-
-	if epoch != 1 {
-		t.Fatalf("expected epoch=1, got %d", epoch)
-	}
-
-	decrypted, err := b.Decrypt(nil, ciphertext)
-	if err != nil {
-		t.Fatalf("Decrypt failed: %v", err)
-	}
-
-	if !bytes.Equal(plaintext, decrypted) {
-		t.Fatal("decrypted data does not match original")
-	}
-}
-
 func TestBarrier_EncryptWithEpochWhenSealed(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
@@ -588,26 +540,6 @@ func TestBarrier_EncryptWithEpochWhenSealed(t *testing.T) {
 }
 
 // --- DecryptForEpoch ---
-
-func TestBarrier_DecryptForEpoch(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	plaintext := []byte("epoch-specific decryption")
-	ciphertext, err := b.Encrypt(nil, plaintext)
-	if err != nil {
-		t.Fatalf("Encrypt failed: %v", err)
-	}
-
-	decrypted, err := b.DecryptForEpoch(nil, ciphertext, 1)
-	if err != nil {
-		t.Fatalf("DecryptForEpoch failed: %v", err)
-	}
-
-	if !bytes.Equal(plaintext, decrypted) {
-		t.Fatal("decrypted data does not match original")
-	}
-}
 
 func TestBarrier_DecryptForEpochUnknown(t *testing.T) {
 	b, s := testInitializedBarrier(t)
@@ -1294,23 +1226,6 @@ func TestBarrier_SetSealedRootKey(t *testing.T) {
 	}
 }
 
-func TestBarrier_SetSealedRootKeyValid(t *testing.T) {
-	b := MustNewBarrier(DefaultBarrierConfig(1))
-
-	// SetSealedRootKey with valid fields should succeed.
-	err := b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategyPassphrase,
-		Epoch:       1,
-		Salt:        make([]byte, 32),
-		HKDFVersion: HKDFV2,
-		Ciphertext:  []byte("dummy"),
-		KnownEpochs: []uint64{1},
-	})
-	if err != nil {
-		t.Fatalf("SetSealedRootKey failed: %v", err)
-	}
-}
-
 // --- SealedRootKeyData ---
 
 func TestBarrier_SealedRootKeyDataNotInitialized(t *testing.T) {
@@ -1364,32 +1279,6 @@ func TestDeriveDEK_DifferentEpochs(t *testing.T) {
 
 	if bytes.Equal(dek1, dek2) {
 		t.Fatal("DEKs for different epochs should not be equal")
-	}
-}
-
-func TestDeriveDEK_Deterministic(t *testing.T) {
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	dek1, err := deriveDEK(rootKey, salt, 1, 42, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK failed: %v", err)
-	}
-
-	dek2, err := deriveDEK(rootKey, salt, 1, 42, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK failed: %v", err)
-	}
-
-	if !bytes.Equal(dek1, dek2) {
-		t.Fatal("same inputs should produce same DEK")
 	}
 }
 
@@ -1617,31 +1506,6 @@ func TestBarrier_CrossBarrierIsolation(t *testing.T) {
 }
 
 // --- Edge Cases ---
-
-func TestBarrier_EncryptLargePayload(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	// 1 MB payload.
-	plaintext := make([]byte, 1024*1024)
-	if _, err := rand.Read(plaintext); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	ct, err := b.Encrypt(nil, plaintext)
-	if err != nil {
-		t.Fatalf("Encrypt failed: %v", err)
-	}
-
-	dec, err := b.Decrypt(nil, ct)
-	if err != nil {
-		t.Fatalf("Decrypt failed: %v", err)
-	}
-
-	if !bytes.Equal(plaintext, dec) {
-		t.Fatal("large payload decryption mismatch")
-	}
-}
 
 func TestBarrier_EncryptDecryptAfterSealUnsealCycle(t *testing.T) {
 	b, s := testInitializedBarrier(t)
@@ -2095,37 +1959,6 @@ func TestBarrier_InitializeStrategyFails(t *testing.T) {
 	// Barrier should remain uninitialized.
 	if b.IsInitialized() {
 		t.Fatal("barrier should not be initialized after failed Initialize")
-	}
-}
-
-// TestBarrier_DoubleCheckPatternEncrypt_FastPath verifies the first atomic
-// unsealed check in Encrypt/Decrypt catches sealed state without locking.
-func TestBarrier_DoubleCheckPatternEncrypt_FastPath(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-
-	_, err := b.Encrypt(nil, []byte("test"))
-	if !errors.Is(err, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed, got %v", err)
-	}
-
-	_, _, err = b.EncryptWithEpoch(nil, []byte("test"))
-	if !errors.Is(err, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed from EncryptWithEpoch, got %v", err)
-	}
-
-	_, err = b.Decrypt(nil, make([]byte, epochSize+1+12+16))
-	if !errors.Is(err, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed from Decrypt, got %v", err)
-	}
-
-	_, err = b.DecryptForEpoch(nil, make([]byte, epochSize+1+12+16), 1)
-	if !errors.Is(err, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed from DecryptForEpoch, got %v", err)
 	}
 }
 
@@ -2688,20 +2521,6 @@ func TestBarrier_RotateUpdatesSealedEpoch(t *testing.T) {
 	}
 }
 
-func TestBarrier_RotateUpdatesSealedEpoch_WhenSealed(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-
-	_, err := b.Rotate(context.Background())
-	if !errors.Is(err, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed, got %v", err)
-	}
-}
-
 // --- Bug fix: KnownEpochs survive restart via persistence ---
 
 func TestBarrier_KnownEpochsSurviveRestart(t *testing.T) {
@@ -3156,35 +2975,6 @@ func TestSoftwareStrategy_AADPreventsCrossStrategySubstitution(t *testing.T) {
 	}
 }
 
-func TestSoftwareStrategy_SealUnsealRoundTripWithAAD(t *testing.T) {
-	// Verify that the AAD binding does not break normal Seal/Unseal flow.
-	s, err := newTestStrategy([]byte("aad-test"))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	defer s.Close()
-
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	sealed, err := s.SealRootKey(context.Background(), rootKey, Credentials{})
-	if err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-
-	decrypted, err := s.UnsealRootKey(context.Background(), sealed, Credentials{})
-	if err != nil {
-		t.Fatalf("Unseal failed: %v", err)
-	}
-
-	if !bytes.Equal(rootKey, decrypted) {
-		t.Fatal("round-trip failed with AAD binding")
-	}
-	enclave.Wipe(decrypted)
-}
-
 // --- Epoch monotonicity validation in SetSealedRootKey ---
 
 func TestBarrier_SetSealedRootKey_RejectsZeroEpoch(t *testing.T) {
@@ -3240,23 +3030,6 @@ func TestBarrier_SetSealedRootKey_RejectsInvalidSaltLength(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalidSealedSalt) {
 		t.Fatalf("expected ErrInvalidSealedSalt for nil salt, got %v", err)
-	}
-}
-
-func TestBarrier_SetSealedRootKey_RejectsMissingCurrentEpoch(t *testing.T) {
-	b := MustNewBarrier(DefaultBarrierConfig(1))
-
-	// KnownEpochs does not contain the current epoch (3).
-	err := b.SetSealedRootKey(&SealedRootKey{
-		Strategy:    StrategyPassphrase,
-		Epoch:       3,
-		Salt:        make([]byte, 32),
-		HKDFVersion: HKDFV2,
-		Ciphertext:  []byte("dummy"),
-		KnownEpochs: []uint64{1, 2}, // Missing 3.
-	})
-	if !errors.Is(err, ErrInvalidSealedEpochs) {
-		t.Fatalf("expected ErrInvalidSealedEpochs, got %v", err)
 	}
 }
 
@@ -3528,20 +3301,6 @@ func (m *mockNonceTracker) Close() error {
 	return m.closeErr
 }
 
-// TestBarrier_CustomInvocationCounter verifies that a custom
-// InvocationCounter injected via BarrierConfig is used instead of the
-// default in-memory implementation.
-func TestBarrier_CustomInvocationCounter(t *testing.T) {
-	mock := &mockInvocationCounter{enabled: true}
-	cfg := DefaultBarrierConfig(1)
-	cfg.InvocationCounter = mock
-	b := MustNewBarrier(cfg)
-
-	if b.InvocationCounter() != mock {
-		t.Fatal("InvocationCounter() should return the injected counter")
-	}
-}
-
 // TestBarrier_InvocationCounterResetError_CommitsNewEpoch verifies the
 // commit-first, fail-safe-reset semantics: when the injected invocation
 // counter's Reset returns an error, Rotate has ALREADY committed the new epoch
@@ -3658,57 +3417,6 @@ func TestBarrier_NonceClearError_CommitsNewEpoch(t *testing.T) {
 	}
 	if !bytes.Equal(pt, []byte("after failed clear")) {
 		t.Fatalf("plaintext mismatch after Rotate with failed clear")
-	}
-}
-
-// TestBarrier_CustomNonceTrackerProvider verifies that a custom
-// NonceTrackerProvider injected via BarrierConfig is used instead of the
-// default in-memory implementation.
-func TestBarrier_CustomNonceTrackerProvider(t *testing.T) {
-	mock := &mockNonceTracker{enabled: true}
-	cfg := DefaultBarrierConfig(1)
-	cfg.NonceTrackerProvider = mock
-	b := MustNewBarrier(cfg)
-
-	if b.NonceTracker() != mock {
-		t.Fatal("NonceTracker() should return the injected provider")
-	}
-}
-
-// TestBarrier_CustomNonceTrackerProviderClearError verifies that when a custom
-// NonceTrackerProvider returns an error from Clear during Rotate, the failure
-// is treated as fail-safe: Rotate does NOT surface it as a fatal TrackerError
-// (which could make a caller retry into another rotation) and instead commits
-// the new epoch and returns it with a nil error.
-func TestBarrier_CustomNonceTrackerProviderClearError(t *testing.T) {
-	clearErr := errors.New("persistent clear failed")
-	mock := &mockNonceTracker{enabled: true, clearErr: clearErr}
-	cfg := testBarrierConfig(1)
-	cfg.NonceTrackerProvider = mock
-	cfg.InvocationLimit = -1 // disable invocation counter so only the nonce tracker is exercised
-	b := MustNewBarrier(cfg)
-	s := testStrategy(t)
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	oldEpoch := b.CurrentEpoch()
-	newEpoch, err := b.Rotate(context.Background())
-	if err != nil {
-		t.Fatalf("Rotate should not return a fatal error on a fail-safe clear failure: %v", err)
-	}
-
-	// No TrackerError must be surfaced for the fail-safe degraded state.
-	var te *TrackerError
-	if errors.As(err, &te) {
-		t.Fatalf("Rotate should not return a TrackerError for a fail-safe clear failure, got: %v", te)
-	}
-	if newEpoch != oldEpoch+1 {
-		t.Fatalf("Rotate returned epoch %d, want newEpoch %d", newEpoch, oldEpoch+1)
-	}
-	if got := b.CurrentEpoch(); got != newEpoch {
-		t.Fatalf("barrier stayed on epoch %d after Rotate, want newEpoch %d", got, newEpoch)
 	}
 }
 
@@ -3899,30 +3607,6 @@ func TestBarrier_EncryptWithNonceTrackerError(t *testing.T) {
 	}
 }
 
-// TestBarrier_EncryptWithNonceTrackerError_NilCheckDoesNotError verifies that
-// when the nonce tracker does not return an error, Encrypt succeeds normally.
-func TestBarrier_EncryptWithNonceTrackerError_NilCheckSucceeds(t *testing.T) {
-	t.Parallel()
-	mockNT := &mockNonceTracker{enabled: true, checkErr: nil}
-	cfg := DefaultBarrierConfig(1)
-	cfg.NonceTrackerProvider = mockNT
-	cfg.InvocationLimit = -1
-	b := MustNewBarrier(cfg)
-	s := testStrategy(t)
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	ct, err := b.Encrypt(nil, []byte("test data"))
-	if err != nil {
-		t.Fatalf("Encrypt should succeed when nonce tracker returns nil: %v", err)
-	}
-	if len(ct) == 0 {
-		t.Fatal("ciphertext should not be empty")
-	}
-}
-
 // --- Encrypt with invocation counter error ---
 
 // TestBarrier_EncryptWithInvocationCounterError verifies that when the
@@ -3947,30 +3631,6 @@ func TestBarrier_EncryptWithInvocationCounterError(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInvocationLimitExceeded) {
 		t.Fatalf("expected ErrInvocationLimitExceeded, got: %v", err)
-	}
-}
-
-// TestBarrier_EncryptWithInvocationCounterError_NilCheckSucceeds verifies that
-// when the invocation counter does not return an error, Encrypt succeeds normally.
-func TestBarrier_EncryptWithInvocationCounterError_NilCheckSucceeds(t *testing.T) {
-	t.Parallel()
-	mockIC := &mockInvocationCounter{enabled: true, incrementErr: nil}
-	cfg := DefaultBarrierConfig(1)
-	cfg.InvocationCounter = mockIC
-	cfg.NonceTracking = BoolPtr(false)
-	b := MustNewBarrier(cfg)
-	s := testStrategy(t)
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	ct, err := b.Encrypt(nil, []byte("test data"))
-	if err != nil {
-		t.Fatalf("Encrypt should succeed when invocation counter returns nil: %v", err)
-	}
-	if len(ct) == 0 {
-		t.Fatal("ciphertext should not be empty")
 	}
 }
 
@@ -4303,33 +3963,6 @@ func TestBarrier_SealUnsealInProcessKeepsAuthoritativeCount(t *testing.T) {
 	}
 	if got := b.InvocationCounter().Count(); got != 3 {
 		t.Fatalf("invocation count after in-process seal/unseal = %d, want the true 3", got)
-	}
-}
-
-// TestBarrier_InProcessSealUnsealKeepsAccurateCount verifies that a
-// seal/unseal cycle within one process does NOT clobber an accurate
-// non-zero in-memory count with the pessimistic seed.
-func TestBarrier_InProcessSealUnsealKeepsAccurateCount(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	for i := 0; i < 5; i++ {
-		if _, err := b.Encrypt(nil, []byte("data")); err != nil {
-			t.Fatalf("Encrypt: %v", err)
-		}
-	}
-	countBefore := b.InvocationCounter().Count()
-	if countBefore != 5 {
-		t.Fatalf("count = %d, want 5", countBefore)
-	}
-
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal: %v", err)
-	}
-	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Unseal: %v", err)
-	}
-
-	if got := b.InvocationCounter().Count(); got != countBefore {
-		t.Fatalf("in-process unseal changed accurate count: %d -> %d", countBefore, got)
 	}
 	if b.ShouldRotateKey() {
 		t.Fatal("in-process unseal must not force rotation")

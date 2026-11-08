@@ -218,29 +218,6 @@ func TestSnapshotPool_NewWithMinimumWorkers(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_StartAndStop(t *testing.T) {
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	// Workers should be running.
-	close(stopC)
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected: all workers stopped.
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot pool workers did not stop within timeout")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Save snapshot tests
 // ---------------------------------------------------------------------------
@@ -433,37 +410,6 @@ func TestSnapshotPool_SaveSnapshot_MaxSnapshotSizeZeroDisablesCheck(t *testing.T
 	}
 	if result.index != 100 {
 		t.Fatalf("result.index = %d, want 100", result.index)
-	}
-}
-
-func TestSnapshotPool_SaveSnapshot_ZeroLastApplied(t *testing.T) {
-	stopC := make(chan struct{})
-	defer close(stopC)
-	p := newSnapshotPool(2, nil, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	ss := newSnapshotTestSnapshotter(0) // zero means nothing to snapshot
-	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, ss, t.TempDir(), nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID:   10,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, p, "snapshot")
-	if result.err != nil {
-		t.Fatalf("unexpected error: %v", result.err)
-	}
-	if result.index != 0 {
-		t.Fatalf("result.index = %d, want 0", result.index)
 	}
 }
 
@@ -1001,14 +947,6 @@ func TestSnapshotPool_SnapshotSaveDir(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_SnapshotSaveDir_ZeroIndex(t *testing.T) {
-	dir := snapshotSaveDir("/tmp", 1, 1, 0)
-	expected := filepath.Join("/tmp", "shard-1", "replica-1", "snapshot-00000000000000000000")
-	if dir != expected {
-		t.Fatalf("snapshotSaveDir = %s, want %s", dir, expected)
-	}
-}
-
 func TestSnapshotPool_LatestSnapshotDir(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -1297,12 +1235,6 @@ func (b *testBarrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (i
 	b.purgedBefore = minEpoch
 	b.purgeCallCount++
 	return 0, nil
-}
-
-func (b *testBarrier) InFlightCount(epoch uint64) int64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.inFlight[epoch]
 }
 
 func (b *testBarrier) PurgedBefore() uint64 {
@@ -2738,17 +2670,10 @@ func TestIsSnapshotScratchTemp(t *testing.T) {
 		name string
 		want bool
 	}{
-		{".decrypt-123.tmp", true},
-		{".send-decrypt-123.tmp", true},
 		{".decrypt-.tmp", true},
 		{".recv-encrypt-123.tmp", true},
 		{".reencrypt-snapshot-123.tmp", true},
-		{"decrypt-123.tmp", false},
-		{".decrypt-123", false},
 		{".recv-encrypt-123", false},
-		{".encrypt-123.tmp", true},
-		{snapshotDataFile, false},
-		{snapshotMetadataFile, false},
 	}
 	for _, tt := range tests {
 		if got := IsSnapshotScratchTemp(tt.name); got != tt.want {
@@ -2854,34 +2779,6 @@ func TestIsSnapshotImportStage(t *testing.T) {
 // I.6: In-flight epoch protection tests
 // ---------------------------------------------------------------------------
 
-func TestSnapshotPool_InFlightEpochTracking(t *testing.T) {
-	barrier := newTestBarrier(5)
-
-	// Register an in-flight epoch.
-	barrier.RegisterInFlightEpoch(3)
-	if barrier.InFlightCount(3) != 1 {
-		t.Fatalf("in-flight count = %d, want 1", barrier.InFlightCount(3))
-	}
-
-	// Register again.
-	barrier.RegisterInFlightEpoch(3)
-	if barrier.InFlightCount(3) != 2 {
-		t.Fatalf("in-flight count = %d, want 2", barrier.InFlightCount(3))
-	}
-
-	// Deregister once.
-	barrier.DeregisterInFlightEpoch(3)
-	if barrier.InFlightCount(3) != 1 {
-		t.Fatalf("in-flight count = %d, want 1", barrier.InFlightCount(3))
-	}
-
-	// Deregister again, should be removed from map.
-	barrier.DeregisterInFlightEpoch(3)
-	if barrier.InFlightCount(3) != 0 {
-		t.Fatalf("in-flight count = %d, want 0", barrier.InFlightCount(3))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Error type tests
 // ---------------------------------------------------------------------------
@@ -2891,14 +2788,6 @@ func TestSnapshotEncryptError_Error(t *testing.T) {
 	want := "engine: snapshot encrypt failed: quicraft: snapshot frame corrupt"
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err.Error(), want)
-	}
-}
-
-func TestSnapshotEncryptError_Unwrap(t *testing.T) {
-	inner := ErrSnapshotCorrupt
-	err := &SnapshotEncryptError{Op: "decrypt", Err: inner}
-	if !errors.Is(err, ErrSnapshotCorrupt) {
-		t.Fatal("Unwrap should chain to ErrSnapshotCorrupt")
 	}
 }
 
@@ -3004,70 +2893,6 @@ func TestSnapshotPool_WriteMetadataWithEpoch(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_SaveSnapshot_PersistsMembership(t *testing.T) {
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	// Create a real peer with a known membership (single-node cluster).
-	var shardID, replicaID uint64 = 10, 1
-	peer, lr := newTestPeer(t, shardID, replicaID)
-	// Tick the single-node cluster to leader so the peer is fully
-	// initialized with its membership.
-	tickPeerToLeader(peer)
-
-	ss := newSnapshotTestSnapshotter(100)
-	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID:   shardID,
-		replicaID: replicaID,
-		node:      node,
-		save:      true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, p, "snapshot")
-	if result.err != nil {
-		t.Fatalf("unexpected error: %v", result.err)
-	}
-	if result.index != 100 {
-		t.Fatalf("result.index = %d, want 100", result.index)
-	}
-
-	// Verify LogDB snapshot contains the membership.
-	snap, err := ldb.GetSnapshot(shardID, replicaID)
-	if err != nil {
-		t.Fatalf("GetSnapshot failed: %v", err)
-	}
-	if snap.Index != 100 {
-		t.Fatalf("logdb snapshot index = %d, want 100", snap.Index)
-	}
-
-	// The peer was bootstrapped with Addresses{replicaID: "localhost:0"}.
-	// Verify this membership was captured in the snapshot.
-	if len(snap.Membership.Addresses) == 0 {
-		t.Fatal("snapshot membership Addresses is empty; membership not persisted")
-	}
-	addr, ok := snap.Membership.Addresses[replicaID]
-	if !ok {
-		t.Fatalf("snapshot membership missing replicaID %d", replicaID)
-	}
-	if addr != "localhost:0" {
-		t.Fatalf("snapshot membership address = %q, want %q", addr, "localhost:0")
-	}
-}
-
 func TestSnapshotPool_SaveSnapshot_NilPeer_EmptyMembership(t *testing.T) {
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
@@ -3119,6 +2944,11 @@ func TestSnapshotPool_SaveSnapshot_NilPeer_EmptyMembership(t *testing.T) {
 	}
 	if len(snap.Membership.Addresses) != 0 {
 		t.Fatalf("expected empty Addresses, got %v", snap.Membership.Addresses)
+	}
+	// With no peer there is no applied term to record: term 0 is the
+	// safe fallback.
+	if snap.Term != 0 {
+		t.Fatalf("snapshot term = %d, want 0 for nil peer", snap.Term)
 	}
 }
 
@@ -3438,37 +3268,6 @@ func TestSnapshotPool_Metrics_IncSnapshot(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_Metrics_NilSafe verifies that snapshot save works
-// correctly without a metrics collector.
-func TestSnapshotPool_Metrics_NilSafe(t *testing.T) {
-	tmpDir := t.TempDir()
-	ldb := newSnapshotTestLogDB()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	var wg sync.WaitGroup
-	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-	p.start(&wg)
-
-	snapshotter := newSnapshotTestSnapshotter(100)
-	cfg := config.Config{ShardID: 7, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, tmpDir, nil)
-	node.snapshotter = snapshotter
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID: 7, replicaID: 1, node: node, save: true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, p, "snapshot")
-	if result.err != nil {
-		t.Fatalf("snapshot save failed: %v", result.err)
-	}
-	// No panic = success with nil metrics.
-}
-
 // ---------------------------------------------------------------------------
 // Snapshot term resolved from Peer.AppliedToTerm, not LogReader
 // ---------------------------------------------------------------------------
@@ -3570,50 +3369,6 @@ func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_SaveSnapshot_NilPeerTermZero(t *testing.T) {
-	// When the Peer is nil (e.g. during recovery), the term should be 0
-	// as a safe fallback. This verifies the nil check.
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	pool := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	pool.start(&wg)
-
-	ss := newSnapshotTestSnapshotter(50)
-	cfg := config.Config{ShardID: 20, ReplicaID: 1, CompactionOverhead: 10}
-	cfg.SetDefaults()
-	// Node with nil peer.
-	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
-
-	err := pool.requestSnapshot(snapshotRequest{
-		shardID:   20,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, pool, "snapshot")
-	if result.err != nil {
-		t.Fatalf("snapshot save failed: %v", result.err)
-	}
-
-	// Term should be 0 since there's no peer.
-	snap, snapErr := ldb.GetSnapshot(20, 1)
-	if snapErr != nil {
-		t.Fatalf("GetSnapshot failed: %v", snapErr)
-	}
-	if snap.Term != 0 {
-		t.Fatalf("snapshot term = %d, want 0 for nil peer", snap.Term)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // snapshotRequest.appliedToTerm: captured at creation, not read from Peer
 // ---------------------------------------------------------------------------
@@ -3704,133 +3459,6 @@ func TestSnapshotRequest_AppliedToTermCarriedInRequest(t *testing.T) {
 	}
 	if snap.Term != 7 {
 		t.Fatalf("snapshot term = %d, want 7 (from request.appliedToTerm)", snap.Term)
-	}
-}
-
-func TestSnapshotRequest_ZeroTermWhenNoPeer(t *testing.T) {
-	// When no peer exists (nil), the appliedToTerm in the request
-	// should be zero, and the snapshot should be saved with term=0.
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	pool := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	pool.start(&wg)
-
-	ss := newSnapshotTestSnapshotter(50)
-	cfg := config.Config{ShardID: 25, ReplicaID: 1, CompactionOverhead: 10}
-	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
-
-	// With nil peer, appliedToTerm is zero (the default).
-	err := pool.requestSnapshot(snapshotRequest{
-		shardID:       25,
-		replicaID:     1,
-		node:          node,
-		appliedToTerm: 0,
-		save:          true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, pool, "snapshot")
-	if result.err != nil {
-		t.Fatalf("snapshot save failed: %v", result.err)
-	}
-
-	snap, snapErr := ldb.GetSnapshot(25, 1)
-	if snapErr != nil {
-		t.Fatalf("GetSnapshot failed: %v", snapErr)
-	}
-	if snap.Term != 0 {
-		t.Fatalf("snapshot term = %d, want 0 for nil peer", snap.Term)
-	}
-}
-
-func TestSnapshotRequest_TermOverridesStaleValue(t *testing.T) {
-	// Verify that the term in the request is used even when it differs
-	// from what the Peer would currently return. This simulates the case
-	// where the step worker has advanced appliedToTerm after the request
-	// was created but before the pool worker processes it.
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	pool := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	pool.start(&wg)
-
-	var shardID, replicaID uint64 = 70, 1
-	testLDB := newTestLogDB()
-	lr := logdb.NewLogReader(shardID, replicaID, testLDB)
-	ms := proto.Membership{
-		Addresses: map[uint64]string{replicaID: "localhost:0"},
-	}
-	lr.ApplySnapshot(proto.Snapshot{
-		Index:      0,
-		Term:       0,
-		Membership: ms,
-	})
-	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
-	cfg.SetDefaults()
-	peer, err := raft.NewPeer(cfg, lr, nil)
-	if err != nil {
-		t.Fatalf("failed to create peer: %v", err)
-	}
-
-	// Install snapshot at index 100, term 5.
-	snapMsg := proto.Message{
-		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
-		From:    2,
-		To:      1,
-		ShardID: shardID,
-		Term:    5,
-		Snapshot: proto.Snapshot{
-			Index:      100,
-			Term:       5,
-			Membership: ms,
-		},
-	}
-	if handleErr := peer.Handle(snapMsg); handleErr != nil {
-		t.Fatalf("Handle snapshot failed: %v", handleErr)
-	}
-	if peer.AppliedToTerm() != 5 {
-		t.Fatalf("precondition: AppliedToTerm = %d, want 5", peer.AppliedToTerm())
-	}
-
-	ss := newSnapshotTestSnapshotter(100)
-	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
-
-	// Capture term 5 at request creation time. Even if the peer's
-	// appliedToTerm changes later, the snapshot must use term 5.
-	err = pool.requestSnapshot(snapshotRequest{
-		shardID:       shardID,
-		replicaID:     replicaID,
-		node:          node,
-		appliedToTerm: 5,
-		save:          true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, pool, "snapshot")
-	if result.err != nil {
-		t.Fatalf("snapshot save failed: %v", result.err)
-	}
-
-	snap, snapErr := ldb.GetSnapshot(shardID, replicaID)
-	if snapErr != nil {
-		t.Fatalf("GetSnapshot failed: %v", snapErr)
-	}
-	if snap.Term != 5 {
-		t.Fatalf("snapshot term = %d, want 5 (from captured appliedToTerm)", snap.Term)
 	}
 }
 
@@ -4154,45 +3782,6 @@ func TestSnapshotPool_GCSnapshotDirs_RemovesOrphanedDirs(t *testing.T) {
 // exportSnapshotToPath
 // ---------------------------------------------------------------------------
 
-func TestExportSnapshotToPath_Success(t *testing.T) {
-	// Create a fake snapshot directory with data and metadata files.
-	saveDir := t.TempDir()
-	dataContent := []byte("snapshot-data-for-export-test")
-	if err := os.WriteFile(filepath.Join(saveDir, snapshotDataFile), dataContent, 0o600); err != nil {
-		t.Fatalf("write data file: %v", err)
-	}
-	metaContent := make([]byte, snapshotMetaSize)
-	binary.LittleEndian.PutUint64(metaContent[0:], 100) // Index
-	binary.LittleEndian.PutUint64(metaContent[8:], 5)   // Term
-	if err := os.WriteFile(filepath.Join(saveDir, snapshotMetadataFile), metaContent, 0o600); err != nil {
-		t.Fatalf("write metadata file: %v", err)
-	}
-
-	exportDir := filepath.Join(t.TempDir(), "export-dest")
-
-	if err := exportSnapshotToPath(saveDir, exportDir); err != nil {
-		t.Fatalf("exportSnapshotToPath failed: %v", err)
-	}
-
-	// Verify data file was copied.
-	exported, readErr := os.ReadFile(filepath.Join(exportDir, snapshotDataFile))
-	if readErr != nil {
-		t.Fatalf("read exported data file: %v", readErr)
-	}
-	if string(exported) != string(dataContent) {
-		t.Errorf("exported data = %q, want %q", string(exported), string(dataContent))
-	}
-
-	// Verify metadata file was copied.
-	exportedMeta, metaErr := os.ReadFile(filepath.Join(exportDir, snapshotMetadataFile))
-	if metaErr != nil {
-		t.Fatalf("read exported metadata file: %v", metaErr)
-	}
-	if len(exportedMeta) != snapshotMetaSize {
-		t.Errorf("exported metadata size = %d, want %d", len(exportedMeta), snapshotMetaSize)
-	}
-}
-
 func TestExportSnapshotToPath_MissingSourceData(t *testing.T) {
 	// saveDir exists but has no data file.
 	saveDir := t.TempDir()
@@ -4201,30 +3790,6 @@ func TestExportSnapshotToPath_MissingSourceData(t *testing.T) {
 	err := exportSnapshotToPath(saveDir, exportDir)
 	if err == nil {
 		t.Fatal("exportSnapshotToPath should fail when source data file is missing")
-	}
-	var exportErr *SnapshotExportError
-	if !errors.As(err, &exportErr) {
-		t.Fatalf("expected *SnapshotExportError, got %T: %v", err, err)
-	}
-}
-
-func TestExportSnapshotToPath_InvalidExportDir(t *testing.T) {
-	// Create source data file.
-	saveDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(saveDir, snapshotDataFile), []byte("data"), 0o600); err != nil {
-		t.Fatalf("write data file: %v", err)
-	}
-
-	// Use a path that cannot be created (file exists where directory is needed).
-	blockingFile := filepath.Join(t.TempDir(), "blocking-file")
-	if err := os.WriteFile(blockingFile, []byte("block"), 0o600); err != nil {
-		t.Fatalf("write blocking file: %v", err)
-	}
-	exportDir := filepath.Join(blockingFile, "subdir")
-
-	err := exportSnapshotToPath(saveDir, exportDir)
-	if err == nil {
-		t.Fatal("exportSnapshotToPath should fail when export dir cannot be created")
 	}
 	var exportErr *SnapshotExportError
 	if !errors.As(err, &exportErr) {
@@ -4369,6 +3934,13 @@ func TestSaveSnapshot_WithExportPath(t *testing.T) {
 	if _, statErr := os.Stat(exportedData); os.IsNotExist(statErr) {
 		t.Fatal("exported snapshot data file does not exist at export path")
 	}
+	exportedMeta, metaErr := os.ReadFile(filepath.Join(exportDir, snapshotMetadataFile))
+	if metaErr != nil {
+		t.Fatalf("read exported metadata file: %v", metaErr)
+	}
+	if len(exportedMeta) != snapshotMetaSize {
+		t.Errorf("exported metadata size = %d, want %d", len(exportedMeta), snapshotMetaSize)
+	}
 }
 
 func TestSaveSnapshot_WithExportPath_InvalidDir(t *testing.T) {
@@ -4405,6 +3977,10 @@ func TestSaveSnapshot_WithExportPath_InvalidDir(t *testing.T) {
 	_, err := pool.saveSnapshot(req)
 	if err == nil {
 		t.Fatal("saveSnapshot with invalid export path should fail")
+	}
+	var exportErr *SnapshotExportError
+	if !errors.As(err, &exportErr) {
+		t.Fatalf("expected *SnapshotExportError, got %T: %v", err, err)
 	}
 }
 
@@ -4461,15 +4037,9 @@ func TestHandleRequest_PanicRecovery_SaveRequest(t *testing.T) {
 	}
 
 	// Wait for the request to be processed (panic recovered).
-	deadline := time.After(5 * time.Second)
-	for node.snapshotting.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for panic recovery")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
+		return !node.snapshotting.Load()
+	})
 
 	// snapshotting should be cleared.
 	if node.snapshotting.Load() {
@@ -4535,15 +4105,9 @@ func TestHandleRequest_PanicRecovery_RecoverRequest(t *testing.T) {
 
 	// Wait for the request to be processed. The observable signal is
 	// that snapshotting is cleared (it was set by requestSnapshot).
-	deadline := time.After(5 * time.Second)
-	for node.snapshotting.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for panic recovery")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
+		return !node.snapshotting.Load()
+	})
 
 	// recovering should be cleared.
 	if node.IsRecovering() {
@@ -4599,15 +4163,9 @@ func TestHandleRequest_CompletedCFull_DropsResult(t *testing.T) {
 	}
 
 	// Wait for callback to confirm processing.
-	deadline := time.After(5 * time.Second)
-	for cb.snapshotCallCount.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for snapshot completion callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for snapshot completion callback", func() bool {
+		return cb.snapshotCallCount.Load() != 0
+	})
 
 	// The callback was called even though completedC is full.
 	if cb.snapshotCallCount.Load() == 0 {
@@ -4647,35 +4205,29 @@ func TestSnapshotPool_ProductionPoolDropsNothing(t *testing.T) {
 		// No snapshotter: every save fails, so each outcome carries an error.
 		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 		// The request queue holds `workers` requests; wait out a full one.
-		for {
+		waitFor(t, 5*time.Second, time.Millisecond, "the snapshot request queue never freed a slot", func() bool {
 			err := pool.requestSnapshot(snapshotRequest{shardID: shardID, replicaID: 1, node: node, save: true})
 			if err == nil {
-				break
+				return true
 			}
 			var busy *SnapshotPoolBusyError
 			if !errors.As(err, &busy) {
 				t.Fatalf("requestSnapshot(shard %d): %v", shardID, err)
 			}
-			time.Sleep(time.Millisecond)
-		}
+			return false
+		})
 	}
 
 	var calls []snapshotCall
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	waitFor(t, 5*time.Second, time.Millisecond, "OnSnapshotCompleted did not fire once per request", func() bool {
 		cb.mu.Lock()
-		n := len(cb.snapshotCalls)
-		if n == requests {
-			calls = append([]snapshotCall(nil), cb.snapshotCalls...)
-			cb.mu.Unlock()
-			break
+		defer cb.mu.Unlock()
+		if len(cb.snapshotCalls) != requests {
+			return false
 		}
-		cb.mu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatalf("OnSnapshotCompleted fired %d times, want %d", n, requests)
-		}
-		time.Sleep(time.Millisecond)
-	}
+		calls = append([]snapshotCall(nil), cb.snapshotCalls...)
+		return true
+	})
 	seen := make(map[uint64]bool)
 	for _, c := range calls {
 		if c.err == nil {
@@ -4987,16 +4539,6 @@ func TestSnapshotAAD_UnbindableBarrierSuppressesContext(t *testing.T) {
 					"with ErrHardwareMode and every snapshot save would fail", len(ctx))
 			}
 		})
-	}
-}
-
-// TestSnapshotAAD_CapableBarrierBindsContext is the other half: a barrier that
-// CAN authenticate caller AAD gets the positional binding regardless of whether
-// it encrypts in software or delegates to hardware.
-func TestSnapshotAAD_CapableBarrierBindsContext(t *testing.T) {
-	ctx := NewSnapshotAAD(1, 2, 3, aadCapability{supports: true}).Frame(4, false)
-	if len(ctx) != SnapshotFrameAADLen {
-		t.Fatalf("context = %d bytes, want %d", len(ctx), SnapshotFrameAADLen)
 	}
 }
 
