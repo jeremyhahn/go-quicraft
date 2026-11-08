@@ -41,8 +41,9 @@ func TestNode_WaitForApplyDrain_BlocksUntilInFlightApplyCompletes(t *testing.T) 
 		}
 	}()
 
-	// The drain must NOT complete while the apply is still in flight.
-	time.Sleep(20 * time.Millisecond)
+	// The drain must NOT complete while the apply is still in flight. The
+	// goroutine sets recovering immediately before it starts draining.
+	waitFor(t, 2*time.Second, time.Millisecond, "the drain goroutine never set recovering", n.IsRecovering)
 	if drained.Load() {
 		t.Fatal("WaitForApplyDrain returned while an apply was still in flight")
 	}
@@ -50,15 +51,7 @@ func TestNode_WaitForApplyDrain_BlocksUntilInFlightApplyCompletes(t *testing.T) 
 	// Complete the in-flight apply; the drain must now finish promptly.
 	n.applyInFlight.Add(-1)
 
-	deadline := time.After(2 * time.Second)
-	for !drained.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("WaitForApplyDrain did not complete after apply drained")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
+	waitFor(t, 2*time.Second, time.Millisecond, "WaitForApplyDrain did not complete after apply drained", drained.Load)
 }
 
 // TestNode_WaitForApplyDrain_StopCAborts verifies the drain returns false and
