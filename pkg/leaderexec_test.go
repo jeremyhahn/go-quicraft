@@ -618,6 +618,8 @@ func TestExecuteOnLeader_DeadlineWithAnAttemptInFlight(t *testing.T) {
 // forwarded path, and that the error is permanent.
 func TestExecuteOnLeader_HandlerNotRegistered(t *testing.T) {
 	c := newExecCluster(t)
+	c.serve(nil)
+	c.hosts[1].UnregisterLeaderHandler(execShard)
 	c.elect(1, 5, 1, 2, 3)
 
 	if _, err := c.hosts[1].ExecuteOnLeader(context.Background(), execShard, []byte("x")); !errors.Is(err, ErrLeaderHandlerNotRegistered) {
@@ -658,19 +660,6 @@ func TestExecuteOnLeader_HandlerNotRegisteredOffTheTermIsNotLeader(t *testing.T)
 	c.deliver(c.expect(proto.LeaderExecResp, 3, 2, 6))
 	wantReply(t, c.result(res), "3@6:req")
 	c.wantRuns(map[uint64][]uint64{6: {3}})
-}
-
-// TestUnregisterLeaderHandler: requests after the removal are refused.
-func TestUnregisterLeaderHandler(t *testing.T) {
-	c := newExecCluster(t)
-	c.serve(nil)
-	c.elect(1, 5, 1)
-	c.hosts[1].UnregisterLeaderHandler(execShard)
-
-	if _, err := c.hosts[1].ExecuteOnLeader(context.Background(), execShard, nil); !errors.Is(err, ErrLeaderHandlerNotRegistered) {
-		t.Fatalf("err = %v, want ErrLeaderHandlerNotRegistered", err)
-	}
-	c.wantRuns(map[uint64][]uint64{})
 }
 
 // TestRegisterLeaderHandler_Validation: a nil handler, and a closed host.

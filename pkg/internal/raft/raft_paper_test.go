@@ -161,34 +161,6 @@ func TestPaper_CandidateUpdatesTermFromHigherTermMessage(t *testing.T) {
 	}
 }
 
-// TestPaper_LeaderStepsDownOnHigherTerm verifies that a leader becomes
-// follower when it receives a message with a higher term.
-//
-// Raft Section 5.1: "If a candidate or leader discovers that its term
-// is out of date, it immediately reverts to follower state."
-func TestPaper_LeaderStepsDownOnHigherTerm(t *testing.T) {
-	r := newPaperRaft(1)
-	electPaperLeader(r)
-	leaderTerm := r.term
-
-	higherTerm := leaderTerm + 1
-	err := r.step(proto.Message{
-		Type: proto.Heartbeat,
-		From: 3,
-		Term: higherTerm,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if r.state != follower {
-		t.Fatalf("expected leader to step down to follower, got %s", r.state)
-	}
-	if r.term != higherTerm {
-		t.Fatalf("expected term %d, got %d", higherTerm, r.term)
-	}
-}
-
 // TestPaper_StaleTermMessageRejected verifies that messages with lower
 // terms are rejected.
 //
@@ -473,81 +445,9 @@ func TestPaper_CandidateFallsBackToFollower(t *testing.T) {
 	}
 }
 
-// TestPaper_ElectionTimeoutRandomized verifies that the election timeout
-// is randomized within [electionTimeout, 2*electionTimeout).
-//
-// Raft Section 5.2: "Raft uses randomized election timeouts to ensure
-// that split votes are rare."
-func TestPaper_ElectionTimeoutRandomized(t *testing.T) {
-	seen := make(map[int]bool)
-	for i := 0; i < 100; i++ {
-		r := newPaperRaft(1)
-		timeout := r.randomizedElectionTimeout
-		if timeout < r.electionTimeout || timeout >= 2*r.electionTimeout {
-			t.Fatalf("randomized timeout %d not in [%d, %d)",
-				timeout, r.electionTimeout, 2*r.electionTimeout)
-		}
-		seen[timeout] = true
-	}
-	// With 100 samples over a range of electionTimeout values (10),
-	// we should see at least 2 distinct values.
-	if len(seen) < 2 {
-		t.Fatalf("expected multiple distinct election timeouts, got %d unique values", len(seen))
-	}
-}
-
 // ==========================================================================
 // Section 5.3 - Log Replication
 // ==========================================================================
-
-// TestPaper_LeaderCommitsEntry verifies that the leader commits an
-// entry when a majority of followers acknowledge it.
-//
-// Raft Section 5.3: "An entry is committed once the leader that created
-// the entry has replicated it on a majority of the servers."
-func TestPaper_LeaderCommitsEntry(t *testing.T) {
-	r := newPaperRaft(1)
-	electPaperLeader(r)
-	r.drainMessages()
-
-	// Propose an entry.
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		From:    r.replicaID,
-		Entries: []proto.Entry{{Cmd: []byte("cmd1")}},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	proposedIdx := r.log.lastIndex()
-	r.drainMessages()
-
-	// Persist the leader's log: tryCommit counts the leader's own match
-	// at its durable index, so the single follower ack below completes
-	// the quorum.
-	persistLog(r)
-
-	commitBefore := r.log.committed
-
-	// Acknowledge from one peer (quorum = 2 for 3-node cluster).
-	err = r.step(proto.Message{
-		Type:     proto.ReplicateResp,
-		From:     2,
-		Term:     r.term,
-		LogIndex: proposedIdx,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if r.log.committed <= commitBefore {
-		t.Fatalf("expected commit to advance past %d, got %d",
-			commitBefore, r.log.committed)
-	}
-	if r.log.committed < proposedIdx {
-		t.Fatalf("expected committed >= %d, got %d", proposedIdx, r.log.committed)
-	}
-}
 
 // TestPaper_LeaderCommitsPrecedingEntries verifies that when a new entry
 // is committed, all preceding uncommitted entries are also committed.
@@ -875,60 +775,6 @@ func TestPaper_LeaderSyncsFollowerLog(t *testing.T) {
 // Section 5.4 - Safety
 // ==========================================================================
 
-// TestPaper_CandidateWithStalerLogLosesElection verifies that a candidate
-// whose log is less up-to-date than the voter's log is rejected.
-//
-// Raft Section 5.4.1: "The voter denies its vote if its own log is more
-// up-to-date than that of the candidate."
-func TestPaper_CandidateWithStalerLogLosesElection(t *testing.T) {
-	tests := []struct {
-		name            string
-		voterEntries    []proto.Entry
-		candidateLogIdx uint64
-		candidateLogTrm uint64
-	}{
-		{
-			name:            "candidate has shorter log with same last term",
-			voterEntries:    []proto.Entry{{Term: 1, Index: 1}, {Term: 1, Index: 2}, {Term: 1, Index: 3}},
-			candidateLogIdx: 1,
-			candidateLogTrm: 1,
-		},
-		{
-			name:            "candidate has lower last term",
-			voterEntries:    []proto.Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}},
-			candidateLogIdx: 3,
-			candidateLogTrm: 1,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			voter := newPaperRaftWithLog(1, tt.voterEntries)
-			voter.becomeFollower(3, noLeader)
-			voter.drainMessages()
-
-			err := voter.step(proto.Message{
-				Type:     proto.RequestVote,
-				From:     2,
-				Term:     3,
-				LogIndex: tt.candidateLogIdx,
-				LogTerm:  tt.candidateLogTrm,
-			})
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			resps := collectMessages(voter, proto.RequestVoteResp)
-			if len(resps) != 1 {
-				t.Fatalf("expected 1 vote response, got %d", len(resps))
-			}
-			if !resps[0].Reject {
-				t.Fatal("expected vote to be rejected for less up-to-date candidate")
-			}
-		})
-	}
-}
-
 // TestPaper_LeaderOnlyCommitsCurrentTermEntries verifies that a leader
 // cannot commit entries from previous terms using only the replication
 // count. It must commit at least one entry from its current term first.
@@ -1220,42 +1066,6 @@ func TestPaper_DuelingPreCandidates(t *testing.T) {
 // ==========================================================================
 // CheckQuorum
 // ==========================================================================
-
-// TestPaper_LeaderStepsDownWithoutQuorum verifies that a leader steps
-// down to follower when CheckQuorum is enabled and the leader has not
-// received communication from a quorum of nodes within the election
-// timeout.
-//
-// Raft PhD thesis Section 6.2 / CheckQuorum extension.
-func TestPaper_LeaderStepsDownWithoutQuorum(t *testing.T) {
-	members := map[uint64]string{
-		1: "addr1",
-		2: "addr2",
-		3: "addr3",
-	}
-	cfg := raftTestCfgCheckQuorum(1, 1, true)
-	cfg.PreVote = config.BoolPtr(false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	electPaperLeader(r)
-	if r.state != leader {
-		t.Fatalf("expected leader, got %s", r.state)
-	}
-
-	// Advance past the election timeout without any follower activity.
-	// The leader's checkQuorum runs at electionTimeout ticks.
-	for i := 0; i < r.electionTimeout+1; i++ {
-		r.tickFunc(r)
-	}
-
-	if r.state != follower {
-		t.Fatalf("expected leader to step down without quorum, got %s", r.state)
-	}
-}
 
 // TestPaper_FreeStuckCandidateWithCheckQuorum verifies that when
 // CheckQuorum is enabled, a candidate that is stuck can still

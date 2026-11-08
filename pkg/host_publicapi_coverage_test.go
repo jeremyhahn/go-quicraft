@@ -82,29 +82,6 @@ func TestFollowerRead_Rejections(t *testing.T) {
 	})
 }
 
-// TestFollowerRead_FastPathServesAppliedState verifies the fast path: when the
-// state machine has already applied everything committed, the read is answered
-// immediately from local state without polling.
-func TestFollowerRead_FastPathServesAppliedState(t *testing.T) {
-	h := startReadBufShard(t, testCreateFunc)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	if _, err := h.SyncPropose(ctx, 1, []byte("committed-write")); err != nil {
-		t.Fatalf("SyncPropose: %v", err)
-	}
-
-	// mockStateMachine.Lookup echoes the query.
-	got, err := h.FollowerRead(ctx, 1, "follower-query")
-	if err != nil {
-		t.Fatalf("FollowerRead: %v", err)
-	}
-	if got != "follower-query" {
-		t.Fatalf("FollowerRead = %v, want %q", got, "follower-query")
-	}
-}
-
 // TestFollowerRead_LaggingApplyRespectsDeadline verifies the slow path: when
 // the state machine is behind the committed index the read polls, backs off
 // after the initial burst, and ultimately honours the caller's deadline

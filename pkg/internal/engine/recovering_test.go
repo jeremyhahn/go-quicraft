@@ -70,6 +70,7 @@ func TestRecovering_BlocksEntryApplication(t *testing.T) {
 
 	// While recovering, the batch stays parked: the SM is untouched and
 	// commitPending remains set.
+	// Kept: a parked batch exposes no signal, so the test observes a fixed window for the absence of an apply.
 	time.Sleep(20 * time.Millisecond)
 	if goodSM.applyCount.Load() != 0 {
 		t.Fatalf("expected 0 SM.Apply calls during recovery, got %d", goodSM.applyCount.Load())
@@ -87,15 +88,9 @@ func TestRecovering_BlocksEntryApplication(t *testing.T) {
 	node.lastApplied.Store(6)
 	node.SetRecovering(false)
 
-	deadlineRec := time.After(5 * time.Second)
-	for node.commitPending.Load() {
-		select {
-		case <-deadlineRec:
-			t.Fatal("timed out waiting for commitPending to clear after recovery completed")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for commitPending to clear after recovery completed", func() bool {
+		return !node.commitPending.Load()
+	})
 
 	// Entries covered by the recovered snapshot must not reach the SM.
 	if goodSM.applyCount.Load() != 0 {
@@ -212,6 +207,7 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	applyC <- item1
 
 	// The batch stays parked while recovery is in progress.
+	// Kept: a parked batch exposes no signal, so the test observes a fixed window for the absence of an apply.
 	time.Sleep(20 * time.Millisecond)
 	if node.lastApplied.Load() != 0 {
 		t.Fatalf("expected lastApplied=0 during recovery, got %d", node.lastApplied.Load())
@@ -228,15 +224,9 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	node.SetRecovering(false)
 
 	// Wait for entries to be applied.
-	deadline := time.After(5 * time.Second)
-	for node.lastApplied.Load() < 11 {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for entries to be applied (phase 2)")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for entries to be applied (phase 2)", func() bool {
+		return node.lastApplied.Load() >= 11
+	})
 
 	// Verify entries were applied.
 	if got := node.lastApplied.Load(); got != 11 {
@@ -395,15 +385,9 @@ func TestRecovering_FlagOnlySetsForRecoveryNotSave(t *testing.T) {
 	}
 
 	// Wait for completion.
-	deadline := time.After(5 * time.Second)
-	for node.snapshotting.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for snapshot save to complete")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for snapshot save to complete", func() bool {
+		return !node.snapshotting.Load()
+	})
 
 	// The recovering flag should NEVER have been set for a save request.
 	if node.IsRecovering() {
@@ -446,15 +430,9 @@ func TestRecovering_SnapshotPoolSetsRecoveringBeforeExecution(t *testing.T) {
 	}
 
 	// Wait for completion via the snapshot callback.
-	deadline := time.After(5 * time.Second)
-	for cb.snapshotCallCount.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for snapshot completion callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for snapshot completion callback", func() bool {
+		return cb.snapshotCallCount.Load() != 0
+	})
 
 	// After completion, both flags should be cleared.
 	if node.IsRecovering() {
@@ -545,15 +523,9 @@ func TestRecovering_ApplyWorkerDoesNotParkEmptyBatch(t *testing.T) {
 	item.node = node
 	applyC <- item
 
-	deadline := time.After(5 * time.Second)
-	for node.commitPending.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("commitPending still set: an empty batch was parked on the recovering gate")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "commitPending still set: an empty batch was parked on the recovering gate", func() bool {
+		return !node.commitPending.Load()
+	})
 
 	if goodSM.applyCount.Load() != 0 {
 		t.Fatalf("expected 0 SM.Apply calls for an empty batch, got %d", goodSM.applyCount.Load())

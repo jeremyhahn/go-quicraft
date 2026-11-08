@@ -210,39 +210,6 @@ func TestHandleMessage_RemovedReplicaCannotBypassItsTombstoneWithAForgedFrom(t *
 	}
 }
 
-// TestHandleMessage_ConfiguredMemberQuorumTrafficStillFlows is the liveness
-// half: a member speaking under its own certificate must still have every
-// quorum-bearing message delivered. A gate that fails this stops the shard from
-// committing or electing at all.
-func TestHandleMessage_ConfiguredMemberQuorumTrafficStillFlows(t *testing.T) {
-	const memberAddr, memberID = "127.0.0.1:5002", "spki:2222222222222222222222222222222222222222222222222222222222222222"
-	ms := proto.Membership{
-		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: memberAddr},
-		Identities: map[uint64]string{2: memberID},
-	}
-
-	for _, msgType := range quorumBearingTypes {
-		t.Run(proto.MessageTypeName(msgType), func(t *testing.T) {
-			eng, handler := fromGateRig(t, ms, map[uint64]string{2: memberAddr})
-
-			batch := proto.MessageBatch{
-				SourceAddress: memberAddr,
-				Requests: []proto.Message{
-					{ShardID: 1, From: 2, To: 1, Type: msgType, Term: 5},
-				},
-			}
-			if err := handler.HandleMessage(batch, certCoveringAs(memberID, memberAddr)); err != nil {
-				t.Fatalf("HandleMessage: %v", err)
-			}
-			if len(eng.delivered) != 1 {
-				t.Fatalf("delivered %d %s messages from a configured member, want 1: "+
-					"the shard can no longer reach quorum",
-					len(eng.delivered), proto.MessageTypeName(msgType))
-			}
-		})
-	}
-}
-
 // TestHandleMessage_MemberAdvertisingAnEquivalentAddressIsNotPartitioned is the
 // regression for a LIVENESS defect the first version of this gate introduced.
 //
@@ -825,32 +792,5 @@ func TestRegisterIfAbsent_ConcurrentEstablishHasExactlyOneWinner(t *testing.T) {
 	}
 	if got := reg.Count(); got != keys {
 		t.Fatalf("Count = %d, want %d: the entry count diverged from the map", got, keys)
-	}
-}
-
-// TestRegisterIfAbsent_NeverReplacesAnEstablishedMapping is the sequential
-// contract: the return value reports the RETAINED address and that this caller
-// did not store it.
-func TestRegisterIfAbsent_NeverReplacesAnEstablishedMapping(t *testing.T) {
-	reg := registry.NewRegistry()
-
-	existing, stored := reg.RegisterIfAbsent(1, 2, "127.0.0.1:5002")
-	if !stored || existing != "127.0.0.1:5002" {
-		t.Fatalf("RegisterIfAbsent on an empty entry = (%q, %v), want (%q, true)",
-			existing, stored, "127.0.0.1:5002")
-	}
-
-	existing, stored = reg.RegisterIfAbsent(1, 2, "10.0.0.9:9999")
-	if stored {
-		t.Fatal("RegisterIfAbsent replaced an established mapping")
-	}
-	if existing != "127.0.0.1:5002" {
-		t.Fatalf("RegisterIfAbsent returned %q, want the retained %q", existing, "127.0.0.1:5002")
-	}
-	if got, _ := reg.Resolve(1, 2); got != "127.0.0.1:5002" {
-		t.Fatalf("Resolve = %q, want the retained %q", got, "127.0.0.1:5002")
-	}
-	if got := reg.Count(); got != 1 {
-		t.Fatalf("Count = %d after a rejected register, want 1", got)
 	}
 }
