@@ -4037,15 +4037,9 @@ func TestHandleRequest_PanicRecovery_SaveRequest(t *testing.T) {
 	}
 
 	// Wait for the request to be processed (panic recovered).
-	deadline := time.After(5 * time.Second)
-	for node.snapshotting.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for panic recovery")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
+		return !node.snapshotting.Load()
+	})
 
 	// snapshotting should be cleared.
 	if node.snapshotting.Load() {
@@ -4111,15 +4105,9 @@ func TestHandleRequest_PanicRecovery_RecoverRequest(t *testing.T) {
 
 	// Wait for the request to be processed. The observable signal is
 	// that snapshotting is cleared (it was set by requestSnapshot).
-	deadline := time.After(5 * time.Second)
-	for node.snapshotting.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for panic recovery")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
+		return !node.snapshotting.Load()
+	})
 
 	// recovering should be cleared.
 	if node.IsRecovering() {
@@ -4175,15 +4163,9 @@ func TestHandleRequest_CompletedCFull_DropsResult(t *testing.T) {
 	}
 
 	// Wait for callback to confirm processing.
-	deadline := time.After(5 * time.Second)
-	for cb.snapshotCallCount.Load() == 0 {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for snapshot completion callback")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for snapshot completion callback", func() bool {
+		return cb.snapshotCallCount.Load() != 0
+	})
 
 	// The callback was called even though completedC is full.
 	if cb.snapshotCallCount.Load() == 0 {
@@ -4223,35 +4205,29 @@ func TestSnapshotPool_ProductionPoolDropsNothing(t *testing.T) {
 		// No snapshotter: every save fails, so each outcome carries an error.
 		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 		// The request queue holds `workers` requests; wait out a full one.
-		for {
+		waitFor(t, 5*time.Second, time.Millisecond, "the snapshot request queue never freed a slot", func() bool {
 			err := pool.requestSnapshot(snapshotRequest{shardID: shardID, replicaID: 1, node: node, save: true})
 			if err == nil {
-				break
+				return true
 			}
 			var busy *SnapshotPoolBusyError
 			if !errors.As(err, &busy) {
 				t.Fatalf("requestSnapshot(shard %d): %v", shardID, err)
 			}
-			time.Sleep(time.Millisecond)
-		}
+			return false
+		})
 	}
 
 	var calls []snapshotCall
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	waitFor(t, 5*time.Second, time.Millisecond, "OnSnapshotCompleted did not fire once per request", func() bool {
 		cb.mu.Lock()
-		n := len(cb.snapshotCalls)
-		if n == requests {
-			calls = append([]snapshotCall(nil), cb.snapshotCalls...)
-			cb.mu.Unlock()
-			break
+		defer cb.mu.Unlock()
+		if len(cb.snapshotCalls) != requests {
+			return false
 		}
-		cb.mu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatalf("OnSnapshotCompleted fired %d times, want %d", n, requests)
-		}
-		time.Sleep(time.Millisecond)
-	}
+		calls = append([]snapshotCall(nil), cb.snapshotCalls...)
+		return true
+	})
 	seen := make(map[uint64]bool)
 	for _, c := range calls {
 		if c.err == nil {

@@ -156,9 +156,8 @@ func (c *nextWireCluster) committed() (uint64, bool) {
 // an election.
 func (c *nextWireCluster) propose(tag string) {
 	c.t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
 	var lastErr error
-	for time.Now().Before(deadline) {
+	if waitUntil(20*time.Second, func() bool {
 		for _, n := range c.nodes {
 			info, err := n.host.ShardInfo(nextWireShard)
 			if err != nil || !info.IsLeader {
@@ -168,10 +167,12 @@ func (c *nextWireCluster) propose(tag string) {
 			_, lastErr = n.host.SyncPropose(ctx, nextWireShard, []byte(tag))
 			cancel()
 			if lastErr == nil {
-				return
+				return true
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		return false
+	}) {
+		return
 	}
 	c.t.Fatalf("proposal %q never committed: %v", tag, lastErr)
 }
@@ -187,6 +188,7 @@ func TestNextWire_RollingUpgradeSwitchesOnlyOnceEveryReplicaRunsIt(t *testing.T)
 	for i := range 2 {
 		c.upgrade(i)
 		c.propose(fmt.Sprintf("mixed-%d", i))
+		// Kept: the absence of a switch in this window is the behaviour under test.
 		// Give an upgraded leader time to see every advertisement and, if it
 		// wrongly would, propose: a switch while a replica runs the old build
 		// would cut it off.
@@ -201,16 +203,12 @@ func TestNextWire_RollingUpgradeSwitchesOnlyOnceEveryReplicaRunsIt(t *testing.T)
 
 	c.upgrade(2)
 	target := proto.WireVersion + 1
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		if v, ok := c.committed(); ok && v == target {
-			break
-		}
-		if time.Now().After(deadline) {
-			v, _ := c.committed()
-			t.Fatalf("every replica runs the next build, yet the shard never switched to %d (at %d)", target, v)
-		}
-		time.Sleep(20 * time.Millisecond)
+	if !waitUntil(30*time.Second, func() bool {
+		v, ok := c.committed()
+		return ok && v == target
+	}) {
+		v, _ := c.committed()
+		t.Fatalf("every replica runs the next build, yet the shard never switched to %d (at %d)", target, v)
 	}
 	for i := range 3 {
 		c.propose(fmt.Sprintf("after-%d", i))

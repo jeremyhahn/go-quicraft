@@ -37,12 +37,8 @@ func shardLockRefs(l *shardLocks, shardID uint64) int {
 // waiters, so a test knows a goroutine is parked in acquire.
 func waitForShardLockRefs(t *testing.T, l *shardLocks, shardID uint64, want int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for shardLockRefs(l, shardID) != want {
-		if time.Now().After(deadline) {
-			t.Fatalf("shard %d lock refs = %d, want %d", shardID, shardLockRefs(l, shardID), want)
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(5*time.Second, func() bool { return shardLockRefs(l, shardID) == want }) {
+		t.Fatalf("shard %d lock refs = %d, want %d", shardID, shardLockRefs(l, shardID), want)
 	}
 }
 

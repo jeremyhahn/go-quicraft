@@ -9,6 +9,6 @@
 # verified against the attacker key. Changing this file is a reviewed change,
 # which is what makes it an anchor at all.
 #
-# Public half of the key agent-go-quicraft signs with; the private half lives
-# only in the company repo (infra/gitea/agent-keys/, mode 600).
+# Public half of the key the project's release identity signs with; the
+# private half is held by the release signer, never in this repository.
 agent-go-quicraft@example.internal ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIO4zYciUPVq8P1993g/mgQgDndTE2gOcxS7iRPO/9LhM agent-go-quicraft@example.internal

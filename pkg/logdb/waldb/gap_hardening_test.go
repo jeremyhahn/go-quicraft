@@ -29,7 +29,6 @@ import (
 	"strconv"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
@@ -311,13 +310,19 @@ func TestCloseConcurrentWithWriters(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	var wg sync.WaitGroup
+	// started counts the writers that have made their first save, so Close
+	// races writers that are already in their loop.
+	var wg, started sync.WaitGroup
 	for w := 0; w < 4; w++ {
 		wg.Add(1)
+		started.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; ; i++ {
 				err := db.SaveEntries(uint64(w+1), 1, makeEntries(uint64(i*3+1), 3, 1))
+				if i == 0 {
+					started.Done()
+				}
 				if err != nil {
 					if !errors.Is(err, logdb.ErrClosed) && !errors.Is(err, ErrClosed) {
 						t.Errorf("writer %d: unexpected error %v", w, err)
@@ -328,7 +333,7 @@ func TestCloseConcurrentWithWriters(t *testing.T) {
 		}(w)
 	}
 
-	time.Sleep(5 * time.Millisecond)
+	started.Wait()
 	if err := db.Close(); err != nil {
 		t.Errorf("Close: %v", err)
 	}
