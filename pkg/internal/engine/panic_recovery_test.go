@@ -401,18 +401,9 @@ func TestApplyWorkerDispatcherPanicRecovery_NormalFlowUnaffected(t *testing.T) {
 	applyC <- item
 
 	// Wait for the apply to complete.
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for normal apply to complete")
-		default:
-		}
-		if node.lastApplied.Load() >= 1 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for normal apply to complete", func() bool {
+		return node.lastApplied.Load() >= 1
+	})
 
 	// Verify the state machine received the entry.
 	if goodSM.applyCount.Load() != 1 {

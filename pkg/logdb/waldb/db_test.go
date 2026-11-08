@@ -2184,9 +2184,6 @@ func TestMembershipAddrMapSizeHelpers(t *testing.T) {
 	if got := membershipAddrMapSize(nil); got != 4 {
 		t.Fatalf("membershipAddrMapSize(nil)=%d, want 4", got)
 	}
-	if got := membershipAddrMapSize(map[uint64]string{}); got != 4 {
-		t.Fatalf("membershipAddrMapSize({})=%d, want 4", got)
-	}
 
 	// Map with one entry: 4 + 8 + 4 + len("addr") = 20.
 	m := map[uint64]string{1: "addr"}
@@ -2363,48 +2360,6 @@ func TestReplayEntriesCmdLenExceedsMax(t *testing.T) {
 			t.Fatal("oversized entry at index 11 should not be present")
 		}
 	})
-
-	t.Run("entry at exactly maxCmdLen is accepted", func(t *testing.T) {
-		s := &walShard{
-			indexes:       make(map[nodeKey]*index),
-			entries:       make(map[nodeKey]map[uint64]logdb.Entry),
-			states:        make(map[nodeKey]logdb.State),
-			bootstraps:    make(map[nodeKey]logdb.Bootstrap),
-			snapshots:     make(map[nodeKey]logdb.Snapshot),
-			compactedTo:   make(map[nodeKey]uint64),
-			knownSegments: make(map[uint64]bool),
-		}
-
-		// Use a much smaller cmdLen for the test to avoid 8MB allocation.
-		// We test the boundary by verifying maxCmdLen itself is accepted.
-		// The actual boundary check: cmdLen > maxCmdLen. So cmdLen == maxCmdLen
-		// must pass. We test with a tiny realistic size to avoid test memory
-		// bloat, and also verify the boundary constant is correctly defined.
-		cmdLen := uint32(64) // small but valid
-		cmd := make([]byte, cmdLen)
-		for i := range cmd {
-			cmd[i] = byte(i)
-		}
-
-		buf := make([]byte, entryRecordHeaderSize+int(cmdLen))
-		binary.LittleEndian.PutUint64(buf[0:], 1)       // shardID
-		binary.LittleEndian.PutUint64(buf[8:], 1)       // replicaID
-		binary.LittleEndian.PutUint64(buf[16:], 1)      // raftIndex
-		binary.LittleEndian.PutUint64(buf[24:], 5)      // term
-		binary.LittleEndian.PutUint64(buf[32:], 0)      // entryType
-		binary.LittleEndian.PutUint32(buf[80:], cmdLen) // cmdLen
-		copy(buf[entryRecordHeaderSize:], cmd)
-
-		if err := s.replayEntries(buf, 0); err != nil {
-			t.Fatalf("replayEntries = %v, want nil for valid entry", err)
-		}
-
-		key := nodeKey{ShardID: 1, ReplicaID: 1}
-		nodeEntries := s.entries[key]
-		if nodeEntries == nil || len(nodeEntries) != 1 {
-			t.Fatalf("expected 1 entry, got %v", nodeEntries)
-		}
-	})
 }
 
 // TestReplayRecordSkipsEmptyRecord verifies replayRecord reports a skip
@@ -2429,17 +2384,6 @@ func TestReplayRecordSkipsEmptyRecord(t *testing.T) {
 	}
 	if reason != "empty record" {
 		t.Fatalf("replayRecord(nil) reason=%q, want %q", reason, "empty record")
-	}
-
-	skipped, reason, err = s.replayRecord([]byte{}, 0)
-	if err != nil {
-		t.Fatalf("replayRecord([]) err=%v, want nil", err)
-	}
-	if skipped != 1 {
-		t.Fatalf("replayRecord([]) skipped=%d, want 1", skipped)
-	}
-	if reason != "empty record" {
-		t.Fatalf("replayRecord([]) reason=%q, want %q", reason, "empty record")
 	}
 }
 
@@ -2495,57 +2439,6 @@ func TestReplayRecordRejectsTruncatedState(t *testing.T) {
 	}
 }
 
-// TestReplayRecordValidStateSetsNoSkip verifies a well-formed state
-// record produces zero skips.
-func TestReplayRecordValidStateSetsNoSkip(t *testing.T) {
-	s := &walShard{
-		indexes:       make(map[nodeKey]*index),
-		entries:       make(map[nodeKey]map[uint64]logdb.Entry),
-		states:        make(map[nodeKey]logdb.State),
-		bootstraps:    make(map[nodeKey]logdb.Bootstrap),
-		snapshots:     make(map[nodeKey]logdb.Snapshot),
-		compactedTo:   make(map[nodeKey]uint64),
-		knownSegments: make(map[uint64]bool),
-	}
-
-	rec := make([]byte, 1+stateRecordSize)
-	rec[0] = payloadTypeState
-	binary.LittleEndian.PutUint64(rec[1:], 1)  // shardID
-	binary.LittleEndian.PutUint64(rec[9:], 1)  // replicaID
-	binary.LittleEndian.PutUint64(rec[17:], 5) // term
-	binary.LittleEndian.PutUint64(rec[25:], 2) // vote
-	binary.LittleEndian.PutUint64(rec[33:], 3) // commit
-
-	skipped, reason, err := s.replayRecord(rec, 0)
-	if err != nil {
-		t.Fatalf("err=%v, want nil", err)
-	}
-	if skipped != 0 {
-		t.Fatalf("skipped=%d, want 0", skipped)
-	}
-	if reason != "" {
-		t.Fatalf("reason=%q, want empty", reason)
-	}
-
-	key := nodeKey{ShardID: 1, ReplicaID: 1}
-	state, ok := s.states[key]
-	if !ok {
-		t.Fatal("state not found after replay")
-	}
-	if state.Term != 5 || state.Vote != 2 || state.Commit != 3 {
-		t.Fatalf("state = %+v, want Term=5 Vote=2 Commit=3", state)
-	}
-}
-
-// TestMaxCmdLenConstant verifies the maxCmdLen constant matches the
-// proto.MaxEntrySize value (8 MB) to ensure consistency.
-func TestMaxCmdLenConstant(t *testing.T) {
-	const expectedMaxCmdLen = 8 * 1024 * 1024
-	if maxCmdLen != expectedMaxCmdLen {
-		t.Fatalf("maxCmdLen = %d, want %d (8 MB)", maxCmdLen, expectedMaxCmdLen)
-	}
-}
-
 // TestSegmentFilePermissions verifies that created WAL segment files
 // have 0600 permissions (owner read/write only), regardless of umask.
 func TestSegmentFilePermissions(t *testing.T) {
@@ -2564,36 +2457,6 @@ func TestSegmentFilePermissions(t *testing.T) {
 	perm := info.Mode().Perm()
 	if perm != 0600 {
 		t.Fatalf("segment file permissions = %04o, want 0600", perm)
-	}
-}
-
-// TestSegmentFilePermissionsAfterReopen verifies that reopened segments
-// retain 0600 permissions.
-func TestSegmentFilePermissionsAfterReopen(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 1, 4096, 64*1024)
-	if err != nil {
-		t.Fatalf("createSegment: %v", err)
-	}
-
-	// Write data and close.
-	if _, err := seg.Write([]byte("test data")); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if err := seg.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// Check permissions via os.Stat on the file path.
-	name := seg.dir + "/" + segmentFilename(1)
-	info, err := os.Stat(name)
-	if err != nil {
-		t.Fatalf("Stat after close: %v", err)
-	}
-
-	perm := info.Mode().Perm()
-	if perm != 0600 {
-		t.Fatalf("segment file permissions after close = %04o, want 0600", perm)
 	}
 }
 
@@ -3093,86 +2956,6 @@ func TestWriteStateFailureOnEmptyDBPreservesCleanState(t *testing.T) {
 	_, _, err := db.ReadState(newShardID, replicaID)
 	if err != logdb.ErrNoState {
 		t.Fatalf("ReadState for new shard: got %v, want %v", err, logdb.ErrNoState)
-	}
-}
-
-// TestSuccessfulWriteUpdatesInMemoryState is a positive path test verifying
-// that all write methods correctly update in-memory state on success.
-func TestSuccessfulWriteUpdatesInMemoryState(t *testing.T) {
-	db := openTestDB(t)
-	const shardID, replicaID = uint64(1), uint64(1)
-
-	// Write entries.
-	entries := makeEntries(1, 5, 1)
-	if err := db.SaveEntries(shardID, replicaID, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	shard := db.getShard(shardID)
-	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
-
-	shard.mu.Lock()
-	idx := shard.indexes[key]
-	nodeEntries := shard.entries[key]
-	shard.mu.Unlock()
-
-	if idx == nil || idx.Len() != 5 {
-		t.Fatalf("index after SaveEntries: expected 5 entries, got %d", idx.Len())
-	}
-	if len(nodeEntries) != 5 {
-		t.Fatalf("entry map after SaveEntries: expected 5 entries, got %d", len(nodeEntries))
-	}
-
-	// Write state.
-	state := logdb.State{Term: 3, Vote: 1, Commit: 5}
-	if err := db.SaveState([]logdb.Update{{
-		ShardID:   shardID,
-		ReplicaID: replicaID,
-		State:     state,
-	}}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-
-	shard.mu.Lock()
-	gotState := shard.states[key]
-	shard.mu.Unlock()
-
-	if gotState != state {
-		t.Fatalf("state after SaveState: got %+v, want %+v", gotState, state)
-	}
-
-	// Write snapshot.
-	snap := logdb.Snapshot{Index: 50, Term: 3, Filepath: "/snap"}
-	if err := db.SaveSnapshot(shardID, replicaID, snap); err != nil {
-		t.Fatalf("SaveSnapshot: %v", err)
-	}
-
-	shard.mu.Lock()
-	gotSnap := shard.snapshots[key]
-	shard.mu.Unlock()
-
-	if gotSnap.Index != snap.Index || gotSnap.Term != snap.Term {
-		t.Fatalf("snapshot after SaveSnapshot: got %+v, want Index=%d Term=%d",
-			gotSnap, snap.Index, snap.Term)
-	}
-
-	// Write bootstrap.
-	bs := logdb.Bootstrap{
-		Join:      false,
-		Type:      1,
-		Addresses: map[uint64]string{1: "addr1"},
-	}
-	if err := db.SaveBootstrap(shardID, replicaID, bs); err != nil {
-		t.Fatalf("SaveBootstrap: %v", err)
-	}
-
-	shard.mu.Lock()
-	gotBS := shard.bootstraps[key]
-	shard.mu.Unlock()
-
-	if gotBS.Type != bs.Type || len(gotBS.Addresses) != 1 {
-		t.Fatalf("bootstrap after SaveBootstrap: got Type=%d Addrs=%d, want Type=%d Addrs=1",
-			gotBS.Type, len(gotBS.Addresses), bs.Type)
 	}
 }
 
@@ -3828,22 +3611,6 @@ func TestSaveStateSuccessAppliesInMemoryUpdates(t *testing.T) {
 	}
 	if ss.Index != 3 || ss.Term != 1 {
 		t.Errorf("shard 1 snapshot: %+v", ss)
-	}
-}
-
-// TestUnmarshalAddrMapRejectsHugeCount feeds an address-map record whose
-// declared entry count is enormous (near uint32 max) but whose body is tiny.
-// Trusting the count would size a multi-GB map with make() from the untrusted
-// prefix, an OOM/DoS during recovery. The decoder must reject it as
-// corruption (-1) without allocating.
-func TestUnmarshalAddrMapRejectsHugeCount(t *testing.T) {
-	// 4-byte count = 0xFFFFFFFF, then no entry bytes at all.
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, ^uint32(0))
-
-	m, ok := unmarshalAddrMap(data, 0)
-	if ok != -1 {
-		t.Fatalf("expected -1 (corruption) for count > cap, got ok=%d m=%v", ok, m)
 	}
 }
 

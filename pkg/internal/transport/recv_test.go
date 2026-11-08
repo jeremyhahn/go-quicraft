@@ -38,15 +38,8 @@ import (
 // or the timeout elapses, failing the test otherwise.
 func waitForBatchCount(t *testing.T, h *testHandler, want int64, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if h.batchCount.Load() >= want {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for %d batches; got %d (an idle data stream was abandoned while its connection stayed alive?)",
-		want, h.batchCount.Load())
+	pollUntil(t, timeout, 10*time.Millisecond, "timed out waiting for the batches (an idle data stream was abandoned while its connection stayed alive?)",
+		func() bool { return h.batchCount.Load() >= want })
 }
 
 // TestDataStreamSurvivesIdleOnLiveConnection is the regression test for the
@@ -116,7 +109,7 @@ func TestDataStreamSurvivesIdleOnLiveConnection(t *testing.T) {
 	// Idle well past StreamReadIdleTimeout (300ms) but far under the QUIC
 	// connection idle timeout (30s): the connection stays alive; the data
 	// stream goes idle and must not be abandoned by the receiver.
-	time.Sleep(900 * time.Millisecond)
+	time.Sleep(900 * time.Millisecond) // kept: the idle period is the behaviour under test
 
 	// Second send reuses the SAME cached data stream. It must be delivered.
 	t1.Send(dataMsg())
@@ -2572,22 +2565,18 @@ func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
 	// silently (we send far less than the stream receive window) and the
 	// deadline elapses.
 	junk := make([]byte, 1024)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := stream.Write(junk); err != nil {
-			var streamErr *quic.StreamError
-			if !errors.As(err, &streamErr) {
-				t.Fatalf("expected quic.StreamError from write after CancelRead, got %T: %v", err, err)
-			}
-			if streamErr.ErrorCode != QUICStreamErrFrameRejected {
-				t.Fatalf("stream error code = %d, want %d (QUICStreamErrFrameRejected)",
-					streamErr.ErrorCode, QUICStreamErrFrameRejected)
-			}
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 10*time.Millisecond, "stream writes kept succeeding: receive direction was never cancelled", func() bool {
+		_, err = stream.Write(junk)
+		return err != nil
+	})
+	var streamErr *quic.StreamError
+	if !errors.As(err, &streamErr) {
+		t.Fatalf("expected quic.StreamError from write after CancelRead, got %T: %v", err, err)
 	}
-	t.Fatal("stream writes kept succeeding: receive direction was never cancelled")
+	if streamErr.ErrorCode != QUICStreamErrFrameRejected {
+		t.Fatalf("stream error code = %d, want %d (QUICStreamErrFrameRejected)",
+			streamErr.ErrorCode, QUICStreamErrFrameRejected)
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -29,6 +29,29 @@ import (
 )
 
 // snappyEncode is a test helper that wraps snappy.Encode.
+// messageCount is the number of messages h has received, over all batches.
+func (h *testHandler) messageCount() int {
+	n := 0
+	for _, b := range h.getBatches() {
+		n += len(b.Requests)
+	}
+	return n
+}
+
+// waitForMessageCount waits until h has received at least want messages.
+func waitForMessageCount(t *testing.T, h *testHandler, want int, timeout time.Duration) {
+	t.Helper()
+	pollUntil(t, timeout, 5*time.Millisecond, "the expected messages did not arrive",
+		func() bool { return h.messageCount() >= want })
+}
+
+// waitForDrops waits until rec has recorded at least want message drops.
+func waitForDrops(t *testing.T, rec *dropRecorder, want int) {
+	t.Helper()
+	pollUntil(t, 10*time.Second, 5*time.Millisecond, "the expected message drops were not recorded",
+		func() bool { return len(rec.drops()) >= want })
+}
+
 func snappyEncode(dst, src []byte) []byte {
 	return snappy.Encode(dst, src)
 }
@@ -137,7 +160,7 @@ func TestConnectionCleanupWithMultipleConns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getConnection(t2) failed: %v", err)
 	}
-	_, err = t1.getConnection(target3, "")
+	conn3, err := t1.getConnection(target3, "")
 	if err != nil {
 		t.Fatalf("getConnection(t3) failed: %v", err)
 	}
@@ -148,15 +171,17 @@ func TestConnectionCleanupWithMultipleConns(t *testing.T) {
 
 	// Close one connection.
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
 
-	t1.cleanStaleConnections()
-
-	// Should have 1 remaining (t3 still alive).
-	if t1.ConnectionCount() > 1 {
-		// t2's connection may take time to close. Give it another try.
-		time.Sleep(500 * time.Millisecond)
+	// Once t2's connection is dead, cleanup leaves only t3's.
+	pollUntil(t, 10*time.Second, 20*time.Millisecond, "cleanStaleConnections did not remove the stopped peer's connection", func() bool {
 		t1.cleanStaleConnections()
+		return t1.ConnectionCount() == 1
+	})
+	t1.connMu.RLock()
+	kept := t1.conns[target3]
+	t1.connMu.RUnlock()
+	if kept != conn3 {
+		t.Fatal("cleanStaleConnections removed t3's live connection")
 	}
 }
 
@@ -498,29 +523,6 @@ func TestStartWithInvalidUDPAddress(t *testing.T) {
 	}
 }
 
-// TestSendBatchWriteDeadlineAndWriteError verifies that sendBatch handles
-// stream write failures by evicting the stream.
-func TestSendBatchWriteDeadlineAndWriteError(t *testing.T) {
-	t1, t2, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Send a first message to establish the stream.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Stop t2 to make the stream broken.
-	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	// Now send again. The write should fail, triggering stream eviction.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
-	})
-	// Should not panic. The message is silently dropped.
-}
-
 // TestSendBatchMarshalFrameCapReuse verifies the capacity reuse path in
 // sendBatch where the buffer from the pool has sufficient capacity.
 func TestSendBatchMarshalFrameCapReuse(t *testing.T) {
@@ -576,7 +578,7 @@ func TestGetConnectionDeadConnectionRedial(t *testing.T) {
 
 	// Close the connection to make its context done.
 	conn1.CloseWithError(0, "force redial test")
-	time.Sleep(200 * time.Millisecond)
+	waitForChan(t, conn1.Context().Done(), 5*time.Second, "the closed connection's context is not done")
 
 	// Next getConnection should redial.
 	conn2, err := t1.getConnection(target, "")
@@ -1261,16 +1263,23 @@ func TestHandleMessageFrameTooManyMessages(t *testing.T) {
 // TestHandleConnectionRemotePeerClose verifies that handleConnection
 // exits cleanly when the remote peer closes the connection.
 func TestHandleConnectionRemotePeerClose(t *testing.T) {
-	t1, _, _, _, cleanup := transportPair(t, 42)
+	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
+
+	inbound := func() int {
+		n := 0
+		t2.inboundConns.Range(func(_, _ any) bool { n++; return true })
+		return n
+	}
 
 	// Establish a connection by sending a message.
 	t1.Send([]proto.Message{
 		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
 	})
-
-	// Wait for the message to be delivered.
-	time.Sleep(500 * time.Millisecond)
+	handler2.waitBatch(t, 10*time.Second)
+	if n := inbound(); n != 1 {
+		t.Fatalf("t2 tracks %d inbound connections, want 1", n)
+	}
 
 	// Close t1's connection to t2. This triggers the handleConnection
 	// path in t2 where isConnectionClosed returns true.
@@ -1280,16 +1289,19 @@ func TestHandleConnectionRemotePeerClose(t *testing.T) {
 	}
 	t1.connMu.RUnlock()
 
-	// Give time for t2 to detect the closed connection.
-	time.Sleep(500 * time.Millisecond)
+	// handleConnection returns and forgets the connection.
+	pollUntil(t, 10*time.Second, 10*time.Millisecond, "t2's handleConnection did not exit on the peer's close",
+		func() bool { return inbound() == 0 })
 }
 
 // testChunkReader implements chunkReader for testing receiveChunks.
 type testChunkReader struct {
 	data        []byte
 	pos         int
-	readErr     error // error to return when data is exhausted
-	deadlineErr error // error to return from SetReadDeadline
+	readErr     error         // error to return when data is exhausted
+	deadlineErr error         // error to return from SetReadDeadline
+	mark        int           // offset whose reading closes reached
+	reached     chan struct{} // closed once data[:mark] has been read
 }
 
 func (r *testChunkReader) Read(p []byte) (int, error) {
@@ -1301,6 +1313,10 @@ func (r *testChunkReader) Read(p []byte) (int, error) {
 	}
 	n := copy(p, r.data[r.pos:])
 	r.pos += n
+	if r.reached != nil && r.pos >= r.mark {
+		close(r.reached)
+		r.reached = nil
+	}
 	if r.pos >= len(r.data) && r.readErr != nil {
 		return n, r.readErr
 	}
@@ -1589,7 +1605,10 @@ func TestReceiveChunksRateLimitWithStop(t *testing.T) {
 	}
 	data := buildChunkFrames(t, chunks)
 
-	reader := &testChunkReader{data: data}
+	// The first chunk read, the receiver waits out its 1 B/s rate (capped at
+	// 5s) before the second.
+	firstRead := make(chan struct{})
+	reader := &testChunkReader{data: data, mark: len(buildChunkFrames(t, chunks[:1])), reached: firstRead}
 	hdr := &SnapshotHeader{ChunkCount: 2}
 	stopC := make(chan struct{})
 
@@ -1599,15 +1618,11 @@ func TestReceiveChunksRateLimitWithStop(t *testing.T) {
 		sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
 	}()
 
-	// Close stopC after a short delay to interrupt rate limiting.
-	time.Sleep(50 * time.Millisecond)
+	// Close stopC once the first chunk is read, to interrupt rate limiting.
+	waitForChan(t, firstRead, 5*time.Second, "the first chunk was not read")
 	close(stopC)
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timeout waiting for receiveChunks to exit")
-	}
+	waitForChan(t, done, 2*time.Second, "receiveChunks did not exit on stop during the rate-limit wait")
 }
 
 // TestReceiveChunksEmptyChunkCount verifies behavior with ChunkCount=0.

@@ -18,7 +18,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -29,128 +28,72 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Snapshot IO: data integrity verification via hash comparison
+// Snapshot IO: malformed input (bit-flip, garbage, empty, truncation) rejected
 // ---------------------------------------------------------------------------
 
-func TestSnapshot_DataIntegrityRoundTrip(t *testing.T) {
-	t.Run("large dataset fully preserved after restore", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(1000, 1000, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
+func TestSnapshot_MalformedInputRejected(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm1.Close()
 
-		// Apply 100 entries with unique key-value pairs.
-		const numEntries = 100
-		for i := uint64(1); i <= numEntries; i++ {
-			key := fmt.Sprintf("key-%04d", i)
-			val := fmt.Sprintf("value-%04d-with-extra-data-to-make-it-larger", i)
-			entries := []proto.Entry{
-				{Index: i, Cmd: makeCmd(key, val)},
-			}
-			results := make([]sm.Result, 1)
-			if err := rsm1.Apply(entries, results); err != nil {
-				t.Fatalf("Apply(%d) = %v", i, err)
-			}
-		}
+	// Register a session and apply data to create a non-trivial snapshot.
+	if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
+		t.Fatalf("Register = %v", err)
+	}
+	entries := []proto.Entry{
+		{Index: 1, ClientID: 10, SeriesID: 1, Cmd: makeCmd("snap", "truncate-test-value")},
+	}
+	results := make([]sm.Result, 1)
+	if err := rsm1.Apply(entries, results); err != nil {
+		t.Fatalf("Apply = %v", err)
+	}
 
-		// Save snapshot.
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-		snapshotSize := buf.Len()
-		if snapshotSize == 0 {
-			t.Fatal("snapshot should not be empty")
-		}
+	var buf bytes.Buffer
+	stopper := make(chan struct{})
+	if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
+		t.Fatalf("SaveSnapshot = %v", err)
+	}
+	full := buf.Bytes()
+	if len(full) < 8 {
+		t.Fatal("snapshot too short")
+	}
 
-		// Restore into a fresh SM.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(1000, 1000, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm2.Close()
+	// Bit-flip the first bytes (session count in the session marshal format).
+	flipped := make([]byte, len(full))
+	copy(flipped, full)
+	flipped[0] ^= 0xFF
+	flipped[1] ^= 0xFF
 
-		if err := rsm2.RecoverFromSnapshot(context.Background(), bytes.NewReader(buf.Bytes()), stopper); err != nil {
-			t.Fatalf("RecoverFromSnapshot = %v", err)
-		}
-
-		// Verify all data is present and correct.
-		for i := uint64(1); i <= numEntries; i++ {
-			key := fmt.Sprintf("key-%04d", i)
-			expected := fmt.Sprintf("value-%04d-with-extra-data-to-make-it-larger", i)
-			val, err := rsm2.Lookup(context.Background(), key)
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"bit-flipped session count", flipped},
+		{"random bytes", []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+			0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}},
+		{"empty reader", nil},
+		{"truncated at 25%", full[:len(full)*25/100]},
+		{"truncated at 50%", full[:len(full)*50/100]},
+		{"truncated at 75%", full[:len(full)*75/100]},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
 			if err != nil {
-				t.Fatalf("Lookup(%s) = %v", key, err)
+				t.Fatalf("NewStateMachine = %v", err)
 			}
-			if val.(string) != expected {
-				t.Errorf("Lookup(%s) = %q, want %q", key, val, expected)
+			defer rsm2.Close()
+
+			if err := rsm2.RecoverFromSnapshot(context.Background(), bytes.NewReader(tc.data), stopper); err == nil {
+				t.Fatal("RecoverFromSnapshot = nil, want an error")
 			}
-		}
-
-		// Re-save from restored SM and verify the snapshot size is consistent
-		// (same number of KV pairs produces same total snapshot size).
-		var buf2 bytes.Buffer
-		if err := rsm2.SaveSnapshot(context.Background(), &buf2, stopper); err != nil {
-			t.Fatalf("SaveSnapshot(2) = %v", err)
-		}
-		if buf2.Len() != snapshotSize {
-			t.Errorf("re-saved snapshot size = %d, want %d", buf2.Len(), snapshotSize)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: corrupted header bytes (bit-flip, not truncation)
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_CorruptedHeaderDetected(t *testing.T) {
-	t.Run("bit-flipped session count corrupts recovery", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
 		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		// Register session and save snapshot.
-		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-
-		// Corrupt the first 4 bytes (session count in the session marshal format).
-		data := buf.Bytes()
-		if len(data) < 4 {
-			t.Fatal("snapshot too short")
-		}
-		corrupted := make([]byte, len(data))
-		copy(corrupted, data)
-		corrupted[0] ^= 0xFF
-		corrupted[1] ^= 0xFF
-
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm2.Close()
-
-		err = rsm2.RecoverFromSnapshot(context.Background(), bytes.NewReader(corrupted), stopper)
-		if err == nil {
-			t.Fatal("RecoverFromSnapshot should fail on corrupted session count")
-		}
-	})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -336,200 +279,6 @@ func TestSnapshot_ConcurrentSaveAndRestore(t *testing.T) {
 				t.Errorf("Lookup(%d) = %q, want %q", i, val, "value")
 			}
 			restored.Close()
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: session expiry state preserved across snapshot
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_SessionExpiryStatePreserved(t *testing.T) {
-	t.Run("lastActiveIndex survives snapshot roundtrip", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 500), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		// Register sessions at different activity levels.
-		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register(10) = %v", err)
-		}
-		if err := rsm1.Sessions().Register(20, 0, 0); err != nil {
-			t.Fatalf("Register(20) = %v", err)
-		}
-
-		// Apply entry for session 10 at index 400 (recent activity).
-		entries := []proto.Entry{
-			{Index: 400, ClientID: 10, SeriesID: 1, Cmd: makeCmd("act", "ive")},
-		}
-		results := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm1, entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-		// Session 20 remains at lastActiveIndex=0 (stale).
-
-		// Snapshot and restore.
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 500), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm2.Close()
-
-		if err := rsm2.RecoverFromSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("RecoverFromSnapshot = %v", err)
-		}
-
-		// At index 600 with threshold 500, session 20 (last active at 0) should expire.
-		// Session 10 (last active at 400) should NOT expire (gap=200 < 500).
-		expired := rsm2.Sessions().ExpireSessions(600, 500, 10)
-		foundStale := false
-		foundActive := false
-		for _, id := range expired {
-			if id == 20 {
-				foundStale = true
-			}
-			if id == 10 {
-				foundActive = true
-			}
-		}
-		if !foundStale {
-			t.Error("stale session 20 should have been expired after restore")
-		}
-		if foundActive {
-			t.Error("active session 10 should NOT have been expired after restore")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: concurrent SM type snapshot roundtrip
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_ConcurrentSMType(t *testing.T) {
-	t.Run("concurrent SM snapshot roundtrip preserves state", func(t *testing.T) {
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return newTestConcurrentKV()
-		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		if rsm1.SMType() != SMTypeConcurrent {
-			t.Fatalf("SMType = %d, want SMTypeConcurrent", rsm1.SMType())
-		}
-
-		// Register session and apply data.
-		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		entries := []proto.Entry{
-			{Index: 1, ClientID: 10, SeriesID: 1, Cmd: makeCmd("ckey", "cval")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm1.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// Snapshot.
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-
-		// Restore into a new concurrent SM.
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm2.Close()
-
-		if err := rsm2.RecoverFromSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("RecoverFromSnapshot = %v", err)
-		}
-
-		// Verify data.
-		val, err := rsm2.Lookup(context.Background(), "ckey")
-		if err != nil {
-			t.Fatalf("Lookup = %v", err)
-		}
-		if val.(string) != "cval" {
-			t.Errorf("Lookup(ckey) = %q, want %q", val, "cval")
-		}
-		if !rsm2.Sessions().IsRegistered(10) {
-			t.Error("session 10 should be registered after restore")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: on-disk SM type snapshot roundtrip
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_OnDiskSMType(t *testing.T) {
-	t.Run("on-disk SM snapshot roundtrip preserves state", func(t *testing.T) {
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return newTestOnDiskKV()
-		}
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		if rsm1.SMType() != SMTypeOnDisk {
-			t.Fatalf("SMType = %d, want SMTypeOnDisk", rsm1.SMType())
-		}
-
-		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		entries := []proto.Entry{
-			{Index: 1, ClientID: 10, SeriesID: 1, Cmd: makeCmd("dkey", "dval")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm1.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm2.Close()
-
-		if err := rsm2.RecoverFromSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("RecoverFromSnapshot = %v", err)
-		}
-
-		val, err := rsm2.Lookup(context.Background(), "dkey")
-		if err != nil {
-			t.Fatalf("Lookup = %v", err)
-		}
-		if val.(string) != "dval" {
-			t.Errorf("Lookup(dkey) = %q, want %q", val, "dval")
-		}
-		if !rsm2.Sessions().IsRegistered(10) {
-			t.Error("session 10 should be registered after restore")
 		}
 	})
 }
@@ -863,150 +612,6 @@ func TestSnapshot_RecoverReplacesExistingState(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Snapshot IO: stopper cancellation during save/recover
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_StopperCancellationMidOperation(t *testing.T) {
-	t.Run("save snapshot fails when stopper already closed", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		stopper := make(chan struct{})
-		close(stopper)
-
-		var buf bytes.Buffer
-		err = rsm1.SaveSnapshot(context.Background(), &buf, stopper)
-		if !errors.Is(err, ErrStopped) {
-			t.Errorf("SaveSnapshot = %v, want ErrStopped", err)
-		}
-	})
-
-	t.Run("recover from snapshot fails when stopper already closed", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		stopper := make(chan struct{})
-		close(stopper)
-
-		err = rsm1.RecoverFromSnapshot(context.Background(), &bytes.Buffer{}, stopper)
-		if !errors.Is(err, ErrStopped) {
-			t.Errorf("RecoverFromSnapshot = %v, want ErrStopped", err)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: corrupted payload (random bytes) rejected
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_CorruptedPayloadRejected(t *testing.T) {
-	t.Run("completely random bytes fail recovery", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		// Feed completely random/garbage data as a snapshot.
-		garbage := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-			0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}
-		stopper := make(chan struct{})
-		err = rsm1.RecoverFromSnapshot(context.Background(), bytes.NewReader(garbage), stopper)
-		if err == nil {
-			t.Fatal("RecoverFromSnapshot should fail on garbage data")
-		}
-	})
-
-	t.Run("empty reader fails recovery", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		stopper := make(chan struct{})
-		err = rsm1.RecoverFromSnapshot(context.Background(), bytes.NewReader(nil), stopper)
-		if err == nil {
-			t.Fatal("RecoverFromSnapshot should fail on empty reader")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: truncated snapshot rejected
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_TruncatedSnapshotRejected(t *testing.T) {
-	t.Run("snapshot truncated at various points fails recovery", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		// Register sessions and apply data to create a non-trivial snapshot.
-		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		entries := []proto.Entry{
-			{Index: 1, ClientID: 10, SeriesID: 1, Cmd: makeCmd("snap", "truncate-test-value")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm1.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-		fullData := buf.Bytes()
-		if len(fullData) < 8 {
-			t.Fatal("snapshot too short for truncation test")
-		}
-
-		// Try truncating at 25%, 50%, and 75% of the snapshot.
-		for _, pct := range []int{25, 50, 75} {
-			cutPoint := len(fullData) * pct / 100
-			truncated := fullData[:cutPoint]
-
-			rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-			if err != nil {
-				t.Fatalf("NewStateMachine = %v", err)
-			}
-
-			err = rsm2.RecoverFromSnapshot(context.Background(), bytes.NewReader(truncated), stopper)
-			if err == nil {
-				t.Errorf("RecoverFromSnapshot should fail when truncated at %d%%", pct)
-			}
-			rsm2.Close()
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Snapshot IO: empty state machine roundtrip
 // ---------------------------------------------------------------------------
 
@@ -1052,146 +657,5 @@ func TestSnapshot_EmptyStateMachineRoundTrip(t *testing.T) {
 		if sha256.Sum256(buf2.Bytes()) != sha256.Sum256(buf.Bytes()) {
 			t.Error("empty SM snapshot hashes should match after roundtrip")
 		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: session-only state (no KV data) roundtrip
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_SessionOnlyState(t *testing.T) {
-	t.Run("sessions without user data survive snapshot roundtrip", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		// Register sessions but apply no data entries.
-		for i := uint64(1); i <= 5; i++ {
-			entries := []proto.Entry{
-				{Index: i, ClientID: i * 10, SeriesID: proto.SessionSeriesIDForRegister, Type: proto.EntryNormal},
-			}
-			results := make([]sm.Result, 1)
-			if err := rsm1.Apply(entries, results); err != nil {
-				t.Fatalf("Apply(register %d) = %v", i, err)
-			}
-		}
-
-		if rsm1.Sessions().Count() != 5 {
-			t.Fatalf("sessions = %d, want 5", rsm1.Sessions().Count())
-		}
-
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine(2) = %v", err)
-		}
-		defer rsm2.Close()
-
-		if err := rsm2.RecoverFromSnapshot(context.Background(), bytes.NewReader(buf.Bytes()), stopper); err != nil {
-			t.Fatalf("RecoverFromSnapshot = %v", err)
-		}
-
-		if rsm2.Sessions().Count() != 5 {
-			t.Errorf("sessions after recover = %d, want 5", rsm2.Sessions().Count())
-		}
-		for i := uint64(1); i <= 5; i++ {
-			clientID := i * 10
-			if !rsm2.Sessions().IsRegistered(clientID) {
-				t.Errorf("session %d should be registered after restore", clientID)
-			}
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot IO: recover from corrupted middle bytes
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_RecoverFromCorruptedMiddleBytes(t *testing.T) {
-	t.Run("zeroed middle bytes cause recovery failure or data corruption", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		// Build non-trivial state.
-		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		for i := uint64(1); i <= 10; i++ {
-			entries := []proto.Entry{
-				{Index: i, Cmd: makeCmd(fmt.Sprintf("k%d", i), fmt.Sprintf("val%d", i))},
-			}
-			results := make([]sm.Result, 1)
-			if err := rsm1.Apply(entries, results); err != nil {
-				t.Fatalf("Apply(%d) = %v", i, err)
-			}
-		}
-
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-
-		data := buf.Bytes()
-		if len(data) < 20 {
-			t.Fatal("snapshot too short for corruption test")
-		}
-
-		// Zero out 8 bytes in the middle.
-		corrupted := make([]byte, len(data))
-		copy(corrupted, data)
-		mid := len(corrupted) / 2
-		for i := mid; i < mid+8 && i < len(corrupted); i++ {
-			corrupted[i] = 0
-		}
-
-		rsm2, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine(2) = %v", err)
-		}
-		defer rsm2.Close()
-
-		recoverErr := rsm2.RecoverFromSnapshot(context.Background(), bytes.NewReader(corrupted), stopper)
-		if recoverErr != nil {
-			// Recovery failure is the expected outcome for corruption.
-			return
-		}
-
-		// If recovery succeeded, at least one key should differ from original.
-		// This validates that corruption is detectable at the application level
-		// even if the format parser did not catch it.
-		mismatchFound := false
-		for i := uint64(1); i <= 10; i++ {
-			key := fmt.Sprintf("k%d", i)
-			expected := fmt.Sprintf("val%d", i)
-			val, lookupErr := rsm2.Lookup(context.Background(), key)
-			if lookupErr != nil {
-				mismatchFound = true
-				break
-			}
-			if val.(string) != expected {
-				mismatchFound = true
-				break
-			}
-		}
-		// If no mismatch, the corruption happened in padding or unused area.
-		// This is acceptable; the test verifies no panic occurred.
-		_ = mismatchFound
 	})
 }

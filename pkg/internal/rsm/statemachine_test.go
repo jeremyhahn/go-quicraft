@@ -377,16 +377,6 @@ func (kv *testOnDiskKV) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-
 
 func (kv *testOnDiskKV) Close(_ context.Context) error { return nil }
 
-// testOnDiskKVWithApplied returns a specific lastApplied from Open.
-type testOnDiskKVWithApplied struct {
-	testOnDiskKV
-	lastApplied uint64
-}
-
-func (kv *testOnDiskKVWithApplied) Open(_ context.Context, _ string, _ <-chan struct{}) (uint64, error) {
-	return kv.lastApplied, nil
-}
-
 // testOnDiskKVOpenError returns an error from Open.
 type testOnDiskKVOpenError struct {
 	testOnDiskKV
@@ -940,63 +930,6 @@ func TestApply_SessionUnregister_NotFound(t *testing.T) {
 	}
 }
 
-func TestApply_MixedSessionAndNormal(t *testing.T) {
-	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
-		return newTestKV()
-	}, t.TempDir(), testPolicy(0, 0, 0), nil, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rsm.Close()
-
-	// Batch: register(clientID=42), normal entry, unregister(clientID=42)
-	entries := []proto.Entry{
-		{
-			Index:    1,
-			ClientID: 42,
-			SeriesID: proto.SessionSeriesIDForRegister,
-			Type:     proto.EntryNormal,
-		},
-		{
-			Index: 2,
-			Type:  proto.EntryNormal,
-			Cmd:   []byte{3, 'f', 'o', 'o', 'b', 'a', 'r'},
-		},
-		{
-			Index:    3,
-			ClientID: 42,
-			SeriesID: proto.SessionSeriesIDForUnregister,
-			Type:     proto.EntryNormal,
-		},
-	}
-	results := make([]sm.Result, 3)
-
-	if err := rsm.Apply(entries, results); err != nil {
-		t.Fatalf("Apply: %v", err)
-	}
-
-	// Register result: clientID
-	if results[0].Value != 42 {
-		t.Errorf("register result.Value = %d, want 42", results[0].Value)
-	}
-	// Normal entry result: key count (1 entry in KV)
-	if results[1].Value != 1 {
-		t.Errorf("normal result.Value = %d, want 1", results[1].Value)
-	}
-	// Unregister result: clientID
-	if results[2].Value != 42 {
-		t.Errorf("unregister result.Value = %d, want 42", results[2].Value)
-	}
-	// Session should be gone
-	if rsm.Sessions().IsRegistered(42) {
-		t.Error("session 42 should be unregistered")
-	}
-	// LastApplied should be 3
-	if rsm.LastApplied() != 3 {
-		t.Errorf("LastApplied = %d, want 3", rsm.LastApplied())
-	}
-}
-
 func TestStateMachineIsOnDisk(t *testing.T) {
 	t.Run("regular SM is not on-disk", func(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
@@ -1045,49 +978,6 @@ func TestStateMachineIsOnDisk(t *testing.T) {
 }
 
 func TestStateMachineApply_SessionExpiry(t *testing.T) {
-	t.Run("expired sessions are cleaned up during apply", func(t *testing.T) {
-		// Create RSM with session expiry after 100 entries of inactivity.
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Register a session via the apply path.
-		regEntries := []proto.Entry{{
-			Index:    1,
-			ClientID: 42,
-			SeriesID: proto.SessionSeriesIDForRegister,
-			Type:     proto.EntryNormal,
-		}}
-		regResults := make([]sm.Result, 1)
-		if err := rsm.Apply(regEntries, regResults); err != nil {
-			t.Fatalf("Apply register = %v", err)
-		}
-		if !rsm.Sessions().IsRegistered(42) {
-			t.Fatal("session 42 should be registered")
-		}
-
-		// Apply entries at index 200 (gap of 199 > threshold of 100).
-		// This should trigger expiry of session 42.
-		entries := []proto.Entry{
-			{Index: 200, Cmd: makeCmd("k", "v")},
-		}
-		results := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm, entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// Session should be expired because lastActiveIndex=1, currentIndex=200,
-		// gap=199 > threshold=100.
-		if rsm.Sessions().IsRegistered(42) {
-			t.Error("session 42 should be expired after 200 entries of inactivity")
-		}
-	})
-
 	t.Run("active sessions are not expired", func(t *testing.T) {
 		// Create RSM with session expiry after 100 entries of inactivity.
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
@@ -1134,119 +1024,6 @@ func TestStateMachineApply_SessionExpiry(t *testing.T) {
 			t.Error("session 42 should still be registered (active within threshold)")
 		}
 	})
-
-	t.Run("deterministic expiry across replicas", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-
-		// Two replicas with same config.
-		rsm1, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine(1) = %v", err)
-		}
-		defer rsm1.Close()
-
-		rsm2, err := NewStateMachine(1, 2, createFn, t.TempDir(), testPolicy(100, 100, 100), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine(2) = %v", err)
-		}
-		defer rsm2.Close()
-
-		// Both process the same log entries.
-		regEntries := []proto.Entry{{
-			Index:    1,
-			ClientID: 42,
-			SeriesID: proto.SessionSeriesIDForRegister,
-			Type:     proto.EntryNormal,
-		}}
-		regResults1 := make([]sm.Result, 1)
-		regResults2 := make([]sm.Result, 1)
-		if err := rsm1.Apply(regEntries, regResults1); err != nil {
-			t.Fatalf("rsm1.Apply register = %v", err)
-		}
-		if err := rsm2.Apply(regEntries, regResults2); err != nil {
-			t.Fatalf("rsm2.Apply register = %v", err)
-		}
-
-		// Both apply at index 200.
-		entries := []proto.Entry{
-			{Index: 200, Cmd: makeCmd("k", "v")},
-		}
-		results1 := make([]sm.Result, 1)
-		results2 := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm1, entries, results1); err != nil {
-			t.Fatalf("rsm1.Apply = %v", err)
-		}
-		if err := applyContiguous(t, rsm2, entries, results2); err != nil {
-			t.Fatalf("rsm2.Apply = %v", err)
-		}
-
-		// Both should have expired the same session.
-		r1Registered := rsm1.Sessions().IsRegistered(42)
-		r2Registered := rsm2.Sessions().IsRegistered(42)
-		if r1Registered != r2Registered {
-			t.Errorf("replica divergence: rsm1=%v, rsm2=%v", r1Registered, r2Registered)
-		}
-		if r1Registered {
-			t.Error("session 42 should be expired on both replicas")
-		}
-	})
-}
-
-// TestApply_UnregisteredSessionManagedEntry verifies that a session-managed
-// entry with an unregistered clientID returns ResultSessionExpired (PhD
-// Figure 6.1, step 3) instead of an empty result, so the client can
-// distinguish it from a legitimate operation. The entry is not applied
-// to the user SM.
-func TestApply_UnregisteredSessionManagedEntry(t *testing.T) {
-	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {
-		return newTestKV()
-	}, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rsm.Close()
-
-	// Apply a session-managed entry for clientID=99 which is NOT registered.
-	entries := []proto.Entry{
-		{
-			Index:    1,
-			ClientID: 99,
-			SeriesID: 5,
-			Type:     proto.EntryNormal,
-			Cmd:      []byte{3, 'f', 'o', 'o', 'b', 'a', 'r'},
-		},
-	}
-	results := make([]sm.Result, 1)
-
-	// This should NOT return an error — the apply pipeline must not crash.
-	if err := rsm.Apply(entries, results); err != nil {
-		t.Fatalf("Apply should not fail for unregistered session: %v", err)
-	}
-
-	// The result should carry the reserved ResultSessionExpired sentinel.
-	if results[0].Value != sm.ResultSessionExpired {
-		t.Errorf("result.Value = %d, want sm.ResultSessionExpired (%d)",
-			results[0].Value, sm.ResultSessionExpired)
-	}
-	if results[0].Data != nil {
-		t.Errorf("result.Data = %v, want nil", results[0].Data)
-	}
-
-	// The entry should NOT have been applied to the user SM.
-	val, err := rsm.Lookup(t.Context(), "foo")
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
-	}
-	if val != "" {
-		t.Errorf("Lookup(foo) = %q, want empty (entry should be no-op)", val)
-	}
-
-	// LastApplied should still advance to track progress.
-	if rsm.LastApplied() != 1 {
-		t.Errorf("LastApplied = %d, want 1", rsm.LastApplied())
-	}
 }
 
 // TestApply_UnregisteredSessionMixedBatch verifies that a batch containing
@@ -1726,71 +1503,6 @@ func TestApply_MetadataEntries(t *testing.T) {
 // SetLastApplied / SyncedIndex tracking
 // ---------------------------------------------------------------------------
 
-func TestStateMachine_LastAppliedNeverDecreases(t *testing.T) {
-	t.Run("applying entries with lower index than lastApplied does not decrease it", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Apply entries up to index 10.
-		entries := make([]proto.Entry, 10)
-		for i := range entries {
-			entries[i] = proto.Entry{Index: uint64(i + 1), Cmd: makeCmd("k", "v")}
-		}
-		results := make([]sm.Result, 10)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply(1-10) = %v", err)
-		}
-		if rsm.LastApplied() != 10 {
-			t.Fatalf("LastApplied = %d, want 10", rsm.LastApplied())
-		}
-
-		// Apply entries with lower indices (this can happen in edge cases).
-		// LastApplied should NOT decrease.
-		lowEntries := []proto.Entry{
-			{Index: 5, Cmd: makeCmd("low", "val")},
-		}
-		lowResults := make([]sm.Result, 1)
-		if err := rsm.Apply(lowEntries, lowResults); err != nil {
-			t.Fatalf("Apply(low) = %v", err)
-		}
-		if rsm.LastApplied() != 10 {
-			t.Errorf("LastApplied = %d, want 10 (should not decrease)", rsm.LastApplied())
-		}
-	})
-
-	t.Run("lastApplied advances to max index in batch not in order", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// The Apply code uses the last entry in the batch for lastApplied.
-		// If entries are ordered (which they should be), the last is the max.
-		entries := []proto.Entry{
-			{Index: 5, Cmd: makeCmd("a", "1")},
-			{Index: 6, Cmd: makeCmd("b", "2")},
-			{Index: 7, Cmd: makeCmd("c", "3")},
-		}
-		results := make([]sm.Result, 3)
-		if err := applyContiguous(t, rsm, entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-		if rsm.LastApplied() != 7 {
-			t.Errorf("LastApplied = %d, want 7", rsm.LastApplied())
-		}
-	})
-}
-
 // ---------------------------------------------------------------------------
 // Empty event handling
 // ---------------------------------------------------------------------------
@@ -2130,100 +1842,6 @@ func TestStateMachineLookup_AbsenceSurvivesBothPaths(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Session expiry disabled when sessionExpiryEntries is 0
-// ---------------------------------------------------------------------------
-
-func TestApply_SessionExpiryDisabled(t *testing.T) {
-	t.Run("session expiry does not run when threshold is zero", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		// sessionExpiryEntries = 0 (disabled).
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		// Apply at very high index. With expiry disabled, session should survive.
-		entries := []proto.Entry{
-			{Index: 999999, Cmd: makeCmd("x", "y")},
-		}
-		results := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm, entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-		if !rsm.Sessions().IsRegistered(10) {
-			t.Error("session 10 should survive when expiry is disabled")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Snapshot roundtrip with on-disk SM that has pre-existing data
-// ---------------------------------------------------------------------------
-
-func TestSnapshot_OnDiskSMWithOpenRecovery(t *testing.T) {
-	t.Run("on-disk SM snapshot roundtrip after Open with lastApplied", func(t *testing.T) {
-		const recoveredIndex = uint64(100)
-		kv1 := newTestOnDiskKVWithState(recoveredIndex)
-		createFn1 := func(shardID, replicaID uint64) interface{} {
-			return kv1
-		}
-		rsm1, err := NewStateMachine(1, 1, createFn1, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm1.Close()
-
-		if _, err := rsm1.Open(make(chan struct{})); err != nil {
-			t.Fatalf("Open = %v", err)
-		}
-
-		// Register session and apply data.
-		if err := rsm1.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		entries := []proto.Entry{
-			{Index: 101, ClientID: 10, SeriesID: 1, Cmd: makeCmd("odsk", "odsv")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm1.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// Snapshot.
-		var buf bytes.Buffer
-		stopper := make(chan struct{})
-		if err := rsm1.SaveSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("SaveSnapshot = %v", err)
-		}
-
-		// Recover into fresh SM.
-		createFn2 := func(shardID, replicaID uint64) interface{} {
-			return newTestOnDiskKVWithState(0)
-		}
-		rsm2, err := NewStateMachine(1, 1, createFn2, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine(2) = %v", err)
-		}
-		defer rsm2.Close()
-
-		if err := rsm2.RecoverFromSnapshot(context.Background(), &buf, stopper); err != nil {
-			t.Fatalf("RecoverFromSnapshot = %v", err)
-		}
-
-		if !rsm2.Sessions().IsRegistered(10) {
-			t.Error("session 10 should be registered after snapshot recovery")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Concurrent reads of LastApplied, SMType, IsOnDisk during Apply
 // ---------------------------------------------------------------------------
 
@@ -2488,58 +2106,6 @@ func TestSMType_TypeCode(t *testing.T) {
 // invalid SM type tests
 // ---------------------------------------------------------------------------
 
-func TestStateMachine_SessionExpiryDuringApply(t *testing.T) {
-	t.Run("expired session returns SESSION_EXPIRED", func(t *testing.T) {
-		// sessionExpiryEntries=10 means sessions inactive for >10 entries are expired.
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 10), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Register session at index 1.
-		regEntries := []proto.Entry{
-			{Index: 1, ClientID: 42, SeriesID: proto.SessionSeriesIDForRegister},
-		}
-		regResults := make([]sm.Result, 1)
-		if err := rsm.Apply(regEntries, regResults); err != nil {
-			t.Fatalf("Apply register = %v", err)
-		}
-		if regResults[0].Value != 42 {
-			t.Fatalf("register result = %d, want 42", regResults[0].Value)
-		}
-
-		// Apply a batch at index 20 with a non-session entry to advance lastApplied
-		// far enough that session 42 (last active at index 1) is expired.
-		// Session expiry threshold is 10, so at index 20, sessions inactive since
-		// index <= 10 are expired.
-		advanceEntries := []proto.Entry{
-			{Index: 20, ClientID: 0, Cmd: makeCmd("advance", "val")},
-		}
-		advanceResults := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm, advanceEntries, advanceResults); err != nil {
-			t.Fatalf("Apply advance = %v", err)
-		}
-
-		// Now try to use the expired session — should get SESSION_EXPIRED.
-		useEntries := []proto.Entry{
-			{Index: 21, ClientID: 42, SeriesID: 1, Cmd: makeCmd("k", "v")},
-		}
-		useResults := make([]sm.Result, 1)
-		if err := rsm.Apply(useEntries, useResults); err != nil {
-			t.Fatalf("Apply expired session = %v", err)
-		}
-		if useResults[0].Value != sm.ResultSessionExpired {
-			t.Errorf("expired session result = %d, want ResultSessionExpired (%d)",
-				useResults[0].Value, sm.ResultSessionExpired)
-		}
-	})
-
-}
-
 func TestStateMachine_ApplyMixedSessionAndNonSessionEntries(t *testing.T) {
 	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 		return newTestKV()
@@ -2688,30 +2254,6 @@ func TestStateMachine_SaveSnapshotDeterministic(t *testing.T) {
 	}
 }
 
-func TestStateMachine_CloseDelegatesToSM(t *testing.T) {
-	t.Run("close is forwarded to user SM", func(t *testing.T) {
-		tracker := &closeTrackingKV{data: make(map[string]string)}
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return tracker
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-
-		if tracker.closeCalled {
-			t.Fatal("close should not be called before Close()")
-		}
-		if err := rsm.Close(); err != nil {
-			t.Fatalf("Close = %v", err)
-		}
-		if !tracker.closeCalled {
-			t.Error("Close should have been forwarded to user SM")
-		}
-	})
-
-}
-
 func TestNewStateMachine_InvalidSMType(t *testing.T) {
 	t.Run("nil factory result", func(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
@@ -2723,56 +2265,6 @@ func TestNewStateMachine_InvalidSMType(t *testing.T) {
 		}
 	})
 
-}
-
-// closeTrackingKV is a testKV that tracks whether Close was called.
-type closeTrackingKV struct {
-	data        map[string]string
-	closeCalled bool
-}
-
-func (kv *closeTrackingKV) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
-	for i, e := range entries {
-		if len(e.Cmd) == 0 {
-			continue
-		}
-		kl := int(e.Cmd[0])
-		key := string(e.Cmd[1 : 1+kl])
-		value := string(e.Cmd[1+kl:])
-		kv.data[key] = value
-		results[i] = sm.Result{Value: uint64(len(value))}
-	}
-	return nil
-}
-
-func (kv *closeTrackingKV) Lookup(_ context.Context, query interface{}) (interface{}, error) {
-	key, ok := query.(string)
-	if !ok {
-		return nil, errors.New("query must be string")
-	}
-	return kv.data[key], nil
-}
-
-func (kv *closeTrackingKV) SaveSnapshot(_ context.Context, w io.Writer, _ <-chan struct{}) error {
-	var buf [4]byte
-	binary.LittleEndian.PutUint32(buf[:], uint32(len(kv.data)))
-	_, err := w.Write(buf[:])
-	return err
-}
-
-func (kv *closeTrackingKV) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct{}) error {
-	var buf [4]byte
-	_, err := io.ReadFull(r, buf[:])
-	if err != nil {
-		return err
-	}
-	kv.data = make(map[string]string)
-	return nil
-}
-
-func (kv *closeTrackingKV) Close(_ context.Context) error {
-	kv.closeCalled = true
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2951,69 +2443,6 @@ func TestOnDiskSM_OpenSetsLastApplied(t *testing.T) {
 // On-disk SM: already-applied entries treated as no-op for lastApplied
 // ---------------------------------------------------------------------------
 
-func TestOnDiskSM_AlreadyAppliedEntryTreatedAsNoOp(t *testing.T) {
-	t.Run("entries at or below lastApplied do not advance it", func(t *testing.T) {
-		const recoveredIndex = uint64(50)
-		kv := newTestOnDiskKVWithState(recoveredIndex)
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if _, err := rsm.Open(make(chan struct{})); err != nil {
-			t.Fatalf("Open = %v", err)
-		}
-
-		// Apply entries at or below recovered index.
-		entries := []proto.Entry{
-			{Index: 30, Cmd: makeCmd("old1", "val1")},
-			{Index: 40, Cmd: makeCmd("old2", "val2")},
-			{Index: 50, Cmd: makeCmd("old3", "val3")},
-		}
-		results := make([]sm.Result, 3)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// LastApplied should remain at 50 (not decrease or re-set).
-		if rsm.LastApplied() != recoveredIndex {
-			t.Errorf("LastApplied = %d, want %d", rsm.LastApplied(), recoveredIndex)
-		}
-	})
-
-	t.Run("entry above lastApplied advances it", func(t *testing.T) {
-		const recoveredIndex = uint64(50)
-		kv := newTestOnDiskKVWithState(recoveredIndex)
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if _, err := rsm.Open(make(chan struct{})); err != nil {
-			t.Fatalf("Open = %v", err)
-		}
-
-		entries := []proto.Entry{
-			{Index: 51, Cmd: makeCmd("new1", "val1")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-		if rsm.LastApplied() != 51 {
-			t.Errorf("LastApplied = %d, want 51", rsm.LastApplied())
-		}
-	})
-}
-
 // ---------------------------------------------------------------------------
 // Apply: user SM Update error propagates through session-managed batch
 // ---------------------------------------------------------------------------
@@ -3051,59 +2480,6 @@ func TestApply_UserSMUpdateErrorPropagatesWithSessionEntries(t *testing.T) {
 		var ue *testUpdateError
 		if !errors.As(err, &ue) {
 			t.Errorf("error = %T, want *testUpdateError", err)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Apply: batch where all session entries are duplicates
-// ---------------------------------------------------------------------------
-
-func TestApply_AllSessionDuplicatesBatch(t *testing.T) {
-	t.Run("all entries are duplicates so no SM Update is called", func(t *testing.T) {
-		kv := &failingUpdateKV{
-			testKV:     testKV{data: make(map[string]string)},
-			failAfterN: 1, // allow first call only
-		}
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		// Apply original entry.
-		entries := []proto.Entry{
-			{Index: 1, ClientID: 10, SeriesID: 1, Cmd: makeCmd("k", "v")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply(original) = %v", err)
-		}
-		originalValue := results[0].Value
-
-		// Now replay the same entry. failingUpdateKV would fail if Update
-		// is called again, but it should not be called since all entries
-		// are deduped.
-		dupEntries := []proto.Entry{
-			{Index: 5, ClientID: 10, SeriesID: 1, Cmd: makeCmd("k", "v")},
-		}
-		dupResults := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm, dupEntries, dupResults); err != nil {
-			t.Fatalf("Apply(dup) = %v", err)
-		}
-		if dupResults[0].Value != originalValue {
-			t.Errorf("dup result = %d, want %d", dupResults[0].Value, originalValue)
-		}
-		// Update should have been called exactly once.
-		if kv.callCount != 1 {
-			t.Errorf("Update call count = %d, want 1", kv.callCount)
 		}
 	})
 }

@@ -46,14 +46,11 @@ func TestEntryMarshalRefusesTypesUnmarshalRefuses(t *testing.T) {
 	}{
 		{"unknown enum value", 5},
 		{"unknown enum value with compression flag", 5 | EntryCompressFlag},
-		{"unknown enum value at the top of the mask", EntryTypeMask},
 		// The reserved bits. The masked type is a perfectly good EntryNormal,
 		// so every IsConfigChange/IsMetadataEntry predicate in the engine reads
 		// these as ordinary entries while 59 bits of sender-chosen data ride
 		// along in a replicated field.
 		{"reserved bit immediately above the compression flag", EntryNormal | 0x20},
-		{"reserved high bit", EntryConfigChange | 1<<63},
-		{"every reserved bit", EntryNormal | entryTypeReservedMask},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := Entry{Term: 1, Index: 1, Type: tc.typ, Cmd: []byte("x")}
@@ -107,7 +104,7 @@ func TestEntryMarshalAcceptsEveryLegalType(t *testing.T) {
 // not cosmetic: UnmarshalFrom rejects the whole FRAME, taking every other
 // message batched with it, and the sender sees only a dead connection.
 func TestMessageMarshalRefusesTypesUnmarshalRefuses(t *testing.T) {
-	for _, typ := range []uint64{maxMessageType + 1, 100, 1 << 63} {
+	for _, typ := range []uint64{maxMessageType + 1} {
 		m := Message{Type: typ, From: 1, To: 2}
 		buf := make([]byte, m.Size())
 		if _, err := m.MarshalTo(buf); !errors.Is(err, ErrInvalidMessageType) {

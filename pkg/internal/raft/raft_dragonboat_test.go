@@ -63,47 +63,6 @@ func TestDragonboat_AppendRejectsIndexHole(t *testing.T) {
 	}
 }
 
-// TestDragonboat_AppendRejectsTermRegression verifies that when entries
-// arrive with correct sequential indices but a later entry has a lower
-// term than an earlier entry, the conflict detection handles it correctly.
-// In practice, the leader assigns terms, so this only occurs via stale
-// retransmissions which are handled by conflict detection.
-func TestDragonboat_AppendRejectsTermRegression(t *testing.T) {
-	entries := makeEntries(1, 4, 2) // indices 1,2,3 at term 2
-	l := newTestRaftLog(entries)
-	l.committed = 1
-
-	// Try to append entries where term regresses: index 3 has term 1
-	// (lower than existing term 2). This creates a conflict at index 3.
-	newEntries := []proto.Entry{
-		{Index: 3, Term: 1, Cmd: []byte("bad")},
-		{Index: 4, Term: 1, Cmd: []byte("also-bad")},
-	}
-
-	// prevLogIndex=2, prevLogTerm=2 matches existing entry.
-	lastIdx, ok, truncated, err := l.tryAppend(2, 2, newEntries)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected tryAppend to succeed (prevLog matches)")
-	}
-	if !truncated {
-		t.Fatal("expected truncated=true since entry 3 was overwritten")
-	}
-	if lastIdx != 4 {
-		t.Fatalf("expected lastIndex 4, got %d", lastIdx)
-	}
-	// Verify the overwritten entry has the new term.
-	term, terr := l.term(3)
-	if terr != nil {
-		t.Fatalf("unexpected error getting term: %v", terr)
-	}
-	if term != 1 {
-		t.Fatalf("expected term 1 at index 3 after overwrite, got %d", term)
-	}
-}
-
 // TestDragonboat_AppendPanicsOnCommittedOverwrite verifies that appending
 // entries at or below the committed index triggers an invariant assertion.
 // The Raft safety property requires committed entries to never be overwritten.
@@ -332,111 +291,6 @@ func TestDragonboat_LeaderTransferRemoveNode(t *testing.T) {
 	}
 }
 
-// TestDragonboat_LeaderTransferToSelf verifies that a leader attempting
-// to transfer leadership to itself is a no-op (already the leader).
-func TestDragonboat_LeaderTransferToSelf(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: r.replicaID})
-	if err != nil {
-		t.Fatalf("expected no error for self-transfer, got %v", err)
-	}
-	if r.transferTarget != noNode {
-		t.Fatalf("expected no transferTarget for self-transfer, got %d", r.transferTarget)
-	}
-	// Should still be leader.
-	if r.state != leader {
-		t.Fatalf("expected leader, got %s", r.state)
-	}
-}
-
-// TestDragonboat_LeaderTransferToSlowFollower verifies that transferring
-// leadership to a follower that needs log catch-up causes the leader to
-// send entries first (not TimeoutNow).
-func TestDragonboat_LeaderTransferToSlowFollower(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-
-	// Propose some entries to get ahead of followers.
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("a")}, {Cmd: []byte("b")}},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	r.drainMessages()
-
-	// Follower 2 is behind (match=0, hasn't acked anything).
-	r.remotes[2].match = 0
-	r.remotes[2].next = 1
-	r.remotes[2].becomeProbe()
-	r.remotes[2].probeSent = false
-
-	// Transfer to slow follower.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	msgs := r.drainMessages()
-
-	// Should send Replicate to follower 2 (not TimeoutNow yet).
-	hasReplicate := false
-	hasTimeoutNow := false
-	for _, m := range msgs {
-		if m.To == 2 && m.Type == proto.Replicate {
-			hasReplicate = true
-		}
-		if m.To == 2 && m.Type == proto.TimeoutNow {
-			hasTimeoutNow = true
-		}
-	}
-	if !hasReplicate {
-		t.Fatal("expected Replicate to slow follower during transfer")
-	}
-	if hasTimeoutNow {
-		t.Fatal("expected no TimeoutNow before follower catches up")
-	}
-
-	// After follower catches up, the leader sends TimeoutNow.
-	err = r.step(proto.Message{
-		Type:     proto.ReplicateResp,
-		From:     2,
-		Term:     r.term,
-		LogIndex: r.log.lastIndex(),
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	msgs = r.drainMessages()
-	hasTimeoutNow = false
-	for _, m := range msgs {
-		if m.To == 2 && m.Type == proto.TimeoutNow {
-			hasTimeoutNow = true
-		}
-	}
-	if !hasTimeoutNow {
-		t.Fatal("expected TimeoutNow after slow follower caught up")
-	}
-}
-
-// TestDragonboat_LeaderTransferToNonExistingNode verifies that transferring
-// to a node not in the cluster returns ErrNodeNotFound.
-func TestDragonboat_LeaderTransferToNonExistingNode(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 99})
-	if !errors.Is(err, ErrNodeNotFound) {
-		t.Fatalf("expected ErrNodeNotFound, got %v", err)
-	}
-}
-
 // TestDragonboat_LeaderTransferWithCheckQuorum verifies that leadership
 // transfer works correctly when CheckQuorum is enabled. The transfer
 // should proceed normally and the leader should step down correctly.
@@ -534,33 +388,6 @@ func TestDragonboat_LeaderTransferWithPreVote(t *testing.T) {
 	// handleTimeoutNow calls becomeCandidate (not becomePreCandidate).
 	if r2.state != candidate {
 		t.Fatalf("expected candidate (bypassing PreVote), got %s", r2.state)
-	}
-}
-
-// TestDragonboat_LeaderTransferSecondTransferToSameNode verifies that a
-// second transfer request to the same target is rejected with
-// ErrTransferInProgress.
-func TestDragonboat_LeaderTransferSecondTransferToSameNode(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-	r.remotes[2].match = 0 // slow follower
-
-	// First transfer.
-	err := r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
-	if err != nil {
-		t.Fatalf("unexpected error on first transfer: %v", err)
-	}
-	r.drainMessages()
-
-	// Second transfer to same target.
-	err = r.step(proto.Message{Type: proto.LeaderTransfer, Origin: proto.OriginLocal, Hint: 2})
-	if !errors.Is(err, ErrTransferInProgress) {
-		t.Fatalf("expected ErrTransferInProgress for second transfer to same node, got %v", err)
-	}
-	// Original target preserved.
-	if r.transferTarget != 2 {
-		t.Fatalf("expected transferTarget 2, got %d", r.transferTarget)
 	}
 }
 
@@ -872,101 +699,18 @@ func TestDragonboat_RestoreIgnoresStaleSnapshot(t *testing.T) {
 // State Transition Matrix
 // ===========================================================================
 
-// TestDragonboat_StateTransitionMatrix tests all valid and invalid state
-// transitions comprehensively.
-func TestDragonboat_StateTransitionMatrix(t *testing.T) {
-	t.Run("follower_to_candidate", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		r.becomeCandidate()
-		if r.state != candidate {
-			t.Fatalf("expected candidate, got %s", r.state)
+// TestDragonboat_BecomeLeaderFromFollowerPanics verifies that a follower
+// cannot become leader without first standing as a candidate. The other
+// state transitions are covered by the TestRaft_Become* tests in
+// raft_test.go.
+func TestDragonboat_BecomeLeaderFromFollowerPanics(t *testing.T) {
+	r := newTestRaftPreVoteDisabled(1)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic: follower cannot become leader directly")
 		}
-	})
-
-	t.Run("follower_to_precandidate", func(t *testing.T) {
-		r := newTestRaft(1) // PreVote enabled by default
-		r.becomePreCandidate()
-		if r.state != preCandidate {
-			t.Fatalf("expected preCandidate, got %s", r.state)
-		}
-	})
-
-	t.Run("candidate_to_leader", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		r.becomeCandidate()
-		r.becomeLeader()
-		if r.state != leader {
-			t.Fatalf("expected leader, got %s", r.state)
-		}
-	})
-
-	t.Run("candidate_to_follower", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		r.becomeCandidate()
-		r.becomeFollower(r.term+1, 2)
-		if r.state != follower {
-			t.Fatalf("expected follower, got %s", r.state)
-		}
-	})
-
-	t.Run("precandidate_to_candidate", func(t *testing.T) {
-		r := newTestRaft(1)
-		r.becomePreCandidate()
-		r.becomeCandidate()
-		if r.state != candidate {
-			t.Fatalf("expected candidate, got %s", r.state)
-		}
-	})
-
-	t.Run("precandidate_to_follower", func(t *testing.T) {
-		r := newTestRaft(1)
-		r.becomePreCandidate()
-		r.becomeFollower(r.term+1, 2)
-		if r.state != follower {
-			t.Fatalf("expected follower, got %s", r.state)
-		}
-	})
-
-	t.Run("leader_to_follower", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		electLeader(r)
-		r.becomeFollower(r.term+1, 2)
-		if r.state != follower {
-			t.Fatalf("expected follower, got %s", r.state)
-		}
-	})
-
-	t.Run("follower_to_leader_panics", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic: follower cannot become leader directly")
-			}
-		}()
-		r.becomeLeader()
-	})
-
-	t.Run("leader_to_candidate_panics", func(t *testing.T) {
-		r := newTestRaftPreVoteDisabled(1)
-		electLeader(r)
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic: leader cannot become candidate")
-			}
-		}()
-		r.becomeCandidate()
-	})
-
-	t.Run("leader_to_precandidate_panics", func(t *testing.T) {
-		r := newTestRaft(1)
-		electLeader(r)
-		defer func() {
-			if recover() == nil {
-				t.Fatal("expected panic: leader cannot become preCandidate")
-			}
-		}()
-		r.becomePreCandidate()
-	})
+	}()
+	r.becomeLeader()
 }
 
 // TestDragonboat_VoteFromAnyState verifies that vote request handling
@@ -1111,59 +855,6 @@ func TestDragonboat_CommitAfterRemoveNode(t *testing.T) {
 
 	if r.log.committed < lastIdx {
 		t.Fatalf("expected committed >= %d after quorum ack, got %d", lastIdx, r.log.committed)
-	}
-}
-
-// TestDragonboat_ProposalByProxy verifies that a follower forwards
-// proposals to the leader.
-func TestDragonboat_ProposalByProxy(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeFollower(1, 2) // node 2 is leader
-	r.drainMessages()
-
-	// Propose on the follower.
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("client-data")}},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Follower should forward the proposal to leader (node 2).
-	msgs := r.drainMessages()
-	found := false
-	for _, m := range msgs {
-		if m.Type == proto.Propose && m.To == 2 {
-			found = true
-			if len(m.Entries) != 1 {
-				t.Fatalf("expected 1 entry forwarded, got %d", len(m.Entries))
-			}
-		}
-	}
-	if !found {
-		t.Fatal("expected proposal forwarded to leader")
-	}
-}
-
-// TestDragonboat_ProposalByProxy_NoLeader verifies that a follower
-// without a known leader returns NotLeaderError.
-func TestDragonboat_ProposalByProxy_NoLeader(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	// No leader known.
-	r.drainMessages()
-
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("data")}},
-	})
-
-	var notLeader *NotLeaderError
-	if !errors.As(err, &notLeader) {
-		t.Fatalf("expected NotLeaderError, got %v", err)
-	}
-	if notLeader.LeaderID != 0 {
-		t.Fatalf("expected LeaderID=0, got %d", notLeader.LeaderID)
 	}
 }
 

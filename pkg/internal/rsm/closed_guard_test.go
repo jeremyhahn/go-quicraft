@@ -24,57 +24,39 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-func newClosedGuardSM(t *testing.T) *StateMachine {
-	t.Helper()
-	createFn := func(_, _ uint64) interface{} { return newTestKV() }
-	machine, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-	if err != nil {
-		t.Fatalf("NewStateMachine failed: %v", err)
+// TestStateMachine_ClosedGuard verifies the defence-in-depth guard on the
+// basic tier: Apply, SaveSnapshot and RecoverFromSnapshot on a closed state
+// machine return ErrClosed without running user code.
+func TestStateMachine_ClosedGuard(t *testing.T) {
+	cases := []struct {
+		name string
+		call func(*StateMachine) error
+	}{
+		{"Apply", func(m *StateMachine) error {
+			entries := []proto.Entry{{Index: 1, Term: 1, Cmd: []byte{1, 'k', 'v'}}}
+			return m.Apply(entries, make([]sm.Result, 1))
+		}},
+		{"SaveSnapshot", func(m *StateMachine) error {
+			var buf bytes.Buffer
+			return m.SaveSnapshot(context.Background(), &buf, make(chan struct{}))
+		}},
+		{"RecoverFromSnapshot", func(m *StateMachine) error {
+			return m.RecoverFromSnapshot(context.Background(), bytes.NewReader(nil), make(chan struct{}))
+		}},
 	}
-	return machine
-}
-
-// TestStateMachine_Apply_Closed verifies the defence-in-depth guard:
-// Apply on a closed state machine must return ErrClosed without running
-// user code.
-func TestStateMachine_Apply_Closed(t *testing.T) {
-	machine := newClosedGuardSM(t)
-	if err := machine.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	entries := []proto.Entry{{Index: 1, Term: 1, Cmd: []byte{1, 'k', 'v'}}}
-	results := make([]sm.Result, 1)
-	if err := machine.Apply(entries, results); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Apply on closed SM returned %v, want ErrClosed", err)
-	}
-}
-
-// TestStateMachine_SaveSnapshot_Closed verifies SaveSnapshot on a closed
-// state machine returns ErrClosed.
-func TestStateMachine_SaveSnapshot_Closed(t *testing.T) {
-	machine := newClosedGuardSM(t)
-	if err := machine.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	var buf bytes.Buffer
-	stopper := make(chan struct{})
-	if err := machine.SaveSnapshot(context.Background(), &buf, stopper); !errors.Is(err, ErrClosed) {
-		t.Fatalf("SaveSnapshot on closed SM returned %v, want ErrClosed", err)
-	}
-}
-
-// TestStateMachine_RecoverFromSnapshot_Closed verifies RecoverFromSnapshot
-// on a closed state machine returns ErrClosed.
-func TestStateMachine_RecoverFromSnapshot_Closed(t *testing.T) {
-	machine := newClosedGuardSM(t)
-	if err := machine.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-
-	stopper := make(chan struct{})
-	if err := machine.RecoverFromSnapshot(context.Background(), bytes.NewReader(nil), stopper); !errors.Is(err, ErrClosed) {
-		t.Fatalf("RecoverFromSnapshot on closed SM returned %v, want ErrClosed", err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			createFn := func(_, _ uint64) interface{} { return newTestKV() }
+			machine, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+			if err != nil {
+				t.Fatalf("NewStateMachine failed: %v", err)
+			}
+			if err := machine.Close(); err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+			if err := c.call(machine); !errors.Is(err, ErrClosed) {
+				t.Fatalf("%s on closed SM returned %v, want ErrClosed", c.name, err)
+			}
+		})
 	}
 }
