@@ -35,33 +35,6 @@ var allShardHealthValues = []ShardHealth{
 	ShardSnapshotting,
 }
 
-// TestShardHealth_JSONRoundTrip pins that MarshalJSON and UnmarshalJSON agree
-// for EVERY value the type defines, and that the name tables are complete in
-// both directions.
-func TestShardHealth_JSONRoundTrip(t *testing.T) {
-	if len(shardHealthNames) != len(allShardHealthValues) ||
-		len(shardHealthValues) != len(allShardHealthValues) {
-		t.Fatalf("name tables hold %d/%d entries, want %d: a value was added without its JSON mapping",
-			len(shardHealthNames), len(shardHealthValues), len(allShardHealthValues))
-	}
-	for _, want := range allShardHealthValues {
-		data, err := json.Marshal(want)
-		if err != nil {
-			t.Fatalf("MarshalJSON(%d): %v", want, err)
-		}
-		if string(data) == `""` {
-			t.Fatalf("MarshalJSON(%d) produced an empty name; the value has no shardHealthNames entry", want)
-		}
-		var got ShardHealth
-		if err := json.Unmarshal(data, &got); err != nil {
-			t.Fatalf("UnmarshalJSON(%s): %v", data, err)
-		}
-		if got != want {
-			t.Errorf("round trip of %d through %s = %d, want %d", want, data, got, want)
-		}
-	}
-}
-
 // TestShardHealth_UnmarshalJSONFailsClosed pins the direction an unrecognized
 // health value must fail in.
 //
@@ -140,6 +113,7 @@ func TestShardHealth_String(t *testing.T) {
 		{ShardError, "error"},
 		{ShardRecovering, "recovering"},
 		{ShardSnapshotting, "snapshotting"},
+		{ShardHealth(255), ""}, // an unknown value has no name
 	}
 
 	for _, tc := range tests {
@@ -150,40 +124,9 @@ func TestShardHealth_String(t *testing.T) {
 	}
 }
 
-func TestShardHealth_String_Unknown(t *testing.T) {
-	unknown := ShardHealth(255)
-	got := unknown.String()
-	// Unknown values return empty string from the map.
-	if got != "" {
-		t.Errorf("ShardHealth(255).String() = %q, want empty string", got)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // ShardInfo ConfigChangeIndex
 // ---------------------------------------------------------------------------
-
-func TestShardInfo_ConfigChangeIndex_JSONRoundTrip(t *testing.T) {
-	info := ShardInfo{
-		ShardID:           1,
-		ReplicaID:         2,
-		ConfigChangeIndex: 777,
-	}
-
-	data, err := json.Marshal(info)
-	if err != nil {
-		t.Fatalf("Marshal error: %v", err)
-	}
-
-	var got ShardInfo
-	if err := json.Unmarshal(data, &got); err != nil {
-		t.Fatalf("Unmarshal error: %v", err)
-	}
-
-	if got.ConfigChangeIndex != 777 {
-		t.Errorf("ConfigChangeIndex round-trip = %d, want 777", got.ConfigChangeIndex)
-	}
-}
 
 func TestShardInfo_ConfigChangeIndex_JSONKey(t *testing.T) {
 	info := ShardInfo{
@@ -248,6 +191,12 @@ func TestShardHealth_MarshalJSON(t *testing.T) {
 		{ShardError, `"error"`},
 		{ShardRecovering, `"recovering"`},
 		{ShardSnapshotting, `"snapshotting"`},
+	}
+	if len(tests) != len(allShardHealthValues) ||
+		len(shardHealthNames) != len(allShardHealthValues) ||
+		len(shardHealthValues) != len(allShardHealthValues) {
+		t.Fatalf("pin table/name tables hold %d/%d/%d entries, want %d: a value was added without its JSON mapping",
+			len(tests), len(shardHealthNames), len(shardHealthValues), len(allShardHealthValues))
 	}
 
 	for _, tc := range tests {

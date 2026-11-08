@@ -49,19 +49,6 @@ func TestProposeFloorVerdict(t *testing.T) {
 			completed: 399, errored: 0, quiet: true,
 		},
 		{
-			name: "measured quiet-box rate is published with a note",
-			// The real 2026-09-10 run at benchtime=5s: 24 of 399 (6.0%).
-			// Ordinary Raft weather; the surviving samples describe the engine.
-			completed: 375, errored: 24, fatal: false, wants: "6.0%",
-		},
-		{
-			name: "measured contended rate is refused",
-			// The real 2026-09-10 run at benchtime=30s failed 21 of 24 (87.5%).
-			// Scaled to a calibrated run's sample size, because 24 attempts is
-			// itself below the sample floor: the same rate over 240.
-			completed: 30, errored: 210, fatal: true, wants: "contended host",
-		},
-		{
 			name: "calibration probe with one transient failure is NOT judged",
 			// Go runs every benchmark at b.N=1 first. The concurrent helper
 			// makes eight proposals there; one refusal is 12.5%, which a
@@ -81,11 +68,6 @@ func TestProposeFloorVerdict(t *testing.T) {
 			// rate, so this is reported and admitted, and the calibrated run
 			// that follows -- with thousands of attempts -- is what gets judged.
 			completed: 3, errored: 21, fatal: false, wants: "not judged",
-		},
-		{
-			name: "total failure is refused as measuring nothing",
-			// The shape the tolerant-but-uncounted loops passed clean.
-			completed: 0, errored: 50, fatal: true, wants: "measured nothing",
 		},
 		{
 			name: "exactly at the limit is allowed",

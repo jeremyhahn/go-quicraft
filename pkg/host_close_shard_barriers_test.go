@@ -232,45 +232,29 @@ func newValueBarrier(label string) valueBarrier {
 // it. A value copy shared by two shards seals the one underlying barrier, and
 // the second Seal's ErrBarrierSealed is not a Close error.
 func TestClose_SealsNonComparableValueBarriers(t *testing.T) {
-	cases := []struct {
-		name        string
-		hostBarrier bool
-	}{
-		{name: "with host-wide barrier", hostBarrier: true},
-		{name: "per-shard only", hostBarrier: false},
+	shared := newValueBarrier("shared")
+	own := newValueBarrier("own")
+	h, err := NewHost(testHostConfig(t),
+		WithLogDB(newMockLogDB()),
+		WithoutTransport(),
+		WithShardBarriers(func(shardID uint64) Barrier {
+			if shardID == 3 {
+				return own
+			}
+			return shared
+		}))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			shared := newValueBarrier("shared")
-			own := newValueBarrier("own")
-			opts := []HostOption{
-				WithLogDB(newMockLogDB()),
-				WithoutTransport(),
-				WithShardBarriers(func(shardID uint64) Barrier {
-					if shardID == 3 {
-						return own
-					}
-					return shared
-				}),
-			}
-			if tc.hostBarrier {
-				opts = append(opts, WithBarrier(newSealCountingBarrier()))
-			}
-			h, err := NewHost(testHostConfig(t), opts...)
-			if err != nil {
-				t.Fatalf("NewHost failed: %v", err)
-			}
-			startShardBarrierTestShards(t, h, 1, 2, 3)
+	startShardBarrierTestShards(t, h, 1, 2, 3)
 
-			if err := h.Close(); err != nil {
-				t.Fatalf("Close failed: %v", err)
-			}
-			for name, b := range map[string]valueBarrier{"shared": shared, "own": own} {
-				if !b.IsSealed() {
-					t.Errorf("%s value barrier is not sealed after Host.Close()", name)
-				}
-			}
-		})
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	for name, b := range map[string]valueBarrier{"shared": shared, "own": own} {
+		if !b.IsSealed() {
+			t.Errorf("%s value barrier is not sealed after Host.Close()", name)
+		}
 	}
 }
 

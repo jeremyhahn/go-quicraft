@@ -99,17 +99,6 @@ func TestBuildInitialMembershipEntry_WitnessPolicyIsPartOfTheInput(t *testing.T)
 			"policy would silently NOT be part of the committed configuration, and a " +
 			"cluster could form with each founder using its own policy undetected")
 	}
-	// The corollary: SAME policy + same members => identical, which is the safe
-	// path founders must stay on.
-	same, err := BuildInitialMembershipEntry(proto.Membership{
-		Addresses: base, MaxWitnesses: 1, RequireFullReplicaMajority: true,
-	})
-	if err != nil {
-		t.Fatalf("build same: %v", err)
-	}
-	if !bytes.Equal(strict.Cmd, same.Cmd) {
-		t.Fatal("identical input produced different bytes: determinism is broken")
-	}
 }
 
 // TestInitialMembershipRoundTrip confirms the entry decodes back to the

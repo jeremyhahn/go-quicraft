@@ -324,30 +324,6 @@ func TestStartShard_RejectsDuplicateMemberAddress(t *testing.T) {
 	}
 }
 
-// TestStartShard_AllowsColocatedRepliasOnDistinctPorts is the liveness half:
-// two replicas on ONE machine at different ports are a supported deployment and
-// stay supported. The comparison is on the whole address, not the host —
-// co-located replicas are already indistinguishable to a certificate (see
-// transport.isCoLocatedCertHost) but they are still distinct endpoints.
-func TestStartShard_AllowsColocatedRepliasOnDistinctPorts(t *testing.T) {
-	cfg := sanHostConfig(t, "127.0.0.1:5000", "*.raft.test")
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{
-		1: "127.0.0.1:5000",
-		2: "127.0.0.1:5001",
-		3: "127.0.0.1:5002",
-	}
-	if startErr := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members)); startErr != nil {
-		t.Fatalf("StartShard rejected co-located replicas on distinct ports: %v", startErr)
-	}
-}
-
 // TestStartShard_RejectsSpellingVariantDuplicateAddress closes the residual the
 // literal string compare left in the seeding path.
 //

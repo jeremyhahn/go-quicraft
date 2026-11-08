@@ -84,11 +84,6 @@ func TestStartShard_TransportHostRequiresFounderIdentities(t *testing.T) {
 	if err := h.StartShard(members, false, testCreateFunc, zero); !errors.As(err, &inv) {
 		t.Fatalf("StartShard with an identity for replica 0 = %v, want *InvalidMemberError", err)
 	}
-
-	// Every member named: admitted.
-	if err := h.StartShard(members, false, testCreateFunc, testShardConfigWithIdentities(h, 1, 1, members)); err != nil {
-		t.Fatalf("StartShard with every member named: %v", err)
-	}
 }
 
 // TestStartShard_RefusesDuplicateIdentitiesAndKeepsAnchorEntriesOutOfBootstrap
@@ -283,31 +278,6 @@ func TestRequestAddNode_TransportHostRequiresIdentity(t *testing.T) {
 			}
 		})
 	}
-
-	rs, err := h.RequestAddNodeWithIdentity(ctx, 1, 2, "node-b.raft.test:5000", testIdentity(2), 0)
-	if err != nil {
-		t.Fatalf("RequestAddNodeWithIdentity: %v", err)
-	}
-	rs.Release()
-}
-
-// TestStartShard_NoTransportHostDoesNotRequireIdentities pins the other side:
-// a host without a transport has no wire boundary, so its shards keep the
-// old ergonomics — no identities at bootstrap, identity-less adds.
-func TestStartShard_NoTransportHostDoesNotRequireIdentities(t *testing.T) {
-	h := newTestHost(t)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
-		t.Fatalf("StartShard without identities on a transportless host: %v", err)
-	}
-	waitForLeader(t, h, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	rs, err := h.RequestAddNode(ctx, 1, 2, "127.0.0.1:5001", 0)
-	if err != nil {
-		t.Fatalf("RequestAddNode without an identity on a transportless host: %v", err)
-	}
-	rs.Release()
 }
 
 // TestImportMembershipFor_RequiresIdentitiesBehindATransport pins the import

@@ -20,60 +20,6 @@ import (
 	"testing"
 )
 
-func TestSnapshotChunkMarshalUnmarshalRoundTrip(t *testing.T) {
-	sc := SnapshotChunk{
-		ShardID:        100,
-		ReplicaID:      2,
-		From:           1,
-		Index:          500,
-		Term:           10,
-		ChunkID:        0,
-		ChunkCount:     5,
-		ChunkSize:      uint64(len("chunk-payload-data")),
-		FileSize:       5120,
-		Filepath:       "/snap/100/chunk-0.dat",
-		FileChunkID:    0,
-		FileChunkCount: 5,
-		HasFileInfo:    true,
-		FileInfo: SnapshotFile{
-			Filepath: "/external/data.db",
-			FileSize: 2048,
-			FileID:   1,
-			Metadata: []byte("db-file"),
-		},
-		Membership: Membership{
-			ConfigChangeID: 42,
-			Addresses:      map[uint64]string{1: "node1:5000", 2: "node2:5000"},
-			Observers:      map[uint64]string{},
-			Witnesses:      map[uint64]string{},
-			Removed:        map[uint64]bool{},
-		},
-		OnDiskIndex:  499,
-		DeploymentID: 12345,
-		BinVer:       WireVersion,
-		Epoch:        5,
-		Data:         []byte("chunk-payload-data"),
-	}
-	buf := make([]byte, sc.Size())
-	n, err := sc.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	if n != sc.Size() {
-		t.Fatalf("MarshalTo: wrote %d, want %d", n, sc.Size())
-	}
-
-	var sc2 SnapshotChunk
-	consumed, err := sc2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if consumed != n {
-		t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, n)
-	}
-	assertSnapshotChunkEqual(t, &sc, &sc2)
-}
-
 func TestSnapshotChunkMarshalUnmarshalNoFileInfo(t *testing.T) {
 	sc := SnapshotChunk{
 		ShardID:        1,

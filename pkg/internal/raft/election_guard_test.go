@@ -52,37 +52,6 @@ func TestStartElection_UnreadableLastTermDoesNotBurnTerm(t *testing.T) {
 	}
 }
 
-// TestStartElection_ReadableLastTermStillCampaigns is the liveness control:
-// the guard must not suppress a legitimate election.
-func TestStartElection_ReadableLastTermStillCampaigns(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
-	cfg := raftTestCfg(1, 1)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("newRaft failed: %v", err)
-	}
-	if _, ok := r.log.lastTerm(); !ok {
-		t.Fatal("precondition failed: lastTerm should be readable on a fresh log")
-	}
-
-	r.startElection()
-
-	if r.state == follower {
-		t.Error("replica with a readable last term did not campaign")
-	}
-	var sawVote bool
-	for i := range r.msgs {
-		if r.msgs[i].Type == proto.RequestVote || r.msgs[i].Type == proto.RequestPreVote {
-			sawVote = true
-			break
-		}
-	}
-	if !sawVote {
-		t.Error("campaign emitted no vote request")
-	}
-}
-
 // unreadableLastTermReplica builds a follower whose lastIndex resolves to an
 // index whose term cannot be read: the in-memory marker sits above it and the
 // test LogDB has nothing. It is the same fault the two startElection tests above

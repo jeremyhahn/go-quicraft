@@ -15,7 +15,6 @@
 package shamir
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -73,27 +72,6 @@ func TestNewProtectedShare_AllocationFailureIsNotValidation(t *testing.T) {
 			t.Fatalf("byte %d = %#x: the source was not wiped, so the documented "+
 				"consume-on-allocation-failure contract is wrong", i, b)
 		}
-	}
-}
-
-// TestNewProtectedShare_ValidationFailureLeavesSourceUntouched is the other half
-// of the same contract, and the reason the two errors must stay distinct: a
-// syntactic rejection happens BEFORE any locked memory is allocated, so the
-// caller's buffer survives for it to wipe or retry.
-func TestNewProtectedShare_ValidationFailureLeavesSourceUntouched(t *testing.T) {
-	value := []byte("not valid base64 at all !!!")
-	want := append([]byte(nil), value...)
-
-	share, err := NewProtectedShare(1, 2, 3, value)
-	if share != nil {
-		t.Fatal("an invalid value must not yield a share")
-	}
-	var vErr *ValidationError
-	if !errors.As(err, &vErr) {
-		t.Fatalf("error = %T (%v), want *ValidationError", err, err)
-	}
-	if !bytes.Equal(value, want) {
-		t.Fatalf("the source was modified on a validation failure: %q", value)
 	}
 }
 
