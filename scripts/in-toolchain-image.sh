@@ -51,6 +51,16 @@
 # concurrency follows the container CPU quota, so lint takes N with no flag.
 # A 4-CPU slot on either runner host gives 4; never a hardcoded number.
 #
+# Memory (#621, Company Agent m1923 (e); go-xkms's v4 block): the sibling
+# holds the job slot's memory bound the same way. The job container's cgroup
+# memory.max (8g when the job has no limit; IN_IMAGE_MEMORY, a size in bytes,
+# m or g such as 12g, overrides) becomes --memory, and --memory-swap is set to
+# the same size, so the stage gets no swap: a stage that outgrows it is
+# OOM-killed and fails, instead of swapping the shared runner host.
+# CI_CGROUP_PARENT, when the runner sets it, is the runner's cgroup slice: the
+# sibling is created under it (--cgroup-parent), so its memory is charged to
+# that slice rather than to the Docker daemon's root. Unset adds nothing.
+#
 # The container is named <CI_STACK_PREFIX>tc-<pid>-<random>, under the prefix
 # scripts/reap-stale-ci-stacks.sh reaps (default <checkout dir>-ci-, which in CI
 # is <repo>-ci-), and is removed on every exit. IN_IMAGE_UID is the non-root
@@ -97,6 +107,19 @@ fi
 case $cpus in
   "" | 0 | *[!0-9]*) echo "IN_IMAGE_CPUS must be a positive integer: $cpus" >&2; exit 2 ;;
 esac
+memory=${IN_IMAGE_MEMORY:-}
+if [ -z "$memory" ]; then
+  limit=max
+  if [ -r /sys/fs/cgroup/memory.max ]; then read -r limit < /sys/fs/cgroup/memory.max; fi
+  case $limit in
+    max | "" | *[!0-9]*) memory=8g ;;
+    *) memory=$limit ;;
+  esac
+fi
+if ! [[ $memory =~ ^[1-9][0-9]*[mg]?$ ]]; then
+  echo "IN_IMAGE_MEMORY must be a size in bytes, m or g, e.g. 16g: $memory" >&2
+  exit 2
+fi
 args=(
   --name "$name"
   --cpus "$cpus"
@@ -106,6 +129,8 @@ args=(
   --cap-drop ALL
   --security-opt no-new-privileges:true
   --pids-limit 4096
+  --memory "$memory"
+  --memory-swap "$memory"
   --ulimit memlock=67108864:67108864
   --ulimit core=1048576:1048576
   --ulimit nofile=65536:65536
@@ -116,6 +141,9 @@ args=(
   --env HOME=/tmp
   --env CI="${CI:-}"
 )
+if [ -n "${CI_CGROUP_PARENT:-}" ]; then
+  args+=(--cgroup-parent "$CI_CGROUP_PARENT")
+fi
 modcache=/tmp/gomodcache
 if [ "$cache" = on ]; then
   vols="${prefix}cache-${class}"

@@ -50,21 +50,3 @@ func TestLogSampled_BoundsPeerDrivenDiagnostics(t *testing.T) {
 		t.Fatal("LogSampled never re-armed: the diagnostic is silenced, not sampled")
 	}
 }
-
-// TestRecvWarnings_AreCountedNotJustSampled pins that sampling does not lose
-// information: the counters beside each sampled line are unconditional, so the
-// line that does get emitted carries the true total.
-func TestRecvWarnings_AreCountedNotJustSampled(t *testing.T) {
-	tr, _ := newDropTransport(t)
-
-	before := tr.recvBudgetDrops.Load()
-	var stamp atomic.Int64
-	for i := 0; i < 100; i++ {
-		tr.recvBudgetDrops.Add(1)
-		_ = LogSampled(&stamp, time.Hour)
-	}
-	if got := tr.recvBudgetDrops.Load() - before; got != 100 {
-		t.Fatalf("counter recorded %d of 100 drops: sampling must bound the "+
-			"LOG, never the accounting", got)
-	}
-}

@@ -215,6 +215,7 @@ func TestApplyFailureFailsTheShardWithoutRetrying(t *testing.T) {
 				t.Fatal("OnShardFailed never fired: the apply failure did not fail the shard")
 			}
 
+			// Kept: the absence of a retry in this window is the behaviour under test.
 			// Give any retry loop that might exist room to run before counting.
 			// Re-applying an in-memory entry costs microseconds, so a count of 1
 			// after this window is a real absence of retries and not a race the
@@ -672,13 +673,11 @@ func TestFollowerReadsAgainstALatchedShardFailFast(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getNode: %v", err)
 	}
-	waitFor := time.Now().Add(5 * time.Second)
-	for engNode.CommittedIndex() <= ns.lastApplied.Load() {
-		if time.Now().After(waitFor) {
-			t.Fatalf("committed (%d) never advanced past lastApplied (%d); the poison "+
-				"entry did not commit", engNode.CommittedIndex(), ns.lastApplied.Load())
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(5*time.Second, func() bool {
+		return engNode.CommittedIndex() > ns.lastApplied.Load()
+	}) {
+		t.Fatalf("committed (%d) never advanced past lastApplied (%d); the poison "+
+			"entry did not commit", engNode.CommittedIndex(), ns.lastApplied.Load())
 	}
 
 	inside := make(chan outcome, 1)
@@ -991,12 +990,8 @@ func TestProposalDrainedByTheHaltReportsMaybeApplied(t *testing.T) {
 		t.Fatalf("StartShard after the halt: %v", err)
 	}
 	waitForLeader(t, h, 1)
-	deadline := time.Now().Add(5 * time.Second)
-	for reloaded.heldApplies.Load() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the reloaded shard never applied the committed entry")
-		}
-		time.Sleep(5 * time.Millisecond)
+	if !waitUntil(5*time.Second, func() bool { return reloaded.heldApplies.Load() > 0 }) {
+		t.Fatal("the reloaded shard never applied the committed entry")
 	}
 }
 
@@ -1607,15 +1602,11 @@ func TestLeaderChangeFailsHandedOffProposalsAsMaybeApplied(t *testing.T) {
 		t.Fatal("fixture: the proposal is not pending")
 	}
 	pp := v.(*pendingProposal)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if taken, _ := pp.node.ProposalTaken(&pp.enqueuedAt); taken {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("fixture: the step worker never took the proposal from the queue")
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(5*time.Second, func() bool {
+		taken, _ := pp.node.ProposalTaken(&pp.enqueuedAt)
+		return taken
+	}) {
+		t.Fatal("fixture: the step worker never took the proposal from the queue")
 	}
 
 	(&hostEngineCallback{h: h}).OnLeaderUpdated(1, 0, ns.term.Load())

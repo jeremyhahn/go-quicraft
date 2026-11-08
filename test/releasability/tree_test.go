@@ -95,7 +95,7 @@ func TestThePlantedViolationIsCaught(t *testing.T) {
 		"pkg/seal/doc.go":          "// observed on " + plantedAgent + "\n",
 		"scripts/release.sh":       "GIT_AUTHOR_EMAIL=" + plantedPrincipal + " make release\n",
 		"test/performance/x":       "PERF_PROFILE=" + plantedBenchHost + "\n",
-		".github/workflows/ci.yml": "# v1.15 (" + plantedCompanyRepo + "#211): push runs on main\n",
+		".github/workflows/ci.yml": "# v1.15 (" + plantedHandbookIssue + "): push runs on main\n",
 	}
 	root, files := writeTree(t, planted)
 
@@ -150,13 +150,11 @@ func TestTheAllowListDoesNotReachTheValuesThisChangeRemoved(t *testing.T) {
 	}
 }
 
-// agentFilesAndWorkflows are tracked files this repository publishes under
-// option (a) of the owner ruling on #406 and #407: the agent files and the
-// CI template's workflows, neutralised like the rest of the tree.
+// agentFilesAndWorkflows are tracked files this repository publishes: the
+// Serena project file and the CI template's workflows, neutralised like the
+// rest of the tree. The other agent files (AGENTS.md, CLAUDE.md, .claude/) are
+// no longer tracked, so the manifest cannot hold them.
 var agentFilesAndWorkflows = []string{
-	"AGENTS.md",
-	"CLAUDE.md",
-	".claude/agents/go-quicraft.md",
 	".serena/project.yml",
 	".github/workflows/batch.yml",
 	".github/workflows/ci.yml",

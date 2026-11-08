@@ -4,7 +4,7 @@
 > and the gate that enforces it · Last verified: 2026-10-20
 
 This repository ships publicly: as a Go module and as release archives built
-from a tagged commit. Everything tracked here is published, the agent files and
+from a tagged commit. Everything tracked here is published, `.serena/` and
 the CI template's workflows included, except the private forge's own workflows
 and the private release trust anchor, which `.gitattributes` excludes (below). This page states the rule and the gate that
 enforces it.
@@ -16,17 +16,18 @@ internal identities or its internal repositories. Concretely, six classes:
 
 | Class | What it covers | Use instead |
 |---|---|---|
-| `lab-address` | An address on the fleet subnet | RFC 5737 documentation addresses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) or a name under `.example` |
+| `lab-address` | An address on the fleet subnet | An RFC 5737 documentation address from `192.0.2.0/24` or `203.0.113.0/24`, or a name under `.example` |
 | `lab-host` | A fleet build or bench host name | The role, not the machine: `build-host.example`, `user@bench-host.example`, `forge.example`, `bench-01` |
-| `owner-path` | A path under the owner's home directory or the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, or the agent account's home directory |
-| `owner-account` | The owner's account name on its own | A role: `user`, `operator`, or the module path |
+| `owner-path` | A path under the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, or the agent account's home directory |
+| `owner-account` | The owner's account name, in a home path or on its own | A role: `user`, `operator`, or the module path |
 | `internal-identity` | An address in the internal mail domain, or an agent principal of the form `agent-<name>@...` on any domain | A neutral example identity: `release@example.invalid`, `ops@forge.example` |
 | `internal-repository` | A private-forge repository that is not this project (the company repository, the agent tooling repository) or an issue number on the handbook's tracker | The decision itself, stated in place, or a public document |
 
-The fleet's own subnet, hostnames, path prefixes and internal mail domain are
-written down in one place, the `patterns` list in
-`test/releasability/scanner_test.go`. Read them there rather than repeating
-them here.
+The `patterns` list in `test/releasability/scanner_test.go` names the
+placeholder vocabulary the published tree uses for the fleet's subnet,
+hostnames, path prefixes and internal mail domain, so a placeholder copied into
+new prose or a new fixture is caught like the value it stands for. The values a
+private scan of an unpublished tree needs live outside this repository.
 
 Site configuration (which machine the remote targets offload to, which forge a
 build host fetches modules from) is supplied at invocation time
@@ -40,15 +41,15 @@ Two things are explicitly *not* violations:
   meaning, not a leak. The stored profiles under `test/performance/profiles/`
   and the baselines under `test/performance/baselines/` are named after their
   machines; prose that cites them waives the line.
-- **RFC 1918 literals that are not the fleet subnet.** Tests across this tree
-  use `192.168.1.x` and `10.0.0.x` as opaque addresses that are never dialed.
-  The gate does not look at `192.168.0.0/16` at large, only at the fleet's own
-  `/24`.
+- **RFC 1918 and documentation-range literals that are not the placeholder
+  subnet.** Tests across this tree use `192.168.1.x`, `10.0.0.x` and
+  `192.0.2.x` as opaque addresses that are never dialed. The gate does not look
+  at those ranges at large, only at the placeholder subnet's own `/24`.
 
 Test files are published and scanned like everything else; they use neutral
-fixtures (`bench-01`, `198.51.100.x`, `forge.example`). Only the gate's own
-tests plant fleet values, because they are what the rules exist to find, and
-each such line carries an inline waiver.
+fixtures (`bench-01`, `192.0.2.x`, `forge.example`). Only the gate's own
+tests plant placeholder values, because they are what the rules exist to find,
+and each such line carries an inline waiver.
 
 ## What is published
 
@@ -67,10 +68,9 @@ maintainer releasing from an export names their own allowed-signers file with
 `RELEASE_ALLOWED_SIGNERS` (Releasing, in `CONTRIBUTING.md`). The four are
 `privateWorkflowFiles` in `test/releasability/manifest_test.go`, exact paths.
 
-The agent files (`CLAUDE.md` and `AGENTS.md` at any depth, `.claude/`,
-`.serena/`) and every other workflow under `.github/workflows` are published as
-they are and scanned like everything else (owner ruling on #406 and #407,
-option (a)).
+`CLAUDE.md`, `AGENTS.md` and `.claude/` are no longer tracked. `.serena/` and
+every other workflow under `.github/workflows` are published as they are and
+scanned like everything else.
 So they are neutralised the same way as the rest of the tree: no internal host,
 repository number or domain. `.github/dependabot.yml` is published too: it is a
 github.com service file, inert on the private forge.
@@ -84,8 +84,8 @@ because an image runs the code and carries no development tooling.
 
 - `TestThePublishedTreeIsTheTrackedTreeLessThePrivateWorkflow`: the published
   manifest (`publishedFiles`, the index minus export-ignored paths) holds no
-  `privateWorkflowFiles` entry, holds the agent files and the CI template's
-  workflows, and nothing else is export-ignored.
+  `privateWorkflowFiles` entry, holds `.serena/project.yml` and the CI
+  template's workflows, and nothing else is export-ignored.
 - `TestGitArchiveHonoursTheExclusionList`: a repository carrying this tree's
   `.gitattributes`, archived as a forge would, leaves out the private forge's
   workflows and the trust anchor and keeps the agent files and every other
@@ -166,10 +166,11 @@ The list is meant to shrink. Today it holds:
 | `test/performance/baselines/**` | `lab-host` | Benchmark provenance: the file name and run-host/build-host header |
 | `test/performance/perfprofile/generate_test.go` | `lab-host` | Drives the generator with a real stored profile |
 | `CHANGELOG.md` | `lab-host` | Historical release notes recording where measurements ran |
+| `docs/references/**` | `lab-address` | Verbatim IETF text |
 
-### Adding a fleet value to the rule set
+### Adding a placeholder to the rule set
 
-One entry in `patterns`: the regexp, a lowercase `needle` literal every match
+One entry in `patterns` (a real fleet value never goes here): the regexp, a lowercase `needle` literal every match
 must contain (the scanner searches for needles first, which is what keeps a
 whole-tree scan cheap), and the guidance a tripping engineer reads. Add a sample
 to `TestPatternsEveryNeedleIsImpliedByItsExpr`, which is what stops a needle
