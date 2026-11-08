@@ -240,6 +240,11 @@ func TestManagerCheckDuplicate(t *testing.T) {
 		if m.sessions[1].lastActiveIndex != 500 {
 			t.Errorf("lastActiveIndex = %d, want 500", m.sessions[1].lastActiveIndex)
 		}
+		// A hit at a lower index must not move lastActiveIndex back.
+		_, _, _ = m.CheckDuplicate(1, 5, 300)
+		if m.sessions[1].lastActiveIndex != 500 {
+			t.Errorf("lastActiveIndex = %d, want 500 (must not decrease)", m.sessions[1].lastActiveIndex)
+		}
 	})
 }
 
@@ -478,6 +483,27 @@ func TestManagerExpireSessions(t *testing.T) {
 		// Current index 1000, threshold 1000. Gap is only 100, < 1000.
 		expired := m.ExpireSessions(1000, 1000, 10)
 		if len(expired) != 0 {
+			t.Errorf("len(expired) = %d, want 0", len(expired))
+		}
+	})
+
+	t.Run("does not expire at exact threshold", func(t *testing.T) {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
+			t.Fatalf("Register = %v", err)
+		}
+		// Gap is exactly the threshold; expiry needs a gap above it.
+		if expired := m.ExpireSessions(1100, 1000, 10); len(expired) != 0 {
+			t.Errorf("len(expired) = %d, want 0", len(expired))
+		}
+	})
+
+	t.Run("does not expire when current index is behind last active", func(t *testing.T) {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 5000); err != nil {
+			t.Fatalf("Register = %v", err)
+		}
+		if expired := m.ExpireSessions(100, 10, 10); len(expired) != 0 {
 			t.Errorf("len(expired) = %d, want 0", len(expired))
 		}
 	})
