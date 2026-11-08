@@ -20,6 +20,7 @@ package memdb
 import (
 	"bytes"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -554,6 +555,38 @@ func TestSaveSnapshotRejectsIndexZero(t *testing.T) {
 // so the batch applies A and parks on B. The fixture asserts both the batch
 // and the removal really are blocked there, so a change that closed the
 // window some other way cannot make this vacuous.
+// waitForRemovalLock waits until cond holds, failing the test with what
+// after five seconds.
+func waitForRemovalLock(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting until %s", what)
+		}
+		runtime.Gosched()
+	}
+}
+
+// removalReadHeld reports whether a write holds removalMu for reading.
+func (m *MemDB) removalReadHeld() bool {
+	if m.removalMu.TryLock() {
+		m.removalMu.Unlock()
+		return false
+	}
+	return true
+}
+
+// removalWriterQueued reports whether RemoveNodeData or Close is waiting for
+// removalMu: a queued writer makes TryRLock fail.
+func (m *MemDB) removalWriterQueued() bool {
+	if m.removalMu.TryRLock() {
+		m.removalMu.RUnlock()
+		return false
+	}
+	return true
+}
+
 func TestRemoveNodeDataWaitsForAnInFlightBatch(t *testing.T) {
 	db := New()
 	b := db.getOrCreateNode(2, 1)
@@ -567,9 +600,9 @@ func TestRemoveNodeDataWaitsForAnInFlightBatch(t *testing.T) {
 		})
 	}()
 	removed := make(chan error, 1)
-	time.Sleep(50 * time.Millisecond)
+	waitForRemovalLock(t, "the batch holds the removal lock", db.removalReadHeld)
 	go func() { removed <- db.RemoveNodeData(2, 1) }()
-	time.Sleep(50 * time.Millisecond)
+	waitForRemovalLock(t, "RemoveNodeData waits for the removal lock", db.removalWriterQueued)
 	select {
 	case err := <-saved:
 		b.mu.Unlock()
@@ -615,10 +648,10 @@ func TestCloseWaitsForAnInFlightBatch(t *testing.T) {
 			{ShardID: 2, ReplicaID: 1, State: logdb.State{Term: 3, Vote: 1}},
 		})
 	}()
-	time.Sleep(50 * time.Millisecond)
+	waitForRemovalLock(t, "the batch holds the removal lock", db.removalReadHeld)
 	closed := make(chan error, 1)
 	go func() { closed <- db.Close() }()
-	time.Sleep(50 * time.Millisecond)
+	waitForRemovalLock(t, "Close waits for the removal lock", db.removalWriterQueued)
 	select {
 	case err := <-saved:
 		b.mu.Unlock()

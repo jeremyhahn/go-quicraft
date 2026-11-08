@@ -527,7 +527,7 @@ func TestModuleAuthIsTheSectionSixPayload(t *testing.T) {
 	runner := map[string]string{
 		"GOPRIVATE":          "github.com/jeremyhahn/*",
 		"GIT_CONFIG_COUNT":   "1",
-		"GIT_CONFIG_KEY_0":   "url.http://x:" + token + "@198.51.100.50:3001/jeremyhahn/.insteadOf",
+		"GIT_CONFIG_KEY_0":   "url.http://x:" + token + "@forge.example/jeremyhahn/.insteadOf",
 		"GIT_CONFIG_VALUE_0": "https://github.com/jeremyhahn/",
 	}
 	getenv := func(m map[string]string) func(string) string {
@@ -537,7 +537,7 @@ func TestModuleAuthIsTheSectionSixPayload(t *testing.T) {
 	got := moduleAuth(getenv(runner))
 	want := "GOPRIVATE='github.com/jeremyhahn/*'\n" +
 		"GIT_CONFIG_COUNT='1'\n" +
-		"GIT_CONFIG_KEY_0='url.http://x:" + token + "@198.51.100.50:3001/jeremyhahn/.insteadOf'\n" +
+		"GIT_CONFIG_KEY_0='url.http://x:" + token + "@forge.example/jeremyhahn/.insteadOf'\n" +
 		"GIT_CONFIG_VALUE_0='https://github.com/jeremyhahn/'\n"
 	if got != want {
 		t.Fatalf("runner environment:\n got %q\nwant %q", got, want)
@@ -575,7 +575,7 @@ func TestBuildImageKeepsTheTokenOffTheCommandLine(t *testing.T) {
 	t.Setenv(moduleAuthEnv, "")
 	t.Setenv("GOPRIVATE", "github.com/jeremyhahn/*")
 	t.Setenv("GIT_CONFIG_COUNT", "1")
-	t.Setenv("GIT_CONFIG_KEY_0", "url.http://x:"+token+"@198.51.100.50:3001/jeremyhahn/.insteadOf")
+	t.Setenv("GIT_CONFIG_KEY_0", "url.http://x:"+token+"@forge.example/jeremyhahn/.insteadOf")
 	t.Setenv("GIT_CONFIG_VALUE_0", "https://github.com/jeremyhahn/")
 
 	if err := buildImage(t.Context(), "quicraft-bench-quicraft", "quicraft/Dockerfile", "/repo"); err != nil {

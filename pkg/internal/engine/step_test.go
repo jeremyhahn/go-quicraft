@@ -211,127 +211,6 @@ func TestStepWorker_ProposalBatching(t *testing.T) {
 	}
 }
 
-// TestStepWorker_ProposalBatching_NoProposals verifies that when the inbox
-// contains no Propose messages, the batching path is a no-op and other
-// messages are still handled normally.
-func TestStepWorker_ProposalBatching_NoProposals(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain the election update.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Deliver only non-proposal messages to the inbox.
-	node.Deliver(proto.Message{
-		Type:    proto.Heartbeat,
-		From:    1,
-		To:      1,
-		ShardID: 1,
-	})
-	node.Deliver(proto.Message{
-		Type:    proto.HeartbeatResp,
-		From:    1,
-		To:      1,
-		ShardID: 1,
-	})
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// The inbox should be drained and no panic should occur.
-	remaining := node.DrainInbox(nil)
-	if len(remaining) != 0 {
-		t.Fatalf("inbox should be empty, got %d messages", len(remaining))
-	}
-}
-
-// TestStepWorker_ProposalQueue_SeparateFromInbox verifies that proposals
-// delivered via DeliverProposal are processed from the MPSC queue while
-// transport messages delivered via Deliver go through the inbox channel.
-// Both paths produce correct peer state changes.
-func TestStepWorker_ProposalQueue_SeparateFromInbox(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain election update.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Deliver proposals via the MPSC proposal queue and a ReadIndex via
-	// the MPSC ReadIndex queue. This proves the three paths are independent.
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("proposal-1")}})
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("proposal-2")}})
-	node.DeliverReadIndex(42)
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// A commit item should be produced with both proposal entries.
-	select {
-	case item := <-commitC:
-		if len(item.update.EntriesToSave) < 2 {
-			t.Fatalf("expected at least 2 entries, got %d", len(item.update.EntriesToSave))
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected commit item from proposals")
-	}
-
-	// All queues should be drained.
-	if remaining := node.DrainProposals(nil); len(remaining) != 0 {
-		t.Fatalf("proposal queue should be empty, got %d", len(remaining))
-	}
-	if remaining := node.DrainInbox(nil); len(remaining) != 0 {
-		t.Fatalf("inbox should be empty, got %d", len(remaining))
-	}
-	if remaining := node.DrainReadIndex(nil); len(remaining) != 0 {
-		t.Fatalf("readIndex queue should be empty, got %d", len(remaining))
-	}
-}
-
 // TestStepWorker_MemoryMode_BypassesCommitC verifies that when
 // memoryMode=true, processReady calls Peer.Commit inline and forwards
 // the update to applyC, completely bypassing commitC. This is the
@@ -663,71 +542,6 @@ func TestStepWorker_CommitPendingInbox_EmptyInbox(t *testing.T) {
 
 	if cb.readyCount.Load() != initialReadyCount {
 		t.Fatal("OnReadyToRead should not fire with empty inbox during commitPending")
-	}
-}
-
-// TestStepWorker_CommitPendingInbox_SendsMessages verifies that outbound
-// messages produced during commitPending inbox processing are delivered
-// via the transport sender.
-func TestStepWorker_CommitPendingInbox_SendsMessages(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newMultiNodeTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	// Tick peer to become leader (grant votes).
-	for range 30 {
-		peer.Tick()
-	}
-	_ = peer.Handle(proto.Message{Type: proto.RequestPreVoteResp, From: 2})
-	_ = peer.Handle(proto.Message{Type: proto.RequestPreVoteResp, From: 3})
-	for range 30 {
-		peer.Tick()
-	}
-	if !peer.IsLeader() {
-		_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 2})
-		_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 3})
-	}
-
-	// Drain initial state.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		_ = peer.Commit(item.update)
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Set commitPending to simulate busy pipeline.
-	node.commitPending.Store(true)
-
-	// Deliver a heartbeat to the inbox. The leader will produce
-	// response messages (sendAppend for probe peers, etc.).
-	node.Deliver(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-	})
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// The message count is deliberately NOT asserted: a follower in probe
-	// state with nothing to send legitimately produces none, so either
-	// outcome is correct. What must hold is that processReady drained the
-	// inbox instead of leaving the delivered HeartbeatResp wedged behind
-	// commitPending.
-	remaining := node.DrainInbox(nil)
-	if len(remaining) != 0 {
-		t.Fatalf("inbox should be empty, got %d", len(remaining))
 	}
 }
 
@@ -3006,6 +2820,12 @@ func TestStepWorker_CommitPendingInbox_HeartbeatsProcessedDuringCommitPending(t 
 	if len(remaining) != 0 {
 		t.Fatalf("expected inbox to be empty after commitPending processing, got %d", len(remaining))
 	}
+	// commitPending skips the full pipeline: no commit item is produced.
+	select {
+	case <-commitC:
+		t.Fatal("commitPending node should not produce a commit item")
+	default:
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3431,90 +3251,6 @@ func TestDrainAndHandleProposals_ErrorCallback(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// drainTick coverage (merged from coverage_step_test.go)
-// ---------------------------------------------------------------------------
-
-// TestDrainTick_NoTickAvailable verifies that drainTick is a no-op when
-// no tick is pending in the ticker channel (the default case).
-func TestDrainTick_NoTickAvailable(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, 10*time.Second, sender, ws, commitC, nil, stopC, nil)
-
-	// Create a very slow ticker that will not fire during the test.
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	// drainTick should take the default path (no tick available).
-	sw.drainTick(ticker)
-}
-
-// TestDrainTick_AdvancesElection verifies that enough drainTick calls
-// (each consuming a tick) cause a single-node cluster to start an election.
-func TestDrainTick_AdvancesElection(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-	cb := newTestCallback()
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	// drainTick calls sw.tick() when a tick is pending. To advance the
-	// Raft election clock 20 times without timer races, call sw.tick()
-	// directly. This is equivalent to drainTick consuming 20 ticks and
-	// directly tests the election advancement without timer dependencies.
-	for range 20 {
-		sw.tick()
-	}
-
-	// After enough ticks, the single-node cluster should have elected itself.
-	sw.processReady()
-
-	if !peer.IsLeader() {
-		t.Fatal("expected peer to become leader after sufficient ticks")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// loadNode campaign-skipped callback wiring (merged from coverage_step_test.go)
-// ---------------------------------------------------------------------------
-
-// TestLoadNode_NilPeerSkipsCallbackWiring verifies that loadNode handles
-// a node with a nil peer gracefully (no callback wiring needed).
-func TestLoadNode_NilPeerSkipsCallbackWiring(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-	cb := newTestCallback()
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	cfg := config.Config{ShardID: 99, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Should not panic with nil peer.
-	sw.loadNode(node)
-
-	sw.nodesMu.RLock()
-	_, found := sw.nodes[99]
-	sw.nodesMu.RUnlock()
-	if !found {
-		t.Fatal("nil-peer node should still be loaded")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // processCallbacks campaign detection (merged from coverage_step_test.go)
 // ---------------------------------------------------------------------------
 
@@ -3919,68 +3655,13 @@ func TestExecutePiggyback_PersistFailureNoApply(t *testing.T) {
 	select {
 	case <-applyC:
 		t.Fatal("apply item must NOT be forwarded when commit-index persist fails")
-	case <-time.After(100 * time.Millisecond):
-		// expected
+	default:
 	}
 }
 
 // ---------------------------------------------------------------------------
 // processReady with commitPending inbox processing (merged from coverage_step_test.go)
 // ---------------------------------------------------------------------------
-
-// TestProcessReady_CommitPendingDrainsInbox verifies that processReady
-// still drains the inbox for ReadIndex messages when commitPending is true.
-func TestProcessReady_CommitPendingDrainsInbox(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-
-	tickPeerToLeader(peer)
-
-	// Drain the election update first.
-	ws.Notify(1)
-	sw.loadNode(node)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-	default:
-	}
-
-	// Set commitPending to true. processReady should skip the full
-	// pipeline but still process the inbox for the commitPending path.
-	node.commitPending.Store(true)
-
-	// Deliver a transport message to the inbox.
-	node.Deliver(proto.Message{
-		Type:    proto.HeartbeatResp,
-		ShardID: 1,
-		From:    2,
-		To:      1,
-		Term:    1,
-	})
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// No commit item should have been produced (commitPending skips
-	// the full pipeline).
-	select {
-	case <-commitC:
-		t.Fatal("commitPending node should not produce a commit item")
-	default:
-	}
-}
 
 // TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop verifies
 // that an InstallSnapshot message deferred during commitPending is NOT

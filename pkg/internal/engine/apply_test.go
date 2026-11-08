@@ -81,18 +81,9 @@ func TestApplyWorker_RecoverFromSMPanic(t *testing.T) {
 	// because failed is stored BEFORE handleError runs. Polling
 	// on the later signal avoids the race where the test reads
 	// errorReported before the apply goroutine has called handleError.
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for panic recovery")
-		default:
-		}
-		if errorReported.Load() != nil {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
+		return errorReported.Load() != nil
+	})
 
 	// Verify the shard is marked as failed.
 	if !node.failed.Load() {
@@ -176,18 +167,7 @@ func TestApplyWorker_RecoverFromSMPanic_ShardContinuesAfterPanic(t *testing.T) {
 	applyC <- item1
 
 	// Wait for shard 1 to be marked as failed.
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for shard 1 to fail")
-		default:
-		}
-		if node1.failed.Load() {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard 1 to fail", node1.failed.Load)
 
 	// Send work to shard 2 - it should still be processed.
 	node2.commitPending.Store(true)
@@ -203,22 +183,14 @@ func TestApplyWorker_RecoverFromSMPanic_ShardContinuesAfterPanic(t *testing.T) {
 	applyC <- item2
 
 	// Wait for callback to fire for shard 2.
-	deadline = time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for shard 2 to apply")
-		default:
-		}
-		calls := cb.getAppliedCalls()
-		for _, c := range calls {
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard 2 to apply", func() bool {
+		for _, c := range cb.getAppliedCalls() {
 			if c.shardID == 2 {
-				goto done
+				return true
 			}
 		}
-		time.Sleep(time.Millisecond)
-	}
-done:
+		return false
+	})
 
 	// Shard 2 should NOT be failed.
 	if node2.failed.Load() {
@@ -272,22 +244,14 @@ func TestApplyWorker_DispatchSkipsUnloadedShard(t *testing.T) {
 	applyC <- item1
 
 	// Wait for the apply callback to confirm shard 10 processed.
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for shard 10 initial apply")
-		default:
-		}
-		calls := cb.getAppliedCalls()
-		for _, c := range calls {
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard 10 initial apply", func() bool {
+		for _, c := range cb.getAppliedCalls() {
 			if c.shardID == 10 {
-				goto applied
+				return true
 			}
 		}
-		time.Sleep(time.Millisecond)
-	}
-applied:
+		return false
+	})
 
 	// Unload shard 10. The dispatcher processes the request via
 	// removeShardChan, closing the per-shard channel and adding shard 10
@@ -310,18 +274,9 @@ applied:
 	applyC <- item2
 
 	// Wait for commitPending to be cleared by the dispatch discard path.
-	deadline = time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for commitPending to be cleared on discarded item")
-		default:
-		}
-		if !node.commitPending.Load() {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for commitPending to be cleared on discarded item", func() bool {
+		return !node.commitPending.Load()
+	})
 
 	// Verify the second item was NOT applied (no second callback for shard 10).
 	appliedCalls := cb.getAppliedCalls()
@@ -372,15 +327,9 @@ func TestApplyWorker_DispatchSkipsUnloadedShard_NoNode(t *testing.T) {
 	applyC <- item
 
 	// Wait for the applyC to be drained (item consumed by dispatcher).
-	deadlineItem := time.After(5 * time.Second)
-	for len(applyC) > 0 {
-		select {
-		case <-deadlineItem:
-			t.Fatal("timed out waiting for dispatcher to drain applyC")
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for dispatcher to drain applyC", func() bool {
+		return len(applyC) == 0
+	})
 
 	// Stop cleanly. If dispatch panicked or leaked a goroutine, this
 	// would hang or the test would have already failed.
@@ -421,22 +370,14 @@ func TestApplyWorker_UnloadThenReload(t *testing.T) {
 	item.node = node
 	applyC <- item
 
-	deadline := time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for initial apply")
-		default:
-		}
-		calls := cb.getAppliedCalls()
-		for _, c := range calls {
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for initial apply", func() bool {
+		for _, c := range cb.getAppliedCalls() {
 			if c.shardID == 5 {
-				goto initialApplied
+				return true
 			}
 		}
-		time.Sleep(time.Millisecond)
-	}
-initialApplied:
+		return false
+	})
 
 	// Step 2: Unload shard 5. The returned done channel closes once the
 	// unload is fully processed (per-shard goroutine exited), so the next
@@ -456,18 +397,9 @@ initialApplied:
 	item.node = node
 	applyC <- item
 
-	deadline = time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for discarded item")
-		default:
-		}
-		if !node.commitPending.Load() {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for discarded item", func() bool {
+		return !node.commitPending.Load()
+	})
 
 	// Only the initial apply should have a callback.
 	appliedCalls := cb.getAppliedCalls()
@@ -513,26 +445,16 @@ initialApplied:
 	item.node = node2
 	applyC <- item
 
-	deadline = time.After(5 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for post-reload apply")
-		default:
-		}
-		calls := cb.getAppliedCalls()
+	// Should now have 2 callbacks: initial + post-reload.
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for post-reload apply", func() bool {
 		postReloadCount := 0
-		for _, c := range calls {
+		for _, c := range cb.getAppliedCalls() {
 			if c.shardID == 5 {
 				postReloadCount++
 			}
 		}
-		// Should now have 2 callbacks: initial + post-reload.
-		if postReloadCount >= 2 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+		return postReloadCount >= 2
+	})
 
 	close(stopC)
 }
@@ -590,15 +512,9 @@ func TestApplyWorker_UnloadedMapCleanup(t *testing.T) {
 	}
 
 	// Wait for all 100 items to be applied (confirming none were discarded).
-	deadlineAll := time.After(10 * time.Second)
-	for goodSM.applyCount.Load() < 100 {
-		select {
-		case <-deadlineAll:
-			t.Fatalf("timed out: only %d/100 items applied", goodSM.applyCount.Load())
-		default:
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 10*time.Second, time.Millisecond, "timed out: not all 100 items applied", func() bool {
+		return goodSM.applyCount.Load() >= 100
+	})
 
 	close(stopC)
 	// wg.Wait in run() should complete promptly if no goroutine leaked.

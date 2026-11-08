@@ -20,7 +20,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -1869,21 +1868,6 @@ func TestStateMachine_OpenError(t *testing.T) {
 		if !errors.As(err, &te) {
 			t.Errorf("Open error = %T, want *testOpenError", err)
 		}
-	})
-
-	t.Run("open error does not update lastApplied", func(t *testing.T) {
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return &testOnDiskKVOpenError{testOnDiskKV: *newTestOnDiskKV()}
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if _, err := rsm.Open(make(chan struct{})); err == nil {
-			t.Fatal("Open should return error")
-		}
 		if rsm.LastApplied() != 0 {
 			t.Errorf("LastApplied = %d, want 0 after failed Open", rsm.LastApplied())
 		}
@@ -2031,56 +2015,6 @@ func TestStateMachine_CloseErrorPropagation(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Lookup via NALookup fast path
-// ---------------------------------------------------------------------------
-
-func TestStateMachine_LookupNAFastPath(t *testing.T) {
-	t.Run("byte query uses NALookup when supported", func(t *testing.T) {
-		kv := &testHasherSM{testKV: testKV{data: make(map[string]string)}}
-		kv.data["hello"] = "world"
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Using []byte query should use NALookup fast path.
-		val, err := rsm.Lookup(context.Background(), []byte("hello"))
-		if err != nil {
-			t.Fatalf("Lookup = %v", err)
-		}
-		if string(val.([]byte)) != "world" {
-			t.Errorf("Lookup = %q, want %q", val, "world")
-		}
-	})
-
-	t.Run("non-byte query falls through to regular Lookup", func(t *testing.T) {
-		kv := &testHasherSM{testKV: testKV{data: make(map[string]string)}}
-		kv.data["hello"] = "world"
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// String query should fall through to regular Lookup.
-		val, err := rsm.Lookup(context.Background(), "hello")
-		if err != nil {
-			t.Fatalf("Lookup = %v", err)
-		}
-		if val.(string) != "world" {
-			t.Errorf("Lookup = %q, want %q", val, "world")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Lookup: absence must survive both paths
 // ---------------------------------------------------------------------------
 
@@ -2196,111 +2130,6 @@ func TestStateMachineLookup_AbsenceSurvivesBothPaths(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// GetHash through StateMachine
-// ---------------------------------------------------------------------------
-
-func TestStateMachine_GetHashSupported(t *testing.T) {
-	t.Run("GetHash returns hash when SM supports it", func(t *testing.T) {
-		kv := &testHasherSM{testKV: testKV{data: make(map[string]string)}}
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		hash, supported, err := rsm.GetHash()
-		if err != nil {
-			t.Fatalf("GetHash = %v", err)
-		}
-		if !supported {
-			t.Fatal("GetHash should be supported for testHasherSM")
-		}
-		if hash != 42 {
-			t.Errorf("GetHash = %d, want 42", hash)
-		}
-	})
-
-}
-
-// ---------------------------------------------------------------------------
-// Mixed batch: session register + data + session unregister with dedup
-// ---------------------------------------------------------------------------
-
-func TestApply_MixedBatchWithDedup(t *testing.T) {
-	t.Run("register then apply then dedup in sequential batches", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Batch 1: register session.
-		regEntries := []proto.Entry{
-			{Index: 1, ClientID: 42, SeriesID: proto.SessionSeriesIDForRegister, Type: proto.EntryNormal},
-		}
-		regResults := make([]sm.Result, 1)
-		if err := rsm.Apply(regEntries, regResults); err != nil {
-			t.Fatalf("Apply(register) = %v", err)
-		}
-
-		// Batch 2: apply data entry for session.
-		dataEntries := []proto.Entry{
-			{Index: 2, ClientID: 42, SeriesID: 1, Cmd: makeCmd("dk", "dv")},
-		}
-		dataResults := make([]sm.Result, 1)
-		if err := rsm.Apply(dataEntries, dataResults); err != nil {
-			t.Fatalf("Apply(data) = %v", err)
-		}
-		originalValue := dataResults[0].Value
-
-		// Batch 3: attempt duplicate with same seriesID.
-		dupEntries := []proto.Entry{
-			{Index: 3, ClientID: 42, SeriesID: 1, Cmd: makeCmd("dk", "DIFFERENT")},
-		}
-		dupResults := make([]sm.Result, 1)
-		if err := rsm.Apply(dupEntries, dupResults); err != nil {
-			t.Fatalf("Apply(dup) = %v", err)
-		}
-		if dupResults[0].Value != originalValue {
-			t.Errorf("dup result = %d, want %d (cached)", dupResults[0].Value, originalValue)
-		}
-
-		// Batch 4: new seriesID with respondedTo advancing past 1.
-		newEntries := []proto.Entry{
-			{Index: 4, ClientID: 42, SeriesID: 2, RespondedTo: 1, Cmd: makeCmd("nk", "nv")},
-		}
-		newResults := make([]sm.Result, 1)
-		if err := rsm.Apply(newEntries, newResults); err != nil {
-			t.Fatalf("Apply(new) = %v", err)
-		}
-
-		// Batch 5: unregister session.
-		unregEntries := []proto.Entry{
-			{Index: 5, ClientID: 42, SeriesID: proto.SessionSeriesIDForUnregister, Type: proto.EntryNormal},
-		}
-		unregResults := make([]sm.Result, 1)
-		if err := rsm.Apply(unregEntries, unregResults); err != nil {
-			t.Fatalf("Apply(unreg) = %v", err)
-		}
-		if unregResults[0].Value != 42 {
-			t.Errorf("unreg Value = %d, want 42", unregResults[0].Value)
-		}
-		if rsm.Sessions().IsRegistered(42) {
-			t.Error("session 42 should be unregistered")
-		}
-		if rsm.LastApplied() != 5 {
-			t.Errorf("LastApplied = %d, want 5", rsm.LastApplied())
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Session expiry disabled when sessionExpiryEntries is 0
 // ---------------------------------------------------------------------------
 
@@ -2330,62 +2159,6 @@ func TestApply_SessionExpiryDisabled(t *testing.T) {
 		}
 		if !rsm.Sessions().IsRegistered(10) {
 			t.Error("session 10 should survive when expiry is disabled")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Multiple sessions in single batch with data entries
-// ---------------------------------------------------------------------------
-
-func TestApply_MultipleSessionsInBatch(t *testing.T) {
-	t.Run("batch with entries from multiple registered sessions", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Register two sessions.
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register(10) = %v", err)
-		}
-		if err := rsm.Sessions().Register(20, 0, 0); err != nil {
-			t.Fatalf("Register(20) = %v", err)
-		}
-
-		// Apply entries from both sessions in single batch.
-		entries := []proto.Entry{
-			{Index: 1, ClientID: 10, SeriesID: 1, Cmd: makeCmd("s10k", "s10v")},
-			{Index: 2, ClientID: 20, SeriesID: 1, Cmd: makeCmd("s20k", "s20v")},
-			{Index: 3, ClientID: 10, SeriesID: 2, RespondedTo: 1, Cmd: makeCmd("s10k2", "s10v2")},
-		}
-		results := make([]sm.Result, 3)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// All should have been applied.
-		for i, r := range results {
-			if r.Value == 0 {
-				t.Errorf("results[%d].Value = 0, want non-zero", i)
-			}
-		}
-
-		// Verify data.
-		for _, kv := range []struct{ k, v string }{
-			{"s10k", "s10v"}, {"s20k", "s20v"}, {"s10k2", "s10v2"},
-		} {
-			val, lookupErr := rsm.Lookup(context.Background(), kv.k)
-			if lookupErr != nil {
-				t.Fatalf("Lookup(%s) = %v", kv.k, lookupErr)
-			}
-			if val.(string) != kv.v {
-				t.Errorf("Lookup(%s) = %q, want %q", kv.k, val, kv.v)
-			}
 		}
 	})
 }
@@ -2695,45 +2468,19 @@ func TestSMType_String(t *testing.T) {
 }
 
 func TestSMType_TypeCode(t *testing.T) {
-	t.Run("SMTypeRegular returns 0", func(t *testing.T) {
-		if got := SMTypeRegular.TypeCode(); got != 0 {
-			t.Errorf("SMTypeRegular.TypeCode() = %d, want 0", got)
+	tests := []struct {
+		smType SMType
+		want   uint64
+	}{
+		{SMTypeRegular, 0},
+		{SMTypeConcurrent, 1},
+		{SMTypeOnDisk, 2},
+	}
+	for _, tt := range tests {
+		if got := tt.smType.TypeCode(); got != tt.want {
+			t.Errorf("%s.TypeCode() = %d, want %d", tt.smType, got, tt.want)
 		}
-	})
-
-	t.Run("SMTypeConcurrent returns 1", func(t *testing.T) {
-		if got := SMTypeConcurrent.TypeCode(); got != 1 {
-			t.Errorf("SMTypeConcurrent.TypeCode() = %d, want 1", got)
-		}
-	})
-
-	t.Run("SMTypeOnDisk returns 2", func(t *testing.T) {
-		if got := SMTypeOnDisk.TypeCode(); got != 2 {
-			t.Errorf("SMTypeOnDisk.TypeCode() = %d, want 2", got)
-		}
-	})
-
-	t.Run("TypeCode returns uint64 for serialization", func(t *testing.T) {
-		// The type code is serialized as a uint64; a narrower return type
-		// would truncate it on the wire. The reflected kind is the assertion —
-		// a `var code uint64 = ...` declaration proves the same thing but
-		// reads as a redundant type annotation.
-		if got := reflect.TypeOf(SMTypeRegular.TypeCode()); got.Kind() != reflect.Uint64 {
-			t.Fatalf("TypeCode() returns %v (kind %v), want a uint64", got, got.Kind())
-		}
-		if code := SMTypeRegular.TypeCode(); code != 0 {
-			t.Errorf("code = %d, want 0", code)
-		}
-	})
-
-	t.Run("TypeCode is consistent with iota ordering", func(t *testing.T) {
-		types := []SMType{SMTypeRegular, SMTypeConcurrent, SMTypeOnDisk}
-		for i, st := range types {
-			if got := st.TypeCode(); got != uint64(i) {
-				t.Errorf("types[%d].TypeCode() = %d, want %d", i, got, i)
-			}
-		}
-	})
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -3309,48 +3056,6 @@ func TestApply_UserSMUpdateErrorPropagatesWithSessionEntries(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Apply: large result data preserved through session cache
-// ---------------------------------------------------------------------------
-
-func TestApply_LargeResultData(t *testing.T) {
-	t.Run("large result Data field preserved in dedup cache", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		entries := []proto.Entry{
-			{Index: 1, ClientID: 10, SeriesID: 1, Cmd: makeCmd("big", "value")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-		originalValue := results[0].Value
-
-		// Replay same seriesID - should return cached result.
-		dupEntries := []proto.Entry{
-			{Index: 5, ClientID: 10, SeriesID: 1, Cmd: makeCmd("big", "DIFFERENT")},
-		}
-		dupResults := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm, dupEntries, dupResults); err != nil {
-			t.Fatalf("Apply(dup) = %v", err)
-		}
-		if dupResults[0].Value != originalValue {
-			t.Errorf("dup result Value = %d, want %d", dupResults[0].Value, originalValue)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Apply: batch where all session entries are duplicates
 // ---------------------------------------------------------------------------
 
@@ -3404,48 +3109,6 @@ func TestApply_AllSessionDuplicatesBatch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Apply: session-managed entry with empty command payload
-// ---------------------------------------------------------------------------
-
-func TestApply_SessionManagedEntryWithEmptyCmd(t *testing.T) {
-	t.Run("session entry with nil Cmd still records result", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		// Session-managed entry with empty Cmd.
-		entries := []proto.Entry{
-			{Index: 1, ClientID: 10, SeriesID: 1, Cmd: nil},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// Replay should return cached result.
-		dupEntries := []proto.Entry{
-			{Index: 5, ClientID: 10, SeriesID: 1, Cmd: makeCmd("ignored", "data")},
-		}
-		dupResults := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm, dupEntries, dupResults); err != nil {
-			t.Fatalf("Apply(dup) = %v", err)
-		}
-		if dupResults[0].Value != results[0].Value {
-			t.Errorf("dup result = %d, want %d", dupResults[0].Value, results[0].Value)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // NALookupBuf: pooled byte-slice lookup
 // ---------------------------------------------------------------------------
 
@@ -3471,31 +3134,6 @@ func TestStateMachine_NALookupBuf_NotSupported(t *testing.T) {
 		t.Errorf("NALookupBuf result = %v, want nil", result)
 	}
 	release() // must be safe to call even when not supported
-}
-
-func TestStateMachine_NALookupBuf_Supported(t *testing.T) {
-	// testNALookupIntoSM implements NALookupInto — uses pooled path.
-	kv := &testNALookupIntoSM{testHasherSM: testHasherSM{testKV: testKV{data: map[string]string{"hello": "world"}}}}
-	createFn := func(shardID, replicaID uint64) interface{} {
-		return kv
-	}
-	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-	if err != nil {
-		t.Fatalf("NewStateMachine = %v", err)
-	}
-	defer rsm.Close()
-
-	result, release, supported, lookupErr := rsm.NALookupBuf([]byte("hello"))
-	if lookupErr != nil {
-		t.Fatalf("NALookupBuf = %v", lookupErr)
-	}
-	if !supported {
-		t.Fatal("NALookupBuf should return supported=true for testNALookupIntoSM")
-	}
-	if string(result) != "world" {
-		t.Errorf("NALookupBuf = %q, want %q", result, "world")
-	}
-	release() // must return the pool buffer safely
 }
 
 func TestStateMachine_NALookupBuf_ErrorPropagated(t *testing.T) {

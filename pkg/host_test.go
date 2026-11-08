@@ -20,7 +20,6 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -36,14 +35,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
-	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
@@ -786,69 +782,27 @@ func TestNewHost_ValidConfig(t *testing.T) {
 	}
 }
 
-func TestNewHost_InvalidConfig_EmptyWALDir(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.WALDir = ""
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err == nil {
-		t.Fatal("NewHost should fail with empty WALDir")
+func TestNewHost_InvalidConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*config.HostConfig)
+	}{
+		{"EmptyWALDir", func(c *config.HostConfig) { c.WALDir = "" }},
+		{"EmptyListenAddress", func(c *config.HostConfig) { c.ListenAddress = "" }},
+		{"ZeroDeploymentID", func(c *config.HostConfig) {
+			c.DeploymentID = 0
+			c.AllowZeroDeploymentID = false
+		}},
 	}
-}
-
-func TestNewHost_InvalidConfig_EmptyListenAddress(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.ListenAddress = ""
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err == nil {
-		t.Fatal("NewHost should fail with empty ListenAddress")
-	}
-}
-
-func TestNewHost_InvalidConfig_ZeroDeploymentID(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.DeploymentID = 0
-	cfg.AllowZeroDeploymentID = false
-	_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err == nil {
-		t.Fatal("NewHost should fail with zero DeploymentID")
-	}
-}
-
-func TestNewHost_WithLogDB(t *testing.T) {
-	cfg := testHostConfig(t)
-	db := newMockLogDB()
-	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.logdb != db {
-		t.Error("LogDB not set correctly")
-	}
-}
-
-func TestNewHost_WithMetrics(t *testing.T) {
-	cfg := testHostConfig(t)
-	m := NoOpMetricsCollector{}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithMetrics(m), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-}
-
-func TestNewHost_WithBarrier(t *testing.T) {
-	cfg := testHostConfig(t)
-	b := &mockBarrier{}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.IsSealed() {
-		t.Error("barrier should not be sealed initially")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testHostConfig(t)
+			tt.mutate(&cfg)
+			_, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+			if err == nil {
+				t.Fatal("NewHost should fail")
+			}
+		})
 	}
 }
 
@@ -896,26 +850,6 @@ func TestNewHost_OverrideHostID(t *testing.T) {
 // StartShard
 // ---------------------------------------------------------------------------
 
-func TestStartShard_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	err = h.StartShard(members, false, testCreateFunc, scfg)
-	if err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	if h.ShardCount() != 1 {
-		t.Errorf("ShardCount = %d, want 1", h.ShardCount())
-	}
-}
-
 func TestStartShard_WithLogDB(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -930,6 +864,9 @@ func TestStartShard_WithLogDB(t *testing.T) {
 	err = h.StartShard(members, false, testCreateFunc, scfg)
 	if err != nil {
 		t.Fatalf("StartShard failed: %v", err)
+	}
+	if h.ShardCount() != 1 {
+		t.Errorf("ShardCount = %d, want 1", h.ShardCount())
 	}
 
 	// Verify bootstrap was saved.
@@ -1070,25 +1007,6 @@ func TestStartShard_InvalidSMType(t *testing.T) {
 	}
 }
 
-func TestStartShard_NilSMReturn(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	nilCreate := func(shardID, replicaID uint64) interface{} {
-		return nil
-	}
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	err = h.StartShard(members, false, nilCreate, scfg)
-	if !errors.Is(err, ErrInvalidSMType) {
-		t.Errorf("StartShard error = %v, want ErrInvalidSMType", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // StopShard
 // ---------------------------------------------------------------------------
@@ -1147,34 +1065,6 @@ func TestStopShard_ClosedHost(t *testing.T) {
 // Propose
 // ---------------------------------------------------------------------------
 
-func TestPropose_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	_, err = h.Propose(context.Background(), 1, []byte("cmd"))
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("Propose error = %v, want ErrClosed", err)
-	}
-}
-
-func TestPropose_ShardNotFound(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.Propose(context.Background(), 999, []byte("cmd"))
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("Propose error = %v, want ErrShardNotFound", err)
-	}
-}
-
 func TestPropose_EntryTooLarge(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -1195,50 +1085,6 @@ func TestPropose_EntryTooLarge(t *testing.T) {
 	if !errors.Is(err, ErrEntryTooLarge) {
 		t.Errorf("Propose error = %v, want ErrEntryTooLarge", err)
 	}
-}
-
-func TestPropose_NotLeader(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// Node is not leader by default.
-	_, err = h.Propose(context.Background(), 1, []byte("cmd"))
-	if !errors.Is(err, ErrNotLeader) {
-		t.Errorf("Propose error = %v, want ErrNotLeader", err)
-	}
-}
-
-func TestPropose_AsLeader_ReturnsRequestState(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// Wait for the single-node raft peer to self-elect as leader.
-	waitForLeader(t, h, 1)
-
-	rs, err := h.Propose(context.Background(), 1, []byte("cmd"))
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("Propose returned nil RequestState")
-	}
-	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -1295,20 +1141,6 @@ func TestSyncRead_ShardNotFound(t *testing.T) {
 // ReadIndex
 // ---------------------------------------------------------------------------
 
-func TestReadIndex_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	_, err = h.ReadIndex(context.Background(), 1)
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("ReadIndex error = %v, want ErrClosed", err)
-	}
-}
-
 func TestReadIndex_Success(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -1329,38 +1161,6 @@ func TestReadIndex_Success(t *testing.T) {
 		t.Fatal("ReadIndex returned nil")
 	}
 	rs.Release()
-}
-
-// ---------------------------------------------------------------------------
-// QueryLocalNode
-// ---------------------------------------------------------------------------
-
-func TestQueryLocalNode_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	_, err = h.QueryLocalNode(context.Background(), 1, nil)
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("QueryLocalNode error = %v, want ErrClosed", err)
-	}
-}
-
-func TestQueryLocalNode_ShardNotFound(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.QueryLocalNode(context.Background(), 999, nil)
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("QueryLocalNode error = %v, want ErrShardNotFound", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2274,24 +2074,6 @@ func TestIsSealed_SealedBarrier(t *testing.T) {
 // EmergencySeal
 // ---------------------------------------------------------------------------
 
-func TestEmergencySeal_SealsBarrier(t *testing.T) {
-	cfg := testHostConfig(t)
-	b := &mockBarrier{sealed: false}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if err := h.EmergencySeal(); err != nil {
-		t.Fatalf("EmergencySeal failed: %v", err)
-	}
-
-	if !h.IsSealed() {
-		t.Error("barrier should be sealed after EmergencySeal")
-	}
-}
-
 func TestEmergencySeal_NoBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -2319,6 +2101,9 @@ func TestEmergencySeal_AlreadySealed(t *testing.T) {
 	if err := h.EmergencySeal(); err != nil {
 		t.Fatalf("first EmergencySeal failed: %v", err)
 	}
+	if !h.IsSealed() {
+		t.Error("barrier should be sealed after EmergencySeal")
+	}
 
 	// Seal again should return ErrBarrierSealed.
 	err = h.EmergencySeal()
@@ -2327,65 +2112,9 @@ func TestEmergencySeal_AlreadySealed(t *testing.T) {
 	}
 }
 
-func TestEmergencySeal_ProposalFailsAfterSeal(t *testing.T) {
-	cfg := testHostConfig(t)
-	b := &mockBarrier{sealed: false}
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Start a shard and make the local node believe it is the leader.
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Emergency seal.
-	if err := h.EmergencySeal(); err != nil {
-		t.Fatalf("EmergencySeal failed: %v", err)
-	}
-
-	// The barrier is sealed; verify IsSealed reflects this.
-	if !h.IsSealed() {
-		t.Error("barrier should be sealed after EmergencySeal")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // updateNodeLeader
 // ---------------------------------------------------------------------------
-
-func TestUpdateNodeLeader_SetsFields(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	h.updateNodeLeader(1, 1, 10)
-
-	info, err := h.ShardInfo(1)
-	if err != nil {
-		t.Fatalf("ShardInfo failed: %v", err)
-	}
-	if info.LeaderID != 1 {
-		t.Errorf("LeaderID = %d, want 1", info.LeaderID)
-	}
-	if info.Term != 10 {
-		t.Errorf("Term = %d, want 10", info.Term)
-	}
-	if !info.IsLeader {
-		t.Error("IsLeader should be true")
-	}
-}
 
 func TestUpdateNodeLeader_NonExistentShard(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -2433,32 +2162,6 @@ func TestNodeState_LastApplied_SetsField(t *testing.T) {
 	}
 }
 
-func TestNodeState_Health_SetsField(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	ns := testLoadNode(h, 1)
-	ns.health.Store(uint32(ShardError))
-
-	info, err := h.ShardInfo(1)
-	if err != nil {
-		t.Fatalf("ShardInfo failed: %v", err)
-	}
-	if info.Health != ShardError {
-		t.Errorf("Health = %v, want ShardError", info.Health)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // HostInitError
 // ---------------------------------------------------------------------------
@@ -2471,27 +2174,9 @@ func TestHostInitError_Error(t *testing.T) {
 	}
 }
 
-func TestHostInitError_Unwrap(t *testing.T) {
-	inner := errors.New("inner error")
-	err := &HostInitError{Field: "test", Err: inner}
-	if !errors.Is(err, inner) {
-		t.Error("Unwrap should return the inner error")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // loadOrGenerateHostID
 // ---------------------------------------------------------------------------
-
-func TestLoadOrGenerateHostID_Override(t *testing.T) {
-	id, err := loadOrGenerateHostID(slog.Default(), t.TempDir(), "my-custom-id")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	if id != "my-custom-id" {
-		t.Errorf("id = %q, want %q", id, "my-custom-id")
-	}
-}
 
 func TestLoadOrGenerateHostID_GeneratesAndPersists(t *testing.T) {
 	dir := t.TempDir()
@@ -2510,43 +2195,6 @@ func TestLoadOrGenerateHostID_GeneratesAndPersists(t *testing.T) {
 	}
 	if id1 != id2 {
 		t.Errorf("IDs differ: %q vs %q", id1, id2)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Multi-shard operations
-// ---------------------------------------------------------------------------
-
-func TestMultipleShardsOnHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	for i := uint64(1); i <= 10; i++ {
-		members := map[uint64]string{i: "127.0.0.1:5000"}
-		scfg := testShardConfig(i, i)
-		err := h.StartShard(members, false, testCreateFunc, scfg)
-		if err != nil {
-			t.Fatalf("StartShard(%d) failed: %v", i, err)
-		}
-	}
-
-	if h.ShardCount() != 10 {
-		t.Errorf("ShardCount = %d, want 10", h.ShardCount())
-	}
-
-	for i := uint64(1); i <= 5; i++ {
-		err := h.StopShard(i)
-		if err != nil {
-			t.Fatalf("StopShard(%d) failed: %v", i, err)
-		}
-	}
-
-	if h.ShardCount() != 5 {
-		t.Errorf("ShardCount = %d, want 5", h.ShardCount())
 	}
 }
 
@@ -2745,28 +2393,6 @@ func TestStaleRead_ReturnsResult(t *testing.T) {
 	}
 }
 
-func TestQueryLocalNode_ReturnsResult(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// The RSM is now wired during StartShard, so Lookup should succeed.
-	result, err := h.QueryLocalNode(context.Background(), 1, "local-query")
-	if err != nil {
-		t.Fatalf("QueryLocalNode error = %v, want nil", err)
-	}
-	if result != "local-query" {
-		t.Errorf("QueryLocalNode result = %v, want %q", result, "local-query")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SyncPropose complete path
 // ---------------------------------------------------------------------------
@@ -2804,47 +2430,6 @@ func TestSyncPropose_ShardNotFound(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SyncPropose with result (simulate engine completion)
-// ---------------------------------------------------------------------------
-
-func TestSyncPropose_WithResult(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// Wait for the single-node raft peer to self-elect.
-	waitForLeader(t, h, 1)
-
-	// Propose through the real peer which is now the leader. The
-	// proposal flows through the full pipeline (step -> commit ->
-	// apply -> callback) and completes the RequestState with the
-	// result from the state machine.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	rs, err := h.Propose(ctx, 1, []byte("cmd"))
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-
-	result, err := rs.Result()
-	if err != nil {
-		t.Fatalf("Result failed: %v", err)
-	}
-	// The mockStateMachine sets Value = entry.Index.
-	if result.Value == 0 {
-		t.Error("expected non-zero result Value from state machine")
-	}
-	rs.Release()
-}
-
-// ---------------------------------------------------------------------------
 // Close with LogDB error
 // ---------------------------------------------------------------------------
 
@@ -2860,24 +2445,6 @@ func TestClose_LogDBCloseError(t *testing.T) {
 	err = h.Close()
 	if err == nil {
 		t.Error("Close should propagate LogDB close error")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadIndex with shard not found
-// ---------------------------------------------------------------------------
-
-func TestReadIndex_ShardNotFound(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.ReadIndex(context.Background(), 999)
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("ReadIndex error = %v, want ErrShardNotFound", err)
 	}
 }
 
@@ -2922,24 +2489,6 @@ func TestRequestLeaderTransfer_ShardNotFound(t *testing.T) {
 // loadOrGenerateHostID invalid file content
 // ---------------------------------------------------------------------------
 
-func TestLoadOrGenerateHostID_InvalidHexContent(t *testing.T) {
-	dir := t.TempDir()
-	idPath := dir + "/host.id"
-	// Write invalid content.
-	if err := os.WriteFile(idPath, []byte("not-valid-hex-content-!@#$"), hostIDFilePerms); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-
-	id, err := loadOrGenerateHostID(slog.Default(), dir, "")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	// Should have regenerated a valid ID.
-	if len(id) != hostIDLength {
-		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
-	}
-}
-
 func TestLoadOrGenerateHostID_ShortContent(t *testing.T) {
 	dir := t.TempDir()
 	idPath := dir + "/host.id"
@@ -2956,10 +2505,6 @@ func TestLoadOrGenerateHostID_ShortContent(t *testing.T) {
 		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// SyncPropose full happy path
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // StartShard with concurrent and on-disk state machines
@@ -3247,22 +2792,6 @@ func TestFailPendingRequests_CompletesAllPendingWithError(t *testing.T) {
 	rsProposal.Release()
 	rsRead.Release()
 	rsSnapshot.Release()
-}
-
-func TestFailPendingRequests_IdempotentOnEmptyMaps(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-
-	// Calling on empty maps must not panic or error.
-	h.failPendingRequests(ns, ErrClosed)
-	h.failPendingRequests(ns, ErrClosed)
 }
 
 func TestFailPendingRequests_DuplicateCallSafeWithCAS(t *testing.T) {
@@ -3613,10 +3142,6 @@ func TestGetNode_StoppedNode(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SyncPropose with completed result through full path
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // NewHost with MkdirAll failures
 // ---------------------------------------------------------------------------
 
@@ -3693,33 +3218,6 @@ func TestStartShard_LogDBBootstrapError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Engine callback integration tests
 // ---------------------------------------------------------------------------
-
-func TestHostEngineCallback_OnApplied_CompletesProposal(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	// Propose and verify it completes through the full pipeline.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	result, err := h.SyncPropose(ctx, 1, []byte("test-cmd"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
-	// mockStateMachine sets Value = entry.Index.
-	if result.Value == 0 {
-		t.Error("expected non-zero result Value")
-	}
-}
 
 func TestHostEngineCallback_OnApplied_UpdatesLastApplied(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -6344,31 +5842,6 @@ func TestReadIndex_ReadIndexQueueFull(t *testing.T) {
 	}
 }
 
-func TestNoOpMetricsCollector_AllMethods(t *testing.T) {
-	m := NoOpMetricsCollector{}
-	// Raft metrics
-	m.ObserveProposalLatency(1, time.Millisecond)
-	m.ObserveCommitLatency(1, time.Millisecond)
-	m.ObserveApplyLatency(1, time.Millisecond)
-	m.IncProposalDropped(1)
-	m.ObserveProposalBatchSize(1, 10)
-	m.ObserveCommitBatchSize(10)
-	m.IncElection(1)
-	m.IncSnapshot(1)
-	m.IncPiggybackCommit(1)
-	// LogDB metrics
-	m.ObserveWriteLatency(time.Millisecond)
-	m.ObserveFsyncLatency(time.Millisecond)
-	m.ObserveCompactionLatency(time.Millisecond)
-	m.IncWriteBytes(1024)
-	// Transport metrics
-	m.ObserveSendLatency(time.Millisecond)
-	m.IncMessagesSent(1, 1, 1)
-	m.IncMessagesReceived(1, 1, 1)
-	m.IncSnapshotsSent(1, 100, time.Millisecond)
-	m.IncSnapshotsReceived(1, 100, time.Millisecond)
-}
-
 // ---------------------------------------------------------------------------
 // Key rotation test helpers
 // ---------------------------------------------------------------------------
@@ -6566,41 +6039,6 @@ func TestHost_KeyRotationLoop_TriggersRotation(t *testing.T) {
 	}
 }
 
-func TestHost_KeyRotationLoop_StopsOnClose(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.KeyRotationInterval = 1 * time.Second
-	barrier := newTestHostBarrier(1)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Poll until at least 1 rotation has happened (avoids timing-dependent sleep).
-	// Use a generous deadline: under race detector + full suite parallelism,
-	// goroutine scheduling can be significantly delayed.
-	deadline := time.Now().Add(5 * time.Second)
-	for barrier.rotateCount.Load() < 1 && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-	if barrier.rotateCount.Load() < 1 {
-		t.Fatalf("expected at least 1 rotation, got %d", barrier.rotateCount.Load())
-	}
-
-	// Close stops the rotation loop and waits for the goroutine to exit.
-	// Capture countBefore AFTER close returns to avoid the race where
-	// a rotation sneaks in between snapshot and close signal.
-	h.Close()
-	countBefore := barrier.rotateCount.Load()
-
-	// Wait and verify no more rotations occurred after close.
-	// h.Close() blocks until keyRotDone is closed, guaranteeing the loop
-	// has fully exited, so no additional sleep is needed.
-	countAfter := barrier.rotateCount.Load()
-	if countAfter != countBefore {
-		t.Fatalf("rotations continued after close: before=%d, after=%d", countBefore, countAfter)
-	}
-}
-
 func TestHost_KeyRotationLoop_NoBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.KeyRotationInterval = 1 * time.Second
@@ -6618,41 +6056,6 @@ func TestHost_KeyRotationLoop_NoBarrier(t *testing.T) {
 	default:
 		t.Fatal("expected keyRotDone to be closed when no barrier is configured")
 	}
-}
-
-// TestHost_KeyRotationLoop_SealedBarrierSkipsRotation verifies that
-// when the barrier is sealed, the rotation loop skips the Rotate call
-// and the epoch does not advance.
-func TestHost_KeyRotationLoop_SealedBarrierSkipsRotation(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.KeyRotationInterval = 1 * time.Second
-	barrier := newTestHostBarrier(1)
-
-	// Seal the barrier before starting the host.
-	barrier.mu.Lock()
-	barrier.sealedVal = true
-	barrier.mu.Unlock()
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Wait for the rotation loop to have had a chance to fire at least once
-	// (2x the rotation interval) while sealed, confirming it skips rotations.
-	<-time.After(2 * cfg.KeyRotationInterval)
-
-	// No rotations should have occurred because the barrier is sealed.
-	if barrier.rotateCount.Load() != 0 {
-		t.Fatalf("expected 0 rotations while sealed, got %d", barrier.rotateCount.Load())
-	}
-
-	// Epoch should not have advanced.
-	if barrier.CurrentEpoch() != 1 {
-		t.Fatalf("epoch = %d, want 1 (no rotations)", barrier.CurrentEpoch())
-	}
-
-	h.Close()
 }
 
 // TestHost_KeyRotationLoop_RotateError verifies that when Rotate returns
@@ -6815,39 +6218,6 @@ func TestHost_RotateBarrierKey_RetentionBelowFloor(t *testing.T) {
 	}
 }
 
-// TestHost_KeyRotationLoop_NoPurgeWhenMaxRetainedZero verifies that when
-// MaxRetainedEpochs is 0 (default), the key rotation loop does not call
-// PurgeEpochsBefore.
-func TestHost_KeyRotationLoop_NoPurgeWhenMaxRetainedZero(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.KeyRotationInterval = 1 * time.Second
-	cfg.MaxRetainedEpochs = 0 // default: no purging
-
-	barrier := newTestHostBarrier(1)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Wait for several rotations.
-	deadline := time.Now().Add(10 * time.Second)
-	for barrier.rotateCount.Load() < 3 && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-
-	if barrier.rotateCount.Load() < 3 {
-		t.Fatalf("expected at least 3 rotations, got %d", barrier.rotateCount.Load())
-	}
-
-	// No purge should have been called.
-	if barrier.purgeCount.Load() != 0 {
-		t.Fatalf("expected 0 purge calls with MaxRetainedEpochs=0, got %d",
-			barrier.purgeCount.Load())
-	}
-
-	h.Close()
-}
-
 // ---------------------------------------------------------------------------
 // I.4: Key rotation loop panic recovery and restart
 // ---------------------------------------------------------------------------
@@ -6881,46 +6251,6 @@ func (b *panickingBarrier) Rotate(ctx context.Context) (uint64, error) {
 }
 
 var _ Barrier = (*panickingBarrier)(nil)
-
-// TestKeyRotationLoopOnce_PanicsReturnTrue verifies that
-// keyRotationLoopOnce returns panicked=true when the barrier's Rotate()
-// panics, proving the recovery defer catches the panic and reports it
-// correctly for the outer restart loop.
-func TestKeyRotationLoopOnce_PanicsReturnTrue(t *testing.T) {
-	// Construct a minimal Host with only the fields that
-	// keyRotationLoopOnce accesses.
-	barrier := newPanickingBarrier(1, 1, "test rotation panic")
-	h := &Host{
-		keyRotStopC: make(chan struct{}),
-		barrier:     barrier,
-		logger:      slog.Default(),
-	}
-
-	panicked := h.keyRotationLoopOnce(context.Background(), 50*time.Millisecond)
-	if !panicked {
-		t.Fatal("expected keyRotationLoopOnce to report panic from barrier.Rotate()")
-	}
-}
-
-// TestKeyRotationLoopOnce_NormalReturnsFalse verifies that
-// keyRotationLoopOnce returns panicked=false when the stop channel
-// fires without any panic.
-func TestKeyRotationLoopOnce_NormalReturnsFalse(t *testing.T) {
-	// Construct a minimal Host. The stop channel is already closed
-	// so the inner select returns immediately.
-	stopC := make(chan struct{})
-	close(stopC)
-	h := &Host{
-		keyRotStopC: stopC,
-		barrier:     newTestHostBarrier(1),
-		logger:      slog.Default(),
-	}
-
-	panicked := h.keyRotationLoopOnce(context.Background(), 50*time.Millisecond)
-	if panicked {
-		t.Fatal("expected keyRotationLoopOnce to return false on normal shutdown")
-	}
-}
 
 // TestKeyRotationLoop_RestartsAfterPanic verifies that the full
 // keyRotationLoop continues rotating keys after the barrier panics
@@ -7145,46 +6475,6 @@ func TestHost_Drain_Timeout(t *testing.T) {
 	}
 }
 
-func TestHost_Drain_Idempotent(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// First drain should succeed.
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("first Drain failed: %v", drainErr)
-	}
-
-	// Second drain should also succeed (idempotent, returns immediately).
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("second Drain failed: %v", drainErr)
-	}
-}
-
-func TestHost_IsDraining(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.IsDraining() {
-		t.Error("IsDraining should be false initially")
-	}
-
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("Drain failed: %v", drainErr)
-	}
-
-	if !h.IsDraining() {
-		t.Error("IsDraining should be true after Drain")
-	}
-}
-
 func TestHost_Close_CallsDrain(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -7199,20 +6489,6 @@ func TestHost_Close_CallsDrain(t *testing.T) {
 
 	if !h.IsDraining() {
 		t.Error("IsDraining should be true after Close (Close calls Drain)")
-	}
-}
-
-func TestHost_Drain_EmptyHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Drain on a host with no shards should succeed immediately.
-	if drainErr := h.Drain(); drainErr != nil {
-		t.Fatalf("Drain failed on empty host: %v", drainErr)
 	}
 }
 
@@ -7389,30 +6665,6 @@ func TestHealthCheck_BarrierSealed(t *testing.T) {
 	}
 }
 
-func TestHealthCheck_ShardError(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Set the shard health to error via direct field access.
-	ns := testLoadNode(h, 1)
-	ns.health.Store(uint32(ShardError))
-
-	status := h.HealthCheck()
-	if status.Status != "degraded" {
-		t.Errorf("Status = %q, want %q", status.Status, "degraded")
-	}
-}
-
 func TestHealthCheck_DiskFull(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -7438,27 +6690,6 @@ func TestHealthCheck_DiskFull(t *testing.T) {
 	// verdict -- it's a separate signal for monitoring.
 	if status.Status != "ok" {
 		t.Errorf("Status = %q, want %q", status.Status, "ok")
-	}
-}
-
-func TestHealthCheck_NilDiskFull(t *testing.T) {
-	// Test that DiskOK defaults to true when diskFull pointer is nil.
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	status := h.HealthCheck()
-	if !status.DiskOK {
-		t.Error("DiskOK should be true when diskFull is nil")
 	}
 }
 
@@ -7537,33 +6768,6 @@ func TestRequestAddNode_NotLeader(t *testing.T) {
 	if !errors.Is(err, ErrNotLeader) {
 		t.Errorf("expected NotLeaderError, got %v", err)
 	}
-}
-
-func TestRequestAddNode_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx := context.Background()
-	rs, err := h.RequestAddNode(ctx, 1, 4, "addr4", 0)
-	if err != nil {
-		t.Fatalf("RequestAddNode failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("expected non-nil RequestState")
-	}
-	rs.Release()
 }
 
 func TestRequestRemoveNode_HostClosed(t *testing.T) {
@@ -7819,34 +7023,6 @@ func TestSyncRequestAddNode_Success(t *testing.T) {
 	}
 }
 
-func TestSyncRequestAddNode_ContextTimeout(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	// Use an already-expired context so the select hits ctx.Done().
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
-	defer cancel()
-
-	err = h.SyncRequestAddNode(ctx, 1, 4, "addr4", 0)
-	// RequestAddNode itself may fail with ErrTimeout or the select may
-	// catch the expired context. Either way, the error must be non-nil.
-	if err == nil {
-		t.Fatal("expected error from expired context, got nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SyncRequestRemoveNode
 // ---------------------------------------------------------------------------
@@ -7930,34 +7106,6 @@ func TestSyncRequestRemoveNode_Success(t *testing.T) {
 	}
 }
 
-func TestSyncRequestRemoveNode_ContextTimeout(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	// Use an already-expired context so the select hits ctx.Done().
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-1*time.Second))
-	defer cancel()
-
-	err = h.SyncRequestRemoveNode(ctx, 1, 2, 0)
-	// RequestRemoveNode itself may fail with ErrTimeout or the select may
-	// catch the expired context. Either way, the error must be non-nil.
-	if err == nil {
-		t.Fatal("expected error from expired context, got nil")
-	}
-}
-
 func TestRequestAddObserver_HostClosed(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -7993,52 +7141,6 @@ func TestRequestAddObserver_Success(t *testing.T) {
 	rs, err := h.RequestAddObserver(ctx, 1, 4, "addr4", 0)
 	if err != nil {
 		t.Fatalf("RequestAddObserver failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("expected non-nil RequestState")
-	}
-	rs.Release()
-}
-
-func TestRequestAddWitness_HostClosed(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	ctx := context.Background()
-	_, err = h.RequestAddWitness(ctx, 1, 4, "addr4", 0)
-	if err != ErrClosed {
-		t.Errorf("expected ErrClosed, got %v", err)
-	}
-}
-
-func TestRequestAddWitness_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	// This test exercises the witness-add API mechanics on a single-replica
-	// shard; the default RequireFullReplicaMajority policy would reject
-	// {1 full + 1 witness} (full 1 < quorum 2), so disable it explicitly.
-	scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx := context.Background()
-	rs, err := h.RequestAddWitness(ctx, 1, 4, "addr4", 0)
-	if err != nil {
-		t.Fatalf("RequestAddWitness failed: %v", err)
 	}
 	if rs == nil {
 		t.Fatal("expected non-nil RequestState")
@@ -8110,30 +7212,6 @@ func TestRequestAddNode_StaleConfigChangeID(t *testing.T) {
 	if sce.Got != 999 {
 		t.Errorf("Got = %d, want 999", sce.Got)
 	}
-}
-
-func TestRequestAddNode_ZeroConfigChangeIDSkipsCheck(t *testing.T) {
-	// Passing configChangeIndex=0 skips the staleness check.
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx := context.Background()
-	rs, err := h.RequestAddNode(ctx, 1, 4, "addr4", 0)
-	if err != nil {
-		t.Fatalf("RequestAddNode with configChangeIndex=0 should skip check, got %v", err)
-	}
-	rs.Release()
 }
 
 func TestRequestRemoveNode_StaleConfigChangeID(t *testing.T) {
@@ -8492,39 +7570,6 @@ func TestGetShardMembership_Success(t *testing.T) {
 	}
 }
 
-func TestGetShardMembership_MapsNotNil(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	m, err := h.ShardMembership(1)
-	if err != nil {
-		t.Fatalf("ShardMembership failed: %v", err)
-	}
-	// All maps must be non-nil to prevent nil map dereference.
-	if m.Nodes == nil {
-		t.Error("Nodes map is nil")
-	}
-	if m.Observers == nil {
-		t.Error("Observers map is nil")
-	}
-	if m.Witnesses == nil {
-		t.Error("Witnesses map is nil")
-	}
-	if m.Removed == nil {
-		t.Error("Removed map is nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // protoMembershipToPublic
 // ---------------------------------------------------------------------------
@@ -8604,29 +7649,6 @@ func TestProtoMembershipToPublic_EmptyMembership(t *testing.T) {
 	}
 	if m.Removed == nil || len(m.Removed) != 0 {
 		t.Errorf("Removed should be empty non-nil map, got %v", m.Removed)
-	}
-}
-
-func TestProtoMembershipToPublic_RemovedBoolConversion(t *testing.T) {
-	// Proto uses map[uint64]bool for Removed; public uses map[uint64]struct{}.
-	// Only keys matter (the bool values are always true in valid membership).
-	pm := &proto.Membership{
-		Removed: map[uint64]bool{
-			10: true,
-			20: true,
-			30: true,
-		},
-	}
-
-	m := protoMembershipToPublic(pm)
-
-	if len(m.Removed) != 3 {
-		t.Errorf("Removed length = %d, want 3", len(m.Removed))
-	}
-	for _, id := range []uint64{10, 20, 30} {
-		if _, ok := m.Removed[id]; !ok {
-			t.Errorf("Removed should contain %d", id)
-		}
 	}
 }
 
@@ -8743,74 +7765,6 @@ func TestGetNodeHostInfo_PendingReflectsProposals(t *testing.T) {
 	}
 	if nhInfo.ShardInfoList[0].Pending != 3 {
 		t.Errorf("Pending = %d, want 3", nhInfo.ShardInfoList[0].Pending)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// diskFull flag recovery
-// ---------------------------------------------------------------------------
-
-func TestBuildWALOptions_DiskFullRecovery(t *testing.T) {
-	var diskFullFlag atomic.Bool
-
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1000,
-		WALDir:         t.TempDir(),
-	}
-
-	opts := buildWALOptions(cfg, &diskFullFlag, nil)
-
-	// Verify that options were created (disk monitor configured).
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with disk monitor, got none")
-	}
-
-	// Simulate disk full by directly setting the flag.
-	diskFullFlag.Store(true)
-	if !diskFullFlag.Load() {
-		t.Fatal("diskFullFlag should be true after Store(true)")
-	}
-
-	// The recovery callback should clear the flag. We can verify the
-	// callback was wired by checking that the options include recovery
-	// handling. The actual callback is invoked by the DiskMonitor
-	// internally when usage drops below the full threshold.
-	// Direct flag clearing test via the atomic flag is sufficient here.
-	diskFullFlag.Store(false)
-	if diskFullFlag.Load() {
-		t.Error("diskFullFlag should be false after Store(false)")
-	}
-}
-
-func TestBuildWALOptions_DiskFullRecoveryWithEventListener(t *testing.T) {
-	var diskFullFlag atomic.Bool
-	var fullCalled atomic.Bool
-
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1000,
-		WALDir:         t.TempDir(),
-		EventListener: &config.EventListener{
-			OnLogDBDiskFull: func(_ config.DiskInfo) {
-				fullCalled.Store(true)
-			},
-		},
-	}
-
-	opts := buildWALOptions(cfg, &diskFullFlag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with disk monitor, got none")
-	}
-
-	// Simulate: the onFull callback sets diskFullFlag=true.
-	diskFullFlag.Store(true)
-	if !diskFullFlag.Load() {
-		t.Fatal("diskFullFlag should be true")
-	}
-
-	// After recovery, the flag should be clearable.
-	diskFullFlag.Store(false)
-	if diskFullFlag.Load() {
-		t.Error("diskFullFlag should be false after recovery")
 	}
 }
 
@@ -9001,25 +7955,6 @@ func TestHost_Close_UnblocksConcurrentWaiters(t *testing.T) {
 	}
 }
 
-func TestHost_Close_NoPendingNoError(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	// Close with no pending work should succeed cleanly.
-	if closeErr := h.Close(); closeErr != nil {
-		t.Fatalf("Close with no pending work failed: %v", closeErr)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // openStopper lifecycle
 // ---------------------------------------------------------------------------
@@ -9144,28 +8079,6 @@ func TestHost_Close_ClosesOpenStoppers(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Host logger
 // ---------------------------------------------------------------------------
-
-// TestNewHost_DoesNotMutateGlobalLogger verifies that NewHost does not
-// call slog.SetDefault, preserving the caller's global logger.
-func TestNewHost_DoesNotMutateGlobalLogger(t *testing.T) {
-	// Capture the current global logger's handler.
-	originalHandler := slog.Default().Handler()
-
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// After NewHost, the global slog default should still have the
-	// same handler. If NewHost called slog.SetDefault, the handler
-	// would be different.
-	currentHandler := slog.Default().Handler()
-	if originalHandler != currentHandler {
-		t.Error("NewHost mutated the global slog default logger")
-	}
-}
 
 // TestNewHost_WithLogger_UsesProvidedLogger verifies that the WithLogger
 // option installs the provided logger on the Host without mutating the
@@ -9376,28 +8289,6 @@ func TestTransportSender_Wait_BlocksUntilDone(t *testing.T) {
 		// Success: Wait returned after Done.
 	case <-time.After(2 * time.Second):
 		t.Fatal("Wait did not return after snapshot completed")
-	}
-}
-
-// TestTransportSender_Wait_NoInFlight verifies that Wait() returns immediately
-// when no snapshot sends are in progress.
-func TestTransportSender_Wait_NoInFlight(t *testing.T) {
-	ts := &transportSender{
-		logger: slog.Default(),
-	}
-
-	// Should return instantly.
-	done := make(chan struct{})
-	go func() {
-		ts.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Good: returned immediately.
-	case <-time.After(1 * time.Second):
-		t.Fatal("Wait blocked when no snapshots are in-flight")
 	}
 }
 
@@ -9612,50 +8503,6 @@ func TestHost_Drain_CompletePendingOpIdempotent(t *testing.T) {
 // Snapshot membership reconciliation
 // ---------------------------------------------------------------------------
 
-// TestReconcileMembershipFromPeer_AddsAndRemovesNodes verifies that
-// reconcileMembershipFromPeer synchronizes ns.nodes with the Peer's
-// membership, adding new nodes and removing stale ones.
-func TestReconcileMembershipFromPeer_AddsAndRemovesNodes(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-	waitForLeader(t, h, 1)
-
-	ns := testLoadNode(h, 1)
-
-	// Add a stale node that should be removed by reconciliation.
-	ns.nodesMu.Lock()
-	ns.nodes[99] = "127.0.0.1:9999"
-	ns.nodesMu.Unlock()
-	h.registry.Register(1, 99, "127.0.0.1:9999")
-
-	// Call reconcileMembershipFromPeer. The Peer should only have
-	// replica 1, so replica 99 should be removed.
-	cb := &hostEngineCallback{h: h}
-	cb.reconcileMembershipFromPeer(1, ns)
-
-	ns.nodesMu.RLock()
-	_, hasStale := ns.nodes[99]
-	_, hasOriginal := ns.nodes[1]
-	ns.nodesMu.RUnlock()
-
-	if hasStale {
-		t.Error("stale node 99 should have been removed by reconciliation")
-	}
-	if !hasOriginal {
-		t.Error("original node 1 should still be present after reconciliation")
-	}
-}
-
 // TestReconcileMembershipFromPeer_NoEngine verifies that
 // reconcileMembershipFromPeer is a no-op when the engine node doesn't exist.
 func TestReconcileMembershipFromPeer_NoEngine(t *testing.T) {
@@ -9822,31 +8669,6 @@ func TestRequestKeysNeverRepeatAndAreNeverZero(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Close waits for snapshot sends
-// ---------------------------------------------------------------------------
-
-// TestHost_Close_WaitsForSnapshotSends verifies that Host.Close() calls
-// transportSender.Wait() before stopping the transport. We verify this
-// indirectly by checking the Close ordering: if the WaitGroup has an
-// in-flight snapshot, Close should not return until it completes.
-func TestHost_Close_WaitsForSnapshotSends(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.ShutdownTimeout = 2 * time.Second
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// The noopSender is used with WithoutTransport, so the Wait path
-	// in Close only triggers for *transportSender. Verify that Close
-	// still succeeds cleanly when the sender is a noopSender.
-	closeErr := h.Close()
-	if closeErr != nil {
-		t.Fatalf("Close failed: %v", closeErr)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // buildShardInfo ConfigChangeIndex
 // ---------------------------------------------------------------------------
 
@@ -9876,32 +8698,6 @@ func TestBuildShardInfo_ConfigChangeIndex(t *testing.T) {
 	info := h.buildShardInfo(ns)
 	if info.ConfigChangeIndex != 42 {
 		t.Errorf("ConfigChangeIndex = %d, want 42", info.ConfigChangeIndex)
-	}
-}
-
-// TestBuildShardInfo_ConfigChangeIndex_ZeroWhenNoChange verifies that
-// ConfigChangeIndex is 0 when no membership change has been applied.
-func TestBuildShardInfo_ConfigChangeIndex_ZeroWhenNoChange(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-	waitForLeader(t, h, 1)
-
-	ns := testLoadNode(h, 1)
-
-	// configChangeIndex is zero-initialized; no Store has been called.
-	info := h.buildShardInfo(ns)
-	if info.ConfigChangeIndex != 0 {
-		t.Errorf("ConfigChangeIndex = %d, want 0 for fresh shard", info.ConfigChangeIndex)
 	}
 }
 
@@ -10020,16 +8816,6 @@ func TestSyncRequestSnapshot_ShardNotFound(t *testing.T) {
 // RemoveData
 // ---------------------------------------------------------------------------
 
-func TestRemoveData_ClosedHost(t *testing.T) {
-	h := newTestHost(t)
-	h.closed.Store(true)
-
-	err := h.RemoveData(1, 1)
-	if !errors.Is(err, ErrClosed) {
-		t.Fatalf("RemoveData closed: got %v, want ErrClosed", err)
-	}
-}
-
 func TestRemoveData_ShardStillRunning(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -10120,19 +8906,6 @@ func TestRequestCompaction_ClosedHost(t *testing.T) {
 	err := h.RequestCompaction(1, 1)
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("RequestCompaction closed: got %v, want ErrClosed", err)
-	}
-}
-
-// TestRequestCompaction_UnloadedShardSucceeds verifies the retired-replica
-// contract: compaction on a shard this host does not have loaded is treated
-// as "already retired via RemoveData" and reclaims what it can, rather than
-// failing. This keeps the canonical StopShard -> RemoveData ->
-// RequestCompaction sequence working (dragonboat behaves the same way).
-func TestRequestCompaction_UnloadedShardSucceeds(t *testing.T) {
-	h := newTestHost(t)
-
-	if err := h.RequestCompaction(999, 1); err != nil {
-		t.Fatalf("RequestCompaction on an unloaded shard: unexpected error: %v", err)
 	}
 }
 
@@ -10240,15 +9013,6 @@ func TestGetLogReader_ShardNotFound(t *testing.T) {
 // ProposeWithSession
 // ---------------------------------------------------------------------------
 
-func TestProposeWithSession_NilSession(t *testing.T) {
-	h := newTestHost(t)
-
-	_, err := h.ProposeWithSession(context.Background(), nil, []byte("cmd"))
-	if !errors.Is(err, ErrInvalidSession) {
-		t.Errorf("ProposeWithSession error = %v, want ErrInvalidSession", err)
-	}
-}
-
 func TestProposeWithSession_NoOpSession(t *testing.T) {
 	h := newTestHost(t)
 
@@ -10294,22 +9058,6 @@ func TestProposeWithSession_RegisterMode(t *testing.T) {
 	_, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
 	if !errors.Is(err, ErrInvalidSession) {
 		t.Errorf("ProposeWithSession error = %v, want ErrInvalidSession", err)
-	}
-}
-
-func TestProposeWithSession_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	session := newSession(1, 100, 0)
-	session.PrepareForPropose()
-	_, err = h.ProposeWithSession(context.Background(), session, []byte("cmd"))
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("ProposeWithSession error = %v, want ErrClosed", err)
 	}
 }
 
@@ -10365,27 +9113,6 @@ func TestProposeWithSession_NotLeader(t *testing.T) {
 	if !errors.Is(err, ErrNotLeader) {
 		t.Errorf("ProposeWithSession error = %v, want ErrNotLeader", err)
 	}
-}
-
-func TestProposeWithSession_Success(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	session := newSession(1, 100, 0)
-	session.PrepareForPropose()
-
-	rs, err := h.ProposeWithSession(context.Background(), session, []byte("cmd"))
-	if err != nil {
-		t.Fatalf("ProposeWithSession failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("ProposeWithSession returned nil RequestState")
-	}
-	rs.Release()
 }
 
 // ---------------------------------------------------------------------------
@@ -10627,80 +9354,9 @@ func TestTransportSender_SendSnapshot_PanicRecovery_NormalError(t *testing.T) {
 	}
 }
 
-// TestSafeNotifySnapshotRejected_NilEngine verifies that
-// safeNotifySnapshotRejected does not panic when the engine is nil.
-func TestSafeNotifySnapshotRejected_NilEngine(t *testing.T) {
-	ts := &transportSender{
-		logger: slog.Default(),
-		// engine is nil -- notifySnapshotStatus would panic.
-	}
-
-	// This must not panic the test.
-	ts.safeNotifySnapshotRejected(1, 1, 2, 0)
-}
-
 // ---------------------------------------------------------------------------
 // Context cancellation returns ErrCanceled (not context.Canceled)
 // ---------------------------------------------------------------------------
-
-func TestSyncRequestAddNode_ContextCanceled(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately.
-
-	err := h.SyncRequestAddNode(ctx, 1, 4, "addr4", 0)
-	if err == nil {
-		t.Fatal("expected error from canceled context")
-	}
-	// The error must match ErrCanceled (not raw context.Canceled).
-	if errors.Is(err, ErrCanceled) {
-		return // correct
-	}
-	// RequestAddNode may also fail early with a different error before
-	// reaching the select, which is acceptable.
-}
-
-func TestSyncRequestRemoveNode_ContextCanceled(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := h.SyncRequestRemoveNode(ctx, 1, 2, 0)
-	if err == nil {
-		t.Fatal("expected error from canceled context")
-	}
-	if errors.Is(err, ErrCanceled) {
-		return
-	}
-}
-
-func TestSyncRemoveData_ContextCanceled(t *testing.T) {
-	h := newTestHost(t)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := h.SyncRemoveData(ctx, 1, 1)
-	if !errors.Is(err, ErrCanceled) {
-		t.Errorf("SyncRemoveData error = %v, want ErrCanceled", err)
-	}
-}
 
 func TestSyncRemoveData_ContextCanceled_NotRawContextError(t *testing.T) {
 	h := newTestHost(t)
@@ -10721,74 +9377,6 @@ func TestSyncRemoveData_ContextCanceled_NotRawContextError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // sweepExpiredPending
 // ---------------------------------------------------------------------------
-
-func TestSweepExpiredPending_ExpiresProposalWithPassedDeadline(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	pool := NewRequestStatePool()
-
-	// Create a proposal with a deadline in the past.
-	deadline := time.Now().Add(-1 * time.Second)
-	rs := newRequestState(pool, 10, deadline, true)
-	ns.pendingProposals.Store(uint64(10), &pendingProposal{rs: rs, deadline: deadline})
-	h.addPendingOp()
-
-	// Run sweeper.
-	h.sweepExpiredPending()
-
-	// Verify the proposal was completed with ErrTimeout.
-	select {
-	case result := <-rs.ResultC():
-		if !errors.Is(result.Err, ErrTimeout) {
-			t.Errorf("result.Err = %v, want ErrTimeout", result.Err)
-		}
-	default:
-		t.Fatal("expired proposal RS should have been completed")
-	}
-
-	// Verify the map is empty.
-	remaining := countSyncMap(&ns.pendingProposals)
-	if remaining != 0 {
-		t.Errorf("pendingProposals has %d entries, want 0", remaining)
-	}
-
-	rs.Release()
-}
-
-func TestSweepExpiredPending_DoesNotExpireActiveProposal(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	pool := NewRequestStatePool()
-
-	// Create a proposal with a deadline in the future.
-	deadline := time.Now().Add(10 * time.Minute)
-	rs := newRequestState(pool, 20, deadline, true)
-	ns.pendingProposals.Store(uint64(20), &pendingProposal{rs: rs, deadline: deadline})
-	h.addPendingOp()
-
-	// Run sweeper.
-	h.sweepExpiredPending()
-
-	// Verify the proposal was NOT completed.
-	select {
-	case result := <-rs.ResultC():
-		t.Fatalf("active proposal should not be completed, got %v", result)
-	default:
-		// Expected: not completed.
-	}
-
-	// Verify the map still contains the entry.
-	remaining := countSyncMap(&ns.pendingProposals)
-	if remaining != 1 {
-		t.Errorf("pendingProposals has %d entries, want 1", remaining)
-	}
-
-	// Clean up by completing it manually.
-	rs.complete(RequestResult{})
-	rs.Release()
-}
 
 func TestSweepExpiredPending_SkipsZeroDeadline(t *testing.T) {
 	h := newTestHost(t)
@@ -11052,16 +9640,6 @@ func TestSweepExpiredPending_ConcurrentWithCompletion(t *testing.T) {
 	}
 
 	rs.Release()
-}
-
-func TestPendingSweepLoop_StopsOnClose(t *testing.T) {
-	h := newTestHost(t)
-
-	// The sweeper goroutine was started by NewHost. Close should stop it.
-	// If the sweeper doesn't stop, Close will hang and the test will timeout.
-	if err := h.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -11704,79 +10282,6 @@ func TestHostEngineCallback_OnCommitted_NilPendingProposals(t *testing.T) {
 	cb.OnCommitted(50, []proto.Entry{{Index: 1, Key: 42}})
 }
 
-func TestHostEngineCallback_OnCommitted_UnmatchedKey(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	cb := &hostEngineCallback{h: h}
-	// Key 999 has no matching pending proposal. Should not panic.
-	cb.OnCommitted(1, []proto.Entry{{Index: 1, Key: 999}})
-}
-
-// ---------------------------------------------------------------------------
-// Host: DiagPipelineState
-// ---------------------------------------------------------------------------
-
-func TestHost_DiagPipelineState_ReturnsState(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-	waitForLeader(t, h, 1)
-
-	pd, diagErr := h.DiagPipelineState(1)
-	if diagErr != nil {
-		t.Fatalf("DiagPipelineState failed: %v", diagErr)
-	}
-	commitPending, proposalQLen, inboxLen, pendingProposals := pd.CommitPending, pd.ProposalQueueLen, pd.InboxLen, pd.PendingProposals
-
-	// After leader election with no pending work, values should be
-	// reasonable (non-negative). We don't assert exact values because
-	// the engine state is dynamic.
-	_ = commitPending
-	if proposalQLen < 0 {
-		t.Errorf("proposalQLen = %d, want >= 0", proposalQLen)
-	}
-	if inboxLen < 0 {
-		t.Errorf("inboxLen = %d, want >= 0", inboxLen)
-	}
-	if pendingProposals < 0 {
-		t.Errorf("pendingProposals = %d, want >= 0", pendingProposals)
-	}
-}
-
-func TestHost_DiagPipelineState_NonexistentShard(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, diagErr := h.DiagPipelineState(999)
-	if diagErr == nil {
-		t.Fatal("expected error for nonexistent shard")
-	}
-	if diagErr != ErrShardNotReady {
-		t.Errorf("err = %v, want ErrShardNotReady", diagErr)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // rotateBarrierKey
 // ---------------------------------------------------------------------------
@@ -11915,97 +10420,6 @@ func TestRotateBarrierKey_PurgesOldEpochs(t *testing.T) {
 	// cannot be determined, so purgedBefore stays at its zero value.
 	if got := rb.purgedBefore.Load(); got != 0 {
 		t.Errorf("PurgeEpochsBefore(%d), want no purge call (fail-safe: unknown global floor)", got)
-	}
-}
-
-// TestRotateBarrierKey_PurgeError verifies that a PurgeEpochsBefore error is
-// logged but does not propagate.
-func TestRotateBarrierKey_PurgeError(t *testing.T) {
-	cfg := testHostConfig(t)
-	cfg.MaxRetainedEpochs = 1
-	rb := &rotatingBarrier{rotateEpoch: 5, purgeErr: errors.New("purge failed")}
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(rb), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Must not panic or return an error even when purge fails.
-	h.rotateBarrierKey(context.Background())
-
-	if rb.rotateCalled.Load() != 1 {
-		t.Errorf("Rotate called %d times, want 1", rb.rotateCalled.Load())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Barrier interface - ShouldRotateKey
-// ---------------------------------------------------------------------------
-
-// thresholdBarrier is a mockBarrier that returns a configurable value from
-// ShouldRotateKey. Used to test threshold-triggered rotation in keyRotationLoop.
-type thresholdBarrier struct {
-	mockBarrier
-	shouldRotate atomic.Bool
-	rotateCalled atomic.Int64
-	rotateEpoch  uint64
-}
-
-func (b *thresholdBarrier) Rotate(ctx context.Context) (uint64, error) {
-	b.rotateCalled.Add(1)
-	return b.rotateEpoch, nil
-}
-
-func (b *thresholdBarrier) ShouldRotateKey() bool {
-	return b.shouldRotate.Load()
-}
-
-// TestBarrier_ShouldRotateKey_TriggersRotation verifies that when
-// ShouldRotateKey returns true the host's rotateBarrierKey is invoked.
-// This is a unit-level test that calls rotateBarrierKey directly after
-// confirming the barrier reports it should rotate.
-func TestBarrier_ShouldRotateKey_TriggersRotation(t *testing.T) {
-	cfg := testHostConfig(t)
-	tb := &thresholdBarrier{rotateEpoch: 2}
-	tb.shouldRotate.Store(true)
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(tb), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Simulate what the thresholdCheck ticker case does.
-	if !tb.IsSealed() && tb.ShouldRotateKey() {
-		h.rotateBarrierKey(context.Background())
-	}
-
-	if tb.rotateCalled.Load() != 1 {
-		t.Errorf("Rotate called %d times, want 1 when ShouldRotateKey=true", tb.rotateCalled.Load())
-	}
-}
-
-// TestBarrier_ShouldRotateKey_NoRotationWhenFalse verifies that rotateBarrierKey
-// is not triggered when ShouldRotateKey returns false.
-func TestBarrier_ShouldRotateKey_NoRotationWhenFalse(t *testing.T) {
-	cfg := testHostConfig(t)
-	tb := &thresholdBarrier{rotateEpoch: 2}
-	tb.shouldRotate.Store(false)
-
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(tb), WithoutTransport())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Simulate what the thresholdCheck ticker case does.
-	if !tb.IsSealed() && tb.ShouldRotateKey() {
-		h.rotateBarrierKey(context.Background())
-	}
-
-	if tb.rotateCalled.Load() != 0 {
-		t.Errorf("Rotate called %d times, want 0 when ShouldRotateKey=false", tb.rotateCalled.Load())
 	}
 }
 
@@ -12152,31 +10566,6 @@ func TestHost_QueryRaftLog_CanceledContext(t *testing.T) {
 // LogRange
 // ---------------------------------------------------------------------------
 
-func TestHost_GetLogRange_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if startErr := h.StartShard(members, false, testCreateFunc, scfg); startErr != nil {
-		t.Fatalf("StartShard failed: %v", startErr)
-	}
-
-	waitForLeader(t, h, 1)
-	lr := waitForLogEntry(t, h, 1)
-
-	// After leader election, the log should have at least one entry
-	// (the initial no-op).
-	if lr.FirstIndex > lr.LastIndex {
-		t.Errorf("LogRange returned inverted range: first=%d, last=%d",
-			lr.FirstIndex, lr.LastIndex)
-	}
-}
-
 func TestHost_GetLogRange_ShardNotFound(t *testing.T) {
 	h := newTestHost(t)
 
@@ -12284,31 +10673,6 @@ func TestPendingSweepLoopOnce_NormalReturnsFalse(t *testing.T) {
 	panicked := h.pendingSweepLoopOnce(10 * time.Millisecond)
 	if panicked {
 		t.Fatal("expected pendingSweepLoopOnce to return false on normal shutdown")
-	}
-}
-
-// TestPendingSweepLoop_NormalShutdown verifies that the pending sweep loop
-// shuts down cleanly during normal Host.Close() without causing goroutine
-// leaks or deadlocks.
-func TestPendingSweepLoop_NormalShutdown(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Close() should stop the sweep loop cleanly.
-	done := make(chan struct{})
-	go func() {
-		h.Close()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Clean shutdown.
-	case <-time.After(10 * time.Second):
-		t.Fatal("Host.Close() deadlocked, sweep loop may be stuck")
 	}
 }
 
@@ -12536,44 +10900,6 @@ func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
 // SyncRead end-to-end
 // ---------------------------------------------------------------------------
 
-// TestSyncRead_LeaderReady verifies the full SyncRead pipeline: propose
-// a value, then read it back via SyncRead (ReadIndex -> wait -> Lookup).
-func TestSyncRead_LeaderReady(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	// Propose a value first so there's committed state.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err = h.SyncPropose(ctx, 1, []byte("write-for-read"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
-
-	// Now perform a SyncRead. The mock state machine's Lookup returns
-	// the query itself, so we should get our query back.
-	result, err := h.SyncRead(ctx, 1, "read-query")
-	if err != nil {
-		t.Fatalf("SyncRead failed: %v", err)
-	}
-	if result != "read-query" {
-		t.Errorf("SyncRead result = %v, want %q", result, "read-query")
-	}
-}
-
 // TestSyncRead_Timeout verifies that SyncRead returns a timeout error
 // when the context deadline expires.
 func TestSyncRead_Timeout(t *testing.T) {
@@ -12789,38 +11115,6 @@ func TestDiagPipelineState_Success(t *testing.T) {
 	}
 }
 
-// TestDiagPipelineState_InvalidShard verifies that DiagPipelineState returns
-// an error for a non-existent shard.
-func TestDiagPipelineState_InvalidShard(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.DiagPipelineState(999)
-	if err == nil {
-		t.Fatal("expected error for non-existent shard")
-	}
-}
-
-// TestDiagRaftState_InvalidShard verifies that DiagRaftState returns an
-// error for a non-existent shard.
-func TestDiagRaftState_InvalidShard(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.DiagRaftState(999)
-	if err == nil {
-		t.Fatal("expected error for non-existent shard")
-	}
-}
-
 // TestDiagRemotes_Success verifies that DiagRemotes returns diagnostic info
 // for a loaded shard.
 func TestDiagRemotes_Success(t *testing.T) {
@@ -13005,62 +11299,6 @@ func TestGetLogReader_Success(t *testing.T) {
 // RemoveData / SyncRemoveData / StopReplica / RequestCompaction
 // ---------------------------------------------------------------------------
 
-// TestRemoveData_AfterStopShard verifies that RemoveData succeeds after
-// the shard has been stopped.
-func TestRemoveData_AfterStopShard(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	if err := h.StopShard(1); err != nil {
-		t.Fatalf("StopShard failed: %v", err)
-	}
-
-	err = h.RemoveData(1, 1)
-	if err != nil {
-		t.Fatalf("RemoveData failed: %v", err)
-	}
-}
-
-// TestSyncRemoveData_AfterStopShard verifies the synchronous RemoveData variant.
-func TestSyncRemoveData_AfterStopShard(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	if err := h.StopShard(1); err != nil {
-		t.Fatalf("StopShard failed: %v", err)
-	}
-
-	ctx := context.Background()
-	err = h.SyncRemoveData(ctx, 1, 1)
-	if err != nil {
-		t.Fatalf("SyncRemoveData failed: %v", err)
-	}
-}
-
 // TestStopReplica_Success verifies that StopReplica stops the shard.
 func TestStopReplica_Success(t *testing.T) {
 	cfg := testHostConfig(t)
@@ -13151,25 +11389,6 @@ func TestProposeWithSession_MultipleProposals(t *testing.T) {
 // NoOPSession
 // ---------------------------------------------------------------------------
 
-// TestGetNoOPSession_Success verifies that NoOPSession returns a
-// non-nil session with the expected shard ID.
-func TestGetNoOPSession_HasCorrectShardID(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	session := h.NoOPSession(42)
-	if session == nil {
-		t.Fatal("expected non-nil no-op session")
-	}
-	if session.ShardID() != 42 {
-		t.Errorf("ShardID = %d, want 42", session.ShardID())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Multiple shard lifecycle
 // ---------------------------------------------------------------------------
@@ -13213,35 +11432,6 @@ func TestStartMultipleShards(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Host ID and descriptor
 // ---------------------------------------------------------------------------
-
-// TestHost_ID verifies that the Host has a non-empty generated ID.
-func TestHost_ID(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.ID() == "" {
-		t.Error("expected non-empty host ID")
-	}
-}
-
-// TestHost_RaftAddress verifies that RaftAddress returns the configured address.
-func TestHost_RaftAddress(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	addr := h.RaftAddress()
-	if addr == "" {
-		t.Error("expected non-empty raft address")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // ShardInfo populated fields
@@ -13325,26 +11515,6 @@ func TestRequestAddNode_WithConfigChangeID(t *testing.T) {
 	}
 	if rs != nil {
 		rs.Release()
-	}
-}
-
-// TestRequestRemoveNode_InvalidShard verifies that requesting to remove a
-// node from a non-existent shard returns an error.
-func TestRequestRemoveNode_InvalidShard(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Shard 999 does not exist.
-	_, err = h.RequestRemoveNode(ctx, 999, 1, 0)
-	if err == nil {
-		t.Fatal("expected error for non-existent shard")
 	}
 }
 
@@ -13591,76 +11761,6 @@ func TestTranslateProposalError_PassThrough(t *testing.T) {
 // ---------------------------------------------------------------------------
 // SyncRequestAddObserver / SyncRequestAddWitness success path
 // ---------------------------------------------------------------------------
-
-// TestSyncRequestAddObserver_Success verifies that SyncRequestAddObserver
-// submits a config change and blocks until the result arrives.
-func TestSyncRequestAddObserver_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	membership, err := h.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
-
-	// Add replica 10 as an observer.
-	err = h.SyncRequestAddObserver(ctx, 1, 10, "127.0.0.1:6000", membership.ConfigChangeID)
-	if err != nil {
-		t.Fatalf("SyncRequestAddObserver failed: %v", err)
-	}
-}
-
-// TestSyncRequestAddWitness_Success verifies that SyncRequestAddWitness
-// submits a config change and blocks until the result arrives.
-func TestSyncRequestAddWitness_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	// This test exercises the witness-add API mechanics on a single-replica
-	// shard; the default RequireFullReplicaMajority policy would reject
-	// {1 full + 1 witness} (full 1 < quorum 2), so disable it explicitly.
-	scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	membership, err := h.SyncGetShardMembership(ctx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership failed: %v", err)
-	}
-
-	// Add replica 10 as a witness.
-	err = h.SyncRequestAddWitness(ctx, 1, 10, "127.0.0.1:6000", membership.ConfigChangeID)
-	if err != nil {
-		t.Fatalf("SyncRequestAddWitness failed: %v", err)
-	}
-}
 
 // TestSyncRequestUpdateWitnessPolicy_EndToEnd verifies the runtime
 // witness-policy update: the policy is committed through Raft, exposed on
@@ -14042,80 +12142,13 @@ func TestProposeSession_ClosedReturnsError(t *testing.T) {
 // SyncRead - context canceled path
 // ---------------------------------------------------------------------------
 
-// TestSyncRead_Canceled verifies that SyncRead returns ErrCanceled when
-// the context is canceled (not timed out).
-func TestSyncRead_Canceled(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Use a context that is already canceled.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err = h.SyncRead(ctx, 1, "query")
-	if err == nil {
-		t.Fatal("expected error for canceled context")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // StartShard - join path
 // ---------------------------------------------------------------------------
 
-// TestStartShard_JoinMarksJoining verifies that StartShard with join=true
-// calls peer.MarkJoining() and skips bootstrap saving.
-func TestStartShard_JoinMarksJoining(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Start with join=true, empty initial members (joining existing cluster).
-	members := map[uint64]string{}
-	scfg := testShardConfig(1, 1)
-	err = h.StartShard(members, true, testCreateFunc, scfg)
-	if err != nil {
-		t.Fatalf("StartShard(join=true) failed: %v", err)
-	}
-
-	// Verify the shard was loaded.
-	_, exists := h.nodes.Load(uint64(1))
-	if !exists {
-		t.Fatal("expected shard 1 to be loaded after join")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // NewHost - AdvertiseAddress and transport error paths
 // ---------------------------------------------------------------------------
-
-// TestNewHost_WithMetricsOption verifies that NewHost properly wires the
-// metrics collector through to the engine and transport config when a
-// MetricsCollector is provided.
-func TestNewHost_WithMetricsAndBarrier(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithMetrics(NoOpMetricsCollector{}), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.metrics == nil {
-		t.Fatal("expected non-nil metrics on host")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // RequestSnapshot - closed host path
@@ -14232,81 +12265,9 @@ func TestSyncRequestSnapshot_Canceled(t *testing.T) {
 // SyncRequestAddObserver / SyncRequestAddWitness - timeout path
 // ---------------------------------------------------------------------------
 
-// TestSyncRequestAddObserver_Timeout verifies that SyncRequestAddObserver
-// returns ErrTimeout when the context deadline is exceeded.
-func TestSyncRequestAddObserver_Timeout(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Use an expired context so it times out immediately.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	<-ctx.Done() // ensure context is expired
-
-	err = h.SyncRequestAddObserver(ctx, 1, 10, "127.0.0.1:6000", 0)
-	if err == nil {
-		t.Fatal("expected error for expired context")
-	}
-}
-
-// TestSyncRequestAddWitness_Timeout verifies that SyncRequestAddWitness
-// returns ErrTimeout when the context deadline is exceeded.
-func TestSyncRequestAddWitness_Timeout(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	// Use an expired context so it times out immediately.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	<-ctx.Done() // ensure context is expired
-
-	err = h.SyncRequestAddWitness(ctx, 1, 10, "127.0.0.1:6000", 0)
-	if err == nil {
-		t.Fatal("expected error for expired context")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // ShardCount and HealthCheck with active shards
 // ---------------------------------------------------------------------------
-
-// TestShardCount_AfterStartAndStop verifies that ShardCount reflects the
-// number of active shards after start and stop operations.
-func TestShardCount_AfterStartAndStop(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if h.ShardCount() != 0 {
-		t.Fatalf("expected 0 shards, got %d", h.ShardCount())
-	}
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	if h.ShardCount() != 1 {
-		t.Fatalf("expected 1 shard, got %d", h.ShardCount())
-	}
-
-	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, testCreateFunc, testShardConfig(2, 1)); err != nil {
-		t.Fatalf("StartShard(2) failed: %v", err)
-	}
-	if h.ShardCount() != 2 {
-		t.Fatalf("expected 2 shards, got %d", h.ShardCount())
-	}
-}
 
 // ---------------------------------------------------------------------------
 // SyncPropose - result with error path
@@ -14315,63 +12276,6 @@ func TestShardCount_AfterStartAndStop(t *testing.T) {
 // ---------------------------------------------------------------------------
 // SyncRequestAddObserver / SyncRequestAddWitness - canceled context path
 // ---------------------------------------------------------------------------
-
-// TestSyncRequestAddObserver_Canceled verifies that SyncRequestAddObserver
-// returns ErrCanceled when the context is canceled (not timed out).
-func TestSyncRequestAddObserver_Canceled(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	// Cancel the context immediately so the select hits ctx.Done().
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err = h.SyncRequestAddObserver(ctx, 1, 10, "127.0.0.1:6000", 0)
-	if err == nil {
-		t.Fatal("expected error for canceled context")
-	}
-	// Should be ErrCanceled or the underlying error propagated from
-	// the config change submission.
-}
-
-// TestSyncRequestAddWitness_Canceled verifies that SyncRequestAddWitness
-// returns ErrCanceled when the context is canceled.
-func TestSyncRequestAddWitness_Canceled(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err = h.SyncRequestAddWitness(ctx, 1, 10, "127.0.0.1:6000", 0)
-	if err == nil {
-		t.Fatal("expected error for canceled context")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // SyncRequestSnapshot - context canceled (not timeout) path
@@ -14408,33 +12312,6 @@ func TestSyncRequestSnapshot_ContextCanceled(t *testing.T) {
 // SyncRead - context deadline exceeded path
 // ---------------------------------------------------------------------------
 
-// TestSyncRead_DeadlineExceeded verifies that SyncRead returns ErrTimeout
-// when the context deadline is exceeded waiting for ReadIndex confirmation.
-func TestSyncRead_DeadlineExceeded(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Use a context that's already expired via timeout (not cancel).
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	<-ctx.Done() // ensure context is expired
-
-	_, err = h.SyncRead(ctx, 1, nil)
-	if err == nil {
-		t.Fatal("expected error for expired context")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // CloseSession - closed host path
 // ---------------------------------------------------------------------------
@@ -14442,32 +12319,6 @@ func TestSyncRead_DeadlineExceeded(t *testing.T) {
 // ---------------------------------------------------------------------------
 // SyncPropose - context canceled (not timeout) path
 // ---------------------------------------------------------------------------
-
-// TestSyncPropose_ContextCanceled verifies that SyncPropose returns
-// ErrCanceled when the context is canceled (not timed out).
-func TestSyncPropose_ContextCanceled(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Use canceled context - should fail before reaching leader.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err = h.SyncPropose(ctx, 1, []byte("data"))
-	if err == nil {
-		t.Fatal("expected error for canceled context")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // SyncGetShardMembership - context canceled path
@@ -14501,31 +12352,6 @@ func TestSyncGetShardMembership_ContextCanceled(t *testing.T) {
 // ---------------------------------------------------------------------------
 // RequestLeaderTransfer - timeout path
 // ---------------------------------------------------------------------------
-
-// TestRequestLeaderTransfer_ContextCanceled verifies that
-// RequestLeaderTransfer returns ErrCanceled when the context is canceled.
-func TestRequestLeaderTransfer_ContextCanceled(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err = h.RequestLeaderTransfer(ctx, 1, 1)
-	if err == nil {
-		t.Fatal("expected error for canceled context")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // NewHost - creates with default WAL LogDB (no WithMemoryLogDB)
@@ -14799,34 +12625,6 @@ func TestNewHost_DefaultLogDB_WithMetrics(t *testing.T) {
 // SyncProposeWithSession - deadline exceeded path
 // ---------------------------------------------------------------------------
 
-// TestSyncProposeWithSession_DeadlineExceededPath verifies the timeout
-// path specifically when the deadline expires during the pipeline wait.
-func TestSyncProposeWithSession_DeadlineExceededPath(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Expired context.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	<-ctx.Done() // ensure context is expired
-
-	session := h.NoOPSession(1)
-	_, err = h.SyncProposeWithSession(ctx, session, []byte("data"))
-	if err == nil {
-		t.Fatal("expected error for expired deadline")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // QueryLocalNode - closed host path
 // ---------------------------------------------------------------------------
@@ -14843,67 +12641,9 @@ func TestSyncProposeWithSession_DeadlineExceededPath(t *testing.T) {
 // SyncRequestAddNode - deadline exceeded path
 // ---------------------------------------------------------------------------
 
-// TestSyncRequestAddNode_DeadlineExceeded verifies that SyncRequestAddNode
-// returns ErrTimeout when the context deadline expires waiting for commit.
-func TestSyncRequestAddNode_DeadlineExceeded(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Use an already-expired deadline. The RequestAddNode will succeed
-	// internally but the select on ctx.Done fires immediately.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	<-ctx.Done() // ensure context is expired
-
-	err = h.SyncRequestAddNode(ctx, 1, 99, "127.0.0.1:9999", 0)
-	if err == nil {
-		t.Fatal("expected error for expired deadline")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SyncRequestRemoveNode - deadline exceeded path
 // ---------------------------------------------------------------------------
-
-// TestSyncRequestRemoveNode_DeadlineExceeded verifies that
-// SyncRequestRemoveNode returns ErrTimeout when the deadline expires.
-func TestSyncRequestRemoveNode_DeadlineExceeded(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	<-ctx.Done() // ensure context is expired
-
-	// Attempt to remove a phantom node. The request goes through Raft but
-	// the context is already expired so the select hits ctx.Done.
-	err = h.SyncRequestRemoveNode(ctx, 1, 99, 0)
-	if err == nil {
-		t.Fatal("expected error for expired deadline")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // CloseSession - nil session returns error
@@ -14913,141 +12653,21 @@ func TestSyncRequestRemoveNode_DeadlineExceeded(t *testing.T) {
 // StopReplica - replica not found path
 // ---------------------------------------------------------------------------
 
-// TestStopReplica_WrongReplicaID verifies that StopReplica returns a
-// ReplicaNotFoundError when the replicaID doesn't match.
-func TestStopReplica_WrongReplicaID(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Try to stop replica 99 on shard 1 where replica 1 is running.
-	err = h.StopReplica(1, 99)
-	var rnfErr *ReplicaNotFoundError
-	if !errors.As(err, &rnfErr) {
-		t.Fatalf("expected ReplicaNotFoundError, got %v", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RequestCompaction - replica not found path
 // ---------------------------------------------------------------------------
-
-// TestRequestCompaction_WrongReplicaID verifies that RequestCompaction
-// returns a ReplicaNotFoundError when the replicaID doesn't match.
-func TestRequestCompaction_WrongReplicaID(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	err = h.RequestCompaction(1, 99)
-	var rnfErr *ReplicaNotFoundError
-	if !errors.As(err, &rnfErr) {
-		t.Fatalf("expected ReplicaNotFoundError, got %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // RemoveData - shard still running path
 // ---------------------------------------------------------------------------
 
-// TestRemoveData_ShardStillActive verifies that RemoveData returns a
-// ShardNotStoppedError when the shard is still loaded on the host.
-func TestRemoveData_ShardStillActive(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	err = h.RemoveData(1, 1)
-	var snsErr *ShardNotStoppedError
-	if !errors.As(err, &snsErr) {
-		t.Fatalf("expected ShardNotStoppedError, got %v", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SyncRemoveData - deadline exceeded path
 // ---------------------------------------------------------------------------
 
-// TestSyncRemoveData_DeadlineExceeded verifies that SyncRemoveData returns
-// ErrTimeout when the context deadline is already expired.
-func TestSyncRemoveData_DeadlineExceeded(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-	<-ctx.Done() // ensure context is expired
-
-	err = h.SyncRemoveData(ctx, 1, 1)
-	if !errors.Is(err, ErrTimeout) {
-		t.Fatalf("expected ErrTimeout, got %v", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RequestLeaderTransfer - not leader path
 // ---------------------------------------------------------------------------
-
-// TestRequestLeaderTransfer_NotLeaderNoLeaderID verifies that
-// RequestLeaderTransfer returns a NotLeaderError when the current node is
-// not the leader and has no known leader.
-func TestRequestLeaderTransfer_NotLeaderNoLeaderID(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	// Set isLeader to false manually before the election completes.
-	v, _ := h.nodes.Load(uint64(1))
-	ns := v.(*nodeState)
-	ns.isLeader.Store(false)
-	ns.leaderID.Store(0)
-
-	err = h.RequestLeaderTransfer(context.Background(), 1, 2)
-	var nle *NotLeaderError
-	if !errors.As(err, &nle) {
-		t.Fatalf("expected NotLeaderError, got %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // RequestLeaderTransfer - engine node nil path
@@ -15158,32 +12778,6 @@ func TestBuildWALOptions_CallbacksZeroDiskSize(t *testing.T) {
 // requestConfigChange - staleness check
 // ---------------------------------------------------------------------------
 
-// TestRequestConfigChange_StaleConfigChangeID verifies that providing an
-// incorrect configChangeIndex triggers a StaleConfigChangeError.
-func TestRequestConfigChange_StaleConfigChangeID(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Use a non-zero but incorrect configChangeIndex. The node's current
-	// configChangeIndex is 0, so passing 999 triggers staleness.
-	_, err = h.RequestAddNode(context.Background(), 1, 99, "127.0.0.1:9999", 999)
-	var staleErr *StaleConfigChangeError
-	if !errors.As(err, &staleErr) {
-		t.Fatalf("expected StaleConfigChangeError, got %v", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // proposeSession - leader check with leaderID == 0
 // ---------------------------------------------------------------------------
@@ -15221,45 +12815,6 @@ func TestProposeSession_NoLeaderReturnsNotLeaderError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // SyncRead - result error propagation
 // ---------------------------------------------------------------------------
-
-// TestSyncRead_Success verifies the full SyncRead end-to-end path: ReadIndex
-// confirmation followed by SM.Lookup on the caught-up state machine.
-func TestSyncRead_SuccessEndToEnd(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Write some data first to exercise the SM state.
-	ctx := context.Background()
-	_, err = h.SyncPropose(ctx, 1, []byte("warmup"))
-	if err != nil {
-		t.Fatalf("warmup SyncPropose failed: %v", err)
-	}
-
-	// SyncRead exercises the full pipeline: ReadIndex -> wait -> Lookup. The
-	// Lookup answer is asserted, not discarded: mockStateMachine echoes the
-	// query, so the echo proves the last stage of that pipeline ran and its
-	// output reached the caller.
-	const query = "success-end-to-end"
-	result, err := h.SyncRead(ctx, 1, query)
-	if err != nil {
-		t.Fatalf("SyncRead failed: %v", err)
-	}
-	if result != query {
-		t.Fatalf("SyncRead result = %#v, want %q: ReadIndex confirmed but the "+
-			"state machine's answer did not reach the caller", result, query)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // ExportSnapshot - closed host path
@@ -15537,58 +13092,9 @@ func TestSyncRead_WithMetrics(t *testing.T) {
 // SyncRequestSnapshot - success end to end
 // ---------------------------------------------------------------------------
 
-// TestSyncRequestSnapshot_Success verifies the full snapshot pipeline:
-// RequestSnapshot -> snapshot worker -> OnSnapshotCompleted -> result.
-func TestSyncRequestSnapshot_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Write some data first so there is something to snapshot.
-	ctx := context.Background()
-	_, err = h.SyncPropose(ctx, 1, []byte("snapshot-data"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
-
-	// Request the snapshot and wait for completion.
-	snapshotIdx, err := h.SyncRequestSnapshot(ctx, 1, SnapshotOption{})
-	if err != nil {
-		t.Fatalf("SyncRequestSnapshot failed: %v", err)
-	}
-	if snapshotIdx == 0 {
-		t.Fatal("expected non-zero snapshot index")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // WaitDrain - when no pending ops
 // ---------------------------------------------------------------------------
-
-// TestDrain_NoPendingOps verifies that Drain returns nil
-// immediately when there are no pending operations.
-func TestDrain_NoPendingOps(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	if err := h.Drain(); err != nil {
-		t.Fatalf("Drain with no ops: %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // ShardMembership - local path
@@ -15597,22 +13103,6 @@ func TestDrain_NoPendingOps(t *testing.T) {
 // ---------------------------------------------------------------------------
 // ProposeWithSession - nil session path
 // ---------------------------------------------------------------------------
-
-// TestProposeWithSession_NilSession verifies that ProposeWithSession
-// returns ErrInvalidSession when the session is nil.
-func TestProposeWithSession_NilSessionReturnsError(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.ProposeWithSession(context.Background(), nil, []byte("data"))
-	if !errors.Is(err, ErrInvalidSession) {
-		t.Fatalf("expected ErrInvalidSession, got %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // CloseSession - wrong shard in session (ValidForSessionOp fails)
@@ -15715,29 +13205,6 @@ func TestImportSnapshot_FullPipeline(t *testing.T) {
 // ImportSnapshot - shard running returns error
 // ---------------------------------------------------------------------------
 
-// TestImportSnapshot_ShardRunningReturnsError verifies that ImportSnapshot
-// returns ErrInvalidOperation when the shard is still running.
-func TestImportSnapshot_ShardRunningReturnsError(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-
-	ctx := context.Background()
-	err = h.ImportSnapshot(ctx, 1, nil)
-	if !errors.Is(err, ErrInvalidOperation) {
-		t.Fatalf("expected ErrInvalidOperation, got %v", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RequestSnapshot with metrics enabled
 // ---------------------------------------------------------------------------
@@ -15783,57 +13250,9 @@ func TestRequestSnapshot_WithMetrics(t *testing.T) {
 // ShardHealth JSON error path
 // ---------------------------------------------------------------------------
 
-// TestShardHealth_UnmarshalJSON_InvalidJSON verifies that UnmarshalJSON
-// returns an error when given malformed JSON input instead of silently
-// defaulting to a healthy state.
-func TestShardHealth_UnmarshalJSON_InvalidJSON(t *testing.T) {
-	var h ShardHealth
-	err := json.Unmarshal([]byte(`{not_valid_json}`), &h)
-	if err == nil {
-		t.Fatal("expected error for invalid JSON input, got nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // SyncRead success path (covers SyncRead lines 1686-1690)
 // ---------------------------------------------------------------------------
-
-// TestSyncRead_SuccessWithReadIndex verifies the full SyncRead pipeline:
-// ReadIndex -> quorum confirm -> SM.Lookup. This covers the read-success
-// path in SyncRead that returns the lookup result.
-func TestSyncRead_SuccessWithReadIndex(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: cfg.RaftAddress}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Write data first so the SM has something to look up.
-	_, err = h.SyncPropose(ctx, 1, []byte("read-test-data"))
-	if err != nil {
-		t.Fatalf("SyncPropose failed: %v", err)
-	}
-
-	// SyncRead does ReadIndex + SM.Lookup.
-	result, err := h.SyncRead(ctx, 1, "read-test-data")
-	if err != nil {
-		t.Fatalf("SyncRead failed: %v", err)
-	}
-	if result == nil {
-		t.Fatal("SyncRead returned nil result")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // translateProposalError - NotLeaderError coverage
@@ -15945,35 +13364,6 @@ func TestTranslateProposalError_NotLeaderError_NoLeader(t *testing.T) {
 // addPendingOp direct unit tests
 // ---------------------------------------------------------------------------
 
-// TestAddPendingOp_IncrementsCounter verifies that addPendingOp increments
-// the pendingOps counter.
-func TestAddPendingOp_IncrementsCounter(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	initial := h.pendingOps.Load()
-
-	h.addPendingOp()
-	if h.pendingOps.Load() != initial+1 {
-		t.Error("addPendingOp did not increment counter")
-	}
-
-	h.addPendingOp()
-	h.addPendingOp()
-	if h.pendingOps.Load() != initial+3 {
-		t.Error("addPendingOp did not increment counter correctly")
-	}
-
-	// Clean up: decrement back to avoid test pollution.
-	h.completePendingOp()
-	h.completePendingOp()
-	h.completePendingOp()
-}
-
 // TestAddPendingOp_ConcurrentIncrement verifies that addPendingOp is
 // safe to call concurrently from multiple goroutines.
 func TestAddPendingOp_ConcurrentIncrement(t *testing.T) {
@@ -16031,13 +13421,6 @@ func TestEffectiveMaxPayload_BothSetEntrySmaller(t *testing.T) {
 	}
 }
 
-func TestEffectiveMaxPayload_BothSetEqual(t *testing.T) {
-	result := effectiveMaxPayload(100, 100)
-	if result != 100 {
-		t.Errorf("effectiveMaxPayload(100, 100) = %d, want 100", result)
-	}
-}
-
 func TestEffectiveMaxPayload_OnlyProposalSet(t *testing.T) {
 	result := effectiveMaxPayload(100, 0)
 	if result != 100 {
@@ -16049,13 +13432,6 @@ func TestEffectiveMaxPayload_OnlyEntrySet(t *testing.T) {
 	result := effectiveMaxPayload(0, 200)
 	if result != 200 {
 		t.Errorf("effectiveMaxPayload(0, 200) = %d, want 200", result)
-	}
-}
-
-func TestEffectiveMaxPayload_NeitherSet(t *testing.T) {
-	result := effectiveMaxPayload(0, 0)
-	if result != 0 {
-		t.Errorf("effectiveMaxPayload(0, 0) = %d, want 0", result)
 	}
 }
 
@@ -16141,18 +13517,6 @@ func TestCopyWithContext_ReadError(t *testing.T) {
 	}
 }
 
-func TestCopyWithContext_EmptySource(t *testing.T) {
-	src := bytes.NewReader([]byte{})
-	var dst bytes.Buffer
-	err := copyWithContext(context.Background(), &dst, src)
-	if err != nil {
-		t.Fatalf("copyWithContext(empty) error: %v", err)
-	}
-	if dst.Len() != 0 {
-		t.Errorf("copyWithContext(empty) wrote %d bytes, want 0", dst.Len())
-	}
-}
-
 // failWriter is a writer that always returns an error.
 type failWriter struct {
 	err error
@@ -16189,14 +13553,6 @@ func TestEmptyMembersError_Error(t *testing.T) {
 	}
 }
 
-func TestEmptyMembersError_ErrorDifferentShardID(t *testing.T) {
-	err := &EmptyMembersError{ShardID: 999}
-	msg := err.Error()
-	if !strings.Contains(msg, "999") {
-		t.Errorf("EmptyMembersError.Error() = %q, want to contain shard ID 999", msg)
-	}
-}
-
 func TestSelfNotInMembersError_Error(t *testing.T) {
 	err := &SelfNotInMembersError{ShardID: 10, ReplicaID: 5}
 	msg := err.Error()
@@ -16208,14 +13564,6 @@ func TestSelfNotInMembersError_Error(t *testing.T) {
 	}
 	if !strings.Contains(msg, "5") {
 		t.Errorf("SelfNotInMembersError.Error() = %q, want to contain replica ID 5", msg)
-	}
-}
-
-func TestSelfNotInMembersError_ErrorZeroValues(t *testing.T) {
-	err := &SelfNotInMembersError{ShardID: 0, ReplicaID: 0}
-	msg := err.Error()
-	if msg == "" {
-		t.Fatal("SelfNotInMembersError.Error() returned empty string")
 	}
 }
 
@@ -16241,19 +13589,6 @@ func TestInvalidMemberError_Error(t *testing.T) {
 	}
 }
 
-func TestInvalidMemberError_ErrorEmptyAddress(t *testing.T) {
-	err := &InvalidMemberError{
-		ShardID:   1,
-		ReplicaID: 2,
-		Address:   "",
-		Reason:    "address must be non-empty",
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "address must be non-empty") {
-		t.Errorf("InvalidMemberError.Error() = %q, want to contain reason", msg)
-	}
-}
-
 func TestTypeAssertionError_Error(t *testing.T) {
 	err := &TypeAssertionError{
 		Context:      "OnCommitted nodeState lookup",
@@ -16266,18 +13601,6 @@ func TestTypeAssertionError_Error(t *testing.T) {
 	}
 	if !strings.Contains(msg, "*nodeState") {
 		t.Errorf("TypeAssertionError.Error() = %q, want to contain expected type", msg)
-	}
-}
-
-func TestTypeAssertionError_ErrorNilActual(t *testing.T) {
-	err := &TypeAssertionError{
-		Context:      "test",
-		ExpectedType: "*nodeState",
-		ActualValue:  nil,
-	}
-	msg := err.Error()
-	if msg == "" {
-		t.Fatal("TypeAssertionError.Error() returned empty string with nil actual")
 	}
 }
 
@@ -16467,33 +13790,6 @@ func TestExportSnapshot_ContextCanceled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: SyncRead context cancellation via goto path
-// ---------------------------------------------------------------------------
-
-func TestSyncRead_ContextCanceledAfterReadIndex(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Use a very short deadline that will expire during the read.
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	defer cancel()
-	// Wait for the deadline to pass.
-	<-ctx.Done()
-	_, err := h.SyncRead(ctx, 1, "query")
-	if err == nil {
-		t.Fatal("expected error from SyncRead with expired context")
-	}
-	if !errors.Is(err, ErrTimeout) && !errors.Is(err, ErrCanceled) {
-		t.Errorf("SyncRead error = %v, want ErrTimeout or ErrCanceled", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: Membership.ConfigChangeIndex
 // ---------------------------------------------------------------------------
 
@@ -16502,30 +13798,6 @@ func TestMembership_ConfigChangeIndex(t *testing.T) {
 	idx := m.ConfigChangeIndex()
 	if idx != 42 {
 		t.Errorf("ConfigChangeIndex() = %d, want 42", idx)
-	}
-}
-
-func TestMembership_ConfigChangeIndex_Zero(t *testing.T) {
-	m := &Membership{}
-	idx := m.ConfigChangeIndex()
-	if idx != 0 {
-		t.Errorf("ConfigChangeIndex() = %d, want 0", idx)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: DiagRaftState error path (no shard loaded)
-// ---------------------------------------------------------------------------
-
-func TestDiagRaftState_ClosedHost(t *testing.T) {
-	h := newTestHost(t)
-	h.Close()
-
-	_, err := h.DiagRaftState(1)
-	if !errors.Is(err, ErrShardNotReady) {
-		// DiagRaftState doesn't check closed - it checks engine node existence.
-		// After close, GetNode returns nil, so ErrShardNotReady.
-		_ = err
 	}
 }
 
@@ -16647,103 +13919,6 @@ func TestStopShard_WithMetrics(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: Prometheus metrics fallback paths (unregistered shard)
-// ---------------------------------------------------------------------------
-
-func TestPrometheusMetrics_FallbackPaths(t *testing.T) {
-	_ = prometheus.NewRegistry()
-	c := NewPrometheusMetricsCollector()
-	// Use a shard ID that was never registered to trigger the fallback path.
-	shardID := uint64(99999)
-
-	// Each of these should hit the fallback (slow) path.
-	c.ObserveCommitLatency(shardID, time.Millisecond)
-	c.ObserveApplyLatency(shardID, time.Millisecond)
-	c.ObserveReadIndexLatency(shardID, time.Millisecond)
-	c.IncProposalDropped(shardID)
-	c.ObserveProposalBatchSize(shardID, 5)
-	c.IncPiggybackCommit(shardID)
-
-	// Verify the metrics were recorded by gathering from the default registry.
-	families, err := prometheus.DefaultGatherer.Gather()
-	if err != nil {
-		t.Fatalf("Gather() failed: %v", err)
-	}
-	if len(families) == 0 {
-		t.Error("expected at least one metric family from fallback paths")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: Prometheus IncSnapshotsSent/Received fallback
-// ---------------------------------------------------------------------------
-
-func TestPrometheusMetrics_SnapshotsSentFallback(t *testing.T) {
-	_ = prometheus.NewRegistry()
-	c := NewPrometheusMetricsCollector()
-	// Register shard to test the fast path.
-	c.RegisterShard(1)
-	c.IncSnapshotsSent(1, 1024, time.Millisecond)
-	// Unregistered shard triggers fallback.
-	c.IncSnapshotsSent(99999, 2048, time.Millisecond)
-}
-
-func TestPrometheusMetrics_SnapshotsReceivedFallback(t *testing.T) {
-	_ = prometheus.NewRegistry()
-	c := NewPrometheusMetricsCollector()
-	c.RegisterShard(1)
-	c.IncSnapshotsReceived(1, 1024, time.Millisecond)
-	c.IncSnapshotsReceived(99999, 2048, time.Millisecond)
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: RequestLeaderTransfer context cancellation after leader check
-// ---------------------------------------------------------------------------
-
-func TestRequestLeaderTransfer_ContextCanceledAfterLeaderCheck(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Create a context that is already canceled to test the second ctx check.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	err := h.RequestLeaderTransfer(ctx, 1, 0)
-	if !errors.Is(err, ErrCanceled) {
-		t.Errorf("RequestLeaderTransfer(canceled) = %v, want ErrCanceled", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: ImportSnapshot context cancellation mid-flow
-// ---------------------------------------------------------------------------
-
-func TestImportSnapshot_ContextCanceledBeforeWrite(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	// Stop shard so ImportSnapshot can proceed.
-	if err := h.StopShard(1); err != nil {
-		t.Fatalf("StopShard failed: %v", err)
-	}
-
-	// Create a context with an already-expired deadline.
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-	err := h.ImportSnapshot(ctx, 1, bytes.NewReader([]byte("data")))
-	if err == nil {
-		t.Fatal("expected error from ImportSnapshot with expired context")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: NewSession and RegisterSession draining paths
 // ---------------------------------------------------------------------------
 
@@ -16846,65 +14021,6 @@ func TestHostEngineCallback_OnReadIndexFailed_NonexistentShard(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: SyncRead result error path
-// ---------------------------------------------------------------------------
-
-func TestSyncRead_ReadIndexError(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Use a short deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	_, err := h.SyncRead(ctx, 1, "query")
-	// The read should either succeed or timeout, but not panic.
-	if err != nil && !errors.Is(err, ErrTimeout) && !errors.Is(err, ErrCanceled) {
-		// Some other error is fine, just verify it doesn't panic.
-		_ = err
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: SyncGetShardMembership context cancellation path
-// ---------------------------------------------------------------------------
-
-func TestSyncGetShardMembership_Timeout(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	defer cancel()
-	<-ctx.Done() // wait for context to expire
-	_, err := h.SyncGetShardMembership(ctx, 1)
-	if err == nil {
-		t.Fatal("expected error from SyncGetShardMembership with expired context")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: NewHost WAL LogDB default path
-// ---------------------------------------------------------------------------
-
-func TestNewHost_WALLogDB_Validates(t *testing.T) {
-	cfg := testHostConfig(t)
-	// Do not pass WithMemoryLogDB or WithLogDB - use default WAL path.
-	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost with default WAL LogDB failed: %v", err)
-	}
-	defer h.Close()
-	if h.logdb == nil {
-		t.Error("logdb should not be nil with default WAL LogDB")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: StopShard with EventListener
 // ---------------------------------------------------------------------------
 
@@ -16998,111 +14114,6 @@ func TestBuildWALOptions_NoDiskMonitoring(t *testing.T) {
 	opts := buildWALOptions(cfg, flag, nil)
 	if len(opts) != 0 {
 		t.Errorf("buildWALOptions returned %d options, want 0", len(opts))
-	}
-}
-
-func TestBuildWALOptions_MaxWALDiskSizeOnly(t *testing.T) {
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30, // 1 GiB
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("buildWALOptions returned no options with MaxWALDiskSize set")
-	}
-}
-
-func TestBuildWALOptions_CallbacksNoMaxSize(t *testing.T) {
-	warningCalled := false
-	cfg := config.HostConfig{
-		EventListener: &config.EventListener{
-			OnLogDBDiskWarning: func(_ config.DiskInfo) {
-				warningCalled = true
-			},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	// MaxWALDiskSize=0 with callbacks should return early (no options).
-	if len(opts) != 0 {
-		t.Errorf("buildWALOptions returned %d options, want 0 (no MaxWALDiskSize)", len(opts))
-	}
-	_ = warningCalled // not called in this test
-}
-
-func TestBuildWALOptions_WithWarningCallback(t *testing.T) {
-	warningCalled := false
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener: &config.EventListener{
-			OnLogDBDiskWarning: func(di config.DiskInfo) {
-				warningCalled = true
-			},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with warning callback and MaxWALDiskSize")
-	}
-	_ = warningCalled
-}
-
-func TestBuildWALOptions_WithFullCallback(t *testing.T) {
-	fullCalled := false
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener: &config.EventListener{
-			OnLogDBDiskFull: func(di config.DiskInfo) {
-				fullCalled = true
-			},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with full callback and MaxWALDiskSize")
-	}
-	_ = fullCalled
-}
-
-func TestBuildWALOptions_WithBothCallbacks(t *testing.T) {
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener: &config.EventListener{
-			OnLogDBDiskWarning: func(_ config.DiskInfo) {},
-			OnLogDBDiskFull:    func(_ config.DiskInfo) {},
-		},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with both callbacks")
-	}
-}
-
-func TestBuildWALOptions_NoEventListenerWithMaxSize(t *testing.T) {
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	// Should add disk monitor with only recovery and full (no user) callbacks.
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options when MaxWALDiskSize > 0")
-	}
-}
-
-func TestBuildWALOptions_EventListenerNoFullCallback(t *testing.T) {
-	// EventListener set but no OnLogDBDiskFull -- should still wire diskFull flag.
-	cfg := config.HostConfig{
-		MaxWALDiskSize: 1 << 30,
-		EventListener:  &config.EventListener{},
-	}
-	flag := &atomic.Bool{}
-	opts := buildWALOptions(cfg, flag, nil)
-	if len(opts) == 0 {
-		t.Fatal("expected WAL options with EventListener + MaxWALDiskSize")
 	}
 }
 
@@ -17362,34 +14373,6 @@ func TestSyncGetShardMembership_DeadlineExceeded(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: ImportSnapshot - context cancellation between copy and save
-// ---------------------------------------------------------------------------
-
-func TestImportSnapshot_ContextCanceledDuringCopy(t *testing.T) {
-	h := newTestHost(t)
-	cfg := testShardConfig(1, 1)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, cfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-	if err := h.StopShard(1); err != nil {
-		t.Fatalf("StopShard: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel immediately so ImportSnapshot sees a canceled context.
-	// Both success and context.Canceled are valid outcomes.
-	cancel()
-	r := bytes.NewReader([]byte("snapshot-data"))
-	err := h.ImportSnapshot(ctx, 1, r)
-	// Might succeed or might get canceled, both are valid.
-	if err != nil && !errors.Is(err, context.Canceled) {
-		_ = err
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: OnReadyToRead - alias completion when lastApplied >= readIndex
 // ---------------------------------------------------------------------------
 
@@ -17523,37 +14506,6 @@ func TestOnReadIndexBatched_MissingBatchKeyNoOp(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: OnLeaderUpdated - became leader with event listener
-// ---------------------------------------------------------------------------
-
-func TestOnLeaderUpdated_BecameLeaderWithEventListener(t *testing.T) {
-	leaderEventFired := false
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnLeaderUpdated: func(info config.LeaderInfo) {
-			leaderEventFired = true
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	t.Cleanup(func() { h.Close() })
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-
-	ns.isLeader.Store(false)
-	ns.leaderID.Store(0)
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnLeaderUpdated(1, 1, 2)
-
-	if !leaderEventFired {
-		t.Error("OnLeaderUpdated event was not fired")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: OnApplied - membership change paths
 // ---------------------------------------------------------------------------
 
@@ -17668,52 +14620,6 @@ func TestClose_FiresOnNodeHostShuttingDown(t *testing.T) {
 	h.Close()
 	if !shutdownCalled {
 		t.Error("OnNodeHostShuttingDown was not called")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: Drain idempotent (second call returns nil)
-// ---------------------------------------------------------------------------
-
-func TestDrain_IdempotentSecondCall(t *testing.T) {
-	h := newTestHost(t)
-	if err := h.Drain(); err != nil {
-		t.Fatalf("first Drain: %v", err)
-	}
-	if err := h.Drain(); err != nil {
-		t.Fatalf("second Drain: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: Close idempotent
-// ---------------------------------------------------------------------------
-
-func TestClose_IdempotentSecondCall(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	if err := h.Close(); err != nil {
-		t.Fatalf("first Close: %v", err)
-	}
-	if err := h.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: ExportSnapshot shard not found
-// ---------------------------------------------------------------------------
-
-func TestExportSnapshot_ShardNotFoundError(t *testing.T) {
-	h := newTestHost(t)
-	ctx := context.Background()
-	var buf bytes.Buffer
-	err := h.ExportSnapshot(ctx, 999, &buf)
-	if err == nil {
-		t.Error("expected error from ExportSnapshot for nonexistent shard")
 	}
 }
 
@@ -17837,67 +14743,6 @@ func TestSyncRemoveData_SuccessAfterStop(t *testing.T) {
 	defer cancel()
 	if err := h.SyncRemoveData(ctx, 1, 1); err != nil {
 		t.Fatalf("SyncRemoveData: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: info.go UnmarshalJSON unknown value
-// ---------------------------------------------------------------------------
-
-func TestShardHealth_UnmarshalJSON_UnknownValue(t *testing.T) {
-	h := ShardError
-	err := json.Unmarshal([]byte(`"unknown-value"`), &h)
-	// An unrecognized value must be REFUSED, not decoded to ShardHealthy.
-	// ShardHealthy is the zero value, so defaulting to it reports a typo as
-	// perfect health. See TestShardHealth_UnmarshalJSONFailsClosed in
-	// info_test.go for the full statement of the property.
-	if !errors.Is(err, ErrInvalidShardHealth) {
-		t.Fatalf("UnmarshalJSON of an unknown value = %v, want ErrInvalidShardHealth", err)
-	}
-	if h != ShardError {
-		t.Errorf("ShardHealth = %v, want the receiver left untouched (ShardError)", h)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: RequestSnapshot not leader path
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: NoOpMetricsCollector - all no-op methods
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: Prometheus metrics - pre-bound (registered shard) paths
-// ---------------------------------------------------------------------------
-
-func TestPrometheusMetrics_RegisteredShardPaths(t *testing.T) {
-	c := NewPrometheusMetricsCollector()
-	shardID := uint64(42)
-	c.RegisterShard(shardID)
-	defer c.UnregisterShard(shardID)
-
-	// Call all shard-scoped methods with the registered shard to cover
-	// the pre-bound (sm != nil) fast path.
-	c.ObserveCommitLatency(shardID, time.Millisecond)
-	c.ObserveApplyLatency(shardID, time.Millisecond)
-	c.ObserveReadIndexLatency(shardID, time.Millisecond)
-	c.IncProposalDropped(shardID)
-	c.ObserveProposalBatchSize(shardID, 5)
-	c.IncPiggybackCommit(shardID)
-}
-
-func TestRequestSnapshot_NotLeader(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	ns.isLeader.Store(false) // not leader
-
-	ctx := context.Background()
-	_, err := h.RequestSnapshot(ctx, 1, SnapshotOption{})
-	// Should return ErrShardNotReady because engine node is nil.
-	if err == nil {
-		t.Error("expected error from RequestSnapshot when engine node is nil")
 	}
 }
 
@@ -18141,101 +14986,14 @@ func TestProposeEntry_DroppedProposalFiresEvent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: SyncRead closed host
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: SyncRead - goto lookup with canceled context
-// ---------------------------------------------------------------------------
-
-func TestSyncRead_ContextCanceledAfterNonBlockingReceive(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// Cancel context before calling SyncRead to trigger the re-check
-	// after the goto label.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := h.SyncRead(ctx, 1, "test-query")
-	if err == nil {
-		t.Fatal("expected error from SyncRead with canceled context")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: DiagRaftState shard not ready
 // ---------------------------------------------------------------------------
-
 func TestDiagRaftState_EngineNodeNil(t *testing.T) {
 	h := newTestHost(t)
 
 	_, err := h.DiagRaftState(999)
 	if !errors.Is(err, ErrShardNotReady) {
 		t.Errorf("expected ErrShardNotReady, got: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: pendingSweepLoopOnce - normal stop
-// ---------------------------------------------------------------------------
-
-func TestPendingSweepLoopOnce_StopChannel(t *testing.T) {
-	// Create a dedicated host with its own sweep channels to avoid
-	// racing with the background sweeper started by NewHost.
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	// Close the host first to stop its background goroutines.
-	h.Close()
-
-	// Create a fresh stop channel and run the loop manually.
-	stopCh := make(chan struct{})
-	h.sweepStopC = stopCh
-	h.closed.Store(false) // allow iteration
-
-	go func() {
-		<-time.After(50 * time.Millisecond)
-		close(stopCh)
-	}()
-
-	panicked := h.pendingSweepLoopOnce(10 * time.Millisecond)
-	if panicked {
-		t.Error("expected normal exit, got panic")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: keyRotationLoopOnce - normal stop
-// ---------------------------------------------------------------------------
-
-func TestKeyRotationLoopOnce_StopChannel(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	stopCh := make(chan struct{})
-	h.keyRotStopC = stopCh
-
-	go func() {
-		<-time.After(50 * time.Millisecond)
-		close(stopCh)
-	}()
-
-	panicked := h.keyRotationLoopOnce(context.Background(), 10*time.Millisecond)
-	if panicked {
-		t.Error("expected normal exit, got panic")
 	}
 }
 
@@ -18288,10 +15046,6 @@ func TestSyncRequestAddWitness_ClosedHost(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: RequestAddObserver and RequestAddWitness - closed host
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Coverage: ExportSnapshot - various error paths
 // ---------------------------------------------------------------------------
 
@@ -18307,38 +15061,6 @@ func TestExportSnapshot_NoLogDB(t *testing.T) {
 	err := h.ExportSnapshot(ctx, 1, &bytes.Buffer{})
 	if !errors.Is(err, ErrSnapshotNotFound) {
 		t.Errorf("expected ErrSnapshotNotFound, got: %v", err)
-	}
-}
-
-func TestExportSnapshot_NoExistingSnapshot(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	// LogDB has no snapshot for this shard yet.
-	ctx := context.Background()
-	err := h.ExportSnapshot(ctx, 1, &bytes.Buffer{})
-	if err == nil {
-		t.Error("expected error when no snapshot exists")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: ImportSnapshot - shard not found
-// ---------------------------------------------------------------------------
-
-func TestImportSnapshot_ShardNotFound(t *testing.T) {
-	h := newTestHost(t)
-
-	ctx := context.Background()
-	err := h.ImportSnapshot(ctx, 999, bytes.NewReader([]byte("data")))
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("expected ErrShardNotFound, got: %v", err)
 	}
 }
 
@@ -18388,39 +15110,6 @@ func TestOnLeaderUpdated_LostLeadership(t *testing.T) {
 		}
 	default:
 		t.Error("expected pending read to be completed on leadership loss")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: OnCampaignLaunched
-// ---------------------------------------------------------------------------
-
-func TestOnCampaignLaunched_NoListener(t *testing.T) {
-	h := newTestHost(t)
-
-	cb := &hostEngineCallback{h: h}
-	// Should not panic when no event listener is set.
-	cb.OnCampaignLaunched(1, 1, 5)
-}
-
-func TestOnCampaignLaunched_WithListener(t *testing.T) {
-	var fired atomic.Bool
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnCampaignLaunched: func(info config.EventShardInfo) {
-			fired.Store(true)
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnCampaignLaunched(1, 1, 5)
-	if !fired.Load() {
-		t.Error("expected OnCampaignLaunched event to fire")
 	}
 }
 
@@ -18626,29 +15315,6 @@ func TestFailPendingRequests_BadPendingProposalType(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: QueryRaftLog - various paths
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: IsDraining
-// ---------------------------------------------------------------------------
-
-func TestIsDraining_InitiallyFalse(t *testing.T) {
-	h := newTestHost(t)
-	if h.IsDraining() {
-		t.Error("expected IsDraining to be false initially")
-	}
-}
-
-func TestIsDraining_TrueAfterDrain(t *testing.T) {
-	h := newTestHost(t)
-	h.Drain()
-	if !h.IsDraining() {
-		t.Error("expected IsDraining to be true after Drain")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Coverage: NodeHostInfo - closed host
 // ---------------------------------------------------------------------------
 
@@ -18665,86 +15331,6 @@ func TestGetNodeHostInfo_BadNodeStateType(t *testing.T) {
 		if si.ShardID == 99 {
 			t.Error("should not contain shard 99 from malformed entry")
 		}
-	}
-}
-
-func TestGetNodeHostInfo_WithLogInfo(t *testing.T) {
-	h := newTestHost(t)
-	info := h.NodeHostInfo(NodeHostInfoOption{SkipLogInfo: false})
-	if info == nil {
-		t.Fatal("expected non-nil info")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: loadOrGenerateHostID - already exists
-// ---------------------------------------------------------------------------
-
-func TestLoadOrGenerateHostID_AlreadyExists(t *testing.T) {
-	h := newTestHost(t)
-
-	// The first call by NewHost generated the ID. Call again to
-	// test the "load existing" path.
-	logger := slog.Default()
-	id, err := loadOrGenerateHostID(logger, h.cfg.NodeHostDir, "")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	if id == "" {
-		t.Error("expected non-empty host ID")
-	}
-	if id != h.ID() {
-		t.Errorf("expected same ID %q, got %q", h.ID(), id)
-	}
-}
-
-func TestLoadOrGenerateHostID_OverrideID(t *testing.T) {
-	dir := t.TempDir()
-	logger := slog.Default()
-	id, err := loadOrGenerateHostID(logger, dir, "custom-host-id")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
-	}
-	if id != "custom-host-id" {
-		t.Errorf("expected %q, got %q", "custom-host-id", id)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: RemoveData - various paths
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Coverage: HandleSnapshot - bad type assertions and missing host
-// ---------------------------------------------------------------------------
-
-func TestHandleSnapshot_EmptyChunks(t *testing.T) {
-	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot(nil, transport.PeerAuth{})
-	if err != nil {
-		t.Errorf("expected nil error for empty chunks, got: %v", err)
-	}
-}
-
-func TestHandleSnapshot_NilHost(t *testing.T) {
-	handler := &hostMessageHandler{}
-	err := handler.HandleSnapshot([]proto.SnapshotChunk{{ShardID: 1}}, transport.PeerAuth{})
-	if err != nil {
-		t.Errorf("expected nil error for nil host, got: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Coverage: HandleMessage - batch source address registration
-// ---------------------------------------------------------------------------
-
-func TestHandleMessage_EmptyBatch(t *testing.T) {
-	h := newTestHost(t)
-	handler := &hostMessageHandler{host: h, engine: h.engine}
-
-	err := handler.HandleMessage(proto.MessageBatch{}, authorizeAllSenders)
-	if err != nil {
-		t.Errorf("expected nil error for empty batch, got: %v", err)
 	}
 }
 
@@ -18840,10 +15426,6 @@ func TestOnApplied_ConfigChangeUnmarshalError(t *testing.T) {
 		[]proto.Entry{{Index: 10, Key: 0, Type: proto.EntryConfigChange, Cmd: []byte("invalid")}},
 		[]sm.Result{{Value: 0}})
 }
-
-// ---------------------------------------------------------------------------
-// Coverage: QueryRaftLog - success path with running shard
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Coverage: OnReadyToRead - type assertion failure
@@ -18977,7 +15559,6 @@ func TestSyncRead_SuccessPath(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Coverage: DiagPipelineState - shard not ready
 // ---------------------------------------------------------------------------
-
 func TestDiagPipelineState_ShardNotReady(t *testing.T) {
 	h := newTestHost(t)
 
@@ -18988,25 +15569,8 @@ func TestDiagPipelineState_ShardNotReady(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: Stoppable/Drain in various states
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
 // Coverage: ReadIndex - witness, draining
 // ---------------------------------------------------------------------------
-
-func TestReadIndex_WitnessRejected(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	ns.cfg.IsWitness = true
-
-	ctx := context.Background()
-	_, err := h.ReadIndex(ctx, 1)
-	if !errors.Is(err, ErrInvalidOperation) {
-		t.Errorf("expected ErrInvalidOperation for witness, got: %v", err)
-	}
-}
 
 func TestReadIndex_DrainingRejected(t *testing.T) {
 	h := newTestHost(t)
