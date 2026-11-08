@@ -174,9 +174,7 @@ func TestCleanStaleConnections(t *testing.T) {
 
 	// Close the connection from the remote side.
 	conn.CloseWithError(0, "test close")
-
-	// Wait for context to propagate.
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Run cleanup.
 	t1.cleanStaleConnections()
@@ -318,16 +316,9 @@ func TestConcurrentSendDoesNotRace(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Wait for some messages to arrive.
-	deadline := time.After(10 * time.Second)
-	for handler2.batchCount.Load() < 1 {
-		select {
-		case <-deadline:
-			t.Fatal("timeout waiting for any batch to arrive")
-		default:
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
+	pollUntil(t, 10*time.Second, 10*time.Millisecond, "timeout waiting for any batch to arrive", func() bool {
+		return handler2.batchCount.Load() >= 1
+	})
 
 	// At least some batches should have arrived.
 	var received atomic.Int64
@@ -466,7 +457,7 @@ func TestCleanStaleConnectionsEvictsStreams(t *testing.T) {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 	conn.CloseWithError(0, "test kill connection")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Run cleanup.
 	t1.cleanStaleConnections()
@@ -546,8 +537,9 @@ func TestCleanStaleConnectionsKeepsLiveStreams(t *testing.T) {
 		t.Fatalf("getStream(t3) failed: %v", err)
 	}
 
-	// Wait for pre-opened heartbeat streams to settle.
-	time.Sleep(200 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat streams not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target2) == 2 && countStreamsForTarget(t1, target3) == 2
+	})
 
 	// Each connection has 1 data stream + 1 pre-opened heartbeat stream.
 	streamsBefore := t1.StreamCount()
@@ -564,7 +556,7 @@ func TestCleanStaleConnectionsKeepsLiveStreams(t *testing.T) {
 		t.Fatalf("getConnection(t2) failed: %v", err)
 	}
 	conn2.CloseWithError(0, "kill t2")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn2.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	t1.cleanStaleConnections()
 
@@ -593,8 +585,9 @@ func TestGetConnectionDeadEvictsStreams(t *testing.T) {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
-	// Wait for pre-opened heartbeat stream to settle.
-	time.Sleep(200 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	streamsBefore := t1.StreamCount()
 	if streamsBefore < 1 {
@@ -607,7 +600,7 @@ func TestGetConnectionDeadEvictsStreams(t *testing.T) {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 	conn.CloseWithError(0, "test kill for redial")
-	time.Sleep(300 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// getConnection should detect the dead connection, evict streams,
 	// and redial. The redial will also fire preOpenHeartbeatStream
@@ -675,8 +668,7 @@ func TestPreOpenHeartbeatStream(t *testing.T) {
 	// Wait for the async preOpenHeartbeatStream goroutine to complete.
 	// The goroutine opens a stream with a 5s timeout, but on loopback
 	// it completes in microseconds. Poll for the heartbeat stream.
-	deadline := time.After(5 * time.Second)
-	for {
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "timeout waiting for heartbeat stream to be pre-opened", func() bool {
 		shardIdx := uint64(0) & (streamShardCount - 1)
 		shard := &t1.streamShards[shardIdx]
 		key := streamKey{target: target, idx: 0}
@@ -684,17 +676,8 @@ func TestPreOpenHeartbeatStream(t *testing.T) {
 		shard.mu.RLock()
 		_, ok := shard.streams[key]
 		shard.mu.RUnlock()
-		if ok {
-			break
-		}
-
-		select {
-		case <-deadline:
-			t.Fatal("timeout waiting for heartbeat stream to be pre-opened")
-		default:
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
+		return ok
+	})
 
 	// Verify getStream returns the pre-opened heartbeat stream without
 	// needing to open a new one (cache hit path).
@@ -734,36 +717,14 @@ func TestPreOpenHeartbeatStreamNoRaceWithGetStream(t *testing.T) {
 		t.Fatal("expected non-nil heartbeat stream")
 	}
 
-	// Wait for preOpenHeartbeatStream to finish.
-	time.Sleep(200 * time.Millisecond)
-
-	// The stream pool should have exactly one heartbeat stream for
-	// this target, not two. Verify by fetching again.
+	// Whichever of the pre-open and getStream stored first, the pool keeps
+	// one live heartbeat stream for the target and later calls get it.
 	stream2, err := t1.getStream(target, 1, true, "")
 	if err != nil {
 		t.Fatalf("second getStream(heartbeat) failed: %v", err)
 	}
-	if stream2 == nil {
-		t.Fatal("expected non-nil heartbeat stream on second call")
-	}
-
-	// Both calls should return the same stream (one of them won the race).
-	// We can't assert pointer equality because the pre-open goroutine
-	// may have won and the getStream returned the pre-opened one, or
-	// vice versa. But the stream should be functional.
-	shardIdx := uint64(0) & (streamShardCount - 1)
-	shard := &t1.streamShards[shardIdx]
-	key := streamKey{target: target, idx: 0}
-	shard.mu.RLock()
-	count := 0
-	for k := range shard.streams {
-		if k == key {
-			count++
-		}
-	}
-	shard.mu.RUnlock()
-	if count != 1 {
-		t.Fatalf("expected exactly 1 heartbeat stream entry, got %d", count)
+	if stream2 != stream {
+		t.Fatal("second getStream(heartbeat) returned a different stream: the pre-open replaced a live entry")
 	}
 }
 
@@ -785,14 +746,16 @@ func TestPreOpenHeartbeatStreamDeadConnection(t *testing.T) {
 
 	// Wait for the async preOpenHeartbeatStream from dialConnection to
 	// complete so it does not interfere with our test.
-	time.Sleep(300 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 1
+	})
 
 	// Evict any streams that were pre-opened by dialConnection.
 	t1.evictStreamsForTarget(target)
 
 	// Close the connection so OpenStreamSync will fail.
 	conn.CloseWithError(0, "test close before pre-open")
-	time.Sleep(100 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Calling preOpenHeartbeatStream on a dead connection should not
 	// panic or block. The stream open will fail and return silently.
