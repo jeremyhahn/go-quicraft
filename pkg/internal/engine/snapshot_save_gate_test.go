@@ -259,7 +259,11 @@ func TestSavingGateDoesNotDropEntries(t *testing.T) {
 		item.node = node
 		applyC <- item
 	}
-	time.Sleep(5 * time.Millisecond)
+	// Wait until the per-shard goroutine has taken a batch to the gate:
+	// applyInFlight is 1 only between its dequeue and each gate recheck,
+	// so a fine poll observing it proves a batch reached the held gate.
+	waitFor(t, 5*time.Second, time.Microsecond, "no batch reached the held saving gate",
+		func() bool { return node.applyInFlight.Load() == 1 })
 	node.SetSaving(false)
 
 	// Every delivered entry must eventually reach the state machine.
