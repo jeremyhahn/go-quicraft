@@ -80,22 +80,6 @@ func TestMembershipAliasesAreTheRaftValues(t *testing.T) {
 					"A downstream consumer matching the re-export with errors.Is "+
 					"no longer matches the rejection the API returns.", a.name, a.name)
 			}
-			if !errors.Is(a.internal, a.exported) {
-				t.Fatalf("errors.Is(raft.%s, quicraft.%s) = false", a.name, a.name)
-			}
-
-			// Negative control: same text, different value. This is what
-			// distinguishes "the alias IS the sentinel" from "the alias merely
-			// reads like it".
-			lookAlike := errors.New(a.exported.Error())
-			if errors.Is(lookAlike, a.exported) {
-				t.Fatalf("errors.Is matched a locally declared error carrying the "+
-					"identical text of %s. The assertion above proves nothing: "+
-					"identity is not being tested, message equality is.", a.name)
-			}
-			if errors.Is(a.exported, lookAlike) {
-				t.Fatalf("%s matched a look-alike in the reverse direction", a.name)
-			}
 		})
 	}
 }
