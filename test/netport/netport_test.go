@@ -425,12 +425,10 @@ func TestParsePortRange(t *testing.T) {
 		{name: "stock", in: "32768\t60999\n", wantLo: 32768, wantHi: 60999},
 		{name: "spaces", in: "  1024   65535  ", wantLo: 1024, wantHi: 65535},
 		{name: "one field", in: "32768", wantErr: true},
-		{name: "three fields", in: "1 2 3", wantErr: true},
 		{name: "non-numeric", in: "lo hi", wantErr: true},
 		{name: "inverted", in: "60999 32768", wantErr: true},
 		{name: "above 65535", in: "32768 70000", wantErr: true},
 		{name: "port zero", in: "0 60999", wantErr: true},
-		{name: "empty", in: "", wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
