@@ -23,25 +23,24 @@ import (
 	"testing"
 )
 
-// The fleet values the gate's own tests plant. They are the values the rules
-// exist to find, so each line carries a waiver; every other test in the
+// The placeholder values the gate's own tests plant. They are the values the
+// rules exist to find, so each line carries a waiver; every other test in the
 // repository uses neutral fixtures.
 const (
 	plantedAddress   = "198.51.100.51" // lab-string-ok: planted fixture for the lab-address rule
-	plantedGPUHost   = "gpu-host"        // lab-string-ok: planted fixture for the lab-host rule
-	plantedBenchHost = "omega"          // lab-string-ok: planted fixture for the lab-host rule
+	plantedGPUHost   = "gpu-host"      // lab-string-ok: planted fixture for the lab-host rule
+	plantedBenchHost = "omega"         // lab-string-ok: planted fixture for the lab-host rule
 	plantedRunner    = "ci-node-2"     // lab-string-ok: planted fixture for the lab-host rule
-	plantedAgent     = "vm-host-4"    // lab-string-ok: planted fixture for the lab-host rule
-	plantedHome      = "/home/jhahn"    // lab-string-ok: planted fixture for the owner-path rule
-	plantedMount     = "/mnt/vstation"  // lab-string-ok: planted fixture for the owner-path rule
-	plantedAccount   = "jhahn"          // lab-string-ok: planted fixture for the owner-account rule
+	plantedAgent     = "vm-host-4"     // lab-string-ok: planted fixture for the lab-host rule
+	plantedHome      = "/home/jhahn"   // lab-string-ok: planted fixture for the owner-path rule
+	plantedMount     = "/mnt/vm-host"  // lab-string-ok: planted fixture for the owner-path rule
+	plantedAccount   = "jhahn"         // lab-string-ok: planted fixture for the owner-account rule
 
 	plantedDomain        = "example.internal"                   // lab-string-ok: planted fixture for the internal-identity rule
 	plantedPrincipal     = "agent-go-quicraft@example.internal" // lab-string-ok: planted fixture for the internal-identity rule
-	plantedSibling       = "agent-go-qrdb@forge.example"                  // lab-string-ok: an agent principal outside the internal domain is still one
-	plantedCompanyRepo   = "automatethethings"                            // lab-string-ok: planted fixture for the internal-repository rule
-	plantedHandbookIssue = "handbook #392"                                // lab-string-ok: planted fixture for the internal-repository rule
-	plantedAgentsRepo    = "claude-agents"                                // lab-string-ok: planted fixture for the internal-repository rule
+	plantedSibling       = "agent-go-qrdb@forge.example"        // lab-string-ok: an agent principal outside the internal domain is still one
+	plantedHandbookIssue = "handbook #392"                      // lab-string-ok: planted fixture for the internal-repository rule
+	plantedAgentsRepo    = "claude-agents"                      // lab-string-ok: planted fixture for the internal-repository rule
 )
 
 // writeTree writes files into a temporary directory and returns the root plus
@@ -142,13 +141,6 @@ func TestScanReportsEveryClassWithItsLineAndMatch(t *testing.T) {
 			wantLine:  1,
 		},
 		{
-			name:      "company repository issue in a workflow comment",
-			content:   "# v1.15 (" + plantedCompanyRepo + "#211): push runs on main\n",
-			wantClass: classInternalRepository,
-			wantMatch: plantedCompanyRepo,
-			wantLine:  1,
-		},
-		{
 			name:      "handbook issue in a doc",
 			content:   "# Notes\n\nSee " + strings.ToUpper(plantedHandbookIssue) + " for the ruling.\n",
 			wantClass: classInternalRepository,
@@ -209,16 +201,16 @@ func TestScanAcceptsWhatItShould(t *testing.T) {
 		name    string
 		content string
 	}{
-		{"documentation addresses", "dial 198.51.100.7:8443 or 192.0.2.10 or 203.0.113.4\n"},
+		{"documentation-range literals that are not the placeholder subnet", "dial 192.0.2.10:8443 or 203.0.113.4 or 198.51.10.7\n"},
 		{"RFC 1918 literals that are not the fleet subnet", "peers: 192.168.1.10, 192.168.100.4, 10.0.0.1\n"},
 		{"role names", "make remote-test REMOTE_HOST=build-host.example PERF_HOST=user@bench-host.example\n"},
 		{"a waiver on the offending line", "Measured on " + plantedGPUHost + ". <!-- lab-string-ok: measurement provenance -->\n"},
 		{"a waiver whose reason ends at a comment closer", "x := 1 /* lab-string-ok: provenance */ // " + plantedGPUHost + "\n"},
 		{"a fleet name inside a longer word", "un" + plantedGPUHost + "ness, " + plantedBenchHost + "Dir and OMEGA_HOST are not hosts\n"},
-		{"a fleet prefix without its two digits", "vstation-0 and dellemc-1 name no machine\n"},
+		{"a fleet prefix without its number", "ci-node-x and vm-host-N name no machine\n"},
 		{"agent words that are not principals", "agent-" + "git.sh go-quicraft commit; User-Agent: x; agent-01 runs it\n"},
 		{"a templated principal with no name", "user.email=\"agent-$repo@example.invalid\"\n"},
-		{"a neutral example identity", "release@example.invalid and ops@example.internal\n"},
+		{"a neutral example identity", "release@example.invalid and ops@forge.example\n"},
 	}
 
 	for _, tc := range cases {
@@ -468,16 +460,15 @@ func TestErrorsNameTheirSubjectAndUnwrap(t *testing.T) {
 // every file, and the gate would pass while seeing nothing.
 func TestPatternsEveryNeedleIsImpliedByItsExpr(t *testing.T) {
 	samples := map[string][]string{
-		`\b192\.168\.101\.\d{1,3}\b`:                       {plantedAddress + ":3001", "at " + plantedAddress},
-		`(?i)\bvstation-\d{2}\b`:                           {"agent-" + plantedAgent, strings.ToUpper(plantedAgent) + " rebooted"},
-		`(?i)\bdellemc-\d{2}\b`:                            {"runner " + plantedRunner, strings.ToUpper(plantedRunner)},
-		`(?i)\bgodlike(\.internal)?\b`:                     {"on " + plantedGPUHost, "http://" + strings.ToUpper(plantedGPUHost) + ".internal:8077"},
-		`(?i)\bomega\b`:                                    {"ssh user@" + plantedBenchHost + ":22", strings.ToUpper(plantedBenchHost) + " reported Online"},
-		`/home/jhahn\b`:                                    {plantedHome + "/sources"},     // lab-string-ok: the rule's own source text, as the map key
-		`/mnt/vstation`:                                    {plantedMount + "-01/go-qrdb"}, // lab-string-ok: the rule's own source text, as the map key
+		`\b198\.51\.100\.\d{1,3}\b`: {plantedAddress + ":3001", "at " + plantedAddress},
+		`(?i)\bgpu-host\b`:          {"on " + plantedGPUHost, "http://" + strings.ToUpper(plantedGPUHost) + ".internal:8077"}, // lab-string-ok: the rule's own source text, as the map key
+		`(?i)\bci-node-\d+\b`:       {"runner " + plantedRunner, strings.ToUpper(plantedRunner)},
+		`(?i)\bvm-host-\d+\b`:       {"agent-" + plantedAgent, strings.ToUpper(plantedAgent) + " rebooted"},
+		`(?i)\bomega\b`:             {"ssh user@" + plantedBenchHost + ":22", strings.ToUpper(plantedBenchHost) + " reported Online"},
+		`/home/jhahn\b`:             {plantedHome + "/sources"},     // lab-string-ok: the rule's own source text, as the map key
+		`/mnt/vm-host`:              {plantedMount + "-01/go-qrdb"}, // lab-string-ok: the rule's own source text, as the map key
 		`(?i)\bagent-[a-z0-9-]+@[a-z0-9-]+(\.[a-z0-9-]+)*`: {plantedPrincipal, "user.email=" + strings.ToUpper(plantedSibling)},
-		`(?i)\bautomatethethings\.internal\b`:              {"ops@" + plantedDomain, strings.ToUpper(plantedDomain) + ":22"},
-		`(?i)\bautomatethethings\b`:                        {plantedCompanyRepo + "#207", "repo " + strings.ToUpper(plantedCompanyRepo)},          // lab-string-ok: the rule's own source text, as the map key
+		`(?i)\bexample\.internal\b`:                        {"ops@" + plantedDomain, strings.ToUpper(plantedDomain) + ":22"},
 		`(?i)\bhandbook ?#\d+`:                             {plantedHandbookIssue, "Handbook#44"},                                                 // lab-string-ok: a planted sample for the internal-repository rule
 		`(?i)\bclaude-agents\b`:                            {plantedAgentsRepo + "#92", strings.ToUpper(plantedAgentsRepo)},                       // lab-string-ok: the rule's own source text, as the map key
 		`(?i)\bjhahn\b`:                                    {plantedAccount + "@example.com", "signed off by " + strings.ToUpper(plantedAccount)}, // lab-string-ok: the rule's own source text, as the map key
