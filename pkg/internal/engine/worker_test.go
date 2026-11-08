@@ -62,6 +62,24 @@ func goroutineID() string {
 // wait loop with no observation hook is visible this way only: the dump
 // shows the goroutine inside the loop, not merely about to enter it.
 func goroutineSleepingIn(id, caller string) bool {
+	// Line 1 is the innermost frame, line 3 its caller.
+	lines := goroutineStack(id)
+	return len(lines) > 3 && strings.HasPrefix(lines[1], "time.Sleep(") &&
+		strings.Contains(lines[3], caller)
+}
+
+// goroutineBlockedIn reports whether goroutine id is parked in the wait
+// state (for example "chan receive") directly inside fn: fn is its innermost
+// frame, so the wait is fn's own, not one in a function fn has called.
+func goroutineBlockedIn(id, state, fn string) bool {
+	lines := goroutineStack(id)
+	return len(lines) > 1 && strings.HasPrefix(lines[0], "goroutine "+id+" ["+state) &&
+		strings.Contains(lines[1], fn)
+}
+
+// goroutineStack returns the lines of goroutine id's stack trace, the header
+// first, or nil if there is no such goroutine.
+func goroutineStack(id string) []string {
 	buf := make([]byte, 1<<16)
 	for {
 		n := runtime.Stack(buf, true)
@@ -72,15 +90,11 @@ func goroutineSleepingIn(id, caller string) bool {
 		buf = make([]byte, 2*len(buf))
 	}
 	for _, g := range strings.Split(string(buf), "\n\n") {
-		if !strings.HasPrefix(g, "goroutine "+id+" [") {
-			continue
+		if strings.HasPrefix(g, "goroutine "+id+" [") {
+			return strings.Split(g, "\n")
 		}
-		// Line 1 is the innermost frame, line 3 its caller.
-		lines := strings.Split(g, "\n")
-		return len(lines) > 3 && strings.HasPrefix(lines[1], "time.Sleep(") &&
-			strings.Contains(lines[3], caller)
 	}
-	return false
+	return nil
 }
 
 // --- Test LogDB implementation ---

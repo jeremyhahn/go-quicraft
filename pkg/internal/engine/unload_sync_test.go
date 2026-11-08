@@ -89,11 +89,18 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 
 	// Apply is now in flight. UnloadNode must block until it completes.
 	unloadDone := make(chan struct{})
+	unloadG := make(chan string, 1)
 	go func() {
+		unloadG <- goroutineID()
 		e.UnloadNode(7)
 		close(unloadDone)
 	}()
-	waitFor(t, 5*time.Second, time.Millisecond, "UnloadNode never marked the node unloaded", node.unloaded.Load)
+	gid := <-unloadG
+	// Wait until UnloadNode is blocked in the apply-worker join, its only
+	// direct channel receive: the unloaded flag is stored before the step
+	// and commit worker unloads, so it does not prove the join is reached.
+	waitFor(t, 5*time.Second, time.Millisecond, "UnloadNode never reached the apply-worker join",
+		func() bool { return goroutineBlockedIn(gid, "chan receive", "(*Engine).UnloadNode(") })
 	select {
 	case <-unloadDone:
 		t.Fatal("UnloadNode returned while SM.Apply was still blocked")
