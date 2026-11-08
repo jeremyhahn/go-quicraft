@@ -21,6 +21,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,6 +47,40 @@ func waitFor(t *testing.T, timeout, pollInterval time.Duration, msg string, cond
 		}
 		time.Sleep(pollInterval) // the poll interval of the condition wait itself
 	}
+}
+
+// goroutineID returns the calling goroutine's id as printed in the header
+// of its stack trace ("goroutine <id> [<status>]:").
+func goroutineID() string {
+	buf := make([]byte, 64)
+	buf = buf[:runtime.Stack(buf, false)]
+	return strings.Fields(string(buf))[1]
+}
+
+// goroutineSleepingIn reports whether goroutine id is asleep in time.Sleep
+// called directly from a function whose name contains caller. A polling
+// wait loop with no observation hook is visible this way only: the dump
+// shows the goroutine inside the loop, not merely about to enter it.
+func goroutineSleepingIn(id, caller string) bool {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if !strings.HasPrefix(g, "goroutine "+id+" [") {
+			continue
+		}
+		// Line 1 is the innermost frame, line 3 its caller.
+		lines := strings.Split(g, "\n")
+		return len(lines) > 3 && strings.HasPrefix(lines[1], "time.Sleep(") &&
+			strings.Contains(lines[3], caller)
+	}
+	return false
 }
 
 // --- Test LogDB implementation ---
@@ -4930,17 +4966,21 @@ func TestApplyWorker_RunShardApply_RecoveringSkipsApply(t *testing.T) {
 	// machine. Run it in a goroutine so the parked state can be
 	// observed before completing the recovery.
 	done := make(chan struct{})
+	applyG := make(chan string, 1)
 	go func() {
+		applyG <- goroutineID()
 		aw.runShardApply(shardC)
 		close(done)
 	}()
+	gid := <-applyG
 
 	// While recovering, the batch stays parked: the SM is untouched and
-	// commitPending remains set. Wait until the goroutine has taken the
-	// batch and drops applyInFlight to zero, which it does only while
-	// parked on the gate (or after exiting, which done rules out).
+	// commitPending remains set. Wait until the apply goroutine is asleep
+	// in the recovery gate's wait loop, the only time.Sleep in
+	// runShardApply: that is observed inside the gate, so the batch has
+	// entered it before the recovery completes below.
 	waitFor(t, 5*time.Second, time.Millisecond, "batch never parked on the recovery gate", func() bool {
-		return len(shardC) == 0 && node.applyInFlight.Load() == 0
+		return goroutineSleepingIn(gid, "runShardApply")
 	})
 	select {
 	case <-done:
