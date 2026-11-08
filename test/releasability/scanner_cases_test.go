@@ -36,11 +36,11 @@ const (
 	plantedMount     = "/mnt/vm-host"         // lab-string-ok: planted fixture for the owner-path rule
 	plantedAccount   = "jhahn"                // lab-string-ok: planted fixture for the owner-account rule
 
-	plantedDomain        = "example.internal"          // lab-string-ok: planted fixture for the internal-identity rule
-	plantedPrincipal     = "agent-01@example.internal" // lab-string-ok: planted fixture for the internal-identity rule
-	plantedSibling       = "agent-02@forge.example"    // lab-string-ok: an agent principal outside the internal domain is still one
-	plantedHandbookIssue = "handbook #392"             // lab-string-ok: planted fixture for the internal-repository rule
-	plantedAgentsRepo    = "claude-agents"             // lab-string-ok: planted fixture for the internal-repository rule
+	plantedDomain        = "example.internal"       // lab-string-ok: planted fixture for the internal-identity rule
+	plantedPrincipal     = "agent-01@example.com"   // lab-string-ok: planted fixture for the agent-principal rule
+	plantedSibling       = "agent-02@forge.example" // lab-string-ok: an agent principal outside the internal domain is still one
+	plantedHandbookIssue = "handbook #392"          // lab-string-ok: planted fixture for the internal-repository rule
+	plantedAgentsRepo    = "claude-agents"          // lab-string-ok: planted fixture for the internal-repository rule
 )
 
 // writeTree writes files into a temporary directory and returns the root plus
@@ -361,7 +361,8 @@ func TestScanReportsAValueOnceByItsMostSpecificRule(t *testing.T) {
 // TestScanReportsAnAgentPrincipalOnce pins the rule order: the internal domain
 // inside an agent principal is part of that one identity, not a second leak.
 func TestScanReportsAnAgentPrincipalOnce(t *testing.T) {
-	root, files := writeTree(t, map[string]string{"signers": plantedPrincipal + " ssh-ed25519 AAAA " + plantedPrincipal + "\n"})
+	principal := "agent-01@" + plantedDomain
+	root, files := writeTree(t, map[string]string{"signers": principal + " ssh-ed25519 AAAA " + principal + "\n"})
 	findings, err := scan(root, files, nil)
 	if err != nil {
 		t.Fatalf("scan: %v", err)
@@ -370,7 +371,7 @@ func TestScanReportsAnAgentPrincipalOnce(t *testing.T) {
 		t.Fatalf("want the principal once per occurrence and the domain never, got %v", findings)
 	}
 	for _, f := range findings {
-		if f.class != classInternalIdentity || f.match != plantedPrincipal {
+		if f.class != classInternalIdentity || f.match != principal {
 			t.Errorf("finding = %v, want the whole principal", f)
 		}
 	}
