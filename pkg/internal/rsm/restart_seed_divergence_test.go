@@ -248,6 +248,7 @@ func TestRestart_UnseededReplicaIsRefusedNotDiverged(t *testing.T) {
 		t.Fatalf("Apply(registrations) = %v", err)
 	}
 	unseeded := restartAt(t, replica, seedFixtureCut, false)
+	before := unseeded.LastApplied()
 
 	err := unseeded.Apply(tail, make([]sm.Result, len(tail)))
 	if !errors.Is(err, ErrApplyGap) {
@@ -255,7 +256,11 @@ func TestRestart_UnseededReplicaIsRefusedNotDiverged(t *testing.T) {
 			"ErrApplyGap. Its counter reads %d while the batch starts at %d, so the "+
 			"expiry checkpoint walk would run over every checkpoint in (0, %d] that "+
 			"its peers already ran, draining the session backlog 64 at a time",
-			err, unseeded.LastApplied(), tail[0].Index, seedFixtureCut)
+			err, before, tail[0].Index, seedFixtureCut)
+	}
+	if got := unseeded.LastApplied(); got != before {
+		t.Fatalf("lastApplied = %d, want %d: a rejected batch must not advance the "+
+			"marker", got, before)
 	}
 }
 

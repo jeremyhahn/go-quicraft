@@ -133,6 +133,8 @@ func runSealedReplica(t *testing.T, sealLeader, underLoad bool) {
 			t.Fatalf("SyncRead on sealed %s: err = %v, want ErrBarrierSealed", role, readErr)
 		}
 		refusals++
+		// Sampling interval across the held seal: the replica stays sealed
+		// for sealedHold by design, not until a condition.
 		time.Sleep(50 * time.Millisecond)
 	}
 	close(stopLoad)

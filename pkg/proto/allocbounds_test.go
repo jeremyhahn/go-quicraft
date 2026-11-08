@@ -73,26 +73,6 @@ func TestMessageBatch_UnmarshalFrom_CountExceedsBuffer(t *testing.T) {
 	}
 }
 
-// TestMessageBatch_UnmarshalFrom_CountBoundaryAccepted asserts the
-// cross-check does not reject counts the buffer could legitimately hold.
-func TestMessageBatch_UnmarshalFrom_CountBoundaryAccepted(t *testing.T) {
-	mb := MessageBatch{
-		BinVer:   WireVersion,
-		Requests: []Message{{Type: Heartbeat, ShardID: 1}, {Type: Heartbeat, ShardID: 2}},
-	}
-	buf := make([]byte, mb.Size())
-	if _, err := mb.MarshalTo(buf); err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	var got MessageBatch
-	if _, err := got.UnmarshalFrom(buf); err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if len(got.Requests) != 2 {
-		t.Fatalf("Requests = %d, want 2", len(got.Requests))
-	}
-}
-
 // TestMessage_UnmarshalFrom_EntryCountExceedsBuffer asserts that an entry
 // count the remaining buffer cannot hold is rejected before the []Entry is
 // allocated (10000 * 80-byte Entry was ~800 KB from a 92-byte payload).

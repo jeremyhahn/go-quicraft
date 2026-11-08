@@ -15,7 +15,6 @@
 package rsm
 
 import (
-	"errors"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -72,34 +71,6 @@ func applyContiguous(t *testing.T, s *StateMachine, entries []proto.Entry, resul
 		prev = s.LastApplied()
 	}
 	return s.Apply(entries, results)
-}
-
-// TestApply_RejectsHoleBelowTheBatch is the guard's own unit test. A state
-// machine handed a batch that starts above lastApplied+1 must fail rather than
-// apply it: the hole means either committed entries were dropped or the applied
-// marker was never seeded from the index the shard resumed at, and both make
-// this replica evaluate session expiry over a different index range than the
-// peers that applied the same log contiguously.
-func TestApply_RejectsHoleBelowTheBatch(t *testing.T) {
-	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-		return newTestKV()
-	})
-	s, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 10), nil, false)
-	if err != nil {
-		t.Fatalf("NewStateMachine = %v", err)
-	}
-	defer s.Close()
-
-	entries := []proto.Entry{{Index: 5, Cmd: makeCmd("k", "v")}}
-	if err := s.Apply(entries, make([]sm.Result, 1)); !errors.Is(err, ErrApplyGap) {
-		t.Fatalf("Apply(index 5) on a state machine at lastApplied 0 = %v, want "+
-			"ErrApplyGap: indices 1-4 were never applied here, so the expiry "+
-			"checkpoint walk would run over a range this replica did not apply", err)
-	}
-	if got := s.LastApplied(); got != 0 {
-		t.Fatalf("lastApplied = %d, want 0: a rejected batch must not advance the "+
-			"marker", got)
-	}
 }
 
 // TestApply_AcceptsContiguousAndReplayedBatches pins the two shapes the guard

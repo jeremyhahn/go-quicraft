@@ -33,16 +33,24 @@ func TestNode_WaitForApplyDrain_BlocksUntilInFlightApplyCompletes(t *testing.T) 
 	n.applyInFlight.Add(1)
 
 	var drained atomic.Bool
+	drainG := make(chan string, 1)
 	go func() {
+		drainG <- goroutineID()
 		n.SetRecovering(true)
 		ok := n.WaitForApplyDrain(stopC)
 		if ok {
 			drained.Store(true)
 		}
 	}()
+	gid := <-drainG
 
-	// The drain must NOT complete while the apply is still in flight.
-	time.Sleep(20 * time.Millisecond)
+	// The drain must NOT complete while the apply is still in flight. Wait
+	// until the drain goroutine is asleep in WaitForApplyDrain's in-flight
+	// loop: that proves the drain is waiting on the apply before it is
+	// released below.
+	waitFor(t, 2*time.Second, time.Millisecond, "WaitForApplyDrain never waited on the in-flight apply", func() bool {
+		return goroutineSleepingIn(gid, "WaitForApplyDrain")
+	})
 	if drained.Load() {
 		t.Fatal("WaitForApplyDrain returned while an apply was still in flight")
 	}
@@ -50,15 +58,7 @@ func TestNode_WaitForApplyDrain_BlocksUntilInFlightApplyCompletes(t *testing.T) 
 	// Complete the in-flight apply; the drain must now finish promptly.
 	n.applyInFlight.Add(-1)
 
-	deadline := time.After(2 * time.Second)
-	for !drained.Load() {
-		select {
-		case <-deadline:
-			t.Fatal("WaitForApplyDrain did not complete after apply drained")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
+	waitFor(t, 2*time.Second, time.Millisecond, "WaitForApplyDrain did not complete after apply drained", drained.Load)
 }
 
 // TestNode_WaitForApplyDrain_StopCAborts verifies the drain returns false and

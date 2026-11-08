@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -166,53 +167,36 @@ func TestPreVote_RoundCompletesUnderSustainedApplyBacklog(t *testing.T) {
 		lr := c.replicas[leader]
 		lr.node.DeliverProposal([]proto.Entry{{Cmd: []byte{byte(i)}}})
 		lr.engine.NotifyWork(c.shardID)
-		time.Sleep(20 * time.Millisecond)
 	}
 
 	// The whole cluster must be in the commitPending state, otherwise the test
 	// would prove nothing about which messages may leave it.
-	deadline := time.Now().Add(15 * time.Second)
-	pending := 0
-	for time.Now().Before(deadline) {
-		pending = 0
-		for _, r := range c.replicas {
-			if r.node.commitPending.Load() {
-				pending++
+	waitFor(t, 15*time.Second, 5*time.Millisecond,
+		"not every replica reached commitPending; the test cannot observe the free-order restriction",
+		func() bool {
+			for _, r := range c.replicas {
+				if !r.node.commitPending.Load() {
+					return false
+				}
 			}
-		}
-		if pending == len(c.replicas) {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if pending != len(c.replicas) {
-		t.Fatalf("only %d of %d replicas reached commitPending; the test cannot "+
-			"observe the free-order restriction", pending, len(c.replicas))
-	}
+			return true
+		})
 
 	termAtKill := c.replicas[leader].node.Peer().Term()
 	c.router.kill(leader)
 
-	deadline = time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		for id, r := range c.replicas {
-			if id == leader {
-				continue
+	waitFor(t, 30*time.Second, 5*time.Millisecond,
+		fmt.Sprintf("no surviving replica completed a pre-vote round after the leader "+
+			"was killed (term at kill=%d). With every replica's apply "+
+			"stalled — sustained write load — pre-vote traffic never leaves the "+
+			"nodes, so the shard pre-campaigns indefinitely and stays leaderless "+
+			"with quorum fully available", termAtKill),
+		func() bool {
+			for id, r := range c.replicas {
+				if id != leader && r.node.Peer().Term() > termAtKill {
+					return true
+				}
 			}
-			if r.node.Peer().Term() > termAtKill {
-				return
-			}
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	terms := make(map[uint64]uint64, len(c.replicas))
-	for id, r := range c.replicas {
-		terms[id] = r.node.Peer().Term()
-	}
-	t.Fatalf("no surviving replica completed a pre-vote round after the leader "+
-		"was killed (term at kill=%d, terms now=%v). With every replica's apply "+
-		"stalled — sustained write load — pre-vote traffic never leaves the "+
-		"nodes, so the shard pre-campaigns indefinitely and stays leaderless "+
-		"with quorum fully available", termAtKill, terms)
+			return false
+		})
 }

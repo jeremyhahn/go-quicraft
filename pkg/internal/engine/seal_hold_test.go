@@ -647,14 +647,13 @@ func newLeaseEngine(t *testing.T) *leaseEngine {
 	peer.SetTickInterval(tick)
 	// A LeaseRead replica holds even its own vote down for one election
 	// span of real time after it starts; campaign once that has passed.
-	deadline := time.Now().Add(10 * time.Second)
-	for term, _, _, _, _, _ := peer.DiagRaftState(); term == 0; term, _, _, _, _, _ = peer.DiagRaftState() {
-		if time.Now().After(deadline) {
-			t.Fatal("fixture: the peer never campaigned")
+	waitFor(t, 10*time.Second, 5*time.Millisecond, "fixture: the peer never campaigned", func() bool {
+		if term, _, _, _, _, _ := peer.DiagRaftState(); term != 0 {
+			return true
 		}
 		peer.Tick()
-		time.Sleep(5 * time.Millisecond)
-	}
+		return false
+	})
 	_ = peer.DrainMessages()
 	term, _, _, _, _, _ := peer.DiagRaftState()
 	for _, from := range []uint64{2, 3} {

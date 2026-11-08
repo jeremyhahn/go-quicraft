@@ -270,6 +270,8 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 				baselineLeader, baselineTerm, time.Since(forgottenSince))
 			forgottenSince = time.Time{}
 		}
+		// Sampling interval across the load window: the window runs for
+		// loadWindow by design, not until a condition.
 		time.Sleep(samplePause)
 	}
 
@@ -486,25 +488,28 @@ func requestTransferUntilLeader(t *testing.T, c *testCluster, shardID, targetRep
 	t.Helper()
 
 	targetIdx := int(targetReplica) - 1
-	deadline := time.Now().Add(timeout)
+	// The condition's description is fixed before the wait starts, so each new
+	// RequestLeaderTransfer error is logged as it appears, for the failure.
 	var lastErr error
-	for time.Now().Before(deadline) {
+	waitForCondition(t, timeout, fmt.Sprintf("leadership moves to replica %d. A transfer "+
+		"that is accepted and then does nothing turns every planned handover — rolling "+
+		"restart, drain, maintenance — into an unplanned failover that waits out an "+
+		"election timeout", targetReplica), func() bool {
 		info, err := c.hosts[targetIdx].ShardInfo(shardID)
 		if err == nil && info.IsLeader {
-			return
+			return true
 		}
 		if leaderIdx := c.findLeader(shardID); leaderIdx >= 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-			lastErr = c.hosts[leaderIdx].RequestLeaderTransfer(ctx, shardID, targetReplica)
+			err = c.hosts[leaderIdx].RequestLeaderTransfer(ctx, shardID, targetReplica)
 			cancel()
+			if err != nil && (lastErr == nil || err.Error() != lastErr.Error()) {
+				t.Logf("RequestLeaderTransfer(replica=%d): %v", targetReplica, err)
+			}
+			lastErr = err
 		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Fatalf("leadership never moved to replica %d within %v (last RequestLeaderTransfer "+
-		"error: %v). A transfer that is accepted and then does nothing turns every "+
-		"planned handover — rolling restart, drain, maintenance — into an unplanned "+
-		"failover that waits out an election timeout.",
-		targetReplica, timeout, lastErr)
+		return false
+	})
 }
 
 // TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica asserts

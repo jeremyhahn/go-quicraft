@@ -747,12 +747,15 @@ func waitForBatchLen(t *testing.T, a *Aggregator, n int) {
 // waitForCondition polls cond until it holds, failing the test on timeout.
 func waitForCondition(t *testing.T, within time.Duration, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if cond() {
-			return
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	deadline := time.NewTimer(within)
+	defer deadline.Stop()
+	for !cond() {
+		select {
+		case <-deadline.C:
+			t.Fatalf("condition not met within %v: %s", within, what)
+		case <-ticker.C:
 		}
-		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("condition not met within %v: %s", within, what)
 }
