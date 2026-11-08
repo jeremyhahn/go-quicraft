@@ -269,6 +269,21 @@ func TestManagerRecordResult(t *testing.T) {
 			t.Fatalf("RecordResult(4) = %v", err)
 		}
 
+		// The cached entries at and below respondedTo are physically
+		// deleted; CheckDuplicate below answers from respondedTo alone
+		// and would not notice an entry left behind at the boundary.
+		responses := m.sessions[1].responses
+		for _, sid := range []uint64{1, 2} {
+			if _, ok := responses[sid]; ok {
+				t.Errorf("series %d still cached after respondedTo advanced to 2", sid)
+			}
+		}
+		for _, sid := range []uint64{3, 4} {
+			if _, ok := responses[sid]; !ok {
+				t.Errorf("series %d missing from cache, want kept", sid)
+			}
+		}
+
 		// Series 1 and 2 are <= respondedTo (2), should return ErrResponseEvicted.
 		_, isDup1, err1 := m.CheckDuplicate(1, 1, 105)
 		_, isDup2, err2 := m.CheckDuplicate(1, 2, 106)
