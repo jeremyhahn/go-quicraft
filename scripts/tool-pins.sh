@@ -30,3 +30,8 @@ GOVULNCHECK_VERSION=v1.8.0
 TRIVY_VERSION=v0.75.0
 TRIVY_SHA256_LINUX_AMD64=c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f
 TRIVY_SHA256_LINUX_ARM64=a1ee9f6ffb7d112b64ff726a2a0717c21175c1114361391f4a132956751a13b3
+# The same two archives by release-asset id, the fallback when the release
+# download URL fails: api.github.com/repos/aquasecurity/trivy/releases/assets/<id>.
+# The digests above still check whatever either URL returns.
+TRIVY_ASSET_ID_LINUX_AMD64=603335432
+TRIVY_ASSET_ID_LINUX_ARM64=603335583
