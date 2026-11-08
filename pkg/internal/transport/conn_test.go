@@ -850,7 +850,9 @@ func TestPreOpenHeartbeatStreamExitsEarlyWhenStopped(t *testing.T) {
 	}
 
 	// Wait for the initial preOpenHeartbeatStream from dialConnection.
-	time.Sleep(300 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 1
+	})
 
 	// Evict all streams so we can observe if preOpen creates a new one.
 	t1.evictStreamsForTarget(target)
@@ -892,11 +894,13 @@ func TestPreOpenHeartbeatStreamWaitGroupDoneOnAllPaths(t *testing.T) {
 	}
 
 	// Wait for initial preOpenHeartbeatStream to complete.
-	time.Sleep(300 * time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 1
+	})
 
 	// Close the connection so OpenStreamSync will fail.
 	conn.CloseWithError(0, "test close for wg done verification")
-	time.Sleep(100 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Call preOpenHeartbeatStream on the dead connection. It should fail
 	// gracefully and still call wg.Done() via defer.
@@ -979,10 +983,9 @@ func TestEvictStaleOutboundAliveConnection(t *testing.T) {
 	// against a fully-populated pool rather than whatever subset happened to
 	// exist at snapshot time.
 	const wantStreams = 2
-	deadline := time.Now().Add(5 * time.Second)
-	for t1.StreamCount() < wantStreams && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "stream pool did not reach the pre-opened heartbeat plus the data stream", func() bool {
+		return t1.StreamCount() >= wantStreams
+	})
 	if got := t1.StreamCount(); got != wantStreams {
 		t.Fatalf("stream pool did not settle: StreamCount = %d, want %d "+
 			"(pre-opened heartbeat stream plus the data stream)", got, wantStreams)
@@ -1034,9 +1037,15 @@ func TestEvictStaleOutboundDeadConnection(t *testing.T) {
 		t.Fatal("expected at least 1 stream")
 	}
 
+	// Let the pre-opened heartbeat land before the kill, so it cannot be
+	// stored after the eviction: heartbeat plus three data streams.
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 4
+	})
+
 	// Kill the connection to simulate a peer restart.
 	conn.CloseWithError(0, "simulate peer restart")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// evictStaleOutbound should detect the dead context and clean up.
 	t1.evictStaleOutboundOnRecv(target, 0, nil)
@@ -1146,9 +1155,15 @@ func TestEvictStaleOutboundOnRecv_DeadOutboundEvicted(t *testing.T) {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
+	// Let the pre-opened heartbeat land before the kill, so it cannot be
+	// stored after the eviction.
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
+
 	// Kill the outbound connection to simulate a peer restart.
 	outbound.CloseWithError(0, "simulate dead outbound")
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, outbound.Context().Done(), 5*time.Second, "closed connection context not done")
 
 	// Use a different connection as inbound (t2 dialing t1).
 	inbound, err := t2.getConnection(t1.Addr().String(), "")
@@ -1222,7 +1237,9 @@ func TestEvictStaleOutboundOnRecv_SameConnectionNoop(t *testing.T) {
 	// Wait for the async preOpenHeartbeatStream goroutine (launched by
 	// getConnection) to settle so StreamCount() is stable before we
 	// capture the "before" snapshot.
-	waitForStableStreamCount(t, t1, 50*time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	connsBefore := t1.ConnectionCount()
 	streamsBefore := t1.StreamCount()
@@ -1279,7 +1296,9 @@ func TestGetStreamReturnesFreshStreamAfterEviction(t *testing.T) {
 	}
 
 	// Wait for pre-opened heartbeat stream to settle.
-	waitForStableStreamCount(t, t1, 200*time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	// Kill the connection. This makes the context Done channel close.
 	conn, err := t1.getConnection(target, "")
@@ -1323,7 +1342,9 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initial getStream failed: %v", err)
 	}
-	waitForStableStreamCount(t, t1, 200*time.Millisecond)
+	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
+		return countStreamsForTarget(t1, target) == 2
+	})
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -1347,14 +1368,18 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 				t1.removeConnection(target)
 				t1.evictStreamsForTarget(target)
 			}
+			// Paces the churn on purpose: one eviction per millisecond
+			// leaves the reader's re-dials room to complete.
 			time.Sleep(time.Millisecond)
 		}
 	}()
 
 	// Reader goroutine: repeatedly call getStream.
+	readerDone := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer close(readerDone)
 		for i := 0; i < 20; i++ {
 			select {
 			case <-stop:
@@ -1373,8 +1398,8 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 		}
 	}()
 
-	// Let the goroutines run, then signal stop.
-	time.Sleep(500 * time.Millisecond)
+	// Stop the evictor once the reader has made its 20 calls.
+	waitForChan(t, readerDone, 30*time.Second, "reader goroutine did not finish")
 	close(stop)
 	wg.Wait()
 
@@ -1553,24 +1578,6 @@ func TestDialConnectionReturnsErrorOnShutdown(t *testing.T) {
 	_, err = tr.dialForTest("127.0.0.1:12345")
 	if err == nil {
 		t.Fatal("expected error from dialConnection after stop, got nil")
-	}
-}
-
-// waitForStableStreamCount polls StreamCount until it stops changing for at
-// least two consecutive checks separated by interval/5, or until timeout.
-// This handles the async preOpenHeartbeatStream goroutine that may still be
-// in-flight after getConnection returns.
-func waitForStableStreamCount(t *testing.T, tr *QUICTransport, timeout time.Duration) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	prev := tr.StreamCount()
-	for time.Now().Before(deadline) {
-		time.Sleep(timeout / 10)
-		curr := tr.StreamCount()
-		if curr == prev {
-			return
-		}
-		prev = curr
 	}
 }
 
