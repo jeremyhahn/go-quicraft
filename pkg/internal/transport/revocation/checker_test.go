@@ -1771,6 +1771,28 @@ func TestCheckerStartIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := writeCRLFile(t, dir, "idem.crl.pem", ca.createCRL(t, 91))
 
+	// A goroutine is listed in the dump from the moment its go statement
+	// runs, with a "created by" line naming the function that ran it, even
+	// while it is still in the generated wrapper and has not entered
+	// reloadLoop. Counting those lines counts every goroutine the three
+	// Start calls spawned, so a duplicate loop cannot be missed because it
+	// was not yet scheduled.
+	spawned := func() int {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		return strings.Count(string(buf[:n]), "created by github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation.(*Checker).Start ")
+	}
+
+	// A loop from a checker stopped earlier, such as this test's previous
+	// run under -count, exits asynchronously after Stop: wait for it to go
+	// so it is not counted as a duplicate.
+	for deadline := time.Now().Add(5 * time.Second); spawned() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("goroutine created by an earlier Start still running")
+		}
+		runtime.Gosched()
+	}
+
 	checker := NewChecker(Config{
 		CRLPaths:      []string{path},
 		CheckInterval: time.Hour,
@@ -1780,23 +1802,15 @@ func TestCheckerStartIdempotent(t *testing.T) {
 	checker.Start()
 	defer checker.Stop()
 
-	// Each Start that spawns a reload goroutine has done so by the time it
-	// returns, and a goroutine shows in the dump from its creation, so the
-	// count is read as soon as one is listed rather than after a sleep.
-	reloadLoops := func() int {
-		buf := make([]byte, 1<<20)
-		n := runtime.Stack(buf, true)
-		return strings.Count(string(buf[:n]), ").reloadLoop(")
-	}
-	got := reloadLoops()
-	for deadline := time.Now().Add(5 * time.Second); got == 0; got = reloadLoops() {
+	got := spawned()
+	for deadline := time.Now().Add(5 * time.Second); got == 0; got = spawned() {
 		if time.Now().After(deadline) {
-			t.Fatal("no reloadLoop goroutine after Start")
+			t.Fatal("no goroutine created by Start")
 		}
 		runtime.Gosched()
 	}
 	if got != 1 {
-		t.Fatalf("expected exactly 1 reloadLoop goroutine after repeated Start, got %d", got)
+		t.Fatalf("expected exactly 1 goroutine created by repeated Start, got %d", got)
 	}
 }
 
