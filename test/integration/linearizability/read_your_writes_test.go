@@ -295,6 +295,8 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 		leaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 		waitForCatchUp(t, cluster, shardID, idx, leaderIdx, failoverTimeout, workloadActive)
 		rounds++
+		// The pause between restart rounds is part of the soak's schedule,
+		// not a wait for an effect: the catch-up wait above already ended.
 		time.Sleep(500 * time.Millisecond)
 	}
 
