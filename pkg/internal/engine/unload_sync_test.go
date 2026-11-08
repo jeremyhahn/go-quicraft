@@ -57,6 +57,12 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	defer e.Stop()
 
 	applier := &slowUnloadApplier{started: make(chan struct{}), release: make(chan struct{})}
+	// Release the applier on every exit path. Deferred after e.Stop, so it
+	// runs first: an early t.Fatal must not leave Apply blocked while Stop
+	// joins the apply goroutines.
+	var releaseOnce sync.Once
+	releaseApplier := func() { releaseOnce.Do(func() { close(applier.release) }) }
+	defer releaseApplier()
 	nodeCfg := config.Config{ShardID: 7, ReplicaID: 1}
 	nodeCfg.SetDefaults()
 	node := NewNode(nil, applier, nil, nodeCfg, nil, "", nil)
@@ -93,7 +99,7 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 		t.Fatal("UnloadNode returned while SM.Apply was still blocked")
 	default:
 	}
-	close(applier.release)
+	releaseApplier()
 	select {
 	case <-unloadDone:
 	case <-time.After(5 * time.Second):
