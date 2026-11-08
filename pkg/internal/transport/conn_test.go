@@ -1431,14 +1431,14 @@ func TestPreOpenHeartbeatStreamRespectsShutdownCtx(t *testing.T) {
 	// Call preOpenHeartbeatStream in a goroutine and measure how long
 	// it takes after we cancel shutdownCtx.
 	t1.wg.Add(1)
+	started := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
+		close(started)
 		t1.preOpenHeartbeatStream(target, conn)
 		close(done)
 	}()
-
-	// Give the goroutine time to start blocking on OpenStreamSync.
-	time.Sleep(100 * time.Millisecond)
+	waitForChan(t, started, 5*time.Second, "preOpenHeartbeatStream goroutine did not start")
 
 	// Cancel shutdownCtx by stopping t1. This should unblock the
 	// goroutine promptly.
@@ -1479,14 +1479,14 @@ func TestGetStreamReturnsPromptlyOnShutdown(t *testing.T) {
 	// Evict cached streams so getStream takes the slow path.
 	t1.evictStreamsForTarget(target)
 
+	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
+		close(started)
 		_, err := t1.getStream(target, 1, false, "")
 		done <- err
 	}()
-
-	// Give the goroutine time to enter OpenStreamSync.
-	time.Sleep(100 * time.Millisecond)
+	waitForChan(t, started, 5*time.Second, "getStream goroutine did not start")
 
 	// Cancel shutdownCtx by stopping t1. This should unblock getStream promptly.
 	start := time.Now()
@@ -1529,14 +1529,14 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 	// timeout. 192.0.2.1 is TEST-NET-1 (RFC 5737) and is non-routable.
 	target := "192.0.2.1:9999"
 
+	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
+		close(started)
 		_, err := tr.dialForTest(target)
 		done <- err
 	}()
-
-	// Give the goroutine time to enter Dial.
-	time.Sleep(100 * time.Millisecond)
+	waitForChan(t, started, 5*time.Second, "dial goroutine did not start")
 
 	// Cancel shutdownCtx by stopping the transport. This should unblock
 	// dialConnection promptly.
@@ -1765,8 +1765,6 @@ func TestConnectionCleanup_ExitsOnStopAfterNormalReturn(t *testing.T) {
 		tr.connectionCleanup()
 	}()
 
-	// Let it start, then stop.
-	time.Sleep(20 * time.Millisecond)
 	close(testStopC)
 
 	select {
@@ -1907,6 +1905,9 @@ func TestConnectionCleanup_PanicRestartsAndExitsOnStop(t *testing.T) {
 
 	testStopC := make(chan struct{})
 	tr.stopC = testStopC
+	// Sweep every millisecond so the injected entry panics within the window
+	// below rather than after the default 30s interval.
+	tr.cleanupInterval = time.Millisecond
 
 	// Inject a nil connection that will cause a panic during cleanup.
 	tr.connMu.Lock()
@@ -1919,7 +1920,8 @@ func TestConnectionCleanup_PanicRestartsAndExitsOnStop(t *testing.T) {
 		tr.connectionCleanup()
 	}()
 
-	// Let the panic-restart happen (supervise.RestartDelay is 100ms).
+	// Kept on purpose: the window spans a panicking sweep and a restart delay
+	// (supervise.RestartDelay, 100ms), which expose no signal to wait on.
 	time.Sleep(300 * time.Millisecond)
 
 	// Close stopC to exit the loop.
@@ -1989,14 +1991,14 @@ func TestEvictStaleOutboundOnRecv_PeerRestartDetected(t *testing.T) {
 
 	// Stop t2 to simulate peer restart.
 	t2.Stop()
-	time.Sleep(200 * time.Millisecond)
 
 	// Create a new t2 on the same address to simulate restart.
+	handler2b := newTestHandler()
 	t2b, err := NewQUICTransport(Config{
 		ListenAddress: t2Addr,
 		DeploymentID:  42,
 		MTLSConfig:    mtls,
-	}, newTestHandler(), registry.NewRegistry())
+	}, handler2b, registry.NewRegistry())
 	if err != nil {
 		t.Fatalf("NewQUICTransport(2b) failed: %v", err)
 	}
@@ -2005,11 +2007,14 @@ func TestEvictStaleOutboundOnRecv_PeerRestartDetected(t *testing.T) {
 	}
 	defer t2b.Stop()
 
-	// Send again. The stale outbound should be detected and evicted.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+	// Send again until the restarted peer receives: the stale outbound
+	// must be detected and replaced by a fresh dial.
+	pollUntil(t, 10*time.Second, 50*time.Millisecond, "restarted peer never received a message", func() bool {
+		t1.Send([]proto.Message{
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+		})
+		return handler2b.batchCount.Load() > 0
 	})
-	time.Sleep(500 * time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------
