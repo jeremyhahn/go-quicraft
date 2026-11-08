@@ -1199,16 +1199,11 @@ func TestProposalWhoseWaitEndsReportsMaybeApplied(t *testing.T) {
 // TestProposalWaitOnAClosedQueueIsDefinite: the caller's own wait is
 // classified by the same rule as the drains. A proposal provably never taken
 // from its node's queue, which is now closed, never reached raft, so a wait
-// that ends on it is a definite failure; while the queue is open the step
-// worker could still take it, so the failure stays maybe-applied.
+// that ends on it is a definite failure. While the queue is open the step
+// worker could still take it, so the failure stays maybe-applied; that case
+// is TestProposalWhoseWaitEndsReportsMaybeApplied.
 func TestProposalWaitOnAClosedQueueIsDefinite(t *testing.T) {
 	h, _, _ := newLatchableHost(t)
-	open := registerTestProposal(t, h, time.Now().Add(50*time.Millisecond))
-	defer open.Release()
-	if _, err := open.Result(); !errors.Is(err, ErrTimeout) || !MaybeApplied(err) {
-		t.Fatalf("wait on a queued proposal with the queue open = %v, want maybe-applied ErrTimeout", err)
-	}
-
 	closed := registerTestProposal(t, h, time.Now().Add(50*time.Millisecond))
 	defer closed.Release()
 	// The node stops — its queue closes — without the host draining.
