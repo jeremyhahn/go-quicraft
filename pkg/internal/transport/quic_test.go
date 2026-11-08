@@ -16,6 +16,7 @@ package transport
 
 import (
 	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
@@ -31,6 +32,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"github.com/quic-go/quic-go"
 )
 
 // testMTLSConfig returns a valid MTLSConfig for use in tests. It generates
@@ -3718,10 +3720,9 @@ func TestSend_UnresolvedTargetLogsDrop(t *testing.T) {
 
 // TestSendSnapshot_StopUnblocksStalledChunkWrite verifies that Stop() is not
 // held hostage by an in-flight snapshot send whose chunk writes are blocked
-// on a slow receiver. The receiver rate-limits snapshot chunks (capped 5s
-// sleep per chunk), so the sender fills its QUIC flow-control window and
-// blocks in Write; without the shutdown watcher, Stop() would wait for the
-// entire transfer (30s write deadline per chunk).
+// on a stalled receiver. The receiver never reads the stream, so the sender
+// fills its QUIC flow-control window and blocks in Write; without the
+// shutdown watcher, Stop() would wait out the 30s chunk write deadline.
 func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 	handler1 := newTestHandler()
 	handler2 := newTestHandler()
@@ -3741,26 +3742,37 @@ func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 		t.Fatalf("t1.Start failed: %v", err)
 	}
 
-	// 1 B/s receive rate: every chunk hits the capped 5s rate-limit sleep,
-	// during which the receiver does not drain the stream.
+	// The receiver is a bare QUIC listener with t2's TLS that accepts the
+	// connection and never reads a stream, so no stream credit comes back.
+	// Its 64KB stream window is far below one 1MB chunk, so the first chunk
+	// Write can end only by a cancel or its write deadline.
 	t2, err := NewQUICTransport(Config{
-		ListenAddress:          "127.0.0.1:0",
-		DeploymentID:           42,
-		MTLSConfig:             mtls,
-		MaxSnapshotReceiveRate: 1,
+		ListenAddress: "127.0.0.1:0",
+		DeploymentID:  42,
+		MTLSConfig:    mtls,
 	}, handler2, reg2)
 	if err != nil {
 		t.Fatalf("NewQUICTransport(2) failed: %v", err)
 	}
-	if err := t2.Start(); err != nil {
-		t.Fatalf("t2.Start failed: %v", err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", t2.listenerTLS(), &quic.Config{
+		HandshakeIdleTimeout:       3 * time.Second,
+		InitialStreamReceiveWindow: 64 << 10,
+		MaxStreamReceiveWindow:     64 << 10,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
 	}
-	defer t2.Stop()
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			if _, aerr := ln.Accept(context.Background()); aerr != nil {
+				return
+			}
+		}
+	}()
 
-	reg1.Register(1, 2, t2.Addr().String())
+	reg1.Register(1, 2, ln.Addr().String())
 
-	// 32 x 1MB chunks: far more than the 8MB stream receive window, so the
-	// sender's Write blocks once the window fills.
 	const chunkCount = 32
 	data := bytes.Repeat([]byte("x"), 1<<20)
 	chunks := make([]proto.SnapshotChunk, chunkCount)
@@ -3780,17 +3792,17 @@ func TestSendSnapshot_StopUnblocksStalledChunkWrite(t *testing.T) {
 		}
 	}
 
+	idC := make(chan uint64, 1)
 	sendErr := make(chan error, 1)
-	go func() { sendErr <- t1.SendSnapshot(chunks) }()
+	go func() {
+		idC <- goroutineID()
+		sendErr <- t1.SendSnapshot(chunks)
+	}()
 
-	// Wait until the send has filled the stream's initial flow-control
-	// window, so its chunk Write blocks.
-	conn, err := t1.getConnection(t2.Addr().String(), "")
-	if err != nil {
-		t.Fatalf("getConnection: %v", err)
-	}
-	pollUntil(t, 10*time.Second, 10*time.Millisecond, "the snapshot send did not fill the flow-control window",
-		func() bool { return conn.ConnectionStats().BytesSent >= initialStreamReceiveWindow })
+	// Wait until the send is parked inside the first chunk's stream Write,
+	// which the receiver never lets complete, so Stop meets a write in
+	// flight rather than the between-chunks stopC check.
+	waitBlockedIn(t, idC, "quic-go.(*SendStream).Write", 10*time.Second)
 
 	stopStart := time.Now()
 	if err := t1.Stop(); err != nil {
