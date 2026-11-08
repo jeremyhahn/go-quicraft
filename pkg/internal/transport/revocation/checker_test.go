@@ -1780,10 +1780,22 @@ func TestCheckerStartIdempotent(t *testing.T) {
 	checker.Start()
 	defer checker.Stop()
 
-	time.Sleep(50 * time.Millisecond)
-	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	if got := strings.Count(string(buf[:n]), ").reloadLoop("); got != 1 {
+	// Each Start that spawns a reload goroutine has done so by the time it
+	// returns, and a goroutine shows in the dump from its creation, so the
+	// count is read as soon as one is listed rather than after a sleep.
+	reloadLoops := func() int {
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		return strings.Count(string(buf[:n]), ").reloadLoop(")
+	}
+	got := reloadLoops()
+	for deadline := time.Now().Add(5 * time.Second); got == 0; got = reloadLoops() {
+		if time.Now().After(deadline) {
+			t.Fatal("no reloadLoop goroutine after Start")
+		}
+		runtime.Gosched()
+	}
+	if got != 1 {
 		t.Fatalf("expected exactly 1 reloadLoop goroutine after repeated Start, got %d", got)
 	}
 }
