@@ -249,6 +249,24 @@ func TestReloadMTLS_LeafReloadPresentsNewLeaf(t *testing.T) {
 	}
 }
 
+// ticketSignalCache signals each session ticket the client stores, so a test
+// waits for the ticket instead of sleeping.
+type ticketSignalCache struct {
+	tls.ClientSessionCache
+	put chan struct{}
+}
+
+func (c *ticketSignalCache) Put(key string, cs *tls.ClientSessionState) {
+	c.ClientSessionCache.Put(key, cs)
+	if cs == nil {
+		return
+	}
+	select {
+	case c.put <- struct{}{}:
+	default:
+	}
+}
+
 // TestReloadMTLS_TicketsResumeOnlyWithinOnePair verifies the session-ticket
 // hooks: without a reload a reconnect resumes (the 1-RTT reconnect is kept),
 // and after one it does not.
@@ -262,6 +280,7 @@ func TestReloadMTLS_TicketsResumeOnlyWithinOnePair(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer func() { _ = ln.Close() }()
+	cache := &ticketSignalCache{ClientSessionCache: peer.client.ClientSessionCache, put: make(chan struct{}, 1)}
 
 	resumed := func() bool {
 		t.Helper()
@@ -272,14 +291,23 @@ func TestReloadMTLS_TicketsResumeOnlyWithinOnePair(t *testing.T) {
 				<-c.Context().Done()
 			}
 		}()
+		select {
+		case <-cache.put:
+		default:
+		}
 		cc := peer.client.Clone()
 		cc.ServerName = "127.0.0.1"
+		cc.ClientSessionCache = cache
 		conn, derr := quic.DialAddr(ctx, ln.Addr().String(), cc, &quic.Config{HandshakeIdleTimeout: 3 * time.Second})
 		if derr != nil {
 			t.Fatalf("dial: %v", derr)
 		}
-		// The ticket arrives after the handshake; give it a moment.
-		time.Sleep(50 * time.Millisecond)
+		// The ticket arrives after the handshake; wait until it is stored.
+		select {
+		case <-cache.put:
+		case <-ctx.Done():
+			t.Fatal("no session ticket was stored after the handshake")
+		}
 		did := conn.ConnectionState().TLS.DidResume
 		_ = conn.CloseWithError(0, "")
 		return did

@@ -53,22 +53,25 @@ func (c *hostLogs) WithGroup(string) slog.Handler { return c }
 // contained on the diagnostics worker, and fails the test when none arrives.
 func (c *hostLogs) await(t *testing.T, msg string) slog.Record {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	var (
+		rec slog.Record
+		n   int
+	)
+	if !waitUntil(5*time.Second, func() bool {
 		c.mu.Lock()
+		defer c.mu.Unlock()
 		for _, r := range c.records {
 			if r.Message == msg {
-				c.mu.Unlock()
-				return r
+				rec = r
+				return true
 			}
 		}
-		n := len(c.records)
-		c.mu.Unlock()
-		if time.Now().After(deadline) {
-			t.Fatalf("no %q record reached the Host logger (got %d records)", msg, n)
-		}
-		time.Sleep(time.Millisecond)
+		n = len(c.records)
+		return false
+	}) {
+		t.Fatalf("no %q record reached the Host logger (got %d records)", msg, n)
 	}
+	return rec
 }
 
 // switchHandler forwards to a handler a test can replace while the Host runs,

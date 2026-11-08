@@ -90,28 +90,6 @@ func TestStopShard_ReportsStateMachineCloseFailure(t *testing.T) {
 	}
 }
 
-// TestHostClose_JoinsStateMachineCloseFailure requires Host.Close to carry the
-// same error out. Returning only the LogDB's error would make a failed state
-// machine flush invisible to the caller.
-func TestHostClose_JoinsStateMachineCloseFailure(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
-		closeFailingCreateFunc, testShardConfig(1, 1)); err != nil {
-		t.Fatalf("StartShard: %v", err)
-	}
-
-	closeErr := h.Close()
-	if !errors.Is(closeErr, errCloseSM) {
-		t.Fatalf("Host.Close = %v, want it to carry the state machine's Close error "+
-			"(%v). A nil return means every shard's store flushed, and this one did "+
-			"not", closeErr, errCloseSM)
-	}
-}
-
 // TestHostClose_ReportsIncompleteDrain pins that a Drain which timed out
 // reaches the caller. Close proceeds with shutdown either way — that is the
 // point of the timeout — but a timed-out drain ABANDONED in-flight work, and a

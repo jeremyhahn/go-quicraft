@@ -100,6 +100,7 @@ func TestHandleMessage_ForgedInstallSnapshotCannotRewriteMembership(t *testing.T
 		if !node.IsMember(3) {
 			break
 		}
+		// Kept: no removal across this window is the behaviour under test.
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -180,6 +181,7 @@ func TestHandleMessage_ForgedProcessLocalTypesAreNotStepped(t *testing.T) {
 		if !node.IsMember(3) {
 			break
 		}
+		// Kept: no removal across this window is the behaviour under test.
 		time.Sleep(5 * time.Millisecond)
 	}
 	for _, replicaID := range []uint64{victim, attacker, 3} {
