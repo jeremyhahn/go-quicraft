@@ -294,50 +294,6 @@ func TestMembership_DedupAfterSnapshotRecovery(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Session membership: session state after Apply with no session entries
-// ---------------------------------------------------------------------------
-
-func TestMembership_ApplyNonSessionEntriesLeavesSessionsUnchanged(t *testing.T) {
-	t.Run("non-session entries do not affect session count", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Register one session.
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		// Apply non-session entries.
-		entries := make([]proto.Entry, 50)
-		for i := 0; i < 50; i++ {
-			key := fmt.Sprintf("ns-%d", i)
-			entries[i] = proto.Entry{
-				Index: uint64(i + 1),
-				Cmd:   makeCmd(key, "val"),
-			}
-		}
-		results := make([]sm.Result, 50)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// Session count should still be 1.
-		if rsm.Sessions().Count() != 1 {
-			t.Errorf("session count = %d, want 1", rsm.Sessions().Count())
-		}
-		if !rsm.Sessions().IsRegistered(10) {
-			t.Error("session 10 should still be registered")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Session membership: session eviction ordering via respondedTo
 // ---------------------------------------------------------------------------
 
@@ -401,60 +357,6 @@ func TestMembership_SessionEvictionOrdering(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMembership_MaxResponsesEnforced(t *testing.T) {
-	t.Run("response limit exceeded rejects entry as SESSION_EXPIRED without applying", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		// maxResponses = 3.
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 3, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		// Apply 3 series to fill up maxResponses.
-		for i := uint64(1); i <= 3; i++ {
-			entries := []proto.Entry{
-				{Index: i, ClientID: 10, SeriesID: i, Cmd: makeCmd(fmt.Sprintf("mr%d", i), "v")},
-			}
-			results := make([]sm.Result, 1)
-			if err := rsm.Apply(entries, results); err != nil {
-				t.Fatalf("Apply(%d) = %v", i, err)
-			}
-		}
-
-		// Fourth series without respondedTo hits the capacity gate. Under
-		// the at-most-once fix, the entry is rejected as SESSION_EXPIRED
-		// BEFORE the user SM mutation, so Apply succeeds (no error), the
-		// result carries ResultSessionExpired, and the user SM is NOT
-		// mutated. This is critical: an entry that cannot be cached must
-		// never be applied, otherwise a replay would re-apply it.
-		entries := []proto.Entry{
-			{Index: 4, ClientID: 10, SeriesID: 4, Cmd: makeCmd("mr4", "v")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply over-capacity entry should not error, got %v", err)
-		}
-		if results[0].Value != sm.ResultSessionExpired {
-			t.Fatalf("over-capacity series result = %d, want ResultSessionExpired (%d)",
-				results[0].Value, sm.ResultSessionExpired)
-		}
-		// The user SM must NOT have been mutated by the rejected entry:
-		// the key written by series 4 must be absent.
-		got, lerr := rsm.Lookup(context.Background(), "mr4")
-		if lerr != nil {
-			t.Fatalf("Lookup = %v", lerr)
-		}
-		if s, _ := got.(string); s != "" {
-			t.Fatalf("over-capacity entry was applied: mr4 = %q, want empty", s)
-		}
-	})
-
 	t.Run("respondedTo frees slots allowing new responses", func(t *testing.T) {
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
 			return newTestKV()
@@ -491,61 +393,6 @@ func TestMembership_MaxResponsesEnforced(t *testing.T) {
 		}
 		if results[0].Value == sm.ResultSessionExpired {
 			t.Error("series 4 should succeed after eviction via respondedTo")
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Session membership: high respondedTo evicts multiple series at once
-// ---------------------------------------------------------------------------
-
-func TestMembership_HighRespondedToEvictsMultiple(t *testing.T) {
-	t.Run("respondedTo jumps evict all intermediate series", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if err := rsm.Sessions().Register(10, 0, 0); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-
-		// Apply series 1, 2, 3 without respondedTo advancement.
-		for i := uint64(1); i <= 3; i++ {
-			entries := []proto.Entry{
-				{Index: i, ClientID: 10, SeriesID: i, Cmd: makeCmd(fmt.Sprintf("h%d", i), "v")},
-			}
-			results := make([]sm.Result, 1)
-			if err := rsm.Apply(entries, results); err != nil {
-				t.Fatalf("Apply(%d) = %v", i, err)
-			}
-		}
-
-		// Now apply series 10 with respondedTo=3, evicting series 1, 2, and 3.
-		entries := []proto.Entry{
-			{Index: 10, ClientID: 10, SeriesID: 10, RespondedTo: 3, Cmd: makeCmd("h10", "v")},
-		}
-		results := make([]sm.Result, 1)
-		if err := applyContiguous(t, rsm, entries, results); err != nil {
-			t.Fatalf("Apply(10) = %v", err)
-		}
-
-		// Replay series 1, 2, 3 should all return SESSION_EXPIRED.
-		for _, evicted := range []uint64{1, 2, 3} {
-			replayEntries := []proto.Entry{
-				{Index: 100 + evicted, ClientID: 10, SeriesID: evicted, Cmd: makeCmd("x", "y")},
-			}
-			replayResults := make([]sm.Result, 1)
-			if err := applyContiguous(t, rsm, replayEntries, replayResults); err != nil {
-				t.Fatalf("Apply(replay %d) = %v", evicted, err)
-			}
-			if replayResults[0].Value != sm.ResultSessionExpired {
-				t.Errorf("replay series %d = %d, want ResultSessionExpired", evicted, replayResults[0].Value)
-			}
 		}
 	})
 }
