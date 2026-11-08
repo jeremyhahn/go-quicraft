@@ -1413,10 +1413,6 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 	}
 }
 
-// TestPreOpenHeartbeatStreamRespectsShutdownCtx verifies that
-// preOpenHeartbeatStream derives its context from shutdownCtx so that
-// Stop() cancellation unblocks it promptly instead of waiting for the
-// full 5s timeout.
 // goroutineID returns the calling goroutine's ID, parsed from the
 // "goroutine N [running]:" header of its own stack.
 func goroutineID() uint64 {
@@ -1477,6 +1473,35 @@ func exhaustStreamCredit(t *testing.T, conn *quic.Conn) {
 	t.Fatal("stream limit never reached")
 }
 
+// takeHeartbeatStream waits until the heartbeat stream that getConnection
+// pre-opens in the background is in tr's stream pool, then takes it out
+// without closing it. The pre-open is then over and holds no stream credit,
+// and Stop has no pooled stream to close. A close (as evictStreamsForTarget
+// does) would send the stream's first frame; the live peer, done with it,
+// would grant new stream credit and could release a blocked open without the
+// shutdown. Never written to, the stream stays unknown to the peer.
+func takeHeartbeatStream(t *testing.T, tr *QUICTransport, target string) {
+	t.Helper()
+	key := streamKey{target: target, idx: 0}
+	shard := &tr.streamShards[uint64(0)&(streamShardCount-1)]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		shard.mu.Lock()
+		_, ok := shard.streams[key]
+		if ok {
+			shard.drop(key)
+		}
+		shard.mu.Unlock()
+		if ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("heartbeat stream was not pooled within 5s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // waitBlockedIn waits until the goroutine whose ID arrives on idC is parked
 // inside fn, so the caller acts on an operation that is in flight rather
 // than one that has not begun.
@@ -1505,6 +1530,10 @@ func waitBlockedIn(t *testing.T, idC <-chan uint64, fn string, timeout time.Dura
 	}
 }
 
+// TestPreOpenHeartbeatStreamRespectsShutdownCtx verifies that
+// preOpenHeartbeatStream derives its context from shutdownCtx so that
+// Stop() cancellation unblocks it promptly instead of waiting for the
+// full 5s timeout.
 func TestPreOpenHeartbeatStreamRespectsShutdownCtx(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -1516,6 +1545,10 @@ func TestPreOpenHeartbeatStreamRespectsShutdownCtx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
+
+	// Take the pre-opened heartbeat stream out of the pool, so nothing but
+	// the shutdown can release the open below.
+	takeHeartbeatStream(t, t1, target)
 
 	// Use up the peer's stream credit so OpenStreamSync blocks until its
 	// context ends. (Stopping the peer instead would close the connection,
@@ -1567,13 +1600,15 @@ func TestGetStreamReturnsPromptlyOnShutdown(t *testing.T) {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
+	// Take the pre-opened heartbeat stream out of the pool, so getStream
+	// takes the slow path and nothing but the shutdown can release the open
+	// below.
+	takeHeartbeatStream(t, t1, target)
+
 	// Use up the peer's stream credit so OpenStreamSync blocks until its
 	// context ends. (Stopping the peer instead would close the connection,
 	// and getStream would redial rather than open a stream.)
 	exhaustStreamCredit(t, conn)
-
-	// Evict cached streams so getStream takes the slow path.
-	t1.evictStreamsForTarget(target)
 
 	idC := make(chan uint64, 1)
 	done := make(chan error, 1)
