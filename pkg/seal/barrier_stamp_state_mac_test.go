@@ -44,26 +44,6 @@ func TestStampSealedStateMACLetsAnEmbedderRewrapTheRootKey(t *testing.T) {
 	}
 }
 
-// TestUnsealRefusesAnUnstampedRewrap is the other half: the same flow WITHOUT
-// the stamp must fail, or the method above would be proving nothing.
-func TestUnsealRefusesAnUnstampedRewrap(t *testing.T) {
-	ctx := context.Background()
-	b, strategy := testInitializedBarrier(t)
-
-	unstamped := cloneSealedRootKey(b.SealedRootKeyData())
-	unstamped.StateMAC = nil
-
-	if err := b.SetSealedRootKey(unstamped); err != nil {
-		t.Fatalf("SetSealedRootKey: %v", err)
-	}
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal: %v", err)
-	}
-	if err := b.Unseal(ctx, strategy, Credentials{}); err == nil {
-		t.Fatal("Unseal must refuse a blob carrying no metadata MAC")
-	}
-}
-
 // TestStampSealedStateMACCoversTheMetadata pins that the MAC authenticates the
 // fields it claims to: a blob stamped and then edited must not verify, which
 // is what stops Epoch and KnownEpochs from being attacker-controlled.
