@@ -15,7 +15,11 @@
 package transport
 
 import (
+	"bytes"
 	"errors"
+	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1413,6 +1417,94 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 // preOpenHeartbeatStream derives its context from shutdownCtx so that
 // Stop() cancellation unblocks it promptly instead of waiting for the
 // full 5s timeout.
+// goroutineID returns the calling goroutine's ID, parsed from the
+// "goroutine N [running]:" header of its own stack.
+func goroutineID() uint64 {
+	buf := make([]byte, 64)
+	buf = buf[:runtime.Stack(buf, false)]
+	buf = bytes.TrimPrefix(buf, []byte("goroutine "))
+	if i := bytes.IndexByte(buf, ' '); i >= 0 {
+		buf = buf[:i]
+	}
+	id, _ := strconv.ParseUint(string(buf), 10, 64)
+	return id
+}
+
+// goroutineStack returns the stack of goroutine id, or "" if it has exited.
+func goroutineStack(id uint64) string {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	header := "goroutine " + strconv.FormatUint(id, 10) + " ["
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.HasPrefix(g, header) {
+			return g
+		}
+	}
+	return ""
+}
+
+// goroutineBlockedIn reports whether the stack g is parked (not running or
+// runnable) with fn on it.
+func goroutineBlockedIn(g, fn string) bool {
+	_, state, ok := strings.Cut(g, " [")
+	if !ok || strings.HasPrefix(state, "running") || strings.HasPrefix(state, "runnable") {
+		return false
+	}
+	return strings.Contains(g, fn)
+}
+
+// exhaustStreamCredit opens streams on conn until the peer's stream limit is
+// reached, so the next OpenStreamSync blocks until its context ends. The
+// streams carry no data, so the peer never sees them nor grants more.
+func exhaustStreamCredit(t *testing.T, conn *quic.Conn) {
+	t.Helper()
+	for i := 0; i < 1<<16; i++ {
+		if _, err := conn.OpenStream(); err != nil {
+			// quic-go reports the limit only by message.
+			if !strings.Contains(err.Error(), "too many open streams") {
+				t.Fatalf("OpenStream failed: %v", err)
+			}
+			return
+		}
+	}
+	t.Fatal("stream limit never reached")
+}
+
+// waitBlockedIn waits until the goroutine whose ID arrives on idC is parked
+// inside fn, so the caller acts on an operation that is in flight rather
+// than one that has not begun.
+func waitBlockedIn(t *testing.T, idC <-chan uint64, fn string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	var id uint64
+	select {
+	case id = <-idC:
+	case <-deadline.C:
+		t.Fatal("goroutine under test did not start")
+	}
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		g := goroutineStack(id)
+		if goroutineBlockedIn(g, fn) {
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("goroutine %d did not block in %s within %v; stack:\n%s", id, fn, timeout, g)
+		}
+	}
+}
+
 func TestPreOpenHeartbeatStreamRespectsShutdownCtx(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -1425,20 +1517,22 @@ func TestPreOpenHeartbeatStreamRespectsShutdownCtx(t *testing.T) {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
-	// Kill the peer so OpenStreamSync will block until context timeout.
-	t2.Stop()
+	// Use up the peer's stream credit so OpenStreamSync blocks until its
+	// context ends. (Stopping the peer instead would close the connection,
+	// and OpenStreamSync would fail at once without blocking.)
+	exhaustStreamCredit(t, conn)
 
 	// Call preOpenHeartbeatStream in a goroutine and measure how long
 	// it takes after we cancel shutdownCtx.
 	t1.wg.Add(1)
-	started := make(chan struct{})
+	idC := make(chan uint64, 1)
 	done := make(chan struct{})
 	go func() {
-		close(started)
+		idC <- goroutineID()
 		t1.preOpenHeartbeatStream(target, conn)
 		close(done)
 	}()
-	waitForChan(t, started, 5*time.Second, "preOpenHeartbeatStream goroutine did not start")
+	waitBlockedIn(t, idC, "quic-go.(*Conn).OpenStreamSync", 5*time.Second)
 
 	// Cancel shutdownCtx by stopping t1. This should unblock the
 	// goroutine promptly.
@@ -1468,25 +1562,27 @@ func TestGetStreamReturnsPromptlyOnShutdown(t *testing.T) {
 	target := t2.Addr().String()
 
 	// Establish a connection so getStream's slow path can reach OpenStreamSync.
-	_, err := t1.getConnection(target, "")
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
 
-	// Kill the peer so OpenStreamSync will block until context cancellation.
-	t2.Stop()
+	// Use up the peer's stream credit so OpenStreamSync blocks until its
+	// context ends. (Stopping the peer instead would close the connection,
+	// and getStream would redial rather than open a stream.)
+	exhaustStreamCredit(t, conn)
 
 	// Evict cached streams so getStream takes the slow path.
 	t1.evictStreamsForTarget(target)
 
-	started := make(chan struct{})
+	idC := make(chan uint64, 1)
 	done := make(chan error, 1)
 	go func() {
-		close(started)
+		idC <- goroutineID()
 		_, err := t1.getStream(target, 1, false, "")
 		done <- err
 	}()
-	waitForChan(t, started, 5*time.Second, "getStream goroutine did not start")
+	waitBlockedIn(t, idC, "quic-go.(*Conn).OpenStreamSync", 5*time.Second)
 
 	// Cancel shutdownCtx by stopping t1. This should unblock getStream promptly.
 	start := time.Now()
@@ -1529,14 +1625,14 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 	// timeout. 192.0.2.1 is TEST-NET-1 (RFC 5737) and is non-routable.
 	target := "192.0.2.1:9999"
 
-	started := make(chan struct{})
+	idC := make(chan uint64, 1)
 	done := make(chan error, 1)
 	go func() {
-		close(started)
+		idC <- goroutineID()
 		_, err := tr.dialForTest(target)
 		done <- err
 	}()
-	waitForChan(t, started, 5*time.Second, "dial goroutine did not start")
+	waitBlockedIn(t, idC, "quic-go.(*Transport).Dial", 5*time.Second)
 
 	// Cancel shutdownCtx by stopping the transport. This should unblock
 	// dialConnection promptly.
