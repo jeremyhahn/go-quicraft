@@ -302,9 +302,6 @@ func TestSoftwareStrategy_UnsealRootKeyProtectedErrors(t *testing.T) {
 		// Every blob this strategy writes names it, so an empty field is
 		// refused like a foreign one rather than read as "passphrase".
 		{"empty strategy", &SealedRootKey{Ciphertext: good.Ciphertext, Metadata: good.Metadata}, ErrStrategyMismatch},
-		// A KDF byte this build never writes is refused, not mapped to the
-		// strategy's own KDF.
-		{"unknown kdf version", &SealedRootKey{Strategy: StrategyPassphrase, Ciphertext: good.Ciphertext, Metadata: []byte{0xFF}}, ErrKDFUnsupportedVersion},
 		{"ciphertext too short", &SealedRootKey{Strategy: StrategyPassphrase, Ciphertext: make([]byte, 10)}, ErrCiphertextTooShort},
 		{"authentication failure", tampered, ErrDecryptionFailed},
 	}

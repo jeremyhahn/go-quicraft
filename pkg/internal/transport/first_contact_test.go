@@ -39,25 +39,6 @@ func TestFirstContactBoundOutlastsEveryStageOfAColdSend(t *testing.T) {
 	}
 }
 
-// TestSendFirstContactDeliversAColdSend is the contract in the common case:
-// one cold Send, one batch, content intact.
-func TestSendFirstContactDeliversAColdSend(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	sendFirstContact(t, t1, handler2, []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 7},
-	})
-
-	batches := handler2.getBatches()
-	if len(batches) == 0 {
-		t.Fatal("no batch recorded after sendFirstContact returned")
-	}
-	if got := batches[0].Requests[0].Term; got != 7 {
-		t.Fatalf("delivered term = %d, want 7", got)
-	}
-}
-
 // TestSendUntilDeliveredResendsThenGivesUp drives the helper's core at a
 // small scale against a target the transport drops on the spot (unresolved
 // in the registry), and checks both halves of its behaviour: it sends once

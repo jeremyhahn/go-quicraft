@@ -18,7 +18,7 @@
 # and runner pulls it instead of building it. The registry is the forge's own,
 # host[:port] from GITHUB_SERVER_URL, as in go-qrdb's scripts/ci-registry.sh;
 # no address is written here. The namespace is CI_IMAGE_NAMESPACE, by default
-# agent-ci-images, public for anonymous pull (ruling 217(4)); only the release
+# ci-images, public for anonymous pull (ruling 217(4)); only the release
 # runner writes there (rulings 169 and 173). On github.com both commands do
 # nothing.
 #
@@ -42,7 +42,7 @@ case ${GITHUB_SERVER_URL:-} in
 esac
 host=${GITHUB_SERVER_URL#*://}
 host=${host%%/*}
-ns=${CI_IMAGE_NAMESPACE:-agent-ci-images}
+ns=${CI_IMAGE_NAMESPACE:-ci-images}
 
 local_tag=$(make -s toolchain-image) || die "make -s toolchain-image failed"
 case $local_tag in

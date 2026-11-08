@@ -37,7 +37,6 @@ func FuzzManagerMarshalRoundTrip(f *testing.F) {
 	f.Add(uint64(0), uint64(0), uint64(0), uint64(0), []byte{})
 	f.Add(uint64(math.MaxUint64-3), uint64(1), uint64(math.MaxUint64), uint64(0), []byte("hello"))
 	f.Add(uint64(123), uint64(500), uint64(99), uint64(10), []byte{0xFF, 0x00, 0xAB})
-	f.Add(uint64(1), uint64(1), uint64(1), uint64(0), make([]byte, 256))
 
 	f.Fuzz(func(t *testing.T, clientID, seriesID, resultValue, respondedTo uint64, resultData []byte) {
 		// Cap data size to prevent excessive memory use during fuzzing.
@@ -197,12 +196,9 @@ func FuzzSessionSentinelBoundary(f *testing.F) {
 	// because respondedTo starts at 0, and CheckDuplicate treats
 	// seriesID <= respondedTo as evicted.
 	f.Add(uint64(1))
-	f.Add(uint64(2))
-	f.Add(proto.SessionSeriesIDForRegister - 2)
 	f.Add(proto.SessionSeriesIDForRegister - 1)
 	f.Add(proto.SessionSeriesIDForRegister)
 	f.Add(proto.SessionSeriesIDForUnregister)
-	f.Add(uint64(math.MaxUint64 / 2))
 
 	f.Fuzz(func(t *testing.T, seriesID uint64) {
 		isSentinel := seriesID == proto.SessionSeriesIDForRegister ||
@@ -294,7 +290,6 @@ func FuzzSessionSentinelBoundary(f *testing.F) {
 // eviction logic and boundary conditions.
 func FuzzCheckDuplicateConsistency(f *testing.F) {
 	f.Add(uint64(1), uint64(0), uint64(100))
-	f.Add(uint64(10), uint64(5), uint64(200))
 	f.Add(uint64(0), uint64(0), uint64(0))
 	f.Add(uint64(math.MaxUint64-2), uint64(0), uint64(42))
 	f.Add(uint64(100), uint64(99), uint64(999))

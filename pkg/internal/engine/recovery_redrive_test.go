@@ -107,15 +107,19 @@ func newRedriveFixtureWith(t *testing.T, db *gatedFailingLogDB) *redriveFixture 
 // cycles would, until done reports true or the deadline passes.
 func (f *redriveFixture) drive(t *testing.T, deadline time.Duration, done func() bool) {
 	t.Helper()
-	until := time.Now().Add(deadline)
-	for !done() {
-		if time.Now().After(until) {
-			t.Fatalf("condition not reached within %v: attempts=%d rejected=%d failed=%v lastApplied=%d",
-				deadline, f.db.attempts.Load(), f.cb.snapshotRejected.Load(), f.node.IsFailed(), f.node.LastApplied())
+	defer func() {
+		if t.Failed() {
+			t.Logf("attempts=%d rejected=%d failed=%v lastApplied=%d",
+				f.db.attempts.Load(), f.cb.snapshotRejected.Load(), f.node.IsFailed(), f.node.LastApplied())
+		}
+	}()
+	waitFor(t, deadline, 5*time.Millisecond, "re-drive condition not reached", func() bool {
+		if done() {
+			return true
 		}
 		f.sw.redriveRecovery(f.node)
-		time.Sleep(5 * time.Millisecond)
-	}
+		return false
+	})
 }
 
 // TestRecoveryRedrive_TransientFailureSelfHeals: a recovery rejected before
@@ -169,6 +173,7 @@ func TestRecoveryRedrive_DeterministicFailureLatchesAfterLastAttempt(t *testing.
 	// Nothing more is re-driven once the shard has failed.
 	for range 20 {
 		f.sw.redriveRecovery(f.node)
+		// Kept: spaced step-worker cycles are the window in which no re-drive may start.
 		time.Sleep(10 * time.Millisecond)
 	}
 	if got := f.db.attempts.Load(); got != maxRecoveryAttempts {
@@ -241,6 +246,7 @@ func TestRecoveryRedrive_StopDuringBackoffLeaksNothing(t *testing.T) {
 	deadline := time.Now().Add(3 * recoveryRedriveBaseBackoff)
 	for time.Now().Before(deadline) {
 		f.sw.redriveRecovery(f.node)
+		// Kept: the backoff must elapse in real time; the cycles through it are the test.
 		time.Sleep(5 * time.Millisecond)
 	}
 
@@ -442,13 +448,9 @@ func TestRecoveryRedriveBackoff(t *testing.T) {
 // recovery's settle (which reports before releasing the slot) has finished.
 func waitRecoveryIdle(t *testing.T, node *Node) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for node.snapshotting.Load() || node.IsRecovering() {
-		if time.Now().After(deadline) {
-			t.Fatal("the recovery never released the snapshot slot")
-		}
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(t, 5*time.Second, time.Millisecond, "the recovery never released the snapshot slot", func() bool {
+		return !node.snapshotting.Load() && !node.IsRecovering()
+	})
 }
 
 // BenchmarkStepWorker_RedriveRecoveryIdle measures the re-drive check the step
