@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -587,6 +588,20 @@ func TestSnapshotTooLargeError_MatchesSentinel(t *testing.T) {
 // with no terminator other than ctx.Done() would let a caller with a
 // deadline-less context on a partitioned follower spin at 1000Hz forever, and
 // Host.Close could not interrupt it.
+// pollReachedCtx closes reached on its first Done call. FollowerRead calls
+// Done only inside its slow-path poll loop, so reached marks the reader's
+// arrival there.
+type pollReachedCtx struct {
+	context.Context
+	once    sync.Once
+	reached chan struct{}
+}
+
+func (c *pollReachedCtx) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.reached) })
+	return c.Context.Done()
+}
+
 func TestFollowerRead_SlowPathExitsOnShardStop(t *testing.T) {
 	h := newTestHost(t)
 
@@ -611,14 +626,21 @@ func TestFollowerRead_SlowPathExitsOnShardStop(t *testing.T) {
 	injectApplyLag(t, h, shardID)
 
 	done := make(chan error, 1)
+	// A deadline-less context: only the shutdown check can end this call.
+	ctx := &pollReachedCtx{Context: context.Background(), reached: make(chan struct{})}
 	go func() {
-		// A deadline-less context: only the shutdown check can end this call.
-		_, err := h.FollowerRead(context.Background(), shardID, "k")
+		_, err := h.FollowerRead(ctx, shardID, "k")
 		done <- err
 	}()
 
-	// Let the reader reach the poll loop, then stop the shard.
-	time.Sleep(20 * time.Millisecond)
+	// Wait for the reader to reach the poll loop, then stop the shard.
+	select {
+	case <-ctx.reached:
+	case err := <-done:
+		t.Fatalf("FollowerRead returned %v before reaching the poll loop", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("FollowerRead never reached the poll loop")
+	}
 	ns.stopped.Store(true)
 
 	select {
@@ -817,16 +839,14 @@ func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 	// assertion below cannot pass merely by racing an in-flight append. On a
 	// single-node shard commit is immediate; this drains the pipeline rather
 	// than guessing at a duration.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	if !waitUntil(3*time.Second, func() bool {
 		p, derr := h.DiagPipelineState(1)
 		if derr != nil {
 			t.Fatalf("DiagPipelineState: %v", derr)
 		}
-		if p == (PipelineDiag{}) {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+		return p == (PipelineDiag{})
+	}) {
+		t.Fatal("the shard's pipeline never drained")
 	}
 
 	rsAfter, err := h.DiagRaftState(1)
