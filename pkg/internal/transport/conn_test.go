@@ -2105,8 +2105,11 @@ func TestGetStream_StaleConnectionFastPathEviction(t *testing.T) {
 	handler2.waitBatch(t, 10*time.Second)
 
 	// Stop t2 to make the connection dead.
+	t1.connMu.RLock()
+	dead := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, dead.Context().Done(), 5*time.Second, "outbound connection did not die after peer stop")
 
 	// Restart t2 on the same address.
 	t2b, err := NewQUICTransport(Config{
@@ -2126,10 +2129,7 @@ func TestGetStream_StaleConnectionFastPathEviction(t *testing.T) {
 	// evict it, and fall through to the slow path.
 	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
-		// This may fail if the connection isn't fully dead yet, which
-		// is acceptable. The important thing is that the eviction path
-		// was exercised.
-		t.Logf("getStream returned error (expected on timing): %v", err)
+		t.Fatalf("getStream after stale eviction failed: %v", err)
 	} else if stream == nil {
 		t.Fatal("expected non-nil stream")
 	}
@@ -2158,18 +2158,13 @@ func TestEvictStreamsForTarget_WithMultipleStreams(t *testing.T) {
 		})
 	}
 
-	// Wait for messages to arrive.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
+	pollUntil(t, 10*time.Second, 10*time.Millisecond, "not all eight messages arrived", func() bool {
 		total := 0
 		for _, b := range handler2.getBatches() {
 			total += len(b.Requests)
 		}
-		if total >= 5 {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+		return total >= 8
+	})
 
 	// Evict all streams for the target.
 	t1.evictStreamsForTarget(t2Addr)
@@ -2177,7 +2172,7 @@ func TestEvictStreamsForTarget_WithMultipleStreams(t *testing.T) {
 	// After eviction, getting a stream should open a new one.
 	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
-		t.Logf("getStream after eviction: %v", err)
+		t.Fatalf("getStream after eviction failed: %v", err)
 	} else if stream == nil {
 		t.Fatal("expected non-nil stream after eviction")
 	}
@@ -2234,8 +2229,11 @@ func TestGetStream_SlowPathStaleDedup(t *testing.T) {
 	// Now evict the fast-path cached stream so the next getStream
 	// enters the slow path, but leave a stale stream in the shard map
 	// by stopping t2 (killing the connection) without evicting streams.
+	t1.connMu.RLock()
+	dead := t1.conns[t2Addr]
+	t1.connMu.RUnlock()
 	t2.Stop()
-	time.Sleep(500 * time.Millisecond)
+	waitForChan(t, dead.Context().Done(), 5*time.Second, "outbound connection did not die after peer stop")
 
 	// Remove the connection from the pool but leave streams in the shards.
 	// This simulates the race: another goroutine cached a stream on a
@@ -2263,7 +2261,7 @@ func TestGetStream_SlowPathStaleDedup(t *testing.T) {
 	// 4. Detect it's stale (!connOK), discard + retry
 	stream, err := t1.getStream(t2Addr, 1, false, "")
 	if err != nil {
-		t.Logf("getStream stale dedup: %v (may be timing-dependent)", err)
+		t.Fatalf("getStream stale dedup retry failed: %v", err)
 	} else if stream == nil {
 		t.Fatal("expected non-nil stream from stale dedup retry")
 	}
@@ -2341,8 +2339,7 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	t1.connMu.Unlock()
 	conn2, dialErr := t1.dialForTest(t2Addr)
 	if dialErr != nil {
-		t.Logf("dialConnection for second conn: %v (may be expected)", dialErr)
-		return
+		t.Fatalf("dialConnection for second conn failed: %v", dialErr)
 	}
 	if conn2 == outbound {
 		t.Fatal("expected a distinct second connection after cache removal")
@@ -2355,7 +2352,7 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	// alive-but-stale outbound must be evicted promptly.
 	t1.evictStaleOutboundOnRecv(t2Addr, 2, conn2)
 
-	time.Sleep(200 * time.Millisecond)
+	// The eviction leaves the pool synchronously; there is nothing to wait on.
 	t1.connMu.RLock()
 	current, stillExists := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
@@ -2450,7 +2447,7 @@ func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T)
 	t1.evictStaleOutboundOnRecv(t2Addr, 7, conn2)
 
 	// The alive outbound must still be present (same epoch ⇒ no eviction).
-	time.Sleep(200 * time.Millisecond)
+	// evictStaleOutboundOnRecv decides synchronously, so this is final.
 	t1.connMu.RLock()
 	current, stillExists := t1.conns[t2Addr]
 	t1.connMu.RUnlock()
