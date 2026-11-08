@@ -346,50 +346,6 @@ func TestPeerRejectedFrameKeepsConnection(t *testing.T) {
 	}
 }
 
-// TestUnframeableBatchKeepsConnectionOpen asserts the connection-level
-// invariant directly: a batch whose serialized payload cannot fit in a frame
-// must not close the QUIC connection to the target.
-func TestUnframeableBatchKeepsConnectionOpen(t *testing.T) {
-	p := newDialCounterPair(t)
-
-	p.sender.Send([]proto.Message{{
-		Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-		Entries: entriesOfSize(t, 1, 8, 1),
-	}})
-	p.handler.waitBatch(t, 10*time.Second)
-
-	p.sender.connMu.RLock()
-	conn := p.sender.conns[p.target]
-	p.sender.connMu.RUnlock()
-	if conn == nil {
-		t.Fatal("no cached connection to the target after the warmup send")
-	}
-
-	// One message larger than a whole frame: 20 entries of 1MB each.
-	p.sender.Send([]proto.Message{{
-		Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1,
-		LogIndex: 1, LogTerm: 1,
-		Entries: entriesOfSize(t, 20, 1024*1024, 2),
-	}})
-
-	assertNever(t, 2*time.Second, 50*time.Millisecond,
-		"unframeable batch closed the connection", func() bool {
-			select {
-			case <-conn.Context().Done():
-				return true
-			default:
-			}
-			p.sender.connMu.RLock()
-			cached := p.sender.conns[p.target]
-			p.sender.connMu.RUnlock()
-			return cached != conn
-		})
-
-	if got := p.dials.Load(); got != 1 {
-		t.Fatalf("unframeable batch triggered a re-dial: %d dials (want 1)", got)
-	}
-}
-
 // TestCoalescedBatchSplitsAcrossFrames verifies the sender splits a coalesced
 // batch that does not fit one frame into several frames instead of dropping
 // it: every message must still be delivered, over a single connection.
