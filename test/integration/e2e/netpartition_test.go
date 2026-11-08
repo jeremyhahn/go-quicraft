@@ -186,6 +186,8 @@ func TestNetPartition_TwoOfFourCannotElect(t *testing.T) {
 				}
 			}
 		}
+		// Sampling interval across the held partition: the partition is
+		// held for failoverTimeout by design, not until a condition.
 		time.Sleep(100 * time.Millisecond)
 	}
 
