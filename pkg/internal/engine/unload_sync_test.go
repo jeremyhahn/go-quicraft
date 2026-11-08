@@ -25,17 +25,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// slowUnloadApplier signals when Apply starts, then holds the apply long
-// enough for UnloadNode to be called mid-Apply, and records completion.
+// slowUnloadApplier signals when Apply starts, then holds the apply until
+// release is closed, so UnloadNode is called mid-Apply, and records completion.
 type slowUnloadApplier struct {
 	started   chan struct{}
+	release   chan struct{}
 	startOnce sync.Once
 	completed atomic.Bool
 }
 
 func (s *slowUnloadApplier) Apply(entries []proto.Entry, results []sm.Result) error {
 	s.startOnce.Do(func() { close(s.started) })
-	time.Sleep(150 * time.Millisecond)
+	<-s.release
 	for i := range entries {
 		results[i] = sm.Result{}
 	}
@@ -55,7 +56,13 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	e.Start()
 	defer e.Stop()
 
-	applier := &slowUnloadApplier{started: make(chan struct{})}
+	applier := &slowUnloadApplier{started: make(chan struct{}), release: make(chan struct{})}
+	// Release the applier on every exit path. Deferred after e.Stop, so it
+	// runs first: an early t.Fatal must not leave Apply blocked while Stop
+	// joins the apply goroutines.
+	var releaseOnce sync.Once
+	releaseApplier := func() { releaseOnce.Do(func() { close(applier.release) }) }
+	defer releaseApplier()
 	nodeCfg := config.Config{ShardID: 7, ReplicaID: 1}
 	nodeCfg.SetDefaults()
 	node := NewNode(nil, applier, nil, nodeCfg, nil, "", nil)
@@ -81,7 +88,30 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	}
 
 	// Apply is now in flight. UnloadNode must block until it completes.
-	e.UnloadNode(7)
+	unloadDone := make(chan struct{})
+	unloadG := make(chan string, 1)
+	go func() {
+		unloadG <- goroutineID()
+		e.UnloadNode(7)
+		close(unloadDone)
+	}()
+	gid := <-unloadG
+	// Wait until UnloadNode is blocked in the apply-worker join, its only
+	// direct channel receive: the unloaded flag is stored before the step
+	// and commit worker unloads, so it does not prove the join is reached.
+	waitFor(t, 5*time.Second, time.Millisecond, "UnloadNode never reached the apply-worker join",
+		func() bool { return goroutineBlockedIn(gid, "chan receive", "(*Engine).UnloadNode(") })
+	select {
+	case <-unloadDone:
+		t.Fatal("UnloadNode returned while SM.Apply was still blocked")
+	default:
+	}
+	releaseApplier()
+	select {
+	case <-unloadDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("UnloadNode did not return after SM.Apply completed")
+	}
 
 	if !applier.completed.Load() {
 		t.Fatal("UnloadNode returned while SM.Apply was still in flight: " +

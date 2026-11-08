@@ -17,6 +17,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -98,13 +99,25 @@ func proposeOn(t *testing.T, c *testCluster, id uint64, n int, key *uint64) {
 // waitApplied waits for a to have applied at least n commands.
 func waitApplied(t *testing.T, a *pauseApplier, n int, what string) {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for a.count() < n {
-		if time.Now().After(deadline) {
-			t.Fatalf("%s: applied %d commands, want >= %d", what, a.count(), n)
+	waitFor(t, 15*time.Second, 5*time.Millisecond, fmt.Sprintf("%s: applied fewer than %d commands", what, n),
+		func() bool { return a.count() >= n })
+}
+
+// waitDiscarded waits until the leader has sent paused replica id several
+// messages since the call and its inbox is empty again: step cycles have run
+// over the paused node with the cluster's traffic, and discarded it.
+func waitDiscarded(t *testing.T, c *testCluster, id uint64, what string) {
+	t.Helper()
+	var sent atomic.Int64
+	c.router.setDrop(func(m proto.Message) bool {
+		if m.To == id {
+			sent.Add(1)
 		}
-		time.Sleep(5 * time.Millisecond)
-	}
+		return false
+	})
+	defer c.router.setDrop(nil)
+	waitFor(t, 15*time.Second, 5*time.Millisecond, what+": paused replica never received and discarded traffic",
+		func() bool { return sent.Load() >= 3 && c.replicas[id].node.DiagState().InboxLen == 0 })
 }
 
 func assertLogOrder(t *testing.T, indices []uint64) {
@@ -160,7 +173,7 @@ func TestPause_FollowerAppliesNothingUntilResume(t *testing.T) {
 
 	proposeOn(t, c, leader, 20, &key)
 	waitApplied(t, appliers[witness], 25, "unpaused follower")
-	time.Sleep(200 * time.Millisecond)
+	waitDiscarded(t, c, follower, "paused follower")
 	if got := appliers[follower].count(); got != before {
 		t.Fatalf("paused follower applied %d commands while paused", got-before)
 	}
@@ -258,7 +271,7 @@ func TestPause_WaitsForInFlightApply(t *testing.T) {
 	before := fa.count()
 	proposeOn(t, c, leader, 5, &key)
 	waitApplied(t, appliers[leader], 6, "leader")
-	time.Sleep(200 * time.Millisecond)
+	waitDiscarded(t, c, follower, "paused follower")
 	if got := fa.count(); got != before {
 		t.Fatalf("paused follower applied %d commands while paused", got-before)
 	}

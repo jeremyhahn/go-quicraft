@@ -231,6 +231,7 @@ func TestSavingGateDoesNotDropEntries(t *testing.T) {
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
 	var wg sync.WaitGroup
 	stopC := make(chan struct{})
+	defer close(stopC)
 
 	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
 
@@ -238,17 +239,14 @@ func TestSavingGateDoesNotDropEntries(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	node := NewNode(nil, rec, nil, cfg, nil, "", nil)
 
-	runDone := make(chan struct{})
-	go func() {
-		aw.run()
-		close(runDone)
-	}()
-
-	// Close the gate, deliver a batch while it is held, keep it closed
-	// long enough that a drop-style gate would have returned, then open it.
+	// Close the gate, deliver the batches while it is held, wait until one
+	// has reached the gate, then open it. The test owns the per-shard
+	// channel, so the apply goroutine is its only reader.
 	node.SetSaving(true)
 
 	const total = 32
+	shardC := make(chan *applyItem, total)
+	aw.shardChans[1] = shardC
 	for i := uint64(1); i <= total; i++ {
 		node.commitPending.Store(true)
 		item := applyPool.Get().(*applyItem)
@@ -257,18 +255,37 @@ func TestSavingGateDoesNotDropEntries(t *testing.T) {
 			CommittedEntries: []proto.Entry{{Term: 1, Index: i, Cmd: []byte("c")}},
 		}
 		item.node = node
-		applyC <- item
+		shardC <- item
 	}
-	time.Sleep(5 * time.Millisecond)
+	close(shardC)
+
+	done := make(chan struct{})
+	applyG := make(chan string, 1)
+	go func() {
+		applyG <- goroutineID()
+		aw.runShardApply(shardC)
+		close(done)
+	}()
+	gid := <-applyG
+
+	// The goroutine dequeues one batch and parks it on the held gate; a
+	// drop-style gate would discard it and dequeue the next. Wait until it
+	// is asleep in the gate's wait loop, the only time.Sleep in
+	// runShardApply: the receive from shardC shortens it before the gate is
+	// evaluated, so its length alone does not prove the batch is held.
+	waitFor(t, 5*time.Second, time.Millisecond, "no batch reached the held saving gate",
+		func() bool { return goroutineSleepingIn(gid, "runShardApply") })
+	if got := len(shardC); got != total-1 {
+		t.Fatalf("%d batches dequeued while the saving gate was held, want 1 parked", total-got)
+	}
 	node.SetSaving(false)
 
-	// Every delivered entry must eventually reach the state machine.
-	waitFor(t, 5*time.Second, time.Millisecond, "gated entries were not applied",
-		func() bool { return node.lastApplied.Load() >= total })
-
-	close(stopC)
-	<-runDone
-	wg.Wait()
+	// Every delivered entry must reach the state machine.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gated entries were not applied")
+	}
 
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
