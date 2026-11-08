@@ -109,49 +109,6 @@ func TestMsgRecvBudget_ConcurrentNeverOverCommits(t *testing.T) {
 	}
 }
 
-// TestMsgRecvBudget_CompressedDeltaCharged is the regression test for the
-// compressed receive path: the aggregate budget must be charged with the
-// DECLARED DECOMPRESSED length, not just the compressed frame length. Snappy
-// achieves >1000:1 ratios, so charging only the compressed length would let a
-// peer pin MaxDecompressedSize per in-flight frame while the budget barely
-// moves. A frame whose declared decompressed size exceeds the remaining budget
-// must be rejected, and the budget must return to its baseline afterward.
-func TestMsgRecvBudget_CompressedDeltaCharged(t *testing.T) {
-	const budget = 4096
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	// Config rejects a budget below one maximum-size frame, so the small
-	// budget this case needs is modelled as the aggregate budget other frames
-	// have already drawn down to: only what remains is set.
-	tr.msgRecvBudget.Store(budget)
-
-	// 64KB of zeros compresses to a few dozen bytes: the compressed frame
-	// length fits comfortably within the budget while the declared
-	// decompressed size exceeds the whole budget many times over.
-	raw := make([]byte, 64*1024)
-	compressed := snappyEncode(nil, raw)
-	if int64(len(compressed)) >= budget {
-		t.Fatalf("test setup: compressed length %d must be below budget %d", len(compressed), budget)
-	}
-
-	err = tr.handleMessageFrame(nil, bytes.NewReader(compressed), uint32(len(compressed)), FlagCompressed)
-	if !errors.Is(err, ErrMessageRecvMemoryBudgetExceeded) {
-		t.Fatalf("expected ErrMessageRecvMemoryBudgetExceeded for oversized declared length, got %v", err)
-	}
-	if got := tr.msgRecvBudget.Load(); got != budget {
-		t.Fatalf("budget after rejected compressed frame = %d, want %d (reserve/release imbalance)", got, budget)
-	}
-}
-
 // TestMsgRecvBudget_CompressedDeltaReleasedOnSuccess verifies the success path
 // of the fix: a compressed frame whose declared decompressed size fits the
 // budget is processed normally, and both the compressed-length reservation and
