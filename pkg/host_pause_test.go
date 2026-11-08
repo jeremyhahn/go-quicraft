@@ -226,12 +226,8 @@ func startSlowPause(t *testing.T, h *Host, shardID uint64) (*nodeState, <-chan e
 	ns.cfg.ElectionRTT = 2000 // a 2s transfer window at RTTMillisecond 1
 	done := make(chan error, 1)
 	go func() { done <- h.PauseShard(context.Background(), shardID) }()
-	deadline := time.Now().Add(10 * time.Second)
-	for !ns.paused.Load() {
-		if time.Now().After(deadline) {
-			t.Fatal("PauseShard never set the host flag")
-		}
-		time.Sleep(time.Millisecond)
+	if !waitUntil(10*time.Second, ns.paused.Load) {
+		t.Fatal("PauseShard never set the host flag")
 	}
 	return ns, done
 }

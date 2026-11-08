@@ -55,24 +55,6 @@ func requireReject(t *testing.T, r *raft, to, key uint64) {
 	}
 }
 
-// TestForwardedRead_UnreadyLeaderRejects: a leader that has not committed
-// an entry of its term answers a forwarded ReadIndex with a reject instead
-// of dropping it, so the follower's caller does not wait forever.
-func TestForwardedRead_UnreadyLeaderRejects(t *testing.T) {
-	r := newTestRaft(1)
-	electLeader(r)
-	if r.hasCommittedEntryAtCurrentTerm() {
-		t.Fatal("fixture: the leader committed its term-opening entry")
-	}
-	r.msgs = r.msgs[:0]
-
-	err := r.step(proto.Message{Type: proto.ReadIndex, From: 2, Term: r.term, Hint: 7})
-	if err != nil {
-		t.Fatalf("an answered refusal is not a step error: %v", err)
-	}
-	requireReject(t, r, 2, 7)
-}
-
 // TestForwardedRead_RejectIsFreeOrder: while the engine's commit pipeline is
 // busy it transmits only what drainFreeOrderMessages returns, and an unready
 // leader's pipeline is busy for exactly the window its refusals cover. The

@@ -79,7 +79,7 @@ func TestHandleSnapshot_StopDuringVerdictAdoptsNothingAndKeepsTheArtifact(t *tes
 	if !errors.As(err, &recvErr) || recvErr.Op != "install" {
 		t.Fatalf("HandleSnapshot = %v, want the abandoned install reported", err)
 	}
-	// Give a stray step every chance to happen.
+	// Kept: the absence of a stray step in this window is the behaviour under test.
 	time.Sleep(300 * time.Millisecond)
 	if got := node.CommittedIndex(); got >= snapIndex {
 		t.Fatalf("a stopped node adopted snapshot %d (committed %d)", snapIndex, got)
@@ -138,6 +138,7 @@ func TestHandleSnapshot_ReloadDuringReceiveNeverReachesTheNewNode(t *testing.T) 
 	if err := handler.HandleSnapshot(verdictTestChunks(shardID, localReplicaID, fromReplicaID, snapIndex), authorizeAllSenders); err == nil {
 		t.Fatal("HandleSnapshot succeeded although its node was unloaded before the install could reach it")
 	}
+	// Kept: the absence of an adoption in this window is the behaviour under test.
 	time.Sleep(300 * time.Millisecond)
 	if got := fresh.CommittedIndex(); got >= snapIndex {
 		t.Fatalf("the reloaded shard's new node adopted snapshot %d (committed %d) from a receive awaiting the old node", snapIndex, got)
