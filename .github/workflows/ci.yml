@@ -830,7 +830,7 @@ jobs:
     # <<< CUSTOMIZE
     timeout-minutes: 60       # CUSTOMIZE: ceil(1.5 x a cold toolchain build's p95)
     env:
-      CI_IMAGE_NAMESPACE: agent-ci-images   # ci-standard.md §9 (ruling 217(4))
+      CI_IMAGE_NAMESPACE: ci-images   # ci-standard.md §9 (ruling 217(4))
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -875,7 +875,7 @@ jobs:
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
-      CI_IMAGE_NAMESPACE: agent-ci-images
+      CI_IMAGE_NAMESPACE: ci-images
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -1044,7 +1044,7 @@ jobs:
     if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
     timeout-minutes: 120     # hosted runner: both image builds cold, build, security and trivy image (6 h cap)
     env:
-      CI_IMAGE_NAMESPACE: agent-ci-images   # v1.30
+      CI_IMAGE_NAMESPACE: ci-images   # v1.30
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       # v1.22: the cache volumes' trust class. Only a push to main writes the
       # caches main's build reads; every other event, pull requests included,
@@ -1420,7 +1420,7 @@ jobs:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       # v1.22: the cache volumes' trust class (as in the image job).
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
-      CI_IMAGE_NAMESPACE: agent-ci-images   # v1.30
+      CI_IMAGE_NAMESPACE: ci-images   # v1.30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 

@@ -169,12 +169,6 @@ var patterns = []pattern{
 	},
 	{
 		class:    classOwnerPath,
-		expr:     regexp.MustCompile(`/home/jhahn\b`), // lab-string-ok: the path prefix this rule exists to find
-		needle:   "/home/jhahn",                       // lab-string-ok: the path prefix this rule exists to find
-		guidance: "make the path relative to the repository root, or use /var/lib, /srv, /home/agent",
-	},
-	{
-		class:    classOwnerPath,
 		expr:     regexp.MustCompile(`/mnt/vm-host`), // lab-string-ok: the mount prefix this rule exists to find
 		needle:   "/mnt/vm-host",                     // lab-string-ok: the mount prefix this rule exists to find
 		guidance: "the lab's NFS mount does not exist anywhere else; use a repository-relative path",

@@ -18,8 +18,8 @@ internal identities or its internal repositories. Concretely, six classes:
 |---|---|---|
 | `lab-address` | An address on the fleet subnet | An RFC 5737 documentation address from `192.0.2.0/24` or `203.0.113.0/24`, or a name under `.example` |
 | `lab-host` | A fleet build or bench host name | The role, not the machine: `build-host.example`, `user@bench-host.example`, `forge.example`, `bench-01` |
-| `owner-path` | A path under the owner's home directory or the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, or the agent account's home directory |
-| `owner-account` | The owner's account name on its own | A role: `user`, `operator`, or the module path |
+| `owner-path` | A path under the lab's NFS mount | A repository-relative path, or `/var/lib`, `/srv`, or the agent account's home directory |
+| `owner-account` | The owner's account name, in a home path or on its own | A role: `user`, `operator`, or the module path |
 | `internal-identity` | An address in the internal mail domain, or an agent principal of the form `agent-<name>@...` on any domain | A neutral example identity: `release@example.invalid`, `ops@forge.example` |
 | `internal-repository` | A private-forge repository that is not this project (the company repository, the agent tooling repository) or an issue number on the handbook's tracker | The decision itself, stated in place, or a public document |
 
