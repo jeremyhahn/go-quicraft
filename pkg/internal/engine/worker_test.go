@@ -43,7 +43,7 @@ func waitFor(t *testing.T, timeout, pollInterval time.Duration, msg string, cond
 		if time.Now().After(deadline) {
 			t.Fatal(msg)
 		}
-		time.Sleep(pollInterval)
+		time.Sleep(pollInterval) // the poll interval of the condition wait itself
 	}
 }
 
@@ -1737,7 +1737,7 @@ func (s *slowTestSM) Update(_ context.Context, entries []sm.Entry, results []sm.
 			break
 		}
 	}
-	time.Sleep(s.delay)
+	time.Sleep(s.delay) // the delay is the behaviour: it holds Update open to observe concurrency
 	for i := range results {
 		results[i] = sm.Result{Value: entries[i].Index}
 	}
@@ -4936,8 +4936,17 @@ func TestApplyWorker_RunShardApply_RecoveringSkipsApply(t *testing.T) {
 	}()
 
 	// While recovering, the batch stays parked: the SM is untouched and
-	// commitPending remains set.
-	time.Sleep(20 * time.Millisecond)
+	// commitPending remains set. Wait until the goroutine has taken the
+	// batch and drops applyInFlight to zero, which it does only while
+	// parked on the gate (or after exiting, which done rules out).
+	waitFor(t, 5*time.Second, time.Millisecond, "batch never parked on the recovery gate", func() bool {
+		return len(shardC) == 0 && node.applyInFlight.Load() == 0
+	})
+	select {
+	case <-done:
+		t.Fatal("runShardApply returned while the recovery gate was set")
+	default:
+	}
 	if testSm.applyCount.Load() != 0 {
 		t.Fatal("state machine should not be applied during recovery")
 	}
