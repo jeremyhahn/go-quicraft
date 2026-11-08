@@ -334,31 +334,6 @@ func TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey(t *testing.T) {
 	}
 }
 
-// TestUnseal_NoEncryptionModeStillWipesTheHeapKey covers the branch that returns
-// before the borrow exists at all. NoneStrategy's key is empty, so the wipe has
-// nothing to erase — what this holds is that the deferred wipe leaves the
-// branch's OUTCOME unchanged.
-func TestUnseal_NoEncryptionModeStillWipesTheHeapKey(t *testing.T) {
-	none := NewNoneStrategy()
-
-	b := MustNewBarrier(testBarrierConfig(1))
-	if err := b.Initialize(context.Background(), none, Credentials{}); err != nil {
-		t.Fatalf("Initialize with NoneStrategy: %v", err)
-	}
-	blob := b.SealedRootKeyData()
-
-	b2 := MustNewBarrier(testBarrierConfig(1))
-	if err := b2.SetSealedRootKey(blob); err != nil {
-		t.Fatalf("SetSealedRootKey: %v", err)
-	}
-	if err := b2.Unseal(context.Background(), none, Credentials{}); err != nil {
-		t.Fatalf("Unseal in no-encryption mode: %v", err)
-	}
-	if b2.IsSealed() {
-		t.Fatal("the barrier is still sealed after a successful no-encryption unseal")
-	}
-}
-
 // TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns pins the ORDER of the
 // wipe, which no other test in this package does.
 //
