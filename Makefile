@@ -833,10 +833,101 @@ define run-coverage
 	$(call check-coverage,$(COVER_DIR)/$(1).out,$(1))
 endef
 
+# SHARD and SHARDS pick one slice of a package list: `make coverage-shard
+# SHARD=1 SHARDS=4` runs the second of four. The defaults are the whole list.
+SHARD  ?= 0
+SHARDS ?= 1
+
+# check_shard is a recipe fragment: it exits 1, naming the target, unless
+# SHARD and SHARDS are numbers and SHARD < SHARDS.
+check_shard = case "$(SHARD):$(SHARDS)" in *[!0-9:]* | :* | *:) echo "FAIL: $@: SHARD and SHARDS must be numbers, got SHARD=$(SHARD) SHARDS=$(SHARDS)"; exit 1 ;; esac; \
+	if [ "$(SHARD)" -ge "$(SHARDS)" ]; then echo "FAIL: $@: SHARD=$(SHARD) must be below SHARDS=$(SHARDS)"; exit 1; fi
+
+# shard_deal is a pipeline stage: it reads "<package> <dir>" lines and prints
+# the packages of shard SHARD of SHARDS. A package weighs the bytes of its
+# _test.go files. Heaviest first (ties by name), each package goes to the
+# lightest shard so far (ties to the lowest index). The deal depends only on
+# the tree, so every shard computes the same split: the shards are disjoint
+# and together hold every package, untested ones included.
+shard_deal = while read -r p d; do printf '%s %s\n' "$$(cat "$$d"/*_test.go 2>/dev/null | wc -c)" "$$p"; done | \
+	LC_ALL=C sort -k1,1nr -k2,2 | \
+	awk -v s=$(SHARD) -v n=$(SHARDS) 'BEGIN { for (i = 0; i < n; i++) w[i] = 0 } { b = 0; for (i = 1; i < n; i++) if (w[i] < w[b]) b = i; w[b] += $$1; if (b == s) print $$2 }'
+
+# shard_packages is a recipe fragment for $(call shard_packages,<go list
+# flags>,<patterns>): it sets the shell variable pkgs to shard SHARD of SHARDS
+# of the packages go list finds, dealt by shard_deal.
+shard_packages = $(check_shard); \
+	dirs=$$($(GO) list $(1) -f '{{.ImportPath}} {{.Dir}}' $(2)) || { echo "FAIL: $@: go list failed, so there is nothing to shard"; exit 1; }; \
+	pkgs=$$(printf '%s\n' "$$dirs" | $(shard_deal)); \
+	if [ -z "$$pkgs" ]; then echo "FAIL: $@: shard $(SHARD) of $(SHARDS) holds no package"; exit 1; fi
+
+# The per-package -timeout of the -race unit run. Go's own default; CI raises
+# it for a 4-core hosted runner.
+COVER_TIMEOUT ?= 10m
+
+# cover_shard_profile is shard $(1)'s profile in a run of SHARDS shards.
+cover_shard_profile = $(COVER_DIR)/coverage-shard-$(1)-of-$(SHARDS).out
+
+# The test stage is two pieces, so CI can run the -race unit run as parallel
+# shards (ci.yml's unit and coverage jobs) and a developer runs the same
+# targets in one go:
+#   coverage-shard  one shard of the -race unit run, writing its profile
+#   coverage-merge  joins the SHARDS profiles into total.out and gates it
+# `make coverage` runs both with a single shard.
 .PHONY: coverage
 coverage: | $(COVER_DIR)
-	$(call run-coverage,total,./...)
+	@$(MAKE) --no-print-directory coverage-shard SHARD=0 SHARDS=1
+	@$(MAKE) --no-print-directory coverage-merge SHARDS=1
+
+.PHONY: coverage-shard
+coverage-shard: | $(COVER_DIR)
+	@$(call shard_packages,$(GO_TAGS_FLAG),./...); \
+	echo "==> coverage shard $(SHARD) of $(SHARDS): $$(printf '%s\n' "$$pkgs" | wc -l) packages"; \
+	$(GOTEST) $(GO_TAGS_FLAG) -timeout=$(COVER_TIMEOUT) -coverprofile=$(call cover_shard_profile,$(SHARD)) $$pkgs
+
+# The shards hold disjoint packages, so their profiles join by concatenation:
+# one mode line, then every shard's blocks. Every one of the SHARDS profiles
+# must be present and share the mode line, or the total would be wrong. The
+# total is gated as one profile, and every package under pkg/ on its own.
+.PHONY: coverage-merge
+coverage-merge: | $(COVER_DIR)
+	@$(check_shard); \
+	out=$(COVER_DIR)/total.out; mode=""; i=0; \
+	while [ $$i -lt $(SHARDS) ]; do \
+		f=$(call cover_shard_profile,$$i); \
+		[ -s "$$f" ] || { echo "FAIL: $@: $$f is missing or empty (make coverage-shard SHARD=$$i SHARDS=$(SHARDS))"; exit 1; }; \
+		m=$$(head -n 1 "$$f"); \
+		case "$$m" in mode:*) ;; *) echo "FAIL: $@: $$f does not start with a mode line"; exit 1 ;; esac; \
+		if [ -z "$$mode" ]; then mode=$$m; printf '%s\n' "$$mode" > "$$out"; \
+		elif [ "$$m" != "$$mode" ]; then echo "FAIL: $@: $$f has '$$m', shard 0 has '$$mode'"; exit 1; fi; \
+		tail -n +2 "$$f" >> "$$out"; \
+		i=$$((i + 1)); \
+	done
+	$(call check-coverage,$(COVER_DIR)/total.out,total)
 	scripts/check-coverage-packages.sh $(COVER_DIR)/total.out $(COVER_MIN) github.com/jeremyhahn/go-quicraft/pkg
+
+# shard-packages prints shard SHARD of SHARDS of SHARD_PKGS under the tags
+# SHARD_TAGS, one import path per line, for a workflow that runs go test
+# itself (batch.yml's race-full). It deals packages as coverage-shard does.
+SHARD_PKGS ?= ./...
+SHARD_TAGS ?=
+
+.PHONY: shard-packages
+shard-packages:
+	@$(call shard_packages,$(if $(strip $(SHARD_TAGS)),-tags='$(SHARD_TAGS)'),$(SHARD_PKGS)); \
+	printf '%s\n' "$$pkgs"
+
+# it-shard-packages prints shard SHARD of SHARDS of the integration packages
+# (every directory under INT_TEST_DIR with a test file), one per line, for
+# ci.yml's integration shards to pass as IT_PKGS. It reads the tree, not go
+# list, so the runner needs no Go toolchain: the suite runs in the image.
+.PHONY: it-shard-packages
+it-shard-packages:
+	@$(check_shard); \
+	dirs=$$(find $(INT_TEST_DIR) -name '*_test.go' -printf '%h\n' | LC_ALL=C sort -u | while read -r d; do printf '%s %s\n' "$$d" "$$d"; done); \
+	pkgs=$$(printf '%s\n' "$$dirs" | $(shard_deal)); \
+	if [ -z "$$pkgs" ]; then echo "FAIL: $@: shard $(SHARD) of $(SHARDS) holds no package"; exit 1; fi; \
+	printf '%s\n' "$$pkgs"
 
 # `coverage` also holds every package under pkg/ to COVER_MIN, from the profile
 # it writes, so no package hides under the total: CI's test stage is
@@ -1552,8 +1643,11 @@ IT_TAG    = $(shell { echo 'GO_IMAGE=$(GO_IMAGE)'; echo 'APK_INDEX_SUM=$(APK_IND
 IT_IMAGE   ?= go-quicraft-ci-it:$(IT_TAG)
 IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 # What `make integration-test` runs in the integration image: the CI job's
-# command, -race and serialized packages (see _integration-test).
-IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+# command, -race and serialized packages (see _integration-test). IT_PKGS is
+# the package scope; ci.yml's integration shards pass a slice of it
+# (`make it-shard-packages`).
+IT_PKGS    ?= $(INT_TEST_DIR)/...
+IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(IT_PKGS)
 # Internal: a devcontainer build of one stage. GO_IMAGE comes from the pin file;
 # GO_BUILD_PROXY, when set in the caller's environment, replaces the public
 # module proxy for the build-time fetches. Quoted: CI passes a `|`-separated
