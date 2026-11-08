@@ -521,20 +521,22 @@ func injectApplyLag(t *testing.T, h *Host, shardID uint64) uint64 {
 	const settle = 50 * time.Millisecond
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		committed := engNode.CommittedIndex()
-		if committed > 0 && ns.lastApplied.Load() == committed {
-			time.Sleep(settle)
-			if engNode.CommittedIndex() == committed && ns.lastApplied.Load() == committed {
-				ns.lastApplied.Store(0)
-				return committed
-			}
-		}
-		if time.Now().After(deadline) {
+		var committed uint64
+		agreed := waitUntil(time.Until(deadline), func() bool {
+			committed = engNode.CommittedIndex()
+			return committed > 0 && ns.lastApplied.Load() == committed
+		})
+		if !agreed {
 			t.Fatalf("shard %d never settled: committed=%d lastApplied=%d; the lag "+
 				"cannot be injected without racing an apply that is still coming",
 				shardID, engNode.CommittedIndex(), ns.lastApplied.Load())
 		}
-		time.Sleep(time.Millisecond)
+		// Kept: the settle window is the check itself; no event marks that no apply is still coming.
+		time.Sleep(settle)
+		if engNode.CommittedIndex() == committed && ns.lastApplied.Load() == committed {
+			ns.lastApplied.Store(0)
+			return committed
+		}
 	}
 }
 
@@ -6319,11 +6321,8 @@ func TestKeyRotationLoop_RestartsAfterGoexit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
-	deadline := time.Now().Add(6 * time.Second)
-	for barrier.successCount.Load() < 1 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !barrier.goexited.Load() || barrier.successCount.Load() < 1 {
+	rotated := waitUntil(6*time.Second, func() bool { return barrier.successCount.Load() >= 1 })
+	if !rotated || !barrier.goexited.Load() {
 		t.Fatalf("goexited=%v successful rotations=%d, want a rotation after the Goexit",
 			barrier.goexited.Load(), barrier.successCount.Load())
 	}
