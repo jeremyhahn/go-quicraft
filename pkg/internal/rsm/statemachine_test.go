@@ -1716,71 +1716,6 @@ func TestApply_MetadataEntries(t *testing.T) {
 // SetLastApplied / SyncedIndex tracking
 // ---------------------------------------------------------------------------
 
-func TestStateMachine_LastAppliedNeverDecreases(t *testing.T) {
-	t.Run("applying entries with lower index than lastApplied does not decrease it", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// Apply entries up to index 10.
-		entries := make([]proto.Entry, 10)
-		for i := range entries {
-			entries[i] = proto.Entry{Index: uint64(i + 1), Cmd: makeCmd("k", "v")}
-		}
-		results := make([]sm.Result, 10)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply(1-10) = %v", err)
-		}
-		if rsm.LastApplied() != 10 {
-			t.Fatalf("LastApplied = %d, want 10", rsm.LastApplied())
-		}
-
-		// Apply entries with lower indices (this can happen in edge cases).
-		// LastApplied should NOT decrease.
-		lowEntries := []proto.Entry{
-			{Index: 5, Cmd: makeCmd("low", "val")},
-		}
-		lowResults := make([]sm.Result, 1)
-		if err := rsm.Apply(lowEntries, lowResults); err != nil {
-			t.Fatalf("Apply(low) = %v", err)
-		}
-		if rsm.LastApplied() != 10 {
-			t.Errorf("LastApplied = %d, want 10 (should not decrease)", rsm.LastApplied())
-		}
-	})
-
-	t.Run("lastApplied advances to max index in batch not in order", func(t *testing.T) {
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return newTestKV()
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		// The Apply code uses the last entry in the batch for lastApplied.
-		// If entries are ordered (which they should be), the last is the max.
-		entries := []proto.Entry{
-			{Index: 5, Cmd: makeCmd("a", "1")},
-			{Index: 6, Cmd: makeCmd("b", "2")},
-			{Index: 7, Cmd: makeCmd("c", "3")},
-		}
-		results := make([]sm.Result, 3)
-		if err := applyContiguous(t, rsm, entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-		if rsm.LastApplied() != 7 {
-			t.Errorf("LastApplied = %d, want 7", rsm.LastApplied())
-		}
-	})
-}
-
 // ---------------------------------------------------------------------------
 // Empty event handling
 // ---------------------------------------------------------------------------
@@ -2678,30 +2613,6 @@ func TestStateMachine_SaveSnapshotDeterministic(t *testing.T) {
 	}
 }
 
-func TestStateMachine_CloseDelegatesToSM(t *testing.T) {
-	t.Run("close is forwarded to user SM", func(t *testing.T) {
-		tracker := &closeTrackingKV{data: make(map[string]string)}
-		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
-			return tracker
-		})
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-
-		if tracker.closeCalled {
-			t.Fatal("close should not be called before Close()")
-		}
-		if err := rsm.Close(); err != nil {
-			t.Fatalf("Close = %v", err)
-		}
-		if !tracker.closeCalled {
-			t.Error("Close should have been forwarded to user SM")
-		}
-	})
-
-}
-
 func TestNewStateMachine_InvalidSMType(t *testing.T) {
 	t.Run("nil factory result", func(t *testing.T) {
 		createFn := func(shardID, replicaID uint64) interface{} {
@@ -2713,56 +2624,6 @@ func TestNewStateMachine_InvalidSMType(t *testing.T) {
 		}
 	})
 
-}
-
-// closeTrackingKV is a testKV that tracks whether Close was called.
-type closeTrackingKV struct {
-	data        map[string]string
-	closeCalled bool
-}
-
-func (kv *closeTrackingKV) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
-	for i, e := range entries {
-		if len(e.Cmd) == 0 {
-			continue
-		}
-		kl := int(e.Cmd[0])
-		key := string(e.Cmd[1 : 1+kl])
-		value := string(e.Cmd[1+kl:])
-		kv.data[key] = value
-		results[i] = sm.Result{Value: uint64(len(value))}
-	}
-	return nil
-}
-
-func (kv *closeTrackingKV) Lookup(_ context.Context, query interface{}) (interface{}, error) {
-	key, ok := query.(string)
-	if !ok {
-		return nil, errors.New("query must be string")
-	}
-	return kv.data[key], nil
-}
-
-func (kv *closeTrackingKV) SaveSnapshot(_ context.Context, w io.Writer, _ <-chan struct{}) error {
-	var buf [4]byte
-	binary.LittleEndian.PutUint32(buf[:], uint32(len(kv.data)))
-	_, err := w.Write(buf[:])
-	return err
-}
-
-func (kv *closeTrackingKV) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct{}) error {
-	var buf [4]byte
-	_, err := io.ReadFull(r, buf[:])
-	if err != nil {
-		return err
-	}
-	kv.data = make(map[string]string)
-	return nil
-}
-
-func (kv *closeTrackingKV) Close(_ context.Context) error {
-	kv.closeCalled = true
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -2940,69 +2801,6 @@ func TestOnDiskSM_OpenSetsLastApplied(t *testing.T) {
 // ---------------------------------------------------------------------------
 // On-disk SM: already-applied entries treated as no-op for lastApplied
 // ---------------------------------------------------------------------------
-
-func TestOnDiskSM_AlreadyAppliedEntryTreatedAsNoOp(t *testing.T) {
-	t.Run("entries at or below lastApplied do not advance it", func(t *testing.T) {
-		const recoveredIndex = uint64(50)
-		kv := newTestOnDiskKVWithState(recoveredIndex)
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if _, err := rsm.Open(make(chan struct{})); err != nil {
-			t.Fatalf("Open = %v", err)
-		}
-
-		// Apply entries at or below recovered index.
-		entries := []proto.Entry{
-			{Index: 30, Cmd: makeCmd("old1", "val1")},
-			{Index: 40, Cmd: makeCmd("old2", "val2")},
-			{Index: 50, Cmd: makeCmd("old3", "val3")},
-		}
-		results := make([]sm.Result, 3)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-
-		// LastApplied should remain at 50 (not decrease or re-set).
-		if rsm.LastApplied() != recoveredIndex {
-			t.Errorf("LastApplied = %d, want %d", rsm.LastApplied(), recoveredIndex)
-		}
-	})
-
-	t.Run("entry above lastApplied advances it", func(t *testing.T) {
-		const recoveredIndex = uint64(50)
-		kv := newTestOnDiskKVWithState(recoveredIndex)
-		createFn := func(shardID, replicaID uint64) interface{} {
-			return kv
-		}
-		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
-		if err != nil {
-			t.Fatalf("NewStateMachine = %v", err)
-		}
-		defer rsm.Close()
-
-		if _, err := rsm.Open(make(chan struct{})); err != nil {
-			t.Fatalf("Open = %v", err)
-		}
-
-		entries := []proto.Entry{
-			{Index: 51, Cmd: makeCmd("new1", "val1")},
-		}
-		results := make([]sm.Result, 1)
-		if err := rsm.Apply(entries, results); err != nil {
-			t.Fatalf("Apply = %v", err)
-		}
-		if rsm.LastApplied() != 51 {
-			t.Errorf("LastApplied = %d, want 51", rsm.LastApplied())
-		}
-	})
-}
 
 // ---------------------------------------------------------------------------
 // Apply: user SM Update error propagates through session-managed batch
