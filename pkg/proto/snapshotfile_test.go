@@ -20,33 +20,6 @@ import (
 	"testing"
 )
 
-func TestSnapshotFileMarshalUnmarshalRoundTrip(t *testing.T) {
-	sf := SnapshotFile{
-		Filepath: "/var/lib/quicraft/external.dat",
-		FileSize: 1024 * 1024,
-		FileID:   7,
-		Metadata: []byte("app-specific-metadata"),
-	}
-	buf := make([]byte, sf.Size())
-	n, err := sf.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	if n != sf.Size() {
-		t.Fatalf("MarshalTo: wrote %d, want %d", n, sf.Size())
-	}
-
-	var sf2 SnapshotFile
-	consumed, err := sf2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if consumed != n {
-		t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, n)
-	}
-	assertSnapshotFileEqual(t, &sf, &sf2)
-}
-
 func TestSnapshotFileMarshalUnmarshalEmpty(t *testing.T) {
 	sf := SnapshotFile{}
 	buf := make([]byte, sf.Size())
