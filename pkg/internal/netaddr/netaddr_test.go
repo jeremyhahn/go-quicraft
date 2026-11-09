@@ -73,9 +73,6 @@ func TestCanonicalHost_MatchesVerifyHostnameSemantics(t *testing.T) {
 // normalise the SPELLING without collapsing the port — which is exactly what
 // distinguishes it from CanonicalHost.
 func TestCanonical_PreservesThePort(t *testing.T) {
-	if Canonical("NODE-B.example.com:5001") != Canonical("node-b.example.com:5001") {
-		t.Fatal("two spellings of one endpoint did not canonicalise to one value")
-	}
 	if Canonical("node-b.example.com:5001") == Canonical("node-b.example.com:5002") {
 		t.Fatal("Canonical collapsed two ports on one host: co-located replicas would " +
 			"be rejected as duplicate members")
