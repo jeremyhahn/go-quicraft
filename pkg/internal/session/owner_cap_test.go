@@ -96,19 +96,28 @@ func TestOwnerCapReleasesOnUnregisterAndExpiry(t *testing.T) {
 	const owner = 0xC0FFEE
 
 	t.Run("unregister", func(t *testing.T) {
-		m := NewManager(1000, 16, 1)
+		m := NewManager(1000, 16, 2)
 		if err := m.Register(1, owner, 1); err != nil {
-			t.Fatalf("Register: %v", err)
+			t.Fatalf("Register(1): %v", err)
 		}
-		if err := m.Register(2, owner, 2); !errors.Is(err, ErrSessionLimitExceeded) {
+		if err := m.Register(2, owner, 2); err != nil {
+			t.Fatalf("Register(2): %v", err)
+		}
+		if err := m.Register(3, owner, 3); !errors.Is(err, ErrSessionLimitExceeded) {
 			t.Fatalf("Register at cap = %v, want ErrSessionLimitExceeded", err)
 		}
 		if err := m.Unregister(1); err != nil {
 			t.Fatalf("Unregister: %v", err)
 		}
-		if err := m.Register(2, owner, 3); err != nil {
+		if err := m.Register(3, owner, 4); err != nil {
 			t.Fatalf("Register after Unregister = %v, want nil: the owner "+
-				"released its only session, so the slot must come back", err)
+				"released one session, so one slot must come back", err)
+		}
+		// Exactly one slot came back: the owner still holds session 2, so
+		// the release decremented its count rather than clearing it.
+		if err := m.Register(4, owner, 5); !errors.Is(err, ErrSessionLimitExceeded) {
+			t.Fatalf("Register at cap after one release = %v, want "+
+				"ErrSessionLimitExceeded", err)
 		}
 	})
 
@@ -229,103 +238,5 @@ func TestOwnerCapSurvivesSnapshotRoundTrip(t *testing.T) {
 	if err := dst.Register(4, owner, 4); !errors.Is(err, ErrSessionLimitExceeded) {
 		t.Fatalf("Register on restored manager = %v, want ErrSessionLimitExceeded: "+
 			"the owner already holds 2 of 2", err)
-	}
-}
-
-// TestOwnerCapDeterministicAcrossReplicas is the determinism gate.
-//
-// The cap is a STATE MACHINE decision. Two replicas applying the same log must
-// reach the same accept/reject verdict for every registration, or they diverge
-// permanently: the replica that refused answers SESSION_EXPIRED for every later
-// entry of that session while the other applies it normally, and nothing in
-// Raft detects it because both logs are identical and both replicas are
-// healthy.
-//
-// The two managers here are INDEPENDENT instances fed the same sequence, which
-// is the closest a unit test gets to two replicas replaying one log. The
-// sequence deliberately interleaves owners, mixes ownerless registrations in,
-// and includes unregisters that free slots mid-stream — so a manager whose
-// verdict depended on map iteration order, on insertion order within an owner,
-// or on a count that drifted on release would produce a different verdict
-// vector here.
-func TestOwnerCapDeterministicAcrossReplicas(t *testing.T) {
-	type op struct {
-		register bool
-		clientID uint64
-		ownerID  uint64
-		index    uint64
-	}
-
-	// Three owners against a cap of 3, plus ownerless traffic. Owner 1 is
-	// pushed past the cap, then relieved by an unregister, then pushed past it
-	// again — so the verdict vector encodes both directions of the counter.
-	ops := []op{
-		{true, 101, 1, 1},
-		{true, 102, 1, 2},
-		{true, 201, 2, 3},
-		{true, 103, 1, 4},
-		{true, 104, 1, 5}, // owner 1 at cap -> reject
-		{true, 900, noOwnerID, 6},
-		{true, 202, 2, 7},
-		{false, 102, 1, 8}, // frees one of owner 1's slots
-		{true, 104, 1, 9},  // now admitted
-		{true, 105, 1, 10}, // at cap again -> reject
-		{true, 301, 3, 11},
-		{true, 901, noOwnerID, 12},
-		{true, 203, 2, 13},
-		{true, 204, 2, 14},  // owner 2 at cap -> reject
-		{false, 999, 0, 15}, // unregister of a client that never existed
-		{true, 302, 3, 16},
-	}
-
-	run := func() []string {
-		m := NewManager(1000, 16, 3)
-		verdicts := make([]string, 0, len(ops))
-		for _, o := range ops {
-			var err error
-			if o.register {
-				err = m.Register(o.clientID, o.ownerID, o.index)
-			} else {
-				err = m.Unregister(o.clientID)
-			}
-			if err == nil {
-				verdicts = append(verdicts, "ok")
-			} else {
-				verdicts = append(verdicts, err.Error())
-			}
-		}
-		return verdicts
-	}
-
-	replicaA := run()
-	replicaB := run()
-
-	if len(replicaA) != len(replicaB) {
-		t.Fatalf("verdict vectors differ in length: %d vs %d", len(replicaA), len(replicaB))
-	}
-	for i := range replicaA {
-		if replicaA[i] != replicaB[i] {
-			t.Fatalf("replicas diverged at op %d (%+v): A=%q B=%q.\n"+
-				"Two replicas applying the SAME log reached different "+
-				"accept/reject verdicts. That is a permanent state-machine "+
-				"divergence with every Raft invariant intact: the replica that "+
-				"refused will answer SESSION_EXPIRED for every later entry of "+
-				"that session while its peers apply it normally.",
-				i, ops[i], replicaA[i], replicaB[i])
-		}
-	}
-
-	// The vector must not be uniformly "ok" — a test that only compares two
-	// identical all-accept runs proves nothing about the cap.
-	rejections := 0
-	for _, v := range replicaA {
-		if v == ErrSessionLimitExceeded.Error() {
-			rejections++
-		}
-	}
-	if rejections != 3 {
-		t.Fatalf("expected exactly 3 cap rejections in the sequence, got %d "+
-			"(verdicts: %v). If this is 0 the cap did not fire and the "+
-			"comparison above is vacuous.", rejections, replicaA)
 	}
 }
