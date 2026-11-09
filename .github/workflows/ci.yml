@@ -1,4 +1,5 @@
-# ci-template: v1.30 (customized)
+# ci-template: v1.34.1 (customized)
+# v1.34: the changes, schedule-guard and arch-gates jobs are one `preflight` job (see its comment).
 # Hosted runners (go-quicraft, after go-quicbaas #261): every job runs on
 # GitHub-hosted ubuntu-latest (4 vCPU, 16 GB, about 14 GB free disk, a 6 h
 # job limit); no job names a self-hosted label (.github/actionlint.yaml keeps
@@ -119,8 +120,8 @@
 # v1.29.2 (Company Agent ruling 239(8), 2026-10-28): comments only; no job,
 # gate or tier changes. A CUSTOMIZE job gated on a changes output (a path-gated
 # suite) needs the image job too and tests an output of the image job in its
-# `if:`. On a pull_request, an `if:` that reads only `needs.changes.result` or
-# only `needs.changes.outputs.*` left such a job skipped unstarted (two runs
+# `if:`. On a pull_request, an `if:` that reads only `needs.preflight.result` or
+# only `needs.preflight.outputs.*` left such a job skipped unstarted (two runs
 # in a row); one that also tests the image job's output started it. A
 # repository needs no adoption PR.
 # v1.29.1 (Company Agent ruling 226(15), 108 repair, 2026-10-27): lint fails
@@ -500,7 +501,7 @@
 # host-specific steps are guarded on github.server_url (devops.md §1).
 
 # >>> CUSTOMIZE (go-quicraft)
-# go-quicraft runs the v1.24 tiers. The pr tier (changes, image, arch-gates)
+# go-quicraft runs the v1.24 tiers. The pr tier (preflight, image)
 # runs on every event. The full tier (integration, netfault, errfs, zero-rtt,
 # cross-arch, modules, contrib-dragonboat, fips) runs on push to main,
 # nightly, on workflow_dispatch and on a PR labelled ci:full; its jobs carry
@@ -542,7 +543,7 @@ on:
   # runs are on the default branch. CUSTOMIZE: the hour, off nightly.yml's.
   # v1.29.3: one schedule run per repository (the concurrency group below),
   # and its bigdisk jobs skip while a main push run is in flight (the
-  # schedule-guard job).
+  # preflight job's schedule guard).
   # m1919 rotation (#619): one project per night until the R640s return;
   # go-quicraft's night is Wednesday, so the run fires 05:00 UTC Thursday.
   schedule:
@@ -615,48 +616,24 @@ env:
   IT_SHARDS: 2
 
 jobs:
-  # v1.24 (CA m749, m751 (a)): a PR whose every changed file matches DOCS_ONLY_PATTERN
+  # v1.34: one preflight job instead of three.
+  # `Changed files`, `Schedule guard` and `Architecture Gates` were three jobs,
+  # each a hosted runner of its own on every run, in a saturated hosted queue.
+  # They are steps of this one job now, in this order: the schedule guard
+  # first, before anything is checked out, so AGENT_TOKEN (a schedule run and
+  # a push to main only) still reaches a step beside no repository code; then
+  # one checkout with persist-credentials false; then the changed-files step;
+  # then the architecture gates. The four outputs are the same, read as
+  # needs.preflight.outputs.*. A repository adopts v1.34 in one CI-file PR:
+  # its CUSTOMIZE jobs read needs.preflight where they read the changed-files
+  # or schedule-guard job, its own architecture steps move into this job, and
+  # CI Gate checks `preflight` in place of the three. The comments of the
+  # three former jobs follow.
+  # v1.24: a PR whose every changed file matches DOCS_ONLY_PATTERN
   # runs lint only; build and make coverage are skipped. Off pull_request, or
   # on a ci:full PR, docs_only is always false. Any doubt (a failed diff, an
   # empty list) reads as false, so the tier fails toward running the tests.
-  changes:
-    name: Changed files
-    runs-on: ubuntu-latest
-    # v1.26: a draft PR runs no CI; the image job needs this one and skips with it.
-    if: ${{ !github.event.pull_request.draft }}
-    outputs:
-      docs_only: ${{ steps.diff.outputs.docs_only }}
-      lint_gates: ${{ steps.diff.outputs.lint_gates }}   # v1.30
-    timeout-minutes: 5        # v1.30
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        if: ${{ github.event_name == 'pull_request' && env.CI_FULL_TIER != 'true' }}
-        with:
-          fetch-depth: 0
-      - name: Is every changed file docs or markdown?
-        id: diff
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-          EVENT: ${{ github.event_name }}
-        run: |
-          # v1.30: lint_gates is false only on a PR whose changed files all
-          # miss LINT_GATES_PATTERN; any doubt runs the job.
-          docs_only=false lint_gates=true
-          if [ "$EVENT" = pull_request ] && [ "$CI_FULL_TIER" != true ]; then
-            if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
-              if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN"; then
-                docs_only=true
-              fi
-              printf '%s\n' "$files" | grep -qE "$LINT_GATES_PATTERN" || lint_gates=false
-              printf '%s\n' "$files"
-            fi
-          fi
-          echo "docs only: $docs_only; lint-gates: $lint_gates"
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          echo "lint_gates=$lint_gates" >> "$GITHUB_OUTPUT"
-
-  # v1.29.3 (Company Agent ruling 255(10)/(11)(c)): one nightly per
+  # v1.29.3: one nightly per
   # repository, and none while main is busy. On a schedule run only, this job
   # asks the API whether this workflow has a push run on main in progress or
   # waiting, and sets `verdict`: `run` (none, or not a schedule run), `busy`
@@ -676,16 +653,29 @@ jobs:
   # job skips and CI Gate reads the skips as passed. A proof it cannot read
   # leaves `run`: the full tier runs. A schedule run never gets `proven`,
   # because its security stages read fresh vulnerability databases.
-  schedule-guard:
-    name: Schedule guard
+  # Architecture gate (v1.20; go-xkms arch-gates).
+  # go-objstore owns every blob backend (docs/00), and a repo reaches it only
+  # through the packages that are its storage seam. Test files are exempt, and
+  # go-objstore itself passes. CUSTOMIZE: OBJSTORE_SEAMS, an extended regex of
+  # the paths that may import go-objstore (go-xkms: 'pkg/ca/|pkg/storage/');
+  # empty means none may. CUSTOMIZE: the repo's own layering rules (go-xkms:
+  # xkmsctl and xkey depend only on sdk/go) are further steps in this job.
+  # A source check with grep, not a stage: it runs on the runner's shell.
+  # v1.23: a lint-class check, so it stays on the PR tier.
+  preflight:
+    name: Preflight [changed files, schedule guard, architecture gates]
     runs-on: ubuntu-latest
-    # v1.26: a draft PR runs no CI (as the changes job).
+    # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
-    timeout-minutes: 5        # v1.30
+    timeout-minutes: 10       # v1.34: the three jobs had 5 each
     permissions:
       actions: read
       contents: read
+    env:
+      OBJSTORE_SEAMS: ''      # CUSTOMIZE
     outputs:
+      docs_only: ${{ steps.diff.outputs.docs_only }}
+      lint_gates: ${{ steps.diff.outputs.lint_gates }}   # v1.30
       verdict: ${{ steps.guard.outputs.verdict }}
       proof: ${{ steps.guard.outputs.proof }}   # v1.30
     steps:
@@ -800,6 +790,50 @@ jobs:
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           echo "proof=$PROOF" >> "$GITHUB_OUTPUT"
 
+      # v1.34: the full history on a PR run for the changed-files diff, one
+      # commit otherwise. No credential is left in the checkout.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: ${{ (github.event_name == 'pull_request' && env.CI_FULL_TIER != 'true') && '0' || '1' }}
+          persist-credentials: false
+
+      - name: Is every changed file docs or markdown?
+        id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # v1.30: lint_gates is false only on a PR whose changed files all
+          # miss LINT_GATES_PATTERN; any doubt runs the job.
+          docs_only=false lint_gates=true
+          if [ "$EVENT" = pull_request ] && [ "$CI_FULL_TIER" != true ]; then
+            if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
+              if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN"; then
+                docs_only=true
+              fi
+              printf '%s\n' "$files" | grep -qE "$LINT_GATES_PATTERN" || lint_gates=false
+              printf '%s\n' "$files"
+            fi
+          fi
+          echo "docs only: $docs_only; lint-gates: $lint_gates"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+          echo "lint_gates=$lint_gates" >> "$GITHUB_OUTPUT"
+
+      - name: No direct go-objstore import outside the storage seam
+        run: |
+          if [ "$(sed -n 's/^module //p' go.mod)" = github.com/jeremyhahn/go-objstore ]; then
+            echo "OK: this is go-objstore"; exit 0
+          fi
+          hits=$(grep -rln --include='*.go' '"github.com/jeremyhahn/go-objstore' . \
+                 | grep -v '_test\.go$' \
+                 | { if [ -n "$OBJSTORE_SEAMS" ]; then grep -vE "$OBJSTORE_SEAMS"; else cat; fi; } || true)
+          if [ -n "$hits" ]; then
+            echo "go-objstore may be imported only in the storage seam (OBJSTORE_SEAMS='$OBJSTORE_SEAMS'):"
+            echo "$hits"; exit 1
+          fi
+          echo "OK: no go-objstore import outside the storage seam"
+
   # v1.30 (fix 1): the toolchain image is built once per content hash, here,
   # and every other job pulls it (scripts/ci-image-cache.sh v1, ships beside
   # this file). On a push to main only, on the release runner, which alone
@@ -824,9 +858,9 @@ jobs:
     if: ${{ vars.CI_PUBLISH_IMAGES == 'true' && github.server_url != 'https://github.com' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # A job with no `needs` goes straight to a runner, which is what
     # evaluates its `if`; with no release runner it would stay queued and
-    # hold every run pending. Needing schedule-guard makes the server
+    # hold every run pending. Needing preflight makes the server
     # evaluate the `if` when that job ends and mark this one skipped.
-    needs: [schedule-guard]
+    needs: [preflight]
     # <<< CUSTOMIZE
     timeout-minutes: 60       # CUSTOMIZE: ceil(1.5 x a cold toolchain build's p95)
     env:
@@ -869,8 +903,8 @@ jobs:
   lint:
     name: Lint [lint, gosec, deps-check, build tags]
     runs-on: ubuntu-latest
-    needs: [changes, schedule-guard]
-    if: ${{ !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [preflight]
+    if: ${{ !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the lint stages (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -948,7 +982,7 @@ jobs:
       # it runs the releasability test alone; any other run gets it from make
       # coverage.
       - name: Releasability test (docs-only PR)
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.RELEASABILITY_TEST != '' && needs.changes.outputs.docs_only == 'true' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.RELEASABILITY_TEST != '' && needs.preflight.outputs.docs_only == 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "go test -count=1 -tags '$GO_BUILD_TAGS' $RELEASABILITY_TEST"
 
       # v1.9.2, now in the image: the declared tag set must select code. Each
@@ -956,13 +990,13 @@ jobs:
       # (tests included), it is misspelled or dead. Compares files, not
       # packages, and a tag may swap files (a `!foo` stub for a `foo` body).
       - name: Assert every build tag selects code
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.GO_BUILD_TAGS != '' && needs.changes.outputs.docs_only != 'true' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.GO_BUILD_TAGS != '' && needs.preflight.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "GO_BUILD_TAGS='$GO_BUILD_TAGS' sh scripts/assert-build-tags.sh"
 
       # v1.30 (fix 5): gosec on the PR tier, through the developers' target,
       # with no network. On the full tier make security runs it in the image job.
       - name: make gosec (PR tier)
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.CI_FULL_TIER != 'true' && needs.changes.outputs.docs_only != 'true' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.CI_FULL_TIER != 'true' && needs.preflight.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make gosec GO_BUILD_TAGS='$GO_BUILD_TAGS'"
 
       # Fails when a library, first-party or third-party, is behind its latest
@@ -1037,11 +1071,11 @@ jobs:
   image:
     name: Devcontainer image [build, security, trivy image]
     runs-on: ubuntu-latest
-    needs: [changes, schedule-guard]   # v1.24 (CA m749, m751 (a)); v1.29.3
+    needs: [preflight]   # v1.24 (CA m749, m751 (a)); v1.29.3
     # v1.29.3: on a schedule run, only on the schedule guard's `run`. v1.30:
     # on every event only on `run` (not `refused`, not `proven`), and never
     # on a docs-only PR.
-    if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
+    if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 120     # hosted runner: both image builds cold, build, security and trivy image (6 h cap)
     env:
       CI_IMAGE_NAMESPACE: ci-images   # v1.30
@@ -1165,7 +1199,7 @@ jobs:
       # CUSTOMIZE: nested modules (sdk/go, xkey) and variants (FIPS) are built
       # by `make build` itself, never by an extra step here.
       - name: make build
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.changes.outputs.docs_only != 'true' }}
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && needs.preflight.outputs.docs_only != 'true' }}
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make build GO_BUILD_TAGS='$GO_BUILD_TAGS'"
 
       # make security: gosec, govulncheck, go mod verify (devops.md §8), with
@@ -1210,8 +1244,8 @@ jobs:
   unit:
     name: Unit tests [-race, coverage, shard ${{ matrix.shard }}/4]
     runs-on: ubuntu-latest
-    needs: [changes, schedule-guard]
-    if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 120     # hosted runner: a cold toolchain image build, then a quarter of the -race suite (6 h cap)
     strategy:
       fail-fast: false
@@ -1315,8 +1349,8 @@ jobs:
   coverage:
     name: Coverage [merge, threshold]
     runs-on: ubuntu-latest
-    needs: [changes, schedule-guard, unit]
-    if: ${{ needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.docs_only != 'true' }}
+    needs: [preflight, unit]
+    if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the merge (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1410,11 +1444,11 @@ jobs:
   lint-gates:
     name: Lint Gates [toolchain image]
     runs-on: ubuntu-latest
-    needs: [changes, schedule-guard]     # v1.29.3; v1.30
+    needs: [preflight]     # v1.29.3; v1.30
     # v1.26: never on a draft. v1.29.3: on a schedule run, only on the
     # schedule guard's `run`. v1.30: only on `run` on every event, and on a PR
     # only when a changed file matches LINT_GATES_PATTERN (fix 3).
-    if: ${{ !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' && needs.changes.outputs.lint_gates != 'false' }}
+    if: ${{ !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.lint_gates != 'false' }}
     timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the gates (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1516,13 +1550,13 @@ jobs:
     # v1.26: never on a draft PR, ci:full or not. v1.29.3: on a schedule run,
     # only on the schedule guard's `run`. v1.30: only on `run` on every event
     # (a proven main push and a refused run skip it).
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     runs-on: ubuntu-latest
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the image job: it was the other multi-node QUIC load on a shared
     # runner host. Kept so a forge whose ubuntu-latest runners share a host
     # still serializes them; on hosted runners it costs wall time only.
-    needs: [image, schedule-guard]
+    needs: [image, preflight]
     # <<< CUSTOMIZE
     timeout-minutes: 150     # hosted runner: a cold integration image build, then half the suite (6 h cap)
     strategy:
@@ -1627,13 +1661,13 @@ jobs:
   soak:
     name: Soak [integration image]
     # v1.30: a dispatch off main is refused, so soak runs only on `run`.
-    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight.outputs.verdict == 'run' }}
     runs-on: ubuntu-latest
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the integration job, as integration is behind the image job: one
     # multi-node QUIC load at a time, and a red integration run is not soaked.
     # v1.29.3: and on a schedule run, only on the schedule guard's `run`.
-    needs: [integration, schedule-guard]
+    needs: [integration, preflight]
     # <<< CUSTOMIZE
     timeout-minutes: 180     # hosted runner: a cold image build, SOAK_MINUTES, then one iteration (6 h cap)
     env:
@@ -1745,14 +1779,14 @@ jobs:
   # integration job's `if:`, `full` in CI Gate) unless it is lint, build,
   # unit or race, which stay on the PR tier.
   # v1.29.2 (ruling 239(8)): a CUSTOMIZE job that runs only when certain
-  # paths change (the changes job gains an output for them, `optee` here)
+  # paths change (the preflight job gains an output for them, `optee` here)
   # needs the image job as well, and its `if:` tests an image job output
   # that its build step sets (here `built`, which the image job declares in
   # `outputs:` when a repository adds such a job), never `needs.<job>.result`
-  # and never the changes job's outputs alone. Reading `needs.changes.outputs.*`
+  # and never the preflight job's outputs alone. Reading `needs.preflight.outputs.*`
   # in the same `if:` is fine:
-  #   needs: [changes, image]
-  #   if: ${{ !cancelled() && needs.image.outputs.built == 'true' && !github.event.pull_request.draft && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.changes.outputs.optee == 'true')) }}
+  #   needs: [preflight, image]
+  #   if: ${{ !cancelled() && needs.image.outputs.built == 'true' && !github.event.pull_request.draft && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' || (github.event_name == 'pull_request' && needs.preflight.outputs.optee == 'true')) }}
 
   # >>> CUSTOMIZE (go-quicraft)
   # Full-tier suites the unit run does not reach. Each command is the
@@ -1764,8 +1798,8 @@ jobs:
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
-    needs: [image, integration, schedule-guard]
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.preflight.outputs.verdict == 'run' }}
+    needs: [image, integration, preflight]
     timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1837,8 +1871,8 @@ jobs:
     runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
-    needs: schedule-guard
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [preflight]
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1905,8 +1939,8 @@ jobs:
     runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
-    needs: schedule-guard
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [preflight]
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -1976,8 +2010,8 @@ jobs:
     name: Fuzz seeds [build tag quicraft_fuzz, toolchain image]
     runs-on: ubuntu-latest
     # v1.29.3, v1.30: only on the schedule guard's `run`.
-    needs: schedule-guard
-    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [preflight]
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the seeds (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -2046,8 +2080,8 @@ jobs:
     runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
-    needs: schedule-guard
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [preflight]
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the builds (6 h cap)
     strategy:
       fail-fast: false
@@ -2130,8 +2164,8 @@ jobs:
     runs-on: ubuntu-latest
     # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
     # schedule guard's `run`.
-    needs: schedule-guard
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.schedule-guard.outputs.verdict == 'run' }}
+    needs: [preflight]
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the modules (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -2199,8 +2233,8 @@ jobs:
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration, toolchain image]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
-    needs: [integration, schedule-guard]
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.preflight.outputs.verdict == 'run' }}
+    needs: [integration, preflight]
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -2277,8 +2311,8 @@ jobs:
   fips:
     name: FIPS [toolchain image]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.schedule-guard.outputs.verdict == 'run' }}
-    needs: [integration, schedule-guard]
+    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.preflight.outputs.verdict == 'run' }}
+    needs: [integration, preflight]
     timeout-minutes: 120     # hosted runner: a cold toolchain image build, then the unsharded fips140=only run (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -2357,39 +2391,6 @@ jobs:
         run: rm -f "$RUNNER_TEMP/gomodauth.env"
   # <<< CUSTOMIZE
 
-  # Architecture gate (v1.20, Company Agent m270 item 9; go-xkms arch-gates).
-  # go-objstore owns every blob backend (docs/00), and a repo reaches it only
-  # through the packages that are its storage seam. Test files are exempt, and
-  # go-objstore itself passes. CUSTOMIZE: OBJSTORE_SEAMS, an extended regex of
-  # the paths that may import go-objstore (go-xkms: 'pkg/ca/|pkg/storage/');
-  # empty means none may. CUSTOMIZE: the repo's own layering rules (go-xkms:
-  # xkmsctl and xkey depend only on sdk/go) are further steps in this job.
-  # A source check with grep, not a stage: it runs on the runner's shell.
-  # v1.23: a lint-class check, so it stays on the PR tier.
-  arch-gates:
-    name: Architecture Gates
-    runs-on: ubuntu-latest
-    if: ${{ !github.event.pull_request.draft }}   # v1.26
-    timeout-minutes: 5        # v1.30
-    env:
-      OBJSTORE_SEAMS: ''      # CUSTOMIZE
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: No direct go-objstore import outside the storage seam
-        run: |
-          if [ "$(sed -n 's/^module //p' go.mod)" = github.com/jeremyhahn/go-objstore ]; then
-            echo "OK: this is go-objstore"; exit 0
-          fi
-          hits=$(grep -rln --include='*.go' '"github.com/jeremyhahn/go-objstore' . \
-                 | grep -v '_test\.go$' \
-                 | { if [ -n "$OBJSTORE_SEAMS" ]; then grep -vE "$OBJSTORE_SEAMS"; else cat; fi; } || true)
-          if [ -n "$hits" ]; then
-            echo "go-objstore may be imported only in the storage seam (OBJSTORE_SEAMS='$OBJSTORE_SEAMS'):"
-            echo "$hits"; exit 1
-          fi
-          echo "OK: no go-objstore import outside the storage seam"
-
   # The single required check (devops.md §1). Every job above must appear in
   # BOTH the needs list and the results check — a gate that can pass vacuously
   # is worse than no gate. Do not use join(needs.*.result); it evaluates empty
@@ -2405,12 +2406,12 @@ jobs:
     # gate, so `CI / CI Gate (schedule)` posts `skipped` (Gitea 1.27.1 posts a
     # skipped job as `skipped`, not `success`), never a green nightly. Every
     # other verdict, an empty one included, runs it.
-    if: ${{ always() && (github.event_name != 'schedule' || needs.schedule-guard.outputs.verdict != 'busy') }}
+    if: ${{ always() && (github.event_name != 'schedule' || needs.preflight.outputs.verdict != 'busy') }}
     timeout-minutes: 5        # v1.30
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
     # check line below; remove none of the template's jobs. v1.30: lint
     # joins; publish-images is the one job outside the gate (see its comment).
-    needs: [changes, schedule-guard, lint, image, unit, coverage, lint-gates, integration, soak, arch-gates, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
+    needs: [preflight, lint, image, unit, coverage, lint-gates, integration, soak, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips]
     steps:
       - name: Fail closed on any non-success
         env:
@@ -2424,13 +2425,13 @@ jobs:
           DRAFT: ${{ github.event.pull_request.draft == true }}
           # v1.29.3: the schedule guard's verdict on a schedule run.
           SCHEDULE: ${{ github.event_name == 'schedule' }}
-          SCHEDULE_GUARD: ${{ needs.schedule-guard.outputs.verdict }}
+          SCHEDULE_GUARD: ${{ needs.preflight.outputs.verdict }}
           # v1.30: the proving run of a proven main push, the docs-only PR
           # flag (a `code` job skips on it) and the lint-gates path scope (a
           # `scoped` job skips when no file matched).
-          PROOF: ${{ needs.schedule-guard.outputs.proof }}
-          DOCS_ONLY: ${{ needs.changes.outputs.docs_only == 'true' }}
-          LINT_GATES_SEL: ${{ needs.changes.outputs.lint_gates != 'false' }}
+          PROOF: ${{ needs.preflight.outputs.proof }}
+          DOCS_ONLY: ${{ needs.preflight.outputs.docs_only == 'true' }}
+          LINT_GATES_SEL: ${{ needs.preflight.outputs.lint_gates != 'false' }}
         run: |
           if [ "${DRAFT}" = true ]; then
             echo "FAIL draft pull request: no CI runs on a draft. Mark it ready, then push an empty commit to start its run."
@@ -2463,17 +2464,16 @@ jobs:
           # because the guard had no count: fail closed.
           # v1.30: a refused run (a dispatch off main, a checkpoint-branch PR) fails.
           if [ "${SCHEDULE_GUARD}" = refused ]; then
-            echo "FAIL schedule-guard (refused: a workflow_dispatch off main or a PR from lane-ckpt/*; see its log)"; BAD=1
+            echo "FAIL preflight (schedule guard refused: a workflow_dispatch off main or a PR from lane-ckpt/*; see its log)"; BAD=1
           fi
           if [ "${SCHEDULE}" = true ] && [ "${SCHEDULE_GUARD}" != run ]; then
-            echo "FAIL schedule-guard (verdict '${SCHEDULE_GUARD:-none}': the bigdisk jobs skipped because the guard could not read the API; see its log)"; BAD=1
+            echo "FAIL preflight (schedule guard verdict '${SCHEDULE_GUARD:-none}': the bigdisk jobs skipped because the guard could not read the API; see its log)"; BAD=1
           fi
           # CUSTOMIZE: one line per job in needs above. A job gated to the
           # full tier by its `if:` is marked full, one gated to schedule and
           # workflow_dispatch is nightly; every other job is pr. v1.30: a job
           # that skips on a docs-only PR is code, and lint-gates is scoped.
-          check changes     "${{ needs.changes.result }}" pr
-          check schedule-guard "${{ needs.schedule-guard.result }}" pr
+          check preflight   "${{ needs.preflight.result }}" pr
           check lint        "${{ needs.lint.result }}" pr
           check image       "${{ needs.image.result }}" code
           check unit        "${{ needs.unit.result }}" code
@@ -2481,7 +2481,6 @@ jobs:
           check lint-gates  "${{ needs.lint-gates.result }}" scoped
           check integration "${{ needs.integration.result }}" full
           check soak        "${{ needs.soak.result }}" nightly
-          check arch-gates  "${{ needs.arch-gates.result }}" pr
           # >>> CUSTOMIZE (go-quicraft)
           check netfault    "${{ needs.netfault.result }}" full
           check errfs       "${{ needs.errfs.result }}" full
