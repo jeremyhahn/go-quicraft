@@ -133,38 +133,58 @@ func TestFlush_SlowShardDoesNotBlockOtherShards(t *testing.T) {
 	}
 }
 
-// rejectingProposer always reports a definite rejection.
+// rejectingProposer always fails at once with err.
 type rejectingProposer struct{ err error }
 
 func (r rejectingProposer) SyncPropose(context.Context, uint64, []byte) error {
 	return r.err
 }
 
-// TestSubmit_DefiniteRejectionIsNotIndeterminate pins the other side of the
-// timeout distinction that TestProposeContext_CapsLongCallerDeadline asserts: an ordinary
+// TestSubmit_ProposerErrorIndeterminacy pins the timeout distinction at the
+// proposer. A proposer timeout does NOT mean the proposal was rejected: the
+// entry may already be replicated and will apply, so reporting a definite
+// failure invites a retry that duplicates the whole batch. An ordinary
 // rejection is a definite failure and is safe to surface as one.
-func TestSubmit_DefiniteRejectionIsNotIndeterminate(t *testing.T) {
-	rejected := errors.New("quicraft: not leader")
-	agg, err := NewAggregator(rejectingProposer{err: rejected},
-		WithConfig(Config{MaxBatchSize: 1, FlushInterval: 5 * time.Millisecond, QueueSize: 10}),
-		WithLogger(slog.Default()),
-		WithRegistry(newTestRegistry(t)),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator: %v", err)
+//
+// The proposer returns at once, so the batch context is still live and only
+// the proposer's own error decides the outcome. TestProposeContext_CapsLongCallerDeadline
+// cannot pin this: it waits for the batch context to expire first.
+func TestSubmit_ProposerErrorIndeterminacy(t *testing.T) {
+	cases := []struct {
+		name          string
+		err           error
+		indeterminate bool
+	}{
+		{"timeout", context.DeadlineExceeded, true},
+		{"definite rejection", errors.New("quicraft: not leader"), false},
 	}
-	defer func() { _ = agg.Close() }()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agg, err := NewAggregator(rejectingProposer{err: tc.err},
+				WithConfig(Config{MaxBatchSize: 1, FlushInterval: 5 * time.Millisecond, QueueSize: 10}),
+				WithLogger(slog.Default()),
+				WithRegistry(newTestRegistry(t)),
+			)
+			if err != nil {
+				t.Fatalf("NewAggregator: %v", err)
+			}
+			defer func() { _ = agg.Close() }()
 
-	submitErr := agg.Submit(context.Background(), 1, []byte("write"))
-	var flushErr *FlushError
-	if !errors.As(submitErr, &flushErr) {
-		t.Fatalf("error = %T (%v), want *FlushError", submitErr, submitErr)
-	}
-	if flushErr.Indeterminate {
-		t.Error("a definite rejection must not be reported as indeterminate")
-	}
-	if !errors.Is(submitErr, rejected) {
-		t.Error("the proposer's error is not reachable through errors.Is")
+			submitErr := agg.Submit(context.Background(), 1, []byte("write"))
+			var flushErr *FlushError
+			if !errors.As(submitErr, &flushErr) {
+				t.Fatalf("error = %T (%v), want *FlushError", submitErr, submitErr)
+			}
+			if flushErr.Indeterminate != tc.indeterminate {
+				t.Errorf("Indeterminate = %v, want %v", flushErr.Indeterminate, tc.indeterminate)
+			}
+			if !errors.Is(submitErr, tc.err) {
+				t.Error("the proposer's error is not reachable through errors.Is")
+			}
+			if !errors.Is(submitErr, ErrFlush) {
+				t.Error("errors.Is(err, ErrFlush) = false, want true")
+			}
+		})
 	}
 }
 
