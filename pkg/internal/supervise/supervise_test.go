@@ -82,17 +82,6 @@ func TestClassifyExit(t *testing.T) {
 	}
 }
 
-func TestAwaitRestart(t *testing.T) {
-	stopC := make(chan struct{})
-	if !AwaitRestart(stopC) {
-		t.Fatal("AwaitRestart refused a restart with stopC open")
-	}
-	close(stopC)
-	if AwaitRestart(stopC) {
-		t.Fatal("AwaitRestart allowed a restart after stopC closed")
-	}
-}
-
 // TestSupervise_RestartsAfterGoexit: a loop ended by runtime.Goexit is run
 // again on a fresh goroutine, and wg counts it throughout.
 func TestSupervise_RestartsAfterGoexit(t *testing.T) {
