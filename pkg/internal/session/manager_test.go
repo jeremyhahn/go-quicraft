@@ -240,6 +240,11 @@ func TestManagerCheckDuplicate(t *testing.T) {
 		if m.sessions[1].lastActiveIndex != 500 {
 			t.Errorf("lastActiveIndex = %d, want 500", m.sessions[1].lastActiveIndex)
 		}
+		// A hit at a lower index must not move lastActiveIndex back.
+		_, _, _ = m.CheckDuplicate(1, 5, 300)
+		if m.sessions[1].lastActiveIndex != 500 {
+			t.Errorf("lastActiveIndex = %d, want 500 (must not decrease)", m.sessions[1].lastActiveIndex)
+		}
 	})
 }
 
@@ -262,6 +267,21 @@ func TestManagerRecordResult(t *testing.T) {
 		// Advance respondedTo to 2 by recording series 4.
 		if err := m.RecordResult(1, 4, 2, 104, sm.Result{Value: 4}); err != nil {
 			t.Fatalf("RecordResult(4) = %v", err)
+		}
+
+		// The cached entries at and below respondedTo are physically
+		// deleted; CheckDuplicate below answers from respondedTo alone
+		// and would not notice an entry left behind at the boundary.
+		responses := m.sessions[1].responses
+		for _, sid := range []uint64{1, 2} {
+			if _, ok := responses[sid]; ok {
+				t.Errorf("series %d still cached after respondedTo advanced to 2", sid)
+			}
+		}
+		for _, sid := range []uint64{3, 4} {
+			if _, ok := responses[sid]; !ok {
+				t.Errorf("series %d missing from cache, want kept", sid)
+			}
 		}
 
 		// Series 1 and 2 are <= respondedTo (2), should return ErrResponseEvicted.
@@ -478,6 +498,27 @@ func TestManagerExpireSessions(t *testing.T) {
 		// Current index 1000, threshold 1000. Gap is only 100, < 1000.
 		expired := m.ExpireSessions(1000, 1000, 10)
 		if len(expired) != 0 {
+			t.Errorf("len(expired) = %d, want 0", len(expired))
+		}
+	})
+
+	t.Run("does not expire at exact threshold", func(t *testing.T) {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 100); err != nil {
+			t.Fatalf("Register = %v", err)
+		}
+		// Gap is exactly the threshold; expiry needs a gap above it.
+		if expired := m.ExpireSessions(1100, 1000, 10); len(expired) != 0 {
+			t.Errorf("len(expired) = %d, want 0", len(expired))
+		}
+	})
+
+	t.Run("does not expire when current index is behind last active", func(t *testing.T) {
+		m := NewManager(10, 10, 0)
+		if err := m.Register(1, 0, 5000); err != nil {
+			t.Fatalf("Register = %v", err)
+		}
+		if expired := m.ExpireSessions(100, 10, 10); len(expired) != 0 {
 			t.Errorf("len(expired) = %d, want 0", len(expired))
 		}
 	})
