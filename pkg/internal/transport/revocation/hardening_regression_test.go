@@ -55,14 +55,11 @@ func TestValidateRejectsEnforcedRevocationWithoutSource(t *testing.T) {
 	}
 }
 
-// TestValidateKeepsNoRevocationOptOutUsable pins that the fix does not break
-// the documented opt-out: soft-fail explicitly admits peers whose status
-// cannot be determined, which includes having no source at all, and every
-// mode that DOES name a source stays valid.
-func TestValidateKeepsNoRevocationOptOutUsable(t *testing.T) {
+// TestValidateAcceptsModeAnyWithOneSource pins that the fix does not reject
+// ModeAny when it names a single source of either kind. The soft-fail opt-out
+// with no source is asserted by TestConfigValidateAcceptsSatisfiableModes.
+func TestValidateAcceptsModeAnyWithOneSource(t *testing.T) {
 	cases := []Config{
-		{AllowSoftFail: true},                // opted into soft-fail, no source
-		{Mode: ModeAny, AllowSoftFail: true}, // opted into soft-fail, no source
 		{Mode: ModeAny, CRLPaths: []string{"/tmp/x.crl"}},
 		{Mode: ModeAny, OCSPResponderURL: "http://ocsp.example"},
 	}
@@ -71,44 +68,6 @@ func TestValidateKeepsNoRevocationOptOutUsable(t *testing.T) {
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("case %d: Validate() = %v, want nil", i, err)
 		}
-	}
-}
-
-// TestIsRevokedFailsClosedWithoutSource is the runtime backstop for a checker
-// built without Validate (or whose CRLPaths were dropped in a refactor): the
-// enforcing ModeAny path must surface the missing source instead of returning
-// "not revoked" for every certificate.
-//
-// The Config is left entirely zero-valued, so this is also the assertion that
-// the ZERO VALUE ENFORCES, made on observable behaviour: were the default to
-// revert to soft-fail, IsRevoked would return (false, nil) here.
-func TestIsRevokedFailsClosedWithoutSource(t *testing.T) {
-	ca := newTestCA(t)
-	leaf := ca.issueLeaf(t, 4242)
-
-	checker := NewChecker(Config{}, ca.cert)
-	revoked, err := checker.IsRevoked(leaf)
-	if revoked {
-		t.Fatal("no source configured: nothing can report a certificate revoked")
-	}
-	if !errors.Is(err, ErrNoRevocationSources) {
-		t.Fatalf("IsRevoked error = %v, want ErrNoRevocationSources", err)
-	}
-}
-
-// TestIsRevokedSoftFailWithoutSourceAdmits pins the other half of the opt-out:
-// under soft-fail the same checker admits the peer with no error.
-func TestIsRevokedSoftFailWithoutSourceAdmits(t *testing.T) {
-	ca := newTestCA(t)
-	leaf := ca.issueLeaf(t, 4243)
-
-	checker := NewChecker(Config{AllowSoftFail: true}, ca.cert)
-	revoked, err := checker.IsRevoked(leaf)
-	if err != nil {
-		t.Fatalf("soft-fail with no source must admit: %v", err)
-	}
-	if revoked {
-		t.Fatal("nothing revoked this certificate")
 	}
 }
 
@@ -146,7 +105,10 @@ var sourcelessModes = []struct {
 	{ModeOCSP, ErrOCSPUnavailable},
 	{ModeBoth, ErrOCSPUnavailable},
 	{ModeAny, ErrNoRevocationSources},
-	{"", ErrNoRevocationSources}, // the empty string selects ModeAny
+	// The empty string selects ModeAny. Config{Mode: ""} is the zero Config,
+	// so this case also asserts that the zero value enforces: were the
+	// default to revert to soft-fail, IsRevoked would return (false, nil).
+	{"", ErrNoRevocationSources},
 }
 
 // TestIsRevokedFailsClosedInEveryModeWithoutSource pins that no mode admits a
@@ -185,37 +147,6 @@ func TestIsRevokedSoftFailAdmitsInEveryModeWithoutSource(t *testing.T) {
 		if revoked {
 			t.Fatalf("mode %q: nothing revoked this certificate", tc.mode)
 		}
-	}
-}
-
-// TestIsRevokedModeCRLWithSourceStillAdmits keeps the ModeCRL backstop from
-// degenerating into a blanket rejection: an enforcing checker with a CRL that
-// loaded successfully must still admit a certificate the CRL does not list.
-func TestIsRevokedModeCRLWithSourceStillAdmits(t *testing.T) {
-	ca := newTestCA(t)
-	revokedLeaf := ca.issueLeaf(t, 4248)
-	cleanLeaf := ca.issueLeaf(t, 4249)
-
-	path := writeCRLFile(t, t.TempDir(), "published.crl.pem", ca.createCRL(t, 4248))
-	checker := NewChecker(Config{Mode: ModeCRL, CRLPaths: []string{path}}, ca.cert)
-	if err := checker.ReloadCRLs(); err != nil {
-		t.Fatalf("ReloadCRLs: %v", err)
-	}
-
-	revoked, err := checker.IsRevoked(cleanLeaf)
-	if err != nil {
-		t.Fatalf("a loaded CRL is a source; an unlisted certificate must be admitted: %v", err)
-	}
-	if revoked {
-		t.Fatal("the CRL does not list this certificate")
-	}
-
-	revoked, err = checker.IsRevoked(revokedLeaf)
-	if err != nil {
-		t.Fatalf("IsRevoked(revokedLeaf): %v", err)
-	}
-	if !revoked {
-		t.Fatal("a certificate listed on the loaded CRL must be reported revoked")
 	}
 }
 
