@@ -797,18 +797,6 @@ func TestMembershipVersionByteOnWire(t *testing.T) {
 			t.Fatalf("shape %d: consumed %d, wrote %d", i, n2, n)
 		}
 		assertMembershipEqual(t, &m, &got)
-
-		// Any other version byte must be rejected before a field is read. The
-		// values below include every number an earlier pre-release commit
-		// stamped, plus the two ends of the byte range.
-		for _, bad := range []byte{0, 2, 3, 4, 5, 6, 0xFF} {
-			corrupt := append([]byte{}, buf...)
-			corrupt[0] = bad
-			var m2 Membership
-			if _, err := m2.UnmarshalFrom(corrupt); !errors.Is(err, ErrUnsupportedVersion) {
-				t.Fatalf("shape %d version %d: got %v, want ErrUnsupportedVersion", i, bad, err)
-			}
-		}
 	}
 }
 

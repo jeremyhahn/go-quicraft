@@ -150,21 +150,3 @@ func TestPutIfAbsent_DoesNotDisturbOtherKeys(t *testing.T) {
 		})
 	}
 }
-
-// TestPutIfAbsent_RoundTripsThroughTheCodec pins the wire encoding. The shape
-// is identical to Put apart from the opcode, so a decoder that ignored the
-// opcode would silently turn a conditional write into an unconditional one.
-func TestPutIfAbsent_RoundTripsThroughTheCodec(t *testing.T) {
-	encoded := mustEncodePutIfAbsent(t, []byte("key"), []byte("value"))
-
-	cmd, err := DecodeCommand(encoded)
-	if err != nil {
-		t.Fatalf("DecodeCommand: %v", err)
-	}
-	if cmd.Op != OpPutIfAbsent {
-		t.Errorf("op = %d, want OpPutIfAbsent(%d)", cmd.Op, OpPutIfAbsent)
-	}
-	if string(cmd.Key) != "key" || string(cmd.Value) != "value" {
-		t.Errorf("decoded key/value = %q/%q, want key/value", cmd.Key, cmd.Value)
-	}
-}

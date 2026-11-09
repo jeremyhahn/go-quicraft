@@ -840,40 +840,13 @@ func TestOnApplied_RecoveryDoesNotDoubleReleaseAlreadyCompletedClaims(t *testing
 // awaitResult
 // ---------------------------------------------------------------------------
 
-// TestWaitResultCtx verifies the bridge used by the session APIs: a resolved
-// request returns its result (and its embedded error) verbatim, while a
-// context that ends first unblocks the caller with the mapped error rather
-// than waiting on a request that will never resolve.
+// TestWaitResultCtx verifies the bridge used by the session APIs: a context
+// that ends first unblocks the caller with the mapped error rather than
+// waiting on a request that will never resolve. A resolved request returning
+// its result and embedded error is covered through SyncRequestRemoveNode and
+// SyncRequestAddObserver above.
 func TestWaitResultCtx(t *testing.T) {
 	pool := NewRequestStatePool()
-
-	t.Run("result delivered", func(t *testing.T) {
-		rs := newRequestState(pool, 1, time.Time{}, false)
-		defer rs.Release()
-		rs.complete(RequestResult{Value: 42})
-
-		result, err := awaitResult(context.Background(), rs)
-		if err != nil {
-			t.Fatalf("awaitResult error = %v, want nil", err)
-		}
-		if result.Value != 42 {
-			t.Fatalf("result.Value = %d, want 42", result.Value)
-		}
-	})
-
-	t.Run("result error returned", func(t *testing.T) {
-		rs := newRequestState(pool, 2, time.Time{}, false)
-		defer rs.Release()
-		rs.complete(RequestResult{Err: ErrNotLeader})
-
-		result, err := awaitResult(context.Background(), rs)
-		if !errors.Is(err, ErrNotLeader) {
-			t.Fatalf("awaitResult error = %v, want ErrNotLeader", err)
-		}
-		if !errors.Is(result.Err, ErrNotLeader) {
-			t.Fatalf("result.Err = %v, want ErrNotLeader", result.Err)
-		}
-	})
 
 	t.Run("context canceled", func(t *testing.T) {
 		rs := newRequestState(pool, 3, time.Time{}, false)
