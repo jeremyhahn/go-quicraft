@@ -163,8 +163,8 @@ var patterns = []pattern{
 	},
 	{
 		class:    classLabHost,
-		expr:     regexp.MustCompile(`(?i)\bomega\b`), // lab-string-ok: the hostname this rule exists to find
-		needle:   "omega",                             // lab-string-ok: the hostname this rule exists to find
+		expr:     regexp.MustCompile(`(?i)\bbench-node-\d+\b`),
+		needle:   "bench-node-",
 		guidance: "name the role, not the machine: build-host.example, bench-host.example",
 	},
 	{

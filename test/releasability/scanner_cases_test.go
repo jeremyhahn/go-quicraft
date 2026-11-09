@@ -29,7 +29,7 @@ import (
 const (
 	plantedAddress   = "198.51.100.51"        // lab-string-ok: planted fixture for the lab-address rule
 	plantedGPUHost   = "gpu-host"             // lab-string-ok: planted fixture for the lab-host rule
-	plantedBenchHost = "omega"                // lab-string-ok: planted fixture for the lab-host rule
+	plantedBenchHost = "bench-node-1"         // lab-string-ok: planted fixture for the lab-host rule
 	plantedRunner    = "ci-node-2"            // lab-string-ok: planted fixture for the lab-host rule
 	plantedAgent     = "vm-host-4"            // lab-string-ok: planted fixture for the lab-host rule
 	plantedHome      = plantedMount + "/home" // lab-string-ok: planted fixture for the owner-path rule, a home under the lab mount
@@ -199,8 +199,8 @@ func TestScanAcceptsWhatItShould(t *testing.T) {
 		{"role names", "make remote-test REMOTE_HOST=build-host.example PERF_HOST=user@bench-host.example\n"},
 		{"a waiver on the offending line", "Measured on " + plantedGPUHost + ". <!-- lab-string-ok: measurement provenance -->\n"},
 		{"a waiver whose reason ends at a comment closer", "x := 1 /* lab-string-ok: provenance */ // " + plantedGPUHost + "\n"},
-		{"a fleet name inside a longer word", "un" + plantedGPUHost + "ness, " + plantedBenchHost + "Dir and OMEGA_HOST are not hosts\n"},
-		{"a fleet prefix without its number", "ci-node-x and vm-host-N name no machine\n"},
+		{"a fleet name inside a longer word", "un" + plantedGPUHost + "ness, " + plantedBenchHost + "Dir and BENCH-NODE-1_HOST are not hosts\n"},
+		{"a fleet prefix without its number", "ci-node-x, vm-host-N and bench-node-x name no machine\n"},
 		{"agent words that are not principals", "agent-" + "git.sh go-quicraft commit; User-Agent: x; agent-01 runs it\n"},
 		{"a templated principal with no name", "user.email=\"agent-$repo@example.invalid\"\n"},
 		{"a neutral example identity", "release@example.invalid and ops@forge.example\n"},
@@ -454,12 +454,12 @@ func TestErrorsNameTheirSubjectAndUnwrap(t *testing.T) {
 // every file, and the gate would pass while seeing nothing.
 func TestPatternsEveryNeedleIsImpliedByItsExpr(t *testing.T) {
 	samples := map[string][]string{
-		`\b198\.51\.100\.\d{1,3}\b`: {plantedAddress + ":3001", "at " + plantedAddress},
-		`(?i)\bgpu-host\b`:          {"on " + plantedGPUHost, "http://" + strings.ToUpper(plantedGPUHost) + ".internal:8077"}, // lab-string-ok: the rule's own source text, as the map key
-		`(?i)\bci-node-\d+\b`:       {"runner " + plantedRunner, strings.ToUpper(plantedRunner)},
-		`(?i)\bvm-host-\d+\b`:       {"agent-" + plantedAgent, strings.ToUpper(plantedAgent) + " rebooted"},
-		`(?i)\bomega\b`:             {"ssh user@" + plantedBenchHost + ":22", strings.ToUpper(plantedBenchHost) + " reported Online"},
-		`/mnt/vm-host`:              {plantedMount + "-01/go-qrdb"}, // lab-string-ok: the rule's own source text, as the map key
+		`\b198\.51\.100\.\d{1,3}\b`:                        {plantedAddress + ":3001", "at " + plantedAddress},
+		`(?i)\bgpu-host\b`:                                 {"on " + plantedGPUHost, "http://" + strings.ToUpper(plantedGPUHost) + ".internal:8077"}, // lab-string-ok: the rule's own source text, as the map key
+		`(?i)\bci-node-\d+\b`:                              {"runner " + plantedRunner, strings.ToUpper(plantedRunner)},
+		`(?i)\bvm-host-\d+\b`:                              {"agent-" + plantedAgent, strings.ToUpper(plantedAgent) + " rebooted"},
+		`(?i)\bbench-node-\d+\b`:                           {"ssh user@" + plantedBenchHost + ":22", strings.ToUpper(plantedBenchHost) + " reported Online"},
+		`/mnt/vm-host`:                                     {plantedMount + "-01/go-qrdb"}, // lab-string-ok: the rule's own source text, as the map key
 		`(?i)\bagent-[a-z0-9-]+@[a-z0-9-]+(\.[a-z0-9-]+)*`: {plantedPrincipal, "user.email=" + strings.ToUpper(plantedSibling)},
 		`(?i)\bexample\.internal\b`:                        {"ops@" + plantedDomain, strings.ToUpper(plantedDomain) + ":22"},
 		`(?i)\bhandbook ?#\d+`:                             {plantedHandbookIssue, "Handbook#44"},                                                 // lab-string-ok: a planted sample for the internal-repository rule
