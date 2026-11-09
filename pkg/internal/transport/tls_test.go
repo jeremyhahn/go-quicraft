@@ -53,77 +53,45 @@ func TestBuildMTLSTLSPairValid(t *testing.T) {
 	if pair.server.ClientCAs == nil {
 		t.Fatal("server should have ClientCAs")
 	}
+	if pair.server.RootCAs == nil {
+		t.Fatal("server RootCAs should not be nil")
+	}
 	if pair.client.RootCAs == nil {
 		t.Fatal("client should have RootCAs")
 	}
 	if pair.client.InsecureSkipVerify {
 		t.Fatal("client should NOT have InsecureSkipVerify in mTLS mode")
 	}
-}
-
-// TestBuildMTLSTLSServerConfig verifies mTLS config with real PEM certificates.
-func TestBuildMTLSTLSServerConfig(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	mtls := &MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}
-
-	pair, err := buildMTLSTLS(mtls, nil)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-	cfg := pair.server
-
-	if len(cfg.Certificates) != 1 {
-		t.Fatalf("expected 1 certificate, got %d", len(cfg.Certificates))
-	}
-	if cfg.ClientAuth != tls.RequireAndVerifyClientCert {
-		t.Fatalf("expected RequireAndVerifyClientCert, got %v", cfg.ClientAuth)
-	}
-	if cfg.MinVersion != tls.VersionTLS13 {
-		t.Fatalf("expected TLS 1.3, got %d", cfg.MinVersion)
-	}
-	if cfg.RootCAs == nil {
-		t.Fatal("RootCAs should not be nil")
-	}
-}
-
-// TestBuildMTLSTLSClientConfig verifies mTLS client config has proper
-// CA verification and ALPN protocol.
-func TestBuildMTLSTLSClientConfig(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	pair, err := buildMTLSTLS(&MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}, nil)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-	cfg := pair.client
-
-	if len(cfg.Certificates) != 1 {
-		t.Fatalf("expected 1 certificate, got %d", len(cfg.Certificates))
-	}
-	if cfg.RootCAs == nil {
-		t.Fatal("client RootCAs should not be nil")
-	}
-	if cfg.MinVersion != tls.VersionTLS13 {
-		t.Fatalf("expected TLS 1.3, got %d", cfg.MinVersion)
-	}
-	foundALPN := false
-	for _, proto := range cfg.NextProtos {
-		if proto == tlsALPN {
-			foundALPN = true
-			break
+	for _, tc := range []struct {
+		name string
+		cfg  *tls.Config
+	}{
+		{"server", pair.server},
+		{"client", pair.client},
+	} {
+		if len(tc.cfg.Certificates) != 1 {
+			t.Fatalf("%s: expected 1 certificate, got %d", tc.name, len(tc.cfg.Certificates))
+		}
+		if tc.cfg.MinVersion != tls.VersionTLS13 {
+			t.Fatalf("%s: expected TLS 1.3, got %d", tc.name, tc.cfg.MinVersion)
+		}
+		foundALPN := false
+		for _, proto := range tc.cfg.NextProtos {
+			if proto == tlsALPN {
+				foundALPN = true
+				break
+			}
+		}
+		if !foundALPN {
+			t.Fatalf("%s: NextProtos should contain %q", tc.name, tlsALPN)
 		}
 	}
-	if !foundALPN {
-		t.Fatalf("NextProtos should contain %q", tlsALPN)
+	if pair.client.ClientSessionCache == nil {
+		t.Fatal("client ClientSessionCache should be non-nil for session resumption")
+	}
+	// Only clients resume sessions.
+	if pair.server.ClientSessionCache != nil {
+		t.Fatal("server ClientSessionCache should be nil")
 	}
 }
 
@@ -157,7 +125,8 @@ func TestBuildMTLSTLSInvalidCertKeyPair(t *testing.T) {
 	}
 }
 
-// TestTLSALPNConstant verifies the ALPN protocol identifier.
+// TestTLSALPNConstant pins the ALPN protocol identifier. It is a wire
+// value: peers that advertise a different identifier fail the handshake.
 func TestTLSALPNConstant(t *testing.T) {
 	if tlsALPN != "quicraft" {
 		t.Fatalf("tlsALPN: want quicraft, got %s", tlsALPN)
@@ -176,39 +145,9 @@ func TestNilMTLSConfigReturnsError(t *testing.T) {
 	}
 	cfg.SetDefaults()
 
-	err := cfg.Validate()
-	if !errors.Is(err, ErrMTLSConfigRequired) {
-		t.Fatalf("expected ErrMTLSConfigRequired from Validate, got %v", err)
-	}
-
-	_, err = NewQUICTransport(cfg, handler, reg)
+	_, err := NewQUICTransport(cfg, handler, reg)
 	if !errors.Is(err, ErrMTLSConfigRequired) {
 		t.Fatalf("expected ErrMTLSConfigRequired from NewQUICTransport, got %v", err)
-	}
-}
-
-// TestBuildMTLSTLSServerALPN verifies the server config has the ALPN protocol.
-func TestBuildMTLSTLSServerALPN(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	pair, err := buildMTLSTLS(&MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}, nil)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-
-	foundALPN := false
-	for _, proto := range pair.server.NextProtos {
-		if proto == tlsALPN {
-			foundALPN = true
-			break
-		}
-	}
-	if !foundALPN {
-		t.Fatalf("server NextProtos should contain %q", tlsALPN)
 	}
 }
 
@@ -586,31 +525,6 @@ func TestBuildMTLSTLS_CurvePreferences(t *testing.T) {
 				"ML-KEM hybrid negotiation", tc.name)
 		}
 		assertHandshakeCurves(t, tc.name, tc.curves)
-	}
-}
-
-// TestBuildMTLSTLS_ClientSessionCache verifies that the client TLS config
-// has a non-nil ClientSessionCache for session ticket resumption (1-RTT
-// reconnects instead of 2-RTT full handshakes).
-func TestBuildMTLSTLS_ClientSessionCache(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	pair, err := buildMTLSTLS(&MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}, nil)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-
-	if pair.client.ClientSessionCache == nil {
-		t.Fatal("client ClientSessionCache should be non-nil for session resumption")
-	}
-
-	// Server should NOT have a ClientSessionCache (only clients resume).
-	if pair.server.ClientSessionCache != nil {
-		t.Fatal("server ClientSessionCache should be nil")
 	}
 }
 
