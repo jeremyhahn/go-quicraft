@@ -32,14 +32,13 @@ func TestValidateRejectsEnforcedRevocationWithoutSource(t *testing.T) {
 }
 
 // TestValidateKeepsRevocationOptOutUsable pins that the check above does not
-// break either documented way to run without revocation checking, nor a
-// correctly-sourced enforced configuration.
+// break the soft-fail opt-out, nor an enforced configuration with a single
+// source. A nil RevocationConfig is covered by TestTransportConfig_Validate_Valid.
 func TestValidateKeepsRevocationOptOutUsable(t *testing.T) {
 	cases := []struct {
 		name string
 		rc   *RevocationConfig
 	}{
-		{"disabled entirely", nil},
 		{"soft-fail with no source", &RevocationConfig{Mode: "any", AllowSoftFail: true}},
 		{"enforced with CRL", &RevocationConfig{Mode: "any", CRLPaths: []string{"/etc/crl.pem"}}},
 		{"enforced with OCSP", &RevocationConfig{Mode: "any", OCSPResponderURL: "http://ocsp.example"}},
