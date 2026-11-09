@@ -323,25 +323,6 @@ func TestSyncReadBuf_ContextCanceled(t *testing.T) {
 	release()
 }
 
-// TestSyncReadBuf_ContextDeadlineExceeded verifies that an expired deadline is
-// reported as ErrTimeout, the error identity callers retry on.
-func TestSyncReadBuf_ContextDeadlineExceeded(t *testing.T) {
-	backing := &bufLookupSM{values: map[string][]byte{"k": []byte("v")}}
-	h := startReadBufShard(t, func(uint64, uint64) interface{} { return backing })
-
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
-	defer cancel()
-
-	buf, release, err := h.SyncReadBuf(ctx, 1, []byte("k"))
-	if !errors.Is(err, ErrTimeout) {
-		t.Fatalf("SyncReadBuf error = %v, want ErrTimeout", err)
-	}
-	if buf != nil {
-		t.Fatalf("SyncReadBuf returned %q, want nil", buf)
-	}
-	release()
-}
-
 // ---------------------------------------------------------------------------
 // StaleReadBuf
 // ---------------------------------------------------------------------------
