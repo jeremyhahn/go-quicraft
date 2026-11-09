@@ -24,8 +24,10 @@
 
 ARG GO_IMAGE
 # Build-time module and tool downloads go through this proxy (devcontainer.md
-# §4). The caller's environment supplies another; no tracked file does.
-ARG GO_BUILD_PROXY=https://proxy.golang.org,direct
+# §4). The caller's environment supplies another; no tracked file does. No
+# direct entry (ci-template v1.34.1): a module the proxy cannot serve fails
+# the build instead of being fetched from its origin.
+ARG GO_BUILD_PROXY=https://proxy.golang.org
 
 # ---------------------------------------------------------------------------
 FROM ${GO_IMAGE} AS tools

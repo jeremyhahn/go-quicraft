@@ -201,11 +201,11 @@ const fullTierEnv = `(github.event_name != 'pull_request' && (github.event_name 
 // guardRun is the schedule guard's verdict (ci-template v1.29.3, v1.30): every
 // bigdisk job ANDs it onto its condition, and ci-gate reads its skip as passed
 // only on a proven tree.
-const guardRun = `needs.schedule-guard.outputs.verdict == 'run'`
+const guardRun = `needs.preflight.outputs.verdict == 'run'`
 
 // gateIf is ci-gate's condition (ci-template v1.29.3): always(), except that a
 // busy schedule run skips the gate so it never posts a green nightly.
-const gateIf = `${{ always() && (github.event_name != 'schedule' || needs.schedule-guard.outputs.verdict != 'busy') }}`
+const gateIf = `${{ always() && (github.event_name != 'schedule' || needs.preflight.outputs.verdict != 'busy') }}`
 
 // outsideGate is the job ci-gate does not need (ci-template v1.30):
 // publish-images runs on a push to main alone, after the gate's verdict
@@ -260,7 +260,7 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	if !regexp.MustCompile(`(?m)^  RELEASABILITY_TEST: "\./test/releasability/\.\.\."`).MatchString(body) {
 		t.Errorf("the workflow's RELEASABILITY_TEST is not ./test/releasability/... (ci-template v1.26.1)")
 	}
-	if !strings.Contains(body, "env.RELEASABILITY_TEST != '' && needs.changes.outputs.docs_only == 'true'") {
+	if !strings.Contains(body, "env.RELEASABILITY_TEST != '' && needs.preflight.outputs.docs_only == 'true'") {
 		t.Errorf("no step runs RELEASABILITY_TEST on a docs-only PR (ci-template v1.26.1)")
 	}
 
@@ -290,12 +290,12 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 			}
 		case "code":
 			// ci-template v1.30: a code job skips on a docs-only PR alone.
-			if !strings.Contains(cond, "needs.changes.outputs.docs_only != 'true'") {
+			if !strings.Contains(cond, "needs.preflight.outputs.docs_only != 'true'") {
 				t.Errorf("job %q is tagged code in %s but its `if:` does not skip on docs_only", j, gateJobName)
 			}
 		case "scoped":
 			// ci-template v1.30: a scoped job skips when no file matches LINT_GATES_PATTERN.
-			if !strings.Contains(cond, "needs.changes.outputs.lint_gates != 'false'") {
+			if !strings.Contains(cond, "needs.preflight.outputs.lint_gates != 'false'") {
 				t.Errorf("job %q is tagged scoped in %s but its `if:` does not test lint_gates", j, gateJobName)
 			}
 		case "pr":
