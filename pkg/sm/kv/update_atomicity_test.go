@@ -31,33 +31,42 @@ import (
 // batch must still apply, otherwise the engine marks the shard failed and
 // the same committed entry re-wedges it on every restart.
 func TestUpdate_MalformedEntryYieldsResultNotError(t *testing.T) {
-	for _, b := range backends() {
-		t.Run(b.name, func(t *testing.T) {
-			ctx := context.Background()
-			entries := []sm.Entry{
-				{Index: 1, Cmd: mustEncodePut([]byte("before"), []byte("v1"))},
-				{Index: 2, Cmd: []byte{0x00}}, // 1-byte junk proposal
-				{Index: 3, Cmd: mustEncodePut([]byte("after"), []byte("v2"))},
-			}
-			results := make([]sm.Result, len(entries))
-			if err := b.update(ctx, entries, results); err != nil {
-				t.Fatalf("Update = %v, want nil for malformed committed entry", err)
-			}
-			if results[1].Value != sm.ResultInvalidCommand {
-				t.Errorf("results[1].Value = %d, want ResultInvalidCommand", results[1].Value)
-			}
-			if results[0].Value != 2 {
-				t.Errorf("results[0].Value = %d, want 2", results[0].Value)
-			}
-			if results[2].Value != 2 {
-				t.Errorf("results[2].Value = %d, want 2", results[2].Value)
-			}
-			for _, key := range []string{"before", "after"} {
-				if _, err := b.bytes([]byte(key)); err != nil {
-					t.Errorf("key %q not applied after malformed sibling entry: %v", key, err)
+	junk := map[string][]byte{
+		"short_data": {0x00}, // 1-byte junk proposal
+		"bad_op":     {0xFF, 0x00, 0x00},
+		// op=0, below the OpPut range, with an otherwise valid header.
+		"zero_op": {0x00, 0x01, 0x00, 'k'},
+	}
+	for _, bFn := range []func() backend{newMemoryBackend, newConcurrentBackend} {
+		for name, cmd := range junk {
+			b := bFn()
+			t.Run(b.name+"/"+name, func(t *testing.T) {
+				ctx := context.Background()
+				entries := []sm.Entry{
+					{Index: 1, Cmd: mustEncodePut([]byte("before"), []byte("v1"))},
+					{Index: 2, Cmd: cmd},
+					{Index: 3, Cmd: mustEncodePut([]byte("after"), []byte("v2"))},
 				}
-			}
-		})
+				results := make([]sm.Result, len(entries))
+				if err := b.update(ctx, entries, results); err != nil {
+					t.Fatalf("Update = %v, want nil for malformed committed entry", err)
+				}
+				if results[1].Value != sm.ResultInvalidCommand {
+					t.Errorf("results[1].Value = %d, want ResultInvalidCommand", results[1].Value)
+				}
+				if results[0].Value != 2 {
+					t.Errorf("results[0].Value = %d, want 2", results[0].Value)
+				}
+				if results[2].Value != 2 {
+					t.Errorf("results[2].Value = %d, want 2", results[2].Value)
+				}
+				for _, key := range []string{"before", "after"} {
+					if _, err := b.bytes([]byte(key)); err != nil {
+						t.Errorf("key %q not applied after malformed sibling entry: %v", key, err)
+					}
+				}
+			})
+		}
 	}
 }
 

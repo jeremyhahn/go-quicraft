@@ -20,37 +20,24 @@ import (
 )
 
 func TestEntryQueue_AddRejectsWhenFull(t *testing.T) {
-	q := NewEntryQueue[int](4, 4)
-	ok := q.Add([]int{1, 2, 3, 4})
-	if !ok {
-		t.Fatal("Add should succeed when items fit exactly at maxLen")
-	}
-	ok = q.Add([]int{5})
-	if ok {
-		t.Fatal("Add should reject when queue is at capacity")
-	}
-	// Verify original items are still intact.
-	items := q.Swap(nil)
-	if len(items) != 4 {
-		t.Fatalf("expected 4 items, got %d", len(items))
-	}
-}
-
-func TestEntryQueue_AddRejectsPartialOverflow(t *testing.T) {
 	q := NewEntryQueue[int](4, 5)
-	ok := q.Add([]int{1, 2, 3})
-	if !ok {
+	if !q.Add([]int{1, 2, 3}) {
 		t.Fatal("first Add should succeed")
 	}
 	// Adding 3 more would exceed maxLen of 5 (3 + 3 = 6 > 5).
-	ok = q.Add([]int{4, 5, 6})
-	if ok {
+	if q.Add([]int{4, 5, 6}) {
 		t.Fatal("Add should reject when batch would exceed maxLen")
 	}
-	// Only the first 3 should be present.
+	if !q.Add([]int{4, 5}) {
+		t.Fatal("Add should succeed when items fit exactly at maxLen")
+	}
+	if q.Add([]int{6}) {
+		t.Fatal("Add should reject when queue is at capacity")
+	}
+	// Only the accepted batches are present.
 	items := q.Swap(nil)
-	if len(items) != 3 {
-		t.Fatalf("expected 3 items, got %d", len(items))
+	if len(items) != 5 {
+		t.Fatalf("expected 5 items, got %d", len(items))
 	}
 }
 
@@ -130,9 +117,9 @@ func TestEntryQueue_EmptyAgreesWithSoleConsumer(t *testing.T) {
 			defer wg.Done()
 			for i := range perProducer {
 				if i%2 == 0 {
-					q.AddOne(p)
+					q.AddOne(p*perProducer + i)
 				} else {
-					q.Add([]int{p})
+					q.Add([]int{p*perProducer + i})
 				}
 			}
 		}()
@@ -144,7 +131,15 @@ func TestEntryQueue_EmptyAgreesWithSoleConsumer(t *testing.T) {
 	}()
 	// Only this goroutine takes, so a queue that reported non-empty cannot
 	// be emptied before the Swap that follows.
-	taken := 0
+	seen := make(map[int]bool, producers*perProducer)
+	take := func(items []int) {
+		for _, v := range items {
+			if seen[v] {
+				t.Fatalf("item %d taken twice", v)
+			}
+			seen[v] = true
+		}
+	}
 	var buf []int
 	for finished := false; !finished; {
 		select {
@@ -159,14 +154,17 @@ func TestEntryQueue_EmptyAgreesWithSoleConsumer(t *testing.T) {
 		if len(buf) == 0 {
 			t.Fatal("Empty() reported false but Swap took nothing")
 		}
-		taken += len(buf)
+		take(buf)
 	}
-	taken += len(q.Swap(buf[:0]))
+	take(q.Swap(buf[:0]))
 	if !q.Empty() || q.Len() != 0 {
 		t.Fatalf("drained queue: Empty() = %v, Len() = %d", q.Empty(), q.Len())
 	}
-	if taken != producers*perProducer {
-		t.Fatalf("took %d items, want %d", taken, producers*perProducer)
+	// Every item, from Add and AddOne alike, is taken exactly once.
+	for i := range producers * perProducer {
+		if !seen[i] {
+			t.Fatalf("missing item %d", i)
+		}
 	}
 }
 
@@ -214,55 +212,6 @@ func TestEntryQueue_AddOneAndAddMixed(t *testing.T) {
 	}
 	if items[0] != 1 || items[1] != 2 || items[2] != 3 || items[3] != 4 {
 		t.Fatalf("items = %v, want [1 2 3 4]", items)
-	}
-}
-
-func TestEntryQueue_AddOneMixedConcurrency(t *testing.T) {
-	const numProducers = 4
-	const itemsPerProducer = 100
-	q := NewEntryQueue[int](64, numProducers*itemsPerProducer)
-
-	var wg sync.WaitGroup
-	wg.Add(numProducers)
-	for p := range numProducers {
-		go func(id int) {
-			defer wg.Done()
-			for i := range itemsPerProducer {
-				// Alternate between Add and AddOne.
-				if i%2 == 0 {
-					q.Add([]int{id*itemsPerProducer + i})
-				} else {
-					q.AddOne(id*itemsPerProducer + i)
-				}
-			}
-		}(p)
-	}
-	wg.Wait()
-
-	var collected []int
-	var buf []int
-	for {
-		buf = q.Swap(buf[:0])
-		if len(buf) == 0 {
-			break
-		}
-		collected = append(collected, buf...)
-	}
-
-	if len(collected) != numProducers*itemsPerProducer {
-		t.Fatalf("expected %d total items, got %d",
-			numProducers*itemsPerProducer, len(collected))
-	}
-
-	// Verify all items are present.
-	seen := make(map[int]bool, len(collected))
-	for _, v := range collected {
-		seen[v] = true
-	}
-	for i := range numProducers * itemsPerProducer {
-		if !seen[i] {
-			t.Fatalf("missing item %d", i)
-		}
 	}
 }
 

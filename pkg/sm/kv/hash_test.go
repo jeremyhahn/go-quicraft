@@ -38,38 +38,24 @@ func applyPut(t *testing.T, update func(context.Context, []sm.Entry, []sm.Result
 // between replicas would go undetected. The two states MUST hash
 // differently on both store implementations.
 func TestGetHash_BoundaryAmbiguity(t *testing.T) {
-	t.Run("memory", func(t *testing.T) {
-		a, b := NewMemoryStore(), NewMemoryStore()
-		applyPut(t, a.Update, "user", "1")
-		applyPut(t, b.Update, "use", "r1")
-		ha, err := a.GetHash()
-		if err != nil {
-			t.Fatalf("GetHash a = %v", err)
-		}
-		hb, err := b.GetHash()
-		if err != nil {
-			t.Fatalf("GetHash b = %v", err)
-		}
-		if ha == hb {
-			t.Fatalf("divergent states hash identically (%d): key/value boundaries are ambiguous", ha)
-		}
-	})
-	t.Run("concurrent", func(t *testing.T) {
-		a, b := NewConcurrentStore(), NewConcurrentStore()
-		applyPut(t, a.Update, "user", "1")
-		applyPut(t, b.Update, "use", "r1")
-		ha, err := a.GetHash()
-		if err != nil {
-			t.Fatalf("GetHash a = %v", err)
-		}
-		hb, err := b.GetHash()
-		if err != nil {
-			t.Fatalf("GetHash b = %v", err)
-		}
-		if ha == hb {
-			t.Fatalf("divergent states hash identically (%d): key/value boundaries are ambiguous", ha)
-		}
-	})
+	for _, bFn := range []func() backend{newMemoryBackend, newConcurrentBackend} {
+		a, b := bFn(), bFn()
+		t.Run(a.name, func(t *testing.T) {
+			applyPut(t, a.update, "user", "1")
+			applyPut(t, b.update, "use", "r1")
+			ha, err := a.hash()
+			if err != nil {
+				t.Fatalf("GetHash a = %v", err)
+			}
+			hb, err := b.hash()
+			if err != nil {
+				t.Fatalf("GetHash b = %v", err)
+			}
+			if ha == hb {
+				t.Fatalf("divergent states hash identically (%d): key/value boundaries are ambiguous", ha)
+			}
+		})
+	}
 }
 
 // TestGetHash_CrossStoreEquality asserts that MemoryStore and

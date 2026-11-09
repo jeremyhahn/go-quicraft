@@ -79,20 +79,11 @@ func TestRateLimiter_RateLimited(t *testing.T) {
 	}
 }
 
-func TestRateLimiter_DecreaseUnderflowSaturatesAtZero(t *testing.T) {
-	rl := NewRateLimiter(1000)
-	rl.Set(100)
-
-	// Decrease by more than current value: must saturate at 0.
-	rl.Decrease(200)
-	if rl.Get() != 0 {
-		t.Fatalf("Get = %d, want 0 (underflow saturation)", rl.Get())
-	}
-}
-
 func TestRateLimiter_DecreaseConcurrentUnderflow(t *testing.T) {
 	rl := NewRateLimiter(1000)
-	rl.Set(50)
+	// 55 is not a multiple of the step, so whatever the interleaving one
+	// decrease runs from 5 and must cross zero from a positive value.
+	rl.Set(55)
 
 	// Multiple concurrent decreases that collectively exceed the value.
 	var wg sync.WaitGroup
@@ -106,7 +97,7 @@ func TestRateLimiter_DecreaseConcurrentUnderflow(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Total decrease is 1000 but started at 50: must be 0 (not wrapped).
+	// Total decrease is 1000 but started at 55: must be 0 (not wrapped).
 	val := rl.Get()
 	if val != 0 {
 		t.Fatalf("Get = %d, want 0 (concurrent underflow saturation)", val)
@@ -147,6 +138,9 @@ func TestInMemRateLimiter_Disabled(t *testing.T) {
 	}
 	if rl.RateLimited() {
 		t.Fatal("disabled limiter should never be rate limited")
+	}
+	if rl.IsLimited() {
+		t.Fatal("disabled limiter: IsLimited should always be false")
 	}
 	rl.Increase(999)
 	if rl.RateLimited() {
@@ -254,46 +248,26 @@ func TestInMemRateLimiter_Reset(t *testing.T) {
 	if !rl.RateLimited() {
 		t.Fatal("expected rate limited before reset")
 	}
+	tick := rl.GetTick()
 
 	// Reset clears follower states, the limited flag, and the local size.
+	// The local size belongs to the previous term, so backpressure
+	// accounting starts clean after a leadership transition.
 	rl.Reset()
+	if rl.Get() != 0 {
+		t.Fatalf("Get = %d, want 0 after reset", rl.Get())
+	}
 	if rl.IsLimited() {
 		t.Fatal("IsLimited should be false after Reset")
 	}
 	if rl.RateLimited() {
 		t.Fatal("expected not rate limited after reset")
 	}
-}
 
-func TestInMemRateLimiter_ResetZeroesLocalSize(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-
-	// Drive the local size above the limit. The matching Decrease calls
-	// would normally fire under the same term; on a leadership transition
-	// they belong to the previous term, so the size must be cleared.
-	rl.Set(150)
-	if rl.Get() != 150 {
-		t.Fatalf("Get = %d, want 150 before reset", rl.Get())
-	}
-
-	rl.Reset()
-
-	// The tracked local size must be zeroed so backpressure accounting
-	// starts clean after the leadership transition.
-	if rl.Get() != 0 {
-		t.Fatalf("Get = %d, want 0 after reset", rl.Get())
-	}
-
-	// Advance past the debounce window and confirm a freshly reset limiter
-	// does not spuriously trip on the stale size.
-	for i := 0; i < int(ChangeTickThreshold)+2; i++ {
-		rl.Tick()
-	}
-	if rl.RateLimited() {
-		t.Fatal("expected not rate limited after reset zeroes local size")
-	}
-	if rl.IsLimited() {
-		t.Fatal("expected IsLimited false after reset zeroes local size")
+	// The tick is an opaque counter that keeps advancing across a reset.
+	rl.Tick()
+	if rl.GetTick() != tick+1 {
+		t.Fatalf("GetTick = %d, want %d (tick continues after reset)", rl.GetTick(), tick+1)
 	}
 }
 
@@ -365,14 +339,6 @@ func TestInMemRateLimiter_IsLimited_ReflectsRateLimited(t *testing.T) {
 	rl.RateLimited() // update cache
 	if rl.IsLimited() {
 		t.Fatal("IsLimited should be false after dropping below hysteresis exit")
-	}
-}
-
-func TestInMemRateLimiter_IsLimited_DisabledLimiter(t *testing.T) {
-	rl := NewInMemRateLimiter(0)
-	rl.RateLimited() // seed the cache
-	if rl.IsLimited() {
-		t.Fatal("disabled limiter: IsLimited should always be false")
 	}
 }
 
@@ -454,30 +420,6 @@ func TestInMemRateLimiter_HysteresisExitAtExact70Percent(t *testing.T) {
 	rl.Set(69)
 	if rl.RateLimited() {
 		t.Fatal("expected not rate limited at 69%")
-	}
-}
-
-func TestInMemRateLimiter_ResetClearsTick(t *testing.T) {
-	rl := NewInMemRateLimiter(100)
-	rl.Tick()
-	rl.Tick()
-	rl.Tick()
-	if rl.GetTick() != 3 {
-		t.Fatalf("GetTick = %d, want 3", rl.GetTick())
-	}
-
-	rl.Reset()
-	// Reset clears limited state and followers, but tick is NOT reset
-	// (it is an opaque counter that monotonically advances).
-	// Verify the limited state is cleared.
-	if rl.IsLimited() {
-		t.Fatal("IsLimited should be false after Reset")
-	}
-
-	// Tick continues from where it was.
-	rl.Tick()
-	if rl.GetTick() != 4 {
-		t.Fatalf("GetTick = %d, want 4 (tick continues after reset)", rl.GetTick())
 	}
 }
 
