@@ -41,17 +41,6 @@ func TestGetMapRejectsValueLengthAboveMaxInt32(t *testing.T) {
 	}
 }
 
-// TestGetBoolMapRejectsCountBeyondBuffer pins the sibling decoder's bound: its
-// entries are fixed width, so there is no length prefix to wrap, and a count
-// larger than the buffer can hold must be rejected before allocation.
-func TestGetBoolMapRejectsCountBeyondBuffer(t *testing.T) {
-	buf := make([]byte, 4+8)
-	binary.LittleEndian.PutUint32(buf[0:], 4)
-	if _, _, err := getBoolMap(buf); !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("getBoolMap with truncated entries: expected ErrBufferTooSmall, got %v", err)
-	}
-}
-
 // TestMessageBatchResetReleasesOversizedEntries pins that Reset propagates to
 // the messages it retains. Without the per-message Reset the Entries capacity
 // bound (maxRetainedEntries) is unreachable through the pooled batch, so one

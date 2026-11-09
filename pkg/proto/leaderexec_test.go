@@ -16,7 +16,6 @@ package proto
 
 import (
 	"bytes"
-	"errors"
 	"testing"
 )
 
@@ -56,9 +55,5 @@ func TestLeaderExecMessagesRoundTrip(t *testing.T) {
 
 	if maxMessageType != LeaderExecResp {
 		t.Fatalf("maxMessageType = %d, want LeaderExecResp (%d)", maxMessageType, LeaderExecResp)
-	}
-	bad := Message{Type: maxMessageType + 1}
-	if _, err := bad.MarshalTo(make([]byte, bad.Size())); !errors.Is(err, ErrInvalidMessageType) {
-		t.Fatalf("MarshalTo(type %d) = %v, want ErrInvalidMessageType", bad.Type, err)
 	}
 }

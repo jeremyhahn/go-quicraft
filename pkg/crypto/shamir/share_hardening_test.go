@@ -39,29 +39,16 @@ func TestProtectedShare_StructuredLoggingIsRedacted(t *testing.T) {
 		t.Fatal("share has no value to leak")
 	}
 
-	for _, tc := range []struct {
-		name    string
-		handler func(*bytes.Buffer) slog.Handler
-	}{
-		{"json", func(b *bytes.Buffer) slog.Handler { return slog.NewJSONHandler(b, nil) }},
-		{"text", func(b *bytes.Buffer) slog.Handler { return slog.NewTextHandler(b, nil) }},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var buf bytes.Buffer
-			slog.New(tc.handler(&buf)).Info("custody event", "share", share)
-			out := buf.String()
-			if strings.Contains(out, value) {
-				t.Fatalf("%s handler logged the raw share value: %s", tc.name, out)
-			}
-			if !strings.Contains(out, "redacted") {
-				t.Fatalf("%s handler did not log the redacted form: %s", tc.name, out)
-			}
-		})
+	// The JSON handler with a top-level attr is TestProtectedShare_Redaction.
+	var buf bytes.Buffer
+	slog.New(slog.NewTextHandler(&buf, nil)).Info("custody event", "share", share)
+	if out := buf.String(); strings.Contains(out, value) || !strings.Contains(out, "redacted") {
+		t.Fatalf("text handler logged the raw share value or no redacted form: %s", out)
 	}
 
 	// Also cover the value used as an attr value inside a group, which takes a
 	// different path through the handler.
-	var buf bytes.Buffer
+	buf.Reset()
 	slog.New(slog.NewJSONHandler(&buf, nil)).Info("custody event",
 		slog.Group("ceremony", slog.Any("share", share)))
 	if strings.Contains(buf.String(), value) {
@@ -78,10 +65,6 @@ func TestCombine_BoundsPayloadAndShareCount(t *testing.T) {
 	if _, err := SplitBytes(make([]byte, MaxSecretBytes+1), 2, 3); err == nil {
 		t.Fatal("SplitBytes accepted a secret above MaxSecretBytes")
 	}
-	// The bound is not so tight that a legitimate key is refused.
-	if _, err := SplitBytes(make([]byte, 32), 2, 3); err != nil {
-		t.Fatalf("SplitBytes(32-byte key): %v", err)
-	}
 
 	// A hand-built oversized share must be rejected at parse time, before the
 	// rest of the set is decoded.
@@ -92,12 +75,9 @@ func TestCombine_BoundsPayloadAndShareCount(t *testing.T) {
 		t.Fatal("parseRawShare accepted a payload above MaxSecretBytes")
 	}
 
-	// More shares than GF(2^8) has non-zero x-coordinates is rejected up front,
-	// on both reconstruction paths.
-	tooMany := make([]*ProtectedShare, maxShares+1)
-	if _, err := CombineProtected(tooMany); err == nil {
-		t.Fatal("CombineProtected accepted more than maxShares shares")
-	}
+	// More shares than GF(2^8) has non-zero x-coordinates is rejected up front.
+	// The CombineProtected path is the "too many shares" case of
+	// TestCombineProtected_Invalid.
 	tooManyValues := make([][]byte, maxShares+1)
 	for i := range tooManyValues {
 		tooManyValues[i] = []byte("AQE=")

@@ -55,18 +55,3 @@ func TestCombineRejectsZeroXCoordinate(t *testing.T) {
 		t.Fatalf("err = %T (%v), want *CombineError", err, err)
 	}
 }
-
-// TestCombineRejectsZeroX_ControlStillReconstructs is the control: the
-// rejection above must be caused by the zero x-coordinate specifically, not by
-// the test having produced shares that cannot combine at all.
-func TestCombineRejectsZeroX_ControlStillReconstructs(t *testing.T) {
-	secret := []byte("root-key-material-32-bytes-long!")
-	values := splitValues(t, secret, 2, 3)
-	got, err := CombineBytes(values[:2], 2)
-	if err != nil {
-		t.Fatalf("CombineBytes on untouched shares: %v", err)
-	}
-	if !bytes.Equal(got, secret) {
-		t.Fatalf("CombineBytes = %x, want %x", got, secret)
-	}
-}

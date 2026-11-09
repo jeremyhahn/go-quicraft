@@ -219,7 +219,9 @@ func TestCombineProtectedWith_BeyondBudgetLeavesSharesIntact(t *testing.T) {
 
 // TestWithVariants_RefuseNilAllocator pins that a nil allocator is a refusal,
 // never a silent fall back to unbudgeted locked memory, and that it is decided
-// before NewProtectedShareWith touches the caller's value.
+// before NewProtectedShareWith touches the caller's value and before
+// UnmarshalShareSetWith reads its input: a document that does not parse
+// reports ErrNilAllocator rather than its own error.
 func TestWithVariants_RefuseNilAllocator(t *testing.T) {
 	values, err := SplitBytes([]byte("nil allocator"), 2, 3)
 	if err != nil {
@@ -251,6 +253,12 @@ func TestWithVariants_RefuseNilAllocator(t *testing.T) {
 	if out != nil || !errors.Is(err, enclave.ErrNilAllocator) {
 		out.Destroy()
 		t.Fatalf("CombineProtectedWith(nil) err = %v, want ErrNilAllocator", err)
+	}
+
+	decoded, err := UnmarshalShareSetWith(nil, []byte("not json"))
+	if decoded != nil || !errors.Is(err, enclave.ErrNilAllocator) {
+		destroyAll(decoded)
+		t.Fatalf("UnmarshalShareSetWith(nil) err = %v, want ErrNilAllocator", err)
 	}
 }
 
@@ -407,17 +415,5 @@ func TestUnmarshalShareSet_LockRefusalIsProtectedMemoryError(t *testing.T) {
 	var vErr *ValidationError
 	if errors.As(err, &vErr) {
 		t.Fatal("a locked-memory refusal must NOT be reported as a *ValidationError")
-	}
-}
-
-// TestUnmarshalShareSetWith_RefusesNilAllocator pins the nil-allocator refusal
-// for UnmarshalShareSetWith, and that it is decided before the input is read:
-// a document that does not parse reports ErrNilAllocator rather than its own
-// error.
-func TestUnmarshalShareSetWith_RefusesNilAllocator(t *testing.T) {
-	shares, err := UnmarshalShareSetWith(nil, []byte("not json"))
-	if shares != nil || !errors.Is(err, enclave.ErrNilAllocator) {
-		destroyAll(shares)
-		t.Fatalf("UnmarshalShareSetWith(nil) err = %v, want ErrNilAllocator", err)
 	}
 }

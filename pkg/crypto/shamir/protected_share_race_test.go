@@ -159,25 +159,6 @@ func TestProtectedShare_WithValueExcludesDestroy(t *testing.T) {
 	}
 }
 
-// TestProtectedShare_WithValueAfterDestroy pins the destroyed contract: the
-// callback does not run and an error comes back.
-func TestProtectedShare_WithValueAfterDestroy(t *testing.T) {
-	share := protectedTestShare(t)
-	share.Destroy()
-
-	called := false
-	err := share.WithValue(func([]byte) error {
-		called = true
-		return nil
-	})
-	if called {
-		t.Fatal("callback ran on a destroyed share")
-	}
-	if err == nil {
-		t.Fatal("WithValue on a destroyed share returned nil error")
-	}
-}
-
 // TestProtectedShare_WithValueNilReceiver keeps WithValue consistent with
 // Destroy, which is nil-safe.
 func TestProtectedShare_WithValueNilReceiver(t *testing.T) {

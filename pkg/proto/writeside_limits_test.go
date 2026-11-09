@@ -41,43 +41,9 @@ import (
 // unreadable". These are the same rule on this package's formats.
 // ---------------------------------------------------------------------------
 
-// TestMembershipMarshalRefusesOversizedAddress is the DURABLE-path assertion:
-// it does not stop at the codec, it drives the round trip that a restart
-// performs and shows which half breaks.
-func TestMembershipMarshalRefusesOversizedAddress(t *testing.T) {
-	// The shape Host.StartShard produces: the operator's members map copied
-	// verbatim into Addresses.
-	oversized := Membership{
-		Addresses: map[uint64]string{
-			1: "127.0.0.1:5001",
-			2: strings.Repeat("x", MaxAddressLength+1),
-		},
-	}
-
-	buf := make([]byte, oversized.Size())
-	_, err := oversized.MarshalTo(buf)
-	if !errors.Is(err, ErrAddressTooLong) {
-		t.Fatalf("MarshalTo: got %v, want ErrAddressTooLong.\n"+
-			"An encoder that accepts this writes the bytes into the committed "+
-			"EntryInitialMembership at log index 1, and the NEXT start of the shard "+
-			"cannot decode them — StartShard then fails forever with no remedy but "+
-			"deleting the data directory", err)
-	}
-
-	// The round trip is what the durable path performs. Encode the same
-	// membership by hand — the encoder refuses — and show the decoder rejects it, so the two ends genuinely agree.
-	raw := marshalMembershipUnchecked(t, oversized)
-	var decoded Membership
-	if _, err := decoded.UnmarshalFrom(raw); !errors.Is(err, ErrAddressTooLong) {
-		t.Fatalf("UnmarshalFrom(hand-encoded oversized membership): got %v, want "+
-			"ErrAddressTooLong; the write-side check exists precisely because the "+
-			"read side refuses these bytes", err)
-	}
-}
-
 // TestMembershipMarshalRefusesOversizedMaps covers the count limit on every map
-// including the two identity maps, and TestMembershipMarshalRefusesOversized-
-// Address covers the per-value length. Between them nothing this encoder can
+// including the two identity maps, and TestMembershipAddressTooLong
+// (membership_test.go) covers the per-value length. Between them nothing this encoder can
 // emit is refused by its own decoder.
 func TestMembershipMarshalRefusesOversizedMaps(t *testing.T) {
 	bigStrings := make(map[uint64]string, MaxMembershipEntries+1)
@@ -226,30 +192,6 @@ func TestMarshalRefusesWhatUnmarshalRefuses(t *testing.T) {
 			t.Fatalf("MarshalTo: got %v, want ErrFilepathTooLong", err)
 		}
 	})
-}
-
-// marshalMembershipUnchecked encodes a Membership with the write-side limits
-// BYPASSED. It exists so the read-side half of the round-trip assertion can
-// be driven even though MarshalTo refuses to produce these bytes.
-func marshalMembershipUnchecked(t *testing.T, m Membership) []byte {
-	t.Helper()
-	buf := make([]byte, m.Size())
-	buf[0] = membershipFormatVersion
-	putUint64(buf[1:], m.ConfigChangeID)
-	putUint64(buf[9:], m.MaxWitnesses)
-	putBool(buf[17:], m.RequireFullReplicaMajority)
-	putUint64(buf[sessionPolicyOffset:], m.SessionExpiryEntries)
-	putUint64(buf[sessionPolicyOffset+8:], m.MaxTotalSessions)
-	putUint64(buf[sessionPolicyOffset+16:], m.MaxResponsesPerSession)
-	putUint64(buf[sessionPolicyOffset+24:], m.MaxSessionsPerOwner)
-	offset := membershipFixedSize
-	offset += putMap(buf[offset:], m.Addresses)
-	offset += putMap(buf[offset:], m.Observers)
-	offset += putMap(buf[offset:], m.Witnesses)
-	offset += putBoolMap(buf[offset:], m.Removed)
-	offset += putMap(buf[offset:], m.Identities)
-	offset += putMap(buf[offset:], m.RemovedIdentities)
-	return buf[:offset]
 }
 
 // ---------------------------------------------------------------------------
