@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: ci-template v1.28.0 (`make deps-check` runs on every pull request, a docs-only PR included, as `make lint` does).
 - CI: ci-template v1.29.2. The integration image's tag hashes the Alpine package index checksum (`scripts/apk-index-sum.sh`, `APK_INDEX_SUM`), and its build re-runs `apk upgrade` when that checksum moves, so a new Alpine package release, a CVE fix among them, rebuilds the image. `make lint-gates` runs without `-k`: the first failing gate ends the step.
 - CI: ci-template v1.30 (ci.yml v1.30, nightly.yml v1.9, image cache script; toolchain image build skips a tag the daemon holds)
+- CI: ci-template v1.34. The `changes`, `schedule-guard` and `arch-gates` jobs are one `preflight` job (schedule guard, one checkout without persisted credentials, changed files, architecture gates), with the same outputs; `ci.yml` has 18 jobs.
+- CI: ci-template v1.34.1. No Go module proxy list ends in `direct` (`ci.yml`, `nightly.yml`, the devcontainer Dockerfile, `scripts/in-toolchain-image.sh`), so a module the proxy cannot serve fails the build instead of being fetched from its origin.
 - Dependencies: go-enclave v0.11.0-alpha (was v0.10.0-alpha), in the root module, `contrib/dragonboat` and `test/performance/quicraft`. Its additions (a Linux `memfd_secret` backend and `Sealed.OpenIn`) need no change here.
 - Dependencies: go-enclave v0.11.1-alpha (was v0.11.0-alpha), in the same three modules. It is the v0.11.0-alpha commit tagged again, so no code changes; go.sum carries the checksums the public module proxy serves.
 
