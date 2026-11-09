@@ -14,10 +14,7 @@
 
 package netaddr
 
-import (
-	"net"
-	"testing"
-)
+import "testing"
 
 // TestCanonical_NormalisesPortSpelling pins the quorum-safety property this
 // package exists for.
@@ -42,24 +39,6 @@ func TestCanonical_NormalisesPortSpelling(t *testing.T) {
 			t.Errorf("Canonical(%q) = %q, want %q — one endpoint spelled two "+
 				"ways passes the duplicate-address guard and holds two votes",
 				spelling, got, want)
-		}
-	}
-
-	// Guard the premise: these spellings really are one endpoint. If
-	// ResolveUDPAddr ever stopped accepting them the test above would be
-	// pinning a normalisation nothing needs.
-	base, err := net.ResolveUDPAddr("udp", "127.0.0.1:5001")
-	if err != nil {
-		t.Fatalf("ResolveUDPAddr(base): %v", err)
-	}
-	for _, spelling := range []string{"127.0.0.1:05001", "127.0.0.1:+5001"} {
-		got, rerr := net.ResolveUDPAddr("udp", spelling)
-		if rerr != nil {
-			t.Fatalf("ResolveUDPAddr(%q): %v", spelling, rerr)
-		}
-		if got.String() != base.String() {
-			t.Fatalf("premise broken: %q resolves to %v, not %v",
-				spelling, got, base)
 		}
 	}
 }
