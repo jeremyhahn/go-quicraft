@@ -96,19 +96,28 @@ func TestOwnerCapReleasesOnUnregisterAndExpiry(t *testing.T) {
 	const owner = 0xC0FFEE
 
 	t.Run("unregister", func(t *testing.T) {
-		m := NewManager(1000, 16, 1)
+		m := NewManager(1000, 16, 2)
 		if err := m.Register(1, owner, 1); err != nil {
-			t.Fatalf("Register: %v", err)
+			t.Fatalf("Register(1): %v", err)
 		}
-		if err := m.Register(2, owner, 2); !errors.Is(err, ErrSessionLimitExceeded) {
+		if err := m.Register(2, owner, 2); err != nil {
+			t.Fatalf("Register(2): %v", err)
+		}
+		if err := m.Register(3, owner, 3); !errors.Is(err, ErrSessionLimitExceeded) {
 			t.Fatalf("Register at cap = %v, want ErrSessionLimitExceeded", err)
 		}
 		if err := m.Unregister(1); err != nil {
 			t.Fatalf("Unregister: %v", err)
 		}
-		if err := m.Register(2, owner, 3); err != nil {
+		if err := m.Register(3, owner, 4); err != nil {
 			t.Fatalf("Register after Unregister = %v, want nil: the owner "+
-				"released its only session, so the slot must come back", err)
+				"released one session, so one slot must come back", err)
+		}
+		// Exactly one slot came back: the owner still holds session 2, so
+		// the release decremented its count rather than clearing it.
+		if err := m.Register(4, owner, 5); !errors.Is(err, ErrSessionLimitExceeded) {
+			t.Fatalf("Register at cap after one release = %v, want "+
+				"ErrSessionLimitExceeded", err)
 		}
 	})
 
