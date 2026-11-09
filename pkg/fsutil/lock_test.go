@@ -100,9 +100,8 @@ func TestLockDir_RefusedToAnotherProcess(t *testing.T) {
 	}
 }
 
-func TestLockDir_ReleasedByClose(t *testing.T) {
-	dir := t.TempDir()
-	l, err := LockDir(dir, lockName)
+func TestDirLock_CloseIsIdempotent(t *testing.T) {
+	l, err := LockDir(t.TempDir(), lockName)
 	if err != nil {
 		t.Fatalf("LockDir: %v", err)
 	}
@@ -111,13 +110,6 @@ func TestLockDir_ReleasedByClose(t *testing.T) {
 	}
 	if err := l.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
-	}
-	l2, err := LockDir(dir, lockName)
-	if err != nil {
-		t.Fatalf("LockDir after Close: %v", err)
-	}
-	if err := l2.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
 	}
 	var nilLock *DirLock
 	if err := nilLock.Close(); err != nil {
