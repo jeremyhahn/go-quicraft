@@ -225,27 +225,41 @@ func TestKV_Delete(t *testing.T) {
 		t.Run(b.name, func(t *testing.T) {
 			ctx := context.Background()
 
-			// Put then delete
+			// One batch: two puts, delete one key, then a put after the
+			// delete. The delete must remove only its own key.
 			entries := []sm.Entry{
-				{Index: 1, Cmd: mustEncodePut([]byte("k"), []byte("v"))},
-				{Index: 2, Cmd: mustEncodeDelete([]byte("k"))},
+				{Index: 1, Cmd: mustEncodePut([]byte("a"), []byte("1"))},
+				{Index: 2, Cmd: mustEncodePut([]byte("b"), []byte("2"))},
+				{Index: 3, Cmd: mustEncodeDelete([]byte("a"))},
+				{Index: 4, Cmd: mustEncodePut([]byte("c"), []byte("3"))},
 			}
-			results := make([]sm.Result, 2)
+			results := make([]sm.Result, len(entries))
 			if err := b.update(ctx, entries, results); err != nil {
 				t.Fatalf("Update = %v", err)
 			}
-			if results[1].Value != 1 {
-				t.Errorf("delete result = %d, want 1", results[1].Value)
+			if results[2].Value != 1 {
+				t.Errorf("delete result = %d, want 1", results[2].Value)
 			}
 
-			// Verify key is gone
-			_, err := b.lookup(ctx, []byte("k"))
+			// Verify the deleted key is gone
+			_, err := b.lookup(ctx, []byte("a"))
 			if err == nil {
 				t.Fatal("expected KeyNotFoundError after delete")
 			}
 			var knf *KeyNotFoundError
 			if !errors.As(err, &knf) {
 				t.Errorf("expected KeyNotFoundError, got %T: %v", err, err)
+			}
+
+			// The unrelated key and the later put survive the delete
+			for key, want := range map[string]string{"b": "2", "c": "3"} {
+				val, err := b.lookup(ctx, []byte(key))
+				if err != nil {
+					t.Fatalf("Lookup(%q) = %v", key, err)
+				}
+				if string(val.([]byte)) != want {
+					t.Errorf("Lookup(%q) = %q, want %q", key, val, want)
+				}
 			}
 		})
 	}
