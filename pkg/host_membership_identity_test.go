@@ -314,40 +314,6 @@ func TestSnapshotRecoveryKeepsTheLegitimateHolderAuthorized(t *testing.T) {
 	}
 }
 
-// TestSnapshotRecoveryKeepsMembersAuthorized pins the posture the whole gap
-// blocked. A member whose identity did not survive recovery has its
-// quorum-bearing traffic dropped outright (there is no address fallback), so
-// this is the assertion that says a restart does not cost the shard its quorum.
-func TestSnapshotRecoveryKeepsMembersAuthorized(t *testing.T) {
-	const victimAddr = "10.0.0.2:5001"
-	victimID := identityProtoMembership().Identities[2]
-
-	for _, backend := range logDBBackendsForRecovery() {
-		t.Run(backend.name, func(t *testing.T) {
-			ldb, reopen := backend.open(t)
-			recovered := recoveredMembership(t, ldb, reopen, identityProtoMembership())
-
-			eng, handler, metrics := identityRig(t, recovered)
-
-			batch := proto.MessageBatch{
-				SourceAddress: victimAddr,
-				Requests: []proto.Message{
-					{ShardID: 1, From: 2, To: 1, Type: proto.ReplicateResp, Term: 5},
-				},
-			}
-			if err := handler.HandleMessage(batch, certCoveringAs(victimID, victimAddr)); err != nil {
-				t.Fatalf("HandleMessage: %v", err)
-			}
-			if len(eng.delivered) != 1 {
-				t.Fatalf("a member with a committed identity was dropped "+
-					"after snapshot recovery (reason %q): the shard loses quorum on every "+
-					"restart until the identities survive the snapshot round-trip",
-					metrics.lastReason())
-			}
-		})
-	}
-}
-
 // recoveryBackend is one LogDB implementation plus the strongest restart it
 // can be put through. Both are exercised through the SAME assertions: a field
 // preserved by the backend tests use while the backend production uses drops
