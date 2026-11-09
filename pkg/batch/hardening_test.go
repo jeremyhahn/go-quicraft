@@ -133,13 +133,6 @@ func TestFlush_SlowShardDoesNotBlockOtherShards(t *testing.T) {
 	}
 }
 
-// timeoutProposer always reports a context deadline.
-type timeoutProposer struct{}
-
-func (timeoutProposer) SyncPropose(context.Context, uint64, []byte) error {
-	return context.DeadlineExceeded
-}
-
 // rejectingProposer always reports a definite rejection.
 type rejectingProposer struct{ err error }
 
@@ -147,46 +140,9 @@ func (r rejectingProposer) SyncPropose(context.Context, uint64, []byte) error {
 	return r.err
 }
 
-// TestSubmit_TimeoutIsReportedIndeterminate is the regression test. A
-// proposer timeout or cancellation does NOT mean the proposal was rejected:
-// the entry may already be replicated and will apply. Reporting a hard
-// failure told the caller a committed write failed, and a blind retry
-// duplicated the whole batch.
-func TestSubmit_TimeoutIsReportedIndeterminate(t *testing.T) {
-	agg, err := NewAggregator(timeoutProposer{},
-		WithConfig(Config{MaxBatchSize: 1, FlushInterval: 5 * time.Millisecond, QueueSize: 10}),
-		WithLogger(slog.Default()),
-		WithRegistry(newTestRegistry(t)),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator: %v", err)
-	}
-	defer func() { _ = agg.Close() }()
-
-	submitErr := agg.Submit(context.Background(), 1, []byte("write"))
-	if submitErr == nil {
-		t.Fatal("Submit returned nil for a timed-out proposal")
-	}
-
-	var flushErr *FlushError
-	if !errors.As(submitErr, &flushErr) {
-		t.Fatalf("error = %T (%v), want *FlushError", submitErr, submitErr)
-	}
-	if !flushErr.Indeterminate {
-		t.Error("a proposer timeout must be reported as indeterminate, not as a definite failure")
-	}
-	// The underlying proposer error must stay matchable through the wrapper.
-	if !errors.Is(submitErr, context.DeadlineExceeded) {
-		t.Error("the proposer's error is not reachable through errors.Is")
-	}
-	if !errors.Is(submitErr, ErrFlush) {
-		t.Error("errors.Is(err, ErrFlush) = false, want true")
-	}
-}
-
 // TestSubmit_DefiniteRejectionIsNotIndeterminate pins the other side of the
-// timeout distinction: an ordinary rejection is a definite failure and is safe
-// to surface as one.
+// timeout distinction that TestProposeContext_CapsLongCallerDeadline asserts: an ordinary
+// rejection is a definite failure and is safe to surface as one.
 func TestSubmit_DefiniteRejectionIsNotIndeterminate(t *testing.T) {
 	rejected := errors.New("quicraft: not leader")
 	agg, err := NewAggregator(rejectingProposer{err: rejected},
