@@ -7,6 +7,7 @@
 # in-toolchain-template: v3 (ci-template v1.22.2). Ships beside ci.yml; copy it to
 # scripts/ with the workflow. From go-quicraft's scripts/in-toolchain-image.sh
 # (a141c3c), with the container prefix and uid taken from the environment.
+# v5 proxy list (ci-template v1.34.1): no direct entry, so a module the proxy cannot serve fails the stage instead of being fetched from its origin.
 #
 # How CI runs a stage in the devcontainer image (handbook ci-standard.md §2). A
 # CI runner reaches its Docker daemon through a socket, so a bind mount would
@@ -163,7 +164,7 @@ fi
 if [ "$network" = bridge ]; then
   # The baked module cache is read-only to the run's user and holds only the
   # root module's build list; the nested modules deps-check walks fetch more.
-  args+=(--env "GOPROXY=https://proxy.golang.org,direct" --env "GOMODCACHE=$modcache")
+  args+=(--env "GOPROXY=${DEVCACHE_GOPROXY:+$DEVCACHE_GOPROXY|}https://proxy.golang.org" --env "GOMODCACHE=$modcache")
   for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
     if [ -n "${!v:-}" ]; then args+=(--env "$v"); fi
   done
