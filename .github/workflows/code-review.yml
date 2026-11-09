@@ -1,4 +1,4 @@
-# code-review-template: v5.10.6 -- the code review in Gitea or GitHub CI for a pull request
+# code-review-template: v5.10.7 -- the code review in Gitea or GitHub CI for a pull request
 # that carries `code-review` and `task:ready`, routed by its labels through
 # route-labels (labels.md §2). Codex on the `codex` runner reviews every such
 # PR; `agent:opencode` adds an advisory COMMENT review by the opencode job on
@@ -28,6 +28,21 @@
 #   COORDINATOR_TURNS         the codex rounds the project coordinator has
 #                             on a `needs-coordinator` PR after the two-round
 #                             stop (v5.9.8, Company Agent m2185); default 3
+#
+# v5.10.7 (2026-11-09, Company Agent m2340 (1), ruling 413; Codex's P1s on
+# v5.10.6 at the re-pin PRs): (a) THE BASE IS PINNED to the event's
+# $BASE_REF. The key reads the event's base while the live guards read only
+# the state and the head, so a PR retargeted while a run waited could carry
+# an approval to a diff codex never saw, and the review step diffed the live
+# base. The guard's live read, the carried post, the deps and review steps,
+# the post and the confirm each refuse a PR whose live base is not
+# $BASE_REF; the guard and confirm end red (skip=retargeted), since a
+# retarget starts no run. (b) `needs-owner` is read before the SAME PATCH
+# carry, so a head equal to an approved patch is not approved past it.
+# (c) THE OWNER RESUMES: a count at the last round with `needs-owner` and
+# `needs-coordinator` gone (the owner took it off) starts over at round 1,
+# as re-adding `code-review` does; before, the count stayed past the limit
+# and the label came straight back.
 #
 # v5.10.6 (2026-11-09, Company Agent m2331 (2), ruling 410; Codex's P1 on
 # v5.10.5 at go-xkms #2026): (a) THE REVIEW KEY is read from a diff pinned to
@@ -793,6 +808,17 @@ jobs:
             echo "skip=stale" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # v5.10.7: THE BASE IS PINNED to the event's. The review key, the
+          # carry and the review all read $BASE_REF; a PR retargeted since
+          # this run was created starts no run of its own (no `edited`
+          # trigger), so this run ends red and carries or posts nothing.
+          base_live=$(jq -r '.base.ref // empty' <<<"$pr")
+          if [ "$base_live" != "$BASE_REF" ]; then
+            echo "skip=retargeted" >> "$GITHUB_OUTPUT"
+            touch "$WORK/verdict"
+            echo "::error::PR $PR_NUM was retargeted to ${base_live:-unknown} since this run was created for $BASE_REF. Push a new head, or take code-review off and add it again, to review against the new base."
+            exit 1
+          fi
           labels=$(jq -c '[.labels[]?.name]' <<<"$pr")
           if ! jq -e 'index("code-review") != null' <<<"$labels" >/dev/null; then
             echo "PR $PR_NUM does not carry the code-review label; no review requested."
@@ -1047,6 +1073,14 @@ jobs:
           # fails this run, as on its own head. The same patch at other lines
           # is a moved edit: codex reviews it. A label just added to
           # change the route reviews again (above).
+          # v5.10.7: `needs-owner` is read BEFORE the carry: a head that is
+          # the same patch as an earlier approval is not approved past it.
+          if jq -e 'index("needs-owner") != null' <<<"$labels" >/dev/null; then
+            echo "skip=needs-owner" >> "$GITHUB_OUTPUT"
+            touch "$WORK/verdict"
+            echo "::error::PR $PR_NUM is labelled needs-owner: codex reviews no round until the owner takes the label off (sdlc.md §2b)."
+            exit 1
+          fi
           round=""
           if [ -n "$patch_id" ] && [ -n "$hunk_ctx" ] && [ -z "$again" ]; then
             prev=$(jq -c --arg p "$patch_id" --arg x "$hunk_ctx" --arg s "$EVENT_SHA" '
@@ -1071,6 +1105,14 @@ jobs:
                 echo "the approval of $psha is not carried. Stopping."
                 echo "skip=stale" >> "$GITHUB_OUTPUT"
                 exit 0
+              fi
+              # v5.10.7: nor on a retargeted PR, nor past `needs-owner`.
+              if [ "$(jq -r '.base.ref // empty' <<<"$pr")" != "$BASE_REF" ] ||
+                 jq -e '[.labels[]?.name] | index("needs-owner") != null' <<<"$pr" >/dev/null; then
+                echo "skip=retargeted" >> "$GITHUB_OUTPUT"
+                touch "$WORK/verdict"
+                echo "::error::PR $PR_NUM was retargeted off $BASE_REF or labelled needs-owner since this run began; the approval of $psha is not carried."
+                exit 1
               fi
               echo "skip=same-patch" >> "$GITHUB_OUTPUT"
               round=$(jq -r '.round // empty' <<<"$prev")
@@ -1111,12 +1153,6 @@ jobs:
           [[ $COORDINATOR_TURNS =~ ^[0-9]+$ ]] ||
             die "COORDINATOR_TURNS is '$COORDINATOR_TURNS', not a number of rounds (CUSTOMIZE; the default is 3)"
           last_round=$((2 + COORDINATOR_TURNS))
-          if jq -e 'index("needs-owner") != null' <<<"$labels" >/dev/null; then
-            echo "skip=needs-owner" >> "$GITHUB_OUTPUT"
-            touch "$WORK/verdict"
-            echo "::error::PR $PR_NUM is labelled needs-owner: codex reviews no round until the owner takes the label off (sdlc.md §2b)."
-            exit 1
-          fi
           limit=2
           if jq -e 'index("needs-coordinator") != null' <<<"$labels" >/dev/null; then limit=$last_round; fi
           if [ "${EVENT_ACTION}:${EVENT_LABEL}" = labeled:code-review ]; then
@@ -1129,6 +1165,17 @@ jobs:
           fi
           [[ $done_rounds =~ ^[0-9]+$ ]] || die "could not count the $REVIEWER rounds on PR $PR_NUM"
           latest=$(jq -r 'if length == 0 then "" elif (last | .stands) then last | .state else "DISMISSED" end' <<<"$hist")
+          # v5.10.7: THE OWNER RESUMES. A count at the last round reached
+          # `needs-owner` (the posting step swaps the labels, and the hand-on
+          # step fails red when a label does not stick). With `needs-owner`
+          # gone (read above) and no `needs-coordinator` left, the owner took
+          # it off, and the count starts over, as re-adding `code-review`
+          # does (which anyone with label rights can do already).
+          if [ "$done_rounds" -ge "$last_round" ] && [ "$latest" != APPROVED ] &&
+             ! jq -e 'index("needs-coordinator") != null' <<<"$labels" >/dev/null; then
+            echo "needs-owner was taken off after round $done_rounds: the owner resumed the review; counting from round 1."
+            done_rounds=0
+          fi
           if [ "$done_rounds" -ge "$limit" ] && [ "$latest" != APPROVED ]; then
             stop=needs-coordinator
             [ "$done_rounds" -lt "$last_round" ] || stop=needs-owner
@@ -1360,6 +1407,8 @@ jobs:
           # the same version is not fetched.
           base_ref=$(api GET "/pulls/$PR_NUM" | jq -r '.base.ref // empty')
           [ -n "$base_ref" ] || die "could not read the base branch of PR $PR_NUM"
+          [ "$base_ref" = "$BASE_REF" ] ||
+            die "PR $PR_NUM was retargeted from $BASE_REF to $base_ref during the run; push a new head or re-add code-review"
           ref_q=$(jq -rn --arg r "$base_ref" '$r | @uri')
           : > "$WORK/deps.pubbase"
           for f in "${mods[@]}"; do
@@ -1626,6 +1675,9 @@ jobs:
           pr=$(api GET "/pulls/$PR_NUM")
           base_ref=$(jq -r '.base.ref // empty' <<<"$pr")
           [ -n "$base_ref" ] || die "could not read the base branch of PR $PR_NUM"
+          # v5.10.7: the base the key was computed on, or no review.
+          [ "$base_ref" = "$BASE_REF" ] ||
+            die "PR $PR_NUM was retargeted from $BASE_REF to $base_ref during the run; push a new head or re-add code-review"
           base=$(as_codex git merge-base "refs/remotes/origin/$base_ref" HEAD) ||
             die "no merge base between origin/$base_ref and $EVENT_SHA"
           files=$(as_codex git diff --name-only "$base" HEAD) || die "cannot diff $base..$EVENT_SHA"
@@ -1834,6 +1886,10 @@ jobs:
             echo "PR $PR_NUM closed or moved off $EVENT_SHA during the review; not posting."
             exit 0
           fi
+          if [ "$(jq -r '.base.ref // empty' <<<"$pr")" != "$BASE_REF" ]; then
+            echo "PR $PR_NUM was retargeted off $BASE_REF during the review; not posting (the confirm step ends red)."
+            exit 0
+          fi
           # Never approve over a rejection that appeared while codex ran. Read
           # outside the `if`, where a failed read would not stop the step.
           mine=$(my_verdicts)
@@ -1888,6 +1944,11 @@ jobs:
              [ "$(jq -r '.head.sha // empty' <<<"$pr")" != "$EVENT_SHA" ]; then
             echo "PR $PR_NUM was closed or moved off $EVENT_SHA during the review; this run gates nothing."
             exit 0
+          fi
+          if [ "$(jq -r '.base.ref // empty' <<<"$pr")" != "$BASE_REF" ]; then
+            touch "$WORK/verdict"
+            echo "::error::PR $PR_NUM was retargeted off $BASE_REF during the review; push a new head or re-add code-review."
+            exit 1
           fi
           mine=$(my_verdicts)
           if jq -e 'any(.[]; .state == "REQUEST_CHANGES")' <<<"$mine" >/dev/null; then
