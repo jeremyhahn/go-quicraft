@@ -640,27 +640,9 @@ func TestConformanceIterateEntriesRangeWithoutEntries(t *testing.T) {
 	})
 }
 
-func TestConformanceCompactionFloorReturnsErrCompacted(t *testing.T) {
-	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
-		saveEntries(t, db, 1, 1, 1, 10, 4)
-		if err := db.RemoveEntriesTo(1, 1, 4); err != nil {
-			t.Fatalf("RemoveEntriesTo: %v", err)
-		}
-
-		if _, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 11, 0); !errors.Is(err, logdb.ErrCompacted) {
-			t.Fatalf("IterateEntries below floor = %v, want ErrCompacted", err)
-		}
-		got, _, err := db.IterateEntries(nil, 0, 1, 1, 5, 11, 0)
-		if err != nil {
-			t.Fatalf("IterateEntries above floor: %v", err)
-		}
-		if len(got) != 6 || got[0].Index != 5 {
-			t.Fatalf("live suffix = %d entries starting %d, want 6 starting 5", len(got), got[0].Index)
-		}
-	})
-}
-
-// TestConformanceCompactionFloorIsMonotonic pins the floor's monotonicity: a
+// TestConformanceCompactionFloorIsMonotonic pins the compaction floor: a read
+// that starts below it returns ErrCompacted and the live suffix above it stays
+// readable. It also pins the floor's monotonicity: a
 // lower RemoveEntriesTo call must not lower a floor whose entries are already
 // gone, or reads between the two floors surface a hard log hole instead of
 // ErrCompacted and raft never falls back to InstallSnapshot.
