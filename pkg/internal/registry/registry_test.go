@@ -44,6 +44,9 @@ func TestResolveNonExistentNode(t *testing.T) {
 	if !errors.Is(err, ErrNodeNotFound) {
 		t.Fatal("expected errors.Is match with ErrNodeNotFound")
 	}
+	if want := "registry: node not found (shard=99, replica=99)"; err.Error() != want {
+		t.Fatalf("expected %q, got %q", want, err.Error())
+	}
 }
 
 func TestRegisterOverwritesExistingAddress(t *testing.T) {
@@ -63,36 +66,11 @@ func TestRegisterOverwritesExistingAddress(t *testing.T) {
 	}
 }
 
-func TestRemoveNonExistent(t *testing.T) {
-	r := NewRegistry()
-	// Remove on non-existent node should not panic.
-	r.Remove(42, 42)
-	if r.Count() != 0 {
-		t.Fatalf("expected 0 entries, got %d", r.Count())
-	}
-}
-
-func TestCount(t *testing.T) {
-	r := NewRegistry()
-	if r.Count() != 0 {
-		t.Fatalf("expected 0 entries, got %d", r.Count())
-	}
-
-	r.Register(1, 1, "10.0.0.1:5000")
-	r.Register(2, 1, "10.0.0.2:5000")
-	r.Register(3, 1, "10.0.0.3:5000")
-	if r.Count() != 3 {
-		t.Fatalf("expected 3 entries, got %d", r.Count())
-	}
-
-	r.Remove(2, 1)
-	if r.Count() != 2 {
-		t.Fatalf("expected 2 entries, got %d", r.Count())
-	}
-}
-
 func TestMultipleNodes(t *testing.T) {
 	r := NewRegistry()
+	if r.Count() != 0 {
+		t.Fatalf("expected 0 entries, got %d", r.Count())
+	}
 	nodes := []struct {
 		shardID   uint64
 		replicaID uint64
@@ -123,6 +101,19 @@ func TestMultipleNodes(t *testing.T) {
 			t.Fatalf("expected %s for (%d, %d), got %s",
 				n.address, n.shardID, n.replicaID, addr)
 		}
+	}
+
+	r.Remove(2, 1)
+	if r.Count() != len(nodes)-1 {
+		t.Fatalf("expected %d entries after Remove, got %d", len(nodes)-1, r.Count())
+	}
+	if _, err := r.Resolve(2, 1); !errors.Is(err, ErrNodeNotFound) {
+		t.Fatalf("Resolve of a removed node = %v, want ErrNodeNotFound", err)
+	}
+	// Removing an absent node is a no-op.
+	r.Remove(42, 42)
+	if r.Count() != len(nodes)-1 {
+		t.Fatalf("expected %d entries after a no-op Remove, got %d", len(nodes)-1, r.Count())
 	}
 }
 
@@ -165,14 +156,6 @@ func TestConcurrentRegisterResolveRemove(t *testing.T) {
 	}
 
 	wg.Wait()
-}
-
-func TestNodeNotFoundErrorMessage(t *testing.T) {
-	err := &NodeNotFoundError{ShardID: 5, ReplicaID: 10}
-	expected := "registry: node not found (shard=5, replica=10)"
-	if err.Error() != expected {
-		t.Fatalf("expected %q, got %q", expected, err.Error())
-	}
 }
 
 // ---------------------------------------------------------------------------
