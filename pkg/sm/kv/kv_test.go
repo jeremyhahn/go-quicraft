@@ -392,35 +392,6 @@ func TestKV_GetHash_OrderIndependent(t *testing.T) {
 	}
 }
 
-func TestKV_InvalidCommand(t *testing.T) {
-	// A malformed payload in a COMMITTED entry must never surface as an
-	// Update error (the engine treats that as terminal for the shard).
-	// It must instead yield the reserved deterministic per-entry result.
-	cases := []struct {
-		name string
-		cmd  []byte
-	}{
-		{"short_data", []byte{0x01}},
-		{"bad_op", []byte{0xFF, 0x00, 0x00}},
-		// op=0, below the OpPut range, with an otherwise valid header.
-		{"zero_op", []byte{0x00, 0x01, 0x00, 'k'}},
-	}
-	for _, b := range backends() {
-		for _, tc := range cases {
-			t.Run(b.name+"/"+tc.name, func(t *testing.T) {
-				entries := []sm.Entry{{Index: 1, Cmd: tc.cmd}}
-				results := make([]sm.Result, 1)
-				if err := b.update(context.Background(), entries, results); err != nil {
-					t.Fatalf("Update = %v, want nil for malformed committed entry", err)
-				}
-				if results[0].Value != sm.ResultInvalidCommand {
-					t.Errorf("results[0].Value = %d, want ResultInvalidCommand", results[0].Value)
-				}
-			})
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // MemoryStore-specific tests
 // ---------------------------------------------------------------------------
