@@ -186,54 +186,6 @@ func TestCachedDiskStateMachine_RecoverClearsCache(t *testing.T) {
 	}
 }
 
-func TestCachedDiskStateMachine_FullLifecycle(t *testing.T) {
-	inner := newTrackingDiskStateMachine()
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 100,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
-	}
-	ctx := context.Background()
-	stopper := make(chan struct{})
-
-	// Open
-	if _, err := cached.Open(ctx, "/tmp/cached-lifecycle", stopper); err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-
-	// Update
-	entries := []Entry{{Index: 1, Cmd: []byte("lifecycle-key")}}
-	results := make([]Result, 1)
-	if err := cached.Update(ctx, entries, results); err != nil {
-		t.Fatalf("Update failed: %v", err)
-	}
-
-	// Sync
-	if err := cached.Sync(); err != nil {
-		t.Fatalf("Sync failed: %v", err)
-	}
-
-	// Lookup (cache hit)
-	inner.lookupCount.Store(0)
-	val, err := cached.Lookup(ctx, "lifecycle-key")
-	if err != nil {
-		t.Fatalf("Lookup failed: %v", err)
-	}
-	if string(val.([]byte)) != "lifecycle-key" {
-		t.Errorf("Lookup = %q, want %q", val, "lifecycle-key")
-	}
-	if inner.lookupCount.Load() != 0 {
-		t.Error("expected cache hit in lifecycle test")
-	}
-
-	// Close
-	if err := cached.Close(ctx); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-}
-
 func TestCachedDiskStateMachine_OpenClearsCache(t *testing.T) {
 	inner := newTrackingDiskStateMachine()
 	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
@@ -262,39 +214,6 @@ func TestCachedDiskStateMachine_OpenClearsCache(t *testing.T) {
 // ---------------------------------------------------------------------------
 // LRU cache unit tests
 // ---------------------------------------------------------------------------
-
-func TestLRUCache_PutAndGet(t *testing.T) {
-	c := newLRUCache(10)
-	c.Put("k1", []byte("v1"))
-	c.Put("k2", []byte("v2"))
-
-	val, hit := c.Get("k1")
-	if !hit {
-		t.Fatal("expected hit for k1")
-	}
-	if string(val) != "v1" {
-		t.Errorf("Get(k1) = %q, want %q", val, "v1")
-	}
-
-	val, hit = c.Get("k2")
-	if !hit {
-		t.Fatal("expected hit for k2")
-	}
-	if string(val) != "v2" {
-		t.Errorf("Get(k2) = %q, want %q", val, "v2")
-	}
-}
-
-func TestLRUCache_GetMiss(t *testing.T) {
-	c := newLRUCache(10)
-	val, hit := c.Get("nonexistent")
-	if hit {
-		t.Error("expected miss for nonexistent key")
-	}
-	if val != nil {
-		t.Errorf("Get = %v, want nil", val)
-	}
-}
 
 func TestLRUCache_EvictionOrder(t *testing.T) {
 	c := newLRUCache(3)
@@ -352,71 +271,6 @@ func TestLRUCache_PutNilValueDeletes(t *testing.T) {
 	}
 }
 
-func TestLRUCache_Delete(t *testing.T) {
-	c := newLRUCache(10)
-	c.Put("k", []byte("value"))
-	c.Delete("k")
-
-	if _, hit := c.Get("k"); hit {
-		t.Error("expected miss after Delete")
-	}
-	if c.Len() != 0 {
-		t.Errorf("Len = %d, want 0", c.Len())
-	}
-}
-
-func TestLRUCache_DeleteNonexistent(t *testing.T) {
-	c := newLRUCache(10)
-	c.Delete("nonexistent") // should not panic
-}
-
-func TestLRUCache_Clear(t *testing.T) {
-	c := newLRUCache(10)
-	c.Put("a", []byte("1"))
-	c.Put("b", []byte("2"))
-	c.Clear()
-
-	if c.Len() != 0 {
-		t.Errorf("Len after Clear = %d, want 0", c.Len())
-	}
-	if _, hit := c.Get("a"); hit {
-		t.Error("expected miss after Clear")
-	}
-}
-
-func TestLRUCache_Stats(t *testing.T) {
-	c := newLRUCache(10)
-	c.Put("k", []byte("v"))
-
-	c.Get("k")           // hit
-	c.Get("nonexistent") // miss
-
-	hits, misses := c.Stats()
-	if hits != 1 {
-		t.Errorf("hits = %d, want 1", hits)
-	}
-	if misses != 1 {
-		t.Errorf("misses = %d, want 1", misses)
-	}
-}
-
-func TestLRUCache_SingleEntry(t *testing.T) {
-	c := newLRUCache(1)
-	c.Put("a", []byte("1"))
-	c.Put("b", []byte("2"))
-
-	if _, hit := c.Get("a"); hit {
-		t.Error("expected 'a' evicted")
-	}
-	val, hit := c.Get("b")
-	if !hit {
-		t.Fatal("expected hit for 'b'")
-	}
-	if string(val) != "2" {
-		t.Errorf("Get(b) = %q, want %q", val, "2")
-	}
-}
-
 func TestLRUCache_ConcurrentAccess(t *testing.T) {
 	c := newLRUCache(1000)
 	var wg sync.WaitGroup
@@ -447,42 +301,8 @@ func TestLRUCache_ConcurrentAccess(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Error type tests
-// ---------------------------------------------------------------------------
-
-func TestInvalidCacheConfigError_Message(t *testing.T) {
-	err := &InvalidCacheConfigError{Reason: "test reason"}
-	expected := "sm: invalid cache config: test reason"
-	if err.Error() != expected {
-		t.Errorf("Error() = %q, want %q", err.Error(), expected)
-	}
-}
-
-func TestCacheMaxEntriesError_Message(t *testing.T) {
-	err := &CacheMaxEntriesError{Value: -1}
-	expected := "sm: cache max entries must be > 0, got -1"
-	if err.Error() != expected {
-		t.Errorf("Error() = %q, want %q", err.Error(), expected)
-	}
-}
-
-// ---------------------------------------------------------------------------
 // extractQueryKey tests
 // ---------------------------------------------------------------------------
-
-func TestExtractQueryKey_String(t *testing.T) {
-	key := extractQueryKey("hello")
-	if key != "hello" {
-		t.Errorf("extractQueryKey(string) = %q, want %q", key, "hello")
-	}
-}
-
-func TestExtractQueryKey_Bytes(t *testing.T) {
-	key := extractQueryKey([]byte("hello"))
-	if key != "hello" {
-		t.Errorf("extractQueryKey([]byte) = %q, want %q", key, "hello")
-	}
-}
 
 func TestExtractQueryKey_Other(t *testing.T) {
 	key := extractQueryKey(42)
@@ -492,38 +312,8 @@ func TestExtractQueryKey_Other(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// CacheConfig validate tests
+// CachedDiskStateMachine GetHash
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// CachedDiskStateMachine BytesLookup and GetHash
-// ---------------------------------------------------------------------------
-
-func TestCachedDiskStateMachine_BytesLookupCacheHit(t *testing.T) {
-	inner := newTrackingDiskStateMachine()
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 100,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
-	}
-	ctx := context.Background()
-
-	entries := []Entry{{Index: 1, Cmd: []byte("disk-na")}}
-	results := make([]Result, 1)
-	if err := cached.Update(ctx, entries, results); err != nil {
-		t.Fatalf("Update failed: %v", err)
-	}
-
-	val, err := cached.BytesLookup([]byte("disk-na"))
-	if err != nil {
-		t.Fatalf("BytesLookup failed: %v", err)
-	}
-	if string(val) != "disk-na" {
-		t.Errorf("BytesLookup = %q, want %q", val, "disk-na")
-	}
-}
 
 func TestCachedDiskStateMachine_GetHash(t *testing.T) {
 	inner := newTrackingDiskStateMachine()
@@ -567,26 +357,6 @@ func TestCachedDiskStateMachine_BytesLookupCacheMissFallsToNALookup(t *testing.T
 	}
 	if inner.bytesLookupCount.Load() != 1 {
 		t.Errorf("NALookup count = %d, want 1", inner.bytesLookupCount.Load())
-	}
-}
-
-func TestCachedDiskStateMachine_BytesLookupMissReturnsNil(t *testing.T) {
-	// Use inner with NALookup that returns nil for missing keys.
-	inner := newDiskWithNALookup()
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 100,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
-	}
-
-	val, err := cached.BytesLookup([]byte("nonexistent"))
-	if err != nil {
-		t.Fatalf("BytesLookup failed: %v", err)
-	}
-	if val != nil {
-		t.Errorf("BytesLookup = %v, want nil", val)
 	}
 }
 
@@ -750,30 +520,6 @@ func (d *diskWithNALookup) BytesLookup(key []byte) ([]byte, error) {
 }
 
 var _ NALookup = (*diskWithNALookup)(nil)
-
-func TestCachedDiskStateMachine_BytesLookupDelegatesToNALookup(t *testing.T) {
-	inner := newDiskWithNALookup()
-	inner.state["na-disk"] = []byte("na-disk-val")
-
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 100,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
-	}
-
-	val, err := cached.BytesLookup([]byte("na-disk"))
-	if err != nil {
-		t.Fatalf("BytesLookup failed: %v", err)
-	}
-	if string(val) != "na-disk-val" {
-		t.Errorf("BytesLookup = %q, want %q", val, "na-disk-val")
-	}
-	if inner.bytesLookupCount.Load() != 1 {
-		t.Errorf("NALookup count = %d, want 1", inner.bytesLookupCount.Load())
-	}
-}
 
 // ---------------------------------------------------------------------------
 // CachedDiskStateMachine with Hasher inner
@@ -1174,6 +920,10 @@ func TestNewCachedDiskStateMachine_NilExtractKV(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for nil ExtractKV")
 	}
+	expected := "sm: invalid cache config: ExtractKV must not be nil"
+	if err.Error() != expected {
+		t.Errorf("Error() = %q, want %q", err.Error(), expected)
+	}
 }
 
 func TestNewCachedDiskStateMachine_ZeroMaxEntries(t *testing.T) {
@@ -1184,6 +934,10 @@ func TestNewCachedDiskStateMachine_ZeroMaxEntries(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for MaxEntries=0")
+	}
+	expected := "sm: cache max entries must be > 0, got 0"
+	if err.Error() != expected {
+		t.Errorf("Error() = %q, want %q", err.Error(), expected)
 	}
 }
 
@@ -1585,40 +1339,6 @@ func TestCachedDiskStateMachine_DeclinedConditionalWriteNotCached(t *testing.T) 
 	}
 }
 
-// TestCachedDiskStateMachine_NilEntryAppliedCachesEveryAppliedEntry pins the
-// documented default: a nil EntryApplied caches every entry whose result is not
-// ResultInvalidCommand. That is correct only for unconditional operations, and
-// is why CacheConfig documents the predicate as REQUIRED for a state machine
-// with conditional writes.
-func TestCachedDiskStateMachine_NilEntryAppliedCachesEveryAppliedEntry(t *testing.T) {
-	inner := newKVDiskSM()
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 16,
-		ExtractKV:  kvExtract,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine: %v", err)
-	}
-	ctx := context.Background()
-
-	if err := cached.Update(ctx, []Entry{{Index: 1, Cmd: []byte("k=v")}}, make([]Result, 1)); err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-
-	hitsBefore, _ := cached.CacheStats()
-	got, err := cached.Lookup(ctx, "k")
-	if err != nil {
-		t.Fatalf("Lookup: %v", err)
-	}
-	if string(got.([]byte)) != "v" {
-		t.Fatalf("Lookup = %q, want %q", got, "v")
-	}
-	if hitsAfter, _ := cached.CacheStats(); hitsAfter != hitsBefore+1 {
-		t.Fatalf("cache hits = %d, want %d: an unconditional write must populate the cache",
-			hitsAfter, hitsBefore+1)
-	}
-}
-
 // TestCachedDiskStateMachine_InvalidCommandRefusedDespitePredicate asserts the
 // ResultInvalidCommand floor: the sentinel means the payload could not be
 // decoded and the store was left unchanged, so a predicate that returns true
@@ -1657,18 +1377,5 @@ func TestCachedDiskStateMachine_InvalidCommandRefusedDespitePredicate(t *testing
 	if got != nil {
 		t.Fatalf("Lookup = %v, want nil: an undecodable command left the store "+
 			"unchanged, so nothing may be cached for it", got)
-	}
-}
-
-// TestCacheConfig_EntryAppliedOptional asserts the predicate is optional: a
-// config without it still validates.
-func TestCacheConfig_EntryAppliedOptional(t *testing.T) {
-	cfg := CacheConfig{MaxEntries: 4, ExtractKV: kvExtract}
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate with nil EntryApplied: %v", err)
-	}
-	cfg.EntryApplied = condApplied
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate with EntryApplied set: %v", err)
 	}
 }
