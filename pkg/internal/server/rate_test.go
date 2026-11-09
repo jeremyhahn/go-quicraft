@@ -81,7 +81,9 @@ func TestRateLimiter_RateLimited(t *testing.T) {
 
 func TestRateLimiter_DecreaseConcurrentUnderflow(t *testing.T) {
 	rl := NewRateLimiter(1000)
-	rl.Set(50)
+	// 55 is not a multiple of the step, so whatever the interleaving one
+	// decrease runs from 5 and must cross zero from a positive value.
+	rl.Set(55)
 
 	// Multiple concurrent decreases that collectively exceed the value.
 	var wg sync.WaitGroup
@@ -95,7 +97,7 @@ func TestRateLimiter_DecreaseConcurrentUnderflow(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Total decrease is 1000 but started at 50: must be 0 (not wrapped).
+	// Total decrease is 1000 but started at 55: must be 0 (not wrapped).
 	val := rl.Get()
 	if val != 0 {
 		t.Fatalf("Get = %d, want 0 (concurrent underflow saturation)", val)
