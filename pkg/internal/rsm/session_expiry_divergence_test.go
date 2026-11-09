@@ -192,12 +192,20 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		// The mirror image: the shard committed expiry=100, so BOTH replicas
 		// must expire client 42 at the index-200 checkpoint and reject the
 		// write, and one whose local configuration disables expiry is refused.
+		//
+		// A replica configured with 1000 is refused too. Under its local value
+		// no checkpoint falls before index 300, so it would hold the session
+		// and APPLY the write its peers reject: reading the checkpoint interval
+		// from the local configuration inside the segmented walk is the exact
+		// divergence this file exists to prevent, and a local value of the
+		// same magnitude as the shard's would hide it.
 		replicated := proto.SessionPolicy{
 			ExpiryEntries:          100,
 			MaxTotalSessions:       100,
 			MaxResponsesPerSession: 100,
 		}
 		refused(t, 0, replicated)
+		refused(t, 1000, replicated)
 		a, akv := newReplica(t, 100, replicated)
 		b, bkv := newReplica(t, 100, replicated)
 
@@ -219,53 +227,6 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		}
 	})
 
-	t.Run("local threshold differs in magnitude from the replicated one", func(t *testing.T) {
-		// The decisive case, and the one the two subtests above cannot see.
-		//
-		// The first disables expiry on the shard (replicated 0), which takes
-		// Apply's expiry-disabled fast path so the segmented checkpoint walk
-		// is never entered at all. The second sets replica B's LOCAL threshold
-		// to 100 — the same value the shard committed — so substituting local
-		// for replicated inside that walk is a no-op.
-		//
-		// Injecting `if s.localPolicy.ExpiryEntries != 0 { interval =
-		// s.localPolicy.ExpiryEntries }` into the walk therefore survived the
-		// whole suite, and that substitution is the exact divergence this file
-		// exists to prevent: two replicas evaluating different intervals expire
-		// different sessions at different indexes, and one then answers
-		// ResultSessionExpired for entries the other applies normally.
-		//
-		// Here the shard commits 100 and a replica configured with 1000 is
-		// refused: under its local value no checkpoint falls before index 300,
-		// so it would hold the session and APPLY the write its peers reject.
-		// The replicas that run expire client 42 at the index-200 checkpoint.
-		replicated := proto.SessionPolicy{
-			ExpiryEntries:          100,
-			MaxTotalSessions:       100,
-			MaxResponsesPerSession: 100,
-		}
-		refused(t, 1000, replicated)
-		a, akv := newReplica(t, 100, replicated)
-		b, bkv := newReplica(t, 100, replicated)
-
-		applyLog(t, a)
-		applyLog(t, b)
-
-		if a.Sessions().IsRegistered(clientID) || b.Sessions().IsRegistered(clientID) {
-			t.Fatalf("session held: A=%v B=%v; the shard committed expiry=100, "+
-				"so BOTH replicas must expire client %d",
-				a.Sessions().IsRegistered(clientID),
-				b.Sessions().IsRegistered(clientID), clientID)
-		}
-
-		gotA, gotB := applied(t, akv), applied(t, bkv)
-		if gotA != "" || gotB != "" {
-			t.Fatalf("applied value: A=%q B=%q, want both empty. A replica that "+
-				"reads the checkpoint interval from its LOCAL config finds no "+
-				"checkpoint before index 300, holds the session and applies a "+
-				"write its peers reject", gotA, gotB)
-		}
-	})
 }
 
 // TestSessionPolicy_LocalUsedOnlyWhileShardHasNone pins the fallback that keeps
