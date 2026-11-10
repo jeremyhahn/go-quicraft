@@ -876,84 +876,78 @@ func TestSnapshotPool_PublishedSaveHasTheDocumentedMode(t *testing.T) {
 	}
 }
 
-// TestGCSnapshotDirs_SparesADirectoryARecoveryIsReading: a recovery chooses
-// the record's directory and reads it by path for its whole length; a receive
-// or save recording a newer snapshot meanwhile runs the GC, which spared only
-// the directory the record NOW names — so under retention pressure it deleted
-// the one the recovery was reading and failed the shard. A pinned directory
-// (Node.PinSnapshotDir) is spared too.
-func TestGCSnapshotDirs_SparesADirectoryARecoveryIsReading(t *testing.T) {
-	base := t.TempDir()
-	node := newFenceTestNode(4)
-	var dirs []string
-	for i := uint64(1); i <= 5; i++ { // two more than the GC retains
-		dir := snapshotSaveDir(base, 4, 1, i*100)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		dirs = append(dirs, dir)
-	}
-	node.LockSnapshotDir()
-	node.PinSnapshotDir(dirs[0]) // the recovery's choice, the oldest
-	spare := node.GCSparedSnapshotDirs()
-	node.UnlockSnapshotDir()
-
-	if err := GCSnapshotDirs(base, 4, 1, dirs[4], spare...); err != nil {
-		t.Fatalf("GCSnapshotDirs: %v", err)
-	}
-	if _, err := os.Stat(dirs[0]); err != nil {
-		t.Fatalf("GC deleted the directory a recovery was reading: %v", err)
-	}
-	if _, err := os.Stat(dirs[1]); !os.IsNotExist(err) {
-		t.Fatalf("GC spared an unpinned directory beyond retention (stat err %v)", err)
-	}
-
-	node.LockSnapshotDir()
-	node.UnpinSnapshotDir(dirs[0])
-	if got := node.GCSparedSnapshotDirs(); len(got) != 0 {
-		t.Fatalf("pins left after the unpin: %v", got)
-	}
-	node.UnlockSnapshotDir()
-}
-
-// TestGCSnapshotDirs_SparesADirectoryAReceiveHasClaimed: a receive publishes
-// its canonical directory and claims it until raft's verdict, during which it
-// is unrecorded. Unrecorded directories at higher indexes — receives a stop
-// abandoned, or a crash left — pushed it into GC's removal window, and raft
-// adopting it then recorded a snapshot whose directory was gone.
-func TestGCSnapshotDirs_SparesADirectoryAReceiveHasClaimed(t *testing.T) {
+// TestGCSnapshotDirs_SparesAHeldDirectory: the GC spared only the directory
+// the record NOW names, so under retention pressure it deleted a directory
+// still in use and failed the shard. Two holds keep a directory out of the
+// removal window:
+//
+//   - a recovery chooses the record's directory and reads it by path for its
+//     whole length, while a receive or save recording a newer snapshot runs
+//     the GC; the pinned directory (Node.PinSnapshotDir) is spared;
+//   - a receive publishes its canonical directory and claims it until raft's
+//     verdict, during which it is unrecorded. Unrecorded directories at higher
+//     indexes — receives a stop abandoned, or a crash left — pushed it into
+//     the removal window, and raft adopting it then recorded a snapshot whose
+//     directory was gone; the claimed directory (Node.ClaimSnapshotDir) is
+//     spared.
+func TestGCSnapshotDirs_SparesAHeldDirectory(t *testing.T) {
 	const shardID, replicaID = uint64(4), uint64(1)
-	base := t.TempDir()
-	node := NewNode(nil, nil, nil, config.Config{ShardID: shardID, ReplicaID: replicaID}, nil, base, nil)
-	var dirs []string
-	for i := uint64(1); i <= 5; i++ { // two more than the GC retains
-		dir := node.SnapshotSaveDir(i * 100)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		dirs = append(dirs, dir)
-	}
-	node.LockSnapshotDir()
-	node.ClaimSnapshotDir(100) // published, awaiting raft's verdict
-	spare := node.GCSparedSnapshotDirs()
-	node.UnlockSnapshotDir()
+	for _, tt := range []struct {
+		name     string
+		recorded bool // the GC is told the newest directory is the recorded one
+		hold     func(n *Node, oldest string)
+		release  func(n *Node, oldest string)
+	}{
+		{
+			name:     "a recovery is reading it",
+			recorded: true,
+			hold:     func(n *Node, oldest string) { n.PinSnapshotDir(oldest) }, // the recovery's choice
+			release:  func(n *Node, oldest string) { n.UnpinSnapshotDir(oldest) },
+		},
+		{
+			name:    "a receive has claimed it",
+			hold:    func(n *Node, _ string) { n.ClaimSnapshotDir(100) }, // published, awaiting raft's verdict
+			release: func(n *Node, _ string) { n.ReleaseSnapshotDir(100) },
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			base := t.TempDir()
+			node := NewNode(nil, nil, nil, config.Config{ShardID: shardID, ReplicaID: replicaID}, nil, base, nil)
+			var dirs []string
+			for i := uint64(1); i <= 5; i++ { // two more than the GC retains
+				dir := node.SnapshotSaveDir(i * 100)
+				if err := os.MkdirAll(dir, 0o750); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+				dirs = append(dirs, dir)
+			}
+			node.LockSnapshotDir()
+			tt.hold(node, dirs[0])
+			spare := node.GCSparedSnapshotDirs()
+			node.UnlockSnapshotDir()
 
-	if err := GCSnapshotDirs(base, shardID, replicaID, "", spare...); err != nil {
-		t.Fatalf("GCSnapshotDirs: %v", err)
-	}
-	if _, err := os.Stat(dirs[0]); err != nil {
-		t.Fatalf("GC deleted the directory a receive had published and claimed: %v", err)
-	}
-	if _, err := os.Stat(dirs[1]); !os.IsNotExist(err) {
-		t.Fatalf("GC spared an unclaimed directory beyond retention (stat err %v)", err)
-	}
+			recorded := ""
+			if tt.recorded {
+				recorded = dirs[4]
+			}
+			if err := GCSnapshotDirs(base, shardID, replicaID, recorded, spare...); err != nil {
+				t.Fatalf("GCSnapshotDirs: %v", err)
+			}
+			if _, err := os.Stat(dirs[0]); err != nil {
+				t.Fatalf("GC deleted the held directory: %v", err)
+			}
+			if _, err := os.Stat(dirs[1]); !os.IsNotExist(err) {
+				t.Fatalf("GC spared an unheld directory beyond retention (stat err %v)", err)
+			}
 
-	node.LockSnapshotDir()
-	node.ReleaseSnapshotDir(100)
-	if got := node.GCSparedSnapshotDirs(); len(got) != 0 {
-		t.Fatalf("claims left after the release: %v", got)
+			node.LockSnapshotDir()
+			tt.release(node, dirs[0])
+			if got := node.GCSparedSnapshotDirs(); len(got) != 0 {
+				t.Fatalf("holds left after the release: %v", got)
+			}
+			node.UnlockSnapshotDir()
+		})
 	}
-	node.UnlockSnapshotDir()
 }
 
 // pinCheckingSnapshotter records, from inside RecoverFromSnapshot, whether the
