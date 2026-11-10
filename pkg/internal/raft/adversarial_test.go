@@ -950,7 +950,7 @@ func electSelf(r *raft) {
 // harness that never elects a leader, never accepts an append and never
 // advances a commit index proves nothing no matter how many inputs it runs,
 // and that failure mode is SILENT -- every assertion passes. It is asserted
-// against in TestAdversarialHarnessReachesRaftBehaviour.
+// against in TestAdversarialStepSweep.
 type harnessCoverage struct {
 	roles             map[roleState]int
 	committedAdvanced int
@@ -1301,9 +1301,7 @@ func TestAdversarialStepSeeds(t *testing.T) {
 	}
 }
 
-// sweepInput builds the i'th deterministic sweep input. Sharing it between
-// the sweep and the reachability test guarantees the reachability numbers
-// describe the inputs the sweep actually runs.
+// sweepInput builds the next deterministic sweep input from rng.
 func sweepInput(rng *mathrand.Rand, buf []byte) []byte {
 	n := 16 + rng.Intn(len(buf)-16)
 	chunk := buf[:n]
@@ -1313,24 +1311,29 @@ func sweepInput(rng *mathrand.Rand, buf []byte) []byte {
 	return chunk
 }
 
-// TestAdversarialHarnessReachesRaftBehaviour is the anti-vacuity gate.
+// TestAdversarialStepSweep is the deterministic property test: a fixed-seed
+// pseudo-random sweep of the same input grammar. It runs in CI on every
+// commit and covers the space between the hand-written seeds without
+// requiring -fuzz.
 //
-// An adversarial harness whose inputs are all refused at the front door
-// asserts nothing: every invariant holds trivially over a state machine that
-// never changed state. That failure is invisible -- the suite is green -- so
-// the reachability of each interesting behaviour is asserted explicitly here,
-// and a change to the grammar, the config, or the step path that stops
-// reaching them fails this test instead of silently hollowing out the fuzzer.
-func TestAdversarialHarnessReachesRaftBehaviour(t *testing.T) {
+// It is also the anti-vacuity gate. An adversarial harness whose inputs are
+// all refused at the front door asserts nothing: every invariant holds
+// trivially over a state machine that never changed state. That failure is
+// invisible -- the suite is green -- so the reachability of each interesting
+// behaviour is asserted explicitly over the inputs the sweep ran, and a
+// change to the grammar, the config, or the step path that stops reaching
+// them fails this test instead of silently hollowing out the fuzzer.
+func TestAdversarialStepSweep(t *testing.T) {
 	quietLogs(t)
+	const iterations = 3000
 	cov := newHarnessCoverage()
-	for _, seed := range adversarialSeeds() {
-		runAdversarialStepSequenceCov(t, seed.data, cov)
-	}
 	rng := mathrand.New(mathrand.NewSource(0x5EED_1A57))
 	buf := make([]byte, 512)
-	for i := 0; i < 3000; i++ {
-		runAdversarialStepSequenceCov(t, sweepInput(rng, buf), cov)
+	for i := 0; i < iterations; i++ {
+		chunk := sweepInput(rng, buf)
+		t.Run(fmt.Sprintf("iter%d", i), func(t *testing.T) {
+			runAdversarialStepSequenceCov(t, chunk, cov)
+		})
 	}
 
 	// Each threshold is deliberately far below the observed value: the point
@@ -1355,32 +1358,11 @@ func TestAdversarialHarnessReachesRaftBehaviour(t *testing.T) {
 	}
 	for _, c := range checks {
 		if c.got < c.min {
-			t.Errorf("harness reached %s only %d times, want >= %d: the adversarial sweep is not exercising this path and its invariants are vacuous",
+			t.Errorf("sweep reached %s only %d times, want >= %d: the adversarial sweep is not exercising this path and its invariants are vacuous",
 				c.name, c.got, c.min)
 		}
 	}
 	t.Logf("reachability: roles=%v appendsAccepted=%d appendsRejected=%d votesGranted=%d votesDenied=%d commitAdvanced=%d truncations=%d wireSnapshotRefusals=%d",
 		cov.roles, cov.appendsAccepted, cov.appendsRejected, cov.votesGranted,
 		cov.votesDenied, cov.committedAdvanced, cov.logsTruncated, cov.snapshotsRefused)
-}
-
-// TestAdversarialStepSweep is the deterministic property test: a fixed-seed
-// pseudo-random sweep of the same input grammar. It runs in CI on every
-// commit and covers the space between the hand-written seeds without
-// requiring -fuzz.
-func TestAdversarialStepSweep(t *testing.T) {
-	quietLogs(t)
-	const iterations = 3000
-	rng := mathrand.New(mathrand.NewSource(0x5EED_1A57))
-	buf := make([]byte, 512)
-	for i := 0; i < iterations; i++ {
-		n := 16 + rng.Intn(len(buf)-16)
-		chunk := buf[:n]
-		for j := range chunk {
-			chunk[j] = byte(rng.Intn(256))
-		}
-		t.Run(fmt.Sprintf("iter%d", i), func(t *testing.T) {
-			runAdversarialStepSequence(t, chunk)
-		})
-	}
 }
