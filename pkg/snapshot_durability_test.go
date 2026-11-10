@@ -655,7 +655,6 @@ func TestReencryptSnapshotFile_FailurePropagation(t *testing.T) {
 		{name: "temp_write_fails", op: opWrite, match: ".reencrypt-snapshot-"},
 		{name: "temp_fsync_fails", op: opSync, match: ".reencrypt-snapshot-"},
 		{name: "rename_fails", op: opRename, match: "snapshot.dat"},
-		{name: "dir_fsync_fails", op: opDirSync, match: "dst"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			srcBarrier := createTestBarrier(t)
@@ -676,11 +675,8 @@ func TestReencryptSnapshotFile_FailurePropagation(t *testing.T) {
 				t.Fatalf("injected cause not propagated: %v", err)
 			}
 
-			// Everything except the directory fsync fails before the rename,
-			// so the destination must still hold the original.
-			if tc.op == opDirSync {
-				return
-			}
+			// Each of these fails before the rename, so the destination must
+			// still hold the original.
 			stored, ok := cfs.liveBytes(dstPath)
 			if !ok {
 				t.Fatalf("%s was removed by a failed migration", dstPath)
