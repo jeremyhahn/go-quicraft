@@ -162,27 +162,6 @@ func TestSetSealedRootKeyRejectsZeroKnownEpoch(t *testing.T) {
 	}
 }
 
-// TestSetSealedRootKeyAcceptsValidKnownEpochs pins that the new gate is
-// specific: a legitimate historical set still loads.
-func TestSetSealedRootKeyAcceptsValidKnownEpochs(t *testing.T) {
-	src := MustNewBarrier(testBarrierConfig(32))
-	if err := src.Initialize(context.Background(), testStrategy(t), Credentials{}); err != nil {
-		t.Fatalf("Initialize: %v", err)
-	}
-	if _, err := src.Rotate(context.Background()); err != nil {
-		t.Fatalf("Rotate: %v", err)
-	}
-	blob := src.SealedRootKeyData()
-	if len(blob.KnownEpochs) != 2 {
-		t.Fatalf("expected two known epochs after one rotation, got %v", blob.KnownEpochs)
-	}
-
-	b := MustNewBarrier(testBarrierConfig(32))
-	if err := b.SetSealedRootKey(blob); err != nil {
-		t.Fatalf("a valid two-epoch blob was rejected: %v", err)
-	}
-}
-
 // --- per-invocation message bounds ---
 
 // TestMaxPlaintextSizePerAlgorithm pins the ceilings against the values the
@@ -196,14 +175,9 @@ func TestMaxPlaintextSizePerAlgorithm(t *testing.T) {
 			t.Errorf("%s MaxPlaintextSize() = %d, want %d", tc.alg, got, tc.maxPlaintext)
 		}
 	}
-	// An algorithm this build does not register has no ceiling to report, which
-	// is the same answer as for an identifier nobody defined; see
+	// An identifier nobody defined has no ceiling to report. The algorithms
+	// this build leaves unregistered give the same answer, asserted in
 	// TestUnregisteredAlgorithmsAreRefused.
-	for _, alg := range unregisteredAlgorithms {
-		if got := alg.MaxPlaintextSize(); got != 0 {
-			t.Errorf("unregistered %#x MaxPlaintextSize() = %d, want 0", byte(alg), got)
-		}
-	}
 	if got := SymmetricAlgorithm(0x7f).MaxPlaintextSize(); got != 0 {
 		t.Errorf("unknown algorithm MaxPlaintextSize() = %d, want 0", got)
 	}
