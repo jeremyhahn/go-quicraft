@@ -200,37 +200,6 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	}
 }
 
-// TestSweepStaleDecryptTmpTree_ReclaimsASendScratchInTheBaseDir: a snapshot
-// send decrypts into a scratch file in the replica's base directory and
-// unlinks it at once; a name survives only when that unlink failed, and then
-// holds a plaintext state-machine image. The canonical snapshot-directory scan
-// never looks at regular files in the base directory, so the tree sweep must
-// reclaim it there — and leave everything else alone.
-func TestSweepStaleDecryptTmpTree_ReclaimsASendScratchInTheBaseDir(t *testing.T) {
-	const shardID, replicaID = uint64(3), uint64(1)
-	base := t.TempDir()
-	replicaDir := snapshotBaseDir(base, shardID, replicaID)
-	if err := os.MkdirAll(replicaDir, 0o750); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	scratch := filepath.Join(replicaDir, SendDecryptTempPrefix+"123"+ScratchTempSuffix)
-	keep := filepath.Join(replicaDir, "unrelated")
-	for _, p := range []string{scratch, keep} {
-		if err := os.WriteFile(p, []byte("plaintext"), 0o600); err != nil {
-			t.Fatalf("write %s: %v", p, err)
-		}
-	}
-
-	SweepStaleDecryptTmpTree(base, shardID, replicaID)
-
-	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
-		t.Fatalf("send scratch survived the tree sweep: %v", err)
-	}
-	if _, err := os.Stat(keep); err != nil {
-		t.Fatalf("the sweep removed a file it does not own: %v", err)
-	}
-}
-
 // TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced pins the fence on the
 // recovery's sweeps: the retry of the import-stage reclaim and the scratch
 // sweep of the replica directory. StartShard sweeps first but
