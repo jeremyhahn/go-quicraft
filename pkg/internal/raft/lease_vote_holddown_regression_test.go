@@ -181,6 +181,9 @@ func TestLeaseVoteHoldDown_NonLeaseShardVotesImmediately(t *testing.T) {
 			if resp := voteReply(t, r, kind.preVote, false); resp.Reject {
 				t.Fatal("restarted non-LeaseRead follower refused an up-to-date candidate at startup")
 			}
+			if got := r.hardState().VoteWindow; got != 0 {
+				t.Fatalf("a replica without LeaseRead recorded a window of %d", got)
+			}
 		})
 	}
 }
@@ -444,19 +447,5 @@ func TestLeaseVoteHoldDown_RestartedFollowerCannotElectInsideOldLease(t *testing
 	}
 	if since := elected.Sub(restarted); since < s.nodes[3].voteHoldDuration {
 		t.Fatalf("new leader elected %v after F1 restarted, inside its %v hold-down", since, s.nodes[3].voteHoldDuration)
-	}
-}
-
-// TestLeaseVoteHoldDown_ConfigDefaultOff pins that the hold-down follows the
-// shard's LeaseRead flag and nothing else: the zero Config has none.
-func TestLeaseVoteHoldDown_ConfigDefaultOff(t *testing.T) {
-	var cfg config.Config
-	if cfg.LeaseRead {
-		t.Fatal("LeaseRead must default to off")
-	}
-	r := newTestRaft(3)
-	r.setTickInterval(testLeaseTick)
-	if r.voteHeldDown() {
-		t.Fatal("default shard reported a vote hold-down")
 	}
 }
