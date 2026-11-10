@@ -90,6 +90,24 @@ func TestReencrypt_NonDefaultBlockSizeIsMigratable(t *testing.T) {
 		t.Fatalf("Reencrypt copied %d nodes, want 1", count)
 	}
 
+	// Opening the destination with the DEFAULT geometry must be refused: that
+	// refusal is the proof that the destination recorded the source's block
+	// size rather than the default.
+	defaultDB, err := waldb.Open(dstDir)
+	if err == nil {
+		_ = defaultDB.Close()
+		t.Fatal("the destination opened with the default block size: it was " +
+			"written with the default geometry, not the source's")
+	}
+	var geoErr *waldb.WALGeometryMismatchError
+	if !errors.As(err, &geoErr) {
+		t.Fatalf("Open error = %v, want a *WALGeometryMismatchError", err)
+	}
+	if geoErr.Recorded != migrationBlockSize {
+		t.Fatalf("destination records block size %d, want %d",
+			geoErr.Recorded, migrationBlockSize)
+	}
+
 	// The destination must be a geometry-faithful copy, not merely readable:
 	// the caller swaps it in and reopens it with the node's own configuration.
 	dst, err := waldb.Open(dstDir, waldb.WithBlockSize(migrationBlockSize))
@@ -117,42 +135,6 @@ func TestReencrypt_NonDefaultBlockSizeIsMigratable(t *testing.T) {
 	}
 	if state.Commit != uint64(len(want)) {
 		t.Fatalf("destination commit index = %d, want %d", state.Commit, len(want))
-	}
-}
-
-// TestReencrypt_DestinationRecordsSourceGeometry pins the second half of the
-// same defect. Threading the option only into the SOURCE would make the
-// migration appear to succeed while stamping the destination with the default
-// geometry — the operator swaps it into place and the next ordinary Open
-// refuses to read it.
-func TestReencrypt_DestinationRecordsSourceGeometry(t *testing.T) {
-	root := t.TempDir()
-	srcDir := filepath.Join(root, "src")
-	dstDir := filepath.Join(root, "dst")
-
-	seedWAL(t, srcDir, 3, waldb.WithBlockSize(migrationBlockSize))
-
-	if _, err := waldb.Reencrypt(srcDir, nil, dstDir, nil, nil,
-		waldb.WithBlockSize(migrationBlockSize)); err != nil {
-		t.Fatalf("Reencrypt: %v", err)
-	}
-
-	// Opening the destination with the DEFAULT geometry must be refused: that
-	// refusal is the proof that the destination recorded the source's block
-	// size rather than the default.
-	db, err := waldb.Open(dstDir)
-	if err == nil {
-		_ = db.Close()
-		t.Fatal("the destination opened with the default block size: it was " +
-			"written with the default geometry, not the source's")
-	}
-	var geoErr *waldb.WALGeometryMismatchError
-	if !errors.As(err, &geoErr) {
-		t.Fatalf("Open error = %v, want a *WALGeometryMismatchError", err)
-	}
-	if geoErr.Recorded != migrationBlockSize {
-		t.Fatalf("destination records block size %d, want %d",
-			geoErr.Recorded, migrationBlockSize)
 	}
 }
 
