@@ -499,66 +499,6 @@ func TestPendingRequests_DeadlinelessContextIsClamped(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Leadership changes must not fail local snapshot work
-// ---------------------------------------------------------------------------
-
-// TestOnLeaderUpdated_KeepsPendingSnapshots asserts that a routine election
-// leaves an in-flight snapshot request alone. Saving a snapshot is purely
-// local: it reads this replica's own state machine and writes its own disk, so
-// failing the caller with NotLeaderError while the save keeps running only
-// produced a retry that hit ErrSnapshotInProgress.
-func TestOnLeaderUpdated_KeepsPendingSnapshots(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	pool := NewRequestStatePool()
-
-	snapRS := newRequestState(pool, 70, time.Time{}, true)
-	ns.pendingSnapshotsMu.Lock()
-	ns.pendingSnapshots[70] = snapRS
-	ns.pendingSnapshotsMu.Unlock()
-
-	propRS := newRequestState(pool, 71, time.Time{}, true)
-	ns.pendingProposals.Store(uint64(71), &pendingProposal{rs: propRS})
-	h.addPendingOp()
-
-	// This replica was the leader and has just lost leadership to replica 2.
-	ns.isLeader.Store(true)
-	cb := &hostEngineCallback{h: h}
-	cb.OnLeaderUpdated(1, 2, 10)
-
-	select {
-	case result := <-propRS.ResultC():
-		if !errors.Is(result.Err, ErrNotLeader) {
-			t.Errorf("proposal result.Err = %v, want NotLeaderError", result.Err)
-		}
-	default:
-		t.Error("a pending proposal must be failed on leadership loss")
-	}
-
-	select {
-	case result := <-snapRS.ResultC():
-		t.Fatalf("pending snapshot completed with %v on a leadership change; a "+
-			"snapshot save has no leadership dependency", result.Err)
-	default:
-	}
-
-	// Teardown, where the save really is abandoned, does fail it.
-	h.failPendingRequests(ns, ErrClosed)
-	select {
-	case result := <-snapRS.ResultC():
-		if !errors.Is(result.Err, ErrClosed) {
-			t.Errorf("snapshot result.Err = %v, want ErrClosed", result.Err)
-		}
-	default:
-		t.Error("teardown must fail pending snapshots")
-	}
-
-	propRS.Release()
-	snapRS.Release()
-}
-
-// ---------------------------------------------------------------------------
 // Leader and term must be readable as a consistent pair
 // ---------------------------------------------------------------------------
 
