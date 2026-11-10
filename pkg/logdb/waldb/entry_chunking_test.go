@@ -20,18 +20,19 @@ import (
 // PERMANENT error, deliberately not retried or rotated -- and the node could
 // never persist it. A lagging follower catching up on many small entries is
 // the realistic trigger.
+//
+// The split records must also replay: the format tolerates several entry
+// records per Update, which is what makes chunking safe rather than a format
+// change. So the batch is read back twice, from the live store and again
+// after a reopen.
 func TestSaveState_BatchLargerThanOneRecord(t *testing.T) {
-	dir := t.TempDir()
+	dir := filepath.Join(t.TempDir(), "wal")
 	// A small segment keeps the test fast; the ratio is what matters, not the
 	// absolute size.
 	const blockSize = 4096
 	const maxFile = 256 * 1024
 
-	db, err := Open(filepath.Join(dir, "wal"),
-		WithBlockSize(blockSize),
-		WithMaxFileSize(maxFile),
-		WithNoSync(true),
-	)
+	db, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(maxFile))
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
@@ -70,84 +71,46 @@ func TestSaveState_BatchLargerThanOneRecord(t *testing.T) {
 		t.Fatalf("SaveState failed for a batch raft can legitimately produce: %v", err)
 	}
 
-	// Every entry must be readable back, in order, with its payload intact.
-	got, _, err := db.IterateEntries(nil, 0, 1, 1, 1, entryCount+1, 1<<30)
-	if err != nil {
-		t.Fatalf("IterateEntries failed: %v", err)
-	}
-	if len(got) != entryCount {
-		t.Fatalf("read back %d entries, want %d", len(got), entryCount)
-	}
-	for i := range got {
-		if got[i].Index != uint64(i+1) {
-			t.Fatalf("entry %d has index %d, want %d", i, got[i].Index, i+1)
+	// Every entry must be readable back, in order, with its payload intact,
+	// and the hard state written after the entries must have survived with
+	// them.
+	verify := func(t *testing.T, db *DB, when string) {
+		t.Helper()
+		got, _, err := db.IterateEntries(nil, 0, 1, 1, 1, entryCount+1, 1<<30)
+		if err != nil {
+			t.Fatalf("%s: IterateEntries failed: %v", when, err)
 		}
-		if len(got[i].Cmd) != cmdLen || got[i].Cmd[0] != byte(i) {
-			t.Fatalf("entry %d payload corrupted", i)
+		if len(got) != entryCount {
+			t.Fatalf("%s: read back %d entries, want %d (records split across "+
+				"one Update must all be kept)", when, len(got), entryCount)
+		}
+		for i := range got {
+			if got[i].Index != uint64(i+1) {
+				t.Fatalf("%s: entry %d has index %d, want %d", when, i, got[i].Index, i+1)
+			}
+			if len(got[i].Cmd) != cmdLen || got[i].Cmd[0] != byte(i) {
+				t.Fatalf("%s: entry %d payload corrupted", when, i)
+			}
+		}
+		state, _, err := db.ReadState(1, 1)
+		if err != nil {
+			t.Fatalf("%s: ReadState failed: %v", when, err)
+		}
+		if state.Commit != entryCount {
+			t.Errorf("%s: state.Commit = %d, want %d", when, state.Commit, entryCount)
 		}
 	}
+	verify(t, db, "before reopen")
 
-	// The hard state written after the entries must also have survived.
-	state, _, err := db.ReadState(1, 1)
-	if err != nil {
-		t.Fatalf("ReadState failed: %v", err)
-	}
-	if state.Commit != entryCount {
-		t.Errorf("state.Commit = %d, want %d", state.Commit, entryCount)
-	}
-}
-
-// TestSaveState_BatchSurvivesReopen verifies the split records replay: the
-// format tolerates several entry records per Update, which is what makes
-// chunking safe rather than a format change.
-func TestSaveState_BatchSurvivesReopen(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "wal")
-	const blockSize = 4096
-	const maxFile = 256 * 1024
-	const entryCount = 1500
-	const cmdLen = 256
-
-	entries := make([]logdb.Entry, entryCount)
-	for i := range entries {
-		cmd := make([]byte, cmdLen)
-		cmd[0] = byte(i)
-		entries[i] = logdb.Entry{Index: uint64(i + 1), Term: 2, Cmd: cmd}
-	}
-
-	db, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(maxFile))
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	if err := db.SaveState([]logdb.Update{{
-		ShardID: 1, ReplicaID: 1,
-		State:   logdb.State{Term: 2, Vote: 1, Commit: entryCount},
-		Entries: entries,
-	}}); err != nil {
-		t.Fatalf("SaveState failed: %v", err)
-	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
-
 	reopened, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(maxFile))
 	if err != nil {
 		t.Fatalf("reopen failed: %v", err)
 	}
 	defer func() { _ = reopened.Close() }()
-
-	got, _, err := reopened.IterateEntries(nil, 0, 1, 1, 1, entryCount+1, 1<<30)
-	if err != nil {
-		t.Fatalf("IterateEntries after reopen failed: %v", err)
-	}
-	if len(got) != entryCount {
-		t.Fatalf("after reopen read %d entries, want %d (records split across "+
-			"one Update must all replay)", len(got), entryCount)
-	}
-	for i := range got {
-		if got[i].Index != uint64(i+1) || got[i].Cmd[0] != byte(i) {
-			t.Fatalf("entry %d did not survive reopen intact", i)
-		}
-	}
+	verify(t, reopened, "after reopen")
 }
 
 // TestSaveState_SingleEntryLargerThanRecordStillFails verifies the permanent
