@@ -1,4 +1,4 @@
-# code-review-template: v5.10.7 -- the code review in Gitea or GitHub CI for a pull request
+# code-review-template: v5.10.8 -- the code review in Gitea or GitHub CI for a pull request
 # that carries `code-review` and `task:ready`, routed by its labels through
 # route-labels (labels.md §2). Codex on the `codex` runner reviews every such
 # PR; `agent:opencode` adds an advisory COMMENT review by the opencode job on
@@ -28,6 +28,27 @@
 #   COORDINATOR_TURNS         the codex rounds the project coordinator has
 #                             on a `needs-coordinator` PR after the two-round
 #                             stop (v5.9.8, Company Agent m2185); default 3
+#
+# v5.10.8 (2026-11-09, Company Agent m2349 (2), ruling 416; Codex's five P1s
+# on v5.10.7 at go-luks2 #436, go-qrdb #1436, xkey-android #119 and
+# go-quicraft #717): (a) THE OWNER HOLD comes before EVERY approval reuse.
+# v5.10.7 read `needs-owner` before the carry only, so the already-approved
+# and twin-wait early returns reused an approval past it, the confirm step
+# passed it, and the posting step (xkey-android #119) approved past one added
+# while codex ran. owner_hold (lib.sh) ends the run red, skip=needs-owner,
+# before the carry, before the already-approved return and before the
+# twin-wait return (a live read there, after the wait); the posting step
+# reads it from its live PR read before a fresh approval, and the confirm
+# step reads the labels live again immediately before it passes. (b) THE
+# OWNER RESUMES ONLY ON EVIDENCE: a relabel can lose `needs-owner`, so its
+# absence alone no longer starts the count over. The count starts over on an
+# `owner-resume` label, which the guard takes off as it uses it, or, on
+# GitHub, when the issue timeline records `needs-owner` taken off after the
+# latest verdict by a person: not a bot, not the reviewer and not an agent
+# principal. Otherwise the count stands and the PR goes back to
+# `needs-owner`. (c) THE HAND-ON IS PINNED to the run's head (go-quicraft
+# #717): a stale run could put its stop label on a newer head. The hand-on
+# step reads the live head first and sets nothing when it is not $EVENT_SHA.
 #
 # v5.10.7 (2026-11-09, Company Agent m2340 (1), ruling 413; Codex's P1s on
 # v5.10.6 at the re-pin PRs): (a) THE BASE IS PINNED to the event's
@@ -160,7 +181,8 @@
 #   round 2 does. A head past the limit is not reviewed: the run ends
 #   skip=round-limit, red, posts nothing and sets the same label. A PR
 #   labelled `needs-owner` is not reviewed (skip=needs-owner, red) until
-#   the owner takes the label off. Removing and re-adding `code-review`
+#   the owner takes the label off (v5.10.8: no approval is reused past it,
+#   and the count starts over only on evidence of the owner). Removing and re-adding `code-review`
 #   starts the count over (round 1); re-running the run that added it
 #   replays its event and also starts over. `review:round-3` (unreleased)
 #   is gone. The labelling step re-reads the labels (Gitea can answer 200
@@ -678,10 +700,11 @@ jobs:
           # v5.9.8: put label $1 on the PR and take label $2, when given, off
           # it, then read the PR's labels again: Gitea can answer 200 without
           # applying a label. GitHub takes names, Gitea the label ids.
+          # v5.10.8: an empty $1 adds nothing (the guard takes owner-resume off).
           relabel() {
             local add=$1 drop=${2:-} names id
             names=$(api GET "/pulls/$PR_NUM" | jq -c '[.labels[]?.name]')
-            if ! jq -e --arg l "$add" 'index($l) != null' <<<"$names" >/dev/null; then
+            if [ -n "$add" ] && ! jq -e --arg l "$add" 'index($l) != null' <<<"$names" >/dev/null; then
               if [ "$FORGE" = github ]; then
                 jq -n --arg l "$add" '{labels: [$l]}' > "$WORK/label.json"
               else
@@ -699,9 +722,23 @@ jobs:
               api DELETE "/issues/$PR_NUM/labels/$id" >/dev/null
             fi
             names=$(api GET "/pulls/$PR_NUM" | jq -c '[.labels[]?.name]')
-            jq -e --arg a "$add" --arg d "$drop" 'index($a) != null and ($d == "" or index($d) == null)' \
+            jq -e --arg a "$add" --arg d "$drop" '($a == "" or index($a) != null) and ($d == "" or index($d) == null)' \
                 <<<"$names" >/dev/null ||
-              die "PR $PR_NUM's labels are $names after adding $add${drop:+ and removing $drop}; the reviewer may lack the label permission"
+              die "PR $PR_NUM's labels are $names after ${add:+adding $add}${add:+${drop:+ and }}${drop:+removing $drop}; the reviewer may lack the label permission"
+          }
+          # v5.10.8 (Company Agent m2349 (2), ruling 416): THE OWNER HOLD. A PR
+          # labelled `needs-owner` gets no round and no reused approval: the
+          # run ends red, skip=needs-owner, and posts nothing. $1 is the label
+          # list the caller read; with none, the live PR's labels are read now.
+          owner_hold() {
+            local names=${1:-}
+            [ -n "$names" ] || names=$(api GET "/pulls/$PR_NUM" | jq -c '[.labels[]?.name]')
+            jq -e 'type == "array"' <<<"$names" >/dev/null 2>&1 || die "could not read the labels of PR $PR_NUM"
+            jq -e 'index("needs-owner") != null' <<<"$names" >/dev/null || return 0
+            echo "skip=needs-owner" >> "$GITHUB_OUTPUT"
+            touch "$WORK/verdict"
+            echo "::error::PR $PR_NUM is labelled needs-owner: codex reviews no round and reuses no approval until the owner takes the label off (sdlc.md §2b)."
+            exit 1
           }
           # FAIL CLOSED on the credential: no token, no review, and no other
           # token to fall back to. Read into $HDR (root, 0600); never echoed.
@@ -902,6 +939,8 @@ jobs:
                 exit 1
               fi
               if jq -e 'any(.[]; .state == "APPROVED")' <<<"$mine" >/dev/null; then
+                # v5.10.8: not past `needs-owner`, read live: the wait was long.
+                owner_hold
                 echo "$REVIEWER approved $EVENT_SHA in the older run after a $twin_waited s wait. Not reviewing it twice."
                 echo "skip=reviewed" >> "$GITHUB_OUTPUT"
                 exit 0
@@ -1005,6 +1044,8 @@ jobs:
               echo "${EVENT_LABEL} was just added; reviewing $EVENT_SHA again under it." ;;
             *)
               if jq -e 'any(.[]; .state == "APPROVED")' <<<"$mine" >/dev/null; then
+                # v5.10.8: not past `needs-owner`.
+                owner_hold "$labels"
                 echo "$REVIEWER already approved $EVENT_SHA. Not reviewing it twice."
                 echo "skip=reviewed" >> "$GITHUB_OUTPUT"
                 exit 0
@@ -1057,7 +1098,7 @@ jobs:
                     | select(.state == "APPROVED" or .state == "REQUEST_CHANGES" or .state == "DISMISSED")
                     | (.body // "") as $b
                     | ($b | capture("<!-- codex-review:verdict head=(?<h>[0-9a-f]{40})(?<a>[^>]*)-->")) as $m
-                    | { id, commit_id, body: $b, head: $m.h,
+                    | { id, commit_id, body: $b, head: $m.h, at: (.submitted_at // ""),
                         stands: ((.state != "DISMISSED") and (.dismissed | not)),
                         state: (if .state == "DISMISSED" then "DISMISSED" else .state end),
                         patch: (($m.a | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // ""),
@@ -1075,12 +1116,7 @@ jobs:
           # change the route reviews again (above).
           # v5.10.7: `needs-owner` is read BEFORE the carry: a head that is
           # the same patch as an earlier approval is not approved past it.
-          if jq -e 'index("needs-owner") != null' <<<"$labels" >/dev/null; then
-            echo "skip=needs-owner" >> "$GITHUB_OUTPUT"
-            touch "$WORK/verdict"
-            echo "::error::PR $PR_NUM is labelled needs-owner: codex reviews no round until the owner takes the label off (sdlc.md §2b)."
-            exit 1
-          fi
+          owner_hold "$labels"
           round=""
           if [ -n "$patch_id" ] && [ -n "$hunk_ctx" ] && [ -z "$again" ]; then
             prev=$(jq -c --arg p "$patch_id" --arg x "$hunk_ctx" --arg s "$EVENT_SHA" '
@@ -1106,14 +1142,16 @@ jobs:
                 echo "skip=stale" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
-              # v5.10.7: nor on a retargeted PR, nor past `needs-owner`.
-              if [ "$(jq -r '.base.ref // empty' <<<"$pr")" != "$BASE_REF" ] ||
-                 jq -e '[.labels[]?.name] | index("needs-owner") != null' <<<"$pr" >/dev/null; then
+              # v5.10.7: nor on a retargeted PR, nor past `needs-owner`
+              # (v5.10.8: skip=needs-owner, from the live labels).
+              if [ "$(jq -r '.base.ref // empty' <<<"$pr")" != "$BASE_REF" ]; then
                 echo "skip=retargeted" >> "$GITHUB_OUTPUT"
                 touch "$WORK/verdict"
-                echo "::error::PR $PR_NUM was retargeted off $BASE_REF or labelled needs-owner since this run began; the approval of $psha is not carried."
+                echo "::error::PR $PR_NUM was retargeted off $BASE_REF since this run began; the approval of $psha is not carried."
                 exit 1
               fi
+              names=$(jq -c '[.labels[]?.name]' <<<"$pr")
+              owner_hold "$names"
               echo "skip=same-patch" >> "$GITHUB_OUTPUT"
               round=$(jq -r '.round // empty' <<<"$prev")
               jq -r --arg s "$EVENT_SHA" --arg p "$patch_id" --arg x "$hunk_ctx" --arg r "$round" --arg o "$psha" '
@@ -1168,13 +1206,43 @@ jobs:
           # v5.10.7: THE OWNER RESUMES. A count at the last round reached
           # `needs-owner` (the posting step swaps the labels, and the hand-on
           # step fails red when a label does not stick). With `needs-owner`
-          # gone (read above) and no `needs-coordinator` left, the owner took
-          # it off, and the count starts over, as re-adding `code-review`
-          # does (which anyone with label rights can do already).
+          # gone (read above) and no `needs-coordinator` left, the count
+          # starts over, as re-adding `code-review` does (which anyone with
+          # label rights can do already).
+          # v5.10.8 (Company Agent m2349 (2), ruling 416; Codex's P1 on
+          # v5.10.7 at go-qrdb #1436): ONLY ON EVIDENCE. A relabel can lose a
+          # label, so `needs-owner` absent is not the owner. The count starts
+          # over on an `owner-resume` label, taken off here as it is used, or,
+          # on GitHub, when the issue timeline records `needs-owner` taken off
+          # after the latest verdict by a person: not a bot, not the reviewer,
+          # not an agent principal (a login that starts `agent-`). Otherwise
+          # the count stands, and the PR goes back to `needs-owner` below.
           if [ "$done_rounds" -ge "$last_round" ] && [ "$latest" != APPROVED ] &&
              ! jq -e 'index("needs-coordinator") != null' <<<"$labels" >/dev/null; then
-            echo "needs-owner was taken off after round $done_rounds: the owner resumed the review; counting from round 1."
-            done_rounds=0
+            resumed=""
+            if jq -e 'index("owner-resume") != null' <<<"$labels" >/dev/null; then
+              relabel "" owner-resume
+              resumed="the owner-resume label, now taken off"
+            elif [ "$FORGE" = github ]; then
+              at=$(jq -r 'last | .at // ""' <<<"$hist")
+              if [ -n "$at" ]; then
+                timeline=$(api_all "/issues/$PR_NUM/timeline?")
+                who=$(jq -r --arg u "$REVIEWER" --arg t "$at" '
+                    [ .[] | select(.event == "unlabeled" and (.label.name? // "") == "needs-owner"
+                                   and (.created_at // "") > $t)
+                          | (.actor // {}) | select(.type != "Bot" and (.login // "") != "" and .login != $u
+                                                    and (.login | endswith("[bot]") | not)
+                                                    and (.login | startswith("agent-") | not))
+                          | .login ] | last // empty' <<<"$timeline")
+                [ -z "$who" ] || resumed="$who taking needs-owner off after the latest verdict"
+              fi
+            fi
+            if [ -n "$resumed" ]; then
+              echo "The owner resumed the review after round $done_rounds ($resumed); counting from round 1."
+              done_rounds=0
+            else
+              echo "needs-owner is off PR $PR_NUM, but nothing records the owner taking it off (no owner-resume label, no removal by a person after the latest verdict); the count stands."
+            fi
           fi
           if [ "$done_rounds" -ge "$limit" ] && [ "$latest" != APPROVED ]; then
             stop=needs-coordinator
@@ -1890,6 +1958,13 @@ jobs:
             echo "PR $PR_NUM was retargeted off $BASE_REF during the review; not posting (the confirm step ends red)."
             exit 0
           fi
+          # v5.10.8 (Company Agent m2349 (2), ruling 416; Codex's P1 on
+          # v5.10.7 at xkey-android #119): no fresh approval past a
+          # `needs-owner` added while codex ran, read from this live PR.
+          if [ "$event" = APPROVED ]; then
+            names=$(jq -c '[.labels[]?.name]' <<<"$pr")
+            owner_hold "$names"
+          fi
           # Never approve over a rejection that appeared while codex ran. Read
           # outside the `if`, where a failed read would not stop the step.
           mine=$(my_verdicts)
@@ -1926,7 +2001,8 @@ jobs:
       # codex rejection. A rejection is red, so the run that files it cannot
       # read as a pass. A run that found the head already approved confirms
       # that approval, and one that carried a same-patch approval (v5.9.8)
-      # confirms the approval it posted.
+      # confirms the approval it posted. None passes on a PR labelled
+      # `needs-owner`, read live as the last check (v5.10.8).
       - name: Confirm a codex verdict stands on this head
         if: >-
           steps.guard.outputs.requested == 'true' &&
@@ -1964,6 +2040,9 @@ jobs:
           fi
           [ -n "$(jq -r '.body // "" | gsub("\\s"; "")' <<<"$latest")" ] ||
             die "the $REVIEWER approval on $EVENT_SHA has an empty body"
+          # v5.10.8 (ruling 416): `needs-owner`, read live again immediately
+          # before the pass: a label added since the guard holds the PR.
+          owner_hold
           echo "$REVIEWER approved $EVENT_SHA."
 
       # ROOT. THE HAND-ON (v5.9.8, Company Agent m2185; sdlc.md §2b): a loop
@@ -1982,6 +2061,15 @@ jobs:
           # shellcheck source=/dev/null
           . "$WORK/lib.sh"
           [ "$FORGE" != github ] || load_token
+          # v5.10.8 (Company Agent m2349 (2), ruling 416; Codex's P1 on
+          # v5.10.7 at go-quicraft #717): the label goes on the head this run
+          # counted. A stale run, whose head the PR has left, labels nothing;
+          # the run for the new head counts its own rounds.
+          live=$(api GET "/pulls/$PR_NUM" | jq -r '.head.sha // empty')
+          if [ "$live" != "$EVENT_SHA" ]; then
+            echo "PR $PR_NUM moved to ${live:-an unknown head} since this run was created for $EVENT_SHA; $STOP is not set from this run."
+            exit 0
+          fi
           printf '%s\n' "$STOP" > "$WORK/stop-error"
           case "$STOP" in
             needs-coordinator) relabel needs-coordinator ;;
