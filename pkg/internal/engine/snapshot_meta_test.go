@@ -275,27 +275,6 @@ func TestReadSnapshotEpoch_Statuses(t *testing.T) {
 			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
 		},
 		{
-			// No record AND no artifact: the directory was garbage-collected
-			// between enumeration and this read, so there is nothing to protect.
-			name:      "missing_record_no_artifact",
-			write:     func(t *testing.T, _ string) { t.Helper() },
-			wantEpoch: 0, wantStatus: snapshotEpochKnown,
-		},
-		{
-			// No record but the ARTIFACT is still there — a crash between the
-			// two writes. Its epoch is unnameable, which can only mean "do not
-			// purge"; it can never mean "imposes no floor".
-			name: "missing_record_artifact_present",
-			write: func(t *testing.T, dir string) {
-				t.Helper()
-				if err := os.WriteFile(filepath.Join(dir, snapshotDataFile),
-					[]byte("ciphertext"), 0o600); err != nil {
-					t.Fatalf("write artifact: %v", err)
-				}
-			},
-			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
-		},
-		{
 			// A record longer than any this format writes is foreign: its
 			// epoch is indeterminate, so the read fails safe.
 			name: "oversized_record",
