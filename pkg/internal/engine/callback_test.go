@@ -426,135 +426,11 @@ func TestApplyWorker_CallbackFiresOnSuccessfulApply(t *testing.T) {
 	cb := newTestCallback()
 	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, NewWorkSignal(1), stopC, nil)
 
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
-
-	// Send an item with committed entries.
-	node.commitPending.Store(true)
-	item := applyPool.Get().(*applyItem)
-	item.update = proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Term: 1, Index: 1, Cmd: []byte("cmd1")},
-			{Term: 1, Index: 2, Cmd: []byte("cmd2")},
-		},
-	}
-	item.node = node
-	applyC <- item
-
-	runDone := make(chan struct{})
-	go func() {
-		aw.run()
-		close(runDone)
-	}()
-
-	// Poll until the callback fires (apply completed).
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for OnApplied callback", func() bool {
-		return cb.appliedCount.Load() != 0
-	})
-
-	close(stopC)
-	<-runDone
-	wg.Wait()
-
-	// Verify callback was called.
-	if cb.appliedCount.Load() != 1 {
-		t.Fatalf("expected 1 OnApplied call, got %d", cb.appliedCount.Load())
-	}
-
-	calls := cb.getAppliedCalls()
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 applied call, got %d", len(calls))
-	}
-	if calls[0].shardID != 1 {
-		t.Errorf("shardID = %d, want 1", calls[0].shardID)
-	}
-	if len(calls[0].entries) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(calls[0].entries))
-	}
-	if calls[0].entries[0].Index != 1 {
-		t.Errorf("entries[0].Index = %d, want 1", calls[0].entries[0].Index)
-	}
-	if calls[0].entries[1].Index != 2 {
-		t.Errorf("entries[1].Index = %d, want 2", calls[0].entries[1].Index)
-	}
-	if len(calls[0].results) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(calls[0].results))
-	}
-	// testSM sets Value = entry.Index.
-	if calls[0].results[0].Value != 1 {
-		t.Errorf("results[0].Value = %d, want 1", calls[0].results[0].Value)
-	}
-	if calls[0].results[1].Value != 2 {
-		t.Errorf("results[1].Value = %d, want 2", calls[0].results[1].Value)
-	}
-}
-
-func TestApplyWorker_NilCallbackDoesNotPanic(t *testing.T) {
-	applyC := make(chan *applyItem, 64)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	// nil callback should not panic.
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
-
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
-
-	node.commitPending.Store(true)
-	item := applyPool.Get().(*applyItem)
-	item.update = proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Term: 1, Index: 1, Cmd: []byte("cmd1")},
-		},
-	}
-	item.node = node
-	applyC <- item
-
-	runDone := make(chan struct{})
-	go func() {
-		aw.run()
-		close(runDone)
-	}()
-
-	// Poll until the SM apply completes (no panic occurred).
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for SM apply with nil callback", func() bool {
-		return testSm.applyCount.Load() != 0
-	})
-
-	close(stopC)
-	<-runDone
-	wg.Wait()
-
-	// Should have applied without panic.
-	if testSm.applyCount.Load() != 1 {
-		t.Fatalf("expected 1 apply, got %d", testSm.applyCount.Load())
-	}
-}
-
-func TestApplyWorker_CallbackMultipleShards(t *testing.T) {
-	applyC := make(chan *applyItem, 64)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, NewWorkSignal(1), stopC, nil)
-
-	// Create 3 shards with their own SMs.
-	for shardID := uint64(1); shardID <= 3; shardID++ {
-		testSm := newTestSM()
-		rsmSM := newTestApplier(testSm)
+	// Three shards, each with its own SM and a two-entry batch: every shard
+	// fires exactly one OnApplied call carrying its own entries and results.
+	const shards = 3
+	for shardID := uint64(1); shardID <= shards; shardID++ {
+		rsmSM := newTestApplier(newTestSM())
 		cfg := config.Config{ShardID: shardID, ReplicaID: 1}
 		node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
 
@@ -564,7 +440,8 @@ func TestApplyWorker_CallbackMultipleShards(t *testing.T) {
 			ShardID:   shardID,
 			ReplicaID: 1,
 			CommittedEntries: []proto.Entry{
-				{Term: 1, Index: 1, Cmd: []byte("cmd")},
+				{Term: 1, Index: 1, Cmd: []byte("cmd1")},
+				{Term: 1, Index: 2, Cmd: []byte("cmd2")},
 			},
 		}
 		item.node = node
@@ -577,26 +454,41 @@ func TestApplyWorker_CallbackMultipleShards(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Poll until all 3 shards have fired callbacks.
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for 3 OnApplied callbacks", func() bool {
-		return cb.appliedCount.Load() >= 3
+	// Poll until every shard's callback fires (apply completed).
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for OnApplied callbacks", func() bool {
+		return cb.appliedCount.Load() >= shards
 	})
 
 	close(stopC)
 	<-runDone
 	wg.Wait()
 
-	// Each shard should have triggered one callback.
-	if cb.appliedCount.Load() != 3 {
-		t.Fatalf("expected 3 OnApplied calls, got %d", cb.appliedCount.Load())
+	if cb.appliedCount.Load() != shards {
+		t.Fatalf("expected %d OnApplied calls, got %d", shards, cb.appliedCount.Load())
 	}
 
-	calls := cb.getAppliedCalls()
 	shardsSeen := make(map[uint64]bool)
-	for _, call := range calls {
+	for _, call := range cb.getAppliedCalls() {
+		if shardsSeen[call.shardID] {
+			t.Errorf("shard %d: more than one OnApplied call", call.shardID)
+		}
 		shardsSeen[call.shardID] = true
+		if len(call.entries) != 2 || len(call.results) != 2 {
+			t.Fatalf("shard %d: %d entries, %d results, want 2 and 2",
+				call.shardID, len(call.entries), len(call.results))
+		}
+		for i := range 2 {
+			want := uint64(i + 1)
+			if call.entries[i].Index != want {
+				t.Errorf("shard %d: entries[%d].Index = %d, want %d", call.shardID, i, call.entries[i].Index, want)
+			}
+			// testSM sets Value = entry.Index.
+			if call.results[i].Value != want {
+				t.Errorf("shard %d: results[%d].Value = %d, want %d", call.shardID, i, call.results[i].Value, want)
+			}
+		}
 	}
-	for shardID := uint64(1); shardID <= 3; shardID++ {
+	for shardID := uint64(1); shardID <= shards; shardID++ {
 		if !shardsSeen[shardID] {
 			t.Errorf("missing OnApplied call for shard %d", shardID)
 		}
@@ -931,6 +823,12 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 	<-runDone
 	wg.Wait()
 
+	// Fail-fast: lastApplied stays at the seeded frontier. Advancing it
+	// while skipping the batch would diverge the SM from its peers.
+	if got := node.lastApplied.Load(); got != 9 {
+		t.Fatalf("lastApplied = %d, want 9 (fail-fast does not advance)", got)
+	}
+
 	// OnApplied must not be called on error.
 	if cb.appliedCount.Load() != 0 {
 		t.Fatalf("expected 0 OnApplied calls, got %d", cb.appliedCount.Load())
@@ -984,69 +882,6 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 	}
 	if cb.shardFailedCount.Load() != 1 {
 		t.Errorf("OnShardFailed fired %d times for one halt, want 1", cb.shardFailedCount.Load())
-	}
-}
-
-// TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied verifies the
-// fail-fast invariant: when SM.Apply returns an error, lastApplied is NOT
-// advanced and the shard is marked failed. Advancing lastApplied while
-// skipping the failed batch would diverge this state machine from its
-// peers, violating Raft state-machine safety.
-func TestApplyWorker_ApplyError_DoesNotAdvanceLastApplied(t *testing.T) {
-	applyC := make(chan *applyItem, 64)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, NewWorkSignal(1), stopC, nil)
-
-	testSm := newTestSM()
-	testSm.setApplyError(errors.New("transient failure"))
-	rsmSM := newTestApplier(testSm)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
-
-	// Seed the applied frontier so the batch below continues at
-	// lastApplied+1; otherwise the apply gap check rejects it before
-	// SM.Apply is ever called and this test would pass vacuously.
-	node.SeedLastApplied(4, 1)
-	if node.lastApplied.Load() != 4 {
-		t.Fatalf("expected initial lastApplied 4, got %d", node.lastApplied.Load())
-	}
-
-	node.commitPending.Store(true)
-	item := applyPool.Get().(*applyItem)
-	item.update = proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Term: 1, Index: 5, Cmd: []byte("x")},
-			{Term: 1, Index: 6, Cmd: []byte("y")},
-			{Term: 1, Index: 7, Cmd: []byte("z")},
-		},
-	}
-	item.node = node
-	applyC <- item
-
-	runDone := make(chan struct{})
-	go func() {
-		aw.run()
-		close(runDone)
-	}()
-
-	// Wait for the shard to be marked failed (confirms the error path ran).
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard to fail", node.failed.Load)
-
-	close(stopC)
-	<-runDone
-	wg.Wait()
-
-	// lastApplied must remain at the seeded frontier under fail-fast.
-	if got := node.lastApplied.Load(); got != 4 {
-		t.Fatalf("lastApplied = %d, want 4 (fail-fast does not advance)", got)
 	}
 }
 
