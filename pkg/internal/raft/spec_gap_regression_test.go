@@ -569,49 +569,28 @@ func TestSnapshotMembershipAtVotingCapIsAccepted(t *testing.T) {
 //
 // newRaft now refuses to build the replica, so NewPeer returns the error,
 // StartShard reports it as a HostInitError, and the host stays up with its
-// other shards running.
+// other shards running. This test asserts the NewPeer end of that chain.
 func TestOverCapStoredMembershipRefusesShardStartup(t *testing.T) {
 	overCap := make(map[uint64]string, maxVotingMembers+1)
 	for id := uint64(1); id <= uint64(maxVotingMembers)+1; id++ {
 		overCap[id] = fmt.Sprintf("addr%d", id)
 	}
 
-	r, err := newRaft(raftTestCfg(1, 1), newTestLogReaderWithMembership(overCap))
+	// The refusal has to reach the caller StartShard actually uses, because
+	// that is what decides whether the host survives. The constructor's own
+	// refusal, and its acceptance of exactly the maximum, are asserted by
+	// TestBecomeLeader_RefusesTooManyVotingMembers and
+	// TestBecomeLeader_SucceedsWithExactly64VotingMembers.
+	peer, err := NewPeer(raftTestCfg(1, 1), newTestLogReaderWithMembership(overCap), nil)
 	if !errors.Is(err, ErrTooManyVotingMembers) {
-		t.Fatalf("newRaft with a stored %d-voter membership returned %v, want "+
+		t.Fatalf("NewPeer with a stored %d-voter membership returned %v, want "+
 			"ErrTooManyVotingMembers: the replica is built and panics the step "+
 			"worker the moment it campaigns, on every restart",
 			maxVotingMembers+1, err)
 	}
-	if r != nil {
-		t.Fatal("a raft was returned alongside the error: a half-built replica " +
-			"with an untrackable voting set must not escape the constructor")
-	}
-
-	// The same refusal has to reach the caller StartShard actually uses,
-	// because that is what decides whether the host survives.
-	peer, err := NewPeer(raftTestCfg(1, 1), newTestLogReaderWithMembership(overCap), nil)
-	if !errors.Is(err, ErrTooManyVotingMembers) {
-		t.Fatalf("NewPeer returned %v, want ErrTooManyVotingMembers", err)
-	}
 	if peer != nil {
-		t.Fatal("NewPeer returned a peer alongside the error")
-	}
-
-	// The bound is not off by one: a shard running the maximum supported
-	// configuration must still start.
-	atCap := make(map[uint64]string, maxVotingMembers)
-	for id := uint64(1); id <= uint64(maxVotingMembers); id++ {
-		atCap[id] = fmt.Sprintf("addr%d", id)
-	}
-	okRaft, err := newRaft(raftTestCfg(1, 1), newTestLogReaderWithMembership(atCap))
-	if err != nil {
-		t.Fatalf("newRaft with a stored %d-voter membership returned %v, want "+
-			"success: a shard at the supported maximum cannot be started",
-			maxVotingMembers, err)
-	}
-	if okRaft == nil {
-		t.Fatal("newRaft returned no raft and no error")
+		t.Fatal("NewPeer returned a peer alongside the error: a half-built " +
+			"replica with an untrackable voting set must not escape the constructor")
 	}
 }
 
