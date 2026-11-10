@@ -80,12 +80,27 @@ func staleTailFixture(t *testing.T) (*Peer, *failingReadLogReader) {
 // regression. The state machine reports lastApplied 31, so SetProcessedIndex
 // pushes processed to 31 — but the log cannot be read, so nothing is folded. The
 // replica must NOT then decide its configuration is current.
+//
+// It also pins the distinction the return value has to make. A window this
+// replica could not READ is not a window it can never read: the commit pipeline
+// or resolveStaleStartupConfig may cover it later, so it arms the watermark and
+// reports no error. Only "these committed bytes will never decode" is terminal
+// (TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry); otherwise every
+// transient log-read failure at startup would refuse to start the shard.
 func TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign(t *testing.T) {
 	quietLogs(t)
 
 	p, lr := staleTailFixture(t)
 	lr.failing = true
-	p.SetProcessedIndex(31)
+	applied, err := p.SetProcessedIndex(31)
+	if err != nil {
+		t.Fatalf("SetProcessedIndex over an UNREADABLE (not corrupt) tail returned "+
+			"%v; a transient read failure must arm the watermark and let the shard "+
+			"start, or every such failure becomes a refusal to load the shard", err)
+	}
+	if applied != 31 {
+		t.Fatalf("applied = %d, want 31", applied)
+	}
 
 	if p.membership.isVoter(4) {
 		t.Fatal("fixture: the unreadable fold must not have added replica 4")
@@ -111,12 +126,25 @@ func TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign(t *testing.T
 // TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign is the POSITIVE
 // CONTROL. With a readable log the identical sequence must fold the tail, clear
 // the watermark, and campaign against the RESOLVED 4-voter set — otherwise the
-// gate is just a permanent election block.
+// gate is just a permanent election block. It is also the positive control of
+// TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry: a readable tail
+// reports no error and records no unfolded configuration, so that assertion is
+// not satisfied by a method that returns an error unconditionally.
 func TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign(t *testing.T) {
 	quietLogs(t)
 
 	p, _ := staleTailFixture(t)
-	p.SetProcessedIndex(31)
+	applied, err := p.SetProcessedIndex(31)
+	if err != nil {
+		t.Fatalf("SetProcessedIndex over a readable tail: %v; a shard whose log is "+
+			"intact must start", err)
+	}
+	if applied != 31 {
+		t.Fatalf("applied = %d, want 31", applied)
+	}
+	if c := p.UnfoldedConfig(); c.Recorded() {
+		t.Fatalf("UnfoldedConfig = %+v after a complete fold, want none", c)
+	}
 
 	if !p.membership.isVoter(4) {
 		t.Fatal("a readable fold did not add replica 4: SetProcessedIndex must " +
