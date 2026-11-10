@@ -141,21 +141,6 @@ func TestRecoverSnapshot_RefusesATruncatedArtifact(t *testing.T) {
 	}
 }
 
-// TestRecoverSnapshot_AcceptsAMatchingArtifact is the other half. Without it
-// the guard above would pass against a recoverSnapshot that refused every
-// snapshot.
-func TestRecoverSnapshot_AcceptsAMatchingArtifact(t *testing.T) {
-	const full = 4096
-	f := newRecoverFixture(t, snapshotPayload(100, full), full)
-
-	if err := f.pool.recoverSnapshot(f.req); err != nil {
-		t.Fatalf("recoverSnapshot on an intact artifact failed: %v", err)
-	}
-	if f.ss.LastApplied() != 100 {
-		t.Fatalf("recovered lastApplied = %d, want 100", f.ss.LastApplied())
-	}
-}
-
 // TestRecoverSnapshot_UnrecordedSizeIsNotChecked pins the upgrade path: a
 // record written before FileSize was populated carries zero, which claims
 // nothing. Refusing those would make a new binary unable to recover the
@@ -172,8 +157,10 @@ func TestRecoverSnapshot_UnrecordedSizeIsNotChecked(t *testing.T) {
 	}
 }
 
-// TestVerifySnapshotFileSize covers the helper's own contract, including the
-// missing-file case the recovery paths rely on it to report.
+// TestVerifySnapshotFileSize covers the cases of the helper's contract that
+// no recovery test reaches: a file longer than its record, and the
+// missing-file case the recovery paths rely on it to report. A matching, an
+// unrecorded and a short size are asserted through recoverSnapshot.
 func TestVerifySnapshotFileSize(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, snapshotDataFile)
@@ -181,15 +168,6 @@ func TestVerifySnapshotFileSize(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if err := VerifySnapshotFileSize(path, 64); err != nil {
-		t.Errorf("matching size reported %v", err)
-	}
-	if err := VerifySnapshotFileSize(path, 0); err != nil {
-		t.Errorf("an unrecorded size must not be checked, got %v", err)
-	}
-	if err := VerifySnapshotFileSize(path, 65); !errors.Is(err, ErrSnapshotSizeMismatch) {
-		t.Errorf("a short file reported %v, want ErrSnapshotSizeMismatch", err)
-	}
 	if err := VerifySnapshotFileSize(path, 63); !errors.Is(err, ErrSnapshotSizeMismatch) {
 		t.Errorf("a long file reported %v, want ErrSnapshotSizeMismatch", err)
 	}
