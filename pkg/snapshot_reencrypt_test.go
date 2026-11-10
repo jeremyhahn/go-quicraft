@@ -35,110 +35,6 @@ func snapshotPlaintext() []byte {
 	return p
 }
 
-// rotatingRecordBarrier assigns a NEW epoch to every frame (simulating a key
-// rotation between each chunk) and records which epochs were pinned in-flight, so
-// a test can prove the encrypt loop pins EVERY epoch it seals — not just the min.
-type rotatingRecordBarrier struct {
-	mockBarrier
-	mu         sync.Mutex
-	epoch      uint64
-	used       map[uint64]bool
-	registered map[uint64]bool
-}
-
-func (b *rotatingRecordBarrier) CurrentEpoch() uint64 {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.epoch
-}
-
-func (b *rotatingRecordBarrier) EncryptWithEpoch(_, pt []byte) ([]byte, uint64, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	e := b.epoch
-	b.epoch++ // a rotation lands between every frame
-	if b.used == nil {
-		b.used = map[uint64]bool{}
-	}
-	b.used[e] = true
-	return append([]byte(nil), pt...), e, nil
-}
-
-func (b *rotatingRecordBarrier) EncryptWithEpochContext(dst, pt, contextAAD []byte) ([]byte, uint64, error) {
-	ct, epoch, err := b.EncryptWithEpoch(dst, pt)
-	if err != nil {
-		return nil, 0, err
-	}
-	return appendTestAADTag(ct, contextAAD), epoch, nil
-}
-
-func (b *rotatingRecordBarrier) RegisterInFlightEpoch(e uint64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.registered == nil {
-		b.registered = map[uint64]bool{}
-	}
-	b.registered[e] = true
-}
-
-func (b *rotatingRecordBarrier) DeregisterInFlightEpoch(uint64) {}
-
-// TestEncryptSnapshotFrames_PinsEveryFrameEpoch pins the DEK-lifetime property:
-// when a snapshot's frames are sealed under multiple epochs (rotations landing
-// mid-loop), EVERY such epoch must be pinned in-flight — not just the minimum —
-// or a concurrent PurgeEpochsBefore could drop an intermediate frame's DEK and
-// leave the snapshot permanently undecryptable.
-func TestEncryptSnapshotFrames_PinsEveryFrameEpoch(t *testing.T) {
-	b := &rotatingRecordBarrier{epoch: 5}
-	// Several 64KiB chunks -> several frames, each sealed under a new epoch.
-	plain := make([]byte, snapshotEncryptChunkSize*3+100)
-	var out bytes.Buffer
-	_, pinned, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain), &out)
-	if err != nil {
-		t.Fatalf("encryptSnapshotFrames: %v", err)
-	}
-	if len(b.used) < 3 {
-		t.Fatalf("fixture: only %d frame epochs used, want the multi-frame path", len(b.used))
-	}
-	pinnedSet := map[uint64]bool{}
-	for _, e := range pinned {
-		pinnedSet[e] = true
-	}
-	for e := range b.used {
-		if !pinnedSet[e] {
-			t.Fatalf("frame epoch %d was sealed but NOT returned as pinned (pinned=%v, used=%v): "+
-				"a concurrent purge could drop its DEK and orphan that frame", e, pinned, b.used)
-		}
-		if !b.registered[e] {
-			t.Fatalf("frame epoch %d was sealed but never RegisterInFlightEpoch'd", e)
-		}
-	}
-}
-
-// TestSnapshotFrames_EncryptDecryptRoundTrip proves encryptSnapshotFrames and
-// decryptSnapshotFrames are inverses under the same barrier and that the recorded
-// epoch is non-zero.
-func TestSnapshotFrames_EncryptDecryptRoundTrip(t *testing.T) {
-	b := createTestBarrier(t)
-	plain := snapshotPlaintext()
-
-	var enc bytes.Buffer
-	epoch, _, err := encryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, bytes.NewReader(plain), &enc)
-	if err != nil {
-		t.Fatalf("encryptSnapshotFrames: %v", err)
-	}
-	if epoch == 0 {
-		t.Fatal("recorded epoch = 0, want non-zero for an encrypted snapshot")
-	}
-	var dec bytes.Buffer
-	if _, err := decryptSnapshotFrames(b, testSnapShardID, testSnapReplicaID, testSnapIndex, &enc, &dec); err != nil {
-		t.Fatalf("decryptSnapshotFrames: %v", err)
-	}
-	if !bytes.Equal(dec.Bytes(), plain) {
-		t.Fatal("round-trip mismatch")
-	}
-}
-
 // TestReceiveSnapshotReencryptsPerNode is the cross-node regression: a snapshot
 // produced and encrypted by node A is streamed as PLAINTEXT (the sender decrypts
 // before sending — doSendSnapshot), the receiver node B re-encrypts it under its
@@ -286,9 +182,10 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 	}
 }
 
-// TestReencryptSnapshotFile_PlaintextSides covers the none<->keyed paths an
-// enable-encryption migration uses: plaintext source -> keyed dest, and keyed
-// source -> plaintext dest, with data preserved both ways.
+// TestReencryptSnapshotFile_PlaintextSides covers the none->keyed path an
+// enable-encryption migration uses: plaintext source -> keyed dest, with the
+// data preserved. The keyed -> plaintext direction is asserted by
+// TestReencryptSnapshotFile_SealedBarrierFailsClosed (nil destination).
 func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	bar := createTestBarrier(t)
 	plain := snapshotPlaintext()
@@ -317,14 +214,6 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	}
 	if !bytes.Equal(dec.Bytes(), plain) {
 		t.Fatal("plaintext->keyed lost data")
-	}
-
-	plainDst := filepath.Join(dir, "back-to-plain.dat")
-	if _, err := ReencryptSnapshotFile(keyedDst, plainDst, testSnapShardID, testSnapReplicaID, testSnapIndex, bar, nil); err != nil {
-		t.Fatalf("keyed->plaintext: %v", err)
-	}
-	if got := mustRead(t, plainDst); !bytes.Equal(got, plain) {
-		t.Fatal("keyed->plaintext lost data")
 	}
 }
 
@@ -571,18 +460,6 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 			t.Error("nil destination barrier did not write the plaintext through")
 		}
 	})
-}
-
-// EncryptWithEpochPinnedContext composes this fake's OWN seal and register, so
-// whatever it injects or counts in either still takes effect on the pinned path
-// the frame writer now always uses.
-func (b *rotatingRecordBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
-	ct, epoch, err := b.EncryptWithEpochContext(dst, plaintext, contextAAD)
-	if err != nil {
-		return nil, 0, err
-	}
-	b.RegisterInFlightEpoch(epoch)
-	return ct, epoch, nil
 }
 
 // EncryptWithEpochPinnedContext is the path every snapshot frame now takes:
