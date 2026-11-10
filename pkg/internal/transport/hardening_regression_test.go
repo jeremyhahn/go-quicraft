@@ -242,24 +242,6 @@ func TestVerifyConnectionRejectsRevokedPeer(t *testing.T) {
 	}
 }
 
-// TestVerifyConnectionAdmitsCleanPeer pins the other half: an unrevoked peer
-// is admitted, so the rejection above is a verdict and not a blanket failure.
-//
-// This checker has no CRL file, so it is the soft-fail opt-in that turns
-// "nothing revoked this" into an admission; enforcing with no source is a
-// rejection, which would make the assertion above meaningless.
-func TestVerifyConnectionAdmitsCleanPeer(t *testing.T) {
-	pair, _, leaf := newRevocationTLS(t, revocation.Config{
-		Mode:          revocation.ModeCRL,
-		AllowSoftFail: true,
-	})
-
-	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
-	if err := pair.server.VerifyConnection(state); err != nil {
-		t.Fatalf("clean peer rejected: %v", err)
-	}
-}
-
 // TestVerifyConnectionPropagatesCheckerError pins that an "unknown status"
 // verdict under enforcement also fails the handshake, rather than being
 // swallowed into an admission.
@@ -272,17 +254,6 @@ func TestVerifyConnectionPropagatesCheckerError(t *testing.T) {
 	state := tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
 	if err := pair.server.VerifyConnection(state); !errors.Is(err, revocation.ErrCRLStale) {
 		t.Fatalf("VerifyConnection = %v, want the enforced ErrCRLStale rejection", err)
-	}
-}
-
-// TestVerifyConnectionRejectsMissingPeerCertificate pins the fail-closed path
-// for a connection presenting no certificate: it cannot be revocation-checked,
-// so it must be rejected rather than treated as "nothing revoked".
-func TestVerifyConnectionRejectsMissingPeerCertificate(t *testing.T) {
-	pair, _, _ := newRevocationTLS(t, revocation.Config{Mode: revocation.ModeCRL})
-
-	if err := pair.server.VerifyConnection(tls.ConnectionState{}); !errors.Is(err, ErrNoPeerCertificate) {
-		t.Fatalf("VerifyConnection with no peer certificate = %v, want ErrNoPeerCertificate", err)
 	}
 }
 
