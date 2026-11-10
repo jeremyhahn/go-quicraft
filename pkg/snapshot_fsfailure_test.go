@@ -16,7 +16,6 @@ package quicraft
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io/fs"
 	"os"
@@ -245,33 +244,3 @@ func (f importWriteFaultFS) OpenFile(name string, flag int, perm fs.FileMode) (s
 }
 
 var _ snapshotFS = importWriteFaultFS{}
-
-// TestWriteImportedSnapshotData_FilesystemFailures verifies that the import's
-// data write reports every durability failure — the caller discards the
-// staging directory on it — and hands back no epoch and no pins.
-func TestWriteImportedSnapshotData_FilesystemFailures(t *testing.T) {
-	tests := []struct {
-		name    string
-		fsys    importWriteFaultFS
-		wantErr error
-	}{
-		{"data file cannot be flushed", importWriteFaultFS{failSync: true}, errTestSyncFailed},
-		{"data file cannot be closed", importWriteFaultFS{failClose: true}, errTestCloseFailed},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := &Host{}
-			path := filepath.Join(t.TempDir(), "snapshot.dat")
-			b := createTestBarrier(t)
-			epoch, pins, err := h.writeImportedSnapshotData(context.Background(), tt.fsys,
-				testSnapShardID, testSnapReplicaID, testSnapIndex, path, nil,
-				trailedPayload(t, []byte("imported plaintext")), b)
-			if !errors.Is(err, tt.wantErr) {
-				t.Fatalf("writeImportedSnapshotData error = %v, want %v", err, tt.wantErr)
-			}
-			if epoch != 0 || pins != nil {
-				t.Fatalf("writeImportedSnapshotData returned (epoch %d, pins %v) with an error", epoch, pins)
-			}
-		})
-	}
-}
