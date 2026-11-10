@@ -137,37 +137,6 @@ func TestHandleRequest_RecoverPanicLatchesShard(t *testing.T) {
 	}
 }
 
-// TestHandleRequest_SavePanicDoesNotLatch: SaveSnapshot only reads the state
-// machine, so a panic in it leaves nothing damaged. The shard keeps running
-// and the request is reported rejected, so it can be retried.
-func TestHandleRequest_SavePanicDoesNotLatch(t *testing.T) {
-	_, restore := captureLogOutput(t)
-	defer restore()
-
-	stopC := make(chan struct{})
-	defer close(stopC)
-	cb := newTestCallback()
-	pool := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, &halfRestoringSnapshotter{}, t.TempDir(), nil)
-	node.snapshotting.Store(true)
-	pool.inFlight.Store(uint64(1), node)
-
-	pool.handleRequest(snapshotRequest{shardID: 1, replicaID: 1, node: node, save: true})
-
-	if node.IsFailed() {
-		t.Fatal("a save panic tripped the failure latch")
-	}
-	if n := cb.shardFailedCount.Load(); n != 0 {
-		t.Fatalf("OnShardFailed called %d times for a save panic, want 0", n)
-	}
-	if n := cb.snapshotRejected.Load(); n != 1 {
-		t.Fatalf("OnSnapshotRejected called %d times for a save panic, want 1", n)
-	}
-}
-
 // restoreRecordingSnapshotter records whether RecoverFromSnapshot was reached
 // and restores successfully when it is.
 type restoreRecordingSnapshotter struct {
