@@ -25,12 +25,12 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestHandleMessage_ForgedInstallSnapshotCannotRewriteMembership is the
-// end-to-end regression test. It drives the full inbound path a remote peer
-// actually has — hostMessageHandler.HandleMessage (what the transport calls
-// with a decoded MessageBatch) into the engine inbox into the step worker into
-// Peer.Handle — with one crafted message and asserts the shard's membership,
-// the set quorum() is computed over, is untouched.
+// TestHandleMessage_ForgedProcessLocalTypesAreNotStepped is the end-to-end
+// regression test. It drives the full inbound path a remote peer actually has
+// — hostMessageHandler.HandleMessage (what the transport calls with a decoded
+// MessageBatch) into the engine inbox into the step worker into Peer.Handle —
+// and asserts the shard's membership, the set quorum() is computed over, is
+// untouched.
 //
 // The attack it reproduces needs nothing but a CA-signed cluster certificate:
 //
@@ -45,80 +45,13 @@ import (
 // this" and adopted the attacker's Membership because its ConfigChangeID was
 // larger. Repeated per follower it hands the attacker both the commit and the
 // election quorum.
-func TestHandleMessage_ForgedInstallSnapshotCannotRewriteMembership(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	ldb := memdb.New()
-	eng := engine.NewEngine(cfg, ldb, &noopSender{}, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	h := &Host{cfg: cfg, logdb: ldb, registry: registry.NewRegistry()}
-	handler := &hostMessageHandler{engine: eng, host: h}
-
-	const shardID, victim, attacker = uint64(31), uint64(1), uint64(2)
-	voters := map[uint64]string{victim: "127.0.0.1:6001", attacker: "127.0.0.1:6002", 3: "127.0.0.1:6003"}
-	node := newEngineNodeWithMembership(t, shardID, victim, voters)
-	eng.LoadNode(node)
-	defer eng.UnloadNode(shardID)
-
-	forged := proto.MessageBatch{
-		SourceAddress: "127.0.0.1:6002",
-		Requests: []proto.Message{{
-			Type:    proto.InstallSnapshot,
-			From:    attacker, // an authenticated member: IsMember passes
-			To:      victim,   // correctly addressed: the To check passes
-			ShardID: shardID,
-			Term:    0, // skips the entire term-transition block in step
-			Snapshot: proto.Snapshot{
-				Index: 1, // at or below committed: handleSnapshot returns nil
-				Term:  1,
-				Membership: proto.Membership{
-					ConfigChangeID: 1 << 62, // beats any real ConfigChangeID
-					Addresses:      map[uint64]string{attacker: "attacker"},
-				},
-			},
-		}},
-	}
-	if err := handler.HandleMessage(forged, authorizeAllSenders); err != nil {
-		t.Fatalf("HandleMessage: %v", err)
-	}
-
-	// The step worker drains asynchronously. Give it a real window to do the
-	// damage rather than racing it: the assertions below must hold after the
-	// message has certainly been stepped.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if !node.IsMember(3) {
-			break
-		}
-		// Kept: no removal across this window is the behaviour under test.
-		time.Sleep(5 * time.Millisecond)
-	}
-
-	for _, replicaID := range []uint64{victim, attacker, 3} {
-		if !node.IsMember(replicaID) {
-			t.Fatalf("replica %d was removed from the shard membership by a forged "+
-				"wire InstallSnapshot: quorum is now computed over the attacker's "+
-				"configuration", replicaID)
-		}
-	}
-}
-
-// TestHandleMessage_ForgedProcessLocalTypesAreNotStepped covers the rest of
-// the class. localControlMessages exempts Propose, ReadIndex,
-// InstallSnapshot, SnapshotStatus, Unreachable and LeaderTransfer from the
-// term gate; all six decode off the wire, and HandleMessage applies no type
-// filter. Delivering each of them from a "member" must leave the shard's
-// membership intact and must not take the shard down.
+//
+// The forged InstallSnapshot is one of six cases. localControlMessages exempts
+// Propose, ReadIndex, InstallSnapshot, SnapshotStatus, Unreachable and
+// LeaderTransfer from the term gate; all six decode off the wire, and
+// HandleMessage applies no type filter. Delivering each of them from a
+// "member" must leave the shard's membership intact and must not take the
+// shard down.
 func TestHandleMessage_ForgedProcessLocalTypesAreNotStepped(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
