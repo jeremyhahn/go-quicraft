@@ -74,7 +74,11 @@ func TestSaveState_RolledBackBatchDoesNotLowerEpochFloor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if db != nil {
+			_ = db.Close()
+		}
+	}()
 
 	const shardID, replicaID = uint64(1), uint64(1)
 	shard := db.getShard(shardID)
@@ -157,6 +161,33 @@ func TestSaveState_RolledBackBatchDoesNotLowerEpochFloor(t *testing.T) {
 	if epoch != 2 {
 		t.Fatalf("MinLiveEpoch = %d, want 2: only epoch-2 records exist, but the "+
 			"rolled-back batch left epoch %d pinned forever", epoch, epoch)
+	}
+
+	// The floor replay rebuilds from the ciphertext headers on disk must
+	// agree with the live one: the rolled-back batch's bytes were truncated,
+	// so a restart finds only the epoch-2 records too.
+	closeErr := db.Close()
+	db = nil
+	if closeErr != nil {
+		t.Fatalf("Close: %v", closeErr)
+	}
+	reopened, err := Open(dir,
+		WithBlockSize(1024),
+		WithMaxFileSize(64*1024),
+		WithBarrier(barrier),
+	)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	recoveredEpoch, err := reopened.MinLiveEpoch()
+	if err != nil {
+		t.Fatalf("MinLiveEpoch after reopen: %v", err)
+	}
+	if recoveredEpoch != epoch {
+		t.Fatalf("MinLiveEpoch = %d live but %d after replay: the in-memory floor "+
+			"disagrees with the ciphertext headers on disk", epoch, recoveredEpoch)
 	}
 }
 
@@ -260,103 +291,5 @@ func TestEpochFloorTracksCommittedWrites(t *testing.T) {
 					activeSegID, got, ok)
 			}
 		})
-	}
-}
-
-// TestEpochFloorSurvivesRestartAfterRollback verifies the floor the writers
-// maintain in memory agrees with what recovery derives from the ciphertext
-// headers on disk, which is the ground truth. A rolled-back batch leaves
-// nothing on disk, so replay must land on the same floor the live shard
-// reports.
-func TestEpochFloorSurvivesRestartAfterRollback(t *testing.T) {
-	barrier := newTestBarrier(t)
-	dir := t.TempDir()
-	db, err := Open(dir,
-		WithBlockSize(1024),
-		WithMaxFileSize(64*1024),
-		WithBarrier(barrier),
-	)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-
-	const shardID, replicaID = uint64(1), uint64(1)
-	shard := db.getShard(shardID)
-
-	shard.mu.Lock()
-	ensErr := shard.ensureActiveSegment()
-	shard.mu.Unlock()
-	if ensErr != nil {
-		t.Fatalf("ensureActiveSegment: %v", ensErr)
-	}
-
-	simulated := errors.New("simulated EIO on block flush")
-	shard.mu.Lock()
-	realFile := shard.activeSegment.f
-	shard.activeSegment.f = &failingWriteAtFile{
-		File: realFile, writeErr: simulated, failAfter: 0,
-	}
-	shard.mu.Unlock()
-
-	if err := db.SaveState([]logdb.Update{
-		{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			State:     logdb.State{Term: 1, Vote: 1, Commit: 1},
-			Entries:   makeEntries(1, 3, 1),
-		},
-		{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			Entries: []logdb.Entry{
-				{Index: 4, Term: 1, Cmd: bytes.Repeat([]byte("x"), 8*1024)},
-			},
-		},
-	}); !errors.Is(err, simulated) {
-		t.Fatalf("SaveState = %v, want the injected write error", err)
-	}
-
-	shard.mu.Lock()
-	shard.activeSegment.f = realFile
-	shard.mu.Unlock()
-
-	rotateBarrierTo(t, db, 2)
-	if err := db.SaveState([]logdb.Update{{
-		ShardID:   shardID,
-		ReplicaID: replicaID,
-		State:     logdb.State{Term: 2, Vote: 1, Commit: 1},
-		Entries:   makeEntries(1, 3, 2),
-	}}); err != nil {
-		t.Fatalf("SaveState after rollback: %v", err)
-	}
-
-	liveEpoch, err := db.MinLiveEpoch()
-	if err != nil {
-		t.Fatalf("MinLiveEpoch: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	reopened, err := Open(dir,
-		WithBlockSize(1024),
-		WithMaxFileSize(64*1024),
-		WithBarrier(barrier),
-	)
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer reopened.Close()
-
-	recoveredEpoch, err := reopened.MinLiveEpoch()
-	if err != nil {
-		t.Fatalf("MinLiveEpoch after reopen: %v", err)
-	}
-	if recoveredEpoch != liveEpoch {
-		t.Fatalf("MinLiveEpoch = %d live but %d after replay: the in-memory floor "+
-			"disagrees with the ciphertext headers on disk", liveEpoch, recoveredEpoch)
-	}
-	if recoveredEpoch != 2 {
-		t.Fatalf("MinLiveEpoch after replay = %d, want 2", recoveredEpoch)
 	}
 }
