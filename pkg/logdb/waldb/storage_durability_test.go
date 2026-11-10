@@ -346,24 +346,18 @@ func TestSaveSnapshot_RejectsOversizedMembership(t *testing.T) {
 // silently on uint64 overflow), so a stray file could be adopted as a segment
 // or make an unrelated ID look live.
 func TestParseSegmentFilename_RequiresCanonicalForm(t *testing.T) {
-	valid := map[string]uint64{
-		"000000.log":  0,
-		"000001.log":  1,
-		"999999.log":  999999,
-		"1000000.log": 1000000,
-	}
-	for name, want := range valid {
-		got, ok := parseSegmentFilename(name)
-		if !ok || got != want {
-			t.Errorf("parseSegmentFilename(%q) = %d, %v; want %d, true", name, got, ok, want)
-		}
+	// The canonical-width, short, seven-digit-padded and plain uint64-overflow
+	// names are cases of TestParseSegmentFilename (compaction_test.go). The
+	// cases here are the ones only this regression reaches: an ID that has
+	// outgrown the canonical width, padding far beyond it, and an overflow
+	// that a wrapping parser reads back as a small live ID.
+	const sevenDigits = "1000000.log"
+	if got, ok := parseSegmentFilename(sevenDigits); !ok || got != 1000000 {
+		t.Errorf("parseSegmentFilename(%q) = %d, %v; want 1000000, true", sevenDigits, got, ok)
 	}
 
 	invalid := []string{
 		"00000000000000000001.log",  // padded beyond the canonical width
-		"0000001.log",               // seven digits with a leading zero
-		"1.log",                     // shorter than the canonical width
-		"99999999999999999999.log",  // overflows uint64
 		"184467440737095516151.log", // overflows uint64 (a wrapping parser reads 1)
 	}
 	for _, name := range invalid {
