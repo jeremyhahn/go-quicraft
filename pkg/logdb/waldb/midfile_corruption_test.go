@@ -83,74 +83,12 @@ func writeSegmentRecords(t *testing.T, dir string, id uint64, blockSize, n, recS
 	return filepath.Join(dir, segmentFilename(id))
 }
 
-// TestReadAll_CorruptionWithValidDataAfterIsNotATornTail pins the mid-file
-// corruption detection in segment.ReadAll.
-//
-// A ReadAll that returned at the FIRST decode failure without looking at
-// anything below it would make every corruption indistinguishable from a torn
-// tail. recover() would then truncate the file to the clean prefix and fsync,
-// making the loss permanent: one flipped bit early in a 64 MiB active segment
-// would discard everything after it — thousands of already-acknowledged
-// entries plus the newest HardState.
-//
-// The zero-hole path has always applied the correct test (does data FOLLOW the
-// suspect region?); this asserts the CRC path applies it too.
-func TestReadAll_CorruptionWithValidDataAfterIsNotATornTail(t *testing.T) {
-	dir := t.TempDir()
-	const (
-		blockSize = 1024
-		total     = 60
-		recSize   = 200
-	)
-	path := writeSegmentRecords(t, dir, 1, blockSize, total, recSize)
-
-	// Baseline: the intact segment reads back every record.
-	intact := openSegmentForTest(t, dir, 1, blockSize)
-	baseline, _, err := intact.ReadAll()
-	intact.Close()
-	if err != nil {
-		t.Fatalf("ReadAll (intact): %v", err)
-	}
-	if len(baseline) != total {
-		t.Fatalf("fixture: intact segment read %d records, want %d", len(baseline), total)
-	}
-
-	// Flip one bit inside a record in the SECOND block. Ten more blocks of
-	// valid records follow it.
-	flipByteAt(t, path, int64(blockSize)+100)
-
-	seg := openSegmentForTest(t, dir, 1, blockSize)
-	defer seg.Close()
-	records, cleanEnd, err := seg.ReadAll()
-	if err != nil {
-		t.Fatalf("ReadAll (corrupt): %v", err)
-	}
-
-	if !seg.stoppedAtCorruption {
-		t.Fatal("a flipped bit inside a record was not detected as corruption")
-	}
-	if !seg.ackedDataAfterCorruption {
-		t.Fatalf("ReadAll stopped at the corruption at ~%d and reported it as a torn "+
-			"tail even though %d valid records follow it in later blocks; recovery "+
-			"would truncate the segment there and permanently destroy every "+
-			"acknowledged record after the flipped bit (clean prefix was %d of %d "+
-			"records, clean end %d)",
-			blockSize+100, total-len(records), len(records), total, cleanEnd)
-	}
-	if len(records) >= total {
-		t.Fatalf("ReadAll returned %d of %d records across corruption: records after "+
-			"the corrupt one were replayed", len(records), total)
-	}
-	if cleanEnd < int64(blockSize) || cleanEnd >= int64(2*blockSize) {
-		t.Fatalf("clean end %d is not inside the corrupt block [%d,%d)",
-			cleanEnd, blockSize, 2*blockSize)
-	}
-}
-
-// TestReadAll_TornTailIsStillATornTail is the counterweight to the test above:
-// corruption with NOTHING decodable after it is a genuinely interrupted write,
-// and recovery must still be allowed to repair it by truncation. Without this,
-// the mid-file fix would turn every ordinary crash into an unbootable node.
+// TestReadAll_TornTailIsStillATornTail is the counterweight to
+// TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating, which fails
+// stop on a flipped bit that valid records follow: corruption with NOTHING
+// decodable after it is a genuinely interrupted write, and recovery must still
+// be allowed to repair it by truncation. Without this, the mid-file fix would
+// turn every ordinary crash into an unbootable node.
 func TestReadAll_TornTailIsStillATornTail(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -266,9 +204,12 @@ func TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating(t *testing.T) {
 		t.Fatalf("corruption reported at shard %d segment %d, want shard %d segment 0",
 			corrupt.ShardIndex, corrupt.SegmentID, shardID%DefaultShardCount)
 	}
-	if corrupt.CleanEnd <= 0 || corrupt.CleanEnd >= sizeBefore {
-		t.Fatalf("clean end %d is not inside the segment (size %d)",
-			corrupt.CleanEnd, sizeBefore)
+	// The clean end is the start of the damaged record, so it lies in the block
+	// that holds the flipped bit: the valid records in the blocks above it are
+	// what makes this mid-segment corruption and not a torn tail.
+	if corrupt.CleanEnd < int64(blockSize) || corrupt.CleanEnd >= int64(2*blockSize) {
+		t.Fatalf("clean end %d is not inside the corrupt block [%d,%d) (size %d)",
+			corrupt.CleanEnd, blockSize, 2*blockSize, sizeBefore)
 	}
 }
 
