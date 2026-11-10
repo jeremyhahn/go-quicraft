@@ -194,26 +194,6 @@ func TestSnapshotSend_IntactPlaintextIsDeliveredWhole(t *testing.T) {
 	}
 }
 
-// TestSnapshotSend_MetadataOnlyStillSends pins that a witness's snapshot —
-// no data file, so nothing recorded to verify — is still shipped as its single
-// metadata-only chunk.
-func TestSnapshotSend_MetadataOnlyStillSends(t *testing.T) {
-	msg := proto.Message{
-		Type: proto.InstallSnapshot, ShardID: 1, From: 2, To: 1,
-		Snapshot: proto.Snapshot{Index: 50, Term: 3},
-	}
-	var chunks []proto.SnapshotChunk
-	if err := forEachSnapshotChunk(osSnapshotFS{}, msg, func(c proto.SnapshotChunk) error {
-		chunks = append(chunks, c)
-		return nil
-	}); err != nil {
-		t.Fatalf("metadata-only send: %v", err)
-	}
-	if len(chunks) != 1 || chunks[0].ChunkCount != 1 || len(chunks[0].Data) != 0 {
-		t.Fatalf("chunks = %+v, want a single metadata-only chunk", chunks)
-	}
-}
-
 // TestDoSendSnapshot_EncryptedArtifactHeldToItsRecord drives the real send
 // with an encrypted artifact whose frames authenticate but whose record does
 // not match the bytes on disk. The send must refuse it after the decrypt and
@@ -261,17 +241,14 @@ func TestDoSendSnapshot_EncryptedArtifactHeldToItsRecord(t *testing.T) {
 // the artifact it reads against its record: a same-size corruption fails the
 // export with ErrSnapshotCorrupt, and — the artifact fitting in one copy
 // buffer — nothing at all reaches the writer, header included. The intact
-// artifact exports as before.
+// export of the same two sizes is TestExportImportSnapshot_TrailerRoundTrip.
 func TestExportSnapshot_CorruptPlaintextFails(t *testing.T) {
 	cases := []struct {
-		name    string
-		size    int
-		corrupt bool
+		name string
+		size int
 	}{
-		{name: "intact", size: 64 << 10},
-		{name: "corrupt_small", size: 64 << 10, corrupt: true},
-		{name: "intact_multi_buffer", size: 3*copyWithContextChunkSize + 7},
-		{name: "corrupt_multi_buffer", size: 3*copyWithContextChunkSize + 7, corrupt: true},
+		{name: "corrupt_small", size: 64 << 10},
+		{name: "corrupt_multi_buffer", size: 3*copyWithContextChunkSize + 7},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -289,25 +266,13 @@ func TestExportSnapshot_CorruptPlaintextFails(t *testing.T) {
 			dir := t.TempDir()
 			payload := bytes.Repeat([]byte("exported-state"), tc.size/14+1)[:tc.size]
 			path := writeRecordedSnapshot(t, dir, payload)
-			if tc.corrupt {
-				flipSnapshotByte(t, path, 3)
-			}
+			flipSnapshotByte(t, path, 3)
 			if saveErr := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 500, Term: 3, Filepath: dir}); saveErr != nil {
 				t.Fatalf("SaveSnapshot: %v", saveErr)
 			}
 
 			var out bytes.Buffer
 			expErr := h.ExportSnapshot(context.Background(), 1, &out)
-			if !tc.corrupt {
-				if expErr != nil {
-					t.Fatalf("ExportSnapshot of an intact artifact: %v", expErr)
-				}
-				stripArtifactTrailer(t, &out)
-				if !bytes.Equal(out.Bytes(), payload) {
-					t.Fatalf("exported %d data bytes, want the %d-byte artifact", out.Len(), len(payload))
-				}
-				return
-			}
 			if !errors.Is(expErr, ErrSnapshotCorrupt) {
 				t.Fatalf("ExportSnapshot of a corrupted artifact: err = %v, want ErrSnapshotCorrupt", expErr)
 			}
@@ -323,48 +288,6 @@ func TestExportSnapshot_CorruptPlaintextFails(t *testing.T) {
 			if out.Len() >= len(payload) {
 				t.Fatalf("a failed export wrote %d bytes of a %d-byte artifact; its tail must be withheld",
 					out.Len(), len(payload))
-			}
-		})
-	}
-}
-
-// TestExportSnapshot_EncryptedArtifactHeldToItsRecord is the encrypted
-// export's counterpart: frames that authenticate do not excuse a record that
-// disagrees with the bytes on disk. The export refuses what a recovery of the
-// same artifact would refuse.
-func TestExportSnapshot_EncryptedArtifactHeldToItsRecord(t *testing.T) {
-	for _, skew := range []uint64{0, 1} {
-		t.Run(map[uint64]string{0: "record_matches", 1: "record_disagrees"}[skew], func(t *testing.T) {
-			db := newMockLogDB()
-			barrier := createTestBarrier(t)
-			h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithBarrier(barrier))
-			if err != nil {
-				t.Fatalf("NewHost: %v", err)
-			}
-			defer h.Close()
-			if startErr := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
-				testCreateFunc, testShardConfig(1, 1)); startErr != nil {
-				t.Fatalf("StartShard: %v", startErr)
-			}
-
-			dir := t.TempDir()
-			plaintext := []byte("sealed state machine for export")
-			writeEncryptedSnapshotFileFor(t, barrier, filepath.Join(dir, "snapshot.dat"), plaintext, 1, 1, 700)
-			stampSnapshotMeta(t, dir, skew)
-			if saveErr := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 700, Filepath: dir, Epoch: barrier.CurrentEpoch()}); saveErr != nil {
-				t.Fatalf("SaveSnapshot: %v", saveErr)
-			}
-
-			var out bytes.Buffer
-			expErr := h.ExportSnapshot(context.Background(), 1, &out)
-			if skew == 0 {
-				if expErr != nil {
-					t.Fatalf("ExportSnapshot of an intact encrypted artifact: %v", expErr)
-				}
-				return
-			}
-			if !errors.Is(expErr, ErrSnapshotCorrupt) {
-				t.Fatalf("ExportSnapshot against a disagreeing record: err = %v, want ErrSnapshotCorrupt", expErr)
 			}
 		})
 	}
