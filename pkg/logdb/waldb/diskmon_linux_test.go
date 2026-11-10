@@ -22,14 +22,6 @@ import (
 	"testing"
 )
 
-// TestPlatformDiskUsage_RealFilesystem exercises the statfs-backed default
-// against a real directory, which every mocked monitor test bypasses.
-func TestPlatformDiskUsage_RealFilesystem(t *testing.T) {
-	if _, err := platformDiskUsage(t.TempDir()); err != nil {
-		t.Fatalf("platformDiskUsage on an existing directory: %v", err)
-	}
-}
-
 // TestPlatformDiskUsage_MissingDirectory verifies a statfs failure is
 // reported as a DiskUsageError naming the directory.
 func TestPlatformDiskUsage_MissingDirectory(t *testing.T) {
@@ -45,7 +37,8 @@ func TestPlatformDiskUsage_MissingDirectory(t *testing.T) {
 }
 
 // TestDiskMonitor_DefaultUsageFunc verifies a monitor built without an
-// override measures the real filesystem.
+// override measures the real filesystem: the statfs-backed default against a
+// real directory, which every mocked monitor test bypasses.
 func TestDiskMonitor_DefaultUsageFunc(t *testing.T) {
 	dm := NewDiskMonitor(t.TempDir(), 1<<62)
 	if _, err := dm.diskUsage(dm.dir); err != nil {
