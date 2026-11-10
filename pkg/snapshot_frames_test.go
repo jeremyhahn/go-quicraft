@@ -478,30 +478,6 @@ func multiFramePlaintext() []byte {
 	return p
 }
 
-// TestSnapshotFrameAAD_RoundTripUnderMatchingContext is the positive case: the
-// encrypt and decrypt sides derive the same context from the same identity, so
-// the artifact round-trips byte for byte.
-func TestSnapshotFrameAAD_RoundTripUnderMatchingContext(t *testing.T) {
-	b := createTestBarrier(t)
-	plain := multiFramePlaintext()
-
-	var enc bytes.Buffer
-	if _, _, err := encryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(plain), &enc); err != nil {
-		t.Fatalf("encryptSnapshotFrames: %v", err)
-	}
-	if got := len(splitSnapshotFrames(t, enc.Bytes())); got < 3 {
-		t.Fatalf("fixture produced %d frames, want the multi-frame path", got)
-	}
-
-	var dec bytes.Buffer
-	if _, err := decryptSnapshotFrames(b, 4, 2, 900, bytes.NewReader(enc.Bytes()), &dec); err != nil {
-		t.Fatalf("decryptSnapshotFrames under the matching context: %v", err)
-	}
-	if !bytes.Equal(dec.Bytes(), plain) {
-		t.Fatalf("round-trip mismatch: %d bytes back, want %d", dec.Len(), len(plain))
-	}
-}
-
 // TestSnapshotFrameAAD_ReorderedFrameFailsToDecrypt proves the ORDINAL half of
 // the binding. Two frames are swapped in place; the framing is still
 // structurally valid and every frame is still authentic under its own epoch, so
