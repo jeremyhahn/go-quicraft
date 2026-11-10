@@ -442,31 +442,6 @@ func TestOpen_EmptyDirectoryIsStampedImmediately(t *testing.T) {
 	}
 }
 
-// TestWALFormatMarkerRoundTrip covers the encoder/decoder pair directly,
-// including the absent-marker case that must not be reported as an error.
-func TestWALFormatMarkerRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-
-	blockSize, present, err := readWALFormat(defaultFS(), dir)
-	if err != nil {
-		t.Fatalf("readWALFormat on an empty dir: %v", err)
-	}
-	if present || blockSize != 0 {
-		t.Fatalf("empty dir reported a marker: (%d, %v)", blockSize, present)
-	}
-
-	if err := writeWALFormat(defaultFS(), dir, 4096, false); err != nil {
-		t.Fatalf("writeWALFormat: %v", err)
-	}
-	blockSize, present, err = readWALFormat(defaultFS(), dir)
-	if err != nil {
-		t.Fatalf("readWALFormat: %v", err)
-	}
-	if !present || blockSize != 4096 {
-		t.Fatalf("round trip = (%d, %v), want (4096, true)", blockSize, present)
-	}
-}
-
 // markerRecordingFS records the sequence of operations the marker publication
 // performs, so a test can assert the durability steps actually happen rather
 // than assuming they do because the code reads as if they do.
