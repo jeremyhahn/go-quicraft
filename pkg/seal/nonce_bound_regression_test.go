@@ -304,12 +304,11 @@ func TestNewBarrierQuietWhenRotatable(t *testing.T) {
 	}
 }
 
-// TestNonceTrackerDefaultCeiling documents the shipped bound so a change to it
-// is a deliberate edit rather than a silent regression.
+// TestNonceTrackerDefaultCeiling pins the shipped bound below the invocation
+// limit, without which it would bound nothing. That a new tracker starts at
+// DefaultMaxTrackedNonces is asserted in
+// TestNonceTracking_CeilingIsDocumentedAndAdjustable.
 func TestNonceTrackerDefaultCeiling(t *testing.T) {
-	if got := NewNonceTracker(true).MaxTrackedNonces(); got != DefaultMaxTrackedNonces {
-		t.Fatalf("default ceiling = %d, want %d", got, DefaultMaxTrackedNonces)
-	}
 	if DefaultMaxTrackedNonces >= DefaultInvocationLimit {
 		t.Fatalf("ceiling %d does not bound anything below the invocation limit %d",
 			DefaultMaxTrackedNonces, DefaultInvocationLimit)
