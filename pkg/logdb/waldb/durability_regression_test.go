@@ -476,6 +476,15 @@ func TestRecovery_NonFinalCorruptionDoesNotMutateDisk(t *testing.T) {
 	if !errors.Is(err, ErrNonFinalSegmentCorruption) {
 		t.Fatalf("Open error = %v, want ErrNonFinalSegmentCorruption", err)
 	}
+	// The error is a RecoveryError naming the corrupt non-final segment, not
+	// one of the intact segments above it.
+	var recErr *RecoveryError
+	if !errors.As(err, &recErr) {
+		t.Fatalf("Open error = %v, want RecoveryError", err)
+	}
+	if recErr.SegmentID != 0 {
+		t.Fatalf("RecoveryError.SegmentID = %d, want 0 (the corrupt non-final segment)", recErr.SegmentID)
+	}
 
 	// Nothing on disk may have been truncated or discarded.
 	if got := sizeBefore(seg0Path); got != want0 {
@@ -492,51 +501,6 @@ func TestRecovery_NonFinalCorruptionDoesNotMutateDisk(t *testing.T) {
 		if fi.Size() != tc.want {
 			t.Fatalf("committed segment %s was mutated: size=%d, want %d", tc.path, fi.Size(), tc.want)
 		}
-	}
-}
-
-// TestRecovery_NonFinalCorruptionIsFatal verifies the fail-stop rule:
-// corruption in a segment that is NOT the highest-numbered one is bit rot /
-// a lying fsync / tampering, never a torn tail — a lower segment was fully
-// fdatasynced before any higher one was created, so everything above it is
-// committed. Recovery must fail with a RecoveryError wrapping
-// ErrNonFinalSegmentCorruption instead of silently prefix-truncating segment 0
-// and discarding the committed higher segment (which would regress term/vote).
-func TestRecovery_NonFinalCorruptionIsFatal(t *testing.T) {
-	const blockSize = 1024
-	dir := t.TempDir()
-	const shardID = uint64(1)
-
-	db, err := Open(dir, WithBlockSize(blockSize), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	writeSingleGenerationSegment(t, db, shardID)
-	rotateShard(t, db, shardID)
-	if err := db.SaveNodeState(shardID, 1, logdb.State{Term: 7, Vote: 2, Commit: 1}); err != nil {
-		t.Fatalf("SaveNodeState: %v", err)
-	}
-	seg0Path := segmentPath(db, shardID, 0)
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// Corrupt segment 0 mid-file; segment 1 above it holds committed state.
-	corruptSegmentBlock(t, seg0Path, blockSize)
-
-	_, err = Open(dir, WithBlockSize(blockSize), WithMaxFileSize(64*1024))
-	if err == nil {
-		t.Fatal("Open: expected fatal RecoveryError on non-final segment corruption")
-	}
-	var recErr *RecoveryError
-	if !errors.As(err, &recErr) {
-		t.Fatalf("Open error = %v, want RecoveryError", err)
-	}
-	if recErr.SegmentID != 0 {
-		t.Fatalf("RecoveryError.SegmentID = %d, want 0 (the corrupt non-final segment)", recErr.SegmentID)
-	}
-	if !errors.Is(err, ErrNonFinalSegmentCorruption) {
-		t.Fatalf("Open error = %v, want ErrNonFinalSegmentCorruption", err)
 	}
 }
 
