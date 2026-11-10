@@ -480,6 +480,9 @@ func TestParseSegmentFilename(t *testing.T) {
 		{"non-numeric", "abcdef.log", 0, false},
 		{"mixed", "00a001.log", 0, false},
 		{"directory", "shard-0", 0, false},
+		{"single letter", "x", 0, false},
+		{"letters only", "abc", 0, false},
+		{"other extension", "test.txt", 0, false},
 	}
 
 	for _, tt := range tests {
@@ -492,16 +495,6 @@ func TestParseSegmentFilename(t *testing.T) {
 				t.Fatalf("parseSegmentFilename(%q): id=%d, want %d", tt.input, id, tt.wantID)
 			}
 		})
-	}
-}
-
-// TestParseSegmentFilenameInvalid verifies various invalid filenames.
-func TestParseSegmentFilenameInvalid(t *testing.T) {
-	invalidNames := []string{"", "x", "abc", ".log", "test.txt", "000001.idx"}
-	for _, name := range invalidNames {
-		if _, ok := parseSegmentFilename(name); ok {
-			t.Fatalf("parseSegmentFilename(%q): expected false, got true", name)
-		}
 	}
 }
 
