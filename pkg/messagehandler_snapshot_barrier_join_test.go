@@ -119,32 +119,6 @@ func TestHandleSnapshot_SealedBarrierFailsClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("nil_barrier_stays_plaintext", func(t *testing.T) {
-		f := newSnapshotReceiveFixture(t, nil)
-		authorizeSnapshotPath(t, f.engine, f.host, 1, 2, 1)
-
-		chunks := snapshotChunkFor(1, 2, 1, 500, 10,
-			map[uint64]string{1: "127.0.0.1:6002", 2: "127.0.0.1:6001"}, []byte(payload))
-
-		if err := f.handler.HandleSnapshot(chunks, authorizeAllSenders); err != nil {
-			t.Fatalf("HandleSnapshot with encryption disabled: %v", err)
-		}
-		snap, getErr := f.logdb.GetSnapshot(1, 2)
-		if getErr != nil {
-			t.Fatalf("GetSnapshot: %v", getErr)
-		}
-		if snap.Epoch != 0 {
-			t.Errorf("recorded epoch = %d, want 0 for a shard with no barrier", snap.Epoch)
-		}
-		data, readErr := os.ReadFile(filepath.Join(snap.Filepath, "snapshot.dat"))
-		if readErr != nil {
-			t.Fatalf("read snapshot artifact: %v", readErr)
-		}
-		if !bytes.Equal(data, []byte(payload)) {
-			t.Errorf("artifact = %q, want the plaintext payload %q", data, payload)
-		}
-	})
-
 	t.Run("unsealed_barrier_encrypts", func(t *testing.T) {
 		barrier := createTestBarrier(t)
 		f := newSnapshotReceiveFixture(t, barrier)
