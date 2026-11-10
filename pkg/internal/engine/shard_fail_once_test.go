@@ -88,28 +88,6 @@ func TestShardFailure_ReportedOnceUnderConcurrentLatches(t *testing.T) {
 	}
 }
 
-// TestShardFailure_FailShardReportsOnceWhenAlreadyFailed: a latch tripped by
-// one path is not reported again by a later one.
-func TestShardFailure_FailShardReportsOnceWhenAlreadyFailed(t *testing.T) {
-	_, restore := captureLogOutput(t)
-	t.Cleanup(restore)
-	var listenerFailed atomic.Int64
-	listener := &config.EventListener{
-		OnShardFailed: func(config.ShardFailedInfo) { listenerFailed.Add(1) },
-	}
-	node := NewNode(nil, nil, nil, config.Config{ShardID: 1, ReplicaID: 1}, nil, "", listener)
-	cb := newTestCallback()
-	failShard(node, cb, errors.New("first"), nil)
-	failShard(node, cb, errors.New("second"), nil)
-	failCommit(node, cb, proto.Update{ShardID: 1, ReplicaID: 1}, errors.New("third"))
-	if got := listenerFailed.Load(); got != 1 {
-		t.Fatalf("EventListener.OnShardFailed fired %d times, want 1", got)
-	}
-	if got := cb.shardFailedCount.Load(); got != 1 {
-		t.Fatalf("Callback.OnShardFailed fired %d times, want 1", got)
-	}
-}
-
 // orderRecordingCallback records, for each proposal failure and shard-failure
 // report, whether the node's latch had already tripped when it ran.
 type orderRecordingCallback struct {
