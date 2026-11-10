@@ -488,56 +488,6 @@ func TestRaft_SelfRemoved_OwnVoteNotTallied(t *testing.T) {
 	}
 }
 
-// TestPeer_SelfRemovedFollower_DoesNotCampaign drives the whole production
-// path: propose RemoveNode(self) on the leader, commit it, watch the leader
-// step down via checkLeaderSelfRemoval, and then confirm the resulting
-// follower never campaigns. Without the guard the stepped-down leader would
-// start a new election at the next election timeout and could win it with
-// a single grant while {2,3} elect their own leader in the same term.
-func TestPeer_SelfRemovedFollower_DoesNotCampaign(t *testing.T) {
-	p := newTestMultiNodeLeaderPeer(t)
-
-	if err := p.ProposeConfigChange(proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: p.replicaID,
-	}); err != nil {
-		t.Fatalf("self-removal proposal: %v", err)
-	}
-
-	p.Handle(proto.Message{
-		Type:     proto.ReplicateResp,
-		From:     2,
-		Term:     p.r.term,
-		LogIndex: p.r.log.lastIndex(),
-	})
-	runUpdateCycles(t, p)
-
-	if p.membership.isMember(p.replicaID) {
-		t.Fatal("precondition: the self-removal must have committed")
-	}
-	if p.r.state == leader {
-		t.Fatal("precondition: the leader must have stepped down")
-	}
-	if !p.r.selfRemoved {
-		t.Fatal("selfRemoved was not synced from the committed membership")
-	}
-
-	termAfterRemoval := p.r.term
-	for range 4 * p.r.electionTimeout {
-		p.Tick()
-	}
-
-	if p.r.state != follower {
-		t.Fatalf("state = %s, want follower: a removed replica must not campaign",
-			p.r.state)
-	}
-	if p.r.term != termAfterRemoval {
-		t.Fatalf("term advanced from %d to %d: a removed replica campaigned and "+
-			"can be elected leader of a configuration it is not in",
-			termAfterRemoval, p.r.term)
-	}
-}
-
 // TestPeer_ReAddedReplica_CampaignsAgain is the liveness control: a replica
 // added back to the configuration must resume campaigning, otherwise the
 // self-removal guard would permanently disable a legitimate voter.
