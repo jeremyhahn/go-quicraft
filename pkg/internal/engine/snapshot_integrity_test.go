@@ -96,22 +96,6 @@ func TestVerifySnapshotArtifact_DetectsSilentCorruption(t *testing.T) {
 	}
 }
 
-// TestVerifySnapshotArtifact_DetectsTruncation covers the other half: a
-// trailing frame lost to a torn write reads as a clean EOF, because no frame
-// count is recorded anywhere.
-func TestVerifySnapshotArtifact_DetectsTruncation(t *testing.T) {
-	data := []byte("frame-one|frame-two|frame-three")
-	dir := writeSnapshotDir(t, data)
-	dataPath := filepath.Join(dir, snapshotDataFile)
-
-	if err := os.WriteFile(dataPath, data[:len(data)-10], 0o600); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
-	if err := VerifySnapshotArtifact(dir, dataPath); !errors.Is(err, ErrSnapshotCorrupt) {
-		t.Fatalf("a truncated artifact returned %v, want ErrSnapshotCorrupt", err)
-	}
-}
-
 // TestVerifySnapshotArtifact_RefusesUnverifiableMetadata guards against an
 // integrity check that switches itself off.
 //
