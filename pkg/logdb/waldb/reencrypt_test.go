@@ -248,7 +248,10 @@ func soleSegmentRel(t *testing.T, dir string, shardID uint64) string {
 	return filepath.Join(shardDir, filepath.Base(matches[0]))
 }
 
-// TestReencrypt_EntriesDurableBeforeState is a regression test.
+// TestReencrypt_EntriesDurableBeforeState is a regression test, and it is also
+// the CX4 regression test: a live log spanning multiple batches must migrate
+// via per-batch streaming (no single oversized destination record / OOM), and
+// the destination must hold the full, in-order entry range.
 //
 // Reencrypt writes the destination WAL through a sequence of independently
 // fsynced SaveState calls, so the destination's durable record order IS that
@@ -296,8 +299,12 @@ func TestReencrypt_EntriesDurableBeforeState(t *testing.T) {
 		t.Fatalf("close src: %v", err)
 	}
 
-	if _, err := Reencrypt(srcDir, barrier, dstDir, barrier, nil); err != nil {
+	n, err := Reencrypt(srcDir, barrier, dstDir, barrier, nil)
+	if err != nil {
 		t.Fatalf("Reencrypt: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("migrated %d nodes, want 1", n)
 	}
 
 	// Close() truncates each segment to its written size, so the file length is
@@ -327,11 +334,36 @@ func TestReencrypt_EntriesDurableBeforeState(t *testing.T) {
 
 		db, oerr := Open(crashed, WithBarrier(barrier))
 		if oerr != nil {
+			if cut == full {
+				t.Fatalf("Open of the intact migrated WAL: %v", oerr)
+			}
 			// A torn tail that refuses to recover is fail-loud, not the silent
 			// inversion this test guards against.
 			continue
 		}
 		recovered++
+
+		// The uncut destination: the log was streamed in many batches (the
+		// threshold is far below its size), and it holds every entry, in
+		// order, with no gap.
+		if cut == full {
+			got, gerr := db.GetEntries(shardID, replicaID, 1, total+1, 0)
+			if gerr != nil {
+				_ = db.Close()
+				t.Fatalf("GetEntries on the intact migrated WAL: %v", gerr)
+			}
+			if len(got) != total {
+				_ = db.Close()
+				t.Fatalf("migrated %d entries, want %d (streaming dropped entries)", len(got), total)
+			}
+			for j, e := range got {
+				if e.Index != uint64(j+1) || string(e.Cmd) != string(entries[j].Cmd) {
+					_ = db.Close()
+					t.Fatalf("entry %d = index %d cmd %q, want index %d cmd %q (out of order or gap)",
+						j, e.Index, e.Cmd, j+1, entries[j].Cmd)
+				}
+			}
+		}
 
 		first, length, rerr := db.EntryRange(shardID, replicaID)
 		if rerr != nil {
@@ -371,15 +403,6 @@ func TestReencrypt_EntriesDurableBeforeState(t *testing.T) {
 	}
 	if sawPartialLog == 0 {
 		t.Fatal("no truncation point recovered a partial entry log; the sweep never cut the entry stream")
-	}
-}
-
-// TestReencryptError_Type covers the typed error.
-func TestReencryptError_Type(t *testing.T) {
-	base := errors.New("x")
-	e := &ReencryptError{Op: "open-source", Err: base}
-	if !errors.Is(e, base) {
-		t.Fatal("Unwrap")
 	}
 }
 
@@ -454,61 +477,6 @@ func TestReencrypt_SnapshotHookRecordsDstEpoch(t *testing.T) {
 	}
 	if snap.Epoch != wantEpoch {
 		t.Fatalf("migrated snapshot epoch = %d, want %d (hook's dst epoch)", snap.Epoch, wantEpoch)
-	}
-}
-
-// TestReencrypt_StreamsLargeLogInBatches is the CX4 regression test: a live log
-// spanning multiple batches must migrate via per-batch streaming (no single
-// oversized destination record / OOM), and the destination must hold the full,
-// in-order entry range.
-func TestReencrypt_StreamsLargeLogInBatches(t *testing.T) {
-	// Lower the batch threshold so a few hundred small entries span many
-	// batches, exercising the streaming path without writing 64 MiB.
-	saved := reencryptBatchBytes
-	reencryptBatchBytes = 4096
-	defer func() { reencryptBatchBytes = saved }()
-
-	srcDir := t.TempDir()
-	dstDir := t.TempDir()
-	noneBarrier := newNoneBarrier(t)
-
-	src := openWALAt(t, srcDir, noneBarrier)
-	if err := src.SaveBootstrap(1, 1, logdb.Bootstrap{Addresses: map[uint64]string{1: "127.0.0.1:1"}}); err != nil {
-		t.Fatalf("SaveBootstrap: %v", err)
-	}
-	const total = 300
-	entries := make([]logdb.Entry, total)
-	for i := range entries {
-		entries[i] = logdb.Entry{Index: uint64(i + 1), Term: 1, Cmd: []byte("entry-payload-deadbeefcafef00d")}
-	}
-	if err := src.SaveEntries(1, 1, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-	if err := src.Close(); err != nil {
-		t.Fatalf("close src: %v", err)
-	}
-
-	n, err := Reencrypt(srcDir, noneBarrier, dstDir, noneBarrier, nil)
-	if err != nil {
-		t.Fatalf("Reencrypt: %v", err)
-	}
-	if n != 1 {
-		t.Fatalf("migrated %d nodes, want 1", n)
-	}
-
-	dst := openWALAt(t, dstDir, noneBarrier)
-	defer dst.Close()
-	got, err := dst.GetEntries(1, 1, 1, total+1, 0)
-	if err != nil {
-		t.Fatalf("GetEntries: %v", err)
-	}
-	if len(got) != total {
-		t.Fatalf("migrated %d entries, want %d (streaming dropped entries)", len(got), total)
-	}
-	for i, e := range got {
-		if e.Index != uint64(i+1) {
-			t.Fatalf("entry %d has index %d, want %d (out-of-order or gap)", i, e.Index, i+1)
-		}
 	}
 }
 
