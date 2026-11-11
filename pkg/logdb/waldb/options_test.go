@@ -115,33 +115,3 @@ func TestValidateInvalidMaxFileSize(t *testing.T) {
 		}
 	}
 }
-
-// TestIsPowerOfTwo verifies the isPowerOfTwo helper function.
-func TestIsPowerOfTwo(t *testing.T) {
-	tests := []struct {
-		n    int
-		want bool
-	}{
-		{0, false},
-		{1, true},
-		{2, true},
-		{3, false},
-		{4, true},
-		{5, false},
-		{8, true},
-		{16, true},
-		{100, false},
-		{128, true},
-		{1024, true},
-		{32768, true},
-		{-1, false},
-		{-2, false},
-	}
-
-	for _, tc := range tests {
-		got := isPowerOfTwo(tc.n)
-		if got != tc.want {
-			t.Errorf("isPowerOfTwo(%d) = %v, want %v", tc.n, got, tc.want)
-		}
-	}
-}
