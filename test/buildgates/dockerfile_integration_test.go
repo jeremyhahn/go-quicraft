@@ -186,46 +186,53 @@ func runStubbedBuild(t *testing.T, body, stub string) buildOutcome {
 // failingCompile writes nothing and reports failure, like a compile error.
 const failingCompile = "#!/bin/sh\necho 'compile error' >&2\nexit 1\n"
 
-func TestIntegrationBuildFailsWhenTheCompileFails(t *testing.T) {
-	got := runStubbedBuild(t, buildRunBody(t), failingCompile)
-	if got.exitedZero {
-		t.Fatalf("the build step exited 0 on a FAILING compile. `docker compose "+
-			"--exit-code-from test-runner` would report the integration suite "+
-			"green having run nothing.\noutput:\n%s", got.output)
-	}
-}
-
-func TestIntegrationBuildFailsOnAZeroByteBinary(t *testing.T) {
-	// The outcome the old `|| echo ... && touch` construct actually produced:
-	// a zero-byte executable that exits 0 when run.
-	stub := "#!/bin/sh\n: > \"$BIN\"\nchmod +x \"$BIN\"\nexit 0\n"
-	got := runStubbedBuild(t, buildRunBody(t), stub)
-	if got.exitedZero {
-		t.Fatalf("the build step exited 0 with a ZERO-BYTE binary installed. "+
-			"execve returns ENOEXEC, the shell runs it as an empty script, and "+
-			"it exits 0 -- a green suite that ran nothing.\noutput:\n%s", got.output)
-	}
-}
-
-func TestIntegrationBuildFailsWhenNoBinaryIsProduced(t *testing.T) {
-	// `go test -c` on a package with NO test files writes no output file and
-	// still exits 0, so a successful-looking compile can leave nothing behind.
-	got := runStubbedBuild(t, buildRunBody(t), "#!/bin/sh\nexit 0\n")
-	if got.exitedZero {
-		t.Fatalf("the build step exited 0 having produced no binary at all.\n"+
-			"output:\n%s", got.output)
-	}
-}
-
-func TestIntegrationBuildFailsWhenTheBinaryContainsNoTests(t *testing.T) {
-	// Non-empty and executable, so `test -s` is satisfied; it simply has no
-	// tests in it. Only the -test.list assertion catches this.
-	stub := "#!/bin/sh\nprintf '#!/bin/sh\\nexit 0\\n' > \"$BIN\"\nchmod +x \"$BIN\"\n"
-	got := runStubbedBuild(t, buildRunBody(t), stub)
-	if got.exitedZero {
-		t.Fatalf("the build step exited 0 with a binary that lists NO tests; "+
-			"`test -s` alone cannot tell a real test binary from any other "+
-			"non-empty file.\noutput:\n%s", got.output)
+// TestIntegrationBuildRefusesAFalseGreen runs the build step against every
+// compile outcome that would leave `docker compose --exit-code-from
+// test-runner` reporting a green integration suite that ran nothing.
+func TestIntegrationBuildRefusesAFalseGreen(t *testing.T) {
+	for _, tc := range []struct {
+		name, stub, why string
+	}{
+		{
+			name: "the compile fails",
+			stub: failingCompile,
+			why: "the build step exited 0 on a FAILING compile. `docker compose " +
+				"--exit-code-from test-runner` would report the integration suite " +
+				"green having run nothing.",
+		},
+		{
+			// The outcome the old `|| echo ... && touch` construct actually
+			// produced: a zero-byte executable that exits 0 when run.
+			name: "a zero-byte binary",
+			stub: "#!/bin/sh\n: > \"$BIN\"\nchmod +x \"$BIN\"\nexit 0\n",
+			why: "the build step exited 0 with a ZERO-BYTE binary installed. " +
+				"execve returns ENOEXEC, the shell runs it as an empty script, and " +
+				"it exits 0 -- a green suite that ran nothing.",
+		},
+		{
+			// `go test -c` on a package with NO test files writes no output
+			// file and still exits 0, so a successful-looking compile can
+			// leave nothing behind.
+			name: "no binary is produced",
+			stub: "#!/bin/sh\nexit 0\n",
+			why:  "the build step exited 0 having produced no binary at all.",
+		},
+		{
+			// Non-empty and executable, so `test -s` is satisfied; it simply
+			// has no tests in it. Only the -test.list assertion catches this.
+			name: "the binary contains no tests",
+			stub: "#!/bin/sh\nprintf '#!/bin/sh\\nexit 0\\n' > \"$BIN\"\nchmod +x \"$BIN\"\n",
+			why: "the build step exited 0 with a binary that lists NO tests; " +
+				"`test -s` alone cannot tell a real test binary from any other " +
+				"non-empty file.",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := runStubbedBuild(t, buildRunBody(t), tc.stub)
+			if got.exitedZero {
+				t.Fatalf("%s\noutput:\n%s", tc.why, got.output)
+			}
+		})
 	}
 }
 
