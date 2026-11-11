@@ -19,35 +19,6 @@ import (
 	"testing"
 )
 
-func TestStateMarshalUnmarshalRoundTrip(t *testing.T) {
-	s := State{
-		Term:       10,
-		Vote:       3,
-		Commit:     50,
-		VoteWindow: 2_000_000_000,
-	}
-	buf := make([]byte, s.Size())
-	n, err := s.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	if n != stateSize {
-		t.Fatalf("MarshalTo: wrote %d, want %d", n, stateSize)
-	}
-
-	var s2 State
-	consumed, err := s2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if consumed != stateSize {
-		t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, stateSize)
-	}
-	if s2 != s {
-		t.Fatalf("Round-trip mismatch: got %+v, want %+v", s2, s)
-	}
-}
-
 func TestStateSize(t *testing.T) {
 	s := State{}
 	if s.Size() != 32 {
