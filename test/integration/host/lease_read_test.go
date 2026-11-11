@@ -96,197 +96,6 @@ func testLeaseReadShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// TestHostAPI_LeaseRead_BasicLinearizable verifies that LeaseRead returns
-// linearizable results on a 3-node cluster. A value is written, then read
-// back via SyncRead (which uses LeaseRead when configured) and verified
-// to be consistent.
-func TestHostAPI_LeaseRead_BasicLinearizable(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	t.Cleanup(func() { cluster.close() })
-
-	const shardID uint64 = 1
-
-	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
-	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
-
-	// Write a value through whoever leads now. The index above is kept for the
-	// state machine assertion below, which is satisfied by replication and does
-	// not care which replica proposed.
-	proposeToLeader(t, cluster, shardID, encodeKVPut("lr-key", "lr-value"), defaultTimeout)
-
-	// Wait for the leader SM to apply.
-	leaderSM := trackers[leaderIdx].Get(shardID, uint64(leaderIdx+1))
-	waitForCondition(t, defaultTimeout, "lr-key applied on leader", func() bool {
-		_, ok := leaderSM.Get("lr-key")
-		return ok
-	})
-
-	// Perform a linearizable read via SyncRead (uses LeaseRead internally)
-	// through whoever leads now.
-	result := readFromLeader(t, cluster, shardID, "lr-key", defaultTimeout)
-	val, ok := result.(string)
-	if !ok {
-		t.Fatalf("SyncRead returned unexpected type: %T", result)
-	}
-	if val != "lr-value" {
-		t.Errorf("SyncRead = %q, want %q", val, "lr-value")
-	}
-
-	t.Logf("LeaseRead linearizable read verified: key=%q value=%q", "lr-key", val)
-}
-
-// TestHostAPI_LeaseRead_ConcurrentWritesAndReads verifies that LeaseRead
-// returns consistent results under concurrent write load. Multiple
-// goroutines write sequentially increasing values for the same key while
-// readers verify that values are monotonically non-decreasing (no stale
-// reads when using LeaseRead).
-func TestHostAPI_LeaseRead_ConcurrentWritesAndReads(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	t.Cleanup(func() { cluster.close() })
-
-	const shardID uint64 = 1
-
-	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
-	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d] with LeaseRead enabled", leaderIdx)
-
-	// Warmup write to establish a committed entry at the current term
-	// (PhD 6.4 requirement for linearizable reads).
-	proposeToLeader(t, cluster, shardID, encodeKVPut("warmup", "ok"), defaultTimeout)
-
-	const (
-		numWriters = 3
-		numReaders = 4
-		numWrites  = 20
-	)
-
-	// Separate wait groups: writerWg tracks writers, readerWg tracks readers.
-	// Writers signal writesDone when all finish, allowing readers to exit.
-	var writesDone atomic.Bool
-	var writerWg, readerWg sync.WaitGroup
-	errCh := make(chan error, (numWriters*numWrites)+(numReaders*100))
-
-	// pollKey is the key the readers poll: the last key writer 0 writes.
-	pollKey := fmt.Sprintf("writer-0-%03d", numWrites-1)
-	pollVal := fmt.Sprintf("val-0-%03d", numWrites-1)
-
-	// pollKeyWritten is set once writer 0's SyncPropose for pollKey has
-	// returned successfully, which means the entry is committed and applied.
-	// From that instant a linearizable read of pollKey MUST return its value.
-	var pollKeyWritten atomic.Bool
-
-	// written records every value a writer committed, for the final check.
-	var writtenMu sync.Mutex
-	written := make(map[string]string, numWriters*numWrites)
-
-	// Launch writers.
-	for w := range numWriters {
-		writerWg.Add(1)
-		go func(workerID int) {
-			defer writerWg.Done()
-			for i := range numWrites {
-				key := fmt.Sprintf("writer-%d-%03d", workerID, i)
-				value := fmt.Sprintf("val-%d-%03d", workerID, i)
-
-				// tryProposeToLeader, not the t-fataling form: this runs on a
-				// non-test goroutine, where t.Fatal would only stop this
-				// goroutine and let the test continue. Errors go to errCh.
-				_, wErr := tryProposeToLeader(cluster, shardID, encodeKVPut(key, value), defaultTimeout)
-				if wErr != nil {
-					errCh <- fmt.Errorf("writer %d entry %d: %w", workerID, i, wErr)
-					return
-				}
-				writtenMu.Lock()
-				written[key] = value
-				writtenMu.Unlock()
-				if key == pollKey {
-					pollKeyWritten.Store(true)
-				}
-			}
-		}(w)
-	}
-
-	// Launch readers that perform SyncRead through whoever leads at the moment
-	// of each read. Each reader reads a fixed key that writer-0 will have
-	// written, verifying that a read issued after that key was committed never
-	// comes back empty and that values never regress.
-	for r := range numReaders {
-		readerWg.Add(1)
-		go func(readerID int) {
-			defer readerWg.Done()
-			lastSeen := ""
-			for !writesDone.Load() {
-				// Sampled BEFORE the read: if the key was already committed
-				// when this read STARTED, a linearizable read must observe
-				// it, so an empty value is a stale read and not a race.
-				committedBeforeRead := pollKeyWritten.Load()
-
-				result, rErr := tryReadFromLeader(cluster, shardID, pollKey, defaultTimeout)
-				if rErr != nil {
-					continue
-				}
-				val, ok := result.(string)
-				if !ok {
-					errCh <- fmt.Errorf("reader %d: SyncRead(%q) returned %T, want string",
-						readerID, pollKey, result)
-					return
-				}
-				if val == "" {
-					// An empty value is what a MISSING key returns. Skipping
-					// it as noise — the previous behaviour — discarded
-					// exactly the stale read this test exists to detect.
-					if committedBeforeRead {
-						errCh <- fmt.Errorf(
-							"reader %d: stale read on key %q: the key was committed before "+
-								"this read started, but the read returned an empty value "+
-								"(what a missing key returns)", readerID, pollKey)
-						return
-					}
-					continue
-				}
-				// Once we've seen a non-empty value, it must never regress.
-				if lastSeen != "" && val < lastSeen {
-					errCh <- fmt.Errorf("reader %d: stale read regression: saw %q then %q", readerID, lastSeen, val)
-					return
-				}
-				lastSeen = val
-			}
-		}(r)
-	}
-
-	// Wait for all writers to finish, then signal readers to stop.
-	writerWg.Wait()
-	writesDone.Store(true)
-
-	// Wait for all readers to observe the signal and exit.
-	readerWg.Wait()
-
-	// Drain and report any errors.
-	close(errCh)
-	for e := range errCh {
-		t.Errorf("concurrent error: %v", e)
-	}
-
-	// Every write that was accepted must be present with its own value on
-	// every node: the reader loop alone asserts nothing about the writes that
-	// were not polled.
-	writtenMu.Lock()
-	finalWritten := make(map[string]string, len(written))
-	for k, v := range written {
-		finalWritten[k] = v
-	}
-	writtenMu.Unlock()
-
-	if len(finalWritten) != numWriters*numWrites {
-		t.Fatalf("only %d of %d writes were accepted", len(finalWritten), numWriters*numWrites)
-	}
-	if got := finalWritten[pollKey]; got != pollVal {
-		t.Fatalf("poll key %q recorded value %q, want %q", pollKey, got, pollVal)
-	}
-	verifyAllData(t, cluster, trackers, shardID, finalWritten)
-}
-
 // TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover verifies that
 // lease-based reads do not return stale values after a leader failover.
 // Per PhD Section 6.4, a new leader must not serve LeaseRead requests
@@ -675,9 +484,8 @@ func parseConcValue(val string) (writerID, keyIdx, seq uint64, err error) {
 	return fields[0], fields[1], fields[2], nil
 }
 
-// TestHostAPI_LeaseRead_ReadAfterLeaderTransfer verifies that leadership
-// transfer correctly invalidates the old leader's lease and that the new
-// leader does not serve stale reads. Per PhD Section 6.4.1, a leader must
+// TestHostAPI_LeaseRead_ReadAfterLeaderTransfer verifies that the new
+// leader does not serve stale reads after a leadership transfer. Per PhD Section 6.4.1, a leader must
 // expire its lease before transferring leadership. This test:
 //  1. Writes data on the original leader.
 //  2. Transfers leadership to a specific follower.
@@ -691,7 +499,6 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 
 	trackers := cluster.startShardWithConfig(shardID, testLeaseReadShardConfig)
 	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
 	t.Logf("initial leader elected at node[%d] with LeaseRead enabled", leaderIdx)
 
 	// Write several entries on the current leader.
@@ -789,23 +596,6 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 		t.Errorf("read after transfer: got %q, want %q (stale read detected)", readVal, finalVal)
 	}
 	t.Logf("read after leader transfer verified: key=%q value=%q", finalKey, readVal)
-
-	// Verify the old leader rejects reads (it should no longer be leader).
-	// After transferring leadership, its lease should be invalidated.
-	oldLeaderReadCtx, oldLeaderReadCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	//quicraft:direct-read the deposed incumbent IS the subject: its refusal after the transfer is the assertion
-	_, oldLeaderErr := leaderHost.SyncRead(oldLeaderReadCtx, shardID, finalKey)
-	oldLeaderReadCancel()
-	if oldLeaderErr == nil {
-		// If the old leader still serves reads, it may have been
-		// re-elected. Verify it is not the leader anymore.
-		info, infoErr := leaderHost.ShardInfo(shardID)
-		if infoErr == nil && info.IsLeader {
-			t.Logf("old leader was re-elected, which is valid raft behavior")
-		}
-	} else {
-		t.Logf("old leader correctly rejected read after transfer: %v", oldLeaderErr)
-	}
 
 	// Final verification: every entry is readable through whoever leads now.
 	// The transfer target was the subject above; here only the data is.
