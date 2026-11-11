@@ -2616,7 +2616,7 @@ jobs:
           check lint-gates  "${{ needs.lint-gates.result }}" scoped
           check integration "${{ needs.integration.result }}" full
           check soak        "${{ needs.soak.result }}" nightly
-          check signatures  "${{ needs.signatures.result }}" pr   # v1.35
+          check signatures  "${{ needs.signatures.result }}" pr
           # >>> CUSTOMIZE (go-quicraft)
           check netfault    "${{ needs.netfault.result }}" full
           check errfs       "${{ needs.errfs.result }}" full
