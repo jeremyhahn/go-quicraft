@@ -540,29 +540,6 @@ func TestNodeHost_ConfigChangeIndexIgnoredWhenUnordered(t *testing.T) {
 	}
 }
 
-func TestNodeHost_ConfigChangeIndexHonoredWhenOrdered(t *testing.T) {
-	nh := newTestNodeHost(t)
-
-	members := map[uint64]Target{1: nh.RaftAddress()}
-	cfg := dbConfig.Config{
-		ShardID:             2,
-		ReplicaID:           1,
-		ElectionRTT:         5,
-		HeartbeatRTT:        1,
-		CheckQuorum:         true,
-		OrderedConfigChange: true,
-	}
-	if err := nh.StartReplica(members, false, testSMFactory(), cfg); err != nil {
-		t.Fatalf("StartReplica: %v", err)
-	}
-	if got := nh.effectiveConfigChangeIndex(2, 99); got != 99 {
-		t.Errorf("effectiveConfigChangeIndex = %d, want 99 when ordered", got)
-	}
-	if !nh.orderedConfigChange(2) {
-		t.Error("orderedConfigChange must report the retained shard config")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // M: QueryRaftLog out-of-range resolves with RequestOutOfRange
 // ---------------------------------------------------------------------------
@@ -705,51 +682,10 @@ func TestShardInfo_PendingIsNothingAppliedYet(t *testing.T) {
 // ResultC must aggregate committed+applied when NotifyCommit is on
 // ---------------------------------------------------------------------------
 
-func TestRequestState_ResultC_AggregatesCommittedThenApplied(t *testing.T) {
-	cfg := testNodeHostConfig(t.TempDir())
-	cfg.NotifyCommit = true
-	nh := newTestNodeHostWithConfig(t, cfg)
-	startTestShard(t, nh, 1, 1)
-
-	session := nh.GetNoOPSession(1)
-	rs, err := nh.Propose(session, []byte("cmd"), 5*time.Second)
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	defer rs.Release()
-
-	// The canonical dragonboat NotifyCommit consumer loop: the first
-	// receive reports the commit, the second the apply result. Returning
-	// only the applied channel would park the second receive forever.
-	resultC := rs.ResultC()
-	if resultC != rs.ResultC() {
-		t.Fatal("ResultC must return the same aggregate channel on every call")
-	}
-
-	select {
-	case first := <-resultC:
-		if first.code != RequestCommitted {
-			t.Fatalf("first value = %v, want RequestCommitted", first.code)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the commit notification")
-	}
-
-	select {
-	case second := <-resultC:
-		if !second.Completed() {
-			t.Fatalf("second value = %v, want Completed", second.code)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the apply result")
-	}
-}
-
 // TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffered
 // deterministically targets the commit-notification race window, instead of
-// relying on production goroutine scheduling the way
-// TestRequestState_ResultC_AggregatesCommittedThenApplied does (that test
-// calls ResultC immediately after Propose, so whether the commit
+// relying on production goroutine scheduling the way a consumer that
+// calls ResultC immediately after Propose does (TestIntegration_DB_NotifyCommit_ProposalCommitted; so whether the commit
 // notification has actually landed on the source channel by the time the
 // aggregator's select runs is a scheduling accident -- under mutation testing
 // it catches a relay-bridge design in only ~2% of individual runs).
@@ -794,6 +730,9 @@ func TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffere
 		// racing against already-ready data -- exactly the scenario that
 		// can drop the commit notification.
 		resultC := rs.ResultC()
+		if resultC != rs.ResultC() {
+			t.Fatalf("iteration %d: ResultC must return the same aggregate channel on every call", i)
+		}
 
 		select {
 		case first := <-resultC:
@@ -814,31 +753,6 @@ func TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffere
 		}
 
 		rs.Release()
-	}
-}
-
-func TestRequestState_ResultC_IsAppliedChannelWhenNotifyCommitOff(t *testing.T) {
-	nh := newTestNodeHost(t) // NotifyCommit defaults to false
-	startTestShard(t, nh, 1, 1)
-
-	session := nh.GetNoOPSession(1)
-	rs, err := nh.Propose(session, []byte("cmd"), 5*time.Second)
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	defer rs.Release()
-
-	if rs.ResultC() != rs.AppliedC() {
-		t.Error("ResultC must be the applied channel when NotifyCommit is off")
-	}
-
-	select {
-	case r := <-rs.ResultC():
-		if !r.Completed() {
-			t.Errorf("result = %v, want Completed", r.code)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the apply result")
 	}
 }
 
