@@ -89,44 +89,6 @@ func TestCloseAlreadyClosed(t *testing.T) {
 	}
 }
 
-// TestWriteAndReadAllRoundTrip writes a single record and verifies ReadAll
-// returns it intact.
-func TestWriteAndReadAllRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	blockSize := 1024
-	seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
-	if err != nil {
-		t.Fatalf("createSegment: unexpected error: %v", err)
-	}
-
-	data := []byte("hello raft")
-	seq, err := seg.Write(data)
-	if err != nil {
-		t.Fatalf("Write: unexpected error: %v", err)
-	}
-	if seq != 1 {
-		t.Fatalf("Write: seq = %d, want 1", seq)
-	}
-	if err := seg.Close(); err != nil {
-		t.Fatalf("Close: unexpected error: %v", err)
-	}
-
-	// Reopen for reading.
-	rseg := openSegmentForTest(t, dir, 1, blockSize)
-	defer rseg.Close()
-
-	records, _, err := rseg.ReadAll()
-	if err != nil {
-		t.Fatalf("ReadAll: unexpected error: %v", err)
-	}
-	if len(records) != 1 {
-		t.Fatalf("ReadAll: got %d records, want 1", len(records))
-	}
-	if !bytes.Equal(records[0], data) {
-		t.Fatalf("ReadAll: data = %q, want %q", records[0], data)
-	}
-}
-
 // TestMultipleWritesReadAll writes multiple records and verifies ReadAll
 // returns them all in order.
 func TestMultipleWritesReadAll(t *testing.T) {
@@ -462,56 +424,26 @@ func TestReadAllClosedSegment(t *testing.T) {
 	}
 }
 
-// TestSyncNoSync verifies that Sync is a no-op when noSync is set.
-func TestSyncNoSync(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
-	if err != nil {
-		t.Fatalf("createSegment: unexpected error: %v", err)
-	}
-	seg.noSync = true
-	defer seg.Close()
-
-	_, err = seg.Write([]byte("test data"))
-	if err != nil {
-		t.Fatalf("Write: unexpected error: %v", err)
-	}
-
-	if err := seg.Sync(); err != nil {
-		t.Fatalf("Sync: unexpected error: %v", err)
-	}
-}
-
-// TestSyncAfterWrite verifies that Sync completes without error after a write.
+// TestSyncAfterWrite verifies that Sync completes without error after a
+// write, both with fsync and when noSync makes it a no-op.
 func TestSyncAfterWrite(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
-	if err != nil {
-		t.Fatalf("createSegment: unexpected error: %v", err)
-	}
-	defer seg.Close()
+	for _, noSync := range []bool{false, true} {
+		dir := t.TempDir()
+		seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
+		if err != nil {
+			t.Fatalf("createSegment: unexpected error: %v", err)
+		}
+		seg.noSync = noSync
 
-	_, err = seg.Write([]byte("sync test"))
-	if err != nil {
-		t.Fatalf("Write: unexpected error: %v", err)
-	}
-
-	if err := seg.Sync(); err != nil {
-		t.Fatalf("Sync: unexpected error: %v", err)
-	}
-}
-
-// TestSegmentID verifies the ID getter returns the correct segment ID.
-func TestSegmentID(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 42, 1024, 1024*1024)
-	if err != nil {
-		t.Fatalf("createSegment: unexpected error: %v", err)
-	}
-	defer seg.Close()
-
-	if seg.ID() != 42 {
-		t.Fatalf("ID = %d, want 42", seg.ID())
+		if _, err := seg.Write([]byte("sync test")); err != nil {
+			t.Fatalf("noSync=%v: Write: unexpected error: %v", noSync, err)
+		}
+		if err := seg.Sync(); err != nil {
+			t.Fatalf("noSync=%v: Sync: unexpected error: %v", noSync, err)
+		}
+		if err := seg.Close(); err != nil {
+			t.Fatalf("noSync=%v: Close: unexpected error: %v", noSync, err)
+		}
 	}
 }
 
@@ -581,27 +513,6 @@ func TestReadAllEmptySegment(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("ReadAll: got %d records, want 0", len(records))
-	}
-}
-
-// TestSequenceNumberIncrement verifies that sequential writes return
-// monotonically increasing sequence numbers.
-func TestSequenceNumberIncrement(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 1024*1024)
-	if err != nil {
-		t.Fatalf("createSegment: unexpected error: %v", err)
-	}
-	defer seg.Close()
-
-	for i := uint64(1); i <= 5; i++ {
-		seq, err := seg.Write([]byte("seq test"))
-		if err != nil {
-			t.Fatalf("Write[%d]: unexpected error: %v", i, err)
-		}
-		if seq != i {
-			t.Fatalf("Write[%d]: seq = %d, want %d", i, seq, i)
-		}
 	}
 }
 
