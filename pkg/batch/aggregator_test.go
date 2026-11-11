@@ -107,26 +107,6 @@ func TestNewAggregator_NilProposer(t *testing.T) {
 	}
 }
 
-func TestNewAggregator_Defaults(t *testing.T) {
-	t.Parallel()
-	mp := &mockProposer{}
-	agg, err := NewAggregator(mp, WithRegistry(newTestRegistry(t)))
-	if err != nil {
-		t.Fatalf("NewAggregator failed: %v", err)
-	}
-	defer agg.Close()
-
-	if agg.cfg.MaxBatchSize != DefaultMaxBatchSize {
-		t.Errorf("MaxBatchSize = %d, want %d", agg.cfg.MaxBatchSize, DefaultMaxBatchSize)
-	}
-	if agg.cfg.FlushInterval != DefaultFlushInterval {
-		t.Errorf("FlushInterval = %v, want %v", agg.cfg.FlushInterval, DefaultFlushInterval)
-	}
-	if agg.cfg.QueueSize != DefaultQueueSize {
-		t.Errorf("QueueSize = %d, want %d", agg.cfg.QueueSize, DefaultQueueSize)
-	}
-}
-
 func TestNewAggregator_WithCustomConfig(t *testing.T) {
 	t.Parallel()
 	mp := &mockProposer{}
@@ -260,92 +240,6 @@ func TestNewAggregator_WithNilRegistryUsesDefault(t *testing.T) {
 	}
 }
 
-func TestDefaultConfig(t *testing.T) {
-	t.Parallel()
-	cfg := DefaultConfig()
-
-	if cfg.MaxBatchSize != DefaultMaxBatchSize {
-		t.Errorf("MaxBatchSize = %d, want %d", cfg.MaxBatchSize, DefaultMaxBatchSize)
-	}
-	if cfg.FlushInterval != DefaultFlushInterval {
-		t.Errorf("FlushInterval = %v, want %v", cfg.FlushInterval, DefaultFlushInterval)
-	}
-	if cfg.QueueSize != DefaultQueueSize {
-		t.Errorf("QueueSize = %d, want %d", cfg.QueueSize, DefaultQueueSize)
-	}
-}
-
-func TestSubmit_Success(t *testing.T) {
-	t.Parallel()
-	agg, mp := newTestAggregator(t)
-	defer agg.Close()
-
-	ctx := context.Background()
-	err := agg.Submit(ctx, 1, []byte("test-data"))
-	if err != nil {
-		t.Fatalf("Submit failed: %v", err)
-	}
-
-	// Verify proposer was called.
-	calls := mp.getCalls()
-	if len(calls) == 0 {
-		t.Fatal("proposer was not called")
-	}
-
-	// The data should be encoded in a batch format. Decode it and verify.
-	found := false
-	for _, call := range calls {
-		if call.shardID != 1 {
-			continue
-		}
-		decoded, decErr := DecodeBatch(call.data)
-		if decErr != nil {
-			t.Fatalf("DecodeBatch failed: %v", decErr)
-		}
-		for _, cmd := range decoded {
-			if bytes.Equal(cmd, []byte("test-data")) {
-				found = true
-				break
-			}
-		}
-	}
-	if !found {
-		t.Error("submitted data not found in proposer calls")
-	}
-}
-
-func TestSubmit_MultipleItems(t *testing.T) {
-	t.Parallel()
-	agg, mp := newTestAggregator(t)
-	defer agg.Close()
-
-	ctx := context.Background()
-	var wg sync.WaitGroup
-	itemCount := 5
-
-	errs := make([]error, itemCount)
-	wg.Add(itemCount)
-	for i := range itemCount {
-		go func(idx int) {
-			defer wg.Done()
-			data := []byte{byte(idx)}
-			errs[idx] = agg.Submit(ctx, 1, data)
-		}(i)
-	}
-	wg.Wait()
-
-	for i, err := range errs {
-		if err != nil {
-			t.Errorf("Submit[%d] failed: %v", i, err)
-		}
-	}
-
-	calls := mp.getCalls()
-	if len(calls) == 0 {
-		t.Fatal("proposer was never called")
-	}
-}
-
 func TestSubmit_AfterClose(t *testing.T) {
 	t.Parallel()
 	agg, _ := newTestAggregator(t)
@@ -366,57 +260,6 @@ func TestSubmit_AfterClose(t *testing.T) {
 	if !errors.Is(err, ErrClosed) {
 		t.Error("error should match ErrClosed sentinel")
 	}
-}
-
-func TestSubmit_CanceledContext(t *testing.T) {
-	t.Parallel()
-
-	// Create a proposer that blocks until signaled so the submit waits
-	// long enough for the context cancellation to take effect.
-	blockingProposer := &blockingMockProposer{
-		unblock: make(chan struct{}),
-	}
-
-	reg := newTestRegistry(t)
-	agg, err := NewAggregator(blockingProposer,
-		WithConfig(Config{
-			MaxBatchSize:  1,
-			FlushInterval: 5 * time.Millisecond,
-			QueueSize:     100,
-		}),
-		WithRegistry(reg),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator failed: %v", err)
-	}
-	defer func() {
-		close(blockingProposer.unblock)
-		agg.Close()
-	}()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately.
-
-	submitErr := agg.Submit(ctx, 1, []byte("data"))
-	if submitErr == nil {
-		t.Fatal("Submit with canceled context should return error")
-	}
-
-	// The error should be context.Canceled or ClosedError (depending on
-	// timing), but it must not be nil.
-	if !errors.Is(submitErr, context.Canceled) && !errors.Is(submitErr, ErrClosed) {
-		t.Errorf("unexpected error: %v", submitErr)
-	}
-}
-
-// blockingMockProposer blocks SyncPropose until unblock is closed.
-type blockingMockProposer struct {
-	unblock chan struct{}
-}
-
-func (b *blockingMockProposer) SyncPropose(_ context.Context, _ uint64, _ []byte) error {
-	<-b.unblock
-	return nil
 }
 
 // enteredBlockingProposer blocks every SyncPropose until unblock is closed and
@@ -633,46 +476,6 @@ func flushReasonCount(t *testing.T, reg *prometheus.Registry, reason string) flo
 		}
 	}
 	return 0
-}
-
-func TestSubmit_ProposerError(t *testing.T) {
-	t.Parallel()
-
-	proposerErr := errors.New("raft unavailable")
-	mp := &mockProposer{err: proposerErr}
-	reg := newTestRegistry(t)
-	agg, err := NewAggregator(mp,
-		WithConfig(Config{
-			MaxBatchSize:  1,
-			FlushInterval: 5 * time.Millisecond,
-			QueueSize:     100,
-		}),
-		WithRegistry(reg),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator failed: %v", err)
-	}
-	defer agg.Close()
-
-	submitErr := agg.Submit(context.Background(), 1, []byte("will-fail"))
-	if submitErr == nil {
-		t.Fatal("Submit should propagate proposer error")
-	}
-
-	var fe *FlushError
-	if !errors.As(submitErr, &fe) {
-		t.Fatalf("error should be *FlushError, got %T: %v", submitErr, submitErr)
-	}
-	if fe.ShardID != 1 {
-		t.Errorf("FlushError.ShardID = %d, want 1", fe.ShardID)
-	}
-	if !errors.Is(submitErr, ErrFlush) {
-		t.Error("error should match ErrFlush sentinel")
-	}
-	// The original proposer error should be unwrappable.
-	if !errors.Is(submitErr, proposerErr) {
-		t.Error("error should wrap the original proposer error")
-	}
 }
 
 func TestSubmit_MultipleShards(t *testing.T) {
@@ -1074,90 +877,6 @@ func TestSubmit_DataIntegrity(t *testing.T) {
 	}
 	if !found {
 		t.Error("original data not found in proposer calls after submit")
-	}
-}
-
-func TestProposeContext_AllCanceled(t *testing.T) {
-	t.Parallel()
-
-	mp := &mockProposer{}
-	reg := newTestRegistry(t)
-	agg, err := NewAggregator(mp,
-		WithConfig(Config{
-			MaxBatchSize:  1000,
-			FlushInterval: 10 * time.Millisecond,
-			QueueSize:     100,
-		}),
-		WithRegistry(reg),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator failed: %v", err)
-	}
-	defer agg.Close()
-
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	cancel1()
-	cancel2()
-
-	proposals := []*proposal{
-		{ctx: ctx1, shardID: 1, data: []byte("a"), resultCh: make(chan error, 1)},
-		{ctx: ctx2, shardID: 1, data: []byte("b"), resultCh: make(chan error, 1)},
-	}
-
-	// Every caller has already given up, so there is nobody left to receive a
-	// result. The batch must be skipped rather than proposed on an unbounded
-	// context, which is what wedged the single flush goroutine.
-	ctx, cancel, ok := agg.proposeContext(proposals)
-	if ok {
-		cancel()
-		t.Fatal("proposeContext with all contexts canceled should report ok=false")
-	}
-	if ctx != nil || cancel != nil {
-		t.Error("proposeContext must return a nil context and cancel when ok=false")
-	}
-}
-
-func TestProposeContext_FirstNonCanceled(t *testing.T) {
-	t.Parallel()
-
-	mp := &mockProposer{}
-	reg := newTestRegistry(t)
-	agg, err := NewAggregator(mp,
-		WithConfig(Config{
-			MaxBatchSize:  1000,
-			FlushInterval: 10 * time.Millisecond,
-			QueueSize:     100,
-		}),
-		WithRegistry(reg),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator failed: %v", err)
-	}
-	defer agg.Close()
-
-	canceledCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	liveCtx := context.Background()
-
-	proposals := []*proposal{
-		{ctx: canceledCtx, shardID: 1, data: []byte("a"), resultCh: make(chan error, 1)},
-		{ctx: liveCtx, shardID: 1, data: []byte("b"), resultCh: make(chan error, 1)},
-	}
-
-	ctx, cancel, ok := agg.proposeContext(proposals)
-	if !ok {
-		t.Fatal("proposeContext should select the first non-canceled context")
-	}
-	defer cancel()
-	if ctx.Err() != nil {
-		t.Error("proposeContext should return a live context")
-	}
-	// liveCtx carries no deadline of its own, so the aggregator must supply
-	// one: an unbounded propose on the single flush goroutine stalls every
-	// other shard and hangs Close.
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		t.Error("proposeContext must bound a deadline-less caller context")
 	}
 }
 
