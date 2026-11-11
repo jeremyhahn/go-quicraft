@@ -16,36 +16,41 @@ package proto
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
 func TestUpdateCommitMarshalUnmarshalRoundTrip(t *testing.T) {
-	uc := UpdateCommit{
-		StableLogTo:      100,
-		StableLogTerm:    5,
-		StableSnapshotTo: 50,
-		Processed:        true,
-		LastApplied:      99,
-		ReadyToRead:      3,
-	}
-	buf := make([]byte, uc.Size())
-	n, err := uc.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	if n != updateCommitSize {
-		t.Fatalf("MarshalTo: wrote %d, want %d", n, updateCommitSize)
-	}
+	for _, processed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("processed=%v", processed), func(t *testing.T) {
+			uc := UpdateCommit{
+				StableLogTo:      100,
+				StableLogTerm:    5,
+				StableSnapshotTo: 50,
+				Processed:        processed,
+				LastApplied:      99,
+				ReadyToRead:      3,
+			}
+			buf := make([]byte, uc.Size())
+			n, err := uc.MarshalTo(buf)
+			if err != nil {
+				t.Fatalf("MarshalTo: %v", err)
+			}
+			if n != updateCommitSize {
+				t.Fatalf("MarshalTo: wrote %d, want %d", n, updateCommitSize)
+			}
 
-	var uc2 UpdateCommit
-	consumed, err := uc2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
+			var uc2 UpdateCommit
+			consumed, err := uc2.UnmarshalFrom(buf)
+			if err != nil {
+				t.Fatalf("UnmarshalFrom: %v", err)
+			}
+			if consumed != updateCommitSize {
+				t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, updateCommitSize)
+			}
+			assertUpdateCommitEqual(t, &uc, &uc2)
+		})
 	}
-	if consumed != updateCommitSize {
-		t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, updateCommitSize)
-	}
-	assertUpdateCommitEqual(t, &uc, &uc2)
 }
 
 func TestUpdateCommitSize(t *testing.T) {
@@ -111,28 +116,6 @@ func TestUpdateReset(t *testing.T) {
 		u.Messages != nil || !u.Snapshot.IsEmpty() ||
 		u.ReadyToRead != nil || u.LastApplied != 0 {
 		t.Fatal("Update.Reset did not clear all fields")
-	}
-}
-
-func TestUpdateCommitProcessedBoolRoundTrip(t *testing.T) {
-	tests := []struct {
-		name      string
-		processed bool
-	}{
-		{"false", false},
-		{"true", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			uc := UpdateCommit{Processed: tt.processed}
-			buf := make([]byte, uc.Size())
-			uc.MarshalTo(buf)
-			var uc2 UpdateCommit
-			uc2.UnmarshalFrom(buf)
-			if uc2.Processed != tt.processed {
-				t.Fatalf("Processed: got %v, want %v", uc2.Processed, tt.processed)
-			}
-		})
 	}
 }
 
