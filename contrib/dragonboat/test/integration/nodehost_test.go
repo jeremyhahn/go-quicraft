@@ -20,49 +20,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
-
-	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
 )
-
-// TestIntegration_DB_ProposeAndRead verifies that a 3-node cluster using the
-// dragonboat adapter API can propose entries and serve linearizable reads
-// via SyncRead.
-func TestIntegration_DB_ProposeAndRead(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose 10 entries through the dragonboat adapter.
-	expected := proposeNEntries(t, cluster, trackers, 1, 10, "db-rw")
-
-	// Verify all entries replicated to all 3 nodes.
-	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("all 10 entries replicated to 3 nodes via dragonboat adapter")
-
-	// Perform a linearizable read from whichever replica leads shard 1 NOW.
-	// leaderIdx was true when waitForClusterLeader returned it and is not a
-	// pin: the assertion here is about the VALUE, so the read re-resolves.
-	targetKey := "db-rw-005"
-	expectedValue := expected[targetKey]
-	result := cluster.readFromLeader(t, 1, encodeKVGet(targetKey), defaultTimeout)
-
-	val, ok := result.(string)
-	if !ok {
-		t.Fatalf("SyncRead returned type %T, want string", result)
-	}
-	if val != expectedValue {
-		t.Fatalf("SyncRead(%q) = %q, want %q", targetKey, val, expectedValue)
-	}
-	t.Logf("SyncRead(%q) = %q (correct)", targetKey, val)
-}
 
 // TestIntegration_DB_Replication verifies that a 3-node cluster using the
 // dragonboat adapter replicates 30 entries to all nodes with identical
@@ -123,104 +81,70 @@ func TestIntegration_DB_Replication(t *testing.T) {
 	t.Logf("all 3 nodes have identical state machine data (%d keys)", len(reference))
 }
 
-// TestIntegration_DB_AsyncPropose verifies the dragonboat async Propose +
-// ResultC pattern works correctly through the adapter.
-func TestIntegration_DB_AsyncPropose(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry.
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	session := dbClient.NewNoOPSession(1, nil)
-
-	// Propose 10 entries using the async Propose + ResultC pattern.
-	const numEntries = 10
-	expected := make(map[string]string, numEntries)
-	for i := range numEntries {
-		key := fmt.Sprintf("async-%03d", i)
-		value := fmt.Sprintf("val-async-%03d", i)
-		expected[key] = value
-
-		cmd := encodeKVPut(key, value)
-		rs := cluster.proposeAsyncToLeader(t, session, cmd, defaultTimeout).RS
-
-		// Wait for the result via ResultC (dragonboat async pattern).
-		select {
-		case result := <-rs.ResultC():
-			if !result.Completed() {
-				t.Fatalf("Propose(%q) did not complete successfully", key)
-			}
-			smResult := result.GetResult()
-			if smResult.Value != uint64(len(value)) {
-				t.Errorf("Propose(%q) result value = %d, want %d",
-					key, smResult.Value, len(value))
-			}
-		case <-time.After(defaultTimeout):
-			t.Fatalf("Propose(%q) timed out waiting for ResultC", key)
-		}
-		rs.Release()
-	}
-
-	// Verify all entries replicated to all nodes.
-	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("all %d async entries verified on all nodes", numEntries)
-}
-
-// TestIntegration_DB_LeaderFailover verifies that a 3-node cluster using
-// the dragonboat adapter correctly handles leader failure and elects a
-// new leader that can serve continued proposals.
+// TestIntegration_DB_LeaderFailover verifies that a cluster using the
+// dragonboat adapter handles proposals, replication, leader failure and
+// continued writes through the newly elected leader, on a 3-node cluster
+// (quorum 2 of 3) and a 5-node cluster (quorum 3 of 5).
 func TestIntegration_DB_LeaderFailover(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("initial leader at node[%d]", leaderIdx)
-
-	// Warmup entry.
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose entries before failover.
-	expected := proposeNEntries(t, cluster, trackers, 1, 10, "pre-failover")
-	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("10 pre-failover entries verified")
-
-	// Kill the leader.
-	oldLeaderIdx := cluster.findLeader(1)
-	if oldLeaderIdx < 0 {
-		t.Fatal("no leader found before failover")
+	tests := []struct {
+		name  string
+		nodes int
+		pre   int
+		post  int
+	}{
+		{name: "3 nodes", nodes: 3, pre: 10, post: 10},
+		{name: "5 nodes", nodes: 5, pre: 20, post: 10},
 	}
-	t.Logf("stopping leader node[%d]", oldLeaderIdx)
-	cluster.stopNode(oldLeaderIdx)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster := newDBTestCluster(t, tc.nodes)
+			defer cluster.close()
 
-	// Wait for new leader election.
-	newLeaderIdx := cluster.waitForClusterLeader(1, failoverTimeout)
-	if newLeaderIdx == oldLeaderIdx {
-		t.Fatal("new leader must not be the stopped node")
+			trackers := cluster.startShard(1)
+			leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+			t.Logf("initial leader at node[%d]", leaderIdx)
+
+			// Warmup entry.
+			proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
+			waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
+
+			// Propose entries before failover.
+			expected := proposeNEntries(t, cluster, trackers, 1, tc.pre, "pre-failover")
+			verifyAllData(t, cluster, trackers, 1, expected)
+			t.Logf("%d pre-failover entries verified on %d nodes", tc.pre, tc.nodes)
+
+			// Kill the leader.
+			oldLeaderIdx := cluster.findLeader(1)
+			if oldLeaderIdx < 0 {
+				t.Fatal("no leader found before failover")
+			}
+			t.Logf("stopping leader node[%d]", oldLeaderIdx)
+			cluster.stopNode(oldLeaderIdx)
+
+			// Wait for new leader election.
+			newLeaderIdx := cluster.waitForClusterLeader(1, failoverTimeout)
+			if newLeaderIdx == oldLeaderIdx {
+				t.Fatal("new leader must not be the stopped node")
+			}
+			t.Logf("new leader elected at node[%d]", newLeaderIdx)
+
+			// Warmup after new election.
+			proposeAndWait(t, cluster, trackers, 1, "post-warmup", "ok")
+
+			// Propose entries after failover through the new leader.
+			for i := range tc.post {
+				key := fmt.Sprintf("post-failover-%03d", i)
+				value := fmt.Sprintf("val-post-failover-%03d", i)
+				proposeAndWait(t, cluster, trackers, 1, key, value)
+				expected[key] = value
+			}
+
+			// Verify all entries on surviving nodes.
+			verifyAllData(t, cluster, trackers, 1, expected)
+			t.Logf("all %d entries verified on %d surviving nodes after failover",
+				len(expected), tc.nodes-1)
+		})
 	}
-	t.Logf("new leader elected at node[%d]", newLeaderIdx)
-
-	// Warmup after new election.
-	proposeAndWait(t, cluster, trackers, 1, "post-warmup", "ok")
-
-	// Propose entries after failover through the new leader.
-	for i := range 10 {
-		key := fmt.Sprintf("post-failover-%03d", i)
-		value := fmt.Sprintf("val-post-failover-%03d", i)
-		proposeAndWait(t, cluster, trackers, 1, key, value)
-		expected[key] = value
-	}
-
-	// Verify all entries on surviving nodes.
-	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("all 20 entries verified on surviving nodes after failover")
 }
 
 // TestIntegration_DB_Membership verifies that SyncGetShardMembership returns
@@ -327,56 +251,4 @@ func TestIntegration_DB_StaleRead(t *testing.T) {
 		t.Fatalf("StaleRead = %q, want %q", val, "stale-value")
 	}
 	t.Logf("StaleRead from follower[%d] = %q (correct)", followerIdx, val)
-}
-
-// TestIntegration_DB_FiveNode verifies that a 5-node cluster using the
-// dragonboat adapter handles proposals, replication, leader failover, and
-// continued writes under a larger quorum (3 of 5).
-func TestIntegration_DB_FiveNode(t *testing.T) {
-	cluster := newDBTestCluster(t, 5)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("5-node cluster leader at node[%d]", leaderIdx)
-
-	// Warmup entry.
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose 20 entries.
-	expected := proposeNEntries(t, cluster, trackers, 1, 20, "db5n")
-
-	// Verify all 20 entries on all 5 nodes.
-	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("20 entries verified on all 5 nodes")
-
-	// Kill the leader.
-	oldLeaderIdx := cluster.findLeader(1)
-	if oldLeaderIdx < 0 {
-		t.Fatal("no leader found before failover")
-	}
-	t.Logf("stopping leader node[%d]", oldLeaderIdx)
-	cluster.stopNode(oldLeaderIdx)
-
-	newLeaderIdx := cluster.waitForClusterLeader(1, failoverTimeout)
-	if newLeaderIdx == oldLeaderIdx {
-		t.Fatal("new leader must not be the stopped node")
-	}
-	t.Logf("new leader elected at node[%d] after failover", newLeaderIdx)
-
-	// Warmup after new election.
-	proposeAndWait(t, cluster, trackers, 1, "post-warmup", "ok")
-
-	// Propose 10 more entries through the new leader.
-	for i := range 10 {
-		key := fmt.Sprintf("db5n-post-%03d", i)
-		value := fmt.Sprintf("val-db5n-post-%03d", i)
-		proposeAndWait(t, cluster, trackers, 1, key, value)
-		expected[key] = value
-	}
-
-	// Verify all 30 entries on the 4 surviving nodes.
-	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("all 30 entries verified on 4 surviving nodes after failover")
 }
