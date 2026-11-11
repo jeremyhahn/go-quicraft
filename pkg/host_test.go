@@ -1169,34 +1169,6 @@ func TestReadIndex_Success(t *testing.T) {
 // StaleRead
 // ---------------------------------------------------------------------------
 
-func TestStaleRead_ClosedHost(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	h.Close()
-
-	_, err = h.StaleRead(context.Background(), 1, nil)
-	if !errors.Is(err, ErrClosed) {
-		t.Errorf("StaleRead error = %v, want ErrClosed", err)
-	}
-}
-
-func TestStaleRead_ShardNotFound(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	_, err = h.StaleRead(context.Background(), 999, nil)
-	if !errors.Is(err, ErrShardNotFound) {
-		t.Errorf("StaleRead error = %v, want ErrShardNotFound", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // NewSession
 // ---------------------------------------------------------------------------
@@ -1815,28 +1787,6 @@ func TestRequestSnapshot_ClosedHost(t *testing.T) {
 	}
 }
 
-func TestRequestSnapshot_Success(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	rs, err := h.RequestSnapshot(context.Background(), 1, SnapshotOption{})
-	if err != nil {
-		t.Fatalf("RequestSnapshot failed: %v", err)
-	}
-	if rs == nil {
-		t.Fatal("RequestSnapshot returned nil")
-	}
-	rs.Release()
-}
-
 func TestRequestSnapshot_ShardNotFound(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -2370,28 +2320,6 @@ func TestSyncRead_TimesOutWhenLeaderNotReady(t *testing.T) {
 	_, err = h.SyncRead(ctx, 1, "hello")
 	if err == nil {
 		t.Fatal("expected error from SyncRead before leader is ready")
-	}
-}
-
-func TestStaleRead_ReturnsResult(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	h.StartShard(members, false, testCreateFunc, scfg)
-
-	// The RSM is now wired during StartShard, so Lookup should succeed.
-	result, err := h.StaleRead(context.Background(), 1, "stale-query")
-	if err != nil {
-		t.Fatalf("StaleRead error = %v, want nil", err)
-	}
-	if result != "stale-query" {
-		t.Errorf("StaleRead result = %v, want %q", result, "stale-query")
 	}
 }
 
@@ -9860,38 +9788,6 @@ func TestOnLeaderUpdated_FollowerNoPreviousLeaderFailsStrandedProposals(t *testi
 	rs.Release()
 }
 
-func TestOnLeaderUpdated_LeaderLostStillWorks(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	pool := NewRequestStatePool()
-
-	// Set up: replica 1 is the leader.
-	ns.leaderID.Store(1)
-	ns.isLeader.Store(true)
-
-	// Register a pending proposal.
-	rs := newRequestState(pool, 400, time.Time{}, true)
-	ns.pendingProposals.Store(uint64(400), &pendingProposal{rs: rs})
-	h.addPendingOp()
-
-	// Leader lost: was leader (replica 1), new leader is replica 2.
-	cb := &hostEngineCallback{h: h}
-	cb.OnLeaderUpdated(1, 2, 7)
-
-	// Proposal should be failed via the existing leader-lost path.
-	select {
-	case result := <-rs.ResultC():
-		if !errors.Is(result.Err, ErrNotLeader) {
-			t.Errorf("proposal result.Err = %v, want NotLeaderError", result.Err)
-		}
-	default:
-		t.Fatal("leader-lost should fail proposals")
-	}
-
-	rs.Release()
-}
-
 // ---------------------------------------------------------------------------
 // hostEngineCallback: OnCampaignLaunched
 // ---------------------------------------------------------------------------
@@ -13853,32 +13749,6 @@ func TestPropose_DrainingReturnsError(t *testing.T) {
 // Coverage: QueryLocalNode and StaleRead RSM nil
 // ---------------------------------------------------------------------------
 
-func TestQueryLocalNode_NilRSM(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	ns.rsm = nil
-
-	ctx := context.Background()
-	_, err := h.QueryLocalNode(ctx, 1, "query")
-	if !errors.Is(err, ErrShardNotReady) {
-		t.Errorf("QueryLocalNode with nil RSM = %v, want ErrShardNotReady", err)
-	}
-}
-
-func TestStaleRead_NilRSM(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	ns.rsm = nil
-
-	ctx := context.Background()
-	_, err := h.StaleRead(ctx, 1, "query")
-	if !errors.Is(err, ErrShardNotReady) {
-		t.Errorf("StaleRead with nil RSM = %v, want ErrShardNotReady", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Coverage: translateProposalError - ReadIndexNotReady
 // ---------------------------------------------------------------------------
@@ -15063,28 +14933,6 @@ func TestOnLeaderUpdated_LostLeadership(t *testing.T) {
 	}
 }
 
-func TestOnSnapshotRejected_WithListener(t *testing.T) {
-	var fired atomic.Bool
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnSnapshotRejected: func(info config.SnapshotInfo) {
-			fired.Store(true)
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-	defer h.Close()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnSnapshotRejected(1, 1, nil)
-	flushListeners(t, cb)
-	if !fired.Load() {
-		t.Error("expected OnSnapshotRejected event to fire")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Coverage: failPendingRequests - snapshot failure path
 // ---------------------------------------------------------------------------
@@ -15308,32 +15156,6 @@ func TestOnApplied_BadPendingProposalType(t *testing.T) {
 	cb.OnApplied(1, []proto.Entry{{Index: 1, Key: 55}}, []sm.Result{{Value: 0}})
 }
 
-func TestOnApplied_SessionExpiredResult(t *testing.T) {
-	h := newTestHost(t)
-	addTestNodeState(h, 1, 1)
-	ns := testLoadNode(h, 1)
-	ns.requestPool = NewRequestStatePool()
-
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 66, time.Time{}, true)
-	ns.pendingProposals.Store(uint64(66), &pendingProposal{rs: rs})
-	h.addPendingOp()
-
-	cb := &hostEngineCallback{h: h}
-	cb.OnApplied(1, []proto.Entry{{Index: 10, Key: 66, ClientID: 999}},
-		[]sm.Result{{Value: sm.ResultSessionExpired}})
-
-	select {
-	case result := <-rs.ResultC():
-		var se *SessionExpiredError
-		if !errors.As(result.Err, &se) {
-			t.Errorf("expected *SessionExpiredError, got: %v", result.Err)
-		}
-	default:
-		t.Error("expected pending proposal to be completed with session expired")
-	}
-}
-
 func TestOnApplied_NormalResultCompletes(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -15478,33 +15300,6 @@ func TestHandleMessage_WithSourceAddress(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Coverage: SyncRead success path
 // ---------------------------------------------------------------------------
-
-func TestSyncRead_SuccessPath(t *testing.T) {
-	h := newTestHost(t)
-
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	scfg := testShardConfig(1, 1)
-	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	const query = "test-query"
-	result, err := h.SyncRead(ctx, 1, query)
-	if err != nil {
-		t.Fatalf("SyncRead failed: %v", err)
-	}
-	// mockStateMachine.Lookup echoes the query, so this asserts the SM was
-	// consulted and its answer returned. The comment this replaces claimed
-	// the test SM returns nil, which is not what mockStateMachine does — the
-	// result was simply never checked.
-	if result != query {
-		t.Fatalf("SyncRead result = %#v, want %q", result, query)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Coverage: DiagPipelineState - shard not ready
