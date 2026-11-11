@@ -85,6 +85,10 @@ func TestIsTempError_TemporaryErrors(t *testing.T) {
 		{"ErrShardNotInitialized", ErrShardNotInitialized},
 		{"ErrClosed", ErrClosed},
 		{"ErrAborted", ErrAborted},
+		// A raw quicraft not-leader error reaching a migrated retry loop must
+		// not be treated as fatal: an election is a routine, temporary state.
+		{"ErrNotLeader", ErrNotLeader},
+		{"wrapped ErrTimeout", fmt.Errorf("context: %w", ErrTimeout)},
 	}
 
 	for _, tt := range tempErrors {
@@ -109,6 +113,12 @@ func TestIsTempError_NonTemporaryErrors(t *testing.T) {
 		{"ErrInvalidRange", ErrInvalidRange},
 		{"ErrLogDBNotCreatedOrClosed", ErrLogDBNotCreatedOrClosed},
 		{"ErrNoSnapshot", ErrNoSnapshot},
+		// ErrCanceled is not retryable, matching dragonboat v4.
+		{"ErrCanceled", ErrCanceled},
+		{"wrapped ErrCanceled", fmt.Errorf("context canceled: %w", ErrCanceled)},
+		// ErrShardNotBootstrapped is a configuration/setup problem, not a
+		// transient condition.
+		{"ErrShardNotBootstrapped", ErrShardNotBootstrapped},
 		{"nil", nil},
 	}
 
@@ -196,14 +206,20 @@ func (e *wrappedError) Error() string { return e.msg }
 func (e *wrappedError) Unwrap() error { return e.inner }
 
 func TestTranslateError_WrappedQuicraftErrors(t *testing.T) {
-	wrapped := &wrappedError{
-		msg:   "operation failed",
-		inner: quicraft.ErrShardNotFound,
+	tests := []struct {
+		name  string
+		input error
+		want  error
+	}{
+		{"custom wrapper", &wrappedError{msg: "operation failed", inner: quicraft.ErrShardNotFound}, ErrShardNotFound},
+		{"double fmt wrap", fmt.Errorf("layer2: %w", fmt.Errorf("layer1: %w", quicraft.ErrTimeout)), ErrTimeout},
 	}
-
-	result := translateError(wrapped)
-	if !errors.Is(result, ErrShardNotFound) {
-		t.Errorf("expected wrapped error to translate to ErrShardNotFound, got %v", result)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if result := translateError(tt.input); !errors.Is(result, tt.want) {
+				t.Errorf("translateError(%v) = %v, want %v", tt.input, result, tt.want)
+			}
+		})
 	}
 }
 
@@ -244,62 +260,13 @@ func TestTranslateError_ContextErrors(t *testing.T) {
 	}
 }
 
-func TestIsTempError_NotLeaderIsTemporary(t *testing.T) {
-	// A raw quicraft not-leader error reaching a migrated retry loop must
-	// not be treated as fatal: an election is a routine, temporary state.
-	if !IsTempError(ErrNotLeader) {
-		t.Error("IsTempError(ErrNotLeader) = false, want true")
-	}
-}
-
-func TestIsTempError_WrappedTemporaryError(t *testing.T) {
-	wrapped := fmt.Errorf("context: %w", ErrTimeout)
-	if !IsTempError(wrapped) {
-		t.Error("expected IsTempError to return true for wrapped ErrTimeout")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Additional sentinel coverage
 // ---------------------------------------------------------------------------
 
-func TestErrShardNotBootstrapped_IsNotTemp(t *testing.T) {
-	// ErrShardNotBootstrapped is a distinct sentinel and is NOT in the
-	// IsTempError set — it indicates a configuration/setup problem, not
-	// a transient condition.
-	if IsTempError(ErrShardNotBootstrapped) {
-		t.Fatal("ErrShardNotBootstrapped should NOT be temporary")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // TranslateError edge cases
 // ---------------------------------------------------------------------------
-
-func TestTranslateError_DoubleWrappedError(t *testing.T) {
-	inner := fmt.Errorf("layer1: %w", quicraft.ErrTimeout)
-	outer := fmt.Errorf("layer2: %w", inner)
-
-	result := translateError(outer)
-	if !errors.Is(result, ErrTimeout) {
-		t.Errorf("expected ErrTimeout for double-wrapped, got %v", result)
-	}
-}
-
-func TestIsTempError_WrappedCanceledIsNotTemp(t *testing.T) {
-	wrapped := fmt.Errorf("context canceled: %w", ErrCanceled)
-	if IsTempError(wrapped) {
-		t.Error("expected IsTempError to return false for wrapped ErrCanceled")
-	}
-}
-
-func TestIsTempError_CanceledIsNotTemporary(t *testing.T) {
-	// Verify that ErrCanceled is NOT classified as temporary,
-	// matching dragonboat v4 behavior where canceled is not retryable.
-	if IsTempError(ErrCanceled) {
-		t.Error("ErrCanceled should not be temporary (dragonboat v4 does not treat canceled as retryable)")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // CompactionIndexNotSupportedError
@@ -323,14 +290,6 @@ func TestCompactionIndexNotSupportedError_IsErrInvalidOption(t *testing.T) {
 	err := &CompactionIndexNotSupportedError{}
 	if !errors.Is(err, ErrInvalidOption) {
 		t.Error("CompactionIndexNotSupportedError should match ErrInvalidOption via errors.Is")
-	}
-}
-
-func TestTranslateError_TooManySessions(t *testing.T) {
-	// ErrTooManySessions is an alias for ErrSessionLimitExceeded.
-	result := translateError(quicraft.ErrTooManySessions)
-	if !errors.Is(result, ErrSystemBusy) {
-		t.Errorf("translateError(ErrTooManySessions) = %v, want ErrSystemBusy", result)
 	}
 }
 
