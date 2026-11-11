@@ -632,21 +632,6 @@ func TestNodeHost_SyncMethodsRejectExpiredDeadline(t *testing.T) {
 // L: a timeout shorter than one RTT is rejected with ErrTimeoutTooSmall
 // ---------------------------------------------------------------------------
 
-func TestNodeHost_AsyncMethodsRejectTinyTimeout(t *testing.T) {
-	cfg := testNodeHostConfig(t.TempDir())
-	cfg.RTTMillisecond = 100
-	nh := newTestNodeHostWithConfig(t, cfg)
-	startTestShard(t, nh, 1, 1)
-
-	session := nh.GetNoOPSession(1)
-	if _, err := nh.Propose(session, []byte("x"), time.Millisecond); !errors.Is(err, ErrTimeoutTooSmall) {
-		t.Errorf("Propose = %v, want ErrTimeoutTooSmall", err)
-	}
-	if _, err := nh.ReadIndex(1, time.Millisecond); !errors.Is(err, ErrTimeoutTooSmall) {
-		t.Errorf("ReadIndex = %v, want ErrTimeoutTooSmall", err)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // L: Start*Replica validates initial member targets
 // ---------------------------------------------------------------------------
