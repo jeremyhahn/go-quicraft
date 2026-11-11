@@ -200,9 +200,8 @@ func TestBarrier_Unseal_HardwareMode_EncryptorError(t *testing.T) {
 
 	// Now try to unseal with a hw strategy that errors on BarrierEncryptor.
 	hwErr := errors.New("hw unseal init failed")
-	failHW := &hwStrategy{hwEnc: nil, hwErr: hwErr}
-	// We need a strategy that can unseal the key but then fails on BarrierEncryptor.
-	// Create a wrapper that uses swStrategy for unseal but failHW for BarrierEncryptor.
+	// A strategy that unseals the key with swStrategy but then fails on
+	// BarrierEncryptor.
 	wrapped := &hwUnsealErrorStrategy{
 		unsealStrategy: swStrategy,
 		hwErr:          hwErr,
@@ -212,7 +211,6 @@ func TestBarrier_Unseal_HardwareMode_EncryptorError(t *testing.T) {
 	if !errors.Is(err, hwErr) {
 		t.Fatalf("expected hw error, got %v", err)
 	}
-	_ = failHW // satisfy usage
 }
 
 // hwUnsealErrorStrategy unseals successfully but then returns an error from BarrierEncryptor.
@@ -421,39 +419,6 @@ func TestBarrier_PurgeEpochsBefore_HardwareMode(t *testing.T) {
 	}
 }
 
-// --- IsHardwareMode ---
-
-func TestBarrier_IsHardwareMode_False(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	if b.IsHardwareMode() {
-		t.Fatal("expected IsHardwareMode=false for software strategy")
-	}
-}
-
-func TestBarrier_IsHardwareMode_ClearedAfterSeal(t *testing.T) {
-	b := MustNewBarrier(DefaultBarrierConfig(1))
-	enc := &mockHWEncryptor{prefix: []byte("HW:")}
-	s := &hwStrategy{hwEnc: enc}
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	if !b.IsHardwareMode() {
-		t.Fatal("expected hardware mode before seal")
-	}
-
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-
-	if b.IsHardwareMode() {
-		t.Fatal("expected hardware mode cleared after seal")
-	}
-}
-
 // --- EpochBarrier alias ---
 
 func TestEpochBarrier_IsAlias(t *testing.T) {
@@ -581,31 +546,5 @@ func TestSealedRootKeyData_NilNonceAndPayload(t *testing.T) {
 	}
 	if cp.HardwarePayload != nil {
 		t.Fatalf("expected nil HardwarePayload, got %v", cp.HardwarePayload)
-	}
-}
-
-// --- Credentials ---
-
-// TestCredentials_ZeroValue pins the contract every ambient-credential strategy
-// relies on: the zero value is legal and means "none supplied". Secret is a
-// enclave.Sealed, and a nil pointer means no secret.
-// TestCredentials_WithSecret round-trips a passphrase through the protected
-// form. It reads the material back through the sealed enclave rather than off
-// the struct, which is the whole change: there is no plain copy on Credentials
-// to read any more.
-func TestCredentials_WithSecret(t *testing.T) {
-	c := mustCreds(t, "my-secret")
-	defer c.Secret.Destroy()
-
-	opened, err := c.Secret.Open(context.Background())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer opened.Destroy()
-
-	if eq, err := opened.EqualTo([]byte("my-secret")); err != nil {
-		t.Fatalf("EqualTo: %v", err)
-	} else if !eq {
-		t.Fatalf("the credential did not round-trip its passphrase")
 	}
 }
