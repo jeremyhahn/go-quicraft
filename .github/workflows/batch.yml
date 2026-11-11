@@ -46,7 +46,7 @@ permissions:
 
 env:
   # In lockstep with ci-template's GO_VERSION.
-  GO_VERSION: '1.27.3'
+  GO_VERSION: '1.27.4'
   FUZZ_TAGS: 'quicraft_fuzz'  # CUSTOMIZE: the fuzz targets' build tag
   RACE_TAGS: 'quicraft_fuzz'  # CUSTOMIZE: the unit suite plus the fuzz targets' seeds
   RACE_PKGS: './...'     # CUSTOMIZE: ci.yml's Test scope

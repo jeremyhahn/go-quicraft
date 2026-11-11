@@ -12,7 +12,7 @@
 # checksum database verifies the module they are built from.
 
 # The Go toolchain: the version go.mod names, pinned by index digest.
-GO_IMAGE=golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd
+GO_IMAGE=golang:1.27.4-alpine3.24@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf
 
 # The golangci-lint version. Every literal pin in the CI workflows and
 # devcontainer Dockerfiles must match it (check-tool-versions enforces this).
