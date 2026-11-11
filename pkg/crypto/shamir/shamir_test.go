@@ -173,27 +173,6 @@ func TestVerifyShare_TotalMismatch(t *testing.T) {
 	}
 }
 
-func TestSplitBytes_LargeSecret(t *testing.T) {
-	secret := make([]byte, 1024)
-	if _, err := rand.Read(secret); err != nil {
-		t.Fatalf("failed to generate random secret: %v", err)
-	}
-
-	values := splitValues(t, secret, 5, 9)
-	if len(values) != 9 {
-		t.Fatalf("expected 9 shares, got %d", len(values))
-	}
-
-	reconstructed, err := CombineBytes(pick(values, 0, 2, 4, 6, 8), 5)
-	if err != nil {
-		t.Fatalf("CombineBytes failed: %v", err)
-	}
-
-	if !bytes.Equal(secret, reconstructed) {
-		t.Error("reconstructed large secret does not match original")
-	}
-}
-
 func TestErrors_Format(t *testing.T) {
 	splitErr := &SplitError{Reason: "test reason"}
 	if splitErr.Error() != "quicraft/shamir: split failed: test reason" {

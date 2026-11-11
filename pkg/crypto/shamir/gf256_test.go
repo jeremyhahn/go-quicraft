@@ -102,10 +102,10 @@ func TestGFPolyEval(t *testing.T) {
 // for several (threshold, total) configurations and secret sizes.
 func TestSplitCombineRoundTripAllSubsets(t *testing.T) {
 	configs := []struct{ threshold, total int }{
-		{2, 2}, {2, 3}, {3, 5}, {5, 5}, {4, 7},
+		{2, 2}, {2, 3}, {3, 5}, {5, 5}, {4, 7}, {5, 9},
 	}
 	for _, cfg := range configs {
-		for _, size := range []int{1, 31, 32, 33, 64} {
+		for _, size := range []int{1, 31, 32, 33, 64, 1024} {
 			secret := make([]byte, size)
 			if _, err := rand.Read(secret); err != nil {
 				t.Fatalf("rand: %v", err)
