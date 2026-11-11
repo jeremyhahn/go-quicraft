@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -407,47 +408,6 @@ func TestMembership_AddWitness_NilWitnessesMap(t *testing.T) {
 // decisions as the old copy-then-apply approach for every config change
 // type, and that validate() never mutates the membership.
 
-func TestMembership_Validate_AddNodePromotion_NoMutation(t *testing.T) {
-	m := testMembership()
-	m.observers = map[uint64]string{10: "obs1"}
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 10,
-		Address:   "obs1-promoted",
-	}
-	// Validate should succeed (observer promotion is allowed).
-	err := m.validate(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Membership must be unchanged: observer still present, not promoted.
-	if !m.isObserver(10) {
-		t.Fatal("validate must not remove replica from observers")
-	}
-	if m.isVoter(10) {
-		t.Fatal("validate must not add replica to addresses")
-	}
-}
-
-func TestMembership_Validate_RemoveNodeSuccess_NoMutation(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 1,
-	}
-	err := m.validate(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Membership must be unchanged: node 1 still a voter, not removed.
-	if !m.isVoter(1) {
-		t.Fatal("validate must not remove replica from addresses")
-	}
-	if m.removed[1] {
-		t.Fatal("validate must not add replica to removed set")
-	}
-}
-
 func TestMembership_Validate_RemoveNodeLastWitness(t *testing.T) {
 	m := newMembership(proto.Membership{
 		Witnesses: map[uint64]string{1: "wit1"},
@@ -459,74 +419,6 @@ func TestMembership_Validate_RemoveNodeLastWitness(t *testing.T) {
 	err := m.validate(cc)
 	if !errors.Is(err, ErrRemoveLastVoter) {
 		t.Fatalf("expected ErrRemoveLastVoter, got %v", err)
-	}
-}
-
-func TestMembership_Validate_RemoveObserver_NoMutation(t *testing.T) {
-	m := testMembership()
-	m.observers = map[uint64]string{10: "obs1"}
-	cc := proto.ConfigChange{
-		Type:      proto.RemoveNode,
-		ReplicaID: 10,
-	}
-	err := m.validate(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !m.isObserver(10) {
-		t.Fatal("validate must not remove observer")
-	}
-}
-
-func TestMembership_Validate_AddNonVotingSuccess_NoMutation(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddNonVoting,
-		ReplicaID: 10,
-		Address:   "obs1",
-	}
-	err := m.validate(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if m.isObserver(10) {
-		t.Fatal("validate must not add observer to membership")
-	}
-}
-
-func TestMembership_Validate_AddWitnessSuccess_NoMutation(t *testing.T) {
-	m := testMembership()
-	cc := proto.ConfigChange{
-		Type:      proto.AddWitness,
-		ReplicaID: 20,
-		Address:   "wit1",
-	}
-	err := m.validate(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if m.isWitness(20) {
-		t.Fatal("validate must not add witness to membership")
-	}
-}
-
-func TestMembership_Validate_ConfigChangeIDUnchanged(t *testing.T) {
-	m := testMembership()
-	m.configChangeID = 42
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 4,
-		Address:   "addr4",
-	}
-	err := m.validate(cc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if m.configChangeID != 42 {
-		t.Fatalf("validate must not change configChangeID, got %d", m.configChangeID)
-	}
-	if m.isVoter(4) {
-		t.Fatal("validate should not mutate the original membership")
 	}
 }
 
@@ -559,7 +451,10 @@ func TestMembership_Validate_MatchesApply_AllTypes(t *testing.T) {
 		{"AddNode-witness", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 20, Address: "a20"}, ErrNodeAlreadyExists, ErrNodeAlreadyExists},
 		{"AddNode-empty-addr", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: ""}, ErrEmptyAddress, ErrEmptyAddress},
 		{"AddNode-removed", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 99, Address: "a99"}, ErrNodeRemoved, ErrNodeRemoved},
+		// An observer is promoted to voter.
+		{"AddNode-observer", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 10, Address: "obs1-promoted"}, nil, nil},
 		{"RemoveNode-exists", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}, nil, nil},
+		{"RemoveNode-observer", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 10}, nil, nil},
 		{"RemoveNode-missing", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 98}, ErrNodeNotFound, ErrNodeNotFound},
 		{"AddNonVoting-new", proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 11, Address: "o11"}, nil, nil},
 		// Converges: a seeded voter is demoted to the observer role the
@@ -575,12 +470,14 @@ func TestMembership_Validate_MatchesApply_AllTypes(t *testing.T) {
 		{"InvalidType", proto.ConfigChange{Type: 999, ReplicaID: 4, Address: "a4"}, ErrInvalidConfigChangeType, ErrInvalidConfigChangeType},
 		{"ZeroReplica", proto.ConfigChange{Type: proto.AddNode, ReplicaID: 0, Address: "a0"}, ErrZeroReplicaID, ErrZeroReplicaID},
 	}
-	// Voters 1-3, observer 10, witness 20, replica 99 removed.
+	// Voters 1-3, observer 10, witness 20, replica 99 removed, last config
+	// change at index 42.
 	setup := func() *membership {
 		m := testMembership()
 		m.observers[10] = "obs1"
 		m.witnesses[20] = "wit1"
 		m.removed[99] = true
+		m.configChangeID = 42
 		return m
 	}
 	for _, tc := range cases {
@@ -589,6 +486,11 @@ func TestMembership_Validate_MatchesApply_AllTypes(t *testing.T) {
 			validateErr := m.validate(tc.cc)
 			if !errors.Is(validateErr, tc.wantValidate) {
 				t.Fatalf("validate returned %v, want %v", validateErr, tc.wantValidate)
+			}
+			// validate is a dry run: it must leave every role map and the
+			// configChangeID exactly as they were, accepted or refused.
+			if !reflect.DeepEqual(m, setup()) {
+				t.Fatalf("validate mutated the membership: %+v", m)
 			}
 
 			// Apply on a separate copy to get the "ground truth" error.
