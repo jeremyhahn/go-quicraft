@@ -142,6 +142,7 @@ func TestSMWrappers_UserSMErrorsPropagate(t *testing.T) {
 		call  func() error
 		match func(error) bool
 	}{
+		{"regular save", save(&regularSMWrapper{sm: &testRegularKVSaveErr{testKV: testKV{data: make(map[string]string)}}}), isType(new(*testAdapterSaveError))},
 		{"concurrent prepare stops save", save(&concurrentSMWrapper{sm: &testConcurrentKVPrepError{testConcurrentKV: *newTestConcurrentKV()}}), isType(new(*testPrepareError))},
 		{"concurrent save", save(&concurrentSMWrapper{sm: &testConcurrentKVSaveErr{testConcurrentKV: *newTestConcurrentKV()}}), isType(new(*testAdapterSaveError))},
 		{"concurrent update", update(&concurrentSMWrapper{sm: &testConcurrentKVUpdateErr{testConcurrentKV: *newTestConcurrentKV()}}), isType(new(*testAdapterUpdateError))},
@@ -424,6 +425,15 @@ func (kv *testConcurrentKVSaveErr) SaveSnapshot(_ context.Context, _ interface{}
 // ---------------------------------------------------------------------------
 // On-disk SM wrapper: SaveSnapshot error from underlying SM
 // ---------------------------------------------------------------------------
+
+// testRegularKVSaveErr fails SaveSnapshot.
+type testRegularKVSaveErr struct {
+	testKV
+}
+
+func (kv *testRegularKVSaveErr) SaveSnapshot(_ context.Context, _ io.Writer, _ <-chan struct{}) error {
+	return &testAdapterSaveError{}
+}
 
 // testOnDiskKVSaveErr fails SaveSnapshot after Sync and PrepareSnapshot succeed.
 type testOnDiskKVSaveErr struct {
