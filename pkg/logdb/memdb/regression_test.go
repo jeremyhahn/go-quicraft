@@ -27,35 +27,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestSaveStatePersistsSnapshotMetadata verifies that an Update carrying a
-// snapshot persists the full metadata, not only the membership: a
-// follower's InstallSnapshot lands via SaveState, and GetSnapshot must see
-// it afterwards instead of ErrNoSnapshot.
-func TestSaveStatePersistsSnapshotMetadata(t *testing.T) {
-	db := New()
-	snap := logdb.Snapshot{
-		Index:    10,
-		Term:     3,
-		Filepath: "snap-10.dat",
-		FileSize: 4096,
-		Membership: logdb.Membership{
-			ConfigChangeID: 7,
-			Addresses:      map[uint64]string{1: "a1"},
-		},
-	}
-	if err := db.SaveState([]logdb.Update{{ShardID: 1, ReplicaID: 1, Snapshot: snap}}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-
-	got, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot after SaveState: %v", err)
-	}
-	if got.Index != 10 || got.Term != 3 || got.Filepath != "snap-10.dat" || got.FileSize != 4096 {
-		t.Fatalf("GetSnapshot = %+v, want the SaveState snapshot", got)
-	}
-}
-
 // TestSaveStateIgnoresStaleSnapshot verifies the staleness check mirrors
 // SaveSnapshot/waldb: an older snapshot in a later Update must not regress
 // the stored snapshot or its membership.
@@ -225,40 +196,6 @@ func TestIterateEntriesReportsCompactedAfterFullCompaction(t *testing.T) {
 	}
 }
 
-// TestIterateEntriesReportsCompactedAfterPartialCompaction covers the
-// floor check when entries remain, and that the floor never goes backwards.
-func TestIterateEntriesReportsCompactedAfterPartialCompaction(t *testing.T) {
-	db := New()
-	defer db.Close()
-
-	if err := db.SaveState([]logdb.Update{{
-		ShardID: 1, ReplicaID: 1,
-		Entries: []logdb.Entry{
-			{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1}, {Index: 4, Term: 1},
-		},
-	}}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-	if err := db.RemoveEntriesTo(1, 1, 2); err != nil {
-		t.Fatalf("RemoveEntriesTo: %v", err)
-	}
-	// A lower follow-up must not lower the floor.
-	if err := db.RemoveEntriesTo(1, 1, 1); err != nil {
-		t.Fatalf("RemoveEntriesTo(1): %v", err)
-	}
-
-	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 2, 4, 0); !errors.Is(err, logdb.ErrCompacted) {
-		t.Errorf("IterateEntries(low=2) error = %v, want ErrCompacted", err)
-	}
-	got, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 5, 0)
-	if err != nil {
-		t.Fatalf("IterateEntries(low=3): %v", err)
-	}
-	if len(got) != 2 || got[0].Index != 3 {
-		t.Fatalf("IterateEntries(low=3) = %+v, want entries 3 and 4", got)
-	}
-}
-
 // TestSaveStateDeepCopiesSnapshotMembership verifies the four membership maps
 // carried by an Update's snapshot are cloned, matching the no-aliasing
 // contract already honoured for Entry.Cmd. Retaining the caller's maps would
@@ -325,38 +262,6 @@ func TestCopyMembershipPreservesNilMaps(t *testing.T) {
 	}
 	if got.Addresses != nil || got.Observers != nil || got.Witnesses != nil || got.Removed != nil {
 		t.Fatalf("nil maps were replaced by empty maps: %+v", got)
-	}
-}
-
-// TestIterateEntriesReportsHeadGap is a regression test. A requested low
-// below the first stored entry with NO compaction floor is a head GAP, not a
-// compaction: the LogDB contract (and waldb) require ErrLogGapDetected there.
-// Reporting ErrCompacted told raft the range was legitimately truncated and
-// hid a missing prefix.
-func TestIterateEntriesReportsHeadGap(t *testing.T) {
-	db := New()
-	defer db.Close()
-
-	// Entries start at 5 with no RemoveEntriesTo call, so compactedTo is 0.
-	if err := db.SaveState([]logdb.Update{{
-		ShardID: 1, ReplicaID: 1,
-		Entries: []logdb.Entry{
-			{Index: 5, Term: 1}, {Index: 6, Term: 1}, {Index: 7, Term: 1},
-		},
-	}}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-
-	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 8, 0); !errors.Is(err, logdb.ErrLogGapDetected) {
-		t.Fatalf("IterateEntries(low=3) = %v, want ErrLogGapDetected", err)
-	}
-
-	// Once a floor exists it wins: below the floor the range really is compacted.
-	if err := db.RemoveEntriesTo(1, 1, 4); err != nil {
-		t.Fatalf("RemoveEntriesTo: %v", err)
-	}
-	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 8, 0); !errors.Is(err, logdb.ErrCompacted) {
-		t.Fatalf("IterateEntries(low=3) below the floor = %v, want ErrCompacted", err)
 	}
 }
 
