@@ -96,6 +96,9 @@ func TestLog_PostSnapshotRestoreState(t *testing.T) {
 	ss := proto.Snapshot{Index: 20, Term: 5}
 	l.restore(ss)
 
+	if l.inmem.entries != nil {
+		t.Fatal("expected inmem entries to be nil after restore")
+	}
 	// After restore, committed and processed should be at snapshot index.
 	if l.committed != 20 {
 		t.Fatalf("expected committed=20, got %d", l.committed)
