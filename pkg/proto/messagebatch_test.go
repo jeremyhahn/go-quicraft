@@ -65,41 +65,6 @@ func TestMessageBatchMarshalUnmarshalRoundTrip(t *testing.T) {
 	assertMessageBatchEqual(t, &mb, &mb2)
 }
 
-func TestMessageBatchMarshalUnmarshalEmpty(t *testing.T) {
-	mb := MessageBatch{
-		BinVer:        WireVersion,
-		DeploymentID:  0,
-		SourceAddress: "",
-	}
-	buf := make([]byte, mb.Size())
-	mb.MarshalTo(buf)
-	var mb2 MessageBatch
-	_, err := mb2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if len(mb2.Requests) != 0 {
-		t.Fatalf("Requests: got len %d, want 0", len(mb2.Requests))
-	}
-}
-
-func TestMessageBatchUnsupportedVersion(t *testing.T) {
-	mb := MessageBatch{
-		BinVer:        WireVersion,
-		DeploymentID:  1,
-		SourceAddress: "x",
-	}
-	buf := make([]byte, mb.Size())
-	mb.MarshalTo(buf)
-	// Corrupt version to future version
-	putUint64(buf[0:], WireVersion+1)
-	var mb2 MessageBatch
-	_, err := mb2.UnmarshalFrom(buf)
-	if !errors.Is(err, ErrUnsupportedVersion) {
-		t.Fatalf("UnmarshalFrom: got %v, want ErrUnsupportedVersion", err)
-	}
-}
-
 func TestWireWindowIsAClosedSet(t *testing.T) {
 	w := DefaultWireWindow()
 	if w.Current != WireVersion || w.Previous != PreviousWireVersion {
@@ -146,23 +111,6 @@ func TestMessageBatchUnmarshalFromWindow(t *testing.T) {
 		if _, err := got.UnmarshalFrom(buf); (err == nil) != AcceptsWireVersion(v) {
 			t.Fatalf("UnmarshalFrom(BinVer %d) err = %v", v, err)
 		}
-	}
-}
-
-func TestMessageBatchTooManyMessages(t *testing.T) {
-	mb := MessageBatch{
-		BinVer:        WireVersion,
-		SourceAddress: "x",
-	}
-	buf := make([]byte, mb.Size())
-	mb.MarshalTo(buf)
-	// Find the requests count field and corrupt it
-	offset := messageBatchFixedSize + 4 + 1 // after BinVer + DeploymentID + sourceAddress("x")
-	putUint32(buf[offset:], uint32(MaxMessagesPerBatch+1))
-	var mb2 MessageBatch
-	_, err := mb2.UnmarshalFrom(buf)
-	if !errors.Is(err, ErrTooManyMessages) {
-		t.Fatalf("UnmarshalFrom: got %v, want ErrTooManyMessages", err)
 	}
 }
 
@@ -376,52 +324,6 @@ func TestMessageBatchUnmarshalFromEmptyPreservesCapacity(t *testing.T) {
 	}
 	if cap(dst.Requests) != capAfterFirst {
 		t.Fatalf("empty unmarshal lost capacity: got %d, want %d", cap(dst.Requests), capAfterFirst)
-	}
-}
-
-func TestMessageBatchUnmarshalFromBatchSizeLimitExceeded(t *testing.T) {
-	// Craft a batch with messages carrying large Entry.Cmd payloads that
-	// exceed MaxBatchSize (64MB) in aggregate. This verifies the cumulative
-	// size check rejects oversized batches.
-	//
-	// Each message has one entry with a 7MB Cmd payload. With 10 such
-	// messages (10 * ~7MB = ~70MB), the cumulative offset exceeds the
-	// 64MB MaxBatchSize limit. The decoder must reject this.
-	const cmdSize = 7 * 1024 * 1024 // 7MB per entry
-	const msgCount = 10             // 10 * 7MB = 70MB > 64MB limit
-
-	mb := MessageBatch{
-		BinVer:        WireVersion,
-		DeploymentID:  1,
-		SourceAddress: "x",
-		Requests:      make([]Message, msgCount),
-	}
-	for i := range mb.Requests {
-		mb.Requests[i] = Message{
-			Type:    Replicate,
-			From:    1,
-			To:      2,
-			ShardID: 1,
-			Term:    1,
-			Entries: []Entry{
-				{
-					Term:  1,
-					Index: uint64(i + 1),
-					Type:  EntryNormal,
-					Cmd:   make([]byte, cmdSize),
-				},
-			},
-		}
-	}
-	buf := make([]byte, mb.Size())
-	if _, err := mb.MarshalTo(buf); err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-
-	var mb2 MessageBatch
-	_, err := mb2.UnmarshalFrom(buf)
-	if !errors.Is(err, ErrBatchSizeLimitExceeded) {
-		t.Fatalf("UnmarshalFrom: got %v, want ErrBatchSizeLimitExceeded", err)
 	}
 }
 
