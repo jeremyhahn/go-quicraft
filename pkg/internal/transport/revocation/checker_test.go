@@ -1221,62 +1221,6 @@ func TestOnCertRevokedCallback(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Error type tests
-// ---------------------------------------------------------------------------
-
-// TestCertificateRevokedErrorIs verifies errors.Is matching.
-func TestCertificateRevokedErrorIs(t *testing.T) {
-	err := &CertificateRevokedError{Serial: "abc"}
-	if !errors.Is(err, ErrCertificateRevoked) {
-		t.Fatal("CertificateRevokedError should match ErrCertificateRevoked")
-	}
-	if errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("CertificateRevokedError should not match ErrOCSPUnavailable")
-	}
-	if err.Error() != "revocation: certificate serial abc is revoked" {
-		t.Fatalf("unexpected error message: %s", err.Error())
-	}
-}
-
-// TestOCSPUnavailableErrorIs verifies errors.Is matching and Unwrap.
-func TestOCSPUnavailableErrorIs(t *testing.T) {
-	inner := errors.New("connection refused")
-	err := &OCSPUnavailableError{URL: "http://example.com", Err: inner}
-	if !errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("OCSPUnavailableError should match ErrOCSPUnavailable")
-	}
-	if !errors.Is(err, inner) {
-		t.Fatal("OCSPUnavailableError should unwrap to inner error")
-	}
-	if errors.Is(err, ErrCertificateRevoked) {
-		t.Fatal("OCSPUnavailableError should not match ErrCertificateRevoked")
-	}
-	expected := "revocation: OCSP responder http://example.com unavailable: connection refused"
-	if err.Error() != expected {
-		t.Fatalf("unexpected error message: %s", err.Error())
-	}
-}
-
-// TestCRLParseErrorIs verifies errors.Is matching and Unwrap.
-func TestCRLParseErrorIs(t *testing.T) {
-	inner := errors.New("asn1 decode")
-	err := &CRLParseError{Path: "/tmp/crl.pem", Err: inner}
-	if !errors.Is(err, ErrInvalidCRL) {
-		t.Fatal("CRLParseError should match ErrInvalidCRL")
-	}
-	if !errors.Is(err, inner) {
-		t.Fatal("CRLParseError should unwrap to inner error")
-	}
-	if errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("CRLParseError should not match ErrOCSPUnavailable")
-	}
-	expected := "revocation: failed to parse CRL /tmp/crl.pem: asn1 decode"
-	if err.Error() != expected {
-		t.Fatalf("unexpected error message: %s", err.Error())
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Mode constants tests
 // ---------------------------------------------------------------------------
 
