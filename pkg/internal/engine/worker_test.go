@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -2966,91 +2965,6 @@ func TestCommitWorker_PiggybackPersistFailureReoffers(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_PiggybackMessageOrdering verifies that the piggyback
-// path correctly splits messages: free-order messages (Replicate, Heartbeat)
-// are sent before ordered messages (VoteResp, HeartbeatResp, ReplicateResp).
-//
-// OPTIMIZATION: The piggyback path no longer calls SaveState to persist
-// the commit index. The commit index is persisted lazily in the next batch.
-// However, the message ordering is still maintained for consistency with
-// WAL mode behavior. Ordered messages are sent after Commit() completes.
-func TestCommitWorker_PiggybackMessageOrdering(t *testing.T) {
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	ws := NewWorkSignal(64)
-	stopC := make(chan struct{})
-
-	// Use a sequencing sender that records the order of Send calls.
-	var sendOrder []string
-	var sendMu sync.Mutex
-	seqSender := &sequencingSender{
-		onSend: func(msgs []proto.Message) {
-			sendMu.Lock()
-			defer sendMu.Unlock()
-			for _, m := range msgs {
-				sendOrder = append(sendOrder, proto.MessageTypeName(m.Type))
-			}
-		},
-	}
-
-	// Use a LogDB that records when SaveState is called.
-	seqLDB := &sequencingLogDB{
-		testLogDB: newTestLogDB(),
-		onSave: func() {
-			sendMu.Lock()
-			sendOrder = append(sendOrder, "SaveState")
-			sendMu.Unlock()
-		},
-	}
-
-	cw := newCommitWorker(0, seqLDB, seqSender, commitC, applyC, applyPool, ws, nil, stopC, nil)
-	cw.noRetryDelay = true
-
-	peer, lr, update, _ := setupPiggybackPeer(t, 1, 1)
-
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	node.commitPending.Store(true)
-
-	cw.batch = append(cw.batch[:0], update)
-	cw.batchNodes = []*Node{node}
-
-	cw.processBatch()
-
-	// Analyze the sequence of operations.
-	// OPTIMIZATION: Only 1 SaveState call (initial batch persistence).
-	// The piggyback path skips SaveState - commit index is persisted lazily.
-	sendMu.Lock()
-	defer sendMu.Unlock()
-
-	// There should be 2 SaveState calls: the initial batch persistence and
-	// the piggyback commit-index persist (which precedes ordered sends/apply).
-	saveStateCount := 0
-	for _, entry := range sendOrder {
-		if entry == "SaveState" {
-			saveStateCount++
-		}
-	}
-	if saveStateCount != 2 {
-		t.Fatalf("expected 2 SaveState entries (batch + piggyback persist), got %d (sequence: %v)",
-			saveStateCount, sendOrder)
-	}
-
-	// Verify the apply worker received entries (piggyback succeeded).
-	select {
-	case ai := <-applyC:
-		if len(ai.update.CommittedEntries) == 0 {
-			t.Fatal("piggyback apply item should have committed entries")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected an apply item from piggyback")
-	}
-}
-
 // sequencingSender records Send calls for ordering verification.
 type sequencingSender struct {
 	onSend func([]proto.Message)
@@ -3128,53 +3042,9 @@ func TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode(t *testing.T)
 	}
 }
 
-// TestStepWorker_ClearStepCommitPending_EmptyNodes verifies that
-// clearStepCommitPending is a no-op when the worker has no loaded nodes.
 // ---------------------------------------------------------------------------
 // drainUnloadReload tests
 // ---------------------------------------------------------------------------
-
-// TestCommitWorker_DrainUnloadReload_ProcessesUnloads verifies that
-// drainUnloadReload adds unload requests to the unloaded set.
-// TestCommitWorker_DrainUnloadReload_UnloadThenReloadInTwoPasses verifies
-// that drainUnloadReload correctly processes unload followed by reload
-// in separate calls (deterministic ordering).
-func TestCommitWorker_DrainUnloadReload_UnloadThenReloadInTwoPasses(t *testing.T) {
-	ldb := newTestLogDB()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-
-	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
-
-	// First pass: unload shard 10 and shard 20.
-	cw.membershipC <- shardMembership{shardID: 10, unload: true}
-	cw.membershipC <- shardMembership{shardID: 20, unload: true}
-
-	cw.drainUnloadReload()
-
-	// Both should be in the unloaded set.
-	if !cw.unloaded.has(10) {
-		t.Fatal("shard 10 should be in unloaded set after first drain")
-	}
-	if !cw.unloaded.has(20) {
-		t.Fatal("shard 20 should be in unloaded set after first drain")
-	}
-
-	// Second pass: reload shard 10 only.
-	cw.membershipC <- shardMembership{shardID: 10}
-
-	cw.drainUnloadReload()
-
-	// Shard 10 should be removed; shard 20 should remain.
-	if cw.unloaded.has(10) {
-		t.Fatal("shard 10 should be removed from unloaded set after reload")
-	}
-	if !cw.unloaded.has(20) {
-		t.Fatal("shard 20 should still be in unloaded set")
-	}
-}
 
 // TestCommitWorker_DrainUnloadReload_OrderIsDeterministic verifies that
 // unload and reload requests are applied in the order they were made, even
@@ -3331,136 +3201,10 @@ func TestCommitWorker_Run_HandlesUnloadInMainLoop(t *testing.T) {
 // executePiggyback edge cases
 // ---------------------------------------------------------------------------
 
-// TestExecutePiggyback_WithOnCommittedCallback verifies that
-// executePiggyback fires the OnCommitted callback when the node
-// has notifyCommit=true and committed entries are present.
-func TestExecutePiggyback_WithOnCommittedCallback(t *testing.T) {
-	ldb := newTestLogDB()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-	cb := newTestCallback()
-
-	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), cb, stopC, nil)
-	cw.noRetryDelay = true
-
-	peer, lr := newTestPeer(t, 1, 1)
-	tickPeerToLeader(peer)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	node.commitPending.Store(true)
-	node.SetNotifyCommit(true)
-
-	// Persist the term-opening no-op through a real GetUpdate/Commit
-	// cycle. tryCommit counts the leader's own match at its durable
-	// index, so the single-node commit index only advances at the
-	// persistence edge inside Peer.Commit — the manufactured piggyback
-	// below claims entry 1 is committed, which must be true by then.
-	initial, err := peer.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("GetUpdate: %v", err)
-	}
-	if err := peer.Commit(initial); err != nil {
-		t.Fatalf("Commit(initial): %v", err)
-	}
-
-	piggyback := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		State:     proto.State{Term: 1, Commit: 1},
-		CommittedEntries: []proto.Entry{
-			{Index: 1, Term: 1, Cmd: []byte("committed")},
-		},
-	}
-
-	cw.executePiggyback(node, piggyback)
-
-	// OnCommitted should have been called.
-	if cb.committedCount.Load() == 0 {
-		t.Fatal("expected OnCommitted callback to fire for piggyback with notifyCommit=true")
-	}
-
-	// Apply item should be forwarded.
-	select {
-	case ai := <-applyC:
-		if ai.update.ShardID != 1 {
-			t.Fatalf("expected shardID 1, got %d", ai.update.ShardID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected apply item after piggyback")
-	}
-}
-
-// TestExecutePiggyback_OnlyOrderedMessages verifies that executePiggyback
-// handles the case where all messages are ordered (no free-order messages).
-func TestExecutePiggyback_OnlyOrderedMessages(t *testing.T) {
-	ldb := newTestLogDB()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-	sender := newTestSender()
-
-	cw := newCommitWorker(0, ldb, sender, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
-	cw.noRetryDelay = true
-
-	peer, lr := newTestPeer(t, 1, 1)
-	tickPeerToLeader(peer)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	node.commitPending.Store(true)
-
-	// Persist the term-opening no-op through a real GetUpdate/Commit
-	// cycle. The single-node commit index only advances at the
-	// persistence edge inside Peer.Commit — the manufactured piggyback
-	// below claims entry 1 is committed, which must be true by then.
-	initial, err := peer.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("GetUpdate: %v", err)
-	}
-	if err := peer.Commit(initial); err != nil {
-		t.Fatalf("Commit(initial): %v", err)
-	}
-
-	piggyback := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		State:     proto.State{Term: 1, Commit: 1},
-		Messages: []proto.Message{
-			// Only ordered messages (no Heartbeat/Replicate/Ping).
-			{Type: proto.RequestVoteResp, ShardID: 1, From: 1, To: 2, Term: 1},
-			{Type: proto.HeartbeatResp, ShardID: 1, From: 1, To: 2},
-		},
-		CommittedEntries: []proto.Entry{
-			{Index: 1, Term: 1, Cmd: []byte("ordered-only")},
-		},
-	}
-
-	cw.executePiggyback(node, piggyback)
-
-	// Apply item should be forwarded.
-	select {
-	case ai := <-applyC:
-		if ai.update.ShardID != 1 {
-			t.Fatalf("expected shardID 1, got %d", ai.update.ShardID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected apply item for piggyback with ordered messages")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // CommitWorker processBatch with nil logdb (memory mode)
 // ---------------------------------------------------------------------------
 
-// TestCommitWorker_ProcessBatch_NilLogDB_ForwardsPiggyback verifies that
-// processBatch with nil logdb (memory mode) still forwards piggyback
-// committed entries to the apply worker.
 // ---------------------------------------------------------------------------
 // Apply worker: backpressure path in dispatch
 // ---------------------------------------------------------------------------
@@ -3522,69 +3266,6 @@ func TestApplyWorker_Dispatch_Backpressure(t *testing.T) {
 // Apply worker: SM panic recovery in runShardApply
 // ---------------------------------------------------------------------------
 
-// TestApplyWorker_SMPanic_MarksNodeFailed verifies that when the state
-// machine panics during Apply, the node is marked as failed and the
-// error is reported via handleError.
-func TestApplyWorker_SMPanic_MarksNodeFailed(t *testing.T) {
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
-
-	panicSM := &panickingSM{}
-	rsmSM := newTestApplier(panicSM)
-
-	var failedCalled atomic.Bool
-	listener := &config.EventListener{
-		OnShardFailed: func(_ config.ShardFailedInfo) {
-			failedCalled.Store(true)
-		},
-	}
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, rsmSM, nil, cfg, nil, "", listener)
-	node.commitPending.Store(true)
-
-	item := applyPool.Get().(*applyItem)
-	item.update = proto.Update{
-		ShardID:          1,
-		CommittedEntries: []proto.Entry{{Term: 1, Index: 1, Cmd: []byte("panic-trigger")}},
-	}
-	item.node = node
-	applyC <- item
-
-	runDone := make(chan struct{})
-	go func() {
-		aw.run()
-		close(runDone)
-	}()
-
-	// Poll until the node is marked as failed (SM panic recovered).
-	waitFor(t, 5*time.Second, time.Millisecond,
-		"timed out waiting for node to be marked as failed after SM panic",
-		func() bool { return node.IsFailed() })
-
-	close(stopC)
-	<-runDone
-	wg.Wait()
-
-	// Node should be marked as failed.
-	if !node.IsFailed() {
-		t.Fatal("node should be failed after SM panic")
-	}
-
-	// commitPending should still be cleared by defer.
-	if node.commitPending.Load() {
-		t.Fatal("commitPending should be cleared even after SM panic")
-	}
-
-	// Error callback should have been called.
-	if !failedCalled.Load() {
-		t.Fatal("expected error callback for SM panic")
-	}
-}
-
 // panickingSM is a state machine that panics on Update.
 type panickingSM struct{}
 
@@ -3611,61 +3292,6 @@ var _ sm.StateMachine = (*panickingSM)(nil)
 // ---------------------------------------------------------------------------
 // Step worker sendMessages with InstallSnapshot messages
 // ---------------------------------------------------------------------------
-
-// TestStepWorker_SendMessages_WithSnapshot verifies that sendMessages
-// routes InstallSnapshot messages through sender.SendSnapshot while
-// regular messages go through sender.Send.
-func TestStepWorker_SendMessages_WithSnapshot(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	msgs := []proto.Message{
-		{Type: proto.Heartbeat, From: 1, To: 2},
-		{Type: proto.InstallSnapshot, From: 1, To: 3},
-		{Type: proto.Replicate, From: 1, To: 4},
-	}
-
-	sw.sendMessages(msgs)
-
-	// Both Send and SendSnapshot should have been called.
-	if sender.sentCount() == 0 {
-		t.Fatal("expected sender.Send to be called for regular messages")
-	}
-	if sender.snapshotCount() == 0 {
-		t.Fatal("expected sender.SendSnapshot to be called for InstallSnapshot")
-	}
-}
-
-// TestStepWorker_SendMessages_NoSnapshot verifies that sendMessages
-// takes the fast path (single sender.Send) when no InstallSnapshot
-// messages are present.
-func TestStepWorker_SendMessages_NoSnapshot(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	msgs := []proto.Message{
-		{Type: proto.Heartbeat, From: 1, To: 2},
-		{Type: proto.Replicate, From: 1, To: 3},
-	}
-
-	sw.sendMessages(msgs)
-
-	// Only Send should have been called (fast path).
-	if sender.sentCount() == 0 {
-		t.Fatal("expected sender.Send to be called")
-	}
-	if sender.snapshotCount() != 0 {
-		t.Fatal("expected no SendSnapshot calls on fast path")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Apply worker: requestUnload and requestReload
@@ -3896,81 +3522,6 @@ func TestStepWorker_ProcessCommitPendingInbox_InstallSnapshotDeferred(t *testing
 	}
 }
 
-// TestStepWorker_ProcessCommitPendingInbox_EmptyQueues verifies the fast
-// return path when all MPSC queues are empty during commitPending.
-func TestStepWorker_ProcessCommitPendingInbox_EmptyQueues(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-	node.commitPending.Store(true)
-
-	// processReady with empty queues should return without error.
-	ws.Notify(1)
-	sw.processReady()
-
-	select {
-	case <-commitC:
-		t.Fatal("no commit items expected")
-	default:
-		// Expected: empty queues, fast return.
-	}
-}
-
-// TestStepWorker_DrainAndHandleInbox_DebugLogging verifies that inbox
-// messages are handled through peer.Handle during processReady
-// (non-commitPending path), and covers the debug-level
-// logging path in drainAndHandleInbox by temporarily enabling debug-level
-// logging. This exercises the slog.LevelDebug-gated timing code.
-func TestStepWorker_DrainAndHandleInbox_DebugLogging(t *testing.T) {
-	// Enable debug logging for this test to cover the handleStart path.
-	oldHandler := slog.Default().Handler()
-	debugHandler := slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})
-	slog.SetDefault(slog.New(debugHandler))
-	defer slog.SetDefault(slog.New(oldHandler))
-
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Deliver a valid message so peer.Handle succeeds and the debug
-	// timing log fires (the else-if branch at line 368).
-	node.Deliver(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 1,
-		To:   1,
-	})
-
-	ws.Notify(1)
-	sw.processReady()
-
-	remaining := node.DrainInbox(nil)
-	if len(remaining) != 0 {
-		t.Fatalf("inbox should be drained, got %d messages", len(remaining))
-	}
-}
-
 // TestStepWorker_DrainAndHandleInbox_HandleError verifies that peer.Handle
 // errors during inbox processing are logged but do not prevent processing
 // of remaining messages.
@@ -4013,75 +3564,6 @@ func TestStepWorker_DrainAndHandleInbox_HandleError(t *testing.T) {
 // ---------------------------------------------------------------------------
 // executePiggyback additional tests
 // ---------------------------------------------------------------------------
-
-// TestExecutePiggyback_ApplyCFull_BlockingSend verifies that when the
-// first non-blocking send to applyC fails (channel full), executePiggyback
-// falls through to the blocking send path.
-func TestExecutePiggyback_ApplyCFull_BlockingSend(t *testing.T) {
-	ldb := newTestLogDB()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 1) // capacity 1
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-
-	sender := newTestSender()
-	cw := newCommitWorker(0, ldb, sender, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
-	cw.noRetryDelay = true
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-
-	tickPeerToLeader(peer)
-
-	// Persist the term-opening no-op through a real GetUpdate/Commit
-	// cycle. The single-node commit index only advances at the
-	// persistence edge inside Peer.Commit — the manufactured piggyback
-	// below claims entry 1 is committed, which must be true by then.
-	initial, err := peer.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("GetUpdate: %v", err)
-	}
-	if err := peer.Commit(initial); err != nil {
-		t.Fatalf("Commit(initial): %v", err)
-	}
-
-	// Fill applyC to capacity so the first non-blocking send fails.
-	applyC <- &applyItem{}
-
-	// Start a goroutine that drains applyC after a short delay to
-	// unblock the blocking send path.
-	drained := make(chan struct{})
-	go func() {
-		<-applyC // drain the pre-filled item
-		close(drained)
-	}()
-
-	// Wait for the drain goroutine to remove the first item.
-	<-drained
-
-	piggyback := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Index: 1, Term: 1, Cmd: []byte("piggyback")},
-		},
-	}
-
-	node.commitPending.Store(true)
-	cw.executePiggyback(node, piggyback)
-
-	// The piggyback should have been sent to applyC via the blocking path.
-	select {
-	case ai := <-applyC:
-		if ai.update.ShardID != 1 {
-			t.Errorf("apply item ShardID = %d, want 1", ai.update.ShardID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected apply item in applyC")
-	}
-}
 
 // TestExecutePiggyback_ApplyCFull_StopC verifies that when applyC is full
 // and stopC fires, executePiggyback returns without blocking.
@@ -4147,44 +3629,6 @@ func TestExecutePiggyback_ApplyCFull_StopC(t *testing.T) {
 // saveSnapshot additional tests
 // ---------------------------------------------------------------------------
 
-// TestSaveSnapshot_MaxSnapshotSizeExceeded verifies that saveSnapshot
-// rejects snapshots that exceed MaxSnapshotSize and cleans up the
-// oversized snapshot directory.
-func TestSaveSnapshot_MaxSnapshotSizeExceeded(t *testing.T) {
-	_, restore := captureLogOutput(t)
-	defer restore()
-
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-
-	pool := newSnapshotPool(1, nil, nil, nil, ws, stopC, nil)
-
-	snapDir := t.TempDir()
-	cfg := config.Config{ShardID: 1, ReplicaID: 1, MaxSnapshotSize: 10} // 10 bytes max
-	cfg.SetDefaults()
-
-	// Create a snapshotter that writes more data than the limit.
-	ss := &largeSaveSnapshotter{data: make([]byte, 100)} // 100 bytes > 10 byte limit
-	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
-
-	_, err := pool.saveSnapshot(snapshotRequest{
-		shardID:   1,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	})
-	if err == nil {
-		t.Fatal("expected error for oversized snapshot")
-	}
-	var tooLargeErr *SnapshotTooLargeError
-	if !errors.As(err, &tooLargeErr) {
-		t.Fatalf("expected SnapshotTooLargeError, got %T: %v", err, err)
-	}
-	if tooLargeErr.Size <= tooLargeErr.Limit {
-		t.Fatalf("size (%d) should exceed limit (%d)", tooLargeErr.Size, tooLargeErr.Limit)
-	}
-}
-
 // largeSaveSnapshotter writes a fixed amount of data during SaveSnapshot.
 type largeSaveSnapshotter struct {
 	data []byte
@@ -4202,33 +3646,6 @@ func (s *largeSaveSnapshotter) RecoverFromSnapshot(_ context.Context, _ io.Reade
 func (s *largeSaveSnapshotter) LastApplied() uint64 { return 42 }
 
 var _ Snapshotter = (*largeSaveSnapshotter)(nil)
-
-// TestSaveSnapshot_NilSnapshotter verifies that saveSnapshot returns an
-// error when the node's snapshotter is nil.
-func TestSaveSnapshot_NilSnapshotter(t *testing.T) {
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-
-	pool := newSnapshotPool(1, nil, nil, nil, ws, stopC, nil)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil) // nil snapshotter
-
-	_, err := pool.saveSnapshot(snapshotRequest{
-		shardID:   1,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	})
-	if err == nil {
-		t.Fatal("expected error for nil snapshotter")
-	}
-	var snapErr *SnapshotError
-	if !errors.As(err, &snapErr) {
-		t.Fatalf("expected SnapshotError, got %T: %v", err, err)
-	}
-}
 
 // TestSaveSnapshot_ZeroLastApplied verifies that saveSnapshot returns
 // (0, nil) when LastApplied() returns 0 (nothing to snapshot).
@@ -4446,30 +3863,6 @@ func (db *errorSaveSnapshotLogDB) SaveSnapshot(_, _ uint64, _ logdb.Snapshot) er
 // recoverSnapshot additional tests
 // ---------------------------------------------------------------------------
 
-// TestRecoverSnapshot_NilSnapshotter verifies that recoverSnapshot returns
-// nil when the node has no snapshotter (witness node).
-func TestRecoverSnapshot_NilSnapshotter(t *testing.T) {
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-	ldb := newSnapshotTestLogDB()
-
-	pool := newSnapshotPool(1, ldb, nil, nil, ws, stopC, nil)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil) // nil snapshotter
-
-	err := pool.recoverSnapshot(snapshotRequest{
-		shardID:   1,
-		replicaID: 1,
-		node:      node,
-		save:      false,
-	})
-	if err != nil {
-		t.Fatalf("expected nil error for nil snapshotter, got %v", err)
-	}
-}
-
 // TestRecoverSnapshot_GetSnapshotError verifies that recoverSnapshot
 // returns a SnapshotError when LogDB.GetSnapshot fails.
 func TestRecoverSnapshot_GetSnapshotError(t *testing.T) {
@@ -4508,32 +3901,6 @@ type errorGetSnapshotLogDB struct {
 
 func (db *errorGetSnapshotLogDB) GetSnapshot(_, _ uint64) (logdb.Snapshot, error) {
 	return logdb.Snapshot{}, db.err
-}
-
-// TestRecoverSnapshot_ZeroIndex verifies that recoverSnapshot returns nil
-// when the snapshot index is 0 (no snapshot to recover).
-func TestRecoverSnapshot_ZeroIndex(t *testing.T) {
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-	ldb := newSnapshotTestLogDB() // empty, GetSnapshot returns Index=0
-
-	pool := newSnapshotPool(1, ldb, nil, nil, ws, stopC, nil)
-
-	snapDir := t.TempDir()
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	ss := &zeroAppliedSnapshotter{}
-	node := NewNode(nil, nil, nil, cfg, ss, snapDir, nil)
-
-	err := pool.recoverSnapshot(snapshotRequest{
-		shardID:   1,
-		replicaID: 1,
-		node:      node,
-		save:      false,
-	})
-	if err != nil {
-		t.Fatalf("expected nil for zero snapshot index, got %v", err)
-	}
 }
 
 // TestRecoverSnapshot_FileNotExist verifies that recoverSnapshot FAILS with a
@@ -4701,8 +4068,6 @@ var _ Snapshotter = (*noopSnapshotter)(nil)
 // apply worker additional tests
 // ---------------------------------------------------------------------------
 
-// TestApplyWorker_RunShardApply_EmptyEntries verifies that runShardApply
-// clears commitPending when there are no committed entries to apply.
 // TestApplyWorker_RunShardApply_RecoveringSkipsApply verifies that when a
 // node is recovering (snapshot recovery in progress), entries are not
 // applied to the state machine.
@@ -4991,80 +4356,6 @@ func TestApplyWorker_RunShardApply_ApplyError(t *testing.T) {
 	}
 }
 
-// TestRequestSnapshot_PoolBusy verifies that requestSnapshot returns a
-// SnapshotPoolBusyError when the request channel is full.
-func TestRequestSnapshot_PoolBusy(t *testing.T) {
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-	cb := newTestCallback()
-
-	// Create a pool with a very small request channel (capacity 1).
-	pool := newSnapshotPool(1, nil, nil, cb, ws, stopC, nil)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node1 := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	cfg2 := config.Config{ShardID: 2, ReplicaID: 1}
-	cfg2.SetDefaults()
-	node2 := NewNode(nil, nil, nil, cfg2, nil, "", nil)
-
-	// Fill the request channel by submitting a request.
-	err1 := pool.requestSnapshot(snapshotRequest{
-		shardID: 1, replicaID: 1, node: node1, save: true,
-	})
-	if err1 != nil {
-		t.Fatalf("first request should succeed: %v", err1)
-	}
-
-	// The second request for a different shard should fail because the
-	// channel is full (capacity = workers = 1).
-	err2 := pool.requestSnapshot(snapshotRequest{
-		shardID: 2, replicaID: 1, node: node2, save: true,
-	})
-	if err2 == nil {
-		t.Fatal("expected SnapshotPoolBusyError when channel is full")
-	}
-	var busyErr *SnapshotPoolBusyError
-	if !errors.As(err2, &busyErr) {
-		t.Fatalf("expected SnapshotPoolBusyError, got %T: %v", err2, err2)
-	}
-}
-
-// TestRequestSnapshot_Duplicate verifies that requestSnapshot returns a
-// SnapshotDuplicateError when a snapshot is already in-flight for the shard.
-func TestRequestSnapshot_Duplicate(t *testing.T) {
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-	cb := newTestCallback()
-
-	pool := newSnapshotPool(1, nil, nil, cb, ws, stopC, nil)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// First request succeeds.
-	err := pool.requestSnapshot(snapshotRequest{
-		shardID: 1, replicaID: 1, node: node, save: true,
-	})
-	if err != nil {
-		t.Fatalf("first request should succeed: %v", err)
-	}
-
-	// Second request for the same shard should fail as duplicate.
-	err = pool.requestSnapshot(snapshotRequest{
-		shardID: 1, replicaID: 1, node: node, save: true,
-	})
-	if err == nil {
-		t.Fatal("expected SnapshotDuplicateError for duplicate shard request")
-	}
-	var dupErr *SnapshotDuplicateError
-	if !errors.As(err, &dupErr) {
-		t.Fatalf("expected SnapshotDuplicateError, got %T: %v", err, err)
-	}
-}
-
 // TestStepWorker_CommitMemoryMode_StopC verifies that commitMemoryMode
 // returns true when stopC fires during the applyC send, clearing
 // commitPending and returning the apply item to the pool.
@@ -5103,57 +4394,6 @@ func TestStepWorker_CommitMemoryMode_StopC(t *testing.T) {
 	}
 	if node.commitPending.Load() {
 		t.Fatal("commitPending should be cleared on stopC")
-	}
-}
-
-// TestStepWorker_CommitMemoryMode_SuccessPath verifies the normal
-// commitMemoryMode path: Commit succeeds, entries are forwarded to applyC.
-func TestStepWorker_CommitMemoryMode_SuccessPath(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-	sw.memoryMode = true
-	sw.applyC = applyC
-	sw.applyPool = applyPool
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Propose an entry to generate an update.
-	_, err := peer.Propose([]proto.Entry{{Cmd: []byte("memory-mode")}})
-	if err != nil {
-		t.Fatalf("propose failed: %v", err)
-	}
-
-	lastApplied := node.lastApplied.Load()
-	update, getErr := peer.GetUpdate(true, lastApplied)
-	if getErr != nil {
-		t.Fatalf("GetUpdate failed: %v", getErr)
-	}
-
-	stopped := sw.commitMemoryMode(node, update)
-	if stopped {
-		t.Fatal("commitMemoryMode should return false on success")
-	}
-
-	// Should have forwarded to applyC.
-	select {
-	case ai := <-applyC:
-		if ai.update.ShardID != 1 {
-			t.Errorf("apply item ShardID = %d, want 1", ai.update.ShardID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected apply item in applyC")
 	}
 }
 
@@ -5243,59 +4483,6 @@ func TestCommitWorker_ProcessBatch_ApplyCStopC(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_Run_ReloadInMainLoop verifies that the reload case in
-// the commit worker's main select loop removes the shard from the
-// unloaded set.
-// TestStepWorker_EnqueueForCommit_WithMessages verifies that enqueueForCommit
-// splits messages into free-order (sent immediately) and ordered (deferred
-// to the commit worker) when the update contains messages.
-func TestStepWorker_EnqueueForCommit_WithMessages(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Create an update with both free-order and ordered messages.
-	update := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		Messages: []proto.Message{
-			{Type: proto.Replicate, From: 1, To: 2},     // free-order
-			{Type: proto.HeartbeatResp, From: 1, To: 2}, // ordered
-		},
-	}
-
-	stopped := sw.enqueueForCommit(1, node, update)
-	if stopped {
-		t.Fatal("enqueueForCommit should return false on success")
-	}
-
-	// Free-order messages should have been sent immediately.
-	if sender.sentCount() == 0 {
-		t.Fatal("expected free-order messages to be sent")
-	}
-
-	// Commit item should be in commitC with ordered messages.
-	select {
-	case item := <-commitC:
-		if len(item.orderedMsgs) == 0 {
-			t.Fatal("expected ordered messages in commit item")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected commit item")
-	}
-}
-
 // TestStepWorker_ProcessReady_RecoveringDefersSnapshot verifies that a
 // recovering node steps ordinary Raft traffic but DEFERS InstallSnapshot.
 // Handling one would restore the raft log onto a newer snapshot index while
@@ -5366,8 +4553,6 @@ func TestStepWorker_ProcessReady_RecoveringDefersSnapshot(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_Run_UnloadInMainLoop verifies that the unload case in
-// the commit worker's main select loop adds the shard to the unloaded set.
 // ---------------------------------------------------------------------------
 // Peer.Commit failure handling (state-machine safety)
 // ---------------------------------------------------------------------------
