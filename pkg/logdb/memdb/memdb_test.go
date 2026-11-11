@@ -249,6 +249,64 @@ func TestIterateEntriesCompactedRange(t *testing.T) {
 	}
 }
 
+func TestIterateEntriesEmptyRange(t *testing.T) {
+	db := New()
+	db.SaveState([]logdb.Update{
+		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
+			{Index: 1, Term: 1},
+		}},
+	})
+
+	// low == high should return nothing.
+	got, size, err := db.IterateEntries(nil, 0, 1, 1, 5, 5, 0)
+	if err != nil {
+		t.Fatalf("IterateEntries() error: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("IterateEntries() returned %d entries for empty range, want 0", len(got))
+	}
+	if size != 0 {
+		t.Errorf("IterateEntries() size = %d, want 0", size)
+	}
+}
+
+func TestIterateEntriesUnknownNode(t *testing.T) {
+	db := New()
+	_, _, err := db.IterateEntries(nil, 0, 99, 99, 1, 5, 0)
+	if !errors.Is(err, logdb.ErrUnavailable) {
+		t.Errorf("IterateEntries() unknown node: got %v, want ErrUnavailable", err)
+	}
+}
+
+func TestIterateEntriesMaxSizeLimit(t *testing.T) {
+	db := New()
+	entries := make([]logdb.Entry, 10)
+	for i := range entries {
+		entries[i] = logdb.Entry{
+			Index: uint64(i + 1),
+			Term:  1,
+			Cmd:   make([]byte, 100),
+		}
+	}
+	db.SaveState([]logdb.Update{
+		{ShardID: 1, ReplicaID: 1, Entries: entries},
+	})
+
+	perEntry := uint64(logdb.EntryOverheadBytes + 100)
+	budget := 2*perEntry + perEntry/2 // room for 2, not 3
+
+	got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 11, budget)
+	if err != nil {
+		t.Fatalf("IterateEntries() error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("IterateEntries() with maxSize=%d: got %d entries, want 2", budget, len(got))
+	}
+	if want := 2 * perEntry; size != want {
+		t.Errorf("IterateEntries() size = %d, want %d", size, want)
+	}
+}
+
 func TestIterateEntriesAppendsToExistingSlice(t *testing.T) {
 	db := New()
 	db.SaveState([]logdb.Update{
@@ -338,6 +396,19 @@ func TestGetSnapshotReturnsErrNoSnapshotForUnknownNode(t *testing.T) {
 	_, err := db.GetSnapshot(99, 99)
 	if !errors.Is(err, logdb.ErrNoSnapshot) {
 		t.Errorf("GetSnapshot() unknown node: got %v, want ErrNoSnapshot", err)
+	}
+}
+
+func TestGetSnapshotReturnsErrNoSnapshotWhenNoneSaved(t *testing.T) {
+	db := New()
+	// Create node with state but no snapshot.
+	db.SaveState([]logdb.Update{
+		{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 1}},
+	})
+
+	_, err := db.GetSnapshot(1, 1)
+	if !errors.Is(err, logdb.ErrNoSnapshot) {
+		t.Errorf("GetSnapshot() no snapshot: got %v, want ErrNoSnapshot", err)
 	}
 }
 

@@ -265,6 +265,30 @@ func TestCopyMembershipPreservesNilMaps(t *testing.T) {
 	}
 }
 
+// TestIterateEntriesReportsHeadGap is a regression test. A requested low
+// below the first stored entry with NO compaction floor is a head GAP, not a
+// compaction: the LogDB contract (and waldb) require ErrLogGapDetected there.
+// Reporting ErrCompacted told raft the range was legitimately truncated and
+// hid a missing prefix.
+func TestIterateEntriesReportsHeadGap(t *testing.T) {
+	db := New()
+	defer db.Close()
+
+	// Entries start at 5 with no RemoveEntriesTo call, so compactedTo is 0.
+	if err := db.SaveState([]logdb.Update{{
+		ShardID: 1, ReplicaID: 1,
+		Entries: []logdb.Entry{
+			{Index: 5, Term: 1}, {Index: 6, Term: 1}, {Index: 7, Term: 1},
+		},
+	}}); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+
+	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 3, 8, 0); !errors.Is(err, logdb.ErrLogGapDetected) {
+		t.Fatalf("IterateEntries(low=3) = %v, want ErrLogGapDetected", err)
+	}
+}
+
 // TestSaveSnapshotUpdatesMembership is a regression test. SaveSnapshot
 // stored the snapshot but left nd.membership untouched and kept the caller's
 // maps, so ReadState reported an EMPTY membership where waldb reports the
