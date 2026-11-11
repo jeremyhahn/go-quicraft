@@ -42,11 +42,8 @@ func TestNewBenchmarkSuite(t *testing.T) {
 	if len(suite.Results) != 0 {
 		t.Fatalf("expected empty results map, got %d entries", len(suite.Results))
 	}
-}
 
-func TestNewBenchmarkSuiteDefaultConfig(t *testing.T) {
-	suite := NewBenchmarkSuite("etcd", "3.5.0")
-
+	// Default config.
 	if suite.Config.PayloadSize != 128 {
 		t.Fatalf("expected payload size 128, got %d", suite.Config.PayloadSize)
 	}
@@ -103,27 +100,25 @@ func TestAddResultWithRecorder(t *testing.T) {
 	}
 }
 
-func TestAddResultNilRecorder(t *testing.T) {
-	suite := NewBenchmarkSuite("quicraft", "1.0.0")
-	suite.AddResult(ScenarioElectionWAL, 50, 500*time.Millisecond, nil)
-
-	r := suite.Results[ScenarioElectionWAL]
-	if r.Latency.Count != 0 {
-		t.Fatalf("expected zero latency count with nil recorder, got %d", r.Latency.Count)
+func TestAddResultWithoutSamples(t *testing.T) {
+	tests := []struct {
+		name string
+		rec  *LatencyRecorder
+	}{
+		{name: "nil_recorder", rec: nil},
+		{name: "empty_recorder", rec: NewLatencyRecorder(10)},
 	}
-	if r.Latency.P50Ns != 0 || r.Latency.P99Ns != 0 || r.Latency.P999Ns != 0 {
-		t.Fatal("expected zero latency stats with nil recorder")
-	}
-}
 
-func TestAddResultEmptyRecorder(t *testing.T) {
-	suite := NewBenchmarkSuite("quicraft", "1.0.0")
-	rec := NewLatencyRecorder(10)
-	suite.AddResult(ScenarioElectionMemory, 10, time.Second, rec)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			suite := NewBenchmarkSuite("quicraft", "1.0.0")
+			suite.AddResult(ScenarioElectionWAL, 50, 500*time.Millisecond, tt.rec)
 
-	r := suite.Results[ScenarioElectionMemory]
-	if r.Latency.Count != 0 {
-		t.Fatalf("expected zero latency count with empty recorder, got %d", r.Latency.Count)
+			r := suite.Results[ScenarioElectionWAL]
+			if r.Latency != (LatencyStats{}) {
+				t.Fatalf("expected zero latency stats, got %+v", r.Latency)
+			}
+		})
 	}
 }
 
