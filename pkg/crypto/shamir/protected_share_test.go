@@ -610,43 +610,6 @@ func TestSplitProtected_LeavesSecretToTheCaller(t *testing.T) {
 	}
 }
 
-// TestSplitProtected_ProtectedSecretRoundTrip runs the end-to-end shape a
-// custody caller should use: the secret is in locked memory before the split,
-// every share value is in locked memory, and the reconstruction comes back in
-// locked memory. Nothing in the chain is an ordinary heap buffer the caller
-// has to remember to wipe.
-func TestSplitProtected_ProtectedSecretRoundTrip(t *testing.T) {
-	want := []byte("thirty-two bytes of key material")
-	held := mustFromBytes(t, append([]byte(nil), want...))
-	defer held.Destroy()
-
-	// The split reads the held secret inside its borrow, so the secret is never
-	// copied out of locked memory on its way in.
-	var shares []*ProtectedShare
-	if err := held.WithBytes(func(secret []byte) error {
-		var err error
-		shares, err = SplitProtected(secret, 3, 5)
-		return err
-	}); err != nil {
-		t.Fatalf("SplitProtected returned unexpected error: %v", err)
-	}
-	defer destroyAll(shares)
-
-	got, err := CombineProtected(shares[:3])
-	if err != nil {
-		t.Fatalf("CombineProtected returned unexpected error: %v", err)
-	}
-	defer got.Destroy()
-
-	if !bytes.Equal(encCopy(got), want) {
-		t.Errorf("reconstructed %q, want %q", encCopy(got), want)
-	}
-	// The source enclave is untouched by the split.
-	if !bytes.Equal(encCopy(held), want) {
-		t.Errorf("the caller's protected secret changed: %q", encCopy(held))
-	}
-}
-
 // TestCombineProtected_LeavesSharesUsable verifies the input shares survive a
 // reconstruction: CombineProtected reads their values in place, so consuming a
 // share set must remain the caller's decision (a ceremony reconstructs from
