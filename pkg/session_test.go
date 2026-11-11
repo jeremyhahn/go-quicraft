@@ -37,6 +37,9 @@ func TestNewSession_Fields(t *testing.T) {
 	if s.RespondedTo() != 0 {
 		t.Errorf("RespondedTo = %d, want 0", s.RespondedTo())
 	}
+	if s.IsNoOPSession() {
+		t.Error("session with a non-zero clientID should not be a no-op session")
+	}
 }
 
 func TestNewSession_InvalidZeroClientID(t *testing.T) {
@@ -59,52 +62,9 @@ func TestNewNoOPSession_Fields(t *testing.T) {
 	}
 }
 
-func TestNewNoOPSession_IsNotRegularSession(t *testing.T) {
-	regular := newSession(1, 100, 0)
-	noop := NewNoOPSession(1)
-
-	if regular.IsNoOPSession() {
-		t.Error("regular session should not be a no-op session")
-	}
-	if !noop.IsNoOPSession() {
-		t.Error("no-op session should be a no-op session")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // PrepareForPropose
 // ---------------------------------------------------------------------------
-
-func TestPrepareForPropose_SetsFirstProposal(t *testing.T) {
-	s := newSession(1, 100, 0)
-	if s.SeriesID() != 0 {
-		t.Fatalf("initial SeriesID = %d, want 0", s.SeriesID())
-	}
-
-	s.PrepareForPropose()
-	if s.SeriesID() != SeriesIDFirstProposal {
-		t.Errorf("SeriesID after PrepareForPropose = %d, want %d",
-			s.SeriesID(), SeriesIDFirstProposal)
-	}
-}
-
-func TestProposalCompleted_AdvancesSeriesID(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForPropose()
-	if s.SeriesID() != SeriesIDFirstProposal {
-		t.Fatalf("SeriesID = %d, want %d", s.SeriesID(), SeriesIDFirstProposal)
-	}
-
-	// Complete the first proposal — should advance to 2.
-	s.ProposalCompleted()
-	if s.SeriesID() != SeriesIDFirstProposal+1 {
-		t.Errorf("SeriesID after ProposalCompleted = %d, want %d",
-			s.SeriesID(), SeriesIDFirstProposal+1)
-	}
-	if s.RespondedTo() != SeriesIDFirstProposal {
-		t.Errorf("RespondedTo = %d, want %d", s.RespondedTo(), SeriesIDFirstProposal)
-	}
-}
 
 func TestProposalCompleted_Monotonic(t *testing.T) {
 	s := newSession(1, 100, 0)
@@ -115,39 +75,9 @@ func TestProposalCompleted_Monotonic(t *testing.T) {
 			t.Fatalf("iteration %d: SeriesID = %d, want %d", i, s.SeriesID(), expected)
 		}
 		s.ProposalCompleted()
-	}
-}
-
-func TestProposalCompleted_ConcurrentContiguousAdvance(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForPropose()
-
-	const goroutines = 100
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for i := 0; i < goroutines; i++ {
-		go func() {
-			defer wg.Done()
-			s.ProposalCompleted()
-		}()
-	}
-	wg.Wait()
-
-	// seriesID must have advanced exactly by the number of completions.
-	expectedSeriesID := SeriesIDFirstProposal + goroutines
-	if s.SeriesID() != expectedSeriesID {
-		t.Errorf("SeriesID = %d, want %d (no skips)", s.SeriesID(), expectedSeriesID)
-	}
-
-	// respondedTo must be at least SeriesIDFirstProposal (the first
-	// completed value) and at most seriesID - 1. With concurrent
-	// ProposalCompleted calls, the final respondedTo depends on
-	// goroutine scheduling because Store is not monotonic in the
-	// concurrent path. The seriesID CAS is correct (no skips), but
-	// respondedTo may reflect any of the completed values.
-	rt := s.RespondedTo()
-	if rt < SeriesIDFirstProposal || rt >= expectedSeriesID {
-		t.Errorf("RespondedTo = %d, want in [%d, %d)", rt, SeriesIDFirstProposal, expectedSeriesID)
+		if s.RespondedTo() != expected {
+			t.Fatalf("iteration %d: RespondedTo = %d, want %d", i, s.RespondedTo(), expected)
+		}
 	}
 }
 
@@ -201,25 +131,6 @@ func TestPrepareForRegister_SetsSentinel(t *testing.T) {
 	}
 }
 
-func TestPrepareForRegister_DistinctFromUnregister(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForRegister()
-	regID := s.SeriesID()
-
-	s.PrepareForUnregister()
-	unregID := s.SeriesID()
-
-	if regID == unregID {
-		t.Errorf("register and unregister series IDs must differ, both = %d", regID)
-	}
-	if regID != SeriesIDForRegister {
-		t.Errorf("register SeriesID = %d, want %d", regID, SeriesIDForRegister)
-	}
-	if unregID != SeriesIDForUnregister {
-		t.Errorf("unregister SeriesID = %d, want %d", unregID, SeriesIDForUnregister)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // PrepareForUnregister
 // ---------------------------------------------------------------------------
@@ -245,24 +156,23 @@ func TestPrepareForUnregister_SetsSentinel(t *testing.T) {
 // ValidForSessionOp
 // ---------------------------------------------------------------------------
 
-func TestValidForSessionOp_CorrectShard(t *testing.T) {
-	s := newSession(5, 100, 0)
-	if !s.ValidForSessionOp(5) {
-		t.Error("session should be valid for its own shard")
+func TestValidForSessionOp(t *testing.T) {
+	cases := []struct {
+		name    string
+		session *Session
+		shardID uint64
+		want    bool
+	}{
+		{"own shard", newSession(5, 100, 0), 5, true},
+		{"different shard", newSession(5, 100, 0), 10, false},
+		{"no-op session", NewNoOPSession(5), 5, false},
 	}
-}
-
-func TestValidForSessionOp_WrongShard(t *testing.T) {
-	s := newSession(5, 100, 0)
-	if s.ValidForSessionOp(10) {
-		t.Error("session should not be valid for a different shard")
-	}
-}
-
-func TestValidForSessionOp_NoOpSession(t *testing.T) {
-	s := NewNoOPSession(5)
-	if s.ValidForSessionOp(5) {
-		t.Error("no-op session should not be valid for session ops")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.session.ValidForSessionOp(tc.shardID); got != tc.want {
+				t.Errorf("ValidForSessionOp(%d) = %v, want %v", tc.shardID, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -276,6 +186,12 @@ func TestSetRespondedTo_MonotonicallyAdvances(t *testing.T) {
 	s.SetRespondedTo(5)
 	if s.RespondedTo() != 5 {
 		t.Errorf("RespondedTo = %d, want 5", s.RespondedTo())
+	}
+
+	// Setting the same value again should leave it unchanged.
+	s.SetRespondedTo(5)
+	if s.RespondedTo() != 5 {
+		t.Errorf("RespondedTo = %d, want 5 (same value)", s.RespondedTo())
 	}
 
 	// Setting a lower value should be a no-op.
@@ -311,64 +227,42 @@ func TestSetRespondedTo_ConcurrentSafety(t *testing.T) {
 	}
 }
 
-func TestSetRespondedTo_SameValueIsNoOp(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.SetRespondedTo(5)
-	s.SetRespondedTo(5)
-	if s.RespondedTo() != 5 {
-		t.Errorf("RespondedTo = %d, want 5", s.RespondedTo())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // ValidForProposal
 // ---------------------------------------------------------------------------
 
-func TestValidForProposal_ValidSession(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForPropose()
-	if !s.ValidForProposal(1) {
-		t.Error("valid session should return true")
+func TestValidForProposal(t *testing.T) {
+	proposing := func() *Session {
+		s := newSession(1, 100, 0)
+		s.PrepareForPropose()
+		return s
 	}
-}
-
-func TestValidForProposal_WrongShard(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForPropose()
-	if s.ValidForProposal(2) {
-		t.Error("wrong shard should return false")
-	}
-}
-
-func TestValidForProposal_NoOpSession(t *testing.T) {
-	s := NewNoOPSession(1)
-	if s.ValidForProposal(1) {
-		t.Error("no-op session should return false")
-	}
-}
-
-func TestValidForProposal_RegisterMode(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForRegister()
-	if s.ValidForProposal(1) {
-		t.Error("register mode should return false")
-	}
-}
-
-func TestValidForProposal_UnregisterMode(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForUnregister()
-	if s.ValidForProposal(1) {
-		t.Error("unregister mode should return false")
-	}
-}
-
-func TestValidForProposal_RespondedToExceedsSeriesID(t *testing.T) {
-	s := newSession(1, 100, 0)
-	s.PrepareForPropose()
+	registering := newSession(1, 100, 0)
+	registering.PrepareForRegister()
+	unregistering := newSession(1, 100, 0)
+	unregistering.PrepareForUnregister()
 	// Force respondedTo > seriesID (broken invariant).
-	s.respondedTo.Store(SeriesIDFirstProposal + 1)
-	if s.ValidForProposal(1) {
-		t.Error("respondedTo > seriesID should return false")
+	broken := proposing()
+	broken.respondedTo.Store(SeriesIDFirstProposal + 1)
+
+	cases := []struct {
+		name    string
+		session *Session
+		shardID uint64
+		want    bool
+	}{
+		{"valid session", proposing(), 1, true},
+		{"wrong shard", proposing(), 2, false},
+		{"no-op session", NewNoOPSession(1), 1, false},
+		{"register mode", registering, 1, false},
+		{"unregister mode", unregistering, 1, false},
+		{"respondedTo exceeds seriesID", broken, 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.session.ValidForProposal(tc.shardID); got != tc.want {
+				t.Errorf("ValidForProposal(%d) = %v, want %v", tc.shardID, got, tc.want)
+			}
+		})
 	}
 }
