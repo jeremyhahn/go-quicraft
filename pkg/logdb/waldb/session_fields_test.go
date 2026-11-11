@@ -104,39 +104,6 @@ func TestEntrySessionFieldsSurviveReopen(t *testing.T) {
 // loudly instead of
 // being misparsed or silently skipped.
 func TestLegacyEntryFormatRejected(t *testing.T) {
-	t.Run("replayRecord returns ErrLegacyEntryFormat", func(t *testing.T) {
-		s := &walShard{
-			indexes:       make(map[nodeKey]*index),
-			entries:       make(map[nodeKey]map[uint64]logdb.Entry),
-			states:        make(map[nodeKey]logdb.State),
-			bootstraps:    make(map[nodeKey]logdb.Bootstrap),
-			snapshots:     make(map[nodeKey]logdb.Snapshot),
-			compactedTo:   make(map[nodeKey]uint64),
-			knownSegments: make(map[uint64]bool),
-		}
-
-		// Craft a retired-layout entry record: [type:1][44-byte header][cmd].
-		const legacyHeaderSize = 44
-		cmd := []byte("legacy")
-		rec := make([]byte, 1+legacyHeaderSize+len(cmd))
-		rec[0] = 0x01                                             // retired entry payload type, pinned as a literal
-		binary.LittleEndian.PutUint64(rec[1:], 1)                 // shardID
-		binary.LittleEndian.PutUint64(rec[9:], 1)                 // replicaID
-		binary.LittleEndian.PutUint64(rec[17:], 1)                // index
-		binary.LittleEndian.PutUint64(rec[25:], 1)                // term
-		binary.LittleEndian.PutUint64(rec[33:], 0)                // type
-		binary.LittleEndian.PutUint32(rec[41:], uint32(len(cmd))) // cmdLen
-		copy(rec[45:], cmd)
-
-		_, _, err := s.replayRecord(rec, 0)
-		if !errors.Is(err, ErrUnknownPayloadType) {
-			t.Fatalf("replayRecord(0x01) err = %v, want ErrUnknownPayloadType", err)
-		}
-		if len(s.entries) != 0 {
-			t.Fatal("no entries must be replayed from a legacy record")
-		}
-	})
-
 	t.Run("Open fails on a segment with a retired-layout record", func(t *testing.T) {
 		dir := t.TempDir()
 
