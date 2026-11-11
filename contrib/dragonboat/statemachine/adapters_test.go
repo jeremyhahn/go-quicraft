@@ -1040,103 +1040,46 @@ func TestWrapOnDiskCreateFunc(t *testing.T) {
 // Error message tests
 // ---------------------------------------------------------------------------
 
-func TestAdapterUpdateError_Message(t *testing.T) {
-	err := &AdapterUpdateError{Index: 123, Cause: &testUpdateError{msg: "boom"}}
-	expected := "statemachine adapter: update failed at index: 123: boom"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-}
-
-func TestAdapterUpdateError_Unwrap(t *testing.T) {
-	cause := &testUpdateError{msg: "root cause"}
-	err := &AdapterUpdateError{Index: 1, Cause: cause}
-	if !errors.Is(err, cause) {
-		t.Error("Unwrap did not return the cause")
-	}
-}
-
-func TestAdapterLookupError_MessageAndUnwrap(t *testing.T) {
-	cause := &testLookupError{msg: "bad query"}
-	err := &AdapterLookupError{Cause: cause}
-	expected := "statemachine adapter: lookup failed: bad query"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-	if err.Unwrap() != cause {
-		t.Error("Unwrap did not return the cause")
-	}
-}
-
-func TestAdapterSnapshotSaveError_MessageAndUnwrap(t *testing.T) {
-	cause := &testSnapshotError{msg: "disk full"}
-	err := &AdapterSnapshotSaveError{Cause: cause}
-	expected := "statemachine adapter: snapshot save failed: disk full"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-	if err.Unwrap() != cause {
-		t.Error("Unwrap did not return the cause")
-	}
-}
-
-func TestAdapterSnapshotRecoverError_MessageAndUnwrap(t *testing.T) {
-	cause := &testSnapshotError{msg: "corrupt data"}
-	err := &AdapterSnapshotRecoverError{Cause: cause}
-	expected := "statemachine adapter: snapshot recover failed: corrupt data"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-	if err.Unwrap() != cause {
-		t.Error("Unwrap did not return the cause")
-	}
-}
-
-func TestAdapterCloseError_MessageAndUnwrap(t *testing.T) {
-	cause := &testCloseError{msg: "resource leak"}
-	err := &AdapterCloseError{Cause: cause}
-	expected := "statemachine adapter: close failed: resource leak"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-	if err.Unwrap() != cause {
-		t.Error("Unwrap did not return the cause")
-	}
-}
-
-func TestAdapterOpenError_MessageAndUnwrap(t *testing.T) {
-	cause := &testOpenError{msg: "permission denied"}
-	err := &AdapterOpenError{Cause: cause}
-	expected := "statemachine adapter: open failed: permission denied"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-	if err.Unwrap() != cause {
-		t.Error("Unwrap did not return the cause")
-	}
-}
-
-func TestAdapterSyncError_MessageAndUnwrap(t *testing.T) {
-	cause := &testSyncError{msg: "io error"}
-	err := &AdapterSyncError{Cause: cause}
-	expected := "statemachine adapter: sync failed: io error"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-	if err.Unwrap() != cause {
-		t.Error("Unwrap did not return the cause")
-	}
-}
-
-func TestAdapterPrepareSnapshotError_MessageAndUnwrap(t *testing.T) {
-	cause := &testPrepareSnapshotError{msg: "state inconsistent"}
-	err := &AdapterPrepareSnapshotError{Cause: cause}
-	expected := "statemachine adapter: prepare snapshot failed: state inconsistent"
-	if err.Error() != expected {
-		t.Errorf("expected %q, got %q", expected, err.Error())
-	}
-	if err.Unwrap() != cause {
-		t.Error("Unwrap did not return the cause")
+func TestAdapterErrors_MessageAndUnwrap(t *testing.T) {
+	updateCause := &testUpdateError{msg: "boom"}
+	lookupCause := &testLookupError{msg: "bad query"}
+	saveCause := &testSnapshotError{msg: "disk full"}
+	recoverCause := &testSnapshotError{msg: "corrupt data"}
+	closeCause := &testCloseError{msg: "resource leak"}
+	openCause := &testOpenError{msg: "permission denied"}
+	syncCause := &testSyncError{msg: "io error"}
+	prepareCause := &testPrepareSnapshotError{msg: "state inconsistent"}
+	for _, tc := range []struct {
+		name  string
+		err   error
+		cause error
+		want  string
+	}{
+		{"update", &AdapterUpdateError{Index: 123, Cause: updateCause}, updateCause,
+			"statemachine adapter: update failed at index: 123: boom"},
+		{"lookup", &AdapterLookupError{Cause: lookupCause}, lookupCause,
+			"statemachine adapter: lookup failed: bad query"},
+		{"snapshot save", &AdapterSnapshotSaveError{Cause: saveCause}, saveCause,
+			"statemachine adapter: snapshot save failed: disk full"},
+		{"snapshot recover", &AdapterSnapshotRecoverError{Cause: recoverCause}, recoverCause,
+			"statemachine adapter: snapshot recover failed: corrupt data"},
+		{"close", &AdapterCloseError{Cause: closeCause}, closeCause,
+			"statemachine adapter: close failed: resource leak"},
+		{"open", &AdapterOpenError{Cause: openCause}, openCause,
+			"statemachine adapter: open failed: permission denied"},
+		{"sync", &AdapterSyncError{Cause: syncCause}, syncCause,
+			"statemachine adapter: sync failed: io error"},
+		{"prepare snapshot", &AdapterPrepareSnapshotError{Cause: prepareCause}, prepareCause,
+			"statemachine adapter: prepare snapshot failed: state inconsistent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.err.Error(); got != tc.want {
+				t.Errorf("Error() = %q, want %q", got, tc.want)
+			}
+			if errors.Unwrap(tc.err) != tc.cause {
+				t.Error("Unwrap did not return the cause")
+			}
+		})
 	}
 }
 
