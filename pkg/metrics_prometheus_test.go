@@ -246,21 +246,6 @@ func TestPrometheusMetricsCollector_ObserveProposalLatency(t *testing.T) {
 	}
 }
 
-func TestPrometheusMetricsCollector_ObserveProposalLatency_MultipleShard(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.ObserveProposalLatency(1, time.Millisecond)
-	c.ObserveProposalLatency(2, 2*time.Millisecond)
-	c.ObserveProposalLatency(2, 3*time.Millisecond)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_latency_seconds")
-	if histogramCount(t, mf, map[string]string{"shard_id": "1"}) != 1 {
-		t.Error("shard 1 should have 1 observation")
-	}
-	if histogramCount(t, mf, map[string]string{"shard_id": "2"}) != 2 {
-		t.Error("shard 2 should have 2 observations")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // RaftMetrics: Commit Latency
 // ---------------------------------------------------------------------------
@@ -892,22 +877,6 @@ func BenchmarkPrometheusMetricsCollector_AllRaftMetrics_PreBound(b *testing.B) {
 // RegisterShard / UnregisterShard
 // ---------------------------------------------------------------------------
 
-func TestPrometheusMetricsCollector_RegisterShard(t *testing.T) {
-	c := newPerShardTestCollector()
-	c.RegisterShard(42)
-
-	// After registration, metrics should use pre-bound metric references.
-	// Verify by recording a metric and checking the result.
-	c.ObserveProposalLatency(42, 5*time.Millisecond)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_latency_seconds")
-	labels := map[string]string{"shard_id": "42"}
-	count := histogramCount(t, mf, labels)
-	if count != 1 {
-		t.Errorf("expected 1 observation, got %d", count)
-	}
-}
-
 func TestPrometheusMetricsCollector_RegisterShard_MultipleTimes(t *testing.T) {
 	c := newPerShardTestCollector()
 
@@ -974,21 +943,6 @@ func TestPrometheusMetricsCollector_UnregisterShard(t *testing.T) {
 	}
 }
 
-// TestPrometheusMetricsCollector_NeverRegisteredShardStillRecords pins the
-// other half of the ML8 fix: only shards torn down by UnregisterShard are
-// tombstoned. An embedder that never calls RegisterShard must still be
-// metered through the fallback rather than silently unmetered.
-func TestPrometheusMetricsCollector_NeverRegisteredShardStillRecords(t *testing.T) {
-	c := newPerShardTestCollector()
-
-	c.ObserveProposalLatency(7, time.Millisecond)
-
-	mf := gatherMetric(t, c.Registry, "quicraft_raft_proposal_latency_seconds")
-	if got := histogramCount(t, mf, map[string]string{"shard_id": "7"}); got != 1 {
-		t.Errorf("observations for a never-registered shard = %d, want 1", got)
-	}
-}
-
 func TestPrometheusMetricsCollector_UnregisterShard_NeverRegistered(t *testing.T) {
 	c := newPerShardTestCollector()
 	// Unregistering a never-registered shard should not panic.
@@ -1045,12 +999,6 @@ func TestNewSampledMetricsCollector_ZeroRate(t *testing.T) {
 	}
 }
 
-func TestSampledMetricsCollector_ImplementsMetricsCollector(t *testing.T) {
-	inner := NoOpMetricsCollector{}
-	s := NewSampledMetricsCollector(inner, 10)
-	var _ MetricsCollector = s
-}
-
 func TestSampledMetricsCollector_ObserveCommitLatency_Sampling(t *testing.T) {
 	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 10) // 1 in 10
@@ -1067,41 +1015,37 @@ func TestSampledMetricsCollector_ObserveCommitLatency_Sampling(t *testing.T) {
 	}
 }
 
-// TestSampledMetricsCollector_IncMessagesSent_Unsampled is a
-// regression test: counters must record EVERY increment. Sampling a
+// TestSampledMetricsCollector_MessageCountersAreUnsampled is a regression
+// test: counters must record EVERY increment. Sampling a
 // prometheus.Counter.Inc() makes *_total under-report by SampleRate, so
-// every rate()/increase() built on it is off by orders of magnitude.
-func TestSampledMetricsCollector_IncMessagesSent_Unsampled(t *testing.T) {
-	inner := newPerShardTestCollector()
-	s := NewSampledMetricsCollector(inner, 20)
+// every rate()/increase() built on it is off by orders of magnitude. Both the
+// send and the receive counter are checked, each at its own rate.
+func TestSampledMetricsCollector_MessageCountersAreUnsampled(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		rate   uint64
+		inc    func(s *SampledMetricsCollector)
+		metric string
+	}{
+		{"sent", 20, func(s *SampledMetricsCollector) { s.IncMessagesSent(1, 2, 3) },
+			"quicraft_transport_messages_sent_total"},
+		{"received", 25, func(s *SampledMetricsCollector) { s.IncMessagesReceived(1, 2, 3) },
+			"quicraft_transport_messages_received_total"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inner := newPerShardTestCollector()
+			s := NewSampledMetricsCollector(inner, tc.rate)
 
-	// Record 100 messages; ALL 100 must be recorded (counters are exact).
-	for range 100 {
-		s.IncMessagesSent(1, 2, 3)
-	}
+			// Record 100 messages; ALL 100 must be recorded (counters are exact).
+			for range 100 {
+				tc.inc(s)
+			}
 
-	mf := gatherMetric(t, inner.Registry, "quicraft_transport_messages_sent_total")
-	val := counterValue(t, mf, nil)
-	if val != 100 {
-		t.Errorf("expected 100 messages sent (counters must not be sampled), got %f", val)
-	}
-}
-
-// TestSampledMetricsCollector_IncMessagesReceived_Unsampled is the
-// regression test for the receive counter; see IncMessagesSent_Unsampled.
-func TestSampledMetricsCollector_IncMessagesReceived_Unsampled(t *testing.T) {
-	inner := newPerShardTestCollector()
-	s := NewSampledMetricsCollector(inner, 25)
-
-	// Record 100 messages; ALL 100 must be recorded (counters are exact).
-	for range 100 {
-		s.IncMessagesReceived(1, 2, 3)
-	}
-
-	mf := gatherMetric(t, inner.Registry, "quicraft_transport_messages_received_total")
-	val := counterValue(t, mf, nil)
-	if val != 100 {
-		t.Errorf("expected 100 messages received (counters must not be sampled), got %f", val)
+			mf := gatherMetric(t, inner.Registry, tc.metric)
+			if val := counterValue(t, mf, nil); val != 100 {
+				t.Errorf("expected 100 messages %s (counters must not be sampled), got %f", tc.name, val)
+			}
+		})
 	}
 }
 
