@@ -23,66 +23,47 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestEncodeDecodeSmallRecord verifies round-trip encoding and decoding of a
-// small payload that fits within a single chunk.
-func TestEncodeDecodeSmallRecord(t *testing.T) {
-	data := []byte("hello world")
-	buf := make([]byte, recordHeaderSize+len(data))
-
-	n, err := encodeRecord(buf, RecordFull, 0, 0, data)
-	if err != nil {
-		t.Fatalf("encodeRecord: unexpected error: %v", err)
+// TestEncodeDecodeRoundTrip verifies round-trip encoding and decoding of an
+// empty, a small and a larger payload (the larger one checks that the CRC
+// and length fields handle multi-byte payloads), each encoded into a buffer
+// of exactly the right size.
+func TestEncodeDecodeRoundTrip(t *testing.T) {
+	large := make([]byte, 4096)
+	for i := range large {
+		large[i] = byte(i % 256)
 	}
-	if n != recordHeaderSize+len(data) {
-		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize+len(data))
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{"empty", nil},
+		{"small", []byte("hello world")},
+		{"large", large},
 	}
-
-	decoded, recType, _, _, consumed, err := decodeRecord(buf)
-	if err != nil {
-		t.Fatalf("decodeRecord: unexpected error: %v", err)
-	}
-	if recType != RecordFull {
-		t.Fatalf("decodeRecord: type = %d, want %d", recType, RecordFull)
-	}
-	if consumed != n {
-		t.Fatalf("decodeRecord: consumed %d bytes, want %d", consumed, n)
-	}
-	if string(decoded) != "hello world" {
-		t.Fatalf("decodeRecord: data = %q, want %q", decoded, "hello world")
-	}
-}
-
-// TestEncodeDecodeLargeRecord verifies round-trip encoding and decoding of a
-// larger payload to ensure CRC and length fields handle multi-byte payloads.
-func TestEncodeDecodeLargeRecord(t *testing.T) {
-	data := make([]byte, 4096)
-	for i := range data {
-		data[i] = byte(i % 256)
-	}
-	buf := make([]byte, recordHeaderSize+len(data))
-
-	n, err := encodeRecord(buf, RecordFull, 0, 0, data)
-	if err != nil {
-		t.Fatalf("encodeRecord: unexpected error: %v", err)
-	}
-
-	decoded, recType, _, _, consumed, err := decodeRecord(buf[:n])
-	if err != nil {
-		t.Fatalf("decodeRecord: unexpected error: %v", err)
-	}
-	if recType != RecordFull {
-		t.Fatalf("decodeRecord: type = %d, want %d", recType, RecordFull)
-	}
-	if consumed != n {
-		t.Fatalf("decodeRecord: consumed = %d, want %d", consumed, n)
-	}
-	if len(decoded) != len(data) {
-		t.Fatalf("decodeRecord: data length = %d, want %d", len(decoded), len(data))
-	}
-	for i := range decoded {
-		if decoded[i] != data[i] {
-			t.Fatalf("decodeRecord: mismatch at byte %d: got %d, want %d", i, decoded[i], data[i])
-		}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := make([]byte, recordHeaderSize+len(tc.data))
+			n, err := encodeRecord(buf, RecordFull, 0, 0, tc.data)
+			if err != nil {
+				t.Fatalf("encodeRecord: unexpected error: %v", err)
+			}
+			if n != len(buf) {
+				t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, len(buf))
+			}
+			decoded, recType, _, _, consumed, err := decodeRecord(buf[:n])
+			if err != nil {
+				t.Fatalf("decodeRecord: unexpected error: %v", err)
+			}
+			if recType != RecordFull {
+				t.Fatalf("decodeRecord: type = %d, want %d", recType, RecordFull)
+			}
+			if consumed != n {
+				t.Fatalf("decodeRecord: consumed %d bytes, want %d", consumed, n)
+			}
+			if !bytes.Equal(decoded, tc.data) {
+				t.Fatalf("decodeRecord: data = %q, want %q", decoded, tc.data)
+			}
+		})
 	}
 }
 
@@ -95,48 +76,6 @@ func TestEncodeBufferTooSmall(t *testing.T) {
 	_, err := encodeRecord(buf, RecordFull, 0, 0, data)
 	if err != ErrBufferTooSmall {
 		t.Fatalf("encodeRecord: error = %v, want %v", err, ErrBufferTooSmall)
-	}
-}
-
-// TestEncodeBufferExactFit verifies encoding works when the buffer is exactly
-// the right size.
-func TestEncodeBufferExactFit(t *testing.T) {
-	data := []byte("exact")
-	buf := make([]byte, recordHeaderSize+len(data))
-
-	n, err := encodeRecord(buf, RecordFull, 0, 0, data)
-	if err != nil {
-		t.Fatalf("encodeRecord: unexpected error: %v", err)
-	}
-	if n != len(buf) {
-		t.Fatalf("encodeRecord: wrote %d, want %d", n, len(buf))
-	}
-}
-
-// TestEncodeEmptyData verifies that encoding a zero-length payload succeeds.
-func TestEncodeEmptyData(t *testing.T) {
-	buf := make([]byte, recordHeaderSize)
-
-	n, err := encodeRecord(buf, RecordFull, 0, 0, nil)
-	if err != nil {
-		t.Fatalf("encodeRecord: unexpected error: %v", err)
-	}
-	if n != recordHeaderSize {
-		t.Fatalf("encodeRecord: wrote %d bytes, want %d", n, recordHeaderSize)
-	}
-
-	decoded, recType, _, _, consumed, err := decodeRecord(buf[:n])
-	if err != nil {
-		t.Fatalf("decodeRecord: unexpected error: %v", err)
-	}
-	if recType != RecordFull {
-		t.Fatalf("decodeRecord: type = %d, want %d", recType, RecordFull)
-	}
-	if consumed != recordHeaderSize {
-		t.Fatalf("decodeRecord: consumed = %d, want %d", consumed, recordHeaderSize)
-	}
-	if len(decoded) != 0 {
-		t.Fatalf("decodeRecord: data length = %d, want 0", len(decoded))
 	}
 }
 
