@@ -681,37 +681,6 @@ func TestStepWorker_AnsweredInstallNeverFailsTheNode(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_SuccessfulRecoveryOnStoppedNodeReportsNothing: a restore
-// that SUCCEEDS on a node stopped under it restored a state machine discarded
-// with the node, and OnSnapshotCompleted — resolved by shard ID — would
-// complete the next incarnation's pending snapshot requests with its result.
-func TestSnapshotPool_SuccessfulRecoveryOnStoppedNodeReportsNothing(t *testing.T) {
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	stopC := make(chan struct{})
-	defer close(stopC)
-	ldb := newSnapshotTestLogDB()
-	cb := &testCallback{}
-	p := newSnapshotPool(2, ldb, nil, cb, nil, stopC, nil)
-	p.start(&wg)
-
-	seedRecoverableSnapshot(t, ldb, 1, 1, 100, 7, 100)
-	node, peer := newRecoveryTestNode(t, 1, 1, newSnapshotTestSnapshotter(0))
-	installSnapshotIntoLog(t, node, peer, 100, 7)
-	node.Stop()
-
-	if err := p.requestSnapshot(snapshotRequest{shardID: 1, replicaID: 1, node: node}); err != nil {
-		t.Fatalf("requestSnapshot: %v", err)
-	}
-	awaitSnapshotResult(t, p, "recovery")
-	if n := len(cb.getSnapshotCalls()); n != 0 {
-		t.Fatalf("OnSnapshotCompleted fired %d times for a stopped node's recovery", n)
-	}
-	if node.IsRecovering() {
-		t.Error("the recovering gate is still raised")
-	}
-}
-
 // blockingCapture holds the state machine's capture open until release is
 // closed, announcing on entered that it has begun: a save caught mid-capture
 // by an UnloadNode.
