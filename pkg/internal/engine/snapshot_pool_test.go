@@ -233,6 +233,7 @@ func TestSnapshotPool_SaveSnapshot_Success(t *testing.T) {
 	var wg sync.WaitGroup
 	p.start(&wg)
 
+	// MaxSnapshotSize is left 0: the size check is disabled.
 	ss := newSnapshotTestSnapshotter(100)
 	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
 	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
@@ -272,8 +273,17 @@ func TestSnapshotPool_SaveSnapshot_Success(t *testing.T) {
 		snapshotSaveDir(tmpDir, 10, 1, 100),
 		snapshotMetadataFile,
 	)
-	if _, err := os.Stat(metaPath); os.IsNotExist(err) {
-		t.Fatalf("snapshot metadata file not created: %s", metaPath)
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("snapshot metadata file not readable: %v", err)
+	}
+	if len(metaData) != snapshotMetaSize {
+		t.Fatalf("metadata size = %d, want %d", len(metaData), snapshotMetaSize)
+	}
+	meta := mustParseSnapshotMeta(t, metaData)
+	if meta.Index != 100 || meta.ShardID != 10 || meta.ReplicaID != 1 {
+		t.Fatalf("metadata = (index %d, shard %d, replica %d), want (100, 10, 1)",
+			meta.Index, meta.ShardID, meta.ReplicaID)
 	}
 
 	// Verify LogDB was updated.
@@ -377,106 +387,9 @@ func TestSnapshotPool_SaveSnapshot_ExceedsMaxSnapshotSize(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_SaveSnapshot_MaxSnapshotSizeZeroDisablesCheck(t *testing.T) {
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	// MaxSnapshotSize=0 means the check is disabled (default after SetDefaults
-	// sets it to 4GB, but 0 here means not set).
-	ss := newSnapshotTestSnapshotter(100)
-	cfg := config.Config{ShardID: 10, ReplicaID: 1, MaxSnapshotSize: 0}
-	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID:   10,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, p, "snapshot")
-	if result.err != nil {
-		t.Fatalf("unexpected error: %v", result.err)
-	}
-	if result.index != 100 {
-		t.Fatalf("result.index = %d, want 100", result.index)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Recover snapshot tests
 // ---------------------------------------------------------------------------
-
-func TestSnapshotPool_RecoverSnapshot_Success(t *testing.T) {
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	// First, save a snapshot to create the data on disk.
-	saveSS := newSnapshotTestSnapshotter(200)
-	cfg := config.Config{ShardID: 5, ReplicaID: 2, CompactionOverhead: 50}
-	saveNode := NewNode(nil, nil, nil, cfg, saveSS, tmpDir, nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID: 5, replicaID: 2, node: saveNode, save: true,
-	})
-	if err != nil {
-		t.Fatalf("save request failed: %v", err)
-	}
-	result := awaitSnapshotResult(t, p, "save")
-	if result.err != nil {
-		t.Fatalf("save failed: %v", result.err)
-	}
-
-	// Now recover into a fresh snapshotter.
-	recoverSS := newSnapshotTestSnapshotter(0)
-	recoverNode := NewNode(nil, nil, nil, cfg, recoverSS, tmpDir, nil)
-
-	err = p.requestSnapshot(snapshotRequest{
-		shardID: 5, replicaID: 2, node: recoverNode, save: false,
-	})
-	if err != nil {
-		t.Fatalf("recover request failed: %v", err)
-	}
-
-	result = awaitSnapshotResult(t, p, "recover")
-	if result.err != nil {
-		t.Fatalf("recover failed: %v", result.err)
-	}
-	if result.shardID != 5 {
-		t.Fatalf("result.shardID = %d, want 5", result.shardID)
-	}
-	if result.replicaID != 2 {
-		t.Fatalf("result.replicaID = %d, want 2", result.replicaID)
-	}
-
-	// Verify the state was recovered.
-	if recoverSS.state.Load() != 200 {
-		t.Fatalf("recovered state = %d, want 200", recoverSS.state.Load())
-	}
-	if recoverNode.lastApplied.Load() != 200 {
-		t.Fatalf("node.lastApplied = %d, want 200", recoverNode.lastApplied.Load())
-	}
-	if recoverNode.LastSnapshotIndex() != 200 {
-		t.Fatalf("node.LastSnapshotIndex = %d, want 200", recoverNode.LastSnapshotIndex())
-	}
-}
 
 func TestSnapshotPool_RecoverSnapshot_NoSnapshot(t *testing.T) {
 	stopC := make(chan struct{})
@@ -887,58 +800,6 @@ func TestSnapshotPool_GarbageCollection(t *testing.T) {
 // Metadata and directory helpers tests
 // ---------------------------------------------------------------------------
 
-func TestSnapshotPool_MetadataWritten(t *testing.T) {
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	ss := newSnapshotTestSnapshotter(42)
-	cfg := config.Config{ShardID: 7, ReplicaID: 3, CompactionOverhead: 10}
-	node := NewNode(nil, nil, nil, cfg, ss, tmpDir, nil)
-
-	err := p.requestSnapshot(snapshotRequest{
-		shardID: 7, replicaID: 3, node: node, save: true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, p, "snapshot")
-	if result.err != nil {
-		t.Fatalf("unexpected error: %v", result.err)
-	}
-
-	// Read and verify metadata.
-	metaPath := filepath.Join(
-		snapshotSaveDir(tmpDir, 7, 3, 42),
-		snapshotMetadataFile,
-	)
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		t.Fatalf("read metadata failed: %v", err)
-	}
-	if len(data) != snapshotMetaSize {
-		t.Fatalf("metadata size = %d, want %d", len(data), snapshotMetaSize)
-	}
-
-	meta := mustParseSnapshotMeta(t, data)
-	if meta.Index != 42 {
-		t.Fatalf("metadata index = %d, want 42", meta.Index)
-	}
-	if meta.ShardID != 7 {
-		t.Fatalf("metadata shardID = %d, want 7", meta.ShardID)
-	}
-	if meta.ReplicaID != 3 {
-		t.Fatalf("metadata replicaID = %d, want 3", meta.ReplicaID)
-	}
-}
-
 func TestSnapshotPool_SnapshotSaveDir(t *testing.T) {
 	dir := snapshotSaveDir("/data/snapshots", 10, 2, 500)
 	expected := filepath.Join("/data/snapshots", "shard-10", "replica-2", "snapshot-00000000000000000500")
@@ -986,24 +847,6 @@ func TestSnapshotPool_ListSnapshotDirs_NonExistent(t *testing.T) {
 	}
 	if len(dirs) != 0 {
 		t.Fatalf("expected 0 dirs, got %d", len(dirs))
-	}
-}
-
-func TestSnapshotPool_GCSnapshotDirs_NothingToClean(t *testing.T) {
-	tmpDir := t.TempDir()
-	dir := snapshotSaveDir(tmpDir, 1, 1, 100)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		t.Fatalf("mkdir failed: %v", err)
-	}
-
-	err := gcSnapshotDirs(tmpDir, 1, 1, "")
-	if err != nil {
-		t.Fatalf("gcSnapshotDirs should succeed with nothing to clean: %v", err)
-	}
-
-	dirs, _ := listSnapshotDirs(tmpDir, 1, 1)
-	if len(dirs) != 1 {
-		t.Fatalf("expected 1 dir retained, got %d", len(dirs))
 	}
 }
 
@@ -1465,50 +1308,17 @@ func TestSnapshotPool_SaveAndRecoverRoundTrip(t *testing.T) {
 			if recoverNode.lastApplied.Load() != 100 {
 				t.Fatalf("node.lastApplied = %d, want 100", recoverNode.lastApplied.Load())
 			}
+			if recoverNode.LastSnapshotIndex() != 100 {
+				t.Fatalf("node.LastSnapshotIndex = %d, want 100", recoverNode.LastSnapshotIndex())
+			}
+			if result.shardID != 10 || result.replicaID != 1 {
+				t.Fatalf("recover result = (shard %d, replica %d), want (10, 1)",
+					result.shardID, result.replicaID)
+			}
 
 			// The decrypt scratch sibling must not survive recovery.
 			assertNoTempFiles(t, saveDir)
 		})
-	}
-}
-
-func TestSnapshotPool_EncryptDecryptFile_LargePayload(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(3)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	// Create a file larger than snapshotEncryptChunkSize (64KB) to test
-	// multi-chunk encryption.
-	dataPath := filepath.Join(tmpDir, "test.dat")
-	original := make([]byte, snapshotEncryptChunkSize*3+1234)
-	for i := range original {
-		original[i] = byte(i % 251)
-	}
-	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
-
-	// Verify encrypted file differs from original.
-	encrypted, _ := os.ReadFile(dataPath)
-	if len(encrypted) == len(original) {
-		t.Fatal("encrypted file should be larger than original due to framing")
-	}
-
-	// Decrypt to a sibling temp file; the source dataPath stays encrypted.
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 3, barrier)
-	if err != nil {
-		t.Fatalf("decrypt failed: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Remove(plainPath) })
-
-	// Verify the decrypted sibling content matches the original plaintext.
-	decrypted, _ := os.ReadFile(plainPath)
-	if len(decrypted) != len(original) {
-		t.Fatalf("decrypted length = %d, want %d", len(decrypted), len(original))
-	}
-	for i := range original {
-		if decrypted[i] != original[i] {
-			t.Fatalf("mismatch at byte %d: got %d, want %d", i, decrypted[i], original[i])
-		}
 	}
 }
 
@@ -1808,34 +1618,6 @@ func TestSnapshotPool_DecryptFile_PreservesSourceOnFailure(t *testing.T) {
 	assertNoTempFiles(t, tmpDir)
 }
 
-func TestSnapshotPool_DecryptFile_CorruptFrameLen(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(1)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	// Write a corrupt file with invalid frame length.
-	dataPath := filepath.Join(tmpDir, "corrupt.dat")
-	// Frame header says 1000 bytes but file only has 6 bytes.
-	var buf [4]byte
-	binary.LittleEndian.PutUint32(buf[:], 1000)
-	if err := os.WriteFile(dataPath, append(buf[:], 0x01, 0x02), 0o644); err != nil {
-		t.Fatalf("write corrupt file failed: %v", err)
-	}
-
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
-	if err == nil {
-		t.Fatal("expected error for corrupt frame")
-	}
-	if plainPath != "" {
-		t.Fatalf("expected empty path on error, got %q", plainPath)
-	}
-	var encErr *SnapshotEncryptError
-	if !errors.As(err, &encErr) {
-		t.Fatalf("expected SnapshotEncryptError, got %T: %v", err, err)
-	}
-}
-
 // TestSnapshotPool_EncryptFile_SealedBarrier pins the fail-closed save.
 //
 // Asserting the opposite — "even with barrier sealed, save should work
@@ -1880,47 +1662,6 @@ func TestSnapshotPool_EncryptFile_SealedBarrier(t *testing.T) {
 // I.4: Key rotation tests
 // ---------------------------------------------------------------------------
 
-func TestSnapshotPool_EpochInMetadata(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Write metadata with epoch.
-	err := writeTestSnapshotMetadata(tmpDir, 100, 5, 10, 1, 7, config.NoCompression)
-	if err != nil {
-		t.Fatalf("writeSnapshotMetadata failed: %v", err)
-	}
-
-	// Read and verify epoch (status=known: metadata parsed cleanly).
-	epoch, status := readSnapshotEpoch(tmpDir)
-	if status != snapshotEpochKnown || epoch != 7 {
-		t.Fatalf("readSnapshotEpoch = (%d, %v), want (7, known)", epoch, status)
-	}
-}
-
-func TestSnapshotPool_ReadSnapshotEpoch_ShortFile(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Write a 40-byte headerless record. No build reads that layout, so the
-	// record is refused and the epoch is UNKNOWN: under the fail-safe contract
-	// the purge-floor callers must refuse to purge rather than drop this
-	// snapshot from the floor.
-	metaPath := filepath.Join(tmpDir, snapshotMetadataFile)
-	var buf [40]byte
-	binary.LittleEndian.PutUint64(buf[0:], 100) // Index
-	binary.LittleEndian.PutUint64(buf[8:], 5)   // Term
-	if err := os.WriteFile(metaPath, buf[:], 0o644); err != nil {
-		t.Fatalf("write short metadata failed: %v", err)
-	}
-
-	epoch, status := readSnapshotEpoch(tmpDir)
-	if status == snapshotEpochKnown {
-		t.Fatalf("readSnapshotEpoch for headerless file = (%d, known), "+
-			"want a fail-safe status", epoch)
-	}
-	if status != snapshotEpochUnknown {
-		t.Fatalf("readSnapshotEpoch status = %v, want unknown", status)
-	}
-}
-
 func TestSnapshotPool_ReadSnapshotEpoch_MissingFile(t *testing.T) {
 	tmpDir := t.TempDir()
 	// A missing metadata file with NO artifact beside it (snapshot GC'd
@@ -1931,37 +1672,11 @@ func TestSnapshotPool_ReadSnapshotEpoch_MissingFile(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_ReadSnapshotEpoch_ArtifactWithoutRecord pins the distinction
-// the missing-record case must not erase: "the METADATA is absent" is strictly
-// weaker than "the ARTIFACT is absent", and only the latter means the directory
-// imposes no purge floor.
-//
-// A snapshot.dat with no snapshot.meta is producible by any crash between the
-// two writes. Its bytes may be ciphertext at any epoch and the record that
-// would have said which is exactly the one that is missing, so reporting "no
-// floor" lets the next PurgeEpochsBefore destroy the DEK it needs — the
-// artifact becomes permanently undecryptable and StartShard fails closed on it.
-func TestSnapshotPool_ReadSnapshotEpoch_ArtifactWithoutRecord(t *testing.T) {
-	tmpDir := t.TempDir()
-	dataPath := filepath.Join(tmpDir, snapshotDataFile)
-	if err := os.WriteFile(dataPath, []byte("ciphertext-at-an-unknown-epoch"), 0o600); err != nil {
-		t.Fatalf("write artifact: %v", err)
-	}
-
-	epoch, status := readSnapshotEpoch(tmpDir)
-	if status != snapshotEpochUnknown {
-		t.Fatalf("readSnapshotEpoch with snapshot.dat present and snapshot.meta absent = (%d, %v), "+
-			"want (0, unknown): an unevaluable directory can only mean 'do not purge'",
-			epoch, status)
-	}
-	if epoch != 0 {
-		t.Fatalf("readSnapshotEpoch epoch = %d, want 0 alongside an unknown status", epoch)
-	}
-}
-
-// TestSnapshotPool_PurgeFloor_ArtifactWithoutRecordBlocksPurge asserts the
-// CONSEQUENCE of the classification above: the DEK purge is suppressed, so the
-// key the orphaned artifact may need survives.
+// TestSnapshotPool_PurgeFloor_ArtifactWithoutRecordBlocksPurge: a directory
+// holding snapshot.dat but no snapshot.meta (a crash between the two writes)
+// has an epoch that cannot be established, so readSnapshotEpoch reports it
+// unknown and the DEK purge is suppressed: the key the orphaned artifact may
+// need survives, rather than the artifact becoming undecryptable.
 func TestSnapshotPool_PurgeFloor_ArtifactWithoutRecordBlocksPurge(t *testing.T) {
 	tmpDir := t.TempDir()
 	barrier := newTestBarrier(9)
@@ -2014,40 +1729,6 @@ func wireSnapshotNodes(p *snapshotPool, nodes ...*Node) {
 // I.5: Epoch purge after compaction tests
 // ---------------------------------------------------------------------------
 
-func TestSnapshotPool_PurgeOldEpochs_AfterCompaction(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	ldb := newSnapshotTestLogDB()
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	// Create 3 snapshots with different epochs.
-	for _, info := range []struct {
-		index uint64
-		epoch uint64
-	}{
-		{100, 2},
-		{200, 3},
-		{300, 5},
-	} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
-
-	// Call purgeOldEpochs - should purge epochs before the minimum (2).
-	p.purgeOldEpochs(tmpDir, 1, 1)
-
-	if barrier.PurgedBefore() != 2 {
-		t.Fatalf("purgedBefore = %d, want 2", barrier.PurgedBefore())
-	}
-}
-
 func TestSnapshotPool_PurgeOldEpochs_NoBarrier(t *testing.T) {
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
@@ -2068,31 +1749,6 @@ func TestSnapshotPool_PurgeOldEpochs_SealedBarrier(t *testing.T) {
 	p.purgeOldEpochs(tmpDir, 1, 1)
 	if barrier.PurgeCallCount() != 0 {
 		t.Fatalf("expected 0 purge calls, got %d", barrier.PurgeCallCount())
-	}
-}
-
-func TestSnapshotPool_PurgeOldEpochs_AllPlaintext(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	// Create snapshots with epoch=0 (plaintext).
-	for _, idx := range []uint64{100, 200} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, idx)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, idx, 1, 1, 1, 0, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
-
-	// Should not purge since min epoch is 0 (all plaintext).
-	p.purgeOldEpochs(tmpDir, 1, 1)
-	if barrier.PurgeCallCount() != 0 {
-		t.Fatalf("expected 0 purge calls for plaintext snapshots, got %d", barrier.PurgeCallCount())
 	}
 }
 
@@ -2137,175 +1793,64 @@ func TestSnapshotPool_PurgeWiredAfterSave(t *testing.T) {
 // WAL epoch floor tests (purgeOldEpochs bug fix)
 // ---------------------------------------------------------------------------
 
-func TestSnapshotPool_PurgeOldEpochs_WALEpochFloor(t *testing.T) {
-	// Scenario: snapshot min epoch is 4, but WAL still has records
-	// encrypted at epoch 2. The purge floor should be 2, not 4.
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	ldb := newEpochAwareTestLogDB(2) // WAL has records at epoch 2
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	// Create snapshots at epoch 4 and 5.
-	for _, info := range []struct {
-		index uint64
-		epoch uint64
+func TestSnapshotPool_PurgeOldEpochs_Floor(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		ldb          func() logdb.LogDB
+		barrierEpoch uint64
+		epochs       [2]uint64 // epochs of the snapshots at index 100 and 200
+		wantFloor    uint64    // 0: purge must not run at all
 	}{
-		{100, 4},
-		{200, 5},
+		// WAL records still at epoch 2 under a snapshot minimum of 4: the
+		// floor is the WAL minimum, not the snapshot minimum.
+		{"wal_below_snapshots", func() logdb.LogDB { return newEpochAwareTestLogDB(2) }, 5, [2]uint64{4, 5}, 2},
+		// WAL minimum 5 above the snapshot minimum 3: the snapshot sets it.
+		{"wal_above_snapshots", func() logdb.LogDB { return newEpochAwareTestLogDB(5) }, 7, [2]uint64{3, 7}, 3},
+		// WAL epoch 0 (no encrypted records) is ignored.
+		{"wal_epoch_zero_ignored", func() logdb.LogDB { return newEpochAwareTestLogDB(0) }, 5, [2]uint64{3, 5}, 3},
+		// A failed WAL epoch query skips the purge entirely.
+		{"wal_query_error", func() logdb.LogDB {
+			ldb := newEpochAwareTestLogDB(0)
+			ldb.minLiveEpochErr = errors.New("disk I/O error")
+			return ldb
+		}, 5, [2]uint64{3, 5}, 0},
+		// A LogDB that is not epoch-aware but DECLARES itself non-durable
+		// (e.g. MemDB) strands no DEK: the snapshot-only floor applies.
+		{"non_durable_non_epoch_aware", func() logdb.LogDB { return newSnapshotTestLogDB() }, 5, [2]uint64{2, 5}, 2},
+		// No LogDB: the snapshot-only floor applies.
+		{"nil_logdb", func() logdb.LogDB { return nil }, 5, [2]uint64{3, 5}, 3},
+		// Every snapshot plaintext (epoch 0): nothing to purge.
+		{"all_plaintext", func() logdb.LogDB { return nil }, 5, [2]uint64{0, 0}, 0},
 	} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			barrier := newTestBarrier(tc.barrierEpoch)
+			stopC := make(chan struct{})
+			p := newSnapshotPool(2, tc.ldb(), barrier, nil, nil, stopC, nil)
+			wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
 
-	p.purgeOldEpochs(tmpDir, 1, 1)
+			for i, index := range []uint64{100, 200} {
+				dir := snapshotSaveDir(tmpDir, 1, 1, index)
+				if err := os.MkdirAll(dir, 0o750); err != nil {
+					t.Fatalf("mkdir failed: %v", err)
+				}
+				if err := writeTestSnapshotMetadata(dir, index, 1, 1, 1, tc.epochs[i], config.NoCompression); err != nil {
+					t.Fatalf("write metadata failed: %v", err)
+				}
+			}
 
-	// The purge floor should be 2 (WAL min), not 4 (snapshot min).
-	if barrier.PurgedBefore() != 2 {
-		t.Fatalf("purgedBefore = %d, want 2 (WAL epoch floor)", barrier.PurgedBefore())
-	}
-}
+			p.purgeOldEpochs(tmpDir, 1, 1)
 
-func TestSnapshotPool_PurgeOldEpochs_WALEpochHigherThanSnapshot(t *testing.T) {
-	// Scenario: WAL min epoch (5) is higher than snapshot min epoch (3).
-	// The purge floor should be 3 (snapshot min).
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(7)
-	stopC := make(chan struct{})
-	ldb := newEpochAwareTestLogDB(5) // WAL epoch is higher
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	for _, info := range []struct {
-		index uint64
-		epoch uint64
-	}{
-		{100, 3},
-		{200, 7},
-	} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
-
-	p.purgeOldEpochs(tmpDir, 1, 1)
-
-	// Snapshot min (3) is lower than WAL min (5), so floor stays at 3.
-	if barrier.PurgedBefore() != 3 {
-		t.Fatalf("purgedBefore = %d, want 3 (snapshot epoch floor)", barrier.PurgedBefore())
-	}
-}
-
-func TestSnapshotPool_PurgeOldEpochs_WALEpochZeroIgnored(t *testing.T) {
-	// Scenario: WAL returns epoch 0 (no encrypted records or no barrier).
-	// The purge floor should use snapshot min epoch only.
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	ldb := newEpochAwareTestLogDB(0) // no encrypted WAL records
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	for _, info := range []struct {
-		index uint64
-		epoch uint64
-	}{
-		{100, 3},
-		{200, 5},
-	} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
-
-	p.purgeOldEpochs(tmpDir, 1, 1)
-
-	// WAL epoch 0 is ignored; purge floor is snapshot min (3).
-	if barrier.PurgedBefore() != 3 {
-		t.Fatalf("purgedBefore = %d, want 3", barrier.PurgedBefore())
-	}
-}
-
-func TestSnapshotPool_PurgeOldEpochs_WALQueryError(t *testing.T) {
-	// Scenario: WAL epoch query fails. Purge should be skipped entirely.
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	ldb := newEpochAwareTestLogDB(0)
-	ldb.minLiveEpochErr = errors.New("disk I/O error")
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	for _, info := range []struct {
-		index uint64
-		epoch uint64
-	}{
-		{100, 3},
-		{200, 5},
-	} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
-
-	p.purgeOldEpochs(tmpDir, 1, 1)
-
-	// Purge should NOT have been called due to error.
-	if barrier.PurgeCallCount() != 0 {
-		t.Fatalf("expected 0 purge calls when WAL query fails, got %d", barrier.PurgeCallCount())
-	}
-}
-
-func TestSnapshotPool_PurgeOldEpochs_NonEpochAwareLogDB(t *testing.T) {
-	// Scenario: LogDB does not implement EpochAwareLogDB and DECLARES itself
-	// non-durable (e.g., MemDB). No durable artifact means no DEK can be
-	// stranded, so the floor falls back to the snapshot-only epoch floor.
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	ldb := newSnapshotTestLogDB() // does NOT implement EpochAwareLogDB
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	for _, info := range []struct {
-		index uint64
-		epoch uint64
-	}{
-		{100, 2},
-		{200, 5},
-	} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
-
-	p.purgeOldEpochs(tmpDir, 1, 1)
-
-	// Without EpochAwareLogDB, purge floor is snapshot min (2).
-	if barrier.PurgedBefore() != 2 {
-		t.Fatalf("purgedBefore = %d, want 2", barrier.PurgedBefore())
+			if tc.wantFloor == 0 {
+				if n := barrier.PurgeCallCount(); n != 0 {
+					t.Fatalf("expected 0 purge calls, got %d", n)
+				}
+				return
+			}
+			if got := barrier.PurgedBefore(); got != tc.wantFloor {
+				t.Fatalf("purgedBefore = %d, want %d", got, tc.wantFloor)
+			}
+		})
 	}
 }
 
@@ -2383,38 +1928,6 @@ func TestSnapshotPool_PurgeOldEpochs_DurableNonEpochAwareLogDBBlocksPurge(t *tes
 				t.Fatalf("purgedBefore = %d, want 0", barrier.PurgedBefore())
 			}
 		})
-	}
-}
-
-func TestSnapshotPool_PurgeOldEpochs_NilLogDB(t *testing.T) {
-	// Scenario: LogDB is nil. Should still work with snapshot-only logic.
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-	wireSnapshotNodes(p, snapshotDirNode(tmpDir, 1, 1))
-
-	for _, info := range []struct {
-		index uint64
-		epoch uint64
-	}{
-		{100, 3},
-		{200, 5},
-	} {
-		dir := snapshotSaveDir(tmpDir, 1, 1, info.index)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed: %v", err)
-		}
-		if err := writeTestSnapshotMetadata(dir, info.index, 1, 1, 1, info.epoch, config.NoCompression); err != nil {
-			t.Fatalf("write metadata failed: %v", err)
-		}
-	}
-
-	p.purgeOldEpochs(tmpDir, 1, 1)
-
-	// Nil logdb means no EpochAwareLogDB check; purge floor is snapshot min (3).
-	if barrier.PurgedBefore() != 3 {
-		t.Fatalf("purgedBefore = %d, want 3", barrier.PurgedBefore())
 	}
 }
 
