@@ -41,28 +41,6 @@ func TestEntryQueue_AddRejectsWhenFull(t *testing.T) {
 	}
 }
 
-func TestEntryQueue_SwapReusesBuf(t *testing.T) {
-	q := NewEntryQueue[int](4, 256)
-
-	// First cycle: add items, swap with nil.
-	q.Add([]int{10, 20, 30})
-	first := q.Swap(nil)
-	if len(first) != 3 {
-		t.Fatalf("expected 3 items, got %d", len(first))
-	}
-
-	// Second cycle: add more items, swap passing the previous result.
-	// The queue should reuse first's backing array as the new write buffer.
-	q.Add([]int{40, 50})
-	second := q.Swap(first[:0])
-	if len(second) != 2 {
-		t.Fatalf("expected 2 items, got %d", len(second))
-	}
-	if second[0] != 40 || second[1] != 50 {
-		t.Fatalf("items = %v, want [40 50]", second)
-	}
-}
-
 func TestEntryQueue_EmptyTracksEveryTransition(t *testing.T) {
 	q := NewEntryQueue[int](4, 3)
 	check := func(step string, want bool) {
@@ -212,6 +190,17 @@ func TestEntryQueue_AddOneAndAddMixed(t *testing.T) {
 	}
 	if items[0] != 1 || items[1] != 2 || items[2] != 3 || items[3] != 4 {
 		t.Fatalf("items = %v, want [1 2 3 4]", items)
+	}
+
+	// Passing the previous result back makes its backing array the new
+	// write buffer; the items added into it come back intact and in order.
+	q.Add([]int{40, 50})
+	if second := q.Swap(items[:0]); len(second) != 2 || second[0] != 40 || second[1] != 50 {
+		t.Fatalf("swap with a caller buffer = %v, want [40 50]", second)
+	}
+	q.Add([]int{60, 70})
+	if third := q.Swap(nil); len(third) != 2 || third[0] != 60 || third[1] != 70 {
+		t.Fatalf("swap of the recycled buffer = %v, want [60 70]", third)
 	}
 }
 
