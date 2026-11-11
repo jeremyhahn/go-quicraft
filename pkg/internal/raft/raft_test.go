@@ -282,13 +282,6 @@ func advanceElection(r *raft) {
 	}
 }
 
-// advanceHeartbeat ticks the raft node past a heartbeat interval.
-func advanceHeartbeat(r *raft) {
-	for i := 0; i < r.heartbeatTimeout+1; i++ {
-		r.tickFunc(r)
-	}
-}
-
 // electLeader transitions the given raft node to leader by granting
 // votes from peers.
 func electLeader(r *raft) {
