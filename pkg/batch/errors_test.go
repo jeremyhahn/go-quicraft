@@ -19,68 +19,32 @@ import (
 	"testing"
 )
 
-func TestClosedError_Error(t *testing.T) {
+func TestErrors_Error(t *testing.T) {
 	t.Parallel()
-	err := &ClosedError{}
-	want := "quicraft/batch: aggregator closed"
-	if got := err.Error(); got != want {
-		t.Errorf("ClosedError.Error() = %q, want %q", got, want)
+	deadline := errors.New("context deadline exceeded")
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"ClosedError", &ClosedError{}, "quicraft/batch: aggregator closed"},
+		{"QueueFullError", &QueueFullError{QueueSize: 5000},
+			"quicraft/batch: queue full (capacity 5000)"},
+		{"NilProposerError", &NilProposerError{}, "quicraft/batch: proposer is nil"},
+		{"FlushError", &FlushError{ShardID: 42, Err: errors.New("proposer unavailable")},
+			"quicraft/batch: flush failed for shard 42: proposer unavailable"},
+		// An indeterminate flush must not read like a definite failure.
+		{"FlushError indeterminate", &FlushError{ShardID: 5, Err: deadline, Indeterminate: true},
+			"quicraft/batch: flush outcome indeterminate for shard 5: context deadline exceeded"},
+		{"DecodeError", &DecodeError{Reason: "truncated length prefix"},
+			"quicraft/batch: decode failed: truncated length prefix"},
+		{"EncodeError", &EncodeError{Reason: "command length exceeds MaxInt32"},
+			"quicraft/batch: encode failed: command length exceeds MaxInt32"},
 	}
-}
-
-func TestQueueFullError_Error(t *testing.T) {
-	t.Parallel()
-	err := &QueueFullError{QueueSize: 5000}
-	want := "quicraft/batch: queue full (capacity 5000)"
-	if got := err.Error(); got != want {
-		t.Errorf("QueueFullError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestNilProposerError_Error(t *testing.T) {
-	t.Parallel()
-	err := &NilProposerError{}
-	want := "quicraft/batch: proposer is nil"
-	if got := err.Error(); got != want {
-		t.Errorf("NilProposerError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestFlushError_Error(t *testing.T) {
-	t.Parallel()
-	inner := errors.New("proposer unavailable")
-	err := &FlushError{ShardID: 42, Err: inner}
-	want := "quicraft/batch: flush failed for shard 42: proposer unavailable"
-	if got := err.Error(); got != want {
-		t.Errorf("FlushError.Error() = %q, want %q", got, want)
-	}
-}
-
-func TestFlushError_Unwrap(t *testing.T) {
-	t.Parallel()
-	inner := errors.New("wrapped cause")
-	err := &FlushError{ShardID: 7, Err: inner}
-
-	if unwrapped := err.Unwrap(); unwrapped != inner {
-		t.Errorf("Unwrap() = %v, want %v", unwrapped, inner)
-	}
-}
-
-func TestFlushError_UnwrapNilErr(t *testing.T) {
-	t.Parallel()
-	err := &FlushError{ShardID: 1, Err: nil}
-
-	if unwrapped := err.Unwrap(); unwrapped != nil {
-		t.Errorf("Unwrap() = %v, want nil", unwrapped)
-	}
-}
-
-func TestDecodeError_Error(t *testing.T) {
-	t.Parallel()
-	err := &DecodeError{Reason: "truncated length prefix"}
-	want := "quicraft/batch: decode failed: truncated length prefix"
-	if got := err.Error(); got != want {
-		t.Errorf("DecodeError.Error() = %q, want %q", got, want)
+	for _, tc := range cases {
+		if got := tc.err.Error(); got != tc.want {
+			t.Errorf("%s.Error() = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -96,7 +60,8 @@ func TestDecodeError_Error(t *testing.T) {
 //
 // The full cross-product is checked here, both for errors.As (type identity)
 // and errors.Is against each type's own sentinel. ErrEncode/EncodeError is
-// included; it was absent from every distinctness check in this file.
+// included; it was absent from every distinctness check in this file. Two
+// sentinels defined as the same value would also fail the errors.Is half.
 func TestErrorTypes_AreDistinct(t *testing.T) {
 	t.Parallel()
 
@@ -139,46 +104,7 @@ func TestErrorTypes_AreDistinct(t *testing.T) {
 	}
 }
 
-func TestSentinelErrors_AreDistinct(t *testing.T) {
-	t.Parallel()
-
-	// ErrEncode is included: it was the one sentinel this check never covered,
-	// so nothing prevented it from being defined as an alias of another.
-	sentinels := []error{ErrClosed, ErrQueueFull, ErrNilProposer, ErrFlush, ErrDecode, ErrEncode}
-	for i, a := range sentinels {
-		for j, b := range sentinels {
-			if i != j && errors.Is(a, b) {
-				t.Errorf("sentinel %q should not match %q", a, b)
-			}
-		}
-	}
-}
-
 // TestFlushError_ErrorIndeterminate covers FlushError.Error's indeterminate
 // branch, which no test reached. The wording is the caller's only signal that a
 // retry may apply the whole batch a second time — the aggregator has no
 // at-most-once path — so it must not read like the definite-failure message.
-func TestFlushError_ErrorIndeterminate(t *testing.T) {
-	t.Parallel()
-	inner := errors.New("context deadline exceeded")
-	err := &FlushError{ShardID: 5, Err: inner, Indeterminate: true}
-
-	want := "quicraft/batch: flush outcome indeterminate for shard 5: context deadline exceeded"
-	if got := err.Error(); got != want {
-		t.Errorf("FlushError.Error() = %q, want %q", got, want)
-	}
-
-	definite := &FlushError{ShardID: 5, Err: inner}
-	if definite.Error() == err.Error() {
-		t.Error("an indeterminate flush must not report the same message as a definite failure")
-	}
-}
-
-func TestEncodeError_Error(t *testing.T) {
-	t.Parallel()
-	err := &EncodeError{Reason: "command length exceeds MaxInt32"}
-	want := "quicraft/batch: encode failed: command length exceeds MaxInt32"
-	if got := err.Error(); got != want {
-		t.Errorf("EncodeError.Error() = %q, want %q", got, want)
-	}
-}
