@@ -57,40 +57,9 @@ func TestDeregisterInFlightEpochReportsUnbalancedRelease(t *testing.T) {
 	}
 }
 
-// TestDeregisterInFlightEpochNeverUnderflows pins that stray releases leave no
-// buried negative count behind. PurgeEpochsBefore protects an epoch only while
-// its count is > 0, so a count sitting at -2 would mean the next two legitimate
-// pins protect nothing at all.
-func TestDeregisterInFlightEpochNeverUnderflows(t *testing.T) {
-	captureLogs(t)
-	b, _ := testInitializedBarrier(t)
-
-	const epoch uint64 = 42
-	for range 3 {
-		b.DeregisterInFlightEpoch(epoch)
-	}
-
-	b.inFlightMu.Lock()
-	n, present := b.inFlightEpochs[epoch]
-	b.inFlightMu.Unlock()
-	if present && n < 0 {
-		t.Fatalf("pin count for a never-registered epoch = %d; the counter underflowed", n)
-	}
-
-	// A single Register must be enough to protect the epoch again, and the
-	// protection must be real: a purge has to skip it.
-	b.RegisterInFlightEpoch(epoch)
-	b.inFlightMu.Lock()
-	n, present = b.inFlightEpochs[epoch]
-	b.inFlightMu.Unlock()
-	if !present || n != 1 {
-		t.Fatalf("pin count after Register following stray releases = %d (present=%v), want 1",
-			n, present)
-	}
-}
-
-// TestPinnedEpochSurvivesPurgeAfterStrayReleases is the end-to-end statement of
-// the same invariant: stray releases before a pin is taken must not leave the
+// TestPinnedEpochSurvivesPurgeAfterStrayReleases pins that stray releases leave
+// no negative pin count behind (the purge skips only a count above zero): stray
+// releases before a pin is taken must not leave the
 // epoch unprotected once it IS taken, so a frame sealed under it stays
 // decryptable across a rotate + purge.
 func TestPinnedEpochSurvivesPurgeAfterStrayReleases(t *testing.T) {
