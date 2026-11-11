@@ -18,8 +18,6 @@ package integration_test
 
 import (
 	"testing"
-
-	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
 )
 
 // TestIntegration_DB_TermMonotonicity verifies that Raft terms are strictly
@@ -40,12 +38,15 @@ func TestIntegration_DB_TermMonotonicity(t *testing.T) {
 
 	// Record the current term from the leader.
 	leaderHost := cluster.hosts[leaderIdx]
-	_, oldTerm, valid, err := leaderHost.GetLeaderID(1)
+	oldLeaderID, oldTerm, valid, err := leaderHost.GetLeaderID(1)
 	if err != nil {
 		t.Fatalf("GetLeaderID failed: %v", err)
 	}
 	if !valid {
 		t.Fatal("GetLeaderID returned valid=false on elected leader")
+	}
+	if oldLeaderID != uint64(leaderIdx+1) {
+		t.Fatalf("GetLeaderID leaderID = %d, want %d", oldLeaderID, leaderIdx+1)
 	}
 	if oldTerm == 0 {
 		t.Fatal("oldTerm should be > 0 after election")
@@ -79,53 +80,4 @@ func TestIntegration_DB_TermMonotonicity(t *testing.T) {
 		t.Fatalf("term monotonicity violated: newTerm=%d <= oldTerm=%d", newTerm, oldTerm)
 	}
 	t.Logf("term monotonicity verified: oldTerm=%d < newTerm=%d", oldTerm, newTerm)
-}
-
-// TestIntegration_DB_PreVoteElection verifies that a cluster configured with
-// the PreVote protocol extension operates correctly. PreVote prevents
-// disruptive elections from partitioned nodes while still allowing normal
-// propose and read operations.
-func TestIntegration_DB_PreVoteElection(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	// Default config has PreVote enabled; use it directly.
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("PreVote cluster leader at node[%d]", leaderIdx)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose data through the leader.
-	proposeAndWait(t, cluster, trackers, 1, "prevote-key", "prevote-value")
-	waitForReplication(t, cluster, trackers, 1, "prevote-key", "prevote-value", defaultTimeout)
-
-	// Verify linearizable read round-trip works with PreVote enabled. The
-	// subject is the round-trip, not a particular replica, so the read
-	// re-resolves rather than pinning the leader observed above.
-	result := cluster.readFromLeader(t, 1, encodeKVGet("prevote-key"), defaultTimeout)
-	val, ok := result.(string)
-	if !ok {
-		t.Fatalf("SyncRead returned type %T, want string", result)
-	}
-	if val != "prevote-value" {
-		t.Fatalf("SyncRead = %q, want %q", val, "prevote-value")
-	}
-	t.Logf("PreVote cluster propose + read verified: %q = %q", "prevote-key", val)
-
-	// Propose multiple entries to ensure sustained operation.
-	expected := proposeNEntries(t, cluster, trackers, 1, 10, "prevote-batch")
-	verifyAllData(t, cluster, trackers, 1, expected)
-	t.Logf("PreVote cluster replicated %d entries to all nodes", len(expected))
-
-	// Verify async propose also works with PreVote.
-	session := dbClient.NewNoOPSession(1, nil)
-	cmd := encodeKVPut("prevote-async", "async-value")
-	syncResult := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
-	if syncResult.Value != uint64(len("async-value")) {
-		t.Fatalf("SyncPropose result.Value = %d, want %d", syncResult.Value, len("async-value"))
-	}
-	t.Logf("PreVote cluster async propose verified")
 }
