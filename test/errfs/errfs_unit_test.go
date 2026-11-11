@@ -198,6 +198,20 @@ func TestOperationsDelegateWhenNotInjecting(t *testing.T) {
 		t.Fatalf("Close (read-only): %v", err)
 	}
 
+	info, err := efs.Stat(name)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if info.Size() != 4 {
+		t.Errorf("Stat reported size %d, want 4", info.Size())
+	}
+	if err := efs.Remove(name); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := efs.Stat(name); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Stat after Remove = %v, want fs.ErrNotExist", err)
+	}
+
 	if efs.Injected() {
 		t.Error("Injected() reported true with injectAt=0 (disarmed)")
 	}
@@ -240,32 +254,4 @@ func contains(s, sub string) bool {
 		}
 	}
 	return false
-}
-
-// TestStatAndRemoveDelegate covers the remaining FS surface so a wrapper that
-// forgets to call through is caught here rather than as a confusing failure
-// inside a WAL recovery test.
-func TestStatAndRemoveDelegate(t *testing.T) {
-	delegate, dir := realFS(t)
-	efs := New(delegate, 0, errUnit)
-
-	name := filepath.Join(dir, "target")
-	if err := os.WriteFile(name, []byte("x"), 0o600); err != nil {
-		t.Fatalf("seeding the file: %v", err)
-	}
-
-	info, err := efs.Stat(name)
-	if err != nil {
-		t.Fatalf("Stat: %v", err)
-	}
-	if info.Size() != 1 {
-		t.Errorf("Stat reported size %d, want 1", info.Size())
-	}
-
-	if err := efs.Remove(name); err != nil {
-		t.Fatalf("Remove: %v", err)
-	}
-	if _, err := efs.Stat(name); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("Stat after Remove = %v, want fs.ErrNotExist", err)
-	}
 }
