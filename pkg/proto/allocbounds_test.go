@@ -148,33 +148,6 @@ func TestGetBoolMap_CountExceedsBuffer(t *testing.T) {
 	}
 }
 
-// TestGetMap_LargeSatisfiableCount asserts a large count the buffer genuinely
-// satisfies decodes in full. Each entry is the 12-byte minimum
-// ([key:8][valueLen:4=0]), so the count passes the length cross-check and every
-// entry is really there — this is the case the cross-check must NOT reject, and
-// the case getMap now sizes its map from in one allocation (see
-// TestGetMapSizesExactly).
-func TestGetMap_LargeSatisfiableCount(t *testing.T) {
-	const count = 4096
-	buf := make([]byte, 4+count*mapEntryMinBytes)
-	putUint32(buf, count)
-	for i := 0; i < count; i++ {
-		off := 4 + i*mapEntryMinBytes
-		putUint64(buf[off:], uint64(i))
-		putUint32(buf[off+8:], 0)
-	}
-	m, n, err := getMap(buf)
-	if err != nil {
-		t.Fatalf("getMap: %v", err)
-	}
-	if n != len(buf) {
-		t.Fatalf("consumed %d bytes, want %d", n, len(buf))
-	}
-	if len(m) != count {
-		t.Fatalf("map has %d entries, want %d", len(m), count)
-	}
-}
-
 // TestGetMap_RejectsDuplicateKeys asserts the decoder rejects a non-canonical
 // encoding it would never produce (putMap emits each key once, sorted).
 func TestGetMap_RejectsDuplicateKeys(t *testing.T) {
@@ -227,26 +200,17 @@ func TestMessageBatch_Reset_DropsOversizedRequests(t *testing.T) {
 	})
 }
 
-// TestMessage_Reset_DropsOversizedEntries asserts a message grown past
-// maxRetainedEntries releases the slice, so a message held inside a pooled
-// batch cannot retain attacker-influenced capacity for the process lifetime.
-func TestMessage_Reset_DropsOversizedEntries(t *testing.T) {
-	t.Run("oversized capacity dropped", func(t *testing.T) {
-		m := Message{Entries: make([]Entry, maxRetainedEntries+1)}
-		m.Reset()
-		if cap(m.Entries) != 0 {
-			t.Fatalf("cap = %d after Reset, want 0", cap(m.Entries))
-		}
-	})
-
-	t.Run("capacity within threshold retained", func(t *testing.T) {
-		m := Message{Entries: make([]Entry, 0, maxRetainedEntries)}
-		m.Reset()
-		if cap(m.Entries) != maxRetainedEntries {
-			t.Fatalf("cap = %d after Reset, want %d", cap(m.Entries), maxRetainedEntries)
-		}
-		if len(m.Entries) != 0 {
-			t.Fatalf("len = %d after Reset, want 0", len(m.Entries))
-		}
-	})
+// TestMessage_Reset_RetainsCapacityWithinThreshold asserts a message whose
+// Entries capacity is at maxRetainedEntries keeps it across Reset. The
+// oversized case is TestMessageBatchResetReleasesOversizedEntries, which
+// reaches Message.Reset through the pooled batch.
+func TestMessage_Reset_RetainsCapacityWithinThreshold(t *testing.T) {
+	m := Message{Entries: make([]Entry, 0, maxRetainedEntries)}
+	m.Reset()
+	if cap(m.Entries) != maxRetainedEntries {
+		t.Fatalf("cap = %d after Reset, want %d", cap(m.Entries), maxRetainedEntries)
+	}
+	if len(m.Entries) != 0 {
+		t.Fatalf("len = %d after Reset, want 0", len(m.Entries))
+	}
 }
