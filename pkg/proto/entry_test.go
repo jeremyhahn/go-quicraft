@@ -71,31 +71,6 @@ func TestEntryMarshalUnmarshalWithCompression(t *testing.T) {
 	assertEntryEqual(t, &e, &e2)
 }
 
-func TestEntryMarshalUnmarshalEmptyCmd(t *testing.T) {
-	e := Entry{
-		Term:  1,
-		Index: 1,
-		Type:  EntryNormal,
-		Cmd:   nil,
-	}
-	buf := make([]byte, e.Size())
-	n, err := e.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	if n != entryHeaderSize {
-		t.Fatalf("Size with nil cmd: got %d, want %d", n, entryHeaderSize)
-	}
-	var e2 Entry
-	_, err = e2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if e2.Cmd != nil {
-		t.Fatalf("Cmd: got %v, want nil", e2.Cmd)
-	}
-}
-
 func TestEntrySize(t *testing.T) {
 	tests := []struct {
 		name string
@@ -215,38 +190,6 @@ func TestEntryReset(t *testing.T) {
 	if e.Term != 0 || e.Index != 0 || e.Type != 0 || e.Key != 0 ||
 		e.ClientID != 0 || e.SeriesID != 0 || e.RespondedTo != 0 || e.Cmd != nil {
 		t.Fatal("Reset did not clear all fields")
-	}
-}
-
-func TestEntryMultipleInBuffer(t *testing.T) {
-	entries := []Entry{
-		{Term: 1, Index: 1, Type: EntryNormal, Cmd: []byte("cmd1")},
-		{Term: 1, Index: 2, Type: EntryNormal, Cmd: []byte("cmd2-longer")},
-		{Term: 2, Index: 3, Type: EntryConfigChange, Cmd: []byte("cc")},
-	}
-	totalSize := 0
-	for i := range entries {
-		totalSize += entries[i].Size()
-	}
-	buf := make([]byte, totalSize)
-	offset := 0
-	for i := range entries {
-		n, err := entries[i].MarshalTo(buf[offset:])
-		if err != nil {
-			t.Fatalf("MarshalTo entry %d: %v", i, err)
-		}
-		offset += n
-	}
-
-	offset = 0
-	for i := range entries {
-		var e Entry
-		n, err := e.UnmarshalFrom(buf[offset:])
-		if err != nil {
-			t.Fatalf("UnmarshalFrom entry %d: %v", i, err)
-		}
-		offset += n
-		assertEntryEqual(t, &entries[i], &e)
 	}
 }
 

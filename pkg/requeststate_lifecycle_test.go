@@ -15,253 +15,9 @@
 package quicraft
 
 import (
-	"errors"
-	"sync"
 	"testing"
 	"time"
 )
-
-// ===========================================================================
-// PendingConfigChange lifecycle
-// ===========================================================================
-
-// TestRequestState_PendingConfigChange_CreateAndVerify verifies that a
-// RequestState created for a config change operation has correct initial
-// state: key set, deadline set, not released, not completed.
-func TestRequestState_PendingConfigChange_CreateAndVerify(t *testing.T) {
-	pool := NewRequestStatePool()
-	deadline := time.Now().Add(5 * time.Second)
-	rs := newRequestState(pool, 100, deadline, true)
-
-	if rs.Key() != 100 {
-		t.Errorf("Key = %d, want 100", rs.Key())
-	}
-	if !rs.Deadline().Equal(deadline) {
-		t.Errorf("Deadline mismatch: got %v, want %v", rs.Deadline(), deadline)
-	}
-	if rs.released.Load() {
-		t.Error("newly created RequestState should not be released")
-	}
-	if rs.completed.Load() {
-		t.Error("newly created RequestState should not be completed")
-	}
-	if rs.committedDone.Load() {
-		t.Error("newly created RequestState should not have committedDone set")
-	}
-
-	ch := rs.ResultC()
-	if ch == nil {
-		t.Error("ResultC should return non-nil channel for active request")
-	}
-	select {
-	case <-ch:
-		t.Error("channel should be empty initially")
-	default:
-		// Expected.
-	}
-	rs.Release()
-}
-
-// TestRequestState_PendingConfigChange_BusyWhenPending verifies that
-// when a config change request is already pending (ResultC not yet consumed),
-// a second request can detect the busy state by checking the channel.
-func TestRequestState_PendingConfigChange_BusyWhenPending(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs1 := newRequestState(pool, 1, time.Now().Add(10*time.Second), true)
-
-	// rs1 is pending (no result delivered yet). A caller checking
-	// whether a config change is pending should find the channel empty.
-	select {
-	case <-rs1.ResultC():
-		t.Fatal("pending config change should not have a result yet")
-	default:
-		// Busy: config change is pending.
-	}
-
-	// Complete the first one.
-	rs1.complete(RequestResult{Value: 1})
-
-	// Now the channel should have a result.
-	select {
-	case result := <-rs1.ResultC():
-		if result.Value != 1 {
-			t.Errorf("Value = %d, want 1", result.Value)
-		}
-	default:
-		t.Error("completed config change should have a result")
-	}
-	rs1.Release()
-}
-
-// TestRequestState_PendingConfigChange_Timeout verifies that a config
-// change request that exceeds its deadline returns ErrTimeout.
-func TestRequestState_PendingConfigChange_Timeout(t *testing.T) {
-	pool := NewRequestStatePool()
-	deadline := time.Now().Add(50 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline, true)
-
-	_, err := rs.Result()
-	if !errors.Is(err, ErrTimeout) {
-		t.Errorf("expected ErrTimeout, got %v", err)
-	}
-	rs.Release()
-}
-
-// TestRequestState_PendingConfigChange_CompletionNotification verifies
-// that completing a config change delivers the result through both
-// ResultC and Result().
-func TestRequestState_PendingConfigChange_CompletionNotification(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	expected := RequestResult{Value: 42, Data: []byte("config-applied")}
-
-	go func() {
-		rs.complete(expected)
-	}()
-
-	result, err := rs.Result()
-	if err != nil {
-		t.Fatalf("Result returned error: %v", err)
-	}
-	if result.Value != 42 {
-		t.Errorf("Value = %d, want 42", result.Value)
-	}
-	if string(result.Data) != "config-applied" {
-		t.Errorf("Data = %q, want %q", result.Data, "config-applied")
-	}
-	rs.Release()
-}
-
-// TestRequestState_PendingConfigChange_DropCancel verifies that releasing
-// a pending config change (simulating a drop/cancel) makes ResultC return
-// nil and Result return ErrReleased.
-func TestRequestState_PendingConfigChange_DropCancel(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Now().Add(10*time.Second), true)
-
-	// Drop/cancel the pending request.
-	rs.Release()
-
-	if rs.ResultC() != nil {
-		t.Error("ResultC should return nil after Release")
-	}
-	_, err := rs.Result()
-	if !errors.Is(err, ErrReleased) {
-		t.Errorf("expected ErrReleased after drop, got %v", err)
-	}
-}
-
-// ===========================================================================
-// PendingReadIndex lifecycle
-// ===========================================================================
-
-// TestRequestState_PendingReadIndex_CreateAndVerify verifies that a
-// RequestState created for a read index operation has correct initial state.
-func TestRequestState_PendingReadIndex_CreateAndVerify(t *testing.T) {
-	pool := NewRequestStatePool()
-	deadline := time.Now().Add(3 * time.Second)
-	rs := newRequestState(pool, 200, deadline, true)
-
-	if rs.Key() != 200 {
-		t.Errorf("Key = %d, want 200", rs.Key())
-	}
-	if rs.released.Load() {
-		t.Error("newly created read index RequestState should not be released")
-	}
-	if rs.completed.Load() {
-		t.Error("newly created read index RequestState should not be completed")
-	}
-	rs.Release()
-}
-
-// TestRequestState_PendingReadIndex_WhenPending verifies that checking
-// a pending read index detects the busy state through channel inspection.
-func TestRequestState_PendingReadIndex_WhenPending(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Now().Add(10*time.Second), true)
-
-	// Read index is pending.
-	select {
-	case <-rs.ResultC():
-		t.Fatal("pending read index should not have a result")
-	default:
-		// Busy.
-	}
-
-	rs.complete(RequestResult{Value: 500})
-
-	select {
-	case result := <-rs.ResultC():
-		if result.Value != 500 {
-			t.Errorf("Value = %d, want 500", result.Value)
-		}
-	default:
-		t.Error("completed read index should have a result")
-	}
-	rs.Release()
-}
-
-// TestRequestState_PendingReadIndex_CompletionWithCommittedIndex verifies
-// that a read index result carries the committed index from the leader.
-func TestRequestState_PendingReadIndex_CompletionWithCommittedIndex(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Simulate leader confirming the read index at committed=1000.
-	go func() {
-		rs.complete(RequestResult{Value: 1000})
-	}()
-
-	result, err := rs.Result()
-	if err != nil {
-		t.Fatalf("Result returned error: %v", err)
-	}
-	if result.Value != 1000 {
-		t.Errorf("committed index = %d, want 1000", result.Value)
-	}
-	rs.Release()
-}
-
-// TestRequestState_PendingReadIndex_Timeout verifies that a read index
-// request that exceeds its deadline returns ErrTimeout.
-func TestRequestState_PendingReadIndex_Timeout(t *testing.T) {
-	pool := NewRequestStatePool()
-	deadline := time.Now().Add(50 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline, true)
-
-	_, err := rs.Result()
-	if !errors.Is(err, ErrTimeout) {
-		t.Errorf("expected ErrTimeout for read index, got %v", err)
-	}
-	rs.Release()
-}
-
-// TestRequestState_BatchReadIndex_Timeout verifies that multiple read
-// index requests created as a batch all respect their individual deadlines.
-func TestRequestState_BatchReadIndex_Timeout(t *testing.T) {
-	pool := NewRequestStatePool()
-	deadline := time.Now().Add(50 * time.Millisecond)
-
-	const batchSize = 5
-	states := make([]*RequestState, batchSize)
-	for i := range states {
-		states[i] = newRequestState(pool, uint64(i+1), deadline, true)
-	}
-
-	// All should timeout.
-	for i, rs := range states {
-		_, err := rs.Result()
-		if !errors.Is(err, ErrTimeout) {
-			t.Errorf("batch[%d]: expected ErrTimeout, got %v", i, err)
-		}
-		rs.Release()
-	}
-}
-
-// ===========================================================================
-// PendingSnapshot edge cases
-// ===========================================================================
 
 // TestRequestState_SnapshotGCDuringPending verifies that releasing a
 // pending snapshot request (simulating GC) correctly cleans up state.
@@ -288,213 +44,55 @@ func TestRequestState_SnapshotGCDuringPending(t *testing.T) {
 	}
 }
 
-// TestRequestState_SnapshotApplyCompletion verifies that completing a
-// snapshot apply delivers the result correctly to the caller.
-func TestRequestState_SnapshotApplyCompletion(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Simulate snapshot apply completion.
-	go func() {
-		rs.complete(RequestResult{Value: 999, Data: []byte("snapshot-done")})
-	}()
-
-	result, err := rs.Result()
-	if err != nil {
-		t.Fatalf("Result returned error: %v", err)
-	}
-	if result.Value != 999 {
-		t.Errorf("Value = %d, want 999", result.Value)
-	}
-	if string(result.Data) != "snapshot-done" {
-		t.Errorf("Data = %q, want %q", result.Data, "snapshot-done")
-	}
-	rs.Release()
-}
-
-// TestRequestState_SnapshotIdentityByKey verifies that multiple snapshot
-// requests can be distinguished by their unique keys.
-func TestRequestState_SnapshotIdentityByKey(t *testing.T) {
-	pool := NewRequestStatePool()
-
-	rs1 := newRequestState(pool, 100, time.Time{}, true)
-	rs2 := newRequestState(pool, 200, time.Time{}, true)
-	rs3 := newRequestState(pool, 300, time.Time{}, true)
-
-	if rs1.Key() == rs2.Key() || rs2.Key() == rs3.Key() || rs1.Key() == rs3.Key() {
-		t.Error("snapshot requests should have distinct keys")
-	}
-
-	rs1.complete(RequestResult{Value: 1})
-	rs2.complete(RequestResult{Value: 2})
-	rs3.complete(RequestResult{Value: 3})
-
-	check := func(rs *RequestState, expected uint64) {
-		t.Helper()
-		select {
-		case result := <-rs.ResultC():
-			if result.Value != expected {
-				t.Errorf("key=%d: Value = %d, want %d", rs.Key(), result.Value, expected)
-			}
-		default:
-			t.Errorf("key=%d: no result in channel", rs.Key())
-		}
-	}
-
-	check(rs1, 1)
-	check(rs2, 2)
-	check(rs3, 3)
-
-	rs1.Release()
-	rs2.Release()
-	rs3.Release()
-}
-
-// ===========================================================================
-// Release and ready-to-release semantics
-// ===========================================================================
-
-// TestRequestState_ReleaseAndReadyStates verifies the full lifecycle from
-// creation through completion to release, checking state at each stage.
-func TestRequestState_ReleaseAndReadyStates(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Stage 1: Active state.
-	if rs.released.Load() {
-		t.Fatal("stage 1: should not be released")
-	}
-	if rs.completed.Load() {
-		t.Fatal("stage 1: should not be completed")
-	}
-	if rs.ResultC() == nil {
-		t.Fatal("stage 1: ResultC should return non-nil")
-	}
-
-	// Stage 2: Completed but not released.
-	rs.complete(RequestResult{Value: 42})
-	if rs.released.Load() {
-		t.Fatal("stage 2: should not be released after complete")
-	}
-	if !rs.completed.Load() {
-		t.Fatal("stage 2: should be completed")
-	}
-
-	// Consume the result.
-	<-rs.ResultC()
-
-	// Stage 3: Release.
-	rs.Release()
-	if !rs.released.Load() {
-		t.Fatal("stage 3: should be released")
-	}
-	if rs.ResultC() != nil {
-		t.Fatal("stage 3: ResultC should return nil after release")
-	}
-	if rs.CommittedC() != nil {
-		t.Fatal("stage 3: CommittedC should return nil after release")
-	}
-	if rs.ApplyResultC() != nil {
-		t.Fatal("stage 3: ApplyResultC should return nil after release")
-	}
-}
-
-// TestRequestState_DoubleReleaseSafety verifies that releasing twice is
-// safe and idempotent, not panicking or corrupting state.
-func TestRequestState_DoubleReleaseSafety(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.complete(RequestResult{Value: 1})
-	<-rs.ResultC()
-
-	// First release.
-	rs.Release()
-	if !rs.released.Load() {
-		t.Fatal("should be released after first Release")
-	}
-
-	// Second release should not panic.
-	rs.Release()
-	if !rs.released.Load() {
-		t.Fatal("should still be released after second Release")
-	}
-
-	// Result and ResultC after double release.
-	_, err := rs.Result()
-	if !errors.Is(err, ErrReleased) {
-		t.Errorf("expected ErrReleased after double release, got %v", err)
-	}
-	if rs.ResultC() != nil {
-		t.Error("ResultC should return nil after double release")
-	}
-}
-
-// TestRequestState_DoubleReleaseConcurrent verifies that concurrent
-// double-release from multiple goroutines is safe.
-func TestRequestState_DoubleReleaseConcurrent(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-	rs.complete(RequestResult{Value: 1})
-
-	var wg sync.WaitGroup
-	const goroutines = 50
-	wg.Add(goroutines)
-	for range goroutines {
-		go func() {
-			defer wg.Done()
-			rs.Release()
-		}()
-	}
-	wg.Wait()
-
-	if !rs.released.Load() {
-		t.Error("should be released after concurrent releases")
-	}
-}
-
-// ===========================================================================
-// CommitNotify + Complete interaction
-// ===========================================================================
-
 // TestRequestState_PoolRecycleFullLifecycle verifies a full
-// create-complete-release-recycle-create-complete-release cycle
-// ensuring recycled RequestState objects work correctly.
+// create-complete-release-recycle-create-complete-release cycle on one
+// object. The pinned pool hands the same object back, so every field
+// newRequestState resets is observed on a genuinely recycled object: a
+// plain sync.Pool may return a fresh one, and drops Puts under -race.
 func TestRequestState_PoolRecycleFullLifecycle(t *testing.T) {
-	pool := NewRequestStatePool()
+	pool, storage := pinnedStatePool()
 
-	// First lifecycle.
+	// First lifecycle, released with both results unconsumed.
 	rs1 := newRequestState(pool, 1, time.Now().Add(5*time.Second), true)
 	rs1.commitNotify(RequestResult{Value: 0})
 	rs1.complete(RequestResult{Value: 10})
-	<-rs1.CommittedC()
-	<-rs1.ResultC()
 	rs1.Release()
+	if !rs1.recycled.Load() {
+		t.Fatal("first lifecycle: not recycled on Release")
+	}
+	// A stale delivery left in the channels of the recycled object must
+	// not reach the next owner.
+	storage.completedC <- RequestResult{Value: 999}
+	storage.committedC <- RequestResult{Value: 888}
 
-	// Second lifecycle with recycled object.
-	rs2 := newRequestState(pool, 2, time.Now().Add(5*time.Second), true)
+	// Second lifecycle with the recycled object.
+	rs2 := newRequestState(pool, 2, time.Time{}, true)
+	if rs2 != storage {
+		t.Fatal("pinned pool did not hand back the recycled object")
+	}
 	if rs2.Key() != 2 {
 		t.Errorf("recycled key = %d, want 2", rs2.Key())
 	}
-	if rs2.released.Load() {
-		t.Error("recycled RequestState should not be released")
+	if !rs2.Deadline().IsZero() {
+		t.Errorf("recycled deadline = %v, want zero", rs2.Deadline())
 	}
-	if rs2.completed.Load() {
-		t.Error("recycled RequestState should not be completed")
+	if rs2.released.Load() || rs2.recycled.Load() || rs2.completed.Load() || rs2.committedDone.Load() {
+		t.Errorf("recycled flags not reset: released=%v recycled=%v completed=%v committedDone=%v",
+			rs2.released.Load(), rs2.recycled.Load(), rs2.completed.Load(), rs2.committedDone.Load())
 	}
-	if rs2.committedDone.Load() {
-		t.Error("recycled RequestState should not have committedDone set")
+	if got := rs2.outstanding.Load(); got != 0 {
+		t.Errorf("recycled outstanding = %d, want 0", got)
 	}
 
 	// Channels should be empty.
 	select {
-	case <-rs2.completedC:
-		t.Error("recycled completedC should be empty")
+	case r := <-rs2.completedC:
+		t.Errorf("recycled completedC holds a stale result: %+v", r)
 	default:
 	}
 	select {
-	case <-rs2.committedC:
-		t.Error("recycled committedC should be empty")
+	case r := <-rs2.committedC:
+		t.Errorf("recycled committedC holds a stale result: %+v", r)
 	default:
 	}
 

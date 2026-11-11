@@ -85,38 +85,6 @@ func newReplayShard() *walShard {
 	}
 }
 
-// TestRetiredEntryPayloadTypeRejected pins the entry gate.
-//
-// While 0x07 still named the current entry format, this fixture replayed with a
-// nil error and stored an entry whose OwnerID was the record's own CmdLen
-// concatenated with the first four bytes of its command, and whose command was
-// the last sixteen bytes of the real one. OwnerID is the session-admission
-// grouping key every replica must agree on, and the command goes to the state
-// machine, so the accepted-and-wrong outcome is worse than any rejection.
-func TestRetiredEntryPayloadTypeRejected(t *testing.T) {
-	t.Run("replayRecord returns ErrUnknownPayloadType", func(t *testing.T) {
-		s := newReplayShard()
-		_, _, err := s.replayRecord(retiredEntryRecord(), 0)
-		if !errors.Is(err, ErrUnknownPayloadType) {
-			t.Fatalf("replayRecord(0x07) err = %v, want ErrUnknownPayloadType", err)
-		}
-		if len(s.entries) != 0 {
-			t.Fatalf("a refused legacy record stored %d node entry maps; nothing "+
-				"from a format this build cannot read may reach the log", len(s.entries))
-		}
-	})
-
-	t.Run("Open fails on a segment with a retired entry record", func(t *testing.T) {
-		dir := t.TempDir()
-		writeRawShardRecord(t, dir, 1, retiredEntryRecord())
-
-		if _, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
-			WithMaxFileSize(64*1024)); !errors.Is(err, ErrUnknownPayloadType) {
-			t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
-		}
-	})
-}
-
 // TestRetiredSnapshotPayloadTypeRejected pins the snapshot gate.
 //
 // The snapshot record carried the same unallocated change: 0.5.x grew the
@@ -149,29 +117,19 @@ func TestRetiredSnapshotPayloadTypeRejected(t *testing.T) {
 		binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
 		payload[1+snapshotRecordBaseSize] = membershipSectionVersion
 
-		t.Run(fmt.Sprintf("replayRecord(%#02x) returns ErrUnknownPayloadType", retired.typ), func(t *testing.T) {
-			s := newReplayShard()
-			_, _, err := s.replayRecord(payload, 0)
+		t.Run(fmt.Sprintf("Open fails on a segment with a retired %#02x snapshot record", retired.typ), func(t *testing.T) {
+			dir := t.TempDir()
+			writeRawShardRecord(t, dir, 1, payload)
+
+			_, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
+				WithMaxFileSize(64*1024))
 			if !errors.Is(err, ErrUnknownPayloadType) {
-				t.Fatalf("replayRecord(%#02x) err = %v, want ErrUnknownPayloadType", retired.typ, err)
+				t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
 			}
 			if errors.Is(err, ErrTruncatedSnapshotRecord) {
 				t.Fatal("a legacy snapshot record was reported as TRUNCATED; the record " +
 					"is intact and the remedy is to wipe and re-sync, not to investigate " +
 					"corruption")
-			}
-			if len(s.snapshots) != 0 {
-				t.Fatalf("a refused legacy record stored %d snapshots", len(s.snapshots))
-			}
-		})
-
-		t.Run(fmt.Sprintf("Open fails on a segment with a retired %#02x snapshot record", retired.typ), func(t *testing.T) {
-			dir := t.TempDir()
-			writeRawShardRecord(t, dir, 1, payload)
-
-			if _, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
-				WithMaxFileSize(64*1024)); !errors.Is(err, ErrUnknownPayloadType) {
-				t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
 			}
 		})
 	}
@@ -195,28 +153,18 @@ func TestRetiredStatePayloadTypeRejected(t *testing.T) {
 	binary.LittleEndian.PutUint64(payload[25:], 2)  // vote
 	binary.LittleEndian.PutUint64(payload[33:], 10) // commit
 
-	t.Run("replayRecord returns ErrUnknownPayloadType", func(t *testing.T) {
-		s := newReplayShard()
-		_, _, err := s.replayRecord(payload, 0)
-		if !errors.Is(err, ErrUnknownPayloadType) {
-			t.Fatalf("replayRecord(0x02) err = %v, want ErrUnknownPayloadType", err)
-		}
-		if errors.Is(err, ErrTruncatedStateRecord) {
-			t.Fatal("a legacy state record was reported as TRUNCATED; the record " +
-				"is intact and the remedy is to wipe and re-sync")
-		}
-		if len(s.states) != 0 {
-			t.Fatalf("a refused legacy record stored %d states", len(s.states))
-		}
-	})
-
 	t.Run("Open fails on a segment with a retired state record", func(t *testing.T) {
 		dir := t.TempDir()
 		writeRawShardRecord(t, dir, 1, payload)
 
-		if _, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
-			WithMaxFileSize(64*1024)); !errors.Is(err, ErrUnknownPayloadType) {
+		_, err := Open(dir, WithNoSync(true), WithBlockSize(1024),
+			WithMaxFileSize(64*1024))
+		if !errors.Is(err, ErrUnknownPayloadType) {
 			t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
+		}
+		if errors.Is(err, ErrTruncatedStateRecord) {
+			t.Fatal("a legacy state record was reported as TRUNCATED; the record " +
+				"is intact and the remedy is to wipe and re-sync")
 		}
 	})
 }
@@ -231,6 +179,14 @@ func TestRetiredStatePayloadTypeRejected(t *testing.T) {
 // first half is what makes the second load-bearing: if someone bumps the
 // constant later, the marker gate starts catching this fixture first and the
 // record gate stops being exercised by it.
+//
+// The second half is also the test of the entry gate. While 0x07 still named
+// the current entry format, this fixture replayed with a nil error and stored
+// an entry whose OwnerID was the record's own CmdLen concatenated with the
+// first four bytes of its command, and whose command was the last sixteen
+// bytes of the real one. OwnerID is the session-admission grouping key every
+// replica must agree on, and the command goes to the state machine, so the
+// accepted-and-wrong outcome is worse than any rejection.
 func TestA04xDirectoryIsRefusedByRecordNotByVersion(t *testing.T) {
 	const legacyWALFormatVersion uint32 = 1
 

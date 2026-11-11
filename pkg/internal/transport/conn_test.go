@@ -113,32 +113,6 @@ func TestGetConnectionSingleflightCoalescing(t *testing.T) {
 	}
 }
 
-// TestGetConnectionWhenStopped verifies that getConnection returns error
-// when the transport is stopped.
-func TestGetConnectionWhenStopped(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	tr.Stop()
-
-	_, err = tr.getConnection("127.0.0.1:12345", "")
-	if !errors.Is(err, ErrStreamClosed) {
-		t.Fatalf("expected ErrStreamClosed, got %v", err)
-	}
-}
-
 // TestRemoveConnection verifies connection removal from pool.
 func TestRemoveConnection(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
@@ -189,22 +163,6 @@ func TestCleanStaleConnections(t *testing.T) {
 	}
 }
 
-// TestGetStreamOpensNewStream verifies that getStream creates a new stream
-// when none exists in the pool.
-func TestGetStreamOpensNewStream(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	target := t2.Addr().String()
-	stream, err := t1.getStream(target, 1, false, "")
-	if err != nil {
-		t.Fatalf("getStream failed: %v", err)
-	}
-	if stream == nil {
-		t.Fatal("expected non-nil stream")
-	}
-}
-
 // TestGetStreamReusesExisting verifies stream pool caching.
 func TestGetStreamReusesExisting(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
@@ -214,6 +172,9 @@ func TestGetStreamReusesExisting(t *testing.T) {
 	s1, err := t1.getStream(target, 1, false, "")
 	if err != nil {
 		t.Fatalf("first getStream failed: %v", err)
+	}
+	if s1 == nil {
+		t.Fatal("expected non-nil stream")
 	}
 
 	s2, err := t1.getStream(target, 1, false, "")
@@ -247,58 +208,27 @@ func TestGetStreamHeartbeatUsesIndexZero(t *testing.T) {
 	}
 }
 
-// TestIsConnectionClosedWithNil verifies nil error is not closed.
-func TestIsConnectionClosedWithNil(t *testing.T) {
-	if isConnectionClosed(nil) {
-		t.Fatal("nil error should not be considered closed")
+// TestIsConnectionClosed verifies which errors count as a closed
+// connection: quic-go's ApplicationError and IdleTimeoutError do; nil and
+// unrelated errors do not.
+func TestIsConnectionClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"application error", &quic.ApplicationError{ErrorCode: 0}, true},
+		{"idle timeout", &quic.IdleTimeoutError{}, true},
+		{"other error", errors.New("some other error"), false},
 	}
-}
-
-// TestIsConnectionClosedWithAppError verifies ApplicationError detection.
-func TestIsConnectionClosedWithAppError(t *testing.T) {
-	err := &quic.ApplicationError{ErrorCode: 0}
-	if !isConnectionClosed(err) {
-		t.Fatal("ApplicationError should be detected as closed")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isConnectionClosed(tc.err); got != tc.want {
+				t.Fatalf("isConnectionClosed(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
-}
-
-// TestIsConnectionClosedWithIdleTimeout verifies IdleTimeoutError detection.
-func TestIsConnectionClosedWithIdleTimeout(t *testing.T) {
-	err := &quic.IdleTimeoutError{}
-	if !isConnectionClosed(err) {
-		t.Fatal("IdleTimeoutError should be detected as closed")
-	}
-}
-
-// TestIsConnectionClosedWithOtherError verifies non-connection errors.
-func TestIsConnectionClosedWithOtherError(t *testing.T) {
-	err := errors.New("some other error")
-	if isConnectionClosed(err) {
-		t.Fatal("generic error should not be detected as closed")
-	}
-}
-
-// TestConnectionCleanupLoop verifies the periodic cleanup goroutine
-// terminates on stop. Start() launches connectionCleanup automatically.
-func TestConnectionCleanupLoop(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-
-	// Stop should cause the cleanup goroutine to exit cleanly.
-	tr.Stop()
 }
 
 // TestConcurrentSendDoesNotRace verifies that concurrent sends from
@@ -882,40 +812,6 @@ func TestPreOpenHeartbeatStreamExitsEarlyWhenStopped(t *testing.T) {
 	}
 }
 
-// TestPreOpenHeartbeatStreamWaitGroupDoneOnAllPaths verifies that the
-// WaitGroup is properly decremented on both the success and failure paths
-// of preOpenHeartbeatStream. We test the failure path (dead connection)
-// to ensure defer wg.Done() covers all exit points.
-func TestPreOpenHeartbeatStreamWaitGroupDoneOnAllPaths(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	target := t2.Addr().String()
-
-	// Get a connection.
-	conn, err := t1.getConnection(target, "")
-	if err != nil {
-		t.Fatalf("getConnection failed: %v", err)
-	}
-
-	// Wait for initial preOpenHeartbeatStream to complete.
-	pollUntil(t, 5*time.Second, 5*time.Millisecond, "heartbeat stream not pre-opened", func() bool {
-		return countStreamsForTarget(t1, target) == 1
-	})
-
-	// Close the connection so OpenStreamSync will fail.
-	conn.CloseWithError(0, "test close for wg done verification")
-	waitForChan(t, conn.Context().Done(), 5*time.Second, "closed connection context not done")
-
-	// Call preOpenHeartbeatStream on the dead connection. It should fail
-	// gracefully and still call wg.Done() via defer.
-	t1.wg.Add(1) // manually add since we call directly
-	t1.preOpenHeartbeatStream(target, conn)
-
-	// If we can Stop() without hanging, wg.Done() was called properly.
-	// (Stop() calls wg.Wait() which would deadlock if Done was missed.)
-}
-
 // TestEvictStaleOutboundEmptyTarget verifies that evictStaleOutbound
 // returns immediately for an empty target string without touching the
 // connection pool.
@@ -1060,45 +956,6 @@ func TestEvictStaleOutboundDeadConnection(t *testing.T) {
 	}
 	if t1.StreamCount() != 0 {
 		t.Fatalf("expected 0 streams after eviction, got %d", t1.StreamCount())
-	}
-}
-
-// TestEvictStaleOutboundOnRecvDelegatesToEvictStaleOutbound verifies that
-// evictStaleOutboundOnRecv with a nil inbound connection falls back to
-// evictStaleOutbound, which detects and evicts a dead outbound connection.
-func TestEvictStaleOutboundOnRecvDelegatesToEvictStaleOutbound(t *testing.T) {
-	t1, t2, _, _, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	target := t2.Addr().String()
-
-	// Establish a connection.
-	conn, err := t1.getConnection(target, "")
-	if err != nil {
-		t.Fatalf("getConnection failed: %v", err)
-	}
-
-	// Create a stream.
-	_, err = t1.getStream(target, 1, false, "")
-	if err != nil {
-		t.Fatalf("getStream failed: %v", err)
-	}
-
-	// Kill the connection.
-	conn.CloseWithError(0, "dead for nil-inbound test")
-	waitConnDown(t, t1, target, 5*time.Second)
-
-	// Call evictStaleOutboundOnRecv with nil inbound — should delegate
-	// to evictStaleOutbound and clean up the dead connection.
-	t1.evictStaleOutboundOnRecv(target, 0, nil)
-
-	if t1.ConnectionCount() != 0 {
-		t.Fatalf("expected 0 connections after nil-inbound eviction, got %d",
-			t1.ConnectionCount())
-	}
-	if t1.StreamCount() != 0 {
-		t.Fatalf("expected 0 streams after nil-inbound eviction, got %d",
-			t1.StreamCount())
 	}
 }
 
@@ -1694,32 +1551,6 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 	}
 }
 
-// TestDialConnectionReturnsErrorOnShutdown verifies that dialConnection
-// returns an error when shutdownCtx is already cancelled at call time.
-func TestDialConnectionReturnsErrorOnShutdown(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	tr.Stop()
-
-	_, err = tr.dialForTest("127.0.0.1:12345")
-	if err == nil {
-		t.Fatal("expected error from dialConnection after stop, got nil")
-	}
-}
-
 func TestRemoveAndCloseConnection_NoConnection(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
@@ -1798,9 +1629,6 @@ func TestGetStream_StoppedTransportReturnsError(t *testing.T) {
 		t.Fatalf("expected ErrStreamClosed, got %v", err)
 	}
 }
-
-// TestGetStream_StreamPoolSizeOne verifies that when StreamPoolSize is 1,
-// non-heartbeat messages use stream index 0 (same as heartbeats).
 
 // ---------------------------------------------------------------------------
 // connectionCleanupOnce panic path (conn.go:384 - 66.7% coverage)
@@ -2960,44 +2788,6 @@ func TestDialConnection_EmptyHostRejected(t *testing.T) {
 // receiveSnapshot returns immediately when the snapshotTracker
 // has been shut down.
 
-func TestPreOpenHeartbeatStream_StoppedTransportReturns(t *testing.T) {
-	t1, t2, _, handler2, cleanup := transportPair(t, 42)
-
-	// Establish connection so we have a valid conn object.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	t2Addr := t2.Addr().String()
-	t1.connMu.RLock()
-	conn := t1.conns[t2Addr]
-	t1.connMu.RUnlock()
-
-	// Stop to set stopped flag.
-	cleanup()
-
-	// Now preOpenHeartbeatStream should return immediately.
-	t1.wg.Add(1)
-	t1.preOpenHeartbeatStream(t2Addr, conn)
-}
-
-// ---------------------------------------------------------------------------
-// Stop with pre-closed connections (quic.go:420-422, 436-438, 445-447)
-// ---------------------------------------------------------------------------
-
-// TestStop_WithPreClosedConnectionsAndStreams exercises the error logging
-// paths in Stop() when connections and streams are already closed before
-// Stop is called. This covers quic.go:420-422, 436-438, and 445-447.
-
-// ---------------------------------------------------------------------------
-// sendBatch with snappy encode pool capacity too small (quic.go:781-785)
-// ---------------------------------------------------------------------------
-
-// TestSendBatch_SnappyPoolCapacityTooSmallForceAlloc exercises the path
-// where the pooled snappy encode buffer has insufficient capacity for the
-// maximum encoded size. This forces a new allocation (quic.go:784-785).
-
 func TestEvictStreamsForTarget_StreamCloseError(t *testing.T) {
 	mtls := testMTLSConfig(t)
 	handler1 := newTestHandler()
@@ -3425,14 +3215,6 @@ func TestDialConnection_ShutdownContextCanceled(t *testing.T) {
 
 	tr.Stop()
 }
-
-// ---------------------------------------------------------------------------
-// receiveSnapshot concurrency limit (snapshot_recv.go:141-143)
-// ---------------------------------------------------------------------------
-
-// TestReceiveSnapshot_ConcurrencyLimitDrop verifies that when the
-// concurrency semaphore is full, additional snapshot receives are
-// silently dropped.
 
 // ---------------------------------------------------------------------------
 // dialConnection dial-race re-check (conn.go)

@@ -888,6 +888,9 @@ func TestNodeHostConstructionError_WithReason(t *testing.T) {
 	if !strings.Contains(msg, "bad config") {
 		t.Fatalf("error doesn't contain reason: %s", msg)
 	}
+	if e.Unwrap() != nil {
+		t.Fatal("expected nil from Unwrap without an underlying error")
+	}
 }
 
 func TestNodeHostConstructionError_WithUnderlying(t *testing.T) {
@@ -899,13 +902,6 @@ func TestNodeHostConstructionError_WithUnderlying(t *testing.T) {
 	msg := e.Error()
 	if !strings.Contains(msg, "underlying") {
 		t.Fatalf("error doesn't contain underlying message: %s", msg)
-	}
-}
-
-func TestNodeHostConstructionError_NilUnderlying(t *testing.T) {
-	e := &NodeHostConstructionError{Reason: "no inner"}
-	if e.Unwrap() != nil {
-		t.Fatal("expected nil from Unwrap")
 	}
 }
 
@@ -1082,35 +1078,32 @@ func TestNodeHost_RequestSnapshot_InvalidShard(t *testing.T) {
 // Async membership operations with invalid shard
 // ---------------------------------------------------------------------------
 
-func TestNodeHost_RequestAddReplica_InvalidShard(t *testing.T) {
+func TestNodeHost_MembershipChange_InvalidShard(t *testing.T) {
 	nh := newTestNodeHost(t)
-	_, err := nh.RequestAddReplica(999, 2, "addr", 0, time.Second)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
+	async := func(f func() (*RequestState, error)) func(context.Context) error {
+		return func(context.Context) error { _, err := f(); return err }
 	}
-}
-
-func TestNodeHost_RequestDeleteReplica_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	_, err := nh.RequestDeleteReplica(999, 2, 0, time.Second)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
+	tests := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{"RequestAddReplica", async(func() (*RequestState, error) { return nh.RequestAddReplica(999, 2, "addr", 0, time.Second) })},
+		{"RequestDeleteReplica", async(func() (*RequestState, error) { return nh.RequestDeleteReplica(999, 2, 0, time.Second) })},
+		{"RequestAddNonVoting", async(func() (*RequestState, error) { return nh.RequestAddNonVoting(999, 2, "addr", 0, time.Second) })},
+		{"RequestAddWitness", async(func() (*RequestState, error) { return nh.RequestAddWitness(999, 2, "addr", 0, time.Second) })},
+		{"SyncRequestAddReplica", func(ctx context.Context) error { return nh.SyncRequestAddReplica(ctx, 999, 2, "addr", 0) }},
+		{"SyncRequestDeleteReplica", func(ctx context.Context) error { return nh.SyncRequestDeleteReplica(ctx, 999, 2, 0) }},
+		{"SyncRequestAddNonVoting", func(ctx context.Context) error { return nh.SyncRequestAddNonVoting(ctx, 999, 2, "addr", 0) }},
+		{"SyncRequestAddWitness", func(ctx context.Context) error { return nh.SyncRequestAddWitness(ctx, 999, 2, "addr", 0) }},
 	}
-}
-
-func TestNodeHost_RequestAddNonVoting_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	_, err := nh.RequestAddNonVoting(999, 2, "addr", 0, time.Second)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
-	}
-}
-
-func TestNodeHost_RequestAddWitness_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	_, err := nh.RequestAddWitness(999, 2, "addr", 0, time.Second)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := tt.call(ctx); err == nil {
+				t.Error("expected error for non-existent shard")
+			}
+		})
 	}
 }
 
@@ -1118,64 +1111,9 @@ func TestNodeHost_RequestAddWitness_InvalidShard(t *testing.T) {
 // Sync membership operations with invalid shard
 // ---------------------------------------------------------------------------
 
-func TestNodeHost_SyncRequestAddReplica_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err := nh.SyncRequestAddReplica(ctx, 999, 2, "addr", 0)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
-	}
-}
-
-func TestNodeHost_SyncRequestDeleteReplica_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err := nh.SyncRequestDeleteReplica(ctx, 999, 2, 0)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
-	}
-}
-
-func TestNodeHost_SyncRequestAddNonVoting_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err := nh.SyncRequestAddNonVoting(ctx, 999, 2, "addr", 0)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
-	}
-}
-
-func TestNodeHost_SyncRequestAddWitness_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	err := nh.SyncRequestAddWitness(ctx, 999, 2, "addr", 0)
-	if err == nil {
-		t.Error("expected error for non-existent shard")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // ReadLocalNode edge cases
 // ---------------------------------------------------------------------------
-
-func TestNodeHost_ReadLocalNode_NilResultC(t *testing.T) {
-	nh := newTestNodeHost(t)
-	// A RequestState with no delivered completion must be rejected:
-	// serving the query without a resolved ReadIndex would violate
-	// linearizability.
-	rs := &RequestState{}
-	_, err := nh.ReadLocalNode(rs, nil)
-	if err == nil {
-		t.Error("expected error for unresolved RequestState")
-	}
-	if !errors.Is(err, ErrInvalidOperation) {
-		t.Errorf("expected ErrInvalidOperation, got %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // ProposeSession / SyncGetSession / SyncCloseSession error paths
@@ -1827,15 +1765,6 @@ func TestNodeHost_ProposeSession_Success(t *testing.T) {
 	}
 }
 
-func TestNodeHost_ProposeSession_InvalidShard(t *testing.T) {
-	nh := newTestNodeHost(t)
-	session := nh.GetNoOPSession(999)
-	_, err := nh.ProposeSession(session, time.Second)
-	if err == nil {
-		t.Error("expected error for non-existent shard, got nil")
-	}
-}
-
 func TestProposeSession_DoesNotRace(t *testing.T) {
 	nh := newTestNodeHost(t)
 	shardID := uint64(1)
@@ -1954,25 +1883,6 @@ func (f *fixedSource) Uint64() uint64 {
 // ---------------------------------------------------------------------------
 // ReadLocalNode success path (ReadIndex -> ReadLocalNode)
 // ---------------------------------------------------------------------------
-
-func TestNodeHost_ReadLocalNode_ClosedChannel(t *testing.T) {
-	nh := newTestNodeHost(t)
-
-	// A RequestState whose channel was closed without ever delivering a
-	// completion is an abandoned request: no completion was latched, so
-	// ReadLocalNode must refuse to serve the query.
-	ch := make(chan RequestResult)
-	close(ch)
-	rs := &RequestState{CompletedC: ch}
-
-	_, err := nh.ReadLocalNode(rs, nil)
-	if err == nil {
-		t.Error("expected error for abandoned request")
-	}
-	if !errors.Is(err, ErrInvalidOperation) {
-		t.Errorf("expected ErrInvalidOperation, got %v", err)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // RequestCompaction success path
@@ -2267,6 +2177,11 @@ func TestNodeHost_QueryRaftLog_SuccessWithEntries(t *testing.T) {
 		if len(entries) == 0 {
 			t.Error("expected at least one entry from QueryRaftLog")
 		}
+		for _, e := range entries {
+			if e.Term == 0 {
+				t.Errorf("Entry at index %d has Term=0, expected non-zero", e.Index)
+			}
+		}
 		if lr.FirstIndex == 0 {
 			t.Error("expected non-zero FirstIndex")
 		}
@@ -2298,15 +2213,6 @@ func TestNodeHost_GetLogReader_Success(t *testing.T) {
 // WriteHealthMetrics with non-nil writer
 // ---------------------------------------------------------------------------
 
-func TestWriteHealthMetrics_NonNilWriter(t *testing.T) {
-	var buf bytes.Buffer
-	// Should be a no-op that does not panic.
-	WriteHealthMetrics(&buf)
-	if buf.Len() != 0 {
-		t.Errorf("expected empty output from no-op WriteHealthMetrics, got %d bytes", buf.Len())
-	}
-}
-
 // ---------------------------------------------------------------------------
 // NewNodeHost success path (without options)
 // ---------------------------------------------------------------------------
@@ -2337,18 +2243,6 @@ func TestNodeHost_NewNodeHostWithOptions_Success(t *testing.T) {
 	}
 	if nh.RaftAddress() == "" {
 		t.Error("expected non-empty RaftAddress")
-	}
-}
-
-func TestNodeHost_NewNodeHost_InvalidConfig(t *testing.T) {
-	nhConfig := dbConfig.NodeHostConfig{}
-	_, err := NewNodeHost(nhConfig)
-	if err == nil {
-		t.Error("expected error for invalid config")
-	}
-	var constructErr *NodeHostConstructionError
-	if !errors.As(err, &constructErr) {
-		t.Errorf("expected NodeHostConstructionError, got %T", err)
 	}
 }
 
@@ -2556,23 +2450,15 @@ func TestSnapshotOption_Validate_CompactionIndex_DescriptiveMessage(t *testing.T
 	if err == nil {
 		t.Fatal("expected error for unsupported CompactionIndex")
 	}
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Errorf("expected errors.Is(err, ErrInvalidOption) to be true, got %v", err)
+	}
 	msg := err.Error()
 	if !strings.Contains(msg, "CompactionIndex") {
 		t.Errorf("error message should mention CompactionIndex: %s", msg)
 	}
 	if !strings.Contains(msg, "CompactionOverhead") {
 		t.Errorf("error message should suggest CompactionOverhead: %s", msg)
-	}
-}
-
-func TestSnapshotOption_Validate_CompactionIndex_StillMatchesErrInvalidOption(t *testing.T) {
-	opt := SnapshotOption{OverrideCompactionOverhead: true, CompactionIndex: 50}
-	err := opt.Validate()
-	if err == nil {
-		t.Fatal("expected error for unsupported CompactionIndex")
-	}
-	if !errors.Is(err, ErrInvalidOption) {
-		t.Errorf("expected errors.Is(err, ErrInvalidOption) to be true, got %v", err)
 	}
 }
 
@@ -2611,85 +2497,6 @@ func TestNodeHost_Propose_Async_ContextNotCanceledPrematurely(t *testing.T) {
 	rs.Release()
 }
 
-// ---------------------------------------------------------------------------
-// Entry Term field in QueryRaftLog
-// ---------------------------------------------------------------------------
-
-func TestNodeHost_QueryRaftLog_EntryTermField(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Propose a few entries so there is data in the log.
-	session := nh.GetNoOPSession(shardID)
-	for i := 0; i < 3; i++ {
-		_, propErr := nh.SyncPropose(ctx, session, []byte("entry"))
-		if propErr != nil {
-			t.Fatalf("SyncPropose: %v", propErr)
-		}
-	}
-
-	// QueryRaftLog may or may not return entries depending on log state,
-	// but if entries are returned, they should have non-zero Term.
-	rs, err := nh.QueryRaftLog(shardID, 1, 100, 1024*1024)
-	if err != nil {
-		// Error is acceptable if log entries are unavailable.
-		return
-	}
-	defer rs.Release()
-
-	resultC := rs.ResultC()
-	if resultC == nil {
-		return
-	}
-
-	select {
-	case result := <-resultC:
-		entries, _ := result.RaftLogs()
-		for _, e := range entries {
-			if e.Term == 0 {
-				t.Errorf("Entry at index %d has Term=0, expected non-zero", e.Index)
-			}
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out reading QueryRaftLog result")
-	}
-}
-
-func TestNodeHost_GetLeaderID_ConsistentLeaderIDAndTerm(t *testing.T) {
-	nh := newTestNodeHost(t)
-	shardID := uint64(1)
-	replicaID := uint64(1)
-	startTestShard(t, nh, shardID, replicaID)
-
-	// The adapter's GetLeaderID now uses LeaderIDAndTerm internally,
-	// so leaderID and term are read from the same nodeState atomically.
-	leaderID, term, valid, err := nh.GetLeaderID(shardID)
-	if err != nil {
-		t.Fatalf("GetLeaderID: %v", err)
-	}
-	if !valid {
-		t.Error("expected valid=true after leader election")
-	}
-	if leaderID == 0 {
-		t.Error("expected non-zero leaderID")
-	}
-	if term == 0 {
-		t.Error("expected non-zero term when leader is valid")
-	}
-
-	// Verify consistency: if valid, both leaderID and term must be non-zero.
-	// A TOCTOU bug would occasionally return term=0 with a valid leaderID
-	// or vice-versa when leadership changes between two separate calls.
-	if valid && leaderID != 0 && term == 0 {
-		t.Error("inconsistent: valid leader with zero term indicates TOCTOU race")
-	}
-}
-
 func TestNodeHost_GetLeaderID_InvalidShard_ReturnsError(t *testing.T) {
 	nh := newTestNodeHost(t)
 	leaderID, term, valid, err := nh.GetLeaderID(999)
@@ -2717,26 +2524,41 @@ func TestReadLocalNode_UnresolvedFailsFast(t *testing.T) {
 	replicaID := uint64(1)
 	startTestShard(t, nh, shardID, replicaID)
 
+	closed := make(chan RequestResult)
+	close(closed)
+
 	// ReadLocalNode must never block waiting for the ReadIndex: per the
 	// dragonboat contract the caller drains ResultC first, so a second
 	// receive inside ReadLocalNode would deadlock the canonical caller
-	// pattern. An unresolved RequestState is rejected immediately.
-	ch := make(chan RequestResult, 1)
-	rs := &RequestState{CompletedC: ch, shardID: shardID}
+	// pattern. A RequestState with no latched completion is rejected
+	// immediately: serving the query without a resolved ReadIndex would
+	// violate linearizability.
+	tests := []struct {
+		name string
+		rs   *RequestState
+	}{
+		{"NoChannel", &RequestState{}},
+		// Closed without delivering a completion: an abandoned request.
+		{"ClosedChannel", &RequestState{CompletedC: closed}},
+		{"PendingChannel", &RequestState{CompletedC: make(chan RequestResult, 1), shardID: shardID}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			done := make(chan error, 1)
+			go func() {
+				_, err := nh.ReadLocalNode(tt.rs, nil)
+				done <- err
+			}()
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := nh.ReadLocalNode(rs, nil)
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		if !errors.Is(err, ErrInvalidOperation) {
-			t.Fatalf("expected ErrInvalidOperation for unresolved ReadIndex, got %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("ReadLocalNode blocked on an unresolved RequestState")
+			select {
+			case err := <-done:
+				if !errors.Is(err, ErrInvalidOperation) {
+					t.Fatalf("expected ErrInvalidOperation for unresolved ReadIndex, got %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("ReadLocalNode blocked on an unresolved RequestState")
+			}
+		})
 	}
 }
 

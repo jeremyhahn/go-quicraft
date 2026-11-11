@@ -537,6 +537,9 @@ func TestPeer_Handle_InstallSnapshot_Success(t *testing.T) {
 	if p.r.log.committed != 10 {
 		t.Fatalf("expected committed 10, got %d", p.r.log.committed)
 	}
+	if !p.hasPendingSnapshot {
+		t.Fatal("expected hasPendingSnapshot to be true after accepted InstallSnapshot")
+	}
 }
 
 func TestPeer_Handle_InstallSnapshot_BehindCommit(t *testing.T) {
@@ -573,6 +576,9 @@ func TestPeer_Handle_InstallSnapshot_BehindCommit(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected ReplicateResp with LogIndex=20 for rejected snapshot")
+	}
+	if p.hasPendingSnapshot {
+		t.Fatal("expected hasPendingSnapshot to be false after rejected InstallSnapshot")
 	}
 }
 
@@ -1493,21 +1499,6 @@ func TestPeer_IsWitness_True(t *testing.T) {
 
 // --- GetMembership ---
 
-func TestPeer_GetMembership_ReturnsCopy(t *testing.T) {
-	ms := proto.Membership{
-		Addresses: map[uint64]string{1: "addr1", 2: "addr2"},
-	}
-	p := newTestPeer(t, testConfig(), proto.State{}, ms)
-
-	result := p.GetMembership()
-	result.Addresses[1] = "mutated"
-
-	// Original should be unchanged.
-	if p.membership.addresses[1] != "addr1" {
-		t.Fatal("GetMembership should return a deep copy")
-	}
-}
-
 func TestPeer_GetMembership_ReflectsMutations(t *testing.T) {
 	cfg := testConfig()
 	ms := singleNodeMembership()
@@ -1544,31 +1535,28 @@ func TestPeer_GetMembership_ReflectsMutations(t *testing.T) {
 
 // --- hasStateChanged ---
 
-func TestPeer_HasStateChanged_VoteChanged(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.r.vote = 2
-
-	if !p.hasStateChanged() {
-		t.Fatal("expected state changed when vote differs")
+func TestPeer_HasStateChanged(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(p *Peer)
+		want   bool
+	}{
+		// After newTestPeer, prevState matches raft's hard state.
+		{name: "no change", mutate: func(*Peer) {}, want: false},
+		{name: "vote changed", mutate: func(p *Peer) { p.r.vote = 2 }, want: true},
+		{name: "commit changed", mutate: func(p *Peer) {
+			p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 1}})
+			p.r.log.committed = 1
+		}, want: true},
 	}
-}
-
-func TestPeer_HasStateChanged_CommitChanged(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	p.r.log.inmem.merge([]proto.Entry{{Index: 1, Term: 1}})
-	p.r.log.committed = 1
-
-	if !p.hasStateChanged() {
-		t.Fatal("expected state changed when commit differs")
-	}
-}
-
-func TestPeer_HasStateChanged_NoChange(t *testing.T) {
-	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
-	// After newTestPeer, prevState matches raft's hard state.
-
-	if p.hasStateChanged() {
-		t.Fatal("expected no state change")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
+			tc.mutate(p)
+			if got := p.hasStateChanged(); got != tc.want {
+				t.Fatalf("hasStateChanged() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -1862,6 +1850,9 @@ func TestPeer_Tick_FollowerStartsElection(t *testing.T) {
 	if voteReqCount == 0 {
 		t.Fatal("expected RequestVote messages after election timeout")
 	}
+	if p.r.state != candidate {
+		t.Fatalf("expected candidate after election timeout, got %s", p.r.state)
+	}
 }
 
 func TestPeer_Tick_FollowerStartsPreVoteElection(t *testing.T) {
@@ -1884,6 +1875,9 @@ func TestPeer_Tick_FollowerStartsPreVoteElection(t *testing.T) {
 	}
 	if preVoteCount == 0 {
 		t.Fatal("expected RequestPreVote messages after election timeout")
+	}
+	if p.r.state != preCandidate {
+		t.Fatalf("expected preCandidate after election timeout with PreVote, got %s", p.r.state)
 	}
 }
 
@@ -1939,8 +1933,8 @@ func TestPeer_MultiNodeElection_VoteRejectionsLeadToFollower(t *testing.T) {
 	})
 
 	// Should revert to follower.
-	if p.IsLeader() {
-		t.Fatal("expected to be follower after vote rejections")
+	if p.r.state != follower {
+		t.Fatalf("expected follower after majority rejection, got %s", p.r.state)
 	}
 }
 
@@ -2821,9 +2815,13 @@ func TestPeer_GetMembership_ReadsFromAtomicSnapshot(t *testing.T) {
 
 	// Mutating the returned proto should not affect the peer's snapshot.
 	m.Addresses[999] = "mutated"
+	m.Addresses[1] = "mutated"
 	m2 := p.GetMembership()
 	if _, ok := m2.Addresses[999]; ok {
 		t.Fatal("GetMembership should return a deep copy")
+	}
+	if m2.Addresses[1] != ms.Addresses[1] || p.membership.addresses[1] != ms.Addresses[1] {
+		t.Fatal("GetMembership should return a deep copy: existing address was mutated")
 	}
 }
 
@@ -4193,6 +4191,9 @@ func TestPeer_RateLimited_FalseWhenDisabled(t *testing.T) {
 	if p.RateLimited() {
 		t.Error("expected RateLimited to be false when rate limiting is disabled")
 	}
+	if p.RateLimiter() != nil {
+		t.Error("expected RateLimiter to return nil when rate limiting is disabled")
+	}
 }
 
 func TestPeer_RateLimited_TrueWhenOverLimit(t *testing.T) {
@@ -4223,18 +4224,6 @@ func TestPeer_RateLimited_TrueWhenOverLimit(t *testing.T) {
 // ---------------------------------------------------------------------------
 // RateLimiter tests
 // ---------------------------------------------------------------------------
-
-func TestPeer_RateLimiter_ReturnsNilWhenDisabled(t *testing.T) {
-	cfg := testConfig()
-	// MaxInMemLogSize = 0 by default, rate limiting disabled.
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
-
-	rl := p.RateLimiter()
-
-	if rl != nil {
-		t.Error("expected RateLimiter to return nil when rate limiting is disabled")
-	}
-}
 
 // --- Raft Specification Compliance Tests ---
 

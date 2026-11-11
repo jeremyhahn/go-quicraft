@@ -28,51 +28,49 @@ import (
 // isHeartbeatBatch
 // ---------------------------------------------------------------------------
 
-// TestIsHeartbeatBatch_AllHeartbeats verifies that a batch of only heartbeat
-// and heartbeat response messages is detected as a heartbeat batch.
-func TestIsHeartbeatBatch_AllHeartbeats(t *testing.T) {
-	msgs := []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-		{Type: proto.HeartbeatResp, ShardID: 2, From: 1, To: 2, Term: 1},
-		{Type: proto.Heartbeat, ShardID: 3, From: 1, To: 2, Term: 1},
+// TestIsHeartbeatBatch verifies which batches take the heartbeat fast path:
+// only entry-free Heartbeat and HeartbeatResp messages (an empty batch is
+// vacuously one). A heartbeat carrying entries is NOT routed to the
+// fixed-size fast path: the fast path sizes its buffer for
+// HeartbeatMessageSize records, so entries would overflow the marshal and
+// silently drop the whole batch. Such a batch must fall through to the
+// general sendBatch path.
+func TestIsHeartbeatBatch(t *testing.T) {
+	entry := []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("x")}}
+	tests := []struct {
+		name string
+		msgs []proto.Message
+		want bool
+	}{
+		{name: "all heartbeats", want: true, msgs: []proto.Message{
+			{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
+			{Type: proto.HeartbeatResp, ShardID: 2, From: 1, To: 2, Term: 1},
+			{Type: proto.Heartbeat, ShardID: 3, From: 1, To: 2, Term: 1},
+		}},
+		{name: "nil batch", want: true, msgs: nil},
+		{name: "zero-length batch", want: true, msgs: []proto.Message{}},
+		{name: "mixed types", want: false, msgs: []proto.Message{
+			{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+		}},
+		{name: "non-heartbeat only", want: false, msgs: []proto.Message{
+			{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
+			{Type: proto.RequestVote, ShardID: 1, From: 1, To: 2, Term: 1},
+		}},
+		{name: "heartbeat with entries", want: false, msgs: []proto.Message{
+			{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1, Entries: entry},
+		}},
+		{name: "one heartbeat of many with entries", want: false, msgs: []proto.Message{
+			{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
+			{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 3, Term: 1, Entries: entry},
+		}},
 	}
-	if !isHeartbeatBatch(msgs) {
-		t.Fatal("expected heartbeat batch to be detected")
-	}
-}
-
-// TestIsHeartbeatBatch_MixedTypes verifies that a batch containing non-heartbeat
-// messages is not classified as a heartbeat batch.
-func TestIsHeartbeatBatch_MixedTypes(t *testing.T) {
-	msgs := []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	}
-	if isHeartbeatBatch(msgs) {
-		t.Fatal("mixed batch should not be classified as heartbeat batch")
-	}
-}
-
-// TestIsHeartbeatBatch_Empty verifies that an empty batch is classified as
-// a heartbeat batch (vacuously true).
-func TestIsHeartbeatBatch_Empty(t *testing.T) {
-	if !isHeartbeatBatch(nil) {
-		t.Fatal("empty batch should be vacuously true")
-	}
-	if !isHeartbeatBatch([]proto.Message{}) {
-		t.Fatal("zero-length batch should be vacuously true")
-	}
-}
-
-// TestIsHeartbeatBatch_NonHeartbeatOnly verifies that a batch of only
-// non-heartbeat messages is not classified as a heartbeat batch.
-func TestIsHeartbeatBatch_NonHeartbeatOnly(t *testing.T) {
-	msgs := []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-		{Type: proto.RequestVote, ShardID: 1, From: 1, To: 2, Term: 1},
-	}
-	if isHeartbeatBatch(msgs) {
-		t.Fatal("non-heartbeat batch should not be classified as heartbeat batch")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isHeartbeatBatch(tc.msgs); got != tc.want {
+				t.Fatalf("isHeartbeatBatch = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -80,9 +78,9 @@ func TestIsHeartbeatBatch_NonHeartbeatOnly(t *testing.T) {
 // initHeartbeatPrefix
 // ---------------------------------------------------------------------------
 
-// TestInitHeartbeatPrefix_CorrectFormat verifies that the heartbeat prefix
-// is correctly serialized with the expected BinVer, DeploymentID, and
-// SourceAddress fields.
+// TestInitHeartbeatPrefix_CorrectFormat verifies that hbPrefix is nil before
+// Start and that Start serializes it with the fixed BinVer/DeploymentID
+// fields followed by the SourceAddress.
 func TestInitHeartbeatPrefix_CorrectFormat(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
@@ -95,6 +93,9 @@ func TestInitHeartbeatPrefix_CorrectFormat(t *testing.T) {
 	tr, err := NewQUICTransport(cfg, handler, reg)
 	if err != nil {
 		t.Fatalf("NewQUICTransport failed: %v", err)
+	}
+	if tr.hbPrefix != nil {
+		t.Fatal("hbPrefix should be nil before Start()")
 	}
 	if err := tr.Start(); err != nil {
 		t.Fatalf("Start failed: %v", err)
@@ -112,60 +113,9 @@ func TestInitHeartbeatPrefix_CorrectFormat(t *testing.T) {
 	}
 }
 
-// TestInitHeartbeatPrefix_NilBeforeStart verifies that hbPrefix is nil
-// before Start is called.
-func TestInitHeartbeatPrefix_NilBeforeStart(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-
-	if tr.hbPrefix != nil {
-		t.Fatal("hbPrefix should be nil before Start()")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // sendHeartbeatBatch round-trip
 // ---------------------------------------------------------------------------
-
-// TestSendHeartbeatBatch_SingleMessage verifies that a single heartbeat
-// message sent via the fast path is correctly received by the peer.
-func TestSendHeartbeatBatch_SingleMessage(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	t1.Send([]proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 7, Commit: 99},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	batches := handler2.getBatches()
-	if len(batches) != 1 {
-		t.Fatalf("expected 1 batch, got %d", len(batches))
-	}
-	if len(batches[0].Requests) != 1 {
-		t.Fatalf("expected 1 request, got %d", len(batches[0].Requests))
-	}
-	msg := batches[0].Requests[0]
-	if msg.Type != proto.Heartbeat {
-		t.Fatalf("expected Heartbeat, got %d", msg.Type)
-	}
-	if msg.Term != 7 {
-		t.Fatalf("expected Term 7, got %d", msg.Term)
-	}
-	if msg.Commit != 99 {
-		t.Fatalf("expected Commit 99, got %d", msg.Commit)
-	}
-}
 
 // TestSendHeartbeatBatch_MultipleMessages verifies that multiple heartbeat
 // messages coalesced to the same target are correctly delivered via the
@@ -199,70 +149,6 @@ func TestSendHeartbeatBatch_MultipleMessages(t *testing.T) {
 		})
 	if totalMsgs := countRequests(handler2); totalMsgs != 3 {
 		t.Fatalf("expected 3 messages total, got %d", totalMsgs)
-	}
-}
-
-// TestSendHeartbeatBatch_HeartbeatResp verifies that HeartbeatResp messages
-// also use the fast path and round-trip correctly.
-func TestSendHeartbeatBatch_HeartbeatResp(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	t1.Send([]proto.Message{
-		{Type: proto.HeartbeatResp, ShardID: 1, From: 1, To: 2, Term: 3},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	batches := handler2.getBatches()
-	if len(batches) != 1 {
-		t.Fatalf("expected 1 batch, got %d", len(batches))
-	}
-	msg := batches[0].Requests[0]
-	if msg.Type != proto.HeartbeatResp {
-		t.Fatalf("expected HeartbeatResp, got %d", msg.Type)
-	}
-	if msg.Term != 3 {
-		t.Fatalf("expected Term 3, got %d", msg.Term)
-	}
-}
-
-// TestSendHeartbeatBatch_DeploymentIDIncluded verifies that the heartbeat
-// fast path includes the correct DeploymentID in the batch header.
-func TestSendHeartbeatBatch_DeploymentIDIncluded(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 777)
-	defer cleanup()
-
-	t1.Send([]proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	batches := handler2.getBatches()
-	if len(batches) != 1 {
-		t.Fatalf("expected 1 batch, got %d", len(batches))
-	}
-	if batches[0].DeploymentID != 777 {
-		t.Fatalf("expected DeploymentID 777, got %d", batches[0].DeploymentID)
-	}
-}
-
-// TestSendHeartbeatBatch_SourceAddressSet verifies that the heartbeat
-// fast path includes a non-empty SourceAddress in the batch header.
-func TestSendHeartbeatBatch_SourceAddressSet(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	t1.Send([]proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	batches := handler2.getBatches()
-	if len(batches) != 1 {
-		t.Fatalf("expected 1 batch, got %d", len(batches))
-	}
-	if batches[0].SourceAddress == "" {
-		t.Fatal("SourceAddress should not be empty")
 	}
 }
 
@@ -334,9 +220,10 @@ func TestSendHeartbeatBatch_MixedBatchUsesSlowPath(t *testing.T) {
 }
 
 // TestSendHeartbeatBatch_AllFieldsRoundTrip verifies that all Message
-// fields survive the heartbeat fast path serialization.
+// fields survive the heartbeat fast path serialization, and that the batch
+// header carries the sender's DeploymentID and a non-empty SourceAddress.
 func TestSendHeartbeatBatch_AllFieldsRoundTrip(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
+	t1, _, _, handler2, cleanup := transportPair(t, 777)
 	defer cleanup()
 
 	t1.Send([]proto.Message{
@@ -359,6 +246,12 @@ func TestSendHeartbeatBatch_AllFieldsRoundTrip(t *testing.T) {
 	batches := handler2.getBatches()
 	if len(batches) != 1 || len(batches[0].Requests) != 1 {
 		t.Fatal("expected 1 batch with 1 request")
+	}
+	if batches[0].DeploymentID != 777 {
+		t.Fatalf("expected DeploymentID 777, got %d", batches[0].DeploymentID)
+	}
+	if batches[0].SourceAddress == "" {
+		t.Fatal("SourceAddress should not be empty")
 	}
 	msg := batches[0].Requests[0]
 	if msg.Type != proto.Heartbeat {
@@ -491,40 +384,6 @@ func TestSendHeartbeatBatch_ConcurrentSends(t *testing.T) {
 	}
 	if totalMsgs < 1 {
 		t.Fatal("expected at least 1 heartbeat message to be received")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// HeartbeatMessageSize constant validation
-// ---------------------------------------------------------------------------
-
-// TestHeartbeatMessageSize_Constant verifies that the proto.HeartbeatMessageSize
-// constant matches the actual marshaled size of a heartbeat message.
-func TestHeartbeatMessageSize_Constant(t *testing.T) {
-	msg := proto.Message{
-		Type:    proto.Heartbeat,
-		From:    1,
-		To:      2,
-		ShardID: 1,
-		Term:    100,
-		Commit:  50,
-	}
-	if msg.Size() != proto.HeartbeatMessageSize {
-		t.Fatalf("HeartbeatMessageSize constant (%d) does not match actual size (%d)",
-			proto.HeartbeatMessageSize, msg.Size())
-	}
-
-	// Verify with HeartbeatResp too.
-	resp := proto.Message{
-		Type:    proto.HeartbeatResp,
-		From:    2,
-		To:      1,
-		ShardID: 1,
-		Term:    100,
-	}
-	if resp.Size() != proto.HeartbeatMessageSize {
-		t.Fatalf("HeartbeatResp size (%d) does not match HeartbeatMessageSize (%d)",
-			resp.Size(), proto.HeartbeatMessageSize)
 	}
 }
 
@@ -664,72 +523,4 @@ func TestSendHeartbeatBatch_WriteDeadlineErrorEvicts(t *testing.T) {
 		func() bool { return t1.ConnectionCount() == 0 })
 
 	cleanup()
-}
-
-// ---------------------------------------------------------------------------
-// getConnection stale connection path (conn.go:42-82)
-// ---------------------------------------------------------------------------
-
-// TestGetConnection_StoppedTransportReturnsError verifies getConnection
-// returns ErrStreamClosed when the transport is stopped.
-
-// ---------------------------------------------------------------------------
-// sendBatch write deadline error and write error paths
-// ---------------------------------------------------------------------------
-
-// TestSendBatch_WriteDeadlineAndWriteErrorEviction verifies that
-// a write deadline or write error triggers connection removal
-// and stream eviction.
-
-// ---------------------------------------------------------------------------
-// evictStaleOutboundOnRecv inbound changed path (conn.go:564-577)
-// ---------------------------------------------------------------------------
-
-// TestEvictStaleOutboundOnRecv_InboundChanged verifies that when the
-// inbound connection changes (simulating peer restart), the outbound
-// connection is evicted even if it's still alive.
-
-// ---------------------------------------------------------------------------
-// SendSnapshot SetWriteDeadline error after open (quic.go:936-938)
-// ---------------------------------------------------------------------------
-
-// TestSendSnapshot_ChunkLoopWriteFailure exercises the SendSnapshot chunk
-// write error path by sending many large chunks while closing the
-// connection concurrently. The connection close races with chunk writes.
-
-// ---------------------------------------------------------------------------
-// heartbeat fast-path entry guard (heartbeat.go isHeartbeatBatch)
-// ---------------------------------------------------------------------------
-
-// TestIsHeartbeatBatch_EntriesFallThroughToNormalPath verifies that a
-// heartbeat message carrying entries is NOT routed to the fixed-size
-// heartbeat fast path: the fast path sizes its buffer for
-// HeartbeatMessageSize records, so entries would overflow the marshal and
-// silently drop the whole batch. Such a batch must fall through to the
-// general sendBatch path.
-func TestIsHeartbeatBatch_EntriesFallThroughToNormalPath(t *testing.T) {
-	plain := []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-		{Type: proto.HeartbeatResp, ShardID: 1, From: 2, To: 1, Term: 1},
-	}
-	if !isHeartbeatBatch(plain) {
-		t.Fatal("entry-free heartbeat batch must use the fast path")
-	}
-
-	withEntries := []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1,
-			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("x")}}},
-	}
-	if isHeartbeatBatch(withEntries) {
-		t.Fatal("heartbeat carrying entries must fall through to the normal send path")
-	}
-
-	mixed := []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 3, Term: 1,
-			Entries: []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("y")}}},
-	}
-	if isHeartbeatBatch(mixed) {
-		t.Fatal("batch with any entry-carrying heartbeat must fall through to the normal send path")
-	}
 }

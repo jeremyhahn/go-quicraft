@@ -144,6 +144,24 @@ func TestTypedErrorSentinelMatching(t *testing.T) {
 			not:  []error{ErrCRLNotYetValid},
 		},
 		{
+			name: "revoked certificate",
+			err:  &CertificateRevokedError{Serial: "abc"},
+			is:   []error{ErrCertificateRevoked},
+			not:  []error{ErrOCSPUnavailable},
+		},
+		{
+			name: "OCSP unavailable",
+			err:  &OCSPUnavailableError{URL: "http://example.com", Err: errors.New("connection refused")},
+			is:   []error{ErrOCSPUnavailable},
+			not:  []error{ErrCertificateRevoked},
+		},
+		{
+			name: "CRL parse failure",
+			err:  &CRLParseError{Path: "/x", Err: errors.New("asn1 decode")},
+			is:   []error{ErrInvalidCRL},
+			not:  []error{ErrOCSPUnavailable},
+		},
+		{
 			name: "stale OCSP response",
 			err:  &OCSPResponseStaleError{Reason: "r"},
 			is:   []error{ErrOCSPResponseStale},
@@ -175,6 +193,16 @@ func TestWrappedErrorUnwrapChains(t *testing.T) {
 	readErr := &CRLReadError{Path: "/etc/pki/gone.crl", Err: os.ErrNotExist}
 	if !errors.Is(readErr, os.ErrNotExist) {
 		t.Fatal("CRLReadError must unwrap to its I/O cause")
+	}
+
+	netErr := errors.New("connection refused")
+	if !errors.Is(&OCSPUnavailableError{URL: "http://example.com", Err: netErr}, netErr) {
+		t.Fatal("OCSPUnavailableError must unwrap to its transport cause")
+	}
+
+	asnErr := errors.New("asn1 decode")
+	if !errors.Is(&CRLParseError{Path: "/x", Err: asnErr}, asnErr) {
+		t.Fatal("CRLParseError must unwrap to its parse cause")
 	}
 
 	sigErr := &CRLSignatureError{Path: "/etc/pki/x.crl", Err: ErrNoIssuerCertificate}

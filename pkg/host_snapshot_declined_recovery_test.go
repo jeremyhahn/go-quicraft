@@ -55,7 +55,8 @@ func (r *shardFailedRecorder) reports() []config.ShardFailedInfo {
 // outcome that trips it — a failed RecoverFromSnapshot — is reported by the
 // latch itself (engine.Node.Fail in the snapshot pool, pinned by the engine's
 // TestHandleRequest_PostRestoreErrorLatches), so a report here
-// counts the same failure twice. A failed save does not latch at all.
+// counts the same failure twice. A failed save does not latch at all; that
+// path is pinned end to end by TestSnapshotSaveFailure_DoesNotReportShardFailed.
 //
 // The declined stale recovery is the case that made this visible first. The
 // engine refuses a recovery whose snapshot is not ahead of the apply frontier
@@ -105,16 +106,6 @@ func TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport(t *testing.T) {
 				"a second report counts one shard failure twice",
 		},
 		{
-			name: "failed snapshot save",
-			op:   engine.SnapshotSave,
-			err: &engine.SnapshotError{
-				ShardID: 1, ReplicaID: 2, Save: true,
-				Err: errors.New("no space left on device"),
-			},
-			why: "a failed save leaves the shard running; it is logged and " +
-				"returned to the requester instead",
-		},
-		{
 			name: "unclassified error",
 			op:   engine.SnapshotRecover,
 			err:  errors.New("disk full"),
@@ -149,11 +140,10 @@ func TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport(t *testing.T) {
 // host's routing table from the peer's membership. Doing that for a snapshot
 // nothing ever restored would announce a recovery that did not happen.
 func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotReportedAsRecovered(t *testing.T) {
-	var recovered, failed int
+	var recovered int
 	h := newTestHost(t)
 	h.cfg.EventListener = &config.EventListener{
 		OnSnapshotRecovered: func(config.SnapshotInfo) { recovered++ },
-		OnShardFailed:       func(config.ShardFailedInfo) { failed++ },
 	}
 	addTestNodeState(h, 1, 2)
 
@@ -163,9 +153,6 @@ func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotReportedAsRecovered(t *te
 	})
 	flushListeners(t, cb)
 
-	if failed != 0 {
-		t.Errorf("OnShardFailed fired %d times for a declined recovery, want 0", failed)
-	}
 	if recovered != 0 {
 		t.Errorf("OnSnapshotRecovered fired %d times for a declined recovery, want 0: "+
 			"nothing was restored, so announcing a recovery would be a false report "+

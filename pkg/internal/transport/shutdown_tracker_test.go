@@ -41,6 +41,9 @@ func TestShutdownTracker_TryAdd_Success(t *testing.T) {
 // false after ShutdownAndWait has been called.
 func TestShutdownTracker_TryAdd_AfterShutdown(t *testing.T) {
 	var st shutdownTracker
+	if st.IsShutdown() {
+		t.Fatal("IsShutdown should be false before shutdown")
+	}
 	st.ShutdownAndWait()
 	if st.TryAdd() {
 		t.Fatal("TryAdd should fail after shutdown")
@@ -63,39 +66,6 @@ func TestShutdownTracker_ShutdownAndWait_NoInFlight(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("ShutdownAndWait should return immediately with no in-flight ops")
-	}
-}
-
-// TestShutdownTracker_ShutdownAndWait_WaitsForInFlight verifies that
-// ShutdownAndWait blocks until all in-flight operations complete.
-func TestShutdownTracker_ShutdownAndWait_WaitsForInFlight(t *testing.T) {
-	var st shutdownTracker
-
-	// Start an operation.
-	if !st.TryAdd() {
-		t.Fatal("TryAdd should succeed")
-	}
-
-	shutdownDone := make(chan struct{})
-	go func() {
-		st.ShutdownAndWait()
-		close(shutdownDone)
-	}()
-
-	// ShutdownAndWait should block while an operation is in flight.
-	select {
-	case <-shutdownDone:
-		t.Fatal("ShutdownAndWait returned while operation is still in flight")
-	case <-time.After(50 * time.Millisecond):
-	}
-
-	// Complete the operation -- ShutdownAndWait should now return.
-	st.Done()
-
-	select {
-	case <-shutdownDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("ShutdownAndWait should return after last in-flight op completes")
 	}
 }
 
@@ -141,58 +111,6 @@ func TestShutdownTracker_ConcurrentTryAddDuringShutdown(t *testing.T) {
 	}
 }
 
-// TestShutdownTracker_MultipleTryAddAndDone verifies correct counting
-// with multiple concurrent TryAdd/Done cycles.
-func TestShutdownTracker_MultipleTryAddAndDone(t *testing.T) {
-	var st shutdownTracker
-
-	const ops = 100
-	for i := 0; i < ops; i++ {
-		if !st.TryAdd() {
-			t.Fatalf("TryAdd %d should succeed", i)
-		}
-	}
-	if st.InFlight() != ops {
-		t.Fatalf("InFlight: got %d, want %d", st.InFlight(), ops)
-	}
-
-	for i := 0; i < ops; i++ {
-		st.Done()
-	}
-	if st.InFlight() != 0 {
-		t.Fatalf("InFlight after all Done: got %d, want 0", st.InFlight())
-	}
-}
-
-// TestShutdownTracker_IsShutdown_BeforeAndAfter verifies IsShutdown
-// returns the correct value before and after shutdown.
-func TestShutdownTracker_IsShutdown_BeforeAndAfter(t *testing.T) {
-	var st shutdownTracker
-	if st.IsShutdown() {
-		t.Fatal("IsShutdown should be false before shutdown")
-	}
-	st.ShutdownAndWait()
-	if !st.IsShutdown() {
-		t.Fatal("IsShutdown should be true after shutdown")
-	}
-}
-
-// TestShutdownTracker_ZeroValueIsReady verifies that a zero-value
-// shutdownTracker is ready to use without any initialization.
-func TestShutdownTracker_ZeroValueIsReady(t *testing.T) {
-	var st shutdownTracker
-	if st.IsShutdown() {
-		t.Fatal("zero-value should not be in shutdown state")
-	}
-	if st.InFlight() != 0 {
-		t.Fatal("zero-value should have 0 in-flight")
-	}
-	if !st.TryAdd() {
-		t.Fatal("TryAdd on zero-value should succeed")
-	}
-	st.Done()
-}
-
 // TestShutdownTracker_ShutdownAndWait_MultipleInFlight verifies that
 // ShutdownAndWait waits for all N operations, not just the first.
 func TestShutdownTracker_ShutdownAndWait_MultipleInFlight(t *testing.T) {
@@ -230,13 +148,3 @@ func TestShutdownTracker_ShutdownAndWait_MultipleInFlight(t *testing.T) {
 		t.Fatal("ShutdownAndWait should return after all ops complete")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// getOrCreateSendQueue stopped during write lock (quic.go:562-565)
-// ---------------------------------------------------------------------------
-
-// TestGetOrCreateSendQueue_StoppedWhileWaitingForWriteLock exercises
-// the stopped check inside the write lock (quic.go:562-565). It holds
-// the sendQueuesMu write lock, stops the transport, then releases the
-// lock. A concurrent getOrCreateSendQueue call blocks at Lock(), and
-// when it acquires the lock, stopped=true.

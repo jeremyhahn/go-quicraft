@@ -19,138 +19,117 @@ import (
 	"testing"
 )
 
-func TestSaveStateError_Error(t *testing.T) {
-	inner := errors.New("disk write failed")
-	e := &SaveStateError{ShardID: 1, ReplicaID: 2, Err: inner}
-	msg := e.Error()
-	if msg == "" {
-		t.Fatal("expected non-empty error message")
+// TestEngineErrors_Error verifies that each engine error type's message
+// carries the operation and every identifying field an operator triages it by.
+func TestEngineErrors_Error(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{
+			name: "SaveStateError",
+			err:  &SaveStateError{ShardID: 1, ReplicaID: 2, Err: errors.New("disk write failed")},
+			want: []string{"shard 1", "replica 2"},
+		},
+		{
+			name: "ApplyError",
+			err:  &ApplyError{ShardID: 3, ReplicaID: 4, Err: errors.New("sm.Apply failed")},
+			want: []string{"shard 3", "replica 4"},
+		},
+		{
+			name: "SnapshotDuplicateError",
+			err:  &SnapshotDuplicateError{ShardID: 10},
+			want: []string{"shard 10", "in-flight"},
+		},
+		{
+			name: "SnapshotPoolBusyError",
+			err:  &SnapshotPoolBusyError{ShardID: 5},
+			want: []string{"shard 5", "busy"},
+		},
+		{
+			name: "SnapshotError save",
+			err:  &SnapshotError{ShardID: 7, ReplicaID: 8, Save: true, Err: errors.New("io error")},
+			want: []string{"save", "shard 7"},
+		},
+		{
+			name: "SnapshotError recover",
+			err:  &SnapshotError{ShardID: 7, ReplicaID: 8, Save: false, Err: errors.New("io error")},
+			want: []string{"recover"},
+		},
+		{
+			name: "NodeNotLoadedError",
+			err:  &NodeNotLoadedError{ShardID: 99},
+			want: []string{"shard 99", "not loaded"},
+		},
+		{
+			name: "MessageHandleError",
+			err: &MessageHandleError{
+				ShardID: 10, ReplicaID: 2, MsgType: 3, From: 5,
+				Err: errors.New("unknown sender"),
+			},
+			want: []string{"shard 10", "replica 2", "Handle failed"},
+		},
+		{
+			name: "SnapshotTooLargeError",
+			err: &SnapshotTooLargeError{
+				ShardID: 10, ReplicaID: 2, Size: 5000000000, Limit: 4294967296,
+			},
+			want: []string{"shard 10", "replica 2", "5000000000", "4294967296"},
+		},
+		{
+			name: "CommitError",
+			err:  &CommitError{ShardID: 11, ReplicaID: 3, Err: errors.New("log gap detected")},
+			want: []string{"Commit failed", "shard 11", "replica 3", "log gap detected"},
+		},
+		{
+			name: "SnapshotExportError",
+			err:  &SnapshotExportError{ExportPath: "/tmp/export", Err: errors.New("permission denied")},
+			want: []string{"export", "/tmp/export", "permission denied"},
+		},
+		{
+			name: "TypeAssertionError",
+			err: &TypeAssertionError{
+				Context:      "DeliverMessage node lookup",
+				ExpectedType: "*Node",
+				ActualValue:  "not a node",
+			},
+			want: []string{"type assertion failed", "DeliverMessage node lookup", "*Node", "string"},
+		},
 	}
-	if !contains(msg, "shard 1") || !contains(msg, "replica 2") {
-		t.Fatalf("error message missing shard/replica info: %s", msg)
-	}
-}
-
-func TestSaveStateError_Unwrap(t *testing.T) {
-	inner := errors.New("disk write failed")
-	e := &SaveStateError{ShardID: 1, ReplicaID: 2, Err: inner}
-	if !errors.Is(e, inner) {
-		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
-func TestApplyError_Error(t *testing.T) {
-	inner := errors.New("sm.Apply failed")
-	e := &ApplyError{ShardID: 3, ReplicaID: 4, Err: inner}
-	msg := e.Error()
-	if !contains(msg, "shard 3") || !contains(msg, "replica 4") {
-		t.Fatalf("error message missing shard/replica info: %s", msg)
-	}
-}
-
-func TestApplyError_Unwrap(t *testing.T) {
-	inner := errors.New("sm.Apply failed")
-	e := &ApplyError{ShardID: 3, ReplicaID: 4, Err: inner}
-	if !errors.Is(e, inner) {
-		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
-func TestSnapshotDuplicateError_Error(t *testing.T) {
-	e := &SnapshotDuplicateError{ShardID: 10}
-	msg := e.Error()
-	if !contains(msg, "shard 10") || !contains(msg, "in-flight") {
-		t.Fatalf("error message missing expected content: %s", msg)
-	}
-}
-
-func TestSnapshotPoolBusyError_Error(t *testing.T) {
-	e := &SnapshotPoolBusyError{ShardID: 5}
-	msg := e.Error()
-	if !contains(msg, "shard 5") || !contains(msg, "busy") {
-		t.Fatalf("error message missing expected content: %s", msg)
-	}
-}
-
-func TestSnapshotError_Error_Save(t *testing.T) {
-	inner := errors.New("io error")
-	e := &SnapshotError{ShardID: 7, ReplicaID: 8, Save: true, Err: inner}
-	msg := e.Error()
-	if !contains(msg, "save") || !contains(msg, "shard 7") {
-		t.Fatalf("error message missing expected content: %s", msg)
-	}
-}
-
-func TestSnapshotError_Error_Recover(t *testing.T) {
-	inner := errors.New("io error")
-	e := &SnapshotError{ShardID: 7, ReplicaID: 8, Save: false, Err: inner}
-	msg := e.Error()
-	if !contains(msg, "recover") {
-		t.Fatalf("error message should contain 'recover': %s", msg)
-	}
-}
-
-func TestSnapshotError_Unwrap(t *testing.T) {
-	inner := errors.New("io error")
-	e := &SnapshotError{Err: inner}
-	if !errors.Is(e, inner) {
-		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
-func TestNodeNotLoadedError_Error(t *testing.T) {
-	e := &NodeNotLoadedError{ShardID: 99}
-	msg := e.Error()
-	if !contains(msg, "shard 99") || !contains(msg, "not loaded") {
-		t.Fatalf("error message missing expected content: %s", msg)
-	}
-}
-
-func TestMessageHandleError_Error(t *testing.T) {
-	inner := errors.New("unknown sender")
-	e := &MessageHandleError{
-		ShardID:   10,
-		ReplicaID: 2,
-		MsgType:   3,
-		From:      5,
-		Err:       inner,
-	}
-	msg := e.Error()
-	if !contains(msg, "shard 10") || !contains(msg, "replica 2") {
-		t.Fatalf("error message missing shard/replica info: %s", msg)
-	}
-	if !contains(msg, "Handle failed") {
-		t.Fatalf("error message missing operation context: %s", msg)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := tt.err.Error()
+			for _, want := range tt.want {
+				if !contains(msg, want) {
+					t.Fatalf("error message missing %q: %s", want, msg)
+				}
+			}
+		})
 	}
 }
 
-func TestMessageHandleError_Unwrap(t *testing.T) {
-	inner := errors.New("stale term")
-	e := &MessageHandleError{
-		ShardID:   1,
-		ReplicaID: 1,
-		MsgType:   1,
-		From:      2,
-		Err:       inner,
+// TestEngineErrors_Unwrap verifies that each wrapping engine error type
+// exposes its cause to errors.Is.
+func TestEngineErrors_Unwrap(t *testing.T) {
+	inner := errors.New("inner cause")
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"SaveStateError", &SaveStateError{ShardID: 1, ReplicaID: 2, Err: inner}},
+		{"ApplyError", &ApplyError{ShardID: 3, ReplicaID: 4, Err: inner}},
+		{"SnapshotError", &SnapshotError{Err: inner}},
+		{"MessageHandleError", &MessageHandleError{ShardID: 1, ReplicaID: 1, MsgType: 1, From: 2, Err: inner}},
+		{"CommitError", &CommitError{ShardID: 11, ReplicaID: 3, Err: inner}},
+		{"SnapshotExportError", &SnapshotExportError{ExportPath: "/tmp/export", Err: inner}},
 	}
-	if !errors.Is(e, inner) {
-		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
-func TestSnapshotTooLargeError_Error(t *testing.T) {
-	e := &SnapshotTooLargeError{
-		ShardID:   10,
-		ReplicaID: 2,
-		Size:      5000000000,
-		Limit:     4294967296,
-	}
-	msg := e.Error()
-	if !contains(msg, "shard 10") || !contains(msg, "replica 2") {
-		t.Fatalf("error message missing shard/replica info: %s", msg)
-	}
-	if !contains(msg, "5000000000") || !contains(msg, "4294967296") {
-		t.Fatalf("error message missing size/limit: %s", msg)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !errors.Is(tt.err, inner) {
+				t.Fatal("expected Unwrap to return inner error")
+			}
+		})
 	}
 }
 
@@ -161,81 +140,6 @@ func TestSnapshotTooLargeError_Is(t *testing.T) {
 	}
 	if errors.Is(e, ErrSnapshotCorrupt) {
 		t.Fatal("expected Is(ErrSnapshotCorrupt) to be false")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// CommitError
-// ---------------------------------------------------------------------------
-
-func TestCommitError_Error(t *testing.T) {
-	inner := errors.New("log gap detected")
-	e := &CommitError{ShardID: 11, ReplicaID: 3, Err: inner}
-	msg := e.Error()
-	if !contains(msg, "Commit failed") {
-		t.Fatalf("error message missing operation context: %s", msg)
-	}
-	if !contains(msg, "shard 11") || !contains(msg, "replica 3") {
-		t.Fatalf("error message missing shard/replica info: %s", msg)
-	}
-	if !contains(msg, "log gap detected") {
-		t.Fatalf("error message missing inner error: %s", msg)
-	}
-}
-
-func TestCommitError_Unwrap(t *testing.T) {
-	inner := errors.New("log gap detected")
-	e := &CommitError{ShardID: 11, ReplicaID: 3, Err: inner}
-	if !errors.Is(e, inner) {
-		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
-func TestSnapshotExportError_Error(t *testing.T) {
-	inner := errors.New("permission denied")
-	e := &SnapshotExportError{ExportPath: "/tmp/export", Err: inner}
-	msg := e.Error()
-	if !contains(msg, "export") {
-		t.Fatalf("error message missing 'export': %s", msg)
-	}
-	if !contains(msg, "/tmp/export") {
-		t.Fatalf("error message missing export path: %s", msg)
-	}
-	if !contains(msg, "permission denied") {
-		t.Fatalf("error message missing inner error: %s", msg)
-	}
-}
-
-func TestSnapshotExportError_Unwrap(t *testing.T) {
-	inner := errors.New("permission denied")
-	e := &SnapshotExportError{ExportPath: "/tmp/export", Err: inner}
-	if !errors.Is(e, inner) {
-		t.Fatal("expected Unwrap to return inner error")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TypeAssertionError
-// ---------------------------------------------------------------------------
-
-func TestTypeAssertionError_Error(t *testing.T) {
-	e := &TypeAssertionError{
-		Context:      "DeliverMessage node lookup",
-		ExpectedType: "*Node",
-		ActualValue:  "not a node",
-	}
-	msg := e.Error()
-	if !contains(msg, "type assertion failed") {
-		t.Fatalf("error message missing 'type assertion failed': %s", msg)
-	}
-	if !contains(msg, "DeliverMessage node lookup") {
-		t.Fatalf("error message missing context: %s", msg)
-	}
-	if !contains(msg, "*Node") {
-		t.Fatalf("error message missing expected type: %s", msg)
-	}
-	if !contains(msg, "string") {
-		t.Fatalf("error message missing actual type: %s", msg)
 	}
 }
 

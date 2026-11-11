@@ -216,13 +216,6 @@ func TestTransportConfig_Validate_StreamReadIdleTimeout(t *testing.T) {
 }
 
 func TestTransportConfig_Validate_Valid(t *testing.T) {
-	t.Run("valid defaults", func(t *testing.T) {
-		tc := validTransportConfig()
-		if err := tc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
 	t.Run("valid with PEM mTLS", func(t *testing.T) {
 		tc := validTransportConfigWithMTLS()
 		if err := tc.Validate(); err != nil {

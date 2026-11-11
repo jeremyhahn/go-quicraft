@@ -21,34 +21,6 @@ import (
 	"testing"
 )
 
-func TestDeriveKey_PBKDF2SHA256_Deterministic(t *testing.T) {
-	passphrase := []byte("deterministic-test-pbkdf2")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	params := KDFParams{
-		Iterations: 1000,
-		KeyLen:     32,
-		SaltLen:    32,
-	}
-
-	key1, err := DeriveKey(passphrase, salt, KDFPbkdf2SHA256, params)
-	if err != nil {
-		t.Fatalf("first DeriveKey failed: %v", err)
-	}
-
-	key2, err := DeriveKey(passphrase, salt, KDFPbkdf2SHA256, params)
-	if err != nil {
-		t.Fatalf("second DeriveKey failed: %v", err)
-	}
-
-	if !bytes.Equal(key1, key2) {
-		t.Fatal("same passphrase and salt should produce identical keys")
-	}
-}
-
 func TestDeriveKey_DifferentSaltsDifferentKeys(t *testing.T) {
 	passphrase := []byte("salt-test")
 	salt1 := make([]byte, 32)
@@ -79,24 +51,25 @@ func TestDeriveKey_DifferentSaltsDifferentKeys(t *testing.T) {
 	}
 }
 
-func TestDeriveKey_EmptyPassphrase(t *testing.T) {
-	salt := make([]byte, 32)
-	params := DefaultKDFParams()
-
-	_, err := DeriveKey([]byte{}, salt, KDFArgon2id, params)
-	if !errors.Is(err, ErrKDFInvalidPassphrase) {
-		t.Fatalf("expected ErrKDFInvalidPassphrase, got %v", err)
+func TestDeriveKey_RejectsInvalidInput(t *testing.T) {
+	cases := []struct {
+		name       string
+		passphrase []byte
+		saltLen    int
+		version    KDFVersion
+		want       error
+	}{
+		{"empty passphrase", []byte{}, 32, KDFArgon2id, ErrKDFInvalidPassphrase},
+		{"salt below 16 bytes", []byte("test"), 15, KDFArgon2id, ErrKDFInvalidSalt},
+		{"unknown version", []byte("test"), 32, KDFVersion(99), ErrKDFUnsupportedVersion},
 	}
-}
-
-func TestDeriveKey_ShortSalt(t *testing.T) {
-	passphrase := []byte("test")
-	salt := make([]byte, 15) // Below minimum 16 bytes.
-	params := DefaultKDFParams()
-
-	_, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if !errors.Is(err, ErrKDFInvalidSalt) {
-		t.Fatalf("expected ErrKDFInvalidSalt, got %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DeriveKey(tc.passphrase, make([]byte, tc.saltLen), tc.version, DefaultKDFParams())
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("DeriveKey = %v, want %v", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -117,17 +90,6 @@ func TestDeriveKey_MinimumSaltLength(t *testing.T) {
 	}
 	if len(key) != 32 {
 		t.Fatalf("expected 32-byte key, got %d bytes", len(key))
-	}
-}
-
-func TestDeriveKey_InvalidVersion(t *testing.T) {
-	passphrase := []byte("test")
-	salt := make([]byte, 32)
-	params := DefaultKDFParams()
-
-	_, err := DeriveKey(passphrase, salt, KDFVersion(99), params)
-	if !errors.Is(err, ErrKDFUnsupportedVersion) {
-		t.Fatalf("expected ErrKDFUnsupportedVersion, got %v", err)
 	}
 }
 

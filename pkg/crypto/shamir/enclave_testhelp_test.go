@@ -1,8 +1,6 @@
 package shamir
 
 import (
-	"testing"
-
 	"github.com/jeremyhahn/go-enclave"
 )
 
@@ -33,18 +31,6 @@ func valueCopy(s *ProtectedShare) []byte {
 		return nil
 	}
 	return out
-}
-
-// mustFromBytes moves data into a locked, frozen enclave, failing the test if the
-// kernel refuses the lock; go-enclave reports a refused mlock instead of hiding
-// it.
-func mustFromBytes(t testing.TB, data []byte) enclave.ByteAccess {
-	t.Helper()
-	e, err := enclave.NewMemory(data)
-	if err != nil {
-		t.Fatalf("NewMemory: %v", err)
-	}
-	return e
 }
 
 var _ = enclave.ErrEnclaveDestroyed

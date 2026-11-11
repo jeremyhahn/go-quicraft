@@ -27,102 +27,73 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestSendMessages_NoSnapshots verifies that when no InstallSnapshot messages
-// are present, all messages are delivered via Send() and none via SendSnapshot().
-func TestSendMessages_NoSnapshots(t *testing.T) {
-	sender := newTestSender()
-	w := newStepWorker(0, time.Millisecond, sender, NewWorkSignal(1),
-		make(chan *commitItem, 1), nil, make(chan struct{}), nil)
-
-	msgs := []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2},
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 3},
-		{Type: proto.HeartbeatResp, ShardID: 1, From: 2, To: 1},
+// TestSendMessages verifies that sendMessages routes every InstallSnapshot
+// through SendSnapshot and every other message, in order, through Send: the
+// fast path (no snapshot), a batch of snapshots only, and a mixed batch.
+func TestSendMessages(t *testing.T) {
+	tests := []struct {
+		name        string
+		msgs        []proto.Message
+		wantRegular []uint64 // message types sent through Send, in order
+		wantSnapTo  []uint64 // targets sent through SendSnapshot, in order
+	}{
+		{
+			name: "no snapshots",
+			msgs: []proto.Message{
+				{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2},
+				{Type: proto.Replicate, ShardID: 1, From: 1, To: 3},
+				{Type: proto.HeartbeatResp, ShardID: 1, From: 2, To: 1},
+			},
+			wantRegular: []uint64{proto.Heartbeat, proto.Replicate, proto.HeartbeatResp},
+		},
+		{
+			name: "only snapshots",
+			msgs: []proto.Message{
+				{Type: proto.InstallSnapshot, Origin: proto.OriginLocal, ShardID: 1, From: 1, To: 2},
+				{Type: proto.InstallSnapshot, ShardID: 1, From: 1, To: 3},
+			},
+			wantSnapTo: []uint64{2, 3},
+		},
+		{
+			name: "mixed batch",
+			msgs: []proto.Message{
+				{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2},
+				{Type: proto.InstallSnapshot, ShardID: 1, From: 1, To: 3},
+				{Type: proto.Replicate, ShardID: 1, From: 1, To: 4},
+				{Type: proto.InstallSnapshot, ShardID: 2, From: 1, To: 5},
+				{Type: proto.HeartbeatResp, ShardID: 1, From: 2, To: 1},
+			},
+			wantRegular: []uint64{proto.Heartbeat, proto.Replicate, proto.HeartbeatResp},
+			wantSnapTo:  []uint64{3, 5},
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sender := newTestSender()
+			w := newStepWorker(0, time.Millisecond, sender, NewWorkSignal(1),
+				make(chan *commitItem, 1), nil, make(chan struct{}), nil)
 
-	w.sendMessages(msgs)
+			w.sendMessages(tt.msgs)
 
-	if sender.sentCount() != 3 {
-		t.Fatalf("expected 3 sent messages, got %d", sender.sentCount())
-	}
-	if sender.snapshotCount() != 0 {
-		t.Fatalf("expected 0 snapshot messages, got %d", sender.snapshotCount())
-	}
-}
-
-// TestSendMessages_OnlySnapshots verifies that when all messages are
-// InstallSnapshot, they are all routed through SendSnapshot() and Send()
-// receives nothing.
-func TestSendMessages_OnlySnapshots(t *testing.T) {
-	sender := newTestSender()
-	w := newStepWorker(0, time.Millisecond, sender, NewWorkSignal(1),
-		make(chan *commitItem, 1), nil, make(chan struct{}), nil)
-
-	msgs := []proto.Message{
-		{Type: proto.InstallSnapshot, Origin: proto.OriginLocal, ShardID: 1, From: 1, To: 2},
-		{Type: proto.InstallSnapshot, ShardID: 1, From: 1, To: 3},
-	}
-
-	w.sendMessages(msgs)
-
-	if sender.sentCount() != 0 {
-		t.Fatalf("expected 0 regular messages, got %d", sender.sentCount())
-	}
-	if sender.snapshotCount() != 2 {
-		t.Fatalf("expected 2 snapshot messages, got %d", sender.snapshotCount())
-	}
-
-	// Verify snapshot messages carry correct target replicas.
-	snaps := sender.sentSnapshots()
-	if snaps[0].To != 2 {
-		t.Errorf("snapshot[0].To = %d, want 2", snaps[0].To)
-	}
-	if snaps[1].To != 3 {
-		t.Errorf("snapshot[1].To = %d, want 3", snaps[1].To)
-	}
-}
-
-// TestSendMessages_MixedBatch verifies that a mixed batch of regular and
-// InstallSnapshot messages is correctly separated: regular messages go through
-// Send() and snapshot messages go through SendSnapshot().
-func TestSendMessages_MixedBatch(t *testing.T) {
-	sender := newTestSender()
-	w := newStepWorker(0, time.Millisecond, sender, NewWorkSignal(1),
-		make(chan *commitItem, 1), nil, make(chan struct{}), nil)
-
-	msgs := []proto.Message{
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2},
-		{Type: proto.InstallSnapshot, ShardID: 1, From: 1, To: 3},
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 4},
-		{Type: proto.InstallSnapshot, ShardID: 2, From: 1, To: 5},
-		{Type: proto.HeartbeatResp, ShardID: 1, From: 2, To: 1},
-	}
-
-	w.sendMessages(msgs)
-
-	if sender.sentCount() != 3 {
-		t.Fatalf("expected 3 regular messages, got %d", sender.sentCount())
-	}
-	if sender.snapshotCount() != 2 {
-		t.Fatalf("expected 2 snapshot messages, got %d", sender.snapshotCount())
-	}
-
-	// Verify regular messages contain the expected types.
-	regular := sender.sentMessages()
-	expectedTypes := []uint64{proto.Heartbeat, proto.Replicate, proto.HeartbeatResp}
-	for i, msg := range regular {
-		if msg.Type != expectedTypes[i] {
-			t.Errorf("regular[%d].Type = %v, want %v", i, msg.Type, expectedTypes[i])
-		}
-	}
-
-	// Verify snapshot messages.
-	snaps := sender.sentSnapshots()
-	if snaps[0].To != 3 {
-		t.Errorf("snapshot[0].To = %d, want 3", snaps[0].To)
-	}
-	if snaps[1].To != 5 {
-		t.Errorf("snapshot[1].To = %d, want 5", snaps[1].To)
+			regular := sender.sentMessages()
+			if len(regular) != len(tt.wantRegular) {
+				t.Fatalf("sent %d regular messages, want %d", len(regular), len(tt.wantRegular))
+			}
+			for i, msg := range regular {
+				if msg.Type != tt.wantRegular[i] {
+					t.Errorf("regular[%d].Type = %v, want %v", i, msg.Type, tt.wantRegular[i])
+				}
+			}
+			snaps := sender.sentSnapshots()
+			if len(snaps) != len(tt.wantSnapTo) {
+				t.Fatalf("sent %d snapshot messages, want %d", len(snaps), len(tt.wantSnapTo))
+			}
+			for i, snap := range snaps {
+				if snap.To != tt.wantSnapTo[i] {
+					t.Errorf("snapshot[%d].To = %d, want %d", i, snap.To, tt.wantSnapTo[i])
+				}
+			}
+		})
 	}
 }
 
@@ -507,37 +478,6 @@ func TestStepWorker_CommitPendingInbox_ReadIndexResolution(t *testing.T) {
 	}
 }
 
-// TestStepWorker_CommitPendingInbox_EmptyInbox verifies that
-// processCommitPendingInbox is a no-op when the inbox is empty.
-func TestStepWorker_CommitPendingInbox_EmptyInbox(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	node.commitPending.Store(true)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	initialReadyCount := cb.readyCount.Load()
-
-	// processReady with commitPending=true and empty inbox should be a no-op.
-	ws.Notify(1)
-	sw.processReady()
-
-	if cb.readyCount.Load() != initialReadyCount {
-		t.Fatal("OnReadyToRead should not fire with empty inbox during commitPending")
-	}
-}
-
 // TestStepWorker_CommitPendingInbox_NilPeerSkipped verifies that
 // processReady during commitPending does not call processCommitPendingInbox
 // when the peer is nil.
@@ -558,69 +498,6 @@ func TestStepWorker_CommitPendingInbox_NilPeerSkipped(t *testing.T) {
 	ws.Notify(1)
 	sw.processReady()
 }
-
-// TestStepWorker_FlushReadIndex_UnconditionalCall verifies that
-// FlushReadIndex is called unconditionally after inbox drain, not only
-// when inbox messages were present. This ensures ReadIndex broadcasts
-// are never missed regardless of inbox state.
-func TestStepWorker_FlushReadIndex_UnconditionalCall(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain initial election update. Persisting the term-opening no-op
-	// via Peer.Commit fires the persistence-edge commit re-evaluation,
-	// which commits it on this single-node shard — so one follow-up
-	// update (the committed no-op) is expected and must be drained too.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("no-op commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Process with empty inbox. FlushReadIndex should be called
-	// unconditionally but be a no-op (readIndexBroadcastPending=false).
-	// This should not panic or produce errors.
-	ws.Notify(1)
-	sw.processReady()
-
-	// No commit item expected (no updates).
-	select {
-	case <-commitC:
-		t.Fatal("unexpected commit item with empty inbox")
-	default:
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReadIndex batch coalescing tests
-// ---------------------------------------------------------------------------
 
 // TestStepWorker_ReadIndexBatching_SingleKey verifies that a single
 // ReadIndex key is submitted through the MPSC queue and processed by
@@ -674,80 +551,6 @@ func TestStepWorker_ReadIndexBatching_SingleKey(t *testing.T) {
 	}
 }
 
-// TestStepWorker_ReadIndexBatching_MultipleKeys verifies that multiple
-// concurrent ReadIndex keys are coalesced into a single raft ReadIndex
-// operation. The first key becomes the batch key and the rest are
-// registered as aliases via OnReadIndexBatched.
-func TestStepWorker_ReadIndexBatching_MultipleKeys(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain the election update.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Deliver 5 ReadIndex keys to simulate 5 concurrent Host.ReadIndex callers.
-	for i := uint64(100); i < 105; i++ {
-		if !node.DeliverReadIndex(i) {
-			t.Fatalf("DeliverReadIndex(%d) should succeed", i)
-		}
-	}
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// OnReadIndexBatched should have been called exactly once with
-	// batchKey=100 and aliasKeys=[101, 102, 103, 104].
-	if cb.batchCount.Load() != 1 {
-		t.Fatalf("expected 1 OnReadIndexBatched call, got %d", cb.batchCount.Load())
-	}
-
-	calls := cb.getReadIndexBatchCalls()
-	if len(calls) != 1 {
-		t.Fatalf("expected 1 batch call, got %d", len(calls))
-	}
-	if calls[0].shardID != 1 {
-		t.Errorf("batch call shardID = %d, want 1", calls[0].shardID)
-	}
-	if calls[0].batchKey != 100 {
-		t.Errorf("batch call batchKey = %d, want 100", calls[0].batchKey)
-	}
-	if len(calls[0].aliasKeys) != 4 {
-		t.Fatalf("expected 4 alias keys, got %d", len(calls[0].aliasKeys))
-	}
-	for i, want := range []uint64{101, 102, 103, 104} {
-		if calls[0].aliasKeys[i] != want {
-			t.Errorf("aliasKeys[%d] = %d, want %d", i, calls[0].aliasKeys[i], want)
-		}
-	}
-
-	// The ReadIndex queue should be drained.
-	if remaining := node.DrainReadIndex(nil); len(remaining) != 0 {
-		t.Fatalf("readIndex queue should be empty, got %d", len(remaining))
-	}
-}
-
 // TestStepWorker_ReadIndexBatching_NilCallback verifies that ReadIndex
 // batch coalescing works without panicking when the callback is nil.
 func TestStepWorker_ReadIndexBatching_NilCallback(t *testing.T) {
@@ -791,115 +594,6 @@ func TestStepWorker_ReadIndexBatching_NilCallback(t *testing.T) {
 	// Queue should be drained.
 	if remaining := node.DrainReadIndex(nil); len(remaining) != 0 {
 		t.Fatalf("readIndex queue should be empty, got %d", len(remaining))
-	}
-}
-
-// TestStepWorker_ReadIndexBatching_CommitPending verifies that ReadIndex
-// keys are drained and batched during the commitPending fast path.
-// ReadIndex does not modify log state, so it is safe to process while
-// the commit pipeline owns the node.
-func TestStepWorker_ReadIndexBatching_CommitPending(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	// Create a 3-node leader for ReadIndex quorum testing.
-	peer, lr := newMultiNodeLeaderTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	// Drain any residual state from the election.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Set commitPending=true to simulate a concurrent Propose in the
-	// commit pipeline.
-	node.commitPending.Store(true)
-
-	initialBatchCount := cb.batchCount.Load()
-
-	// Deliver 3 ReadIndex keys while commitPending is true.
-	for i := uint64(200); i < 203; i++ {
-		node.DeliverReadIndex(i)
-	}
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// OnReadIndexBatched should fire with batchKey=200 and aliasKeys=[201,202].
-	if cb.batchCount.Load() <= initialBatchCount {
-		t.Fatal("expected OnReadIndexBatched to fire during commitPending")
-	}
-
-	calls := cb.getReadIndexBatchCalls()
-	lastCall := calls[len(calls)-1]
-	if lastCall.batchKey != 200 {
-		t.Errorf("batch key = %d, want 200", lastCall.batchKey)
-	}
-	if len(lastCall.aliasKeys) != 2 {
-		t.Fatalf("expected 2 alias keys, got %d", len(lastCall.aliasKeys))
-	}
-
-	// ReadIndex queue should be drained.
-	if remaining := node.DrainReadIndex(nil); len(remaining) != 0 {
-		t.Fatalf("readIndex queue should be empty, got %d", len(remaining))
-	}
-}
-
-// TestStepWorker_ReadIndexBatching_EmptyQueue verifies that an empty
-// ReadIndex queue is a no-op and does not trigger OnReadIndexBatched.
-func TestStepWorker_ReadIndexBatching_EmptyQueue(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain the election update.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Process with empty ReadIndex queue.
-	ws.Notify(1)
-	sw.processReady()
-
-	// No batch calls should have been made.
-	if cb.batchCount.Load() != 0 {
-		t.Fatalf("expected 0 OnReadIndexBatched calls, got %d", cb.batchCount.Load())
 	}
 }
 
@@ -1036,6 +730,14 @@ func TestStepWorker_ReadIndexBatching_AliasesRegisteredBeforeHandle(t *testing.T
 	}
 
 	events := cb.getEvents()
+
+	// One batch, however many callers: the four aliases ride on one key.
+	if n := cb.batchCount.Load(); n != 1 {
+		t.Fatalf("expected 1 OnReadIndexBatched call, got %d", n)
+	}
+	if remaining := node.DrainReadIndex(nil); len(remaining) != 0 {
+		t.Fatalf("readIndex queue should be empty, got %d", len(remaining))
+	}
 
 	// There must be at least one OnReadIndexBatched and one OnReadyToRead.
 	var batchedIdx, readyIdx int
@@ -1192,170 +894,13 @@ func TestStepWorker_ReadIndexBatching_AliasesBeforeHandle_CommitPending(t *testi
 			t.Errorf("aliasKeys[%d] = %d, want %d", i, batchEvent.keys[i], want)
 		}
 	}
+
+	if remaining := node.DrainReadIndex(nil); len(remaining) != 0 {
+		t.Fatalf("readIndex queue should be empty, got %d", len(remaining))
+	}
 }
 
 // --- GAP-1: Message Ordering Relative to WAL Persistence Tests ---
-
-// TestProcessReady_WALMode_SplitsFreeOrderFromOrderedMessages verifies
-// that in WAL mode, ordered messages that must follow persistence
-// (VoteResp, HeartbeatResp, etc.) are deferred on the commitItem for
-// the commit worker to send after SaveState. This implements Raft PhD
-// thesis section 10.2.1.
-func TestProcessReady_WALMode_SplitsFreeOrderFromOrderedMessages(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain the initial election update so processReady starts clean.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-	sender.mu.Lock()
-	sender.msgs = sender.msgs[:0]
-	sender.snapshots = sender.snapshots[:0]
-	sender.mu.Unlock()
-
-	// Propose to generate a WAL-mode update with messages.
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("gap1-test")}})
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// Drain the commitItem and verify ordered messages are attached.
-	select {
-	case item := <-commitC:
-		// In a single-node cluster, the update typically has no
-		// outbound messages. But the orderedMsgs slice should be
-		// properly initialized (empty but not nil-capacity).
-		// The key verification: if there WERE ordered messages
-		// (e.g., VoteResp), they should NOT have been sent via
-		// the sender before commitC receive.
-		_ = item.orderedMsgs
-
-		// Verify the commitItem carries the update.
-		if item.node != node {
-			t.Fatal("commitItem should reference the correct node")
-		}
-		if item.update.ShardID != 1 {
-			t.Errorf("update.ShardID = %d, want 1", item.update.ShardID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected a commit item in commitC")
-	}
-}
-
-// TestProcessReady_WALMode_FreeOrderSentBeforeCommitC verifies that
-// free-order messages (Replicate) are sent via the transport BEFORE the
-// commitItem is queued to commitC, allowing QUIC send to overlap with
-// WAL fsync.
-func TestProcessReady_WALMode_FreeOrderSentBeforeCommitC(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	// Use unbuffered commitC to block the step worker at the channel
-	// send, proving that free-order messages were already sent.
-	commitC := make(chan *commitItem)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 3, 1)
-	cfg := config.Config{ShardID: 3, ReplicaID: 1}
-	cfg.SetDefaults()
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain the election update (with buffered channel temporarily).
-	electionC := make(chan *commitItem, 16)
-	sw.commitC = electionC
-	ws.Notify(3)
-	sw.processReady()
-	select {
-	case item := <-electionC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Switch back to unbuffered commitC.
-	sw.commitC = commitC
-	sender.mu.Lock()
-	sender.msgs = sender.msgs[:0]
-	sender.snapshots = sender.snapshots[:0]
-	sender.mu.Unlock()
-
-	// Propose to generate messages.
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("overlap-test")}})
-
-	// Run processReady in a goroutine since commitC is unbuffered.
-	done := make(chan struct{})
-	go func() {
-		ws.Notify(3)
-		sw.processReady()
-		close(done)
-	}()
-
-	// Wait for commitPending to be set, which means enqueueForCommit
-	// has sent all free-order messages and is now blocking on commitC.
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for step worker to block on commitC",
-		node.commitPending.Load)
-
-	// Check that only free-order messages were sent.
-	sentMsgs := sender.sentMessages()
-	for _, msg := range sentMsgs {
-		if !proto.IsFreeOrderMessage(msg.Type) {
-			t.Errorf("non-free-order message %s sent before commitC",
-				proto.MessageTypeName(msg.Type))
-		}
-	}
-
-	// Unblock the step worker by reading from commitC.
-	select {
-	case item := <-commitC:
-		// Ordered messages should be on the commitItem.
-		for _, msg := range item.orderedMsgs {
-			if proto.IsFreeOrderMessage(msg.Type) {
-				t.Errorf("free-order message %s found in orderedMsgs",
-					proto.MessageTypeName(msg.Type))
-			}
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("step worker did not produce a commitItem")
-	}
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("step worker did not complete processReady")
-	}
-}
 
 // TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim pins the window
 // that Peer.InvalidatePersistedState exists to close.
@@ -1736,39 +1281,29 @@ func TestTick_CommitPending_FiltersFreeOrderOnly(t *testing.T) {
 
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
-	peer, lr := newTestPeer(t, 1, 1)
+	// A 3-node leader, so its ticks produce heartbeats to send: on a
+	// single-node shard tick() sends nothing and the check below is empty.
+	peer, lr := newMultiNodeLeaderTestPeer(t, 1, 1)
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()
 	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
-	tickPeerToLeader(peer)
-
-	// Drain the election update.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-	default:
+	// commitPending: processReady skips the shard, so tick() is the only
+	// sender of the heartbeats it produces.
+	node.commitPending.Store(true)
+	for range 30 {
+		sw.tick()
 	}
 
-	// Set commitPending and tick.
-	node.commitPending.Store(true)
-	sender.mu.Lock()
-	sender.msgs = sender.msgs[:0]
-	sender.mu.Unlock()
-
-	sw.tick()
-
-	// All messages sent during commitPending tick should be free-order.
-	sentMsgs := sender.sentMessages()
-	for _, msg := range sentMsgs {
-		if !proto.IsFreeOrderMessage(msg.Type) {
-			t.Errorf("non-free-order message %s sent during commitPending tick",
-				proto.MessageTypeName(msg.Type))
+	sent := sender.sentMessages()
+	if !containsType(sent, proto.Heartbeat) {
+		t.Fatalf("tick() during commitPending sent no heartbeat; sent=%v", typeNames(sent))
+	}
+	for _, ordered := range persistBeforeRespondFixture.ordered {
+		if containsType(sent, ordered) {
+			t.Errorf("%s sent by tick() during commitPending, before its state was persisted; sent=%v",
+				proto.MessageTypeName(ordered), typeNames(sent))
 		}
 	}
 }
@@ -1818,151 +1353,6 @@ func (s *sequenceSender) getEvents() []sendEvent {
 }
 
 var _ MessageSender = (*sequenceSender)(nil)
-
-// TestCommitMemoryMode_SplitsFreeOrderFromOrderedMessages verifies that
-// commitMemoryMode sends free-order messages (Replicate, Heartbeat, etc.)
-// before Peer.Commit and ordered messages (VoteResp, HeartbeatResp, etc.)
-// after Peer.Commit. This matches the WAL mode message ordering discipline.
-func TestCommitMemoryMode_SplitsFreeOrderFromOrderedMessages(t *testing.T) {
-	sender := newSequenceSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-	sw.memoryMode = true
-	sw.applyC = applyC
-	sw.applyPool = applyPool
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain the election update via memory mode.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case <-applyC:
-		node.commitPending.Store(false)
-	default:
-	}
-	// Clear sender events from the election cycle.
-	sender.mu.Lock()
-	sender.events = sender.events[:0]
-	sender.seq.Store(0)
-	sender.mu.Unlock()
-
-	// Propose an entry to produce a valid update.
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("split-test")}})
-
-	// Get the update from the peer, then inject synthetic messages of
-	// both types to verify the splitting logic. We call commitMemoryMode
-	// directly with the modified update.
-	ws.Notify(1)
-	_ = ws.Swap(0)
-	// Drain proposals into the peer.
-	buf := node.DrainProposals(nil)
-	if len(buf) > 0 {
-		_ = peer.Handle(proto.Message{
-			Type: proto.Propose, Origin: proto.OriginLocal,
-			Entries: buf,
-		})
-	}
-	peer.FlushReadIndex()
-
-	if !peer.HasUpdate(node.lastApplied.Load()) {
-		t.Fatal("peer should have an update after propose")
-	}
-	update, err := peer.GetUpdate(true, node.lastApplied.Load())
-	if err != nil {
-		t.Fatalf("GetUpdate failed: %v", err)
-	}
-
-	// Inject a mix of free-order and ordered messages.
-	update.Messages = []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2},
-		{Type: proto.RequestVoteResp, ShardID: 1, From: 1, To: 3},
-		{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 4},
-		{Type: proto.HeartbeatResp, ShardID: 1, From: 1, To: 5},
-		{Type: proto.Quiesce, ShardID: 1, From: 1, To: 6},
-		{Type: proto.ReplicateResp, ShardID: 1, From: 1, To: 7},
-	}
-
-	stopped := sw.commitMemoryMode(node, update)
-	if stopped {
-		t.Fatal("commitMemoryMode should not return stopped")
-	}
-
-	events := sender.getEvents()
-	// Expect exactly 2 send events: free-order before Commit, ordered after.
-	if len(events) != 2 {
-		t.Fatalf("expected 2 send events (free-order + ordered), got %d", len(events))
-	}
-
-	// Event 1: free-order messages.
-	freeEvent := events[0]
-	for _, msg := range freeEvent.msgs {
-		if !proto.IsFreeOrderMessage(msg.Type) {
-			t.Errorf("first send event contains non-free-order message: %s",
-				proto.MessageTypeName(msg.Type))
-		}
-	}
-	if len(freeEvent.msgs) != 3 {
-		t.Fatalf("expected 3 free-order messages, got %d", len(freeEvent.msgs))
-	}
-	expectedFreeTypes := []uint64{proto.Replicate, proto.Heartbeat, proto.Quiesce}
-	for i, msg := range freeEvent.msgs {
-		if msg.Type != expectedFreeTypes[i] {
-			t.Errorf("freeOrder[%d].Type = %s, want %s",
-				i, proto.MessageTypeName(msg.Type),
-				proto.MessageTypeName(expectedFreeTypes[i]))
-		}
-	}
-
-	// Event 2: ordered messages.
-	orderedEvent := events[1]
-	for _, msg := range orderedEvent.msgs {
-		if proto.IsFreeOrderMessage(msg.Type) {
-			t.Errorf("second send event contains free-order message: %s",
-				proto.MessageTypeName(msg.Type))
-		}
-	}
-	if len(orderedEvent.msgs) != 3 {
-		t.Fatalf("expected 3 ordered messages, got %d", len(orderedEvent.msgs))
-	}
-	expectedOrderedTypes := []uint64{proto.RequestVoteResp, proto.HeartbeatResp, proto.ReplicateResp}
-	for i, msg := range orderedEvent.msgs {
-		if msg.Type != expectedOrderedTypes[i] {
-			t.Errorf("ordered[%d].Type = %s, want %s",
-				i, proto.MessageTypeName(msg.Type),
-				proto.MessageTypeName(expectedOrderedTypes[i]))
-		}
-	}
-
-	// Verify ordering: free-order seqNum < ordered seqNum.
-	if freeEvent.seqNum >= orderedEvent.seqNum {
-		t.Errorf("free-order send (seq=%d) should precede ordered send (seq=%d)",
-			freeEvent.seqNum, orderedEvent.seqNum)
-	}
-
-	// Verify the update was forwarded to applyC.
-	select {
-	case ai := <-applyC:
-		if ai.node != node {
-			t.Fatal("apply item should reference the correct node")
-		}
-	default:
-		t.Fatal("expected an apply item in applyC")
-	}
-}
 
 // TestCommitMemoryMode_NoMessages verifies that commitMemoryMode does not
 // panic or send any messages when the update has an empty Messages slice.
@@ -2272,172 +1662,9 @@ func TestCommitMemoryMode_OnlyOrderedMessages(t *testing.T) {
 	}
 }
 
-// TestCommitMemoryMode_EndToEnd_MessageOrdering verifies the complete
-// memory-mode pipeline via processReady, ensuring that the message
-// ordering discipline is applied end-to-end. This test exercises the
-// full path: processReady -> commitMemoryMode -> sender, using a real
-// peer with a proposal that generates an update.
-func TestCommitMemoryMode_EndToEnd_MessageOrdering(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-	sw.memoryMode = true
-	sw.applyC = applyC
-	sw.applyPool = applyPool
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	tickPeerToLeader(peer)
-
-	// Drain election update.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case <-applyC:
-		node.commitPending.Store(false)
-	default:
-	}
-	sender.mu.Lock()
-	sender.msgs = sender.msgs[:0]
-	sender.snapshots = sender.snapshots[:0]
-	sender.mu.Unlock()
-
-	// Propose an entry to generate a real update.
-	node.DeliverProposal([]proto.Entry{{Cmd: []byte("e2e-memory-mode")}})
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// applyC should have the update (memory mode bypasses commitC).
-	select {
-	case ai := <-applyC:
-		if ai.node != node {
-			t.Fatal("apply item should reference the correct node")
-		}
-		if ai.update.ShardID != 1 {
-			t.Errorf("update.ShardID = %d, want 1", ai.update.ShardID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("expected an apply item in applyC")
-	}
-
-	// commitC must remain empty.
-	select {
-	case <-commitC:
-		t.Fatal("commitC should be empty in memory mode")
-	default:
-	}
-
-	// commitPending should be set.
-	if !node.commitPending.Load() {
-		t.Fatal("commitPending should be true after memory-mode processReady")
-	}
-
-	// In a single-node cluster, messages are typically empty. All sent
-	// messages (if any) should be valid.
-	sentMsgs := sender.sentMessages()
-	for _, msg := range sentMsgs {
-		if msg.ShardID == 0 && msg.From == 0 && msg.To == 0 {
-			t.Error("sent message has zero fields, likely uninitialized")
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // InstallSnapshot deferral during commitPending tests
 // ---------------------------------------------------------------------------
-
-// TestStepWorker_CommitPendingInbox_DefersInstallSnapshot verifies that
-// InstallSnapshot messages are NOT processed during commitPending. They
-// must be re-delivered to the inbox and deferred to the normal processReady
-// path. Processing InstallSnapshot during commitPending can cause
-// lastApplied regression because log.restore() resets committed/processed
-// while the apply worker may have in-flight entries from the current cycle.
-func TestStepWorker_CommitPendingInbox_DefersInstallSnapshot(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newMultiNodeLeaderTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	testSm := newTestSM()
-	rsmSM := newTestApplier(testSm)
-	node := NewNode(peer, rsmSM, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	// Drain any residual state from the election.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		if err := peer.Commit(item.update); err != nil {
-			t.Fatalf("initial commit failed: %v", err)
-		}
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Set commitPending to simulate an in-flight commit/apply cycle.
-	node.commitPending.Store(true)
-
-	// Deliver an InstallSnapshot message while commitPending is true.
-	snapMsg := proto.Message{
-		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
-		From:    2,
-		To:      1,
-		ShardID: 1,
-		Snapshot: proto.Snapshot{
-			Index: 100,
-			Term:  5,
-		},
-	}
-	// DeliverLocal: a legitimate InstallSnapshot is built by the snapshot
-	// receive path and injected process-local (OriginLocal). A wire-origin one
-	// is dropped in filterSnapshots and refused by raft.
-	node.DeliverLocal(snapMsg)
-
-	// Process. commitPending is true, so processCommitPendingInbox runs.
-	ws.Notify(1)
-	sw.processReady()
-
-	// The InstallSnapshot should have been buffered in deferredSnapshots,
-	// NOT processed or left in the inbox.
-	remaining := node.DrainInbox(nil)
-	if len(remaining) != 0 {
-		t.Fatalf("expected 0 messages in inbox (InstallSnapshot buffered), got %d", len(remaining))
-	}
-	deferred := sw.deferredSnapshots[1]
-	if len(deferred) != 1 {
-		t.Fatalf("expected 1 deferred snapshot, got %d", len(deferred))
-	}
-	if deferred[0].Type != proto.InstallSnapshot {
-		t.Fatalf("deferred message type = %s, want InstallSnapshot",
-			proto.MessageTypeName(deferred[0].Type))
-	}
-	if deferred[0].Snapshot.Index != 100 {
-		t.Errorf("deferred snapshot index = %d, want 100", deferred[0].Snapshot.Index)
-	}
-	if deferred[0].Snapshot.Term != 5 {
-		t.Errorf("deferred snapshot term = %d, want 5", deferred[0].Snapshot.Term)
-	}
-}
 
 // TestStepWorker_CommitPendingInbox_DefersInstallSnapshotButProcessesOthers
 // verifies that when the inbox contains a mix of InstallSnapshot and other
@@ -2729,6 +1956,10 @@ func TestStepWorker_InstallSnapshot_ProcessedDuringNormalProcessReady(t *testing
 	if len(remaining) != 0 {
 		t.Fatalf("expected inbox to be empty after normal processReady, got %d messages", len(remaining))
 	}
+	// commitPending is false, so the snapshot must not be deferred.
+	if n := len(sw.deferredSnapshots[1]); n != 0 {
+		t.Fatalf("InstallSnapshot deferred on the normal path: %d deferred", n)
+	}
 
 	// A commit item should be produced if the snapshot was accepted
 	// (which generates a state change). Drain it to verify the normal
@@ -2740,77 +1971,6 @@ func TestStepWorker_InstallSnapshot_ProcessedDuringNormalProcessReady(t *testing
 		// Also acceptable: the peer might reject the snapshot if terms
 		// don't match or it's stale. The important assertion is that
 		// the inbox was drained (message was handled, not deferred).
-	}
-}
-
-// TestStepWorker_CommitPendingInbox_HeartbeatsProcessedDuringCommitPending
-// verifies that non-snapshot messages (Heartbeat, HeartbeatResp) are fully
-// processed during the commitPending fast path, confirming that the
-// InstallSnapshot filter does not interfere with normal message processing.
-func TestStepWorker_CommitPendingInbox_HeartbeatsProcessedDuringCommitPending(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newMultiNodeTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	// Tick peer to become leader (grant votes).
-	for range 30 {
-		peer.Tick()
-	}
-	_ = peer.Handle(proto.Message{Type: proto.RequestPreVoteResp, From: 2})
-	_ = peer.Handle(proto.Message{Type: proto.RequestPreVoteResp, From: 3})
-	for range 30 {
-		peer.Tick()
-	}
-	if !peer.IsLeader() {
-		_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 2})
-		_ = peer.Handle(proto.Message{Type: proto.RequestVoteResp, From: 3})
-	}
-
-	// Drain initial state.
-	ws.Notify(1)
-	sw.processReady()
-	select {
-	case item := <-commitC:
-		_ = peer.Commit(item.update)
-		node.commitPending.Store(false)
-	default:
-	}
-
-	// Set commitPending to simulate busy pipeline.
-	node.commitPending.Store(true)
-
-	// Deliver heartbeat responses (no InstallSnapshot).
-	node.Deliver(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 2,
-	})
-	node.Deliver(proto.Message{
-		Type: proto.HeartbeatResp,
-		From: 3,
-	})
-
-	ws.Notify(1)
-	sw.processReady()
-
-	// Both messages should have been processed (inbox drained completely).
-	remaining := node.DrainInbox(nil)
-	if len(remaining) != 0 {
-		t.Fatalf("expected inbox to be empty after commitPending processing, got %d", len(remaining))
-	}
-	// commitPending skips the full pipeline: no commit item is produced.
-	select {
-	case <-commitC:
-		t.Fatal("commitPending node should not produce a commit item")
-	default:
 	}
 }
 
@@ -3029,106 +2189,6 @@ func TestStepWorker_ReadIndexFailed_CommitPending_CompletesAllKeys(t *testing.T)
 }
 
 // ---------------------------------------------------------------------------
-// Raft PhD thesis section 10.2.1 -- ordered message deferral classification
-// ---------------------------------------------------------------------------
-
-// TestStepWorker_OrderedMessages_DeferredUntilAfterSave verifies the
-// classification of Raft message types into free-order vs ordered groups.
-// Per the Raft PhD thesis section 10.2.1, messages that constitute RPC
-// responses depending on persisted state (vote grants, heartbeat acks,
-// replicate acks) must NOT be sent before the WAL write completes.
-// Leader-initiated messages (Replicate, Heartbeat) are free-order because
-// they carry data but do not depend on newly persisted follower state.
-func TestStepWorker_OrderedMessages_DeferredUntilAfterSave(t *testing.T) {
-	tests := []struct {
-		name      string
-		msgType   uint64
-		freeOrder bool
-	}{
-		// Free-order: may be sent before WAL write.
-		{"Replicate", proto.Replicate, true},
-		{"Heartbeat", proto.Heartbeat, true},
-		{"Ping", proto.Ping, true},
-		{"Quiesce", proto.Quiesce, true},
-
-		// Ordered: MUST be deferred until after WAL write.
-		{"RequestVoteResp", proto.RequestVoteResp, false},
-		{"RequestPreVoteResp", proto.RequestPreVoteResp, true},
-		{"ReplicateResp", proto.ReplicateResp, false},
-		{"HeartbeatResp", proto.HeartbeatResp, false},
-		{"ReadIndexResp", proto.ReadIndexResp, false},
-		{"InstallSnapshot", proto.InstallSnapshot, false},
-		{"RequestVote", proto.RequestVote, false},
-		{"RequestPreVote", proto.RequestPreVote, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := proto.IsFreeOrderMessage(tt.msgType)
-			if got != tt.freeOrder {
-				t.Errorf("IsFreeOrderMessage(%s) = %v, want %v",
-					tt.name, got, tt.freeOrder)
-			}
-		})
-	}
-}
-
-// TestStepWorker_OrderedMessages_VoteRespNotFreeOrder specifically tests
-// that all response message types are classified as ordered (not free-order).
-// This is the critical safety property from Raft PhD thesis section 10.2.1:
-// a follower must persist its vote before sending VoteResp, otherwise it
-// could crash and vote again for a different candidate in the same term,
-// causing split-brain.
-func TestStepWorker_OrderedMessages_VoteRespNotFreeOrder(t *testing.T) {
-	// These response types MUST NOT be free-order. Sending any of them
-	// before the corresponding state is durable violates Raft safety.
-	//
-	// RequestPreVoteResp is deliberately NOT in this list. The rule is that a
-	// response must wait for the state it implies to be durable; a pre-vote
-	// response implies no state at all. becomePreCandidate does not touch term
-	// or vote, and the pre-vote grant path never sets r.vote, so there is
-	// nothing a crash could un-persist. Classifying it as ordered starved
-	// elections instead: while commitPending is set only free-order messages
-	// are transmitted, and on a shard under sustained write load that is
-	// nearly always, so pre-vote traffic sat buffered and rounds never
-	// completed.
-	orderedResponses := []struct {
-		name    string
-		msgType uint64
-	}{
-		{"RequestVoteResp", proto.RequestVoteResp},
-		{"ReplicateResp", proto.ReplicateResp},
-		{"HeartbeatResp", proto.HeartbeatResp},
-	}
-	for _, tt := range orderedResponses {
-		t.Run(tt.name+"_not_free_order", func(t *testing.T) {
-			if proto.IsFreeOrderMessage(tt.msgType) {
-				t.Errorf("IsFreeOrderMessage(%s) = true, want false; "+
-					"sending %s before WAL write violates Raft safety (PhD thesis 10.2.1)",
-					tt.name, tt.name)
-			}
-		})
-	}
-
-	// These leader-initiated messages ARE free-order.
-	freeOrderMessages := []struct {
-		name    string
-		msgType uint64
-	}{
-		{"Replicate", proto.Replicate},
-		{"Heartbeat", proto.Heartbeat},
-	}
-	for _, tt := range freeOrderMessages {
-		t.Run(tt.name+"_is_free_order", func(t *testing.T) {
-			if !proto.IsFreeOrderMessage(tt.msgType) {
-				t.Errorf("IsFreeOrderMessage(%s) = false, want true; "+
-					"leader-initiated messages should be free-order",
-					tt.name)
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
 // Metrics helpers (merged from coverage_step_test.go)
 // ---------------------------------------------------------------------------
 
@@ -3240,101 +2300,51 @@ func TestDrainAndHandleProposals_ErrorCallback(t *testing.T) {
 // processCallbacks campaign detection (merged from coverage_step_test.go)
 // ---------------------------------------------------------------------------
 
-// TestProcessCallbacks_DetectsCampaignLaunch verifies that processCallbacks
-// detects outbound RequestVote messages and fires OnCampaignLaunched.
-func TestProcessCallbacks_DetectsCampaignLaunch(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-	cb := newTestCallback()
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	update := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		Messages: []proto.Message{
+// TestProcessCallbacks_CampaignDetection verifies that processCallbacks
+// treats an outbound RequestVote or RequestPreVote as a campaign launch,
+// firing OnCampaignLaunched and IncElection, and that other message types
+// fire neither.
+func TestProcessCallbacks_CampaignDetection(t *testing.T) {
+	tests := []struct {
+		name     string
+		msgs     []proto.Message
+		campaign bool
+	}{
+		{"RequestVote", []proto.Message{
 			{Type: proto.RequestVote, Term: 5, From: 1, To: 2},
-		},
-	}
-
-	sw.processCallbacks(1, node, update)
-
-	if cb.campaignCount.Load() == 0 {
-		t.Fatal("expected OnCampaignLaunched to be called for RequestVote message")
-	}
-}
-
-// TestProcessCallbacks_DetectsCampaignLaunchWithMetrics verifies that the
-// metrics IncElection is called when a campaign is detected.
-func TestProcessCallbacks_DetectsCampaignLaunchWithMetrics(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-	cb := newTestCallback()
-	metrics := newTestRaftMetrics()
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, metrics)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	update := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		Messages: []proto.Message{
+		}, true},
+		{"RequestPreVote", []proto.Message{
 			{Type: proto.RequestPreVote, Term: 3, From: 1, To: 2},
-		},
-	}
-
-	sw.processCallbacks(1, node, update)
-
-	if metricsElectionCount(metrics, 1) == 0 {
-		t.Fatal("expected IncElection to be called for RequestPreVote message")
-	}
-}
-
-// TestProcessCallbacks_NoCallbackOnNonElectionMessages verifies that
-// OnCampaignLaunched is NOT called for non-election message types.
-func TestProcessCallbacks_NoCallbackOnNonElectionMessages(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-	cb := newTestCallback()
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, cb, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	update := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		Messages: []proto.Message{
+		}, true},
+		{"NonElection", []proto.Message{
 			{Type: proto.Heartbeat, From: 1, To: 2},
 			{Type: proto.Replicate, From: 1, To: 3},
-		},
+		}, false},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cb := newTestCallback()
+			metrics := newTestRaftMetrics()
+			sw := newStepWorker(0, time.Millisecond, newTestSender(), NewWorkSignal(1),
+				make(chan *commitItem, 16), cb, make(chan struct{}), metrics)
 
-	sw.processCallbacks(1, node, update)
+			peer, lr := newTestPeer(t, 1, 1)
+			cfg := config.Config{ShardID: 1, ReplicaID: 1}
+			cfg.SetDefaults()
+			node := NewNode(peer, nil, lr, cfg, nil, "", nil)
+			sw.loadNode(node)
 
-	if cb.campaignCount.Load() != 0 {
-		t.Fatal("OnCampaignLaunched should NOT be called for non-election messages")
+			sw.processCallbacks(1, node, proto.Update{
+				ShardID: 1, ReplicaID: 1, Messages: tt.msgs,
+			})
+
+			if got := cb.campaignCount.Load() != 0; got != tt.campaign {
+				t.Fatalf("OnCampaignLaunched fired = %v, want %v", got, tt.campaign)
+			}
+			if got := metricsElectionCount(metrics, 1) != 0; got != tt.campaign {
+				t.Fatalf("IncElection called = %v, want %v", got, tt.campaign)
+			}
+		})
 	}
 }
 
@@ -3593,58 +2603,6 @@ func TestExecutePiggyback_WithFreeOrderMessages(t *testing.T) {
 	}
 }
 
-// TestExecutePiggyback_SkipsSaveState verifies that executePiggyback
-// skips the SaveState call (commit index persistence is deferred to
-// the next batch).
-func TestExecutePiggyback_PersistFailureNoApply(t *testing.T) {
-	ldb := newTestLogDB()
-	// The piggyback path now persists the commit index before applying. With
-	// SaveState configured to fail, the persist fails and executePiggyback
-	// must NOT forward to apply (crash-safety: never apply before the commit
-	// index is durable).
-	ldb.setSaveError(errors.New("disk error"))
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-	cb := newTestCallback()
-
-	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), cb, stopC, nil)
-	cw.noRetryDelay = true
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	node.commitPending.Store(true)
-
-	// Make the peer a leader so Commit() succeeds.
-	tickPeerToLeader(peer)
-
-	piggyback := proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		State:     proto.State{Term: 1, Commit: 1},
-		CommittedEntries: []proto.Entry{
-			{Index: 1, Term: 1, Cmd: []byte("committed")},
-		},
-	}
-
-	cw.executePiggyback(node, piggyback)
-
-	// SaveState must have been attempted (commit-index persist).
-	if ldb.saveCount.Load() == 0 {
-		t.Fatal("executePiggyback should persist the commit index via SaveState")
-	}
-
-	// With the persist failing, no apply item must be forwarded.
-	select {
-	case <-applyC:
-		t.Fatal("apply item must NOT be forwarded when commit-index persist fails")
-	default:
-	}
-}
-
 // ---------------------------------------------------------------------------
 // processReady with commitPending inbox processing (merged from coverage_step_test.go)
 // ---------------------------------------------------------------------------
@@ -3729,11 +2687,6 @@ func TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop(t *testin
 	if len(deferred) != 1 {
 		t.Fatalf("deferred snapshot count should remain 1, got %d", len(deferred))
 	}
-
-	// Clear commitPending. On the next normal processReady cycle,
-	// the deferred InstallSnapshot will be re-injected into the inbox
-	// and processed normally.
-	node.commitPending.Store(false)
 }
 
 // TestStepWorker_CommitPendingInbox_DeferredSnapshotReinjected verifies

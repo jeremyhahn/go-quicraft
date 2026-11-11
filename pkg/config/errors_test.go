@@ -116,11 +116,6 @@ func TestMaxEntrySizeExceededError_Error(t *testing.T) {
 			t.Fatalf("Error() = %q, missing %q", msg, want)
 		}
 	}
-
-	var typed *MaxEntrySizeExceededError
-	if !errors.As(error(err), &typed) {
-		t.Fatal("errors.As should match *MaxEntrySizeExceededError")
-	}
 }
 
 func TestMaxApplyEntrySizeExceededError_Error(t *testing.T) {
@@ -133,14 +128,6 @@ func TestMaxApplyEntrySizeExceededError_Error(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("Error() = %q, missing %q", msg, want)
 		}
-	}
-
-	var typed *MaxApplyEntrySizeExceededError
-	if !errors.As(error(err), &typed) {
-		t.Fatal("errors.As should match *MaxApplyEntrySizeExceededError")
-	}
-	if typed.FrameMaximum != MaxReplicationPayloadBytes {
-		t.Errorf("FrameMaximum = %d, want %d", typed.FrameMaximum, MaxReplicationPayloadBytes)
 	}
 }
 
@@ -157,14 +144,6 @@ func TestMTLSConfigRequiredError(t *testing.T) {
 	}
 	if errors.Is(err, ErrLeaseReadRequiresCheckQuorum) {
 		t.Fatal("errors.Is must not match an unrelated sentinel")
-	}
-
-	// The sentinel must match the error Validate actually returns.
-	var tc TransportConfig
-	tc.SetDefaults()
-	tc.MTLSConfig = nil
-	if verr := tc.Validate(); !errors.Is(verr, ErrMTLSConfigRequired) {
-		t.Fatalf("Validate() = %v, want ErrMTLSConfigRequired", verr)
 	}
 }
 

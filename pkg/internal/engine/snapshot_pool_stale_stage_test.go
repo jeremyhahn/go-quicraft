@@ -70,7 +70,12 @@ func TestSweepStageDirsReadFails(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(base, "shard-1"), []byte("not a dir"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
+	before := StaleDecryptSweepFailures()
 	SweepStaleRecvStageDirs(base, 1, 1)
+	if after := StaleDecryptSweepFailures(); after <= before {
+		t.Fatalf("StaleDecryptSweepFailures = %d, was %d: an unreadable shard "+
+			"directory was not reported as a failed sweep", after, before)
+	}
 }
 
 // TestMkdirStageDirMissingParent reports the path error instead of looping:

@@ -27,7 +27,8 @@ import (
 // catches up with the full state. With SnapshotEntries=20 and
 // CompactionOverhead=5, the log is compacted after 20 entries leaving
 // only ~5 trailing entries. A new node joining after 50 entries cannot
-// receive the compacted log entries and must catch up via snapshot.
+// receive the compacted log entries and must catch up via snapshot, after
+// which its state machine must equal the leader's exactly.
 func TestE2E_SnapshotCatchUp_NewNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -64,7 +65,34 @@ func TestE2E_SnapshotCatchUp_NewNode(t *testing.T) {
 	// consistent with plain log replay, so the claim in the name of this test
 	// needs the state machine's own recovery count to be checked.
 	assertCaughtUpViaSnapshot(t, result.tracker, 1, 4, membershipTimeout)
-	assertSnapshotTaken(t, cluster, cluster.waitForClusterLeader(1, leaderElectionTimeout))
+	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
+	assertSnapshotTaken(t, cluster, leaderIdx)
+
+	// The new node's state machine is exactly the leader's: same size, every
+	// leader key with the same value, and no key the leader lacks.
+	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
+	if leaderSM == nil {
+		t.Fatalf("leader state machine not found at node[%d]", leaderIdx)
+	}
+	newNodeSM := result.tracker.Get(1, 4)
+	if newNodeSM == nil {
+		t.Fatal("new node state machine not found for replicaID=4")
+	}
+	leaderData := leaderSM.Snapshot()
+	newNodeData := newNodeSM.Snapshot()
+	if len(leaderData) != len(newNodeData) {
+		t.Fatalf("state machine size mismatch: leader has %d entries, new node has %d",
+			len(leaderData), len(newNodeData))
+	}
+	for key, leaderVal := range leaderData {
+		newNodeVal, ok := newNodeData[key]
+		if !ok {
+			t.Fatalf("new node missing key %q that exists on leader", key)
+		}
+		if leaderVal != newNodeVal {
+			t.Fatalf("data mismatch for key %q: leader=%q, new node=%q", key, leaderVal, newNodeVal)
+		}
+	}
 	t.Logf("new node (replicaID=4) caught up with all 50 entries via snapshot")
 
 	// Propose 10 more entries and verify the new node receives them
@@ -83,84 +111,4 @@ func TestE2E_SnapshotCatchUp_NewNode(t *testing.T) {
 	// Verify all 60 entries on the original 3 nodes as well.
 	verifyAllData(t, cluster, trackers, 1, expected)
 	t.Logf("all 60 entries verified on all 4 nodes (snapshot catch-up + normal replication)")
-}
-
-// TestE2E_SnapshotCatchUp_DataIntegrity verifies that data transferred
-// via snapshot to a new node is byte-for-byte identical to the leader's
-// state machine. This ensures no data corruption or loss during the
-// snapshot save, transfer, and recovery pipeline.
-func TestE2E_SnapshotCatchUp_DataIntegrity(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	snapshotCfg := func(shardID, replicaID uint64) config.Config {
-		return testShardConfigWithSnapshot(shardID, replicaID, 15, 5)
-	}
-	trackers := cluster.startShardWithConfig(1, snapshotCfg)
-
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d], proposing 40 entries with varied keys", leaderIdx)
-
-	// Propose 40 entries with the "integrity" prefix. Snapshots trigger
-	// at entries 15 and 30, compaction removes entries below ~25.
-	expected := proposeNEntries(t, cluster, trackers, 1, 40, "integrity")
-	t.Logf("proposed 40 entries, verifying replication on original 3 nodes")
-
-	// Verify replication before adding the new node.
-	verifyAllData(t, cluster, trackers, 1, expected)
-	waitForLogCompacted(t, cluster, 1, membershipTimeout)
-	t.Logf("all 40 entries replicated and compacted, adding new node (replicaID=4)")
-
-	// Add a 4th node that must catch up via snapshot.
-	result := addNodeToCluster(t, cluster, 1, 4, snapshotCfg)
-
-	// Wait for the new node to receive and apply the snapshot.
-	waitForNodeData(t, result.tracker, 1, 4, expected, membershipTimeout)
-	assertCaughtUpViaSnapshot(t, result.tracker, 1, 4, membershipTimeout)
-	t.Logf("new node caught up via snapshot, comparing state machines for data integrity")
-
-	// Re-find the leader since it may have changed during membership change.
-	leaderIdx = cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderReplicaID := uint64(leaderIdx + 1)
-
-	// Get the leader's state machine snapshot.
-	leaderSM := trackers[leaderIdx].Get(1, leaderReplicaID)
-	if leaderSM == nil {
-		t.Fatalf("leader state machine not found at node[%d] replicaID=%d", leaderIdx, leaderReplicaID)
-	}
-	leaderData := leaderSM.Snapshot()
-
-	// Get the new node's state machine snapshot.
-	newNodeSM := result.tracker.Get(1, 4)
-	if newNodeSM == nil {
-		t.Fatal("new node state machine not found for replicaID=4")
-	}
-	newNodeData := newNodeSM.Snapshot()
-
-	// Compare: every key in the leader must exist in the new node with
-	// the same value.
-	if len(leaderData) != len(newNodeData) {
-		t.Fatalf("state machine size mismatch: leader has %d entries, new node has %d entries",
-			len(leaderData), len(newNodeData))
-	}
-
-	for key, leaderVal := range leaderData {
-		newNodeVal, ok := newNodeData[key]
-		if !ok {
-			t.Fatalf("new node missing key %q that exists on leader", key)
-		}
-		if leaderVal != newNodeVal {
-			t.Fatalf("data mismatch for key %q: leader=%q, new node=%q", key, leaderVal, newNodeVal)
-		}
-	}
-
-	// Reverse check: every key in the new node must exist in the leader.
-	for key := range newNodeData {
-		if _, ok := leaderData[key]; !ok {
-			t.Fatalf("new node has extra key %q not present on leader", key)
-		}
-	}
-
-	t.Logf("data integrity verified: %d entries match between leader (node[%d]) and new node (replicaID=4)",
-		len(leaderData), leaderIdx)
 }

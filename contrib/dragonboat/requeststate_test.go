@@ -23,21 +23,6 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-func TestRequestResult_GetResult(t *testing.T) {
-	data := []byte("payload")
-	r := RequestResult{
-		inner: quicraft.RequestResult{Value: 123, Data: data},
-		code:  RequestCompleted,
-	}
-	result := r.GetResult()
-	if result.Value != 123 {
-		t.Errorf("Value = %d, want 123", result.Value)
-	}
-	if string(result.Data) != "payload" {
-		t.Errorf("Data = %q, want %q", string(result.Data), "payload")
-	}
-}
-
 func TestRequestResult_RequestOutOfRange(t *testing.T) {
 	// Dragonboat signals an out-of-range log query with a dedicated result
 	// code carrying the available range, not with an error value.
@@ -54,36 +39,6 @@ func TestRequestResult_RequestOutOfRange(t *testing.T) {
 	}
 	if lr.FirstIndex != 4 || lr.LastIndex != 9 {
 		t.Errorf("LogRange = %+v, want {4 9}", lr)
-	}
-}
-
-func TestRequestResultCode_OutOfRangeString(t *testing.T) {
-	if got := RequestOutOfRange.String(); got != "RequestOutOfRange" {
-		t.Errorf("RequestOutOfRange.String() = %q", got)
-	}
-}
-
-func TestRequestResult_RequestOutOfRange_False(t *testing.T) {
-	r := RequestResult{
-		inner: quicraft.RequestResult{},
-		code:  RequestCompleted,
-	}
-	if r.RequestOutOfRange() {
-		t.Error("expected RequestOutOfRange() to be false")
-	}
-}
-
-func TestRequestResult_SnapshotIndex_FromTranslateResult(t *testing.T) {
-	// A completed snapshot request delivered through translateResult must
-	// surface the quicraft result Value as the snapshot index, matching
-	// dragonboat's behavior of returning the request result's value.
-	qr := quicraft.RequestResult{Value: 7788}
-	r := translateResult(qr)
-	if !r.Completed() {
-		t.Fatal("expected Completed() to be true for nil error")
-	}
-	if r.SnapshotIndex() != 7788 {
-		t.Errorf("SnapshotIndex() = %d, want 7788", r.SnapshotIndex())
 	}
 }
 
@@ -110,17 +65,6 @@ func TestRequestResult_RaftLogs_WithEntries(t *testing.T) {
 	}
 }
 
-func TestRequestResult_RaftLogs_NoEntries(t *testing.T) {
-	r := RequestResult{code: RequestCompleted}
-	gotEntries, lr := r.RaftLogs()
-	if gotEntries != nil {
-		t.Errorf("expected nil entries, got %v", gotEntries)
-	}
-	if lr.FirstIndex != 0 || lr.LastIndex != 0 {
-		t.Errorf("expected zero LogRange, got {%d, %d}", lr.FirstIndex, lr.LastIndex)
-	}
-}
-
 func TestRequestResultCode_String(t *testing.T) {
 	tests := []struct {
 		code RequestResultCode
@@ -133,6 +77,7 @@ func TestRequestResultCode_String(t *testing.T) {
 		{RequestDropped, "RequestDropped"},
 		{RequestAborted, "RequestAborted"},
 		{RequestCommitted, "RequestCommitted"},
+		{RequestOutOfRange, "RequestOutOfRange"},
 		{RequestResultCode(99), "RequestResultCode(99)"},
 	}
 	for _, tc := range tests {
@@ -195,11 +140,14 @@ func TestTranslateResult(t *testing.T) {
 	if string(result.Data) != "data" {
 		t.Errorf("Data = %q, want %q", string(result.Data), "data")
 	}
-}
+	// A completed snapshot request surfaces the quicraft result Value as
+	// the snapshot index, matching dragonboat's behavior of returning the
+	// request result's value.
+	if r.SnapshotIndex() != 55 {
+		t.Errorf("SnapshotIndex() = %d, want 55", r.SnapshotIndex())
+	}
 
-func TestTranslateResult_WithError(t *testing.T) {
-	qr := quicraft.RequestResult{Err: quicraft.ErrTimeout}
-	r := translateResult(qr)
+	r = translateResult(quicraft.RequestResult{Err: quicraft.ErrTimeout})
 	if !r.Timeout() {
 		t.Error("expected Timeout() for ErrTimeout")
 	}
@@ -232,59 +180,26 @@ func TestRequestState_makeAdaptedChannel_NilInner(t *testing.T) {
 	}
 }
 
-func TestSysOpState_ResultC_IsAliasForCompletedC(t *testing.T) {
-	s := &SysOpState{
-		inner:      quicraft.NewRequestStatePool().Get().(*quicraft.RequestState),
-		completedC: make(chan struct{}),
-	}
-	close(s.completedC)
-
-	completedC := s.CompletedC()
-	resultC := s.ResultC()
-
-	// Both should signal completion.
-	select {
-	case <-completedC:
-	default:
-		t.Error("expected CompletedC to be closed")
-	}
-	select {
-	case <-resultC:
-	default:
-		t.Error("expected ResultC to also be closed")
-	}
-}
-
-func TestSysOpState_Release(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-	s := &SysOpState{
-		inner:      inner,
-		completedC: make(chan struct{}),
-	}
-	close(s.completedC)
-	// Verify Release does not panic.
-	s.Release()
-}
-
 func TestRequestResult_AllCodes(t *testing.T) {
 	codes := []struct {
-		code      RequestResultCode
-		timeout   bool
-		completed bool
-		rejected  bool
-		term      bool
-		dropped   bool
-		aborted   bool
-		committed bool
+		code       RequestResultCode
+		timeout    bool
+		completed  bool
+		rejected   bool
+		term       bool
+		dropped    bool
+		aborted    bool
+		committed  bool
+		outOfRange bool
 	}{
-		{RequestTimeout, true, false, false, false, false, false, false},
-		{RequestCompleted, false, true, false, false, false, false, true},
-		{RequestTerminated, false, false, false, true, false, false, false},
-		{RequestRejected, false, false, true, false, false, false, false},
-		{RequestDropped, false, false, false, false, true, false, false},
-		{RequestAborted, false, false, false, false, false, true, false},
-		{RequestCommitted, false, false, false, false, false, false, true},
+		{RequestTimeout, true, false, false, false, false, false, false, false},
+		{RequestCompleted, false, true, false, false, false, false, true, false},
+		{RequestTerminated, false, false, false, true, false, false, false, false},
+		{RequestRejected, false, false, true, false, false, false, false, false},
+		{RequestDropped, false, false, false, false, true, false, false, false},
+		{RequestAborted, false, false, false, false, false, true, false, false},
+		{RequestCommitted, false, false, false, false, false, false, true, false},
+		{RequestOutOfRange, false, false, false, false, false, false, false, true},
 	}
 	for _, tc := range codes {
 		r := RequestResult{code: tc.code}
@@ -308,6 +223,9 @@ func TestRequestResult_AllCodes(t *testing.T) {
 		}
 		if r.Committed() != tc.committed {
 			t.Errorf("code %d: Committed() = %v, want %v", tc.code, r.Committed(), tc.committed)
+		}
+		if r.RequestOutOfRange() != tc.outOfRange {
+			t.Errorf("code %d: RequestOutOfRange() = %v, want %v", tc.code, r.RequestOutOfRange(), tc.outOfRange)
 		}
 	}
 }
@@ -358,31 +276,6 @@ func TestWrapSysOpState_Release(t *testing.T) {
 // AppliedC on wrapped (non-resolved) RequestState
 // ---------------------------------------------------------------------------
 
-func TestRequestState_AppliedC_NonResolved(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner, false)
-
-	// AppliedC should return the CompletedC channel (adapted from inner).
-	ch := rs.AppliedC()
-	if ch == nil {
-		t.Error("expected non-nil AppliedC channel for wrapped RequestState")
-	}
-	rs.Release()
-}
-
-func TestRequestState_ResultC_NonResolved(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner, false)
-
-	ch := rs.ResultC()
-	if ch == nil {
-		t.Error("expected non-nil ResultC channel for wrapped RequestState")
-	}
-	rs.Release()
-}
-
 // ---------------------------------------------------------------------------
 // WrapRequestStateWithCancel
 // ---------------------------------------------------------------------------
@@ -405,24 +298,6 @@ func TestWrapRequestStateWithCancel_CancelOnRelease(t *testing.T) {
 	}
 }
 
-func TestWrapRequestStateForShardWithCancel_ShardID(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-
-	canceled := false
-	cancel := func() { canceled = true }
-
-	rs := WrapRequestStateForShardWithCancel(inner, 99, cancel, false)
-	if rs.ShardID() != 99 {
-		t.Errorf("ShardID() = %d, want 99", rs.ShardID())
-	}
-
-	rs.Release()
-	if !canceled {
-		t.Error("cancel should be called on Release")
-	}
-}
-
 func TestWrapRequestStateForShardWithCancel_CancelNotCalledPrematurely(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
@@ -431,6 +306,9 @@ func TestWrapRequestStateForShardWithCancel_CancelNotCalledPrematurely(t *testin
 	cancel := func() { canceled = true }
 
 	rs := WrapRequestStateForShardWithCancel(inner, 42, cancel, false)
+	if rs.ShardID() != 42 {
+		t.Errorf("ShardID() = %d, want 42", rs.ShardID())
+	}
 
 	// Access channels before release -- cancel should not fire.
 	ch := rs.ResultC()
@@ -483,91 +361,8 @@ func TestSysOpState_DoubleReleaseReachesInnerOnce(t *testing.T) {
 // Goroutine leak prevention tests
 // ---------------------------------------------------------------------------
 
-func TestRequestState_ReleaseBeforeResult_NoGoroutineLeak(t *testing.T) {
-	// Force GC and stabilize goroutine count before the test.
-	runtime.GC()
-	stabilizeTimer := time.NewTimer(50 * time.Millisecond)
-	<-stabilizeTimer.C
-	stabilizeTimer.Stop()
-	baseline := runtime.NumGoroutine()
-
-	// Create multiple wrapped RequestStates whose inner channels will
-	// never receive a value, then Release them immediately.
-	const count = 50
-	states := make([]*RequestState, count)
-	for i := range states {
-		pool := quicraft.NewRequestStatePool()
-		inner := pool.Get().(*quicraft.RequestState)
-		states[i] = WrapRequestState(inner, false)
-	}
-
-	// Release all before any result is delivered.
-	for _, rs := range states {
-		rs.Release()
-	}
-
-	// Allow bridge goroutines to observe doneC and exit.
-	runtime.Gosched()
-	drainTimer := time.NewTimer(100 * time.Millisecond)
-	<-drainTimer.C
-	drainTimer.Stop()
-	runtime.GC()
-
-	after := runtime.NumGoroutine()
-	// Allow a small margin for unrelated runtime goroutines, but the
-	// bridge goroutines (2 per RequestState = 100 total) must not leak.
-	leaked := after - baseline
-	if leaked > 5 {
-		t.Errorf("goroutine leak detected: baseline=%d, after=%d, leaked=%d", baseline, after, leaked)
-	}
-}
-
-func TestRequestState_ResultThenRelease_NormalFlow(t *testing.T) {
-	// Use newResolvedRequestState to simulate the normal flow where a
-	// result arrives and the caller reads it before calling Release.
-	result := RequestResult{
-		inner: quicraft.RequestResult{Value: 99, Data: []byte("ok")},
-		code:  RequestCompleted,
-	}
-	rs := newResolvedRequestState(result)
-
-	ch := rs.AppliedC()
-	if ch == nil {
-		t.Fatal("expected non-nil AppliedC channel")
-	}
-
-	select {
-	case r := <-ch:
-		if r.GetResult().Value != 99 {
-			t.Errorf("Value = %d, want 99", r.GetResult().Value)
-		}
-		if string(r.GetResult().Data) != "ok" {
-			t.Errorf("Data = %q, want %q", string(r.GetResult().Data), "ok")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for result")
-	}
-
-	// Release after consuming the result - should not panic.
-	rs.Release()
-}
-
-func TestRequestState_DoubleRelease_NoPanic(t *testing.T) {
-	pool := quicraft.NewRequestStatePool()
-	inner := pool.Get().(*quicraft.RequestState)
-	rs := WrapRequestState(inner, false)
-
-	// Double release should not panic (doneOnce protects close).
-	rs.Release()
-	rs.Release()
-}
-
 func TestSysOpState_ReleaseBeforeCompletion_NoGoroutineLeak(t *testing.T) {
-	// Force GC and stabilize goroutine count before the test.
 	runtime.GC()
-	stabilizeTimer := time.NewTimer(50 * time.Millisecond)
-	<-stabilizeTimer.C
-	stabilizeTimer.Stop()
 	baseline := runtime.NumGoroutine()
 
 	// Create multiple SysOpStates whose inner channels will never
@@ -580,17 +375,11 @@ func TestSysOpState_ReleaseBeforeCompletion_NoGoroutineLeak(t *testing.T) {
 		states[i] = WrapSysOpState(inner)
 	}
 
-	// Release all before any result is delivered.
+	// Release all before any result is delivered. Release waits for the
+	// wrapper goroutine, so no grace sleep is needed before counting.
 	for _, s := range states {
 		s.Release()
 	}
-
-	// Allow bridge goroutines to observe doneC and exit.
-	runtime.Gosched()
-	drainTimer := time.NewTimer(100 * time.Millisecond)
-	<-drainTimer.C
-	drainTimer.Stop()
-	runtime.GC()
 
 	after := runtime.NumGoroutine()
 	leaked := after - baseline
@@ -613,9 +402,6 @@ func TestSysOpState_DoubleRelease_NoPanic(t *testing.T) {
 func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) {
 	// Verify the ResultC aggregate bridge goroutine also exits on Release.
 	runtime.GC()
-	stabilizeTimer := time.NewTimer(50 * time.Millisecond)
-	<-stabilizeTimer.C
-	stabilizeTimer.Stop()
 	baseline := runtime.NumGoroutine()
 
 	const count = 50
@@ -631,15 +417,11 @@ func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) 
 		}
 	}
 
+	// Release waits for its bridges, so the goroutine count is back at the
+	// baseline the moment the loop finishes; no grace sleep needed.
 	for _, rs := range states {
 		rs.Release()
 	}
-
-	runtime.Gosched()
-	drainTimer := time.NewTimer(100 * time.Millisecond)
-	<-drainTimer.C
-	drainTimer.Stop()
-	runtime.GC()
 
 	after := runtime.NumGoroutine()
 	leaked := after - baseline
@@ -675,6 +457,9 @@ func TestResolvedRequestState_MultipleReads(t *testing.T) {
 		if r.GetResult().Value != 88 {
 			t.Errorf("ResultC Value = %d, want 88", r.GetResult().Value)
 		}
+		if string(r.GetResult().Data) != "multi" {
+			t.Errorf("ResultC Data = %q, want %q", string(r.GetResult().Data), "multi")
+		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out reading from ResultC")
 	}
@@ -685,6 +470,9 @@ func TestResolvedRequestState_MultipleReads(t *testing.T) {
 		t.Fatal("resolved RequestState delivered a second value")
 	default:
 	}
+
+	// Release after consuming the result must not panic.
+	rs.Release()
 }
 
 func BenchmarkTranslateResultCode(b *testing.B) {

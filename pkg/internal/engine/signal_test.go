@@ -39,22 +39,16 @@ func TestWorkSignal_NotifySendsToCorrectWorker(t *testing.T) {
 	if _, ok := got[5]; !ok {
 		t.Fatal("expected shard 5 in worker 1 ready map")
 	}
-}
 
-func TestWorkSignal_NotifyNoNotificationToOtherWorkers(t *testing.T) {
-	const numWorkers = 4
-	ws := NewWorkSignal(numWorkers)
-
-	// Shard 5 routes to worker 1.
-	ws.Notify(5)
-
-	// Workers 0, 2, 3 should NOT have received notifications.
+	// The other workers have no notification and an empty ready map.
 	for _, wid := range []int{0, 2, 3} {
 		select {
 		case <-ws.WaitC(wid):
 			t.Fatalf("worker %d should not have received notification", wid)
 		default:
-			// Expected: no notification.
+		}
+		if got := ws.Swap(wid); len(got) != 0 {
+			t.Fatalf("worker %d: expected empty ready map, got %d", wid, len(got))
 		}
 	}
 }
@@ -93,6 +87,11 @@ func TestWorkSignal_SwapReturnsReadyShardsForCorrectWorker(t *testing.T) {
 	}
 	if _, ok := got1[1]; !ok {
 		t.Fatal("worker 1: expected shard 1")
+	}
+
+	// Swap drained the map: with no new notifications the next swap is empty.
+	if got := ws.Swap(0); len(got) != 0 {
+		t.Fatalf("worker 0 second swap: expected 0 shards, got %d", len(got))
 	}
 }
 
@@ -174,65 +173,6 @@ func TestWorkSignal_AtomicPreFilterAvoidsDoubleChannelSend(t *testing.T) {
 		t.Fatal("expected channel to be empty after single drain")
 	default:
 		// Expected.
-	}
-}
-
-func TestWorkSignal_MultipleWorkersIndependent(t *testing.T) {
-	const numWorkers = 4
-	ws := NewWorkSignal(numWorkers)
-
-	// Notify worker 2 only.
-	ws.Notify(2) // 2 % 4 = 2.
-
-	// Worker 2 should be notified.
-	select {
-	case <-ws.WaitC(2):
-	case <-time.After(time.Second):
-		t.Fatal("worker 2 should have received notification")
-	}
-
-	// Other workers should have no notifications and empty ready maps.
-	for _, wid := range []int{0, 1, 3} {
-		select {
-		case <-ws.WaitC(wid):
-			t.Fatalf("worker %d should not have a notification", wid)
-		default:
-		}
-		got := ws.Swap(wid)
-		if len(got) != 0 {
-			t.Fatalf("worker %d: expected empty ready map, got %d", wid, len(got))
-		}
-	}
-}
-
-func TestWorkSignal_NotifyAndSwapCycle(t *testing.T) {
-	ws := NewWorkSignal(2)
-
-	// Full lifecycle: notify, wait, clear, swap, process.
-	ws.Notify(0) // Worker 0.
-	ws.Notify(2) // Worker 0 (2 % 2 = 0).
-	ws.Notify(1) // Worker 1 (1 % 2 = 1).
-
-	// Worker 0 cycle.
-	<-ws.WaitC(0)
-	ws.ClearNotified(0)
-	got0 := ws.Swap(0)
-	if len(got0) != 2 {
-		t.Fatalf("worker 0: expected 2 shards, got %d", len(got0))
-	}
-
-	// Worker 1 cycle.
-	<-ws.WaitC(1)
-	ws.ClearNotified(1)
-	got1 := ws.Swap(1)
-	if len(got1) != 1 {
-		t.Fatalf("worker 1: expected 1 shard, got %d", len(got1))
-	}
-
-	// Second cycle: no notifications, swap should be empty.
-	got0 = ws.Swap(0)
-	if len(got0) != 0 {
-		t.Fatalf("worker 0 second cycle: expected 0 shards, got %d", len(got0))
 	}
 }
 

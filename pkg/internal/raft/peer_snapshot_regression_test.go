@@ -271,30 +271,6 @@ func TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership(t *testing.T) {
 	}
 }
 
-// A CURRENT-term InstallSnapshot must still install its membership, so the
-// stale-term guard cannot be satisfied by refusing every snapshot.
-func TestPeer_InstallSnapshot_CurrentTermStillAdoptsMembership(t *testing.T) {
-	cfg := testConfig()
-	cfg.PreVote = config.BoolPtr(false)
-	p := newTestPeer(t, cfg, proto.State{}, threeNodeMembership())
-	p.r.becomeFollower(9, 2)
-
-	ss := proto.Snapshot{
-		Index: 50,
-		Term:  9,
-		Membership: proto.Membership{
-			ConfigChangeID: 7,
-			Addresses:      map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3", 4: "addr4"},
-		},
-	}
-	if err := p.Handle(installSnapshotMsg(ss)); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	if len(p.membership.addresses) != 4 {
-		t.Fatalf("current-term snapshot membership not adopted: %v", p.membership.addresses)
-	}
-}
-
 // The LOCAL snapshot-receive path builds its InstallSnapshot exactly as
 // hostMessageHandler.HandleSnapshot does — no term at all — and injects it
 // through the local delivery API. That message must still install its

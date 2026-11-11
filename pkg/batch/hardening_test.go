@@ -175,6 +175,9 @@ func TestSubmit_ProposerErrorIndeterminacy(t *testing.T) {
 			if !errors.As(submitErr, &flushErr) {
 				t.Fatalf("error = %T (%v), want *FlushError", submitErr, submitErr)
 			}
+			if flushErr.ShardID != 1 {
+				t.Errorf("FlushError.ShardID = %d, want 1", flushErr.ShardID)
+			}
 			if flushErr.Indeterminate != tc.indeterminate {
 				t.Errorf("Indeterminate = %v, want %v", flushErr.Indeterminate, tc.indeterminate)
 			}

@@ -69,37 +69,20 @@ func TestIntegration_DB_SyncRead_AfterLeaderChange(t *testing.T) {
 	// is that the DATA survived the leadership change, not which replica serves
 	// it -- and with one node stopped the surviving two can elect again, so
 	// newLeaderIdx is a snapshot and each read re-resolves.
-	oldResult := cluster.readFromLeader(t, 1, encodeKVGet("pre-leader-change"), defaultTimeout)
-	oldVal, ok := oldResult.(string)
-	if !ok {
-		t.Fatalf("SyncRead returned type %T, want string", oldResult)
+	for _, want := range []struct{ key, value string }{
+		{"pre-leader-change", "old-value"},
+		{"pre-leader-change-2", "old-value-2"},
+		{"post-leader-change", "new-value"},
+	} {
+		result := cluster.readFromLeader(t, 1, encodeKVGet(want.key), defaultTimeout)
+		val, ok := result.(string)
+		if !ok {
+			t.Fatalf("SyncRead(%s) returned type %T, want string", want.key, result)
+		}
+		if val != want.value {
+			t.Fatalf("SyncRead(%s) = %q, want %q", want.key, val, want.value)
+		}
 	}
-	if oldVal != "old-value" {
-		t.Fatalf("SyncRead(pre-leader-change) = %q, want %q", oldVal, "old-value")
-	}
-	t.Logf("old entry readable after leader change: %q = %q", "pre-leader-change", oldVal)
-
-	// Verify linearizable reads of old entry #2.
-	oldResult2 := cluster.readFromLeader(t, 1, encodeKVGet("pre-leader-change-2"), defaultTimeout)
-	oldVal2, ok2 := oldResult2.(string)
-	if !ok2 {
-		t.Fatalf("SyncRead returned type %T, want string", oldResult2)
-	}
-	if oldVal2 != "old-value-2" {
-		t.Fatalf("SyncRead(pre-leader-change-2) = %q, want %q", oldVal2, "old-value-2")
-	}
-	t.Logf("old entry 2 readable after leader change: %q = %q", "pre-leader-change-2", oldVal2)
-
-	// Verify linearizable reads of the new entry.
-	newResult := cluster.readFromLeader(t, 1, encodeKVGet("post-leader-change"), defaultTimeout)
-	newVal, ok3 := newResult.(string)
-	if !ok3 {
-		t.Fatalf("SyncRead returned type %T, want string", newResult)
-	}
-	if newVal != "new-value" {
-		t.Fatalf("SyncRead(post-leader-change) = %q, want %q", newVal, "new-value")
-	}
-	t.Logf("new entry readable after leader change: %q = %q", "post-leader-change", newVal)
 
 	// Verify a follower also serves correct reads after leader change.
 	followerIdx := -1

@@ -22,55 +22,6 @@ import (
 	"testing"
 )
 
-// Compile-time interface satisfaction check. This declaration verifies that
-// any concrete type claiming to implement LogDB will fail to compile if the
-// interface changes. The testLogDB type below is a minimal implementation
-// used solely for this purpose.
-var _ LogDB = (*testLogDB)(nil)
-
-// testLogDB is a minimal LogDB implementation used exclusively for the
-// compile-time interface satisfaction check above.
-type testLogDB struct{}
-
-func (t *testLogDB) Name() string { return "test" }
-
-func (t *testLogDB) SaveState(_ []Update) error { return nil }
-
-func (t *testLogDB) IterateEntries(entries []Entry, size uint64, _ uint64, _ uint64,
-	_ uint64, _ uint64, _ uint64) ([]Entry, uint64, error) {
-	return entries, size, nil
-}
-
-func (t *testLogDB) ReadState(_ uint64, _ uint64) (State, Membership, error) {
-	return State{}, Membership{}, nil
-}
-
-func (t *testLogDB) EntryRange(_ uint64, _ uint64) (uint64, uint64, error) { return 0, 0, nil }
-
-func (t *testLogDB) RemoveEntriesTo(_ uint64, _ uint64, _ uint64) error { return nil }
-
-func (t *testLogDB) Compact(_ uint64, _ uint64) error { return nil }
-
-func (t *testLogDB) SaveSnapshot(_ uint64, _ uint64, _ Snapshot) error { return nil }
-
-func (t *testLogDB) GetSnapshot(_ uint64, _ uint64) (Snapshot, error) {
-	return Snapshot{}, nil
-}
-
-func (t *testLogDB) RemoveNodeData(_ uint64, _ uint64) error { return nil }
-
-func (t *testLogDB) NodeRemoved(_, _ uint64) (bool, error) { return false, nil }
-
-func (t *testLogDB) ListNodeInfo() ([]NodeInfo, error) { return nil, nil }
-
-func (t *testLogDB) SaveBootstrap(_ uint64, _ uint64, _ Bootstrap) error { return nil }
-
-func (t *testLogDB) GetBootstrap(_ uint64, _ uint64) (Bootstrap, bool, error) {
-	return Bootstrap{}, false, nil
-}
-
-func (t *testLogDB) Close() error { return nil }
-
 // --- Error tests ---
 
 // The sentinel group pins production values: losing the "logdb: " prefix, or

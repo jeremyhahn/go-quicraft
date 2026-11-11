@@ -42,35 +42,19 @@ func TestE2E_ThreeNodeCluster_LeaderElection(t *testing.T) {
 	t.Logf("leader elected at node index %d (single-leader check settled on node[%d])", leaderIdx, singleIdx)
 }
 
-// TestE2E_FiveNodeCluster_LeaderElection verifies that a 5-node cluster
-// successfully elects a leader.
-func TestE2E_FiveNodeCluster_LeaderElection(t *testing.T) {
-	cluster := newTestCluster(t, 5)
-	defer cluster.close()
-
-	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	if leaderIdx < 0 || leaderIdx >= 5 {
-		t.Fatalf("expected leader index in [0,4], got %d", leaderIdx)
-	}
-
-	// Wait for exactly one leader, checking election safety on every poll.
-	singleIdx := waitForSingleLeader(t, cluster, 1, leaderElectionTimeout)
-
-	t.Logf("5-node cluster elected leader at node index %d (single-leader check settled on node[%d])",
-		leaderIdx, singleIdx)
-}
-
-// TestE2E_FiveNodeCluster_AllNodesAgreeOnLeader verifies that all 5 nodes
-// in a cluster converge on the same leader ID for a shard. With 5 nodes,
-// the leader needs heartbeats to propagate to 4 followers.
+// TestE2E_FiveNodeCluster_AllNodesAgreeOnLeader verifies that a 5-node
+// cluster elects exactly one leader for a shard and that all 5 nodes
+// converge on the same leader ID. With 5 nodes, the leader needs heartbeats
+// to propagate to 4 followers.
 func TestE2E_FiveNodeCluster_AllNodesAgreeOnLeader(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
 
 	cluster.startShard(1)
 	cluster.waitForClusterLeader(1, leaderElectionTimeout)
+
+	// Wait for exactly one leader, checking election safety on every poll.
+	waitForSingleLeader(t, cluster, 1, leaderElectionTimeout)
 
 	// Wait for all 5 nodes to converge on the same non-zero leader.
 	// After one node becomes leader, followers need a heartbeat round

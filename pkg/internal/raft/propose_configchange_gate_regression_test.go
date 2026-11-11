@@ -78,92 +78,84 @@ func proposeConfigChangeOverTheWire(t *testing.T, p *Peer, cc proto.ConfigChange
 	})
 }
 
-// TestWirePropose_DuplicateIdentityIsRefused is the quorum-forgery test. The
-// configuration already binds "identity-1" to replica 1. A wire-forwarded
-// Propose adds replica 7 with the SAME identity — so one keypair would
-// authenticate as two independent members of the quorum.
-func TestWirePropose_DuplicateIdentityIsRefused(t *testing.T) {
+// TestWirePropose_InvalidConfigChangeIsRefused steps one wire-forwarded
+// config change per membership rule and requires the leader to refuse it,
+// leave its log as it was and leave pendingConfigChange unarmed: a rejected
+// change that armed it would wedge every later membership change.
+//
+//   - duplicate_identity is the quorum-forgery case. The configuration already
+//     binds "identity-1" to replica 1; adding replica 7 with the SAME identity
+//     lets one keypair authenticate as two independent members of the quorum.
+//   - duplicate_address is the address-path equivalent: a certificate is
+//     matched on the address alone, so two active replicas at one committed
+//     address let the single host behind it speak as both.
+//   - removed_replica is the tombstone. The Removed set is the per-shard
+//     DENY-list; re-adding a tombstoned replica un-removes it on every
+//     replica, because the apply path converges on the committed entry.
+//   - empty_address is the structural rule: an AddNode with no address commits
+//     a voter nothing can reach, changing the quorum denominator with no way
+//     to satisfy it.
+func TestWirePropose_InvalidConfigChangeIsRefused(t *testing.T) {
 	quietLogs(t)
 
-	p := leaderPeerWithMembership(t, proto.Membership{
-		Addresses:  map[uint64]string{1: "addr1"},
-		Identities: map[uint64]string{1: "identity-1"},
-	})
-	lastBefore := p.r.log.lastIndex()
-
-	err := proposeConfigChangeOverTheWire(t, p, proto.ConfigChange{
-		Type:         proto.AddNode,
-		ReplicaID:    7,
-		Address:      "addr7",
-		NodeIdentity: "identity-1",
-	})
-	if !errors.Is(err, ErrDuplicateMemberIdentity) {
-		t.Fatalf("wire Propose returned %v, want ErrDuplicateMemberIdentity: one "+
-			"keypair authorized as two replica IDs holds two votes and two match "+
-			"indices in a quorum that believes they are independent", err)
+	cases := []struct {
+		name       string
+		membership proto.Membership
+		change     proto.ConfigChange
+		want       error
+	}{
+		{
+			name: "duplicate_identity",
+			membership: proto.Membership{
+				Addresses:  map[uint64]string{1: "addr1"},
+				Identities: map[uint64]string{1: "identity-1"},
+			},
+			change: proto.ConfigChange{
+				Type: proto.AddNode, ReplicaID: 7, Address: "addr7", NodeIdentity: "identity-1",
+			},
+			want: ErrDuplicateMemberIdentity,
+		},
+		{
+			name:       "duplicate_address",
+			membership: proto.Membership{Addresses: map[uint64]string{1: "addr1"}},
+			change:     proto.ConfigChange{Type: proto.AddNode, ReplicaID: 7, Address: "addr1"},
+			want:       ErrDuplicateMemberAddress,
+		},
+		{
+			name: "removed_replica",
+			membership: proto.Membership{
+				Addresses: map[uint64]string{1: "addr1"},
+				Removed:   map[uint64]bool{9: true},
+			},
+			change: proto.ConfigChange{Type: proto.AddNode, ReplicaID: 9, Address: "addr9"},
+			want:   ErrNodeRemoved,
+		},
+		{
+			name:       "empty_address",
+			membership: proto.Membership{Addresses: map[uint64]string{1: "addr1"}},
+			change:     proto.ConfigChange{Type: proto.AddNode, ReplicaID: 7},
+			want:       ErrEmptyAddress,
+		},
 	}
-	if p.r.log.lastIndex() != lastBefore {
-		t.Fatalf("lastIndex advanced %d -> %d: the entry entered the log, and the "+
-			"apply path never re-validates, so every replica applies it",
-			lastBefore, p.r.log.lastIndex())
-	}
-	if p.r.pendingConfigChange {
-		t.Fatal("a rejected config change left pendingConfigChange armed, which " +
-			"wedges every later membership change on this leader")
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := leaderPeerWithMembership(t, tc.membership)
+			lastBefore := p.r.log.lastIndex()
 
-// TestWirePropose_DuplicateAddressIsRefused covers the address-path equivalent:
-// a certificate is matched on the address alone, so two active replicas at one
-// committed address let the single host behind it speak as both.
-func TestWirePropose_DuplicateAddressIsRefused(t *testing.T) {
-	quietLogs(t)
-
-	p := leaderPeerWithMembership(t, proto.Membership{
-		Addresses: map[uint64]string{1: "addr1"},
-	})
-	err := proposeConfigChangeOverTheWire(t, p, proto.ConfigChange{
-		Type: proto.AddNode, ReplicaID: 7, Address: "addr1",
-	})
-	if !errors.Is(err, ErrDuplicateMemberAddress) {
-		t.Fatalf("wire Propose returned %v, want ErrDuplicateMemberAddress", err)
-	}
-}
-
-// TestWirePropose_RemovedReplicaCannotBeReAdded covers the tombstone. The
-// Removed set is the per-shard DENY-list; a wire Propose that re-adds a
-// tombstoned replica un-removes it on every replica, because the apply path
-// converges on the committed entry.
-func TestWirePropose_RemovedReplicaCannotBeReAdded(t *testing.T) {
-	quietLogs(t)
-
-	p := leaderPeerWithMembership(t, proto.Membership{
-		Addresses: map[uint64]string{1: "addr1"},
-		Removed:   map[uint64]bool{9: true},
-	})
-	err := proposeConfigChangeOverTheWire(t, p, proto.ConfigChange{
-		Type: proto.AddNode, ReplicaID: 9, Address: "addr9",
-	})
-	if !errors.Is(err, ErrNodeRemoved) {
-		t.Fatalf("wire Propose returned %v, want ErrNodeRemoved: a re-add of a "+
-			"tombstoned replica reverses a committed removal", err)
-	}
-}
-
-// TestWirePropose_EmptyAddressIsRefused covers the structural rule that produces
-// an unroutable member: an AddNode with no address commits a voter nothing can
-// reach, changing the quorum denominator with no way to satisfy it.
-func TestWirePropose_EmptyAddressIsRefused(t *testing.T) {
-	quietLogs(t)
-
-	p := leaderPeerWithMembership(t, proto.Membership{
-		Addresses: map[uint64]string{1: "addr1"},
-	})
-	err := proposeConfigChangeOverTheWire(t, p, proto.ConfigChange{
-		Type: proto.AddNode, ReplicaID: 7,
-	})
-	if !errors.Is(err, ErrEmptyAddress) {
-		t.Fatalf("wire Propose returned %v, want ErrEmptyAddress", err)
+			err := proposeConfigChangeOverTheWire(t, p, tc.change)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("wire Propose returned %v, want %v", err, tc.want)
+			}
+			if p.r.log.lastIndex() != lastBefore {
+				t.Fatalf("lastIndex advanced %d -> %d: the entry entered the log, and the "+
+					"apply path never re-validates, so every replica applies it",
+					lastBefore, p.r.log.lastIndex())
+			}
+			if p.r.pendingConfigChange {
+				t.Fatal("a rejected config change left pendingConfigChange armed, which " +
+					"wedges every later membership change on this leader")
+			}
+		})
 	}
 }
 

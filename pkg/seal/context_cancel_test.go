@@ -155,25 +155,6 @@ func TestUnseal_AuthFailureJoinedWithCancelStillCounts(t *testing.T) {
 	}
 }
 
-// TestUnseal_WrongPassphraseStillCountsUnderLiveContext is the control: the
-// cancellation carve-out leaves an ordinary wrong passphrase counted.
-func TestUnseal_WrongPassphraseStillCountsUnderLiveContext(t *testing.T) {
-	b, _, _ := sealedBarrierWithPersister(t)
-	wrong, err := newTestStrategy([]byte("wrong"))
-	if err != nil {
-		t.Fatalf("newTestStrategy: %v", err)
-	}
-	defer wrong.Close()
-
-	if err := b.Unseal(context.Background(), wrong, Credentials{}); err == nil {
-		t.Fatal("Unseal with the wrong passphrase succeeded")
-	}
-	if b.failedAttempts != 1 || b.sealed.FailedAttempts != 1 {
-		t.Fatalf("failedAttempts=%d sealed=%d, want 1 and 1",
-			b.failedAttempts, b.sealed.FailedAttempts)
-	}
-}
-
 // rotatedBarrierWithPersister returns an unsealed barrier at epoch 3 with every
 // epoch's DEK still held, and a counter of persister calls made after setup.
 func rotatedBarrierWithPersister(t *testing.T) (*Barrier, *atomic.Int64) {

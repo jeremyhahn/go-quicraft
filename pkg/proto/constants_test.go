@@ -51,6 +51,7 @@ func TestMessageTypeName(t *testing.T) {
 		{RateLimit, "RateLimit"},
 		{LeaderExec, "LeaderExec"},
 		{LeaderExecResp, "LeaderExecResp"},
+		{9999, "Unknown(9999)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {
@@ -59,13 +60,6 @@ func TestMessageTypeName(t *testing.T) {
 				t.Errorf("MessageTypeName(%d) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestMessageTypeName_Unknown(t *testing.T) {
-	got := MessageTypeName(9999)
-	if got != "Unknown(9999)" {
-		t.Errorf("MessageTypeName(9999) = %q, want %q", got, "Unknown(9999)")
 	}
 }
 
@@ -79,6 +73,7 @@ func TestConfigChangeTypeName(t *testing.T) {
 		{AddNonVoting, "AddNonVoting"},
 		{AddWitness, "AddWitness"},
 		{UpdateWitnessPolicy, "UpdateWitnessPolicy"},
+		{999, "Unknown(999)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {
@@ -87,13 +82,6 @@ func TestConfigChangeTypeName(t *testing.T) {
 				t.Errorf("ConfigChangeTypeName(%d) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestConfigChangeTypeName_Unknown(t *testing.T) {
-	got := ConfigChangeTypeName(999)
-	if got != "Unknown(999)" {
-		t.Errorf("ConfigChangeTypeName(999) = %q, want %q", got, "Unknown(999)")
 	}
 }
 
@@ -160,6 +148,8 @@ func TestIsFreeOrderMessage(t *testing.T) {
 		{"RequestPreVote", RequestPreVote, true},
 		{"RequestPreVoteResp", RequestPreVoteResp, true},
 		{"RateLimit", RateLimit, false},
+		// Unknown types are ordered: the conservative default.
+		{"unknown", 1<<64 - 1, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -169,18 +159,6 @@ func TestIsFreeOrderMessage(t *testing.T) {
 					tt.msgType, got, tt.want)
 			}
 		})
-	}
-}
-
-// TestIsFreeOrderMessage_UnknownType verifies that unknown message
-// types are classified as ordered (not free-order), providing a safe
-// default for any future message types.
-func TestIsFreeOrderMessage_UnknownType(t *testing.T) {
-	unknownTypes := []uint64{1<<64 - 1}
-	for _, msgType := range unknownTypes {
-		if IsFreeOrderMessage(msgType) {
-			t.Errorf("IsFreeOrderMessage(%d) = true, want false for unknown type", msgType)
-		}
 	}
 }
 
@@ -217,23 +195,13 @@ func TestStateMachineTypeName(t *testing.T) {
 		{RegularStateMachine, "regular"},
 		{ConcurrentStateMachine, "concurrent"},
 		{OnDiskStateMachine, "on-disk"},
+		{3, "unknown"},
+		{1<<64 - 1, "unknown"},
 	}
 	for _, tt := range tests {
 		got := StateMachineTypeName(tt.smType)
 		if got != tt.want {
 			t.Errorf("StateMachineTypeName(%d) = %q, want %q", tt.smType, got, tt.want)
-		}
-	}
-}
-
-// TestStateMachineTypeName_Unknown verifies that unrecognized type
-// codes return "unknown" as a safe fallback.
-func TestStateMachineTypeName_Unknown(t *testing.T) {
-	unknownTypes := []uint64{3, 1<<64 - 1}
-	for _, smType := range unknownTypes {
-		got := StateMachineTypeName(smType)
-		if got != "unknown" {
-			t.Errorf("StateMachineTypeName(%d) = %q, want %q", smType, got, "unknown")
 		}
 	}
 }

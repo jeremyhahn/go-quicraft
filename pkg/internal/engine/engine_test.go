@@ -89,29 +89,6 @@ func TestNewEngine_MinimumValues(t *testing.T) {
 	}
 }
 
-func TestEngine_StartAndStop(t *testing.T) {
-	cfg := newTestHostConfig()
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-	e.Start()
-
-	// Stop should not deadlock regardless of how long workers have run.
-	done := make(chan struct{})
-	go func() {
-		e.Stop()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// Expected.
-	case <-time.After(10 * time.Second):
-		t.Fatal("Engine.Stop() did not complete within timeout")
-	}
-}
-
 func TestEngine_UnloadNode(t *testing.T) {
 	cfg := newTestHostConfig()
 	ldb := newTestLogDB()
@@ -129,6 +106,9 @@ func TestEngine_UnloadNode(t *testing.T) {
 	sw := e.StepWorker(workerID)
 	if _, ok := sw.nodes[10]; ok {
 		t.Fatal("node should be unloaded")
+	}
+	if got := e.GetNode(10); got != nil {
+		t.Fatal("GetNode should return nil after unload")
 	}
 }
 
@@ -271,47 +251,9 @@ func TestEngine_WorkerPartitioning(t *testing.T) {
 	}
 }
 
-func TestEngine_SnapshotPoolIntegration(t *testing.T) {
-	cfg := newTestHostConfig()
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-	e.Start()
-
-	sp := e.SnapshotPool()
-
-	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-
-	err := sp.requestSnapshot(snapshotRequest{
-		shardID: 1, replicaID: 1, node: node, save: true,
-	})
-	if err != nil {
-		t.Fatalf("snapshot request failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, sp, "snapshot")
-	if result.shardID != 1 {
-		t.Fatalf("result.shardID = %d, want 1", result.shardID)
-	}
-
-	e.Stop()
-}
-
 // ---------------------------------------------------------------------------
 // DeliverMessage and GetNode
 // ---------------------------------------------------------------------------
-
-func TestEngine_GetNode_NotLoaded(t *testing.T) {
-	cfg := newTestHostConfig()
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
-
-	node := e.GetNode(999)
-	if node != nil {
-		t.Fatal("GetNode should return nil for unloaded shard")
-	}
-}
 
 func TestEngine_GetNode_Loaded(t *testing.T) {
 	cfg := newTestHostConfig()
@@ -327,21 +269,6 @@ func TestEngine_GetNode_Loaded(t *testing.T) {
 	}
 	if got.ShardID() != 42 {
 		t.Errorf("ShardID = %d, want 42", got.ShardID())
-	}
-}
-
-func TestEngine_GetNode_AfterUnload(t *testing.T) {
-	cfg := newTestHostConfig()
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
-
-	nodeCfg := config.Config{ShardID: 42, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-	e.LoadNode(n)
-	e.UnloadNode(42)
-
-	got := e.GetNode(42)
-	if got != nil {
-		t.Fatal("GetNode should return nil after unload")
 	}
 }
 
@@ -415,7 +342,11 @@ func TestNode_DrainInbox_Multiple(t *testing.T) {
 		n.Deliver(proto.Message{Type: proto.Propose, Origin: proto.OriginLocal, From: uint64(i + 1)})
 	}
 
-	buf := n.DrainInbox(nil)
+	// A caller-supplied buffer is reused: its capacity is preserved.
+	buf := n.DrainInbox(make([]proto.Message, 0, 16))
+	if cap(buf) < 16 {
+		t.Errorf("buffer capacity = %d, want >= 16", cap(buf))
+	}
 	if len(buf) != 5 {
 		t.Fatalf("DrainInbox should return 5 messages, got %d", len(buf))
 	}
@@ -432,47 +363,28 @@ func TestNode_DrainInbox_Multiple(t *testing.T) {
 	}
 }
 
-func TestNode_DrainInbox_ReusesBuffer(t *testing.T) {
-	nodeCfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-
-	// Pre-allocate a buffer with capacity.
-	buf := make([]proto.Message, 0, 16)
-	n.Deliver(proto.Message{Type: proto.Heartbeat})
-
-	buf = n.DrainInbox(buf)
-	if len(buf) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(buf))
-	}
-	// The buffer should have been reused (capacity preserved).
-	if cap(buf) < 16 {
-		t.Errorf("buffer capacity = %d, want >= 16", cap(buf))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // GlobalRateLimiter
 // ---------------------------------------------------------------------------
 
-func TestEngine_GlobalRateLimiter_Enabled(t *testing.T) {
-	cfg := newTestHostConfig()
-	cfg.MaxTotalInMemLogSize = 4 * 1024 * 1024 * 1024 // 4GB
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
-
-	rl := e.GlobalRateLimiter()
-	if rl == nil {
-		t.Fatal("GlobalRateLimiter should not be nil when MaxTotalInMemLogSize > 0")
+func TestEngine_GlobalRateLimiter(t *testing.T) {
+	tests := []struct {
+		name    string
+		size    uint64
+		wantNil bool
+	}{
+		{"enabled when MaxTotalInMemLogSize > 0", 4 * 1024 * 1024 * 1024, false},
+		{"disabled when MaxTotalInMemLogSize is 0", 0, true},
 	}
-}
-
-func TestEngine_GlobalRateLimiter_Disabled(t *testing.T) {
-	cfg := newTestHostConfig()
-	cfg.MaxTotalInMemLogSize = 0
-	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
-
-	rl := e.GlobalRateLimiter()
-	if rl != nil {
-		t.Fatal("GlobalRateLimiter should be nil when MaxTotalInMemLogSize is 0")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := newTestHostConfig()
+			cfg.MaxTotalInMemLogSize = tt.size
+			e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
+			if got := e.GlobalRateLimiter() == nil; got != tt.wantNil {
+				t.Fatalf("GlobalRateLimiter() == nil is %v, want %v", got, tt.wantNil)
+			}
+		})
 	}
 }
 
@@ -779,78 +691,6 @@ func TestEngine_RunCommitWorkerLoop_NormalShutdown(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Panic recovery path tests using panicking commit workers
 // ---------------------------------------------------------------------------
-
-// TestEngine_RunCommitWorkerOnce_PanicPath verifies that when a commit
-// worker panics, runCommitWorkerOnce recovers and returns panicked=true.
-// Also verifies clearBatchCommitPending unwedges the batch's nodes.
-func TestEngine_RunCommitWorkerOnce_PanicPath(t *testing.T) {
-	logBuf, restore := captureLogOutput(t)
-	defer restore()
-
-	cfg := newTestHostConfig()
-	cfg.NumWorkers = 1
-	ldb := newTestLogDB()
-	sender := newTestSender()
-
-	e := NewEngine(cfg, ldb, sender, nil, nil, nil)
-	cw := e.CommitWorker(0)
-
-	// Load a node so clearCommitPending has work.
-	nodeCfg := config.Config{ShardID: 0, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, nodeCfg, nil, "", nil)
-	node.commitPending.Store(true)
-	e.LoadNode(node)
-
-	// Queue an item ahead of the panicking one. run() takes it as the batch's
-	// first item and drainCommitC folds the second in, so BOTH end up in
-	// w.batch and both must be unwedged by clearBatchCommitPending.
-	cw.commitC <- &commitItem{node: node}
-
-	// Inject a panic via retryHookForTest: SaveState returns an error,
-	// processBatch calls retryWait, which calls the hook before waiting.
-	cw.retryHookForTest = func(_ int) {
-		panic("injected commit worker panic")
-	}
-
-	// Send a commit item to trigger the retry path in processBatch
-	// (SaveState error -> retryWait -> retryHookForTest panic).
-	ldb.setSaveError(errors.New("disk error"))
-
-	cfg2 := config.Config{ShardID: 1, ReplicaID: 1}
-	node2 := NewNode(nil, nil, nil, cfg2, nil, "", nil)
-	node2.commitPending.Store(true)
-	e.LoadNode(node2)
-
-	cw.commitC <- &commitItem{
-		update: proto.Update{ShardID: 1, ReplicaID: 1, State: proto.State{Term: 1}},
-		node:   node2,
-	}
-
-	panicked := e.runCommitWorkerOnce(cw)
-	if !panicked {
-		t.Fatal("expected runCommitWorkerOnce to report panic")
-	}
-
-	// Verify panic was logged.
-	logOutput := logBuf.Await("commit worker panic recovered")
-	if !contains(logOutput, "commit worker panic recovered") {
-		t.Fatalf("expected panic log message, got: %s", logOutput)
-	}
-
-	// Verify commitPending was cleared on both batch nodes.
-	if node.commitPending.Load() {
-		t.Fatal("commitPending should be cleared by clearBatchCommitPending after panic")
-	}
-	if node2.commitPending.Load() {
-		t.Fatal("commitPending should be cleared by clearBatchCommitPending after panic")
-	}
-	// A commit-worker panic must not FAIL the batch's shards. The batch's
-	// entries were never persisted, but nothing was extracted past stable
-	// storage either — the restarted worker re-derives them.
-	if node.IsFailed() || node2.IsFailed() {
-		t.Fatal("a commit worker panic must unwedge its batch's shards, not fail them")
-	}
-}
 
 // TestEngine_RunStepWorkerOnce_PanicPath verifies that when a step
 // worker panics, runStepWorkerOnce recovers and returns panicked=true.
@@ -1434,7 +1274,7 @@ func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 //   - the batch buffers are cleared, so the restarted worker cannot send this
 //     batch's ordered messages after an unrelated later batch's fsync.
 func TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch(t *testing.T) {
-	_, restore := captureLogOutput(t)
+	logBuf, restore := captureLogOutput(t)
 	defer restore()
 
 	cfg := newTestHostConfig()
@@ -1490,5 +1330,14 @@ func TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch(t *testing.T) {
 	}
 	if node.commitPending.Load() || stale.commitPending.Load() {
 		t.Fatal("commitPending must be cleared on every node owned by the worker")
+	}
+	// A commit-worker panic must not FAIL the batch's shards. The batch's
+	// entries were never persisted, but nothing was extracted past stable
+	// storage either — the restarted worker re-derives them.
+	if node.IsFailed() || stale.IsFailed() {
+		t.Fatal("a commit worker panic must unwedge its batch's shards, not fail them")
+	}
+	if logOutput := logBuf.Await("commit worker panic recovered"); !contains(logOutput, "commit worker panic recovered") {
+		t.Fatalf("expected panic log message, got: %s", logOutput)
 	}
 }

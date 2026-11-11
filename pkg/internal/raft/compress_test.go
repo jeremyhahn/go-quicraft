@@ -23,126 +23,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-func TestCompressEntry_CompressibleData(t *testing.T) {
-	// Highly compressible data (repeated bytes).
-	original := bytes.Repeat([]byte("abcdefghij"), 100) // 1000 bytes
-	e := proto.Entry{
-		Index: 1,
-		Term:  1,
-		Type:  proto.EntryNormal,
-		Cmd:   make([]byte, len(original)),
-	}
-	copy(e.Cmd, original)
-
-	CompressEntry(&e)
-
-	// Flag must be set.
-	if e.Type&proto.EntryCompressFlag == 0 {
-		t.Fatal("expected EntryCompressFlag to be set")
-	}
-	// Entry type mask must still be EntryNormal.
-	if e.Type&proto.EntryTypeMask != proto.EntryNormal {
-		t.Fatalf("expected EntryNormal, got %d", e.Type&proto.EntryTypeMask)
-	}
-	// Compressed data must be smaller.
-	if len(e.Cmd) >= len(original) {
-		t.Fatalf("expected compressed size < %d, got %d", len(original), len(e.Cmd))
-	}
-}
-
-func TestCompressEntry_IncompressibleData(t *testing.T) {
-	// Incompressible data (random-like short payload).
-	// Snappy cannot compress very short or random data below the original size.
-	original := []byte{0x01, 0x02, 0x03, 0x04}
-	e := proto.Entry{
-		Index: 1,
-		Term:  1,
-		Type:  proto.EntryNormal,
-		Cmd:   make([]byte, len(original)),
-	}
-	copy(e.Cmd, original)
-
-	CompressEntry(&e)
-
-	// Flag must NOT be set because compression would not reduce size.
-	if e.Type&proto.EntryCompressFlag != 0 {
-		t.Fatal("expected EntryCompressFlag to NOT be set for incompressible data")
-	}
-	// Data must be unchanged.
-	if !bytes.Equal(e.Cmd, original) {
-		t.Fatal("expected cmd to be unchanged for incompressible data")
-	}
-}
-
-func TestCompressEntry_EmptyCmd(t *testing.T) {
-	e := proto.Entry{
-		Index: 1,
-		Term:  1,
-		Type:  proto.EntryNormal,
-		Cmd:   []byte{},
-	}
-
-	CompressEntry(&e)
-
-	// No flag should be set.
-	if e.Type&proto.EntryCompressFlag != 0 {
-		t.Fatal("expected no compress flag on empty cmd")
-	}
-	if len(e.Cmd) != 0 {
-		t.Fatal("expected empty cmd to remain empty")
-	}
-}
-
-func TestDecompressEntry_CompressedData(t *testing.T) {
-	original := bytes.Repeat([]byte("hello world "), 100)
-	e := proto.Entry{
-		Index: 1,
-		Term:  1,
-		Type:  proto.EntryNormal,
-		Cmd:   make([]byte, len(original)),
-	}
-	copy(e.Cmd, original)
-
-	// Compress first.
-	CompressEntry(&e)
-	if e.Type&proto.EntryCompressFlag == 0 {
-		t.Fatal("expected compress flag to be set")
-	}
-
-	// Decompress.
-	err := DecompressEntry(&e, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Flag must be cleared.
-	if e.Type&proto.EntryCompressFlag != 0 {
-		t.Fatal("expected compress flag to be cleared after decompression")
-	}
-	// Data must match original.
-	if !bytes.Equal(e.Cmd, original) {
-		t.Fatal("decompressed data does not match original")
-	}
-}
-
-func TestDecompressEntry_NotCompressed(t *testing.T) {
-	original := []byte("uncompressed data")
-	e := proto.Entry{
-		Index: 1,
-		Term:  1,
-		Type:  proto.EntryNormal,
-		Cmd:   original,
-	}
-
-	err := DecompressEntry(&e, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	// Data must be unchanged.
-	if !bytes.Equal(e.Cmd, original) {
-		t.Fatal("data should not have changed")
-	}
-}
-
 func TestDecompressEntry_DecompressionBomb(t *testing.T) {
 	// Create a large compressible payload.
 	original := bytes.Repeat([]byte("X"), 10000)
@@ -191,36 +71,22 @@ func TestDecompressEntry_CorruptData(t *testing.T) {
 	}
 }
 
-func TestDecompressEntry_MaxSizeZeroAllowsAny(t *testing.T) {
-	// maxSize=0 means no limit.
-	original := bytes.Repeat([]byte("Y"), 50000)
-	e := proto.Entry{
-		Index: 1,
-		Term:  1,
-		Type:  proto.EntryNormal,
-		Cmd:   make([]byte, len(original)),
-	}
-	copy(e.Cmd, original)
-
-	CompressEntry(&e)
-	err := DecompressEntry(&e, 0) // 0 = no limit
-	if err != nil {
-		t.Fatalf("unexpected error with maxSize=0: %v", err)
-	}
-	if !bytes.Equal(e.Cmd, original) {
-		t.Fatal("decompressed data does not match original")
-	}
-}
-
 func TestCompressDecompress_RoundTrip(t *testing.T) {
+	// One table for the single-entry path: CompressEntry sets the flag only
+	// when snappy shrinks the payload, and DecompressEntry with maxSize 0
+	// (no limit) restores the bytes and clears the flag, or leaves an
+	// unflagged entry untouched.
 	tests := []struct {
-		name string
-		data []byte
+		name           string
+		data           []byte
+		wantCompressed bool
 	}{
-		{"empty", []byte{}},
-		{"small", []byte("hello")},
-		{"compressible", bytes.Repeat([]byte("pattern "), 200)},
-		{"mixed", append(bytes.Repeat([]byte("AAAA"), 100), bytes.Repeat([]byte{0x01, 0x02}, 50)...)},
+		{"empty", []byte{}, false},
+		{"incompressible", []byte{0x01, 0x02, 0x03, 0x04}, false},
+		{"small", []byte("hello"), false},
+		{"compressible", bytes.Repeat([]byte("abcdefghij"), 100), true},
+		{"mixed", append(bytes.Repeat([]byte("AAAA"), 100), bytes.Repeat([]byte{0x01, 0x02}, 50)...), true},
+		{"large_no_limit", bytes.Repeat([]byte("Y"), 50000), true},
 	}
 
 	for _, tt := range tests {
@@ -234,6 +100,20 @@ func TestCompressDecompress_RoundTrip(t *testing.T) {
 			copy(e.Cmd, tt.data)
 
 			CompressEntry(&e)
+			if got := e.Type&proto.EntryCompressFlag != 0; got != tt.wantCompressed {
+				t.Fatalf("compress flag = %v, want %v", got, tt.wantCompressed)
+			}
+			if e.Type&proto.EntryTypeMask != proto.EntryNormal {
+				t.Fatalf("expected EntryNormal, got %d", e.Type&proto.EntryTypeMask)
+			}
+			if tt.wantCompressed {
+				if len(e.Cmd) >= len(tt.data) {
+					t.Fatalf("expected compressed size < %d, got %d", len(tt.data), len(e.Cmd))
+				}
+			} else if !bytes.Equal(e.Cmd, tt.data) {
+				t.Fatal("expected cmd to be unchanged when not compressed")
+			}
+
 			err := DecompressEntry(&e, 0)
 			if err != nil {
 				t.Fatalf("round-trip error: %v", err)
@@ -357,173 +237,102 @@ func TestDecompressError_Unwrap(t *testing.T) {
 	}
 }
 
-func TestCompressEntry_LeaderPropose_CompressesNormalEntries(t *testing.T) {
-	// Create a leader peer with Snappy entry compression enabled.
-	cfg := testConfig()
-	cfg.EntryCompressionType = config.Snappy
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Self-elect as leader.
-	for i := 0; i < 100; i++ {
-		p.Tick()
-		if p.IsLeader() {
-			break
+func TestCompressEntry_LeaderPropose(t *testing.T) {
+	ccBuf := func(t *testing.T) []byte {
+		cc := proto.ConfigChange{
+			Type:      proto.AddNode,
+			ReplicaID: 99,
+			Address:   "addr99",
 		}
-	}
-	if !p.IsLeader() {
-		t.Fatal("peer did not become leader")
-	}
-
-	// Drain the no-op entry.
-	if p.HasUpdate(0) {
-		update, err := p.GetUpdate(true, 0)
-		if err != nil {
-			t.Fatalf("GetUpdate failed: %v", err)
+		buf := make([]byte, cc.Size())
+		if _, err := cc.MarshalTo(buf); err != nil {
+			t.Fatalf("MarshalTo failed: %v", err)
 		}
-		if err := p.Commit(update); err != nil {
-			t.Fatalf("Commit failed: %v", err)
-		}
+		return buf
 	}
+	tests := []struct {
+		name           string
+		compression    config.CompressionType
+		entryType      uint64
+		cmd            func(t *testing.T) []byte
+		wantCompressed bool
+	}{
+		{
+			name:           "snappy_compresses_normal_entry",
+			compression:    config.Snappy,
+			entryType:      proto.EntryNormal,
+			cmd:            func(*testing.T) []byte { return bytes.Repeat([]byte("compressible data "), 100) },
+			wantCompressed: true,
+		},
+		{
+			// Config change entries must remain uncompressed for safety.
+			name:        "snappy_skips_config_change_entry",
+			compression: config.Snappy,
+			entryType:   proto.EntryConfigChange,
+			cmd:         ccBuf,
+		},
+		{
+			// EntryCompressionType zero value is NoCompression.
+			name:        "no_compression_leaves_normal_entry",
+			compression: config.NoCompression,
+			entryType:   proto.EntryNormal,
+			cmd:         func(*testing.T) []byte { return bytes.Repeat([]byte("uncompressed data "), 100) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.EntryCompressionType = tt.compression
+			ms := singleNodeMembership()
+			p := newTestPeer(t, cfg, proto.State{}, ms)
 
-	// Propose a compressible normal entry.
-	original := bytes.Repeat([]byte("compressible data "), 100)
-	entries := []proto.Entry{
-		{Type: proto.EntryNormal, Cmd: make([]byte, len(original))},
-	}
-	copy(entries[0].Cmd, original)
+			// Self-elect as leader.
+			for i := 0; i < 100; i++ {
+				p.Tick()
+				if p.IsLeader() {
+					break
+				}
+			}
+			if !p.IsLeader() {
+				t.Fatal("peer did not become leader")
+			}
 
-	_, err := p.Propose(entries)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
+			// Drain the no-op entry.
+			if p.HasUpdate(0) {
+				update, err := p.GetUpdate(true, 0)
+				if err != nil {
+					t.Fatalf("GetUpdate failed: %v", err)
+				}
+				if err := p.Commit(update); err != nil {
+					t.Fatalf("Commit failed: %v", err)
+				}
+			}
 
-	// The entry in the log should have the compress flag set and a
-	// smaller Cmd payload.
-	lastIdx := p.r.log.lastIndex()
-	e, logErr := getEntryForTest(&p.r.log.inmem, lastIdx)
-	if logErr != nil {
-		t.Fatalf("getEntry failed: %v", logErr)
-	}
-	if e.Type&proto.EntryCompressFlag == 0 {
-		t.Fatal("expected EntryCompressFlag to be set on proposed entry")
-	}
-	if len(e.Cmd) >= len(original) {
-		t.Fatalf("expected compressed cmd to be smaller: %d >= %d", len(e.Cmd), len(original))
-	}
-}
+			original := tt.cmd(t)
+			entries := []proto.Entry{
+				{Type: tt.entryType, Cmd: make([]byte, len(original))},
+			}
+			copy(entries[0].Cmd, original)
+			if _, err := p.Propose(entries); err != nil {
+				t.Fatalf("Propose failed: %v", err)
+			}
 
-func TestCompressEntry_LeaderPropose_SkipsConfigChangeEntries(t *testing.T) {
-	// Config change entries must remain uncompressed for safety.
-	cfg := testConfig()
-	cfg.EntryCompressionType = config.Snappy
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Self-elect as leader.
-	for i := 0; i < 100; i++ {
-		p.Tick()
-		if p.IsLeader() {
-			break
-		}
-	}
-	if !p.IsLeader() {
-		t.Fatal("peer did not become leader")
-	}
-
-	// Drain the no-op entry.
-	if p.HasUpdate(0) {
-		update, err := p.GetUpdate(true, 0)
-		if err != nil {
-			t.Fatalf("GetUpdate failed: %v", err)
-		}
-		if err := p.Commit(update); err != nil {
-			t.Fatalf("Commit failed: %v", err)
-		}
-	}
-
-	// Propose a config change entry with compressible data.
-	cc := proto.ConfigChange{
-		Type:      proto.AddNode,
-		ReplicaID: 99,
-		Address:   "addr99",
-	}
-	ccBuf := make([]byte, cc.Size())
-	if _, err := cc.MarshalTo(ccBuf); err != nil {
-		t.Fatalf("MarshalTo failed: %v", err)
-	}
-
-	entries := []proto.Entry{
-		{Type: proto.EntryConfigChange, Cmd: ccBuf},
-	}
-	_, err := p.Propose(entries)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-
-	// The config change entry must NOT be compressed.
-	lastIdx := p.r.log.lastIndex()
-	e, logErr := getEntryForTest(&p.r.log.inmem, lastIdx)
-	if logErr != nil {
-		t.Fatalf("getEntry failed: %v", logErr)
-	}
-	if e.Type&proto.EntryCompressFlag != 0 {
-		t.Fatal("config change entry should NOT have compress flag")
-	}
-}
-
-func TestCompressEntry_LeaderPropose_NoCompression(t *testing.T) {
-	// When compression is not configured, entries should not be compressed.
-	cfg := testConfig()
-	// EntryCompressionType defaults to NoCompression (zero value).
-	ms := singleNodeMembership()
-	p := newTestPeer(t, cfg, proto.State{}, ms)
-
-	// Self-elect as leader.
-	for i := 0; i < 100; i++ {
-		p.Tick()
-		if p.IsLeader() {
-			break
-		}
-	}
-	if !p.IsLeader() {
-		t.Fatal("peer did not become leader")
-	}
-
-	// Drain the no-op entry.
-	if p.HasUpdate(0) {
-		update, err := p.GetUpdate(true, 0)
-		if err != nil {
-			t.Fatalf("GetUpdate failed: %v", err)
-		}
-		if err := p.Commit(update); err != nil {
-			t.Fatalf("Commit failed: %v", err)
-		}
-	}
-
-	// Propose a normal entry.
-	original := bytes.Repeat([]byte("uncompressed data "), 100)
-	entries := []proto.Entry{
-		{Type: proto.EntryNormal, Cmd: make([]byte, len(original))},
-	}
-	copy(entries[0].Cmd, original)
-
-	_, err := p.Propose(entries)
-	if err != nil {
-		t.Fatalf("Propose failed: %v", err)
-	}
-
-	// The entry should NOT have the compress flag.
-	lastIdx := p.r.log.lastIndex()
-	e, logErr := getEntryForTest(&p.r.log.inmem, lastIdx)
-	if logErr != nil {
-		t.Fatalf("getEntry failed: %v", logErr)
-	}
-	if e.Type&proto.EntryCompressFlag != 0 {
-		t.Fatal("entry should not have compress flag when compression is disabled")
-	}
-	if !bytes.Equal(e.Cmd, original) {
-		t.Fatal("entry cmd should be unchanged when compression is disabled")
+			lastIdx := p.r.log.lastIndex()
+			e, logErr := getEntryForTest(&p.r.log.inmem, lastIdx)
+			if logErr != nil {
+				t.Fatalf("getEntry failed: %v", logErr)
+			}
+			if got := e.Type&proto.EntryCompressFlag != 0; got != tt.wantCompressed {
+				t.Fatalf("compress flag = %v, want %v", got, tt.wantCompressed)
+			}
+			if tt.wantCompressed {
+				if len(e.Cmd) >= len(original) {
+					t.Fatalf("expected compressed cmd to be smaller: %d >= %d", len(e.Cmd), len(original))
+				}
+			} else if !bytes.Equal(e.Cmd, original) {
+				t.Fatal("entry cmd should be unchanged when not compressed")
+			}
+		})
 	}
 }
 

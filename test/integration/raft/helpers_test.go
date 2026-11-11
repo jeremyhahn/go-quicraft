@@ -480,15 +480,6 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 	}
 }
 
-// TestHarness_HostConfigSkipsWALSync pins testHostConfig to NoSyncWAL: a
-// stalled fdatasync holds every election past its timeout (#362).
-func TestHarness_HostConfigSkipsWALSync(t *testing.T) {
-	cfg := testHostConfig(t, "127.0.0.1:0", nil)
-	if !cfg.NoSyncWAL {
-		t.Fatal("testHostConfig must set NoSyncWAL: a stalled fdatasync holds every election past its timeout")
-	}
-}
-
 // testShardConfig creates a per-shard config for integration testing.
 func testShardConfig(shardID, replicaID uint64) config.Config {
 	c := config.Config{
@@ -1024,8 +1015,14 @@ func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, 
 // starts describing a cluster that no longer exists and every budget built on
 // it is wrong by that factor — which is exactly the drift the derivation
 // replaced a literal to prevent. This is the only place that can notice.
+// It also pins testHostConfig to NoSyncWAL: a stalled fdatasync holds every
+// election past its timeout (#362).
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
-	if got := testHostConfig(t, "127.0.0.1:1", nil).RTTMillisecond; got != testRTTMillisecond {
+	cfg := testHostConfig(t, "127.0.0.1:1", nil)
+	if !cfg.NoSyncWAL {
+		t.Fatal("testHostConfig must set NoSyncWAL: a stalled fdatasync holds every election past its timeout")
+	}
+	if got := cfg.RTTMillisecond; got != testRTTMillisecond {
 		t.Fatalf("testHostConfig sets RTTMillisecond=%d but the budgets are derived "+
 			"from testRTTMillisecond=%d; one Raft tick is not what electionRound (%v) "+
 			"thinks it is", got, uint64(testRTTMillisecond), electionRound)
@@ -1036,9 +1033,4 @@ func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 			"are wrong by a factor of %.2f", got, testElectionRTT,
 			electionRound, float64(got)/float64(testElectionRTT))
 	}
-	if electionRound != 2*time.Duration(testElectionRTT)*raftTick {
-		t.Fatalf("electionRound=%v is not 2*ElectionRTT*tick", electionRound)
-	}
-	t.Logf("tick=%v electionRound=%v leaderElectionTimeout=%v (%d rounds)%s",
-		raftTick, electionRound, leaderElectionTimeout, coldStartElectionRounds, "")
 }

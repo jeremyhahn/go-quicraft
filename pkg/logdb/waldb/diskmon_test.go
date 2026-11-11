@@ -153,42 +153,6 @@ func TestDiskMonitorWarningCallbackNotRepeated(t *testing.T) {
 	}
 }
 
-// TestDiskMonitorFullCallback verifies the full callback fires and
-// ErrDiskFull is returned when usage exceeds the full threshold.
-func TestDiskMonitorFullCallback(t *testing.T) {
-	var usedBytes atomic.Uint64
-	var fullCalled atomic.Bool
-	var fullUsed, fullMax uint64
-
-	dm := NewDiskMonitor("/tmp/test-wal", 1000,
-		WithCheckEvery(1),
-		WithWarningPercent(0.80),
-		WithFullPercent(0.95),
-		WithDiskUsageFunc(mockDiskUsage(&usedBytes)),
-		WithOnFull(func(used, max uint64) {
-			fullCalled.Store(true)
-			fullUsed = used
-			fullMax = max
-		}),
-	)
-
-	// Cross full threshold (95% of 1000 = 950).
-	usedBytes.Store(960)
-	err := dm.MaybeCheck()
-	if !errors.Is(err, ErrDiskFull) {
-		t.Fatalf("expected ErrDiskFull, got %v", err)
-	}
-	if !fullCalled.Load() {
-		t.Fatal("full callback should fire at 96%")
-	}
-	if fullUsed != 960 {
-		t.Fatalf("expected full used=960, got %d", fullUsed)
-	}
-	if fullMax != 1000 {
-		t.Fatalf("expected full max=1000, got %d", fullMax)
-	}
-}
-
 // TestDiskMonitorFullCallbackNotRepeated verifies the full callback
 // fires only once per state transition.
 func TestDiskMonitorFullCallbackNotRepeated(t *testing.T) {
@@ -437,6 +401,7 @@ func TestDiskMonitorCustomThresholds(t *testing.T) {
 func TestDiskMonitorIntegrationWithDB(t *testing.T) {
 	var usedBytes atomic.Uint64
 	var fullCalled atomic.Bool
+	var fullUsed, fullMax uint64
 
 	dir := t.TempDir()
 	db, err := Open(dir,
@@ -448,6 +413,8 @@ func TestDiskMonitorIntegrationWithDB(t *testing.T) {
 			WithFullPercent(0.95),
 			WithDiskUsageFunc(mockDiskUsage(&usedBytes)),
 			WithOnFull(func(used, max uint64) {
+				fullUsed = used
+				fullMax = max
 				fullCalled.Store(true)
 			}),
 		),
@@ -480,6 +447,9 @@ func TestDiskMonitorIntegrationWithDB(t *testing.T) {
 	}
 	if !fullCalled.Load() {
 		t.Fatal("full callback should have fired")
+	}
+	if fullUsed != 960 || fullMax != 1000 {
+		t.Fatalf("full callback got used=%d max=%d, want 960 and 1000", fullUsed, fullMax)
 	}
 }
 

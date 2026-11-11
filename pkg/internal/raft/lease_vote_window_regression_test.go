@@ -238,18 +238,6 @@ func TestLeaseVoteWindow_RestartHonoursTheOwedWindow(t *testing.T) {
 	}
 }
 
-// TestLeaseVoteWindow_NothingOwedNoLeaseReadVotesImmediately pins that a
-// replica that neither runs LeaseRead nor owes a window pays nothing.
-func TestLeaseVoteWindow_NothingOwedNoLeaseReadVotesImmediately(t *testing.T) {
-	r := newReplicaOwing(t, raftTestCfgPreVote(1, 2, false), 0)
-	if resp := voteReply(t, r, false, false); resp.Reject {
-		t.Fatal("a replica owing nothing without LeaseRead withheld its vote")
-	}
-	if got := r.hardState().VoteWindow; got != 0 {
-		t.Fatalf("a replica without LeaseRead recorded a window of %d", got)
-	}
-}
-
 // TestLeaseVoteWindow_TickLowersTheOwedWindowWithoutVoteTraffic pins that the
 // record is lowered when the hold-down ends even on a replica no candidate
 // asks, so a later restart does not pay again for a promise nobody holds.

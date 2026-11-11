@@ -353,19 +353,10 @@ func TestTemporary_Nil(t *testing.T) {
 	}
 }
 
-// TestNotLeader asserts the leader ID is surfaced, not merely that the error
-// was recognised — surfacing LeaderID is the entire point of the helper.
+// TestNotLeader asserts the bare sentinel reports leader zero and that other
+// errors are not recognised. The typed error surfacing its LeaderID is asserted
+// through the proposal path by TestTranslateProposalError_NotLeader.
 func TestNotLeader(t *testing.T) {
-	t.Run("typed error carries the leader", func(t *testing.T) {
-		id, ok := NotLeader(&NotLeaderError{ShardID: 1, LeaderID: 7, LeaderAddress: "n7:9000"})
-		if !ok {
-			t.Fatal("NotLeader must recognise *NotLeaderError")
-		}
-		if id != 7 {
-			t.Fatalf("NotLeader returned replicaID %d, want 7", id)
-		}
-	})
-
 	t.Run("bare sentinel", func(t *testing.T) {
 		id, ok := NotLeader(ErrNotLeader)
 		if !ok {
@@ -383,24 +374,6 @@ func TestNotLeader(t *testing.T) {
 			}
 		}
 	})
-}
-
-// TestNotLeader_AgreesWithTemporary pins the documented relationship: every
-// not-leader error is retryable.
-func TestNotLeader_AgreesWithTemporary(t *testing.T) {
-	errs := []error{
-		ErrNotLeader,
-		&NotLeaderError{ShardID: 1, LeaderID: 5},
-		fmt.Errorf("wrapped: %w", &NotLeaderError{ShardID: 1}),
-	}
-	for _, err := range errs {
-		if _, ok := NotLeader(err); !ok {
-			t.Fatalf("setup: %v is not a not-leader error", err)
-		}
-		if !Temporary(err) {
-			t.Errorf("Temporary(%v) = false; every not-leader error must be temporary", err)
-		}
-	}
 }
 
 // TestTransferInProgress_IsTemporaryAndNotMaybeApplied pins the public

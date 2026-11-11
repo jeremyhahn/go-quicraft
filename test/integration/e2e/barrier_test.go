@@ -87,14 +87,17 @@ func assertBarrierSealedEverything(t *testing.T, cluster *barrierTestCluster, ca
 }
 
 // TestE2E_Barrier_ProposeAndRead verifies that a 3-node barrier-encrypted
-// cluster can propose entries, replicate them, and serve linearizable reads,
-// and that the data those entries carry is ENCRYPTED where it lands on disk.
+// cluster can propose entries, replicate them identically across all nodes
+// despite each node having an independent barrier with a distinct passphrase,
+// serve linearizable reads, take automatic and explicit snapshots and apply
+// entries on top of them, and that the data those entries carry is ENCRYPTED
+// where it lands on disk.
 //
 // The at-rest half is the reason this test exists. Asserting only
 // IsSealed() == false — an in-memory flag no production path touches — on a
 // shard whose SnapshotEntries is 0 takes no snapshot and never asks the
 // barrier to encrypt a byte, so a total plaintext downgrade would pass. It
-// takes a real snapshot and asserts both that the barrier sealed
+// takes a real snapshot and asserts both that each node's own barrier sealed
 // frames and that the plaintext canary is absent from the artifact.
 func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 	cluster := newBarrierTestCluster(t, 3)
@@ -111,7 +114,7 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 
 	// Propose entries whose values carry the canary. With SnapshotEntries=15
 	// this also crosses the automatic snapshot threshold on every replica.
-	expected := make(map[string]string, 30)
+	expected := make(map[string]string, 40)
 	for i := range 30 {
 		key := fmt.Sprintf("barrier-rw-%03d", i)
 		value := fmt.Sprintf("val-%s-barrier-rw-%03d", barrierCanary, i)
@@ -122,6 +125,30 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 	// Verify all entries replicated to all 3 nodes.
 	verifyAllData(t, cluster.testCluster, trackers, 1, expected)
 	t.Logf("all 30 entries replicated to 3 barrier-encrypted nodes")
+
+	// Despite independent barriers on each host, the decrypted state machine
+	// data must be identical across all replicas: no node holds a key the
+	// others lack.
+	var reference map[string]string
+	for i := range cluster.hosts {
+		nodeSM := resolveStateMachine(cluster.testCluster, trackers, 1, i)
+		if nodeSM == nil {
+			t.Fatalf("node[%d] has no state machine", i)
+		}
+		snap := nodeSM.Snapshot()
+		if reference == nil {
+			reference = snap
+			continue
+		}
+		if len(snap) != len(reference) {
+			t.Fatalf("node[%d] has %d keys, node[0] has %d keys", i, len(snap), len(reference))
+		}
+		for key, refVal := range reference {
+			if got, exists := snap[key]; !exists || got != refVal {
+				t.Fatalf("node[%d] key %q = %q (present %v), node[0] has %q", i, key, got, exists, refVal)
+			}
+		}
+	}
 
 	// Perform a linearizable read for one of the keys. The subject is the
 	// value the barrier-encrypted cluster returns, not the replica that
@@ -140,156 +167,25 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 	if val != expectedValue {
 		t.Fatalf("SyncRead(%q) = %q, want %q", targetKey, val, expectedValue)
 	}
-	t.Logf("SyncRead(%q) = %q (correct)", targetKey, val)
 
 	// The snapshot below is deliberately still addressed to one replica: it
 	// forces the at-rest write this test then greps for, so it must happen on
-	// a host whose data directory the assertion knows.
-	leaderHost := cluster.hosts[leaderIdx]
-
-	// Force a snapshot on the leader and WAIT for it, so the at-rest assertion
+	// a host whose data directory the assertion knows. Force it and WAIT for
+	// it (save -> encrypt -> persist -> acknowledge), so the at-rest assertion
 	// does not depend on the automatic trigger having already fired there.
-	snapshotIndex := requestSnapshotSync(t, leaderHost, 1)
-	t.Logf("explicit snapshot on leader node[%d] completed at index %d", leaderIdx, snapshotIndex)
-
-	assertBarrierSealedEverything(t, cluster, []string{barrierCanary, expectedValue})
-}
-
-// TestE2E_Barrier_Replication verifies that a 3-node barrier-encrypted
-// cluster replicates data identically across all nodes despite each node
-// having an independent barrier with a distinct passphrase, and that each
-// node's own barrier sealed its own snapshot artifacts.
-//
-// Independent per-node keys are the interesting part: the decrypted state must
-// match across replicas while the CIPHERTEXT on each node is that node's own.
-func TestE2E_Barrier_Replication(t *testing.T) {
-	cluster := newBarrierTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShardWithConfig(1, barrierSnapshotConfig)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster.testCluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster.testCluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose 30 entries to exercise replication under encryption. The values
-	// carry the canary so the on-disk assertion has something to look for.
-	expected := make(map[string]string, 30)
-	for i := range 30 {
-		key := fmt.Sprintf("barrier-repl-%03d", i)
-		value := fmt.Sprintf("val-%s-barrier-repl-%03d", barrierCanary, i)
-		proposeAndWait(t, cluster.testCluster, trackers, 1, key, value)
-		expected[key] = value
-	}
-
-	// Verify all entries on all 3 nodes.
-	verifyAllData(t, cluster.testCluster, trackers, 1, expected)
-	t.Logf("all 30 entries verified on 3 barrier-encrypted nodes")
-
-	// Collect state machine snapshots from all live nodes and compare.
-	// Despite independent barriers on each host, the decrypted state
-	// machine data must be identical across all replicas.
-	snapshots := make([]map[string]string, 0, 3)
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
-		}
-		nodeSM := resolveStateMachine(cluster.testCluster, trackers, 1, i)
-		if nodeSM == nil {
-			t.Fatalf("node[%d] has no state machine", i)
-		}
-		snap := nodeSM.Snapshot()
-		snapshots = append(snapshots, snap)
-	}
-
-	if len(snapshots) < 3 {
-		t.Fatalf("expected 3 snapshots, got %d", len(snapshots))
-	}
-
-	// Compare every snapshot against the first to ensure consistency.
-	reference := snapshots[0]
-	for i := 1; i < len(snapshots); i++ {
-		if len(snapshots[i]) != len(reference) {
-			t.Fatalf("node[%d] has %d keys, node[0] has %d keys",
-				i, len(snapshots[i]), len(reference))
-		}
-		for key, refVal := range reference {
-			got, exists := snapshots[i][key]
-			if !exists {
-				t.Fatalf("node[%d] missing key %q present on node[0]", i, key)
-			}
-			if got != refVal {
-				t.Fatalf("node[%d] key %q = %q, node[0] has %q", i, key, got, refVal)
-			}
-		}
-	}
-	t.Logf("all 3 barrier-encrypted nodes have identical state machine data (%d keys)", len(reference))
-
-	// Force a snapshot on the leader and wait for it, then require that every
-	// node's own barrier sealed frames and that no artifact leaks the canary.
 	snapshotIndex := requestSnapshotSync(t, cluster.hosts[leaderIdx], 1)
 	t.Logf("explicit snapshot on leader node[%d] completed at index %d", leaderIdx, snapshotIndex)
 
-	assertBarrierSealedEverything(t, cluster,
-		[]string{barrierCanary, expected["barrier-repl-007"]})
-}
-
-// TestE2E_Barrier_SnapshotRestore verifies that automatic and explicit
-// snapshots work correctly in a barrier-encrypted cluster. Data written
-// before and after snapshots must be fully recoverable.
-func TestE2E_Barrier_SnapshotRestore(t *testing.T) {
-	cluster := newBarrierTestCluster(t, 3)
-	defer cluster.close()
-
-	// Configure aggressive snapshot settings: every 15 entries with
-	// 5 entries of compaction overhead.
-	trackers := cluster.startShardWithConfig(1, barrierSnapshotConfig)
-
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster.testCluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster.testCluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	// Propose 30 entries. With SnapshotEntries=15, this triggers at
-	// least one automatic snapshot with barrier encryption.
-	expected := make(map[string]string, 30)
-	for i := range 30 {
-		key := fmt.Sprintf("barrier-snap-%03d", i)
-		value := fmt.Sprintf("val-%s-barrier-snap-%03d", barrierCanary, i)
-		proposeAndWait(t, cluster.testCluster, trackers, 1, key, value)
-		expected[key] = value
-	}
-	verifyAllData(t, cluster.testCluster, trackers, 1, expected)
-	t.Logf("30 entries proposed and verified, auto-snapshot should have triggered")
-
-	// Request an explicit snapshot from the leader and WAIT for it. This
-	// exercises the full snapshot pipeline: save -> encrypt -> persist ->
-	// acknowledge.
-	leaderHost := cluster.hosts[leaderIdx]
-	snapshotIndex := requestSnapshotSync(t, leaderHost, 1)
-	t.Logf("explicit snapshot completed at index %d", snapshotIndex)
-
-	// Propose 10 more entries after the snapshot. This ensures that
-	// entries after the snapshot point are correctly applied on top
-	// of any future snapshot restore.
+	// Entries after the snapshot point must apply on top of it on every node.
 	for i := range 10 {
 		key := fmt.Sprintf("barrier-post-%03d", i)
 		value := fmt.Sprintf("val-%s-barrier-post-%03d", barrierCanary, i)
 		proposeAndWait(t, cluster.testCluster, trackers, 1, key, value)
 		expected[key] = value
 	}
-
-	// Verify all 40 entries (30 pre-snapshot + 10 post-snapshot)
-	// are present and correct on all 3 nodes.
 	verifyAllData(t, cluster.testCluster, trackers, 1, expected)
-	t.Logf("all 40 entries verified on 3 barrier-encrypted nodes after snapshot")
 
-	// The snapshot the pipeline just produced must be ciphertext on disk.
-	assertBarrierSealedEverything(t, cluster,
-		[]string{barrierCanary, expected["barrier-snap-007"]})
+	assertBarrierSealedEverything(t, cluster, []string{barrierCanary, expectedValue})
 }
 
 // TestE2E_Barrier_FiveNode verifies that a 5-node barrier-encrypted cluster

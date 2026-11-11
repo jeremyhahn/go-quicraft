@@ -46,60 +46,6 @@ func protectedTestShare(t *testing.T) *ProtectedShare {
 	return shares[0]
 }
 
-// TestProtectedShare_WithValueDestroyRace drives WithValue concurrently with
-// Destroy. Each WithValue either sees the whole live value or is refused
-// without running its callback, once Destroy has returned every borrow is
-// refused, and -race must report nothing.
-func TestProtectedShare_WithValueDestroyRace(t *testing.T) {
-	const iterations = 100
-
-	for i := 0; i < iterations; i++ {
-		share := protectedTestShare(t)
-		want := valueCopy(share)
-		if len(want) == 0 {
-			t.Fatal("share value is empty")
-		}
-
-		var wg sync.WaitGroup
-		start := make(chan struct{})
-
-		for r := 0; r < 4; r++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				<-start
-				for k := 0; k < 25; k++ {
-					_ = share.WithValue(func(v []byte) error {
-						if !bytes.Equal(v, want) {
-							t.Errorf("WithValue saw %q, want %q", v, want)
-						}
-						return nil
-					})
-				}
-			}()
-		}
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			share.Destroy()
-		}()
-
-		close(start)
-		wg.Wait()
-
-		share.Destroy()
-		ran := false
-		if err := share.WithValue(func([]byte) error {
-			ran = true
-			return nil
-		}); err == nil || ran {
-			t.Fatalf("WithValue after Destroy: err = %v, callback ran = %v; want a refusal without a call", err, ran)
-		}
-	}
-}
-
 // TestProtectedShare_WithValueExcludesDestroy covers the window a borrow exists for:
 // the caller is still READING the share's bytes when teardown arrives.
 //
@@ -108,11 +54,19 @@ func TestProtectedShare_WithValueDestroyRace(t *testing.T) {
 // fault. The dereferencing form silently passes against a broken implementation:
 // -race does not instrument an mmap'd region, so the only signal there is an
 // intermittent SIGSEGV.
+//
+// Each callback that does run sees the whole live value, a second Destroy is
+// safe, every borrow after Destroy is refused without running its callback,
+// and -race must report nothing.
 func TestProtectedShare_WithValueExcludesDestroy(t *testing.T) {
 	const iterations = 100
 
 	for i := 0; i < iterations; i++ {
 		share := protectedTestShare(t)
+		want := valueCopy(share)
+		if len(want) == 0 {
+			t.Fatal("share value is empty")
+		}
 
 		var (
 			destroyReturned atomic.Bool
@@ -128,6 +82,9 @@ func TestProtectedShare_WithValueExcludesDestroy(t *testing.T) {
 				<-start
 				for k := 0; k < 25; k++ {
 					_ = share.WithValue(func(v []byte) error {
+						if !bytes.Equal(v, want) {
+							t.Errorf("WithValue saw %q, want %q", v, want)
+						}
 						for spin := 0; spin < 64; spin++ {
 							_ = len(v)
 							runtime.Gosched()
@@ -155,6 +112,15 @@ func TestProtectedShare_WithValueExcludesDestroy(t *testing.T) {
 		if got := violations.Load(); got != 0 {
 			t.Fatalf("callback ran %d time(s) after Destroy had already returned; "+
 				"the share was torn down while a reader held its value", got)
+		}
+
+		share.Destroy()
+		ran := false
+		if err := share.WithValue(func([]byte) error {
+			ran = true
+			return nil
+		}); err == nil || ran {
+			t.Fatalf("WithValue after Destroy: err = %v, callback ran = %v; want a refusal without a call", err, ran)
 		}
 	}
 }

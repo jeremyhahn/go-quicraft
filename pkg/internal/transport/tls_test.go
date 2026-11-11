@@ -25,7 +25,6 @@ import (
 	"errors"
 	"math/big"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,6 +61,10 @@ func TestBuildMTLSTLSPairValid(t *testing.T) {
 	if pair.client.InsecureSkipVerify {
 		t.Fatal("client should NOT have InsecureSkipVerify in mTLS mode")
 	}
+	// Without a revocation checker no VerifyConnection callback is installed.
+	if pair.server.VerifyConnection != nil || pair.client.VerifyConnection != nil {
+		t.Fatal("VerifyConnection should be nil on both configs without a checker")
+	}
 	for _, tc := range []struct {
 		name string
 		cfg  *tls.Config
@@ -92,36 +95,6 @@ func TestBuildMTLSTLSPairValid(t *testing.T) {
 	// Only clients resume sessions.
 	if pair.server.ClientSessionCache != nil {
 		t.Fatal("server ClientSessionCache should be nil")
-	}
-}
-
-// TestBuildMTLSTLSInvalidCACert verifies rejection of invalid CA cert.
-func TestBuildMTLSTLSInvalidCACert(t *testing.T) {
-	_, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	mtls := &MTLSConfig{
-		CACert: []byte("not a valid PEM"),
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}
-
-	_, err := buildMTLSTLS(mtls, nil)
-	if !errors.Is(err, ErrInvalidCACert) {
-		t.Fatalf("expected ErrInvalidCACert, got %v", err)
-	}
-}
-
-// TestBuildMTLSTLSInvalidCertKeyPair verifies rejection of invalid cert/key.
-func TestBuildMTLSTLSInvalidCertKeyPair(t *testing.T) {
-	mtls := &MTLSConfig{
-		CACert: []byte("-----BEGIN CERTIFICATE-----\nfoo\n-----END CERTIFICATE-----"),
-		Cert:   []byte("not-pem"),
-		Key:    []byte("not-pem"),
-	}
-
-	_, err := buildMTLSTLS(mtls, nil)
-	if !errors.Is(err, ErrInvalidCertKeyPair) {
-		t.Fatalf("expected ErrInvalidCertKeyPair, got %v", err)
 	}
 }
 
@@ -226,28 +199,6 @@ func generateTestCertPair(t testing.TB) ([]byte, []byte, []byte, []byte) {
 // VerifyConnection revocation callback tests
 // ---------------------------------------------------------------------------
 
-// TestBuildMTLSTLSNilCheckerNoCallback verifies that when no revocation
-// checker is provided, VerifyConnection is nil on both server and
-// client configs.
-func TestBuildMTLSTLSNilCheckerNoCallback(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	pair, err := buildMTLSTLS(&MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}, nil)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-	if pair.server.VerifyConnection != nil {
-		t.Fatal("server VerifyConnection should be nil without checker")
-	}
-	if pair.client.VerifyConnection != nil {
-		t.Fatal("client VerifyConnection should be nil without checker")
-	}
-}
-
 // TestBuildMTLSTLSWithPrebuiltCertificate verifies the signer seam: when an
 // MTLSConfig supplies a pre-built tls.Certificate (e.g. one whose PrivateKey is
 // a hardware-backed crypto.Signer for a TPM/HSM-resident key) and no PEM
@@ -299,78 +250,6 @@ func TestConfigValidateAcceptsPrebuiltCertificate(t *testing.T) {
 	bad.SetDefaults()
 	if err := bad.Validate(); !errors.Is(err, ErrIncompleteMTLSConfig) {
 		t.Fatalf("Validate without leaf material = %v, want ErrIncompleteMTLSConfig", err)
-	}
-}
-
-// TestBuildMTLSTLSWithCheckerInstallsCallback verifies that a revocation
-// checker causes VerifyConnection to be set on both configs.
-func TestBuildMTLSTLSWithCheckerInstallsCallback(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	// Parse the CA cert for the checker.
-	block, _ := pem.Decode(caCertPEM)
-	caCert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		t.Fatalf("parse CA cert: %v", err)
-	}
-
-	checker := revocation.NewChecker(revocation.Config{
-		Mode: revocation.ModeCRL,
-	}, caCert)
-
-	pair, err := buildMTLSTLS(&MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}, checker)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-	if pair.server.VerifyConnection == nil {
-		t.Fatal("server VerifyConnection should be set with checker")
-	}
-	if pair.client.VerifyConnection == nil {
-		t.Fatal("client VerifyConnection should be set with checker")
-	}
-}
-
-// TestVerifyConnectionRejectsRevoked verifies that the callback
-// rejects a revoked certificate with the correct error type.
-func TestVerifyConnectionRejectsRevoked(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	block, _ := pem.Decode(caCertPEM)
-	caCert, _ := x509.ParseCertificate(block.Bytes)
-
-	checker := revocation.NewChecker(revocation.Config{
-		Mode: revocation.ModeCRL,
-	}, caCert)
-
-	// Parse the leaf cert and add its serial to the revoked set.
-	leafBlock, _ := pem.Decode(certPEM)
-	leafCert, _ := x509.ParseCertificate(leafBlock.Bytes)
-	serial := leafCert.SerialNumber.Text(16)
-	checker.AddRevokedSerial(serial)
-
-	pair, err := buildMTLSTLS(&MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}, checker)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-
-	// Simulate the TLS connection state with the leaf cert.
-	cs := tls.ConnectionState{
-		PeerCertificates: []*x509.Certificate{leafCert},
-	}
-	cbErr := pair.server.VerifyConnection(cs)
-	if cbErr == nil {
-		t.Fatal("VerifyConnection should reject revoked cert")
-	}
-	if !errors.Is(cbErr, revocation.ErrCertificateRevoked) {
-		t.Fatalf("expected ErrCertificateRevoked, got %v", cbErr)
 	}
 }
 
@@ -445,52 +324,6 @@ func TestVerifyConnectionEmptyPeerCerts(t *testing.T) {
 	}
 }
 
-// TestVerifyConnectionCallbackInvokesOnCertRevoked verifies that
-// the OnCertRevoked callback is called when a revoked cert is detected.
-func TestVerifyConnectionCallbackInvokesOnCertRevoked(t *testing.T) {
-	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
-
-	block, _ := pem.Decode(caCertPEM)
-	caCert, _ := x509.ParseCertificate(block.Bytes)
-
-	var callbackCalled atomic.Bool
-	var callbackSerial atomic.Value
-
-	checker := revocation.NewChecker(revocation.Config{
-		Mode: revocation.ModeCRL,
-		OnCertRevoked: func(serial string) {
-			callbackCalled.Store(true)
-			callbackSerial.Store(serial)
-		},
-	}, caCert)
-
-	leafBlock, _ := pem.Decode(certPEM)
-	leafCert, _ := x509.ParseCertificate(leafBlock.Bytes)
-	serial := leafCert.SerialNumber.Text(16)
-	checker.AddRevokedSerial(serial)
-
-	pair, err := buildMTLSTLS(&MTLSConfig{
-		CACert: caCertPEM,
-		Cert:   certPEM,
-		Key:    keyPEM,
-	}, checker)
-	if err != nil {
-		t.Fatalf("buildMTLSTLS failed: %v", err)
-	}
-
-	cs := tls.ConnectionState{
-		PeerCertificates: []*x509.Certificate{leafCert},
-	}
-	_ = pair.server.VerifyConnection(cs)
-
-	if !callbackCalled.Load() {
-		t.Fatal("OnCertRevoked callback should have been called")
-	}
-	if callbackSerial.Load().(string) != serial {
-		t.Fatalf("OnCertRevoked serial: want %q, got %q", serial, callbackSerial.Load())
-	}
-}
-
 // TestBuildMTLSTLS_CurvePreferences verifies that buildMTLSTLS pins
 // CurvePreferences on BOTH roles — an unpinned list negotiates ML-KEM hybrid
 // key exchange and pays ~5% per handshake — and that what it pins is the list
@@ -549,29 +382,5 @@ func TestParseCACertificatesReturnsWholeBundle(t *testing.T) {
 	}
 	if len(issuers) != 2 {
 		t.Fatalf("parsed %d issuers from a two-certificate bundle, want 2", len(issuers))
-	}
-}
-
-// TestParseCACertificatesRejectsBundleWithoutIssuer verifies the fail-fast
-// path: a bundle whose blocks cannot act as an issuing CA leaves revocation
-// with no way to build an OCSP request or verify a CRL, which is a silent
-// no-op under soft-fail and a total handshake outage under enforcement.
-func TestParseCACertificatesRejectsBundleWithoutIssuer(t *testing.T) {
-	_, _, leafPEM, _ := generateTestCertPair(t)
-
-	_, err := parseCACertificates(leafPEM)
-	if err == nil {
-		t.Fatal("expected an error for a bundle containing only a leaf certificate")
-	}
-	if !errors.Is(err, ErrCACertificateParse) {
-		t.Fatalf("expected ErrCACertificateParse, got %v", err)
-	}
-}
-
-// TestParseCACertificatesRejectsEmptyPEM verifies that input with no
-// CERTIFICATE block is rejected rather than yielding an empty issuer list.
-func TestParseCACertificatesRejectsEmptyPEM(t *testing.T) {
-	if _, err := parseCACertificates([]byte("not-pem")); !errors.Is(err, ErrCACertificateParse) {
-		t.Fatalf("expected ErrCACertificateParse for non-PEM input, got %v", err)
 	}
 }

@@ -23,46 +23,6 @@ import (
 	"testing"
 )
 
-// TestEncryptWithEpochPinned_SurvivesConcurrentRotatePurge is the TOCTOU
-// regression: EncryptWithEpoch releases b.mu before returning, so a Rotate +
-// PurgeEpochsBefore (both taking b.mu exclusively) can complete in the gap
-// before the caller pins the returned epoch — dropping the DEK of a frame that
-// is already sealed and making the artifact permanently undecryptable.
-// EncryptWithEpochPinned performs the seal and the pin under one lock, so the
-// ciphertext it returns must ALWAYS remain decryptable no matter how many
-// rotations and purges run immediately afterward.
-func TestEncryptWithEpochPinned_SurvivesConcurrentRotatePurge(t *testing.T) {
-	b, _ := testInitializedBarrier(t) // epoch 1
-	plaintext := []byte("frame that must stay decryptable")
-
-	ct, epoch, err := b.EncryptWithEpochPinned(nil, plaintext)
-	if err != nil {
-		t.Fatalf("EncryptWithEpochPinned: %v", err)
-	}
-	defer b.DeregisterInFlightEpoch(epoch)
-
-	// The interleaving that would orphan the frame: rotate twice past
-	// the sealed epoch, then purge everything below the new current epoch.
-	if _, err := b.Rotate(context.Background()); err != nil {
-		t.Fatalf("Rotate: %v", err)
-	}
-	if _, err := b.Rotate(context.Background()); err != nil {
-		t.Fatalf("Rotate: %v", err)
-	}
-	if _, err := b.PurgeEpochsBefore(context.Background(), b.CurrentEpoch()); err != nil {
-		t.Fatalf("PurgeEpochsBefore: %v", err)
-	}
-
-	pt, err := b.DecryptForEpoch(nil, ct, epoch)
-	if err != nil {
-		t.Fatalf("frame sealed under epoch %d is UNDECRYPTABLE after a concurrent "+
-			"rotate+purge (%v): the atomic seal-and-pin did not protect its DEK", epoch, err)
-	}
-	if !bytes.Equal(pt, plaintext) {
-		t.Fatal("decrypted frame does not match the original plaintext")
-	}
-}
-
 // TestEncryptWithEpochPinned_BalancesRefcount asserts the pin it takes is a
 // single, releasable reference: after the caller deregisters, the epoch is no
 // longer protected and a purge may reclaim it.

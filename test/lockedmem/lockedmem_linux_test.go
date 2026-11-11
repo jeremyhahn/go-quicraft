@@ -89,8 +89,14 @@ func TestProtectionOf_ReportsTheRealProtections(t *testing.T) {
 // consumer reads as "this was not frozen" — a false failure that looks exactly
 // like a real one.
 func TestProtectionOf_RefusesWhatItCannotAnswer(t *testing.T) {
-	if _, err := ProtectionOf(nil); err == nil {
+	_, err := ProtectionOf(nil)
+	if err == nil {
 		t.Fatal("an empty slice has no mapping to report; it must be an error")
+	}
+	// The refusal is its own error, distinguishable from a wrapped read or
+	// parse failure of the maps file.
+	if errors.Unwrap(err) != nil {
+		t.Fatalf("the empty-slice refusal wraps nothing; got %v", errors.Unwrap(err))
 	}
 	if _, err := ProtectionOf([]byte{}); err == nil {
 		t.Fatal("an empty slice has no mapping to report; it must be an error")
@@ -129,18 +135,5 @@ func TestParseRange(t *testing.T) {
 		if _, _, ok := parseRange(bad); ok {
 			t.Errorf("parseRange(%q) reported a range", bad)
 		}
-	}
-}
-
-// TestProtectionOf_ErrorsAreDistinguishable keeps the two failure causes apart
-// for a caller deciding between skipping and failing. Both are wrapped, so
-// errors.Unwrap reaches the cause where there is one.
-func TestProtectionOf_ErrorsAreDistinguishable(t *testing.T) {
-	_, err := ProtectionOf(nil)
-	if err == nil {
-		t.Fatal("expected an error for an empty slice")
-	}
-	if errors.Unwrap(err) != nil {
-		t.Fatalf("the empty-slice refusal wraps nothing; got %v", errors.Unwrap(err))
 	}
 }

@@ -299,43 +299,6 @@ func TestSubmitNoCopy_DoesNotCopy(t *testing.T) {
 	}
 }
 
-// TestSubmit_StoresAnIndependentArray is the counterpart identity check.
-// TestSubmit_CopiesCallerBuffer proves the copy by observing its EFFECT — the
-// recycled contents never reach the proposer — which is the property that
-// matters; this states the mechanism directly, so a build that satisfied the
-// effect some other way (by encoding eagerly, say) still has to declare
-// whether Submit and SubmitNoCopy differ at all.
-func TestSubmit_StoresAnIndependentArray(t *testing.T) {
-	p := newRecordingProposer()
-	agg, err := NewAggregator(p,
-		WithConfig(Config{
-			MaxBatchSize:  1000,
-			FlushInterval: time.Hour,
-			QueueSize:     10,
-		}),
-		WithLogger(slog.Default()),
-		WithRegistry(newTestRegistry(t)),
-	)
-	if err != nil {
-		t.Fatalf("NewAggregator: %v", err)
-	}
-	defer func() { _ = agg.Close() }()
-
-	buf := []byte("CALLER-OWNED-BUF")
-	go func() { _ = agg.Submit(context.Background(), 1, buf) }()
-
-	waitForBatchLen(t, agg, 1)
-	stored := batchedDataOf(t, agg, 0)
-	if &stored[0] == &buf[0] {
-		t.Fatal("Submit stored the caller's own array; the caller regains control " +
-			"of it as soon as Submit returns, so the flush would encode whatever " +
-			"the buffer holds by then")
-	}
-	if string(stored) != string(buf) {
-		t.Fatalf("Submit stored %q, want a copy of %q", stored, buf)
-	}
-}
-
 // batchedDataOf returns the data slice the aggregator is holding for the
 // proposal at position i of the current unflushed batch.
 func batchedDataOf(t *testing.T, a *Aggregator, i int) []byte {

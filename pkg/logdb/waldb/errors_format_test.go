@@ -17,7 +17,6 @@ package waldb
 import (
 	"errors"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,22 +114,6 @@ func TestClearMetaSegmentPins_ReleasesOnlyMatchingPins(t *testing.T) {
 	}
 }
 
-// removeErrFS fails every Remove with a fixed error.
-type removeErrFS struct {
-	FS
-	err error
-}
-
-func (r removeErrFS) Remove(string) error { return r.err }
-
-// TestMarkerTempHelpers_SwallowCleanupFailures verifies the best-effort
-// cleanup helpers never panic or propagate when the filesystem refuses.
-func TestMarkerTempHelpers_SwallowCleanupFailures(t *testing.T) {
-	closeMarkerTemp(&failingCloseFile{closeErr: errors.New("close refused")}, "tmp", "write")
-	removeMarkerTemp(removeErrFS{FS: defaultFS(), err: errors.New("remove refused")}, "tmp")
-	removeMarkerTemp(removeErrFS{FS: defaultFS(), err: fs.ErrNotExist}, "tmp")
-}
-
 // TestWriteMarkerTemp_RoundTripAndNoSync verifies the temp marker is written
 // whole with and without the data sync.
 func TestWriteMarkerTemp_RoundTripAndNoSync(t *testing.T) {
@@ -190,23 +173,13 @@ func TestOSFile_Seek(t *testing.T) {
 	}
 }
 
-// TestNodeRemoved_ReportsRetirementAndClosedDB verifies NodeRemoved answers
-// from the retirement registry and refuses once the DB is closed.
-func TestNodeRemoved_ReportsRetirementAndClosedDB(t *testing.T) {
+// TestNodeRemoved_ClosedDB verifies NodeRemoved refuses once the DB is closed.
+// The answers before and after a retirement are asserted by
+// TestNodeRemoved_RetirementIsDurableAndMigrates.
+func TestNodeRemoved_ClosedDB(t *testing.T) {
 	db, err := Open(t.TempDir(), WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
-	}
-	removed, err := db.NodeRemoved(1, 1)
-	if err != nil || removed {
-		t.Fatalf("unknown node: removed=%v err=%v", removed, err)
-	}
-	if err := db.RemoveNodeData(1, 1); err != nil {
-		t.Fatalf("RemoveNodeData: %v", err)
-	}
-	removed, err = db.NodeRemoved(1, 1)
-	if err != nil || !removed {
-		t.Fatalf("retired node: removed=%v err=%v", removed, err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

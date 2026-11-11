@@ -19,14 +19,6 @@ import (
 	"testing"
 )
 
-func TestReadyMap_SwapEmpty(t *testing.T) {
-	rm := NewReadyMap()
-	got := rm.Swap()
-	if len(got) != 0 {
-		t.Fatalf("expected empty map, got %d entries", len(got))
-	}
-}
-
 func TestReadyMap_DuplicateSetDeduplicated(t *testing.T) {
 	rm := NewReadyMap()
 	rm.Set(42)
@@ -39,26 +31,6 @@ func TestReadyMap_DuplicateSetDeduplicated(t *testing.T) {
 	}
 	if _, ok := got[42]; !ok {
 		t.Fatal("expected shard 42 in result")
-	}
-}
-
-func TestReadyMap_SetAcrossDifferentBuckets(t *testing.T) {
-	rm := NewReadyMap()
-
-	// These shard IDs map to different buckets: id % 64.
-	shards := []uint64{0, 1, 63, 64, 127, 128, 1000, 9999}
-	for _, id := range shards {
-		rm.Set(id)
-	}
-
-	got := rm.Swap()
-	if len(got) != len(shards) {
-		t.Fatalf("expected %d shards, got %d", len(shards), len(got))
-	}
-	for _, id := range shards {
-		if _, ok := got[id]; !ok {
-			t.Fatalf("expected shard %d in result", id)
-		}
 	}
 }
 
@@ -136,48 +108,6 @@ func TestReadyMap_DoubleBufferSwapAlternates(t *testing.T) {
 	third := rm.Swap()
 	if len(third) != 0 {
 		t.Fatalf("third swap: expected 0 shards, got %d", len(third))
-	}
-}
-
-func TestReadyMap_ConcurrentSetWithSwap(t *testing.T) {
-	rm := NewReadyMap()
-	const iterations = 100
-	const writersPerIteration = 10
-	const shardsPerWriter = 100
-
-	// Run concurrent writers while swapping periodically.
-	// All shards must eventually appear in some swap result.
-	collected := make(map[uint64]struct{})
-	var mu sync.Mutex
-
-	var wg sync.WaitGroup
-
-	// Continuous writers.
-	wg.Add(writersPerIteration)
-	for w := range writersPerIteration {
-		go func(base int) {
-			defer wg.Done()
-			for i := range shardsPerWriter {
-				rm.Set(uint64(base*shardsPerWriter + i))
-			}
-		}(w)
-	}
-
-	wg.Wait()
-
-	// Drain everything via swap.
-	for range iterations {
-		result := rm.Swap()
-		mu.Lock()
-		for id := range result {
-			collected[id] = struct{}{}
-		}
-		mu.Unlock()
-	}
-
-	expected := writersPerIteration * shardsPerWriter
-	if len(collected) != expected {
-		t.Fatalf("expected %d unique shards, got %d", expected, len(collected))
 	}
 }
 

@@ -279,56 +279,69 @@ var _ DiskStateMachine = (*testOnDiskStateMachine)(nil)
 // ---------------------------------------------------------------------------
 
 func TestNewCreateFunc_PassesShardAndReplicaIDs(t *testing.T) {
-	var capturedShard, capturedReplica uint64
-	cf := NewCreateFunc(func(shardID, replicaID uint64) StateMachine {
-		capturedShard = shardID
-		capturedReplica = replicaID
-		return newTestStateMachine()
-	})
-	if _, ok := cf(42, 99).(StateMachine); !ok {
-		t.Fatal("NewCreateFunc result does not implement StateMachine")
+	// Each constructor passes the shard and replica IDs through to the user
+	// factory and returns a value of the matching state machine type.
+	tests := []struct {
+		name string
+		// build wraps a factory that records its arguments in the constructor
+		// under test.
+		build func(record func(shardID, replicaID uint64)) CreateFunc
+		// isKind reports whether the created value has the expected type.
+		isKind  func(v interface{}) bool
+		shardID uint64
+		replica uint64
+	}{
+		{
+			name: "NewCreateFunc",
+			build: func(record func(uint64, uint64)) CreateFunc {
+				return NewCreateFunc(func(shardID, replicaID uint64) StateMachine {
+					record(shardID, replicaID)
+					return newTestStateMachine()
+				})
+			},
+			isKind:  func(v interface{}) bool { _, ok := v.(StateMachine); return ok },
+			shardID: 42, replica: 99,
+		},
+		{
+			name: "NewConcurrentCreateFunc",
+			build: func(record func(uint64, uint64)) CreateFunc {
+				return NewConcurrentCreateFunc(func(shardID, replicaID uint64) ConcurrentStateMachine {
+					record(shardID, replicaID)
+					return newTestConcurrentStateMachine()
+				})
+			},
+			isKind:  func(v interface{}) bool { _, ok := v.(ConcurrentStateMachine); return ok },
+			shardID: 77, replica: 88,
+		},
+		{
+			name: "NewDiskCreateFunc",
+			build: func(record func(uint64, uint64)) CreateFunc {
+				return NewDiskCreateFunc(func(shardID, replicaID uint64) DiskStateMachine {
+					record(shardID, replicaID)
+					return newTestOnDiskStateMachine()
+				})
+			},
+			isKind:  func(v interface{}) bool { _, ok := v.(DiskStateMachine); return ok },
+			shardID: 55, replica: 66,
+		},
 	}
-	if capturedShard != 42 {
-		t.Errorf("shardID = %d, want 42", capturedShard)
-	}
-	if capturedReplica != 99 {
-		t.Errorf("replicaID = %d, want 99", capturedReplica)
-	}
-}
-
-func TestNewConcurrentCreateFunc_PassesShardAndReplicaIDs(t *testing.T) {
-	var capturedShard, capturedReplica uint64
-	cf := NewConcurrentCreateFunc(func(shardID, replicaID uint64) ConcurrentStateMachine {
-		capturedShard = shardID
-		capturedReplica = replicaID
-		return newTestConcurrentStateMachine()
-	})
-	if _, ok := cf(77, 88).(ConcurrentStateMachine); !ok {
-		t.Fatal("NewConcurrentCreateFunc result does not implement ConcurrentStateMachine")
-	}
-	if capturedShard != 77 {
-		t.Errorf("shardID = %d, want 77", capturedShard)
-	}
-	if capturedReplica != 88 {
-		t.Errorf("replicaID = %d, want 88", capturedReplica)
-	}
-}
-
-func TestNewDiskCreateFunc_PassesShardAndReplicaIDs(t *testing.T) {
-	var capturedShard, capturedReplica uint64
-	cf := NewDiskCreateFunc(func(shardID, replicaID uint64) DiskStateMachine {
-		capturedShard = shardID
-		capturedReplica = replicaID
-		return newTestOnDiskStateMachine()
-	})
-	if _, ok := cf(55, 66).(DiskStateMachine); !ok {
-		t.Fatal("NewDiskCreateFunc result does not implement DiskStateMachine")
-	}
-	if capturedShard != 55 {
-		t.Errorf("shardID = %d, want 55", capturedShard)
-	}
-	if capturedReplica != 66 {
-		t.Errorf("replicaID = %d, want 66", capturedReplica)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var capturedShard, capturedReplica uint64
+			cf := tt.build(func(shardID, replicaID uint64) {
+				capturedShard = shardID
+				capturedReplica = replicaID
+			})
+			if !tt.isKind(cf(tt.shardID, tt.replica)) {
+				t.Fatalf("%s result has the wrong state machine type", tt.name)
+			}
+			if capturedShard != tt.shardID {
+				t.Errorf("shardID = %d, want %d", capturedShard, tt.shardID)
+			}
+			if capturedReplica != tt.replica {
+				t.Errorf("replicaID = %d, want %d", capturedReplica, tt.replica)
+			}
+		})
 	}
 }
 

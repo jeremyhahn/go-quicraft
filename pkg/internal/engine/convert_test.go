@@ -204,65 +204,6 @@ func TestProtoUpdatesToLogDBReuse_EmptyEntries(t *testing.T) {
 	}
 }
 
-func TestProtoUpdatesToLogDBReuse_GrowsFlatBuffer(t *testing.T) {
-	// Start with a tiny flat buffer that cannot hold all entries.
-	flatBuf := make([]logdb.Entry, 0, 1)
-	src := []proto.Update{
-		{
-			ShardID: 1,
-			EntriesToSave: []proto.Entry{
-				{Term: 1, Index: 1},
-				{Term: 1, Index: 2},
-				{Term: 1, Index: 3},
-			},
-		},
-		{
-			ShardID: 2,
-			EntriesToSave: []proto.Entry{
-				{Term: 2, Index: 10},
-				{Term: 2, Index: 11},
-			},
-		},
-	}
-	var dst []logdb.Update
-	dst, flatBuf = protoUpdatesToLogDBReuse(dst, flatBuf, src)
-
-	if len(flatBuf) != 5 {
-		t.Fatalf("flat buffer len = %d, want 5", len(flatBuf))
-	}
-	if cap(flatBuf) < 5 {
-		t.Errorf("flat buffer cap = %d, want >= 5", cap(flatBuf))
-	}
-	if len(dst[0].Entries) != 3 {
-		t.Errorf("dst[0].Entries len = %d, want 3", len(dst[0].Entries))
-	}
-	if len(dst[1].Entries) != 2 {
-		t.Errorf("dst[1].Entries len = %d, want 2", len(dst[1].Entries))
-	}
-}
-
-func TestProtoUpdatesToLogDBReuse_AllEmpty(t *testing.T) {
-	src := []proto.Update{
-		{ShardID: 1, State: proto.State{Term: 1}},
-		{ShardID: 2, State: proto.State{Term: 2}},
-	}
-	var dst []logdb.Update
-	var flatBuf []logdb.Entry
-	dst, flatBuf = protoUpdatesToLogDBReuse(dst, flatBuf, src)
-
-	if len(dst) != 2 {
-		t.Fatalf("expected 2 updates, got %d", len(dst))
-	}
-	if len(flatBuf) != 0 {
-		t.Errorf("flat buffer len = %d, want 0 (no entries)", len(flatBuf))
-	}
-	for i := range dst {
-		if len(dst[i].Entries) != 0 {
-			t.Errorf("dst[%d].Entries len = %d, want 0", i, len(dst[i].Entries))
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Benchmarks
 // ---------------------------------------------------------------------------

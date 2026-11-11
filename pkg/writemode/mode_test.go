@@ -20,20 +20,31 @@ import (
 	"testing"
 )
 
-func TestMode_String(t *testing.T) {
+func TestMode_DeclaredModeGuarantees(t *testing.T) {
 	tests := []struct {
-		name string
-		mode Mode
-		want string
+		mode       Mode
+		name       string
+		sync       bool
+		async      bool
+		needQuorum bool
 	}{
-		{name: "sync", mode: Sync, want: "sync"},
-		{name: "wal_durable", mode: WALDurable, want: "wal_durable"},
-		{name: "batched", mode: Batched, want: "batched"},
+		{mode: Sync, name: "sync", sync: true, async: false, needQuorum: true},
+		{mode: WALDurable, name: "wal_durable", sync: false, async: true, needQuorum: false},
+		{mode: Batched, name: "batched", sync: true, async: false, needQuorum: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.mode.String(); got != tt.want {
-				t.Errorf("Mode.String() = %q, want %q", got, tt.want)
+			if got := tt.mode.String(); got != tt.name {
+				t.Errorf("Mode(%d).String() = %q, want %q", tt.mode, got, tt.name)
+			}
+			if got := tt.mode.IsSynchronous(); got != tt.sync {
+				t.Errorf("Mode(%d).IsSynchronous() = %v, want %v", tt.mode, got, tt.sync)
+			}
+			if got := tt.mode.IsAsync(); got != tt.async {
+				t.Errorf("Mode(%d).IsAsync() = %v, want %v", tt.mode, got, tt.async)
+			}
+			if got := tt.mode.RequiresQuorum(); got != tt.needQuorum {
+				t.Errorf("Mode(%d).RequiresQuorum() = %v, want %v", tt.mode, got, tt.needQuorum)
 			}
 		})
 	}
@@ -89,63 +100,6 @@ func TestFromString_InvalidMode(t *testing.T) {
 			}
 			if target.Value != tt.input {
 				t.Errorf("InvalidModeError.Value = %q, want %q", target.Value, tt.input)
-			}
-		})
-	}
-}
-
-func TestMode_IsSynchronous(t *testing.T) {
-	tests := []struct {
-		name string
-		mode Mode
-		want bool
-	}{
-		{name: "sync is synchronous", mode: Sync, want: true},
-		{name: "wal_durable is not synchronous", mode: WALDurable, want: false},
-		{name: "batched is synchronous", mode: Batched, want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.mode.IsSynchronous(); got != tt.want {
-				t.Errorf("Mode(%d).IsSynchronous() = %v, want %v", tt.mode, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestMode_IsAsync(t *testing.T) {
-	tests := []struct {
-		name string
-		mode Mode
-		want bool
-	}{
-		{name: "sync is not async", mode: Sync, want: false},
-		{name: "wal_durable is async", mode: WALDurable, want: true},
-		{name: "batched is not async", mode: Batched, want: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.mode.IsAsync(); got != tt.want {
-				t.Errorf("Mode(%d).IsAsync() = %v, want %v", tt.mode, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestMode_RequiresQuorum(t *testing.T) {
-	tests := []struct {
-		name string
-		mode Mode
-		want bool
-	}{
-		{name: "sync requires quorum", mode: Sync, want: true},
-		{name: "wal_durable does not require quorum", mode: WALDurable, want: false},
-		{name: "batched requires quorum", mode: Batched, want: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.mode.RequiresQuorum(); got != tt.want {
-				t.Errorf("Mode(%d).RequiresQuorum() = %v, want %v", tt.mode, got, tt.want)
 			}
 		})
 	}

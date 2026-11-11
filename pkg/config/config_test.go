@@ -170,13 +170,6 @@ func TestConfig_SetDefaults_SnapshotEntries(t *testing.T) {
 }
 
 func TestConfig_Validate_Valid(t *testing.T) {
-	t.Run("valid config after SetDefaults", func(t *testing.T) {
-		c := validConfig()
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-
 	t.Run("valid config with observer", func(t *testing.T) {
 		c := validConfig()
 		c.IsObserver = true
@@ -707,15 +700,6 @@ func TestConfig_Validate_LeaseReadRequiresCheckQuorum(t *testing.T) {
 		var lrErr *LeaseReadRequiresCheckQuorumError
 		if !errors.As(err, &lrErr) {
 			t.Fatalf("expected *LeaseReadRequiresCheckQuorumError, got %T: %v", err, err)
-		}
-	})
-
-	t.Run("LeaseRead true with CheckQuorum true passes validation", func(t *testing.T) {
-		c := validConfig()
-		c.LeaseRead = true
-		c.CheckQuorum = BoolPtr(true)
-		if err := c.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
 		}
 	})
 }

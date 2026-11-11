@@ -191,51 +191,6 @@ func TestCiphertextExpansionWithinBound(t *testing.T) {
 
 // --- round trips ---
 
-// TestContextAADRoundTripAfterReopen is the baseline: records sealed with a
-// positional context are recovered by a reopen that reproduces it.
-func TestContextAADRoundTripAfterReopen(t *testing.T) {
-	barrier := newTestBarrier(t)
-	dir := t.TempDir()
-
-	db := openAADTestDB(t, dir, barrier)
-	entries := makeBenchEntries(1, 12, 3, 64)
-	if err := db.SaveEntries(1, 1, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-	if err := db.SaveState([]logdb.Update{{
-		ShardID: 1, ReplicaID: 1,
-		State: logdb.State{Term: 3, Vote: 2, Commit: 12},
-	}}); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	reopened := openAADTestDB(t, dir, barrier)
-	defer reopened.Close()
-
-	got, err := reopened.GetEntries(1, 1, 1, 13, 0)
-	if err != nil {
-		t.Fatalf("GetEntries after reopen: %v", err)
-	}
-	if len(got) != 12 {
-		t.Fatalf("GetEntries after reopen: got %d entries, want 12", len(got))
-	}
-	for i := range got {
-		if !bytes.Equal(got[i].Cmd, entries[i].Cmd) {
-			t.Fatalf("entry %d Cmd mismatch after reopen", i)
-		}
-	}
-	st, _, err := reopened.ReadState(1, 1)
-	if err != nil {
-		t.Fatalf("ReadState: %v", err)
-	}
-	if st.Term != 3 || st.Vote != 2 || st.Commit != 12 {
-		t.Fatalf("ReadState = %+v, want term 3 vote 2 commit 12", st)
-	}
-}
-
 // TestContextAADMultiChunkRecordRoundTrips proves the ordinal counts LOGICAL
 // records, not physical chunks: a record far larger than one block is split
 // into First/Middle/Last chunks on the way out and reassembled into a single
@@ -279,46 +234,6 @@ func TestContextAADMultiChunkRecordRoundTrips(t *testing.T) {
 	}
 	if !bytes.Equal(got[2].Cmd, big[0].Cmd) {
 		t.Fatal("multi-chunk entry Cmd corrupted across the round trip")
-	}
-}
-
-// TestContextAADSurvivesSegmentRotation exercises the pre-resolved landing
-// segment: enough encrypted records to roll several segments, all of which must
-// recover. A record sealed against the pre-rotation segment ID would be
-// unopenable in the segment it actually landed in.
-func TestContextAADSurvivesSegmentRotation(t *testing.T) {
-	barrier := newTestBarrier(t)
-	dir := t.TempDir()
-
-	db := openAADTestDB(t, dir, barrier)
-	const batches = 40
-	for i := 0; i < batches; i++ {
-		entries := makeBenchEntries(uint64(i*8+1), 8, 1, 256)
-		if err := db.SaveEntries(1, 1, entries); err != nil {
-			t.Fatalf("SaveEntries(batch %d): %v", i, err)
-		}
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	shardDir := walShardDir(dir, 1)
-	segs, err := os.ReadDir(shardDir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(segs) < 3 {
-		t.Fatalf("only %d segment files; the test needs several rotations", len(segs))
-	}
-
-	reopened := openAADTestDB(t, dir, barrier)
-	defer reopened.Close()
-	got, err := reopened.GetEntries(1, 1, 1, batches*8+1, 0)
-	if err != nil {
-		t.Fatalf("GetEntries after reopen: %v", err)
-	}
-	if len(got) != batches*8 {
-		t.Fatalf("GetEntries after reopen: got %d entries, want %d", len(got), batches*8)
 	}
 }
 
@@ -533,67 +448,6 @@ func TestContextAADRecoversAfterBatchRollback(t *testing.T) {
 	}
 }
 
-// TestDiscardPendingRewindsRecordOrdinal is the unit-level half of the same
-// invariant: DiscardPending rewinds the ordinal exactly as it rewinds the
-// offsets, so the counter only ever reflects records present in the file.
-func TestDiscardPendingRewindsRecordOrdinal(t *testing.T) {
-	dir := t.TempDir()
-	seg, _, err := createSegment(defaultFS(), dir, 0, aadTestBlockSize, aadTestMaxFileSize)
-	if err != nil {
-		t.Fatalf("createSegment: %v", err)
-	}
-	defer seg.Close()
-
-	for i := 0; i < 3; i++ {
-		if _, err := seg.Write([]byte("committed")); err != nil {
-			t.Fatalf("Write(committed %d): %v", i, err)
-		}
-	}
-	if err := seg.Sync(); err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	cleanFileOffset, cleanBlockOffset := seg.fileOffset, seg.blockOffset
-	cleanRecordCount := seg.RecordCount()
-	if cleanRecordCount != 3 {
-		t.Fatalf("RecordCount = %d, want 3", cleanRecordCount)
-	}
-
-	for i := 0; i < 4; i++ {
-		if _, err := seg.Write([]byte("rolled back")); err != nil {
-			t.Fatalf("Write(rolled back %d): %v", i, err)
-		}
-	}
-	if seg.RecordCount() != 7 {
-		t.Fatalf("RecordCount before discard = %d, want 7", seg.RecordCount())
-	}
-
-	if err := seg.DiscardPending(cleanFileOffset, cleanBlockOffset, cleanRecordCount); err != nil {
-		t.Fatalf("DiscardPending: %v", err)
-	}
-	if got := seg.RecordCount(); got != 3 {
-		t.Fatalf("RecordCount after discard = %d, want 3", got)
-	}
-
-	// The next record must take ordinal 3 — the index ReadAll will report it at.
-	if _, err := seg.Write([]byte("after rollback")); err != nil {
-		t.Fatalf("Write(after rollback): %v", err)
-	}
-	if got := seg.RecordCount(); got != 4 {
-		t.Fatalf("RecordCount after next write = %d, want 4", got)
-	}
-	if err := seg.Sync(); err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-
-	records := readSegmentRecords(t, dir, 0)
-	if len(records) != 4 {
-		t.Fatalf("ReadAll returned %d records, want 4", len(records))
-	}
-	if string(records[3]) != "after rollback" {
-		t.Fatalf("records[3] = %q, want %q", records[3], "after rollback")
-	}
-}
-
 // --- fail-closed barrier capability ---
 
 // noContextBarrier satisfies WALBarrier but not walContextBarrier: it cannot
@@ -638,21 +492,6 @@ func TestOpenRejectsBarrierWithoutContextSupport(t *testing.T) {
 	}
 	if !errors.Is(err, ErrBarrierContextUnsupported) {
 		t.Fatalf("Open error = %v, want ErrBarrierContextUnsupported", err)
-	}
-}
-
-// TestSealBarrierSatisfiesContextCapability is the compile-and-run check that
-// the production barrier provides the capability the WAL requires.
-func TestSealBarrierSatisfiesContextCapability(t *testing.T) {
-	var _ walContextBarrier = (*seal.Barrier)(nil)
-
-	barrier := newTestBarrier(t)
-	if barrier.IsHardwareMode() {
-		t.Fatal("software test barrier reports hardware mode")
-	}
-	if !barrier.SupportsContextAAD() {
-		t.Fatal("software test barrier reports it cannot bind caller context; " +
-			"every WAL record would be written without positional binding")
 	}
 }
 

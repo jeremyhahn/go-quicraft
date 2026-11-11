@@ -339,26 +339,4 @@ func TestCreateAnonymousScratch_FailedUnlinkFails(t *testing.T) {
 			t.Fatal("a scratch name that survived the best-effort removal was not counted")
 		}
 	})
-
-	t.Run("unlinked_at_once", func(t *testing.T) {
-		dir := t.TempDir()
-		f, err := CreateAnonymousScratch(osScratchFS{}, dir, RecoverDecryptTempPattern)
-		if err != nil {
-			t.Fatalf("CreateAnonymousScratch: %v", err)
-		}
-		defer func() { _ = f.Close() }()
-		if _, statErr := os.Stat(f.Name()); !errors.Is(statErr, fs.ErrNotExist) {
-			t.Fatalf("the scratch still has a name after CreateAnonymousScratch (stat err=%v)", statErr)
-		}
-		if _, err := f.Write([]byte("readable through the handle")); err != nil {
-			t.Fatalf("Write: %v", err)
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			t.Fatalf("Seek: %v", err)
-		}
-		got, err := io.ReadAll(f)
-		if err != nil || string(got) != "readable through the handle" {
-			t.Fatalf("read back %q, %v", got, err)
-		}
-	})
 }

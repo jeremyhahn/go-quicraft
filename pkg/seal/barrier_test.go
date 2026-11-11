@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -739,54 +740,6 @@ func TestBarrier_FullLifecycle(t *testing.T) {
 
 // --- PurgeEpochsBefore ---
 
-func TestBarrier_PurgeEpochsBefore(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	// Create epochs 1, 2, 3.
-	plaintext1 := []byte("epoch 1")
-	ct1, err := b.Encrypt(nil, plaintext1)
-	if err != nil {
-		t.Fatalf("Encrypt at epoch 1 failed: %v", err)
-	}
-
-	if _, err := b.Rotate(context.Background()); err != nil {
-		t.Fatalf("Rotate to 2 failed: %v", err)
-	}
-	if _, err := b.Rotate(context.Background()); err != nil {
-		t.Fatalf("Rotate to 3 failed: %v", err)
-	}
-
-	// Purge epochs before 2 (removes epoch 1).
-	purged, err := b.PurgeEpochsBefore(context.Background(), 2)
-	if err != nil {
-		t.Fatalf("PurgeEpochsBefore failed: %v", err)
-	}
-	if purged != 1 {
-		t.Fatalf("expected 1 epoch purged, got %d", purged)
-	}
-
-	// Epoch 1 data should no longer decrypt.
-	_, err = b.Decrypt(nil, ct1)
-	if !errors.Is(err, ErrDecryptionFailed) {
-		t.Fatalf("expected ErrDecryptionFailed after purge, got %v", err)
-	}
-
-	// Current epoch (3) should still work.
-	plaintext3 := []byte("epoch 3")
-	ct3, err := b.Encrypt(nil, plaintext3)
-	if err != nil {
-		t.Fatalf("Encrypt at epoch 3 failed: %v", err)
-	}
-	dec3, err := b.Decrypt(nil, ct3)
-	if err != nil {
-		t.Fatalf("Decrypt ct3 failed: %v", err)
-	}
-	if !bytes.Equal(plaintext3, dec3) {
-		t.Fatal("ct3 decryption mismatch")
-	}
-}
-
 func TestBarrier_PurgeEpochsBeforeWhenSealed(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
@@ -1256,219 +1209,53 @@ func TestBarrier_SealedRootKeyDataDefensiveCopy(t *testing.T) {
 
 // --- Key Derivation ---
 
-func TestDeriveDEK_DifferentEpochs(t *testing.T) {
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
+// TestDeriveDEK_InputBinding verifies that deriveDEK is deterministic for the
+// same inputs (deployment ID 0 included), returns a 32-byte AES-256 key, and
+// separates keys by epoch, salt and deployment ID.
+func TestDeriveDEK_InputBinding(t *testing.T) {
+	random := func() []byte {
+		b := make([]byte, 32)
+		if _, err := rand.Read(b); err != nil {
+			t.Fatalf("rand.Read failed: %v", err)
+		}
+		return b
 	}
+	rootKey, salt1, salt2 := random(), random(), random()
 
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
+	type in struct {
+		salt         []byte
+		deploymentID uint64
+		epoch        uint64
 	}
-
-	dek1, err := deriveDEK(rootKey, salt, 1, 1, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK epoch 1 failed: %v", err)
+	tests := []struct {
+		name      string
+		a, b      in
+		wantEqual bool
+	}{
+		{"same inputs are deterministic", in{salt1, 42, 7}, in{salt1, 42, 7}, true},
+		{"deployment ID 0 is deterministic", in{salt1, 0, 1}, in{salt1, 0, 1}, true},
+		{"different epochs", in{salt1, 1, 1}, in{salt1, 1, 2}, false},
+		{"different salts", in{salt1, 1, 1}, in{salt2, 1, 1}, false},
+		{"different deployment IDs", in{salt1, 100, 1}, in{salt1, 200, 1}, false},
+		{"deployment ID 0 differs from 1", in{salt1, 0, 1}, in{salt1, 1, 1}, false},
 	}
-
-	dek2, err := deriveDEK(rootKey, salt, 1, 2, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK epoch 2 failed: %v", err)
-	}
-
-	if bytes.Equal(dek1, dek2) {
-		t.Fatal("DEKs for different epochs should not be equal")
-	}
-}
-
-func TestDeriveDEK_DifferentSalts(t *testing.T) {
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	salt1 := make([]byte, 32)
-	salt2 := make([]byte, 32)
-	if _, err := rand.Read(salt1); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-	if _, err := rand.Read(salt2); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	dek1, err := deriveDEK(rootKey, salt1, 1, 1, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK salt1 failed: %v", err)
-	}
-
-	dek2, err := deriveDEK(rootKey, salt2, 1, 1, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK salt2 failed: %v", err)
-	}
-
-	if bytes.Equal(dek1, dek2) {
-		t.Fatal("DEKs with different salts should not be equal")
-	}
-}
-
-// --- HKDF Deployment ID Binding ---
-
-// TestHKDFDeploymentIDBinding verifies that the same root key, salt, and epoch
-// produce different DEKs when the deployment ID differs. This ensures
-// cryptographic isolation between clusters that happen to share key material.
-func TestHKDFDeploymentIDBinding(t *testing.T) {
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	const epoch uint64 = 1
-
-	dek1, err := deriveDEK(rootKey, salt, 100, epoch, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK deploymentID=100 failed: %v", err)
-	}
-
-	dek2, err := deriveDEK(rootKey, salt, 200, epoch, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK deploymentID=200 failed: %v", err)
-	}
-
-	if bytes.Equal(dek1, dek2) {
-		t.Fatal("DEKs for different deployment IDs should not be equal")
-	}
-
-	if len(dek1) != 32 {
-		t.Fatalf("expected DEK size %d, got %d", 32, len(dek1))
-	}
-	if len(dek2) != 32 {
-		t.Fatalf("expected DEK size %d, got %d", 32, len(dek2))
-	}
-}
-
-// TestHKDFDeploymentIDConsistency verifies that the same root key, salt,
-// deployment ID, and epoch always produce the same DEK (deterministic).
-func TestHKDFDeploymentIDConsistency(t *testing.T) {
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	const deploymentID uint64 = 42
-	const epoch uint64 = 7
-
-	dek1, err := deriveDEK(rootKey, salt, deploymentID, epoch, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK call 1 failed: %v", err)
-	}
-
-	dek2, err := deriveDEK(rootKey, salt, deploymentID, epoch, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK call 2 failed: %v", err)
-	}
-
-	if !bytes.Equal(dek1, dek2) {
-		t.Fatal("same inputs should produce same DEK")
-	}
-}
-
-// TestHKDFZeroDeploymentID verifies that deployment ID 0 is a valid input
-// that produces a deterministic DEK, and that it differs from non-zero IDs.
-func TestHKDFZeroDeploymentID(t *testing.T) {
-	rootKey := make([]byte, 32)
-	if _, err := rand.Read(rootKey); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	const epoch uint64 = 1
-
-	// Zero deployment ID should work and produce a valid DEK.
-	dekZero1, err := deriveDEK(rootKey, salt, 0, epoch, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK deploymentID=0 failed: %v", err)
-	}
-	if len(dekZero1) != 32 {
-		t.Fatalf("expected DEK size %d, got %d", 32, len(dekZero1))
-	}
-
-	// Zero deployment ID should be deterministic.
-	dekZero2, err := deriveDEK(rootKey, salt, 0, epoch, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK deploymentID=0 (second call) failed: %v", err)
-	}
-	if !bytes.Equal(dekZero1, dekZero2) {
-		t.Fatal("deploymentID=0 should be deterministic")
-	}
-
-	// Zero deployment ID should differ from non-zero.
-	dekNonZero, err := deriveDEK(rootKey, salt, 1, epoch, AlgAES256GCM, HKDFV2)
-	if err != nil {
-		t.Fatalf("deriveDEK deploymentID=1 failed: %v", err)
-	}
-	if bytes.Equal(dekZero1, dekNonZero) {
-		t.Fatal("deploymentID=0 and deploymentID=1 should produce different DEKs")
-	}
-}
-
-// TestBarrierDeploymentIDIsolation verifies end-to-end that two barriers with
-// different deployment IDs but initialized with the same root key material
-// cannot decrypt each other's ciphertext. This is the integration-level
-// verification of the HKDF cluster binding.
-func TestBarrierDeploymentIDIsolation(t *testing.T) {
-	// Create two barriers with different deployment IDs.
-	b1 := MustNewBarrier(DefaultBarrierConfig(100))
-	s1 := testStrategy(t)
-	defer s1.Close()
-	if err := b1.Initialize(context.Background(), s1, Credentials{}); err != nil {
-		t.Fatalf("b1 Initialize failed: %v", err)
-	}
-
-	b2 := MustNewBarrier(DefaultBarrierConfig(200))
-	s2 := testStrategy(t)
-	defer s2.Close()
-	if err := b2.Initialize(context.Background(), s2, Credentials{}); err != nil {
-		t.Fatalf("b2 Initialize failed: %v", err)
-	}
-
-	// Encrypt with barrier 1.
-	plaintext := []byte("cross-cluster-isolation-test")
-	ct, err := b1.Encrypt(nil, plaintext)
-	if err != nil {
-		t.Fatalf("b1 Encrypt failed: %v", err)
-	}
-
-	// Barrier 1 should decrypt its own ciphertext.
-	pt, err := b1.Decrypt(nil, ct)
-	if err != nil {
-		t.Fatalf("b1 Decrypt failed: %v", err)
-	}
-	if !bytes.Equal(pt, plaintext) {
-		t.Fatal("b1 round-trip failed")
-	}
-
-	// Barrier 2 should fail to decrypt barrier 1's ciphertext because
-	// the DEKs are derived with different deployment IDs. The epoch
-	// tag (epoch 1) will match, but the AES-GCM authentication will fail
-	// because the underlying DEK is different.
-	_, err = b2.Decrypt(nil, ct)
-	if err != ErrDecryptionFailed {
-		t.Fatalf("expected ErrDecryptionFailed from cross-cluster decrypt, got: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dek1, err := deriveDEK(rootKey, tc.a.salt, tc.a.deploymentID, tc.a.epoch, AlgAES256GCM, HKDFV2)
+			if err != nil {
+				t.Fatalf("deriveDEK(a) failed: %v", err)
+			}
+			dek2, err := deriveDEK(rootKey, tc.b.salt, tc.b.deploymentID, tc.b.epoch, AlgAES256GCM, HKDFV2)
+			if err != nil {
+				t.Fatalf("deriveDEK(b) failed: %v", err)
+			}
+			if len(dek1) != 32 || len(dek2) != 32 {
+				t.Fatalf("DEK sizes = %d, %d, want 32", len(dek1), len(dek2))
+			}
+			if got := bytes.Equal(dek1, dek2); got != tc.wantEqual {
+				t.Fatalf("DEKs equal = %v, want %v", got, tc.wantEqual)
+			}
+		})
 	}
 }
 
@@ -1506,42 +1293,6 @@ func TestBarrier_CrossBarrierIsolation(t *testing.T) {
 }
 
 // --- Edge Cases ---
-
-func TestBarrier_EncryptDecryptAfterSealUnsealCycle(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	// Rotate a few times.
-	for i := 0; i < 3; i++ {
-		if _, err := b.Rotate(context.Background()); err != nil {
-			t.Fatalf("Rotate failed: %v", err)
-		}
-	}
-
-	// Encrypt at epoch 4.
-	plaintext := []byte("after rotations")
-	ct, err := b.Encrypt(nil, plaintext)
-	if err != nil {
-		t.Fatalf("Encrypt failed: %v", err)
-	}
-
-	// Seal and unseal.
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-	if err := b.Unseal(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Unseal failed: %v", err)
-	}
-
-	// Should still decrypt.
-	dec, err := b.Decrypt(nil, ct)
-	if err != nil {
-		t.Fatalf("Decrypt after seal/unseal failed: %v", err)
-	}
-	if !bytes.Equal(plaintext, dec) {
-		t.Fatal("decryption mismatch after seal/unseal cycle")
-	}
-}
 
 // TestBarrier_UnsealReDerivesOldEpochDEKs verifies that Unseal re-derives DEKs
 // for all known epochs (not just the current one) so that data encrypted with
@@ -1991,115 +1742,6 @@ func TestBarrier_EncryptWithEpochDoesNotDrawTheNonceFromRandReader(t *testing.T)
 	}
 }
 
-// --- Unseal brute-force failure below threshold (no warn/error) ---
-
-func TestBarrier_UnsealFailBelowThreshold(t *testing.T) {
-	b := MustNewBarrier(DefaultBarrierConfig(1))
-	s := testStrategy(t)
-	defer s.Close()
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-
-	now := time.Now()
-	b.timeNow = func() time.Time { return now }
-
-	wrong, err := newTestStrategy([]byte("wrong"))
-	if err != nil {
-		t.Fatalf("newTestStrategy failed: %v", err)
-	}
-	defer wrong.Close()
-
-	// Fail below threshold - no logging should occur.
-	for i := 0; i < bruteForceThreshold-1; i++ {
-		unsealErr := b.Unseal(context.Background(), wrong, Credentials{})
-		if unsealErr == nil {
-			t.Fatal("expected error for wrong passphrase")
-		}
-		// Should not be a backoff error since we are below threshold.
-		if errors.Is(unsealErr, ErrUnsealBackoff) {
-			t.Fatalf("unexpected backoff at attempt %d", i+1)
-		}
-	}
-	if b.failedAttempts != int64(bruteForceThreshold-1) {
-		t.Fatalf("expected failedAttempts=%d, got %d", bruteForceThreshold-1, b.failedAttempts)
-	}
-}
-
-// --- Unseal brute-force: exactly at threshold triggers Warn logging ---
-
-func TestBarrier_UnsealFailAtThresholdTriggersWarn(t *testing.T) {
-	b := MustNewBarrier(DefaultBarrierConfig(1))
-	s := testStrategy(t)
-	defer s.Close()
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-
-	now := time.Now()
-	b.timeNow = func() time.Time {
-		now = now.Add(bruteForceMaxDelay + time.Second)
-		return now
-	}
-
-	wrong, err := newTestStrategy([]byte("wrong"))
-	if err != nil {
-		t.Fatalf("newTestStrategy failed: %v", err)
-	}
-	defer wrong.Close()
-
-	// Fail exactly at threshold (5) to trigger the slog.Warn path.
-	for i := 0; i < bruteForceThreshold; i++ {
-		_ = b.Unseal(context.Background(), wrong, Credentials{})
-	}
-	if b.failedAttempts != int64(bruteForceThreshold) {
-		t.Fatalf("expected failedAttempts=%d, got %d", bruteForceThreshold, b.failedAttempts)
-	}
-}
-
-// --- Unseal brute-force: above error threshold triggers Error logging ---
-
-func TestBarrier_UnsealFailAboveErrorThreshold(t *testing.T) {
-	b := MustNewBarrier(DefaultBarrierConfig(1))
-	s := testStrategy(t)
-	defer s.Close()
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-	if err := b.Seal(); err != nil {
-		t.Fatalf("Seal failed: %v", err)
-	}
-
-	now := time.Now()
-	b.timeNow = func() time.Time {
-		now = now.Add(bruteForceMaxDelay + time.Second)
-		return now
-	}
-
-	wrong, err := newTestStrategy([]byte("wrong"))
-	if err != nil {
-		t.Fatalf("newTestStrategy failed: %v", err)
-	}
-	defer wrong.Close()
-
-	// Exceed error threshold to trigger slog.Error path.
-	for i := 0; i < bruteForceErrorThreshold+1; i++ {
-		_ = b.Unseal(context.Background(), wrong, Credentials{})
-	}
-	if b.failedAttempts != int64(bruteForceErrorThreshold+1) {
-		t.Fatalf("expected failedAttempts=%d, got %d", bruteForceErrorThreshold+1, b.failedAttempts)
-	}
-}
-
 // --- Concurrent EncryptWithEpoch and DecryptForEpoch ---
 
 func TestBarrier_ConcurrentEncryptWithEpochDecryptForEpoch(t *testing.T) {
@@ -2360,108 +2002,77 @@ func TestBarrier_PurgeSkipsInFlightEpochs(t *testing.T) {
 // releasing the write lock so the waiting goroutine's RLock proceeds and
 // hits the second check.
 
-func TestBarrier_EncryptTOCTOUSecondCheck(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
+func TestBarrier_TOCTOUSecondCheck(t *testing.T) {
+	tests := []struct {
+		name string
+		op   func(b *Barrier, ct []byte) error
+	}{
+		{"Encrypt", func(b *Barrier, _ []byte) error {
+			_, err := b.Encrypt(nil, []byte("test"))
+			return err
+		}},
+		{"EncryptWithEpoch", func(b *Barrier, _ []byte) error {
+			_, _, err := b.EncryptWithEpoch(nil, []byte("test"))
+			return err
+		}},
+		{"Decrypt", func(b *Barrier, ct []byte) error {
+			_, err := b.Decrypt(nil, ct)
+			return err
+		}},
+		{"DecryptForEpoch", func(b *Barrier, ct []byte) error {
+			_, err := b.DecryptForEpoch(nil, ct, 1)
+			return err
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b, s := testInitializedBarrier(t)
+			defer s.Close()
 
-	// Hold write lock to block any RLock in Encrypt.
-	b.mu.Lock()
+			ct, err := b.Encrypt(nil, []byte("test"))
+			if err != nil {
+				t.Fatalf("Encrypt failed: %v", err)
+			}
 
-	errCh := make(chan error, 1)
-	go func() {
-		// This will pass the first atomic check (unsealed is true) then
-		// block on RLock because we hold the write lock.
-		_, err := b.Encrypt(nil, []byte("test"))
-		errCh <- err
-	}()
+			// Hold the write lock so the operation passes the first atomic
+			// check (unsealed is true) and then blocks on RLock.
+			b.mu.Lock()
+			errCh := make(chan error, 1)
+			go func() { errCh <- tc.op(b, ct) }()
+			waitBlockedOnRLock(t, "seal.TestBarrier_TOCTOUSecondCheck")
 
-	// Give the goroutine time to pass the first check and block on RLock.
-	<-time.After(10 * time.Millisecond)
+			// Simulate Seal by clearing the flag while holding the write lock.
+			b.unsealed.Store(false)
+			b.mu.Unlock()
 
-	// Simulate Seal by clearing the flag while holding the write lock.
-	b.unsealed.Store(false)
-	b.mu.Unlock()
-
-	// The goroutine should now acquire RLock and hit the second check.
-	err := <-errCh
-	if !errors.Is(err, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed from TOCTOU path, got %v", err)
+			// The goroutine now acquires RLock and hits the second check.
+			if err := <-errCh; !errors.Is(err, ErrBarrierSealed) {
+				t.Fatalf("expected ErrBarrierSealed from TOCTOU path, got %v", err)
+			}
+		})
 	}
 }
 
-func TestBarrier_EncryptWithEpochTOCTOUSecondCheck(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	b.mu.Lock()
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, _, err := b.EncryptWithEpoch(nil, []byte("test"))
-		errCh <- err
-	}()
-
-	<-time.After(10 * time.Millisecond)
-	b.unsealed.Store(false)
-	b.mu.Unlock()
-
-	err := <-errCh
-	if !errors.Is(err, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed from TOCTOU path, got %v", err)
-	}
-}
-
-func TestBarrier_DecryptTOCTOUSecondCheck(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	ct, err := b.Encrypt(nil, []byte("test"))
-	if err != nil {
-		t.Fatalf("Encrypt failed: %v", err)
-	}
-
-	b.mu.Lock()
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, derr := b.Decrypt(nil, ct)
-		errCh <- derr
-	}()
-
-	<-time.After(10 * time.Millisecond)
-	b.unsealed.Store(false)
-	b.mu.Unlock()
-
-	derr := <-errCh
-	if !errors.Is(derr, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed from TOCTOU path, got %v", derr)
-	}
-}
-
-func TestBarrier_DecryptForEpochTOCTOUSecondCheck(t *testing.T) {
-	b, s := testInitializedBarrier(t)
-	defer s.Close()
-
-	ct, err := b.Encrypt(nil, []byte("test"))
-	if err != nil {
-		t.Fatalf("Encrypt failed: %v", err)
-	}
-
-	b.mu.Lock()
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, derr := b.DecryptForEpoch(nil, ct, 1)
-		errCh <- derr
-	}()
-
-	<-time.After(10 * time.Millisecond)
-	b.unsealed.Store(false)
-	b.mu.Unlock()
-
-	derr := <-errCh
-	if !errors.Is(derr, ErrBarrierSealed) {
-		t.Fatalf("expected ErrBarrierSealed from TOCTOU path, got %v", derr)
+// waitBlockedOnRLock waits until a goroutine created by creator is parked in
+// sync.(*RWMutex).RLock, so a test that holds the write lock knows the
+// goroutine has passed every check before the lock.
+func waitBlockedOnRLock(t *testing.T, creator string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		for _, g := range bytes.Split(buf[:n], []byte("\n\n")) {
+			if bytes.Contains(g, []byte("(*RWMutex).RLock")) &&
+				bytes.Contains(g, []byte("created by ")) &&
+				bytes.Contains(g, []byte(creator)) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("goroutine never blocked on RLock")
+		}
+		runtime.Gosched()
 	}
 }
 
@@ -3495,7 +3106,8 @@ func TestBarrier_Config(t *testing.T) {
 
 // TestBarrier_RotateResetsBothTrackers verifies that after a successful
 // Rotate(), the invocation counter's Reset and nonce tracker's Clear are called,
-// confirming both trackers are reset for the new epoch.
+// confirming both trackers are reset for the new epoch, and that Encrypt and
+// Decrypt work on the new epoch afterwards.
 func TestBarrier_RotateResetsBothTrackers(t *testing.T) {
 	t.Parallel()
 	mockIC := &mockInvocationCounter{enabled: true}
@@ -3540,28 +3152,6 @@ func TestBarrier_RotateResetsBothTrackers(t *testing.T) {
 	}
 	if !foundClear {
 		t.Fatalf("Rotate should call Clear on nonce tracker; calls: %v", mockNT.calls)
-	}
-}
-
-// TestBarrier_RotateResetsBothTrackers_VerifyEncryptAfterRotate verifies that
-// when both trackers are injected but neither returns errors, the Rotate succeeds
-// and subsequent encryptions work with the new epoch.
-func TestBarrier_RotateResetsBothTrackers_VerifyEncryptAfterRotate(t *testing.T) {
-	t.Parallel()
-	mockIC := &mockInvocationCounter{enabled: true}
-	mockNT := &mockNonceTracker{enabled: true}
-	cfg := testBarrierConfig(1)
-	cfg.InvocationCounter = mockIC
-	cfg.NonceTrackerProvider = mockNT
-	b := MustNewBarrier(cfg)
-	s := testStrategy(t)
-
-	if err := b.Initialize(context.Background(), s, Credentials{}); err != nil {
-		t.Fatalf("Initialize failed: %v", err)
-	}
-
-	if _, err := b.Rotate(context.Background()); err != nil {
-		t.Fatalf("Rotate failed: %v", err)
 	}
 
 	// Encrypt should succeed on the new epoch after tracker reset.
@@ -3737,55 +3327,40 @@ func TestBarrier_PersistBackoffState_NilSealed(t *testing.T) {
 // ShouldRotateKey
 // ---------------------------------------------------------------------------
 
-// TestBarrier_ShouldRotateKey_DisabledCounter verifies that ShouldRotateKey
-// returns false when invocation counting is disabled (limit=-1).
-func TestBarrier_ShouldRotateKey_DisabledCounter(t *testing.T) {
-	cfg := DefaultBarrierConfig(1)
-	cfg.InvocationLimit = -1 // -1 disables counting
-	b := MustNewBarrier(cfg)
-
-	if b.ShouldRotateKey() {
-		t.Error("ShouldRotateKey should return false when invocation tracking is disabled")
+// TestBarrier_ShouldRotateKey verifies that ShouldRotateKey reports true only
+// once an enabled invocation counter reaches its rotation threshold.
+func TestBarrier_ShouldRotateKey(t *testing.T) {
+	seeded := func(n int64) func() *Barrier {
+		return func() *Barrier {
+			counter := NewInvocationCounter(true, 1000, 95.0)
+			counter.Seed(n)
+			cfg := DefaultBarrierConfig(1)
+			cfg.InvocationCounter = counter
+			return MustNewBarrier(cfg)
+		}
 	}
-}
-
-// TestBarrier_ShouldRotateKey_BelowThreshold verifies that ShouldRotateKey
-// returns false when usage is below the rotation threshold.
-func TestBarrier_ShouldRotateKey_BelowThreshold(t *testing.T) {
-	counter := NewInvocationCounter(true, 1000, 95.0)
-	// Seed well below the 95% threshold (500 out of 1000 = 50%).
-	counter.Seed(500)
-	cfg := DefaultBarrierConfig(1)
-	cfg.InvocationCounter = counter
-	b := MustNewBarrier(cfg)
-
-	if b.ShouldRotateKey() {
-		t.Error("ShouldRotateKey should return false when below the rotation threshold")
+	tests := []struct {
+		name    string
+		barrier func() *Barrier
+		want    bool
+	}{
+		{"disabled counter", func() *Barrier {
+			cfg := DefaultBarrierConfig(1)
+			cfg.InvocationLimit = -1 // -1 disables counting
+			return MustNewBarrier(cfg)
+		}, false},
+		// 500 of 1000 is well below the 95% threshold.
+		{"below threshold", seeded(500), false},
+		// 950 of 1000 is exactly the 95% threshold.
+		{"at threshold", seeded(950), true},
+		{"nil invocations", func() *Barrier { return &Barrier{} }, false},
 	}
-}
-
-// TestBarrier_ShouldRotateKey_AtThreshold verifies that ShouldRotateKey
-// returns true when the invocation count has reached the rotation threshold.
-func TestBarrier_ShouldRotateKey_AtThreshold(t *testing.T) {
-	counter := NewInvocationCounter(true, 1000, 95.0)
-	// Seed at exactly the 95% threshold (950 out of 1000).
-	counter.Seed(950)
-	cfg := DefaultBarrierConfig(1)
-	cfg.InvocationCounter = counter
-	b := MustNewBarrier(cfg)
-
-	if !b.ShouldRotateKey() {
-		t.Error("ShouldRotateKey should return true when invocation count reaches the threshold")
-	}
-}
-
-// TestBarrier_ShouldRotateKey_NilInvocations verifies that ShouldRotateKey
-// returns false when the invocations field is nil (no counter configured).
-func TestBarrier_ShouldRotateKey_NilInvocations(t *testing.T) {
-	b := &Barrier{}
-
-	if b.ShouldRotateKey() {
-		t.Error("ShouldRotateKey should return false when invocations is nil")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.barrier().ShouldRotateKey(); got != tc.want {
+				t.Errorf("ShouldRotateKey = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

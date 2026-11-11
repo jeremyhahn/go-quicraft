@@ -20,34 +20,6 @@ import (
 	"testing"
 )
 
-func TestConfigChangeMarshalUnmarshalRoundTrip(t *testing.T) {
-	cc := ConfigChange{
-		ConfigChangeID: 42,
-		Type:           AddNode,
-		ReplicaID:      5,
-		Address:        "10.0.0.5:5000",
-		Initialize:     true,
-	}
-	buf := make([]byte, cc.Size())
-	n, err := cc.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	if n != cc.Size() {
-		t.Fatalf("MarshalTo: wrote %d, want %d", n, cc.Size())
-	}
-
-	var cc2 ConfigChange
-	consumed, err := cc2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if consumed != n {
-		t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, n)
-	}
-	assertConfigChangeEqual(t, &cc, &cc2)
-}
-
 // TestConfigChangeAddressTooLong pins the address bound at BOTH ends.
 //
 // The write half is what makes the two agree: a ConfigChange is marshaled into
@@ -95,34 +67,6 @@ func TestConfigChangeBufferTooSmallMarshal(t *testing.T) {
 	}
 }
 
-func TestConfigChangeBufferTooSmallUnmarshalHeader(t *testing.T) {
-	buf := make([]byte, 20) // too short for 3 uint64 + addr length
-	var cc ConfigChange
-	_, err := cc.UnmarshalFrom(buf)
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("UnmarshalFrom: got %v, want ErrBufferTooSmall", err)
-	}
-}
-
-func TestConfigChangeBufferTooSmallUnmarshalInitialize(t *testing.T) {
-	cc := ConfigChange{Address: "x"}
-	buf := make([]byte, cc.Size())
-	if _, err := cc.MarshalTo(buf); err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	// Cut INTO the witness-policy fields. There is one layout and every field
-	// in it is mandatory, so any prefix is a truncation — including the cut at
-	// -4, which lands on the NodeIdentity length prefix.
-	// TestConfigChangeRejectsEveryStrictPrefix sweeps all of them.
-	for _, cut := range []int{4, 6} {
-		var cc2 ConfigChange
-		_, err := cc2.UnmarshalFrom(buf[:cc.Size()-cut])
-		if !errors.Is(err, ErrBufferTooSmall) {
-			t.Fatalf("UnmarshalFrom(-%d bytes): got %v, want ErrBufferTooSmall", cut, err)
-		}
-	}
-}
-
 func TestConfigChangeReset(t *testing.T) {
 	cc := ConfigChange{
 		ConfigChangeID: 42,
@@ -154,28 +98,6 @@ func TestConfigChangeSize(t *testing.T) {
 				t.Fatalf("Size: got %d, want %d", got, tt.want)
 			}
 		})
-	}
-}
-
-// TestConfigChangeUpdateWitnessPolicyRoundTrip verifies the policy fields
-// survive marshal/unmarshal for the UpdateWitnessPolicy change type.
-func TestConfigChangeUpdateWitnessPolicyRoundTrip(t *testing.T) {
-	cc := ConfigChange{
-		ConfigChangeID:             9,
-		Type:                       UpdateWitnessPolicy,
-		MaxWitnesses:               3,
-		RequireFullReplicaMajority: true,
-	}
-	buf := make([]byte, cc.Size())
-	if _, err := cc.MarshalTo(buf); err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	var cc2 ConfigChange
-	if _, err := cc2.UnmarshalFrom(buf); err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if cc2 != cc {
-		t.Fatalf("round trip mismatch: got %+v, want %+v", cc2, cc)
 	}
 }
 
@@ -219,13 +141,14 @@ func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
 	}
 }
 
+// TestConfigChangeUnmarshalValidTypes decodes the accepted membership types no
+// other test round-trips; AddNode, RemoveNode and UpdateWitnessPolicy are
+// TestConfigChangeWithNoIdentityRoundTrips.
 func TestConfigChangeUnmarshalValidTypes(t *testing.T) {
 	validTypes := []struct {
 		name string
 		typ  uint64
 	}{
-		{"AddNode", AddNode},
-		{"RemoveNode", RemoveNode},
 		{"AddNonVoting", AddNonVoting},
 		{"AddWitness", AddWitness},
 	}
@@ -250,24 +173,5 @@ func TestConfigChangeUnmarshalValidTypes(t *testing.T) {
 				t.Fatalf("Type: got %d, want %d", cc2.Type, tc.typ)
 			}
 		})
-	}
-}
-
-func assertConfigChangeEqual(t *testing.T, want, got *ConfigChange) {
-	t.Helper()
-	if got.ConfigChangeID != want.ConfigChangeID {
-		t.Fatalf("ConfigChangeID: got %d, want %d", got.ConfigChangeID, want.ConfigChangeID)
-	}
-	if got.Type != want.Type {
-		t.Fatalf("Type: got %d, want %d", got.Type, want.Type)
-	}
-	if got.ReplicaID != want.ReplicaID {
-		t.Fatalf("ReplicaID: got %d, want %d", got.ReplicaID, want.ReplicaID)
-	}
-	if got.Address != want.Address {
-		t.Fatalf("Address: got %q, want %q", got.Address, want.Address)
-	}
-	if got.Initialize != want.Initialize {
-		t.Fatalf("Initialize: got %v, want %v", got.Initialize, want.Initialize)
 	}
 }

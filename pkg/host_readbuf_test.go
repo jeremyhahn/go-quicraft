@@ -165,89 +165,89 @@ func TestSyncReadBuf_PooledPathReturnsCopy(t *testing.T) {
 	}
 }
 
-// TestSyncReadBuf_PooledLookupErrorPropagates verifies that an error from the
-// state machine's BytesLookupInto reaches the caller unwrapped (errors.Is
-// must classify it) and that the caller still gets a callable release func.
-func TestSyncReadBuf_PooledLookupErrorPropagates(t *testing.T) {
-	backing := &bufLookupSM{values: map[string][]byte{}}
-	h := startReadBufShard(t, func(uint64, uint64) interface{} { return backing })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	buf, release, err := h.SyncReadBuf(ctx, 1, []byte("missing"))
-	if !errors.Is(err, errTestKeyNotFound) {
-		t.Fatalf("SyncReadBuf error = %v, want errTestKeyNotFound", err)
+// TestSyncReadBuf_LookupOutcomes covers every lookup branch of a linearizable
+// buffered read on a running shard: an error from the state machine's
+// BytesLookupInto reaches the caller unwrapped (errors.Is must classify it);
+// a state machine with no byte-slice lookup goes through Lookup, whose []byte
+// result is returned directly, whose non-[]byte result is rejected with
+// ErrInvalidOperation instead of panicking on a type assertion, and whose
+// error reaches the caller; and a canceled context aborts the read with
+// ErrCanceled rather than returning a result read after the caller gave up.
+// Every case must hand back a callable release func, so a caller that
+// unconditionally defers release() cannot panic.
+func TestSyncReadBuf_LookupOutcomes(t *testing.T) {
+	tests := []struct {
+		name     string
+		create   sm.CreateFunc
+		key      string
+		canceled bool
+		want     []byte
+		wantErr  error
+	}{
+		{
+			name: "pooled lookup error",
+			create: func(uint64, uint64) interface{} {
+				return &bufLookupSM{values: map[string][]byte{}}
+			},
+			key:     "missing",
+			wantErr: errTestKeyNotFound,
+		},
+		{
+			// mockStateMachine.Lookup echoes the query, so the []byte key
+			// comes back as a []byte value through the fallback branch.
+			name:   "fallback returns byte result",
+			create: testCreateFunc,
+			key:    "echo-key",
+			want:   []byte("echo-key"),
+		},
+		{
+			name:    "fallback non byte result rejected",
+			create:  func(uint64, uint64) interface{} { return &stringLookupSM{} },
+			key:     "k",
+			wantErr: ErrInvalidOperation,
+		},
+		{
+			name:    "fallback lookup error",
+			create:  func(uint64, uint64) interface{} { return &errLookupSM{} },
+			key:     "k",
+			wantErr: errTestLookupFailed,
+		},
+		{
+			name: "context canceled",
+			create: func(uint64, uint64) interface{} {
+				return &bufLookupSM{values: map[string][]byte{"k": []byte("v")}}
+			},
+			key:      "k",
+			canceled: true,
+			wantErr:  ErrCanceled,
+		},
 	}
-	if buf != nil {
-		t.Fatalf("SyncReadBuf returned %q with an error, want nil", buf)
-	}
-	if release == nil {
-		t.Fatal("SyncReadBuf returned a nil release func on error")
-	}
-	release() // must be safe on the error path (nopHostRelease)
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := startReadBufShard(t, tt.create)
 
-// TestSyncReadBuf_FallbackToLookup verifies the non-pooled fallback: a state
-// machine with no byte-slice lookup goes through Lookup, and a []byte result
-// is returned directly with the no-op release.
-func TestSyncReadBuf_FallbackToLookup(t *testing.T) {
-	// mockStateMachine.Lookup echoes the query, so the []byte key comes back
-	// as a []byte value through the fallback branch.
-	h := startReadBufShard(t, testCreateFunc)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if tt.canceled {
+				cancel()
+			}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	key := []byte("echo-key")
-	buf, release, err := h.SyncReadBuf(ctx, 1, key)
-	if err != nil {
-		t.Fatalf("SyncReadBuf: %v", err)
+			buf, release, err := h.SyncReadBuf(ctx, 1, []byte(tt.key))
+			if release == nil {
+				t.Fatal("SyncReadBuf returned a nil release func")
+			}
+			defer release()
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("SyncReadBuf error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.want == nil && buf != nil {
+				t.Fatalf("SyncReadBuf returned %q with an error, want nil", buf)
+			}
+			if !bytes.Equal(buf, tt.want) {
+				t.Fatalf("SyncReadBuf = %q, want %q", buf, tt.want)
+			}
+		})
 	}
-	if !bytes.Equal(buf, key) {
-		t.Fatalf("SyncReadBuf = %q, want %q", buf, key)
-	}
-	if release == nil {
-		t.Fatal("SyncReadBuf returned a nil release func")
-	}
-	release()
-}
-
-// TestSyncReadBuf_NonByteResultRejected verifies that a state machine which
-// answers Lookup with a non-[]byte value is rejected with ErrInvalidOperation
-// instead of panicking on a type assertion or returning a zero value.
-func TestSyncReadBuf_NonByteResultRejected(t *testing.T) {
-	h := startReadBufShard(t, func(uint64, uint64) interface{} { return &stringLookupSM{} })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	buf, release, err := h.SyncReadBuf(ctx, 1, []byte("k"))
-	if !errors.Is(err, ErrInvalidOperation) {
-		t.Fatalf("SyncReadBuf error = %v, want ErrInvalidOperation", err)
-	}
-	if buf != nil {
-		t.Fatalf("SyncReadBuf returned %q, want nil", buf)
-	}
-	release()
-}
-
-// TestSyncReadBuf_FallbackLookupErrorPropagates verifies that an error from
-// the generic Lookup fallback reaches the caller.
-func TestSyncReadBuf_FallbackLookupErrorPropagates(t *testing.T) {
-	h := startReadBufShard(t, func(uint64, uint64) interface{} { return &errLookupSM{} })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	buf, release, err := h.SyncReadBuf(ctx, 1, []byte("k"))
-	if !errors.Is(err, errTestLookupFailed) {
-		t.Fatalf("SyncReadBuf error = %v, want errTestLookupFailed", err)
-	}
-	if buf != nil {
-		t.Fatalf("SyncReadBuf returned %q, want nil", buf)
-	}
-	release()
 }
 
 // TestSyncReadBuf_ReadIndexRejected verifies that a failure to obtain a read
@@ -303,26 +303,6 @@ func TestSyncReadBuf_ReadIndexRejected(t *testing.T) {
 	})
 }
 
-// TestSyncReadBuf_ContextCanceled verifies that a canceled context aborts the
-// read with ErrCanceled rather than returning a result read after the caller
-// gave up.
-func TestSyncReadBuf_ContextCanceled(t *testing.T) {
-	backing := &bufLookupSM{values: map[string][]byte{"k": []byte("v")}}
-	h := startReadBufShard(t, func(uint64, uint64) interface{} { return backing })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	buf, release, err := h.SyncReadBuf(ctx, 1, []byte("k"))
-	if !errors.Is(err, ErrCanceled) {
-		t.Fatalf("SyncReadBuf error = %v, want ErrCanceled", err)
-	}
-	if buf != nil {
-		t.Fatalf("SyncReadBuf returned %q, want nil", buf)
-	}
-	release()
-}
-
 // ---------------------------------------------------------------------------
 // StaleReadBuf
 // ---------------------------------------------------------------------------
@@ -369,81 +349,75 @@ func TestStaleReadBuf_PooledPathReturnsCopy(t *testing.T) {
 	}
 }
 
-// TestStaleReadBuf_PooledLookupErrorPropagates verifies the state machine's
-// error identity survives the pooled path.
-func TestStaleReadBuf_PooledLookupErrorPropagates(t *testing.T) {
-	backing := &bufLookupSM{values: map[string][]byte{}}
-	h := newTestHost(t)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	create := func(uint64, uint64) interface{} { return backing }
-	if err := h.StartShard(members, false, create, testShardConfig(1, 1)); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
+// TestStaleReadBuf_LookupOutcomes covers every lookup branch of a stale
+// buffered read: the state machine's error identity survives the pooled
+// path, and a state machine with no byte-slice lookup goes through Lookup,
+// whose []byte result is returned directly, whose non-[]byte result is
+// rejected with ErrInvalidOperation, and whose error reaches the caller.
+func TestStaleReadBuf_LookupOutcomes(t *testing.T) {
+	tests := []struct {
+		name    string
+		create  sm.CreateFunc
+		key     string
+		want    []byte
+		wantErr error
+	}{
+		{
+			name: "pooled lookup error",
+			create: func(uint64, uint64) interface{} {
+				return &bufLookupSM{values: map[string][]byte{}}
+			},
+			key:     "missing",
+			wantErr: errTestKeyNotFound,
+		},
+		{
+			name:   "fallback returns byte result",
+			create: testCreateFunc,
+			key:    "echo-key",
+			want:   []byte("echo-key"),
+		},
+		{
+			name:    "fallback non byte result rejected",
+			create:  func(uint64, uint64) interface{} { return &stringLookupSM{} },
+			key:     "k",
+			wantErr: ErrInvalidOperation,
+		},
+		{
+			name:    "fallback lookup error",
+			create:  func(uint64, uint64) interface{} { return &errLookupSM{} },
+			key:     "k",
+			wantErr: errTestLookupFailed,
+		},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newTestHost(t)
+			members := map[uint64]string{1: "127.0.0.1:5000"}
+			if err := h.StartShard(members, false, tt.create, testShardConfig(1, 1)); err != nil {
+				t.Fatalf("StartShard failed: %v", err)
+			}
 
-	buf, release, err := h.StaleReadBuf(context.Background(), 1, []byte("missing"))
-	if !errors.Is(err, errTestKeyNotFound) {
-		t.Fatalf("StaleReadBuf error = %v, want errTestKeyNotFound", err)
+			buf, release, err := h.StaleReadBuf(context.Background(), 1, []byte(tt.key))
+			if release == nil {
+				t.Fatal("StaleReadBuf returned a nil release func")
+			}
+			defer release()
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("StaleReadBuf error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.want == nil && buf != nil {
+				t.Fatalf("StaleReadBuf returned %q with an error, want nil", buf)
+			}
+			if !bytes.Equal(buf, tt.want) {
+				t.Fatalf("StaleReadBuf = %q, want %q", buf, tt.want)
+			}
+		})
 	}
-	if buf != nil {
-		t.Fatalf("StaleReadBuf returned %q, want nil", buf)
-	}
-	release()
 }
 
-// TestStaleReadBuf_FallbackAndRejections covers the non-pooled fallback and
-// every guard StaleReadBuf applies before touching the state machine.
-func TestStaleReadBuf_FallbackAndRejections(t *testing.T) {
-	t.Run("fallback returns byte result", func(t *testing.T) {
-		h := newTestHost(t)
-		members := map[uint64]string{1: "127.0.0.1:5000"}
-		if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
-			t.Fatalf("StartShard failed: %v", err)
-		}
-		key := []byte("echo-key")
-		buf, release, err := h.StaleReadBuf(context.Background(), 1, key)
-		if err != nil {
-			t.Fatalf("StaleReadBuf: %v", err)
-		}
-		if !bytes.Equal(buf, key) {
-			t.Fatalf("StaleReadBuf = %q, want %q", buf, key)
-		}
-		release()
-	})
-
-	t.Run("non byte result rejected", func(t *testing.T) {
-		h := newTestHost(t)
-		members := map[uint64]string{1: "127.0.0.1:5000"}
-		create := func(uint64, uint64) interface{} { return &stringLookupSM{} }
-		if err := h.StartShard(members, false, create, testShardConfig(1, 1)); err != nil {
-			t.Fatalf("StartShard failed: %v", err)
-		}
-		buf, release, err := h.StaleReadBuf(context.Background(), 1, []byte("k"))
-		if !errors.Is(err, ErrInvalidOperation) {
-			t.Fatalf("StaleReadBuf error = %v, want ErrInvalidOperation", err)
-		}
-		if buf != nil {
-			t.Fatalf("StaleReadBuf returned %q, want nil", buf)
-		}
-		release()
-	})
-
-	t.Run("fallback lookup error", func(t *testing.T) {
-		h := newTestHost(t)
-		members := map[uint64]string{1: "127.0.0.1:5000"}
-		create := func(uint64, uint64) interface{} { return &errLookupSM{} }
-		if err := h.StartShard(members, false, create, testShardConfig(1, 1)); err != nil {
-			t.Fatalf("StartShard failed: %v", err)
-		}
-		buf, release, err := h.StaleReadBuf(context.Background(), 1, []byte("k"))
-		if !errors.Is(err, errTestLookupFailed) {
-			t.Fatalf("StaleReadBuf error = %v, want errTestLookupFailed", err)
-		}
-		if buf != nil {
-			t.Fatalf("StaleReadBuf returned %q, want nil", buf)
-		}
-		release()
-	})
-
+// TestStaleReadBuf_Rejections covers every guard StaleReadBuf applies before
+// touching the state machine.
+func TestStaleReadBuf_Rejections(t *testing.T) {
 	t.Run("shard not found", func(t *testing.T) {
 		h := newTestHost(t)
 		buf, release, err := h.StaleReadBuf(context.Background(), 999, []byte("k"))

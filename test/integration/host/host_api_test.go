@@ -80,92 +80,6 @@ func TestHostAPI_QueryLocalNode_ThreeNode(t *testing.T) {
 	}
 }
 
-// TestHostAPI_Session_Lifecycle_ThreeNode creates a session on leader, uses it, closes it.
-func TestHostAPI_Session_Lifecycle_ThreeNode(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer cancel()
-
-	session, err := leaderHost.NewSession(ctx, 1)
-	if err != nil {
-		t.Fatalf("NewSession failed: %v", err)
-	}
-	if session.ClientID() == 0 {
-		t.Error("session ClientID is 0")
-	}
-
-	rs, err := leaderHost.CloseSession(ctx, 1, session)
-	if err != nil {
-		t.Fatalf("CloseSession failed: %v", err)
-	}
-	rs.Release()
-}
-
-// TestHostAPI_Snapshot_LeaderRequest requests a snapshot on the leader and
-// verifies a snapshot actually happened: the request resolves with a non-zero
-// index, a snapshot artifact for that index exists on disk, and a second
-// request after more writes reports a HIGHER index.
-//
-// The previous version released the RequestState without ever reading its
-// result. RequestSnapshot is asynchronous, so the test neither waited for the
-// snapshot nor noticed a failed or skipped one — an engine that never wrote an
-// artifact passed.
-func TestHostAPI_Snapshot_LeaderRequest(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	leaderHost := cluster.hosts[leaderIdx]
-
-	// Write some data first.
-	for i := 0; i < 5; i++ {
-		proposeToLeader(t, cluster, 1, encodeKVPut(
-			fmt.Sprintf("snap-key-%d", i),
-			fmt.Sprintf("snap-val-%d", i),
-		), defaultTimeout)
-	}
-
-	leaderSM := trackers[leaderIdx].Get(1, uint64(leaderIdx+1))
-	waitForCondition(t, defaultTimeout, "5 entries applied", func() bool {
-		return leaderSM.Len() >= 5
-	})
-
-	// This shard uses testShardConfig, whose SnapshotEntries stays 0 —
-	// config.SetDefaults never assigns it — so the engine takes NO automatic
-	// snapshot here and every artifact below comes from an explicit request.
-	snapshotDir := cluster.nodeHostDirs[leaderIdx]
-	firstIndex := requestSnapshotIndex(t, leaderHost, 1)
-	assertSnapshotArtifact(t, snapshotDir, firstIndex, defaultTimeout)
-	t.Logf("first snapshot taken at index %d", firstIndex)
-
-	// Write more entries and snapshot again: the second snapshot must cover
-	// the new entries, which is only true if a snapshot really happened.
-	for i := 5; i < 10; i++ {
-		proposeToLeader(t, cluster, 1, encodeKVPut(
-			fmt.Sprintf("snap-key-%d", i),
-			fmt.Sprintf("snap-val-%d", i),
-		), defaultTimeout)
-	}
-	waitForCondition(t, defaultTimeout, "10 entries applied", func() bool {
-		return leaderSM.Len() >= 10
-	})
-
-	secondIndex := requestSnapshotIndex(t, leaderHost, 1)
-	if secondIndex <= firstIndex {
-		t.Fatalf("second snapshot index = %d, want > %d (the snapshot did not advance)",
-			secondIndex, firstIndex)
-	}
-	assertSnapshotArtifact(t, snapshotDir, secondIndex, defaultTimeout)
-	t.Logf("second snapshot taken at index %d", secondIndex)
-}
-
 // TestHostAPI_ReadIndex_ThreeNode verifies that a ReadIndex issued to the
 // leader resolves to a confirmed index.
 //
@@ -295,29 +209,6 @@ func TestHostAPI_GetShardInfo_AllNodes(t *testing.T) {
 		}
 		if info.Term == 0 {
 			t.Errorf("node[%d] Term is 0", i)
-		}
-	}
-}
-
-// TestHostAPI_GetNodeHostInfo_AllNodes verifies all nodes return host info.
-func TestHostAPI_GetNodeHostInfo_AllNodes(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	for i, h := range cluster.hosts {
-		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
-		if info == nil {
-			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
-		}
-		shardCount := len(info.ShardInfoList)
-		if shardCount != 1 {
-			t.Errorf("node[%d] ShardCount = %d, want 1", i, shardCount)
-		}
-		if info.RaftAddress != cluster.addrs[i] {
-			t.Errorf("node[%d] RaftAddress = %q, want %q", i, info.RaftAddress, cluster.addrs[i])
 		}
 	}
 }

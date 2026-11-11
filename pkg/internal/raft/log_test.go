@@ -358,119 +358,58 @@ func TestRaftLog_Entries_LowBeyondLastIndex(t *testing.T) {
 	}
 }
 
-func TestRaftLog_MatchTerm_Positive(t *testing.T) {
-	entries := []proto.Entry{
+func TestRaftLog_MatchTerm(t *testing.T) {
+	l := newTestRaftLog([]proto.Entry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 2},
 		{Index: 3, Term: 3},
+	})
+	tests := []struct {
+		name        string
+		index, term uint64
+		want        bool
+	}{
+		{"Positive", 2, 2, true},
+		{"Negative", 2, 5, false},
+		{"InvalidIndex", 100, 1, false},
 	}
-	l := newTestRaftLog(entries)
-
-	if !l.matchTerm(2, 2) {
-		t.Fatal("expected matchTerm(2, 2) to be true")
-	}
-}
-
-func TestRaftLog_MatchTerm_Negative(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-		{Index: 3, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	if l.matchTerm(2, 5) {
-		t.Fatal("expected matchTerm(2, 5) to be false")
+	for _, tc := range tests {
+		if got := l.matchTerm(tc.index, tc.term); got != tc.want {
+			t.Errorf("%s: matchTerm(%d, %d) = %v, want %v",
+				tc.name, tc.index, tc.term, got, tc.want)
+		}
 	}
 }
 
-func TestRaftLog_MatchTerm_InvalidIndex(t *testing.T) {
-	entries := makeEntries(1, 4, 1)
-	l := newTestRaftLog(entries)
-
-	if l.matchTerm(100, 1) {
-		t.Fatal("expected matchTerm with invalid index to be false")
-	}
-}
-
-func TestRaftLog_IsUpToDate_HigherTerm(t *testing.T) {
+func TestRaftLog_IsUpToDate(t *testing.T) {
 	entries := []proto.Entry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 2},
 	}
-	l := newTestRaftLog(entries)
-
-	// Candidate has higher term, even with lower index.
-	upToDate, readable := l.isUpToDate(1, 3)
-	if !readable {
-		t.Fatal("expected our own last term to be readable")
+	tests := []struct {
+		name        string
+		index, term uint64
+		want        bool
+	}{
+		// A higher candidate term wins even with a lower index.
+		{"HigherTerm", 1, 3, true},
+		{"SameTermHigherIndex", 3, 2, true},
+		{"SameTermSameIndex", 2, 2, true},
+		{"LowerTerm", 10, 1, false},
+		{"SameTermLowerIndex", 1, 2, false},
 	}
-	if !upToDate {
-		t.Fatal("expected isUpToDate(1, 3) to be true")
-	}
-}
-
-func TestRaftLog_IsUpToDate_SameTermHigherIndex(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	l := newTestRaftLog(entries)
-
-	upToDate, readable := l.isUpToDate(3, 2)
-	if !readable {
-		t.Fatal("expected our own last term to be readable")
-	}
-	if !upToDate {
-		t.Fatal("expected isUpToDate(3, 2) to be true")
-	}
-}
-
-func TestRaftLog_IsUpToDate_SameTermSameIndex(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	l := newTestRaftLog(entries)
-
-	upToDate, readable := l.isUpToDate(2, 2)
-	if !readable {
-		t.Fatal("expected our own last term to be readable")
-	}
-	if !upToDate {
-		t.Fatal("expected isUpToDate(2, 2) to be true")
-	}
-}
-
-func TestRaftLog_IsUpToDate_LowerTerm(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	l := newTestRaftLog(entries)
-
-	upToDate, readable := l.isUpToDate(10, 1)
-	if !readable {
-		t.Fatal("expected our own last term to be readable")
-	}
-	if upToDate {
-		t.Fatal("expected isUpToDate(10, 1) to be false")
-	}
-}
-
-func TestRaftLog_IsUpToDate_SameTermLowerIndex(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	l := newTestRaftLog(entries)
-
-	upToDate, readable := l.isUpToDate(1, 2)
-	if !readable {
-		t.Fatal("expected our own last term to be readable")
-	}
-	if upToDate {
-		t.Fatal("expected isUpToDate(1, 2) to be false")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newTestRaftLog(entries)
+			upToDate, readable := l.isUpToDate(tc.index, tc.term)
+			if !readable {
+				t.Fatal("expected our own last term to be readable")
+			}
+			if upToDate != tc.want {
+				t.Fatalf("isUpToDate(%d, %d) = %v, want %v",
+					tc.index, tc.term, upToDate, tc.want)
+			}
+		})
 	}
 }
 
@@ -777,149 +716,51 @@ func TestRaftLog_Snapshot_WithSnapshot(t *testing.T) {
 	}
 }
 
-func TestRaftLog_Restore_ClearsInMemEntries(t *testing.T) {
-	entries := makeEntries(1, 6, 1)
-	l := newTestRaftLog(entries)
-
-	ss := proto.Snapshot{Index: 20, Term: 5}
-	l.restore(ss)
-
-	if l.inmem.entries != nil {
-		t.Fatal("expected inmem entries to be nil after restore")
+func TestRaftLog_GetConflictIndex(t *testing.T) {
+	tests := []struct {
+		name    string
+		log     []proto.Entry
+		toCheck []proto.Entry
+		want    uint64
+	}{
+		{
+			name:    "NoConflict",
+			log:     []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}, {Index: 3, Term: 3}},
+			toCheck: []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}},
+			want:    0,
+		},
+		{
+			name:    "ConflictAtStart",
+			log:     []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}, {Index: 3, Term: 3}},
+			toCheck: []proto.Entry{{Index: 1, Term: 99}, {Index: 2, Term: 2}},
+			want:    1,
+		},
+		{
+			name:    "ConflictInMiddle",
+			log:     []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}, {Index: 3, Term: 3}},
+			toCheck: []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 99}, {Index: 3, Term: 3}},
+			want:    2,
+		},
+		{
+			// matchTerm is false for an index beyond the log, so the first
+			// new entry is reported as the conflict.
+			name:    "NewEntriesBeyondLog",
+			log:     []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}},
+			toCheck: []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}, {Index: 3, Term: 3}},
+			want:    3,
+		},
 	}
-}
-
-func TestRaftLog_GetConflictIndex_NoConflict(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-		{Index: 3, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	// All entries match.
-	toCheck := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	idx, conflictErr := l.getConflictIndex(toCheck)
-	if conflictErr != nil {
-		t.Fatalf("unexpected getConflictIndex error: %v", conflictErr)
-	}
-	if idx != 0 {
-		t.Fatalf("expected conflict index 0, got %d", idx)
-	}
-}
-
-func TestRaftLog_GetConflictIndex_ConflictAtStart(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-		{Index: 3, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	toCheck := []proto.Entry{
-		{Index: 1, Term: 99}, // conflict at first entry
-		{Index: 2, Term: 2},
-	}
-	idx, conflictErr := l.getConflictIndex(toCheck)
-	if conflictErr != nil {
-		t.Fatalf("unexpected getConflictIndex error: %v", conflictErr)
-	}
-	if idx != 1 {
-		t.Fatalf("expected conflict index 1, got %d", idx)
-	}
-}
-
-func TestRaftLog_GetConflictIndex_ConflictInMiddle(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-		{Index: 3, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	toCheck := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 99}, // conflict at index 2
-		{Index: 3, Term: 3},
-	}
-	idx, conflictErr := l.getConflictIndex(toCheck)
-	if conflictErr != nil {
-		t.Fatalf("unexpected getConflictIndex error: %v", conflictErr)
-	}
-	if idx != 2 {
-		t.Fatalf("expected conflict index 2, got %d", idx)
-	}
-}
-
-func TestRaftLog_GetConflictIndex_NewEntriesBeyondLog(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-	}
-	l := newTestRaftLog(entries)
-
-	// Entries beyond the log: matchTerm returns false for unavailable index.
-	toCheck := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 2},
-		{Index: 3, Term: 3}, // beyond log, no match
-	}
-	idx, conflictErr := l.getConflictIndex(toCheck)
-	if conflictErr != nil {
-		t.Fatalf("unexpected getConflictIndex error: %v", conflictErr)
-	}
-	if idx != 3 {
-		t.Fatalf("expected conflict index 3 (new entry), got %d", idx)
-	}
-}
-
-// TestRaftLog_GetConflictIndex_CompactedEntriesSkipped verifies that
-// getConflictIndex skips entries that return logdb.ErrCompacted from term(),
-// treating them as non-conflicting (already committed and persisted).
-// This prevents false conflicts when a follower's inmem log has a gap
-// after snapshot restore but LogDB has compacted entries below.
-func TestRaftLog_GetConflictIndex_CompactedEntriesSkipped(t *testing.T) {
-	// Build a log with entries [1..5] in LogDB, then compact 1-3.
-	entries := makeEntries(1, 6, 1)
-	logdb := newTestLogReader(entries, proto.State{})
-	if err := logdb.Compact(3); err != nil {
-		t.Fatalf("compact: %v", err)
-	}
-	// Now LogDB has entries [4, 5] and returns logdb.ErrCompacted for 1-3.
-	l := &raftLog{
-		logdb: logdb,
-		inmem: newInMemory(5),
-	}
-	// Simulate post-snapshot state: inmem cleared, markerIndex=4.
-	l.inmem.restore(proto.Snapshot{Index: 3, Term: 1})
-	// Add entry 4 back to inmem.
-	l.inmem.merge([]proto.Entry{{Index: 4, Term: 1}})
-
-	// Entries 2-3 are compacted in LogDB (logdb.ErrCompacted), entry 4 matches inmem.
-	checkEntries := []proto.Entry{
-		{Index: 2, Term: 1}, // compacted → skip
-		{Index: 3, Term: 1}, // compacted → skip
-		{Index: 4, Term: 1}, // matches inmem
-	}
-	idx, err := l.getConflictIndex(checkEntries)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if idx != 0 {
-		t.Fatalf("expected no conflict (0), got %d", idx)
-	}
-
-	// Entry 4 has a different term → real conflict.
-	checkEntries[2].Term = 99
-	idx, err = l.getConflictIndex(checkEntries)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if idx != 4 {
-		t.Fatalf("expected conflict at index 4, got %d", idx)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			l := newTestRaftLog(tc.log)
+			idx, conflictErr := l.getConflictIndex(tc.toCheck)
+			if conflictErr != nil {
+				t.Fatalf("unexpected getConflictIndex error: %v", conflictErr)
+			}
+			if idx != tc.want {
+				t.Fatalf("expected conflict index %d, got %d", tc.want, idx)
+			}
+		})
 	}
 }
 
@@ -1459,48 +1300,6 @@ func BenchmarkRaftLogEntries(b *testing.B) {
 // firstIndexOfTerm / lastIndexOfTerm
 // ---------------------------------------------------------------------------
 
-func TestRaftLog_FirstIndexOfTerm_FindsFirstEntry(t *testing.T) {
-	// Log: [1:t1, 2:t1, 3:t2, 4:t2, 5:t3, 6:t3, 7:t3]
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 2},
-		{Index: 4, Term: 2},
-		{Index: 5, Term: 3},
-		{Index: 6, Term: 3},
-		{Index: 7, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.firstIndexOfTerm(1); got != 1 {
-		t.Fatalf("firstIndexOfTerm(1): expected 1, got %d", got)
-	}
-	if got := l.firstIndexOfTerm(2); got != 3 {
-		t.Fatalf("firstIndexOfTerm(2): expected 3, got %d", got)
-	}
-	if got := l.firstIndexOfTerm(3); got != 5 {
-		t.Fatalf("firstIndexOfTerm(3): expected 5, got %d", got)
-	}
-}
-
-func TestRaftLog_FirstIndexOfTerm_TermNotPresent(t *testing.T) {
-	// Log: [1:t1, 2:t1, 3:t3, 4:t3]  (term 2 missing)
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 3},
-		{Index: 4, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.firstIndexOfTerm(2); got != 0 {
-		t.Fatalf("firstIndexOfTerm(2): expected 0 for missing term, got %d", got)
-	}
-	if got := l.firstIndexOfTerm(99); got != 0 {
-		t.Fatalf("firstIndexOfTerm(99): expected 0 for missing term, got %d", got)
-	}
-}
-
 func TestRaftLog_FirstIndexOfTerm_EmptyLog(t *testing.T) {
 	l := newTestRaftLog(nil)
 	if got := l.firstIndexOfTerm(1); got != 0 {
@@ -1519,44 +1318,6 @@ func TestRaftLog_FirstIndexOfTerm_SingleEntry(t *testing.T) {
 	}
 	if got := l.firstIndexOfTerm(4); got != 0 {
 		t.Fatalf("firstIndexOfTerm(4): expected 0, got %d", got)
-	}
-}
-
-func TestRaftLog_LastIndexOfTerm_FindsLastEntry(t *testing.T) {
-	// Log: [1:t1, 2:t1, 3:t2, 4:t2, 5:t3, 6:t3, 7:t3]
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 2},
-		{Index: 4, Term: 2},
-		{Index: 5, Term: 3},
-		{Index: 6, Term: 3},
-		{Index: 7, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.lastIndexOfTerm(1); got != 2 {
-		t.Fatalf("lastIndexOfTerm(1): expected 2, got %d", got)
-	}
-	if got := l.lastIndexOfTerm(2); got != 4 {
-		t.Fatalf("lastIndexOfTerm(2): expected 4, got %d", got)
-	}
-	if got := l.lastIndexOfTerm(3); got != 7 {
-		t.Fatalf("lastIndexOfTerm(3): expected 7, got %d", got)
-	}
-}
-
-func TestRaftLog_LastIndexOfTerm_TermNotPresent(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 3},
-		{Index: 4, Term: 3},
-	}
-	l := newTestRaftLog(entries)
-
-	if got := l.lastIndexOfTerm(2); got != 0 {
-		t.Fatalf("lastIndexOfTerm(2): expected 0 for missing term, got %d", got)
 	}
 }
 

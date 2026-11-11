@@ -6,8 +6,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestNewRaftLog_ClampsCommittedToLastIndex asserts that a recovered commit
-// index ahead of the last recovered entry is clamped down.
+// TestNewRaftLog_RecordsRecoveryClamp asserts that a recovered commit index
+// ahead of the last recovered entry is clamped down, and that the clamp is
+// recorded.
 //
 // getConflictIndex skips every entry at or below committed as "committed
 // entries cannot conflict". With committed past the end of the log, tryAppend
@@ -19,28 +20,8 @@ import (
 //
 // Reachable from a torn WAL batch that kept the state record while losing
 // entries behind it, or a snapshot record that outlived them.
-func TestNewRaftLog_ClampsCommittedToLastIndex(t *testing.T) {
-	// Log holds entries 1..5, but the recovered hard state claims 99.
-	entries := []proto.Entry{
-		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1},
-		{Index: 4, Term: 1}, {Index: 5, Term: 1},
-	}
-	logdb := newTestLogReader(entries, proto.State{Term: 1, Commit: 99})
-	l := newRaftLog(logdb)
-
-	last := l.lastIndex()
-	if l.committed > last {
-		t.Fatalf("committed = %d with lastIndex = %d: a commit index past the "+
-			"end of the log makes getConflictIndex skip entries this replica "+
-			"does not have, producing a phantom ACK", l.committed, last)
-	}
-	if l.processed > l.committed {
-		t.Errorf("processed = %d exceeds committed = %d after clamping",
-			l.processed, l.committed)
-	}
-}
-
-// TestNewRaftLog_RecordsRecoveryClamp: the clamp is recorded for the Host to
+//
+// The clamp is recorded for the Host to
 // log on its own logger (Peer.RecoveryClamp), with the recovered values, and
 // nothing is recorded when the recovered commit index is within the log.
 func TestNewRaftLog_RecordsRecoveryClamp(t *testing.T) {
@@ -50,7 +31,18 @@ func TestNewRaftLog_RecordsRecoveryClamp(t *testing.T) {
 		t.Fatalf("recoveryClamp = %+v for a commit index within the log, want none", c)
 	}
 
-	c := newRaftLog(newTestLogReader(entries, proto.State{Term: 1, Commit: 9})).recoveryClamp
+	// Log holds entries 1..3, but the recovered hard state claims 9.
+	l := newRaftLog(newTestLogReader(entries, proto.State{Term: 1, Commit: 9}))
+	if l.committed != 3 {
+		t.Fatalf("committed = %d with lastIndex = %d, want 3: a commit index past "+
+			"the end of the log makes getConflictIndex skip entries this replica "+
+			"does not have, producing a phantom ACK", l.committed, l.lastIndex())
+	}
+	if l.processed > l.committed {
+		t.Fatalf("processed = %d exceeds committed = %d after clamping",
+			l.processed, l.committed)
+	}
+	c := l.recoveryClamp
 	want := RecoveryClamp{RecoveredCommit: 9, RecoveredTerm: 1, LastIndex: 3}
 	if c != want {
 		t.Fatalf("recoveryClamp = %+v, want %+v", c, want)
@@ -163,23 +155,8 @@ func TestTotalEntryLoss_NoPhantomReplicateAck(t *testing.T) {
 	}
 }
 
-// TestNewRaftLog_KeepsValidCommitted verifies the clamp does not lower a
-// legitimate commit index, which would silently un-commit entries.
-func TestNewRaftLog_KeepsValidCommitted(t *testing.T) {
-	entries := []proto.Entry{
-		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1},
-	}
-	logdb := newTestLogReader(entries, proto.State{Term: 1, Commit: 3})
-	l := newRaftLog(logdb)
-
-	if l.committed != 3 {
-		t.Errorf("committed = %d, want 3: a commit index within the log must "+
-			"survive recovery unchanged", l.committed)
-	}
-}
-
 // TG-3. The INNER clamp — processed down to the clamped committed — has its
-// own reachable case, and TestNewRaftLog_ClampsCommittedToLastIndex does not
+// own reachable case, and TestNewRaftLog_RecordsRecoveryClamp does not
 // reach it: that fixture has no snapshot, so processed is derived as
 // firstIndex-1 == 0 and `processed > committed` compares 0 against 5. The
 // assertion there is vacuously true and would survive deleting the clamp.

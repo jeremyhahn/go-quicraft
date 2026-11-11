@@ -43,40 +43,37 @@ func TestEncodeBatch_EmptySlice(t *testing.T) {
 
 func TestEncodeBatch_SingleCommand(t *testing.T) {
 	t.Parallel()
-	cmd := []byte("hello")
-	result := mustEncodeBatch(t, [][]byte{cmd})
+	large := make([]byte, 64*1024)
+	for i := range large {
+		large[i] = byte(i % 256)
+	}
+	for _, tc := range []struct {
+		name string
+		cmd  []byte
+	}{
+		{"small", []byte("hello")},
+		{"64KiB", large},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			result := mustEncodeBatch(t, [][]byte{tc.cmd})
 
-	// Expected: 4 bytes length prefix + 5 bytes data = 9 bytes
-	if len(result) != 9 {
-		t.Fatalf("EncodeBatch single command produced %d bytes, want 9", len(result))
-	}
+			// One 4-byte length prefix followed by the command bytes.
+			if want := lengthPrefixSize + len(tc.cmd); len(result) != want {
+				t.Fatalf("EncodeBatch single command produced %d bytes, want %d", len(result), want)
+			}
 
-	// Verify the data round-trips correctly.
-	decoded, err := DecodeBatch(result)
-	if err != nil {
-		t.Fatalf("DecodeBatch failed: %v", err)
-	}
-	if len(decoded) != 1 {
-		t.Fatalf("decoded %d commands, want 1", len(decoded))
-	}
-	if !bytes.Equal(decoded[0], cmd) {
-		t.Errorf("decoded[0] = %q, want %q", decoded[0], cmd)
-	}
-}
-
-func TestEncodeBatch_MultipleCommands(t *testing.T) {
-	t.Parallel()
-	cmds := [][]byte{
-		[]byte("PUT key1 val1"),
-		[]byte("GET key2"),
-		[]byte("DELETE key3"),
-	}
-	result := mustEncodeBatch(t, cmds)
-
-	// Expected: 3 * 4 (prefixes) + 13 + 8 + 11 (data) = 12 + 32 = 44 bytes
-	expectedLen := 3*lengthPrefixSize + 13 + 8 + 11
-	if len(result) != expectedLen {
-		t.Fatalf("EncodeBatch produced %d bytes, want %d", len(result), expectedLen)
+			decoded, err := DecodeBatch(result)
+			if err != nil {
+				t.Fatalf("DecodeBatch failed: %v", err)
+			}
+			if len(decoded) != 1 {
+				t.Fatalf("decoded %d commands, want 1", len(decoded))
+			}
+			if !bytes.Equal(decoded[0], tc.cmd) {
+				t.Error("decoded command does not match original")
+			}
+		})
 	}
 }
 
@@ -106,32 +103,6 @@ func TestEncodeBatch_EmptyCommands(t *testing.T) {
 		if len(d) != 0 {
 			t.Errorf("decoded[%d] has length %d, want 0", i, len(d))
 		}
-	}
-}
-
-func TestEncodeBatch_LargeCommand(t *testing.T) {
-	t.Parallel()
-	large := make([]byte, 64*1024)
-	for i := range large {
-		large[i] = byte(i % 256)
-	}
-	cmds := [][]byte{large}
-	result := mustEncodeBatch(t, cmds)
-
-	expectedLen := lengthPrefixSize + len(large)
-	if len(result) != expectedLen {
-		t.Fatalf("EncodeBatch produced %d bytes, want %d", len(result), expectedLen)
-	}
-
-	decoded, err := DecodeBatch(result)
-	if err != nil {
-		t.Fatalf("DecodeBatch failed: %v", err)
-	}
-	if len(decoded) != 1 {
-		t.Fatalf("decoded %d commands, want 1", len(decoded))
-	}
-	if !bytes.Equal(decoded[0], large) {
-		t.Error("decoded large command does not match original")
 	}
 }
 
@@ -235,6 +206,16 @@ func TestRoundTrip_MultipleCommands(t *testing.T) {
 		[]byte("cmd5-with-binary-\x00\x01\x02"),
 	}
 	encoded := mustEncodeBatch(t, original)
+
+	// Every command, empty or not, carries its own 4-byte length prefix.
+	wantLen := len(original) * lengthPrefixSize
+	for _, cmd := range original {
+		wantLen += len(cmd)
+	}
+	if len(encoded) != wantLen {
+		t.Fatalf("EncodeBatch produced %d bytes, want %d", len(encoded), wantLen)
+	}
+
 	decoded, err := DecodeBatch(encoded)
 	if err != nil {
 		t.Fatalf("round-trip decode failed: %v", err)

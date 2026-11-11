@@ -96,10 +96,7 @@ func TestInflightsFreeToWithIndexNotInBuffer(t *testing.T) {
 	mustAdd(t, in, 5)
 	mustAdd(t, in, 10)
 	mustAdd(t, in, 15)
-	// Index 3 is less than all buffer entries -- should free nothing
-	// because no entries have index <= 3... wait, 5 > 3, so nothing freed.
-	// Actually the scan checks buffer[pos] <= index. 5 > 3, 10 > 3, 15 > 3.
-	// So nothing freed.
+	// Every buffered index is above 3, so nothing is freed.
 	in.freeTo(3)
 	if in.Count() != 3 {
 		t.Errorf("expected count 3 (no entries freed for index 3), got %d", in.Count())
@@ -166,26 +163,14 @@ func TestInflightsCircularBufferWrapsCorrectly(t *testing.T) {
 		t.Errorf("expected full after wrapping")
 	}
 	// Verify the wrapped entries are correct by freeing them
-	in.freeTo(4)
+	in.freeTo(4) // frees positions 3 and 4, so start wraps back to 0
 	if in.Count() != 3 {
 		t.Errorf("expected count 3 after freeing wrapped entries, got %d", in.Count())
 	}
-	in.freeTo(7)
-	if in.Count() != 0 {
-		t.Errorf("expected count 0, got %d", in.Count())
-	}
-}
-
-func TestInflightsCircularBufferStartWraps(t *testing.T) {
-	in := newInflights(3)
-	// Fill and free to move start to the end
-	mustAdd(t, in, 1)
-	mustAdd(t, in, 2)
-	mustAdd(t, in, 3)
-	in.freeTo(3) // start should wrap back to 0
 	if in.start != 0 {
-		t.Errorf("expected start 0 after full cycle, got %d", in.start)
+		t.Errorf("expected start 0 after freeTo wraps, got %d", in.start)
 	}
+	in.freeTo(7)
 	if in.Count() != 0 {
 		t.Errorf("expected count 0, got %d", in.Count())
 	}
@@ -217,26 +202,6 @@ func TestInflightsResetRetainsBuffer(t *testing.T) {
 	}
 	if len(in.buffer) != 5 {
 		t.Errorf("expected buffer length 5, got %d", len(in.buffer))
-	}
-}
-
-func TestInflightsCountReturnsCorrectValue(t *testing.T) {
-	in := newInflights(10)
-	if in.Count() != 0 {
-		t.Errorf("expected 0, got %d", in.Count())
-	}
-	mustAdd(t, in, 1)
-	if in.Count() != 1 {
-		t.Errorf("expected 1, got %d", in.Count())
-	}
-	mustAdd(t, in, 2)
-	mustAdd(t, in, 3)
-	if in.Count() != 3 {
-		t.Errorf("expected 3, got %d", in.Count())
-	}
-	in.freeFirstOne()
-	if in.Count() != 2 {
-		t.Errorf("expected 2, got %d", in.Count())
 	}
 }
 

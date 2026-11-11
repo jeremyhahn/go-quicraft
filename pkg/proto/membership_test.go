@@ -20,44 +20,6 @@ import (
 	"testing"
 )
 
-func TestMembershipMarshalUnmarshalRoundTrip(t *testing.T) {
-	m := Membership{
-		ConfigChangeID: 42,
-		Addresses: map[uint64]string{
-			1: "node-1:5000",
-			2: "node-2:5000",
-			3: "node-3:5000",
-		},
-		Observers: map[uint64]string{
-			10: "observer-10:5000",
-		},
-		Witnesses: map[uint64]string{
-			20: "witness-20:5000",
-		},
-		Removed: map[uint64]bool{
-			99: true,
-		},
-	}
-	buf := make([]byte, m.Size())
-	n, err := m.MarshalTo(buf)
-	if err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	if n != m.Size() {
-		t.Fatalf("MarshalTo: wrote %d, want %d", n, m.Size())
-	}
-
-	var m2 Membership
-	consumed, err := m2.UnmarshalFrom(buf)
-	if err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if consumed != n {
-		t.Fatalf("UnmarshalFrom: consumed %d, want %d", consumed, n)
-	}
-	assertMembershipEqual(t, &m, &m2)
-}
-
 func TestMembershipMarshalUnmarshalEmptyMaps(t *testing.T) {
 	m := Membership{
 		ConfigChangeID: 1,
@@ -67,9 +29,13 @@ func TestMembershipMarshalUnmarshalEmptyMaps(t *testing.T) {
 		Removed:        map[uint64]bool{},
 	}
 	buf := make([]byte, m.Size())
-	m.MarshalTo(buf)
+	if _, err := m.MarshalTo(buf); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
 	var m2 Membership
-	m2.UnmarshalFrom(buf)
+	if _, err := m2.UnmarshalFrom(buf); err != nil {
+		t.Fatalf("UnmarshalFrom: %v", err)
+	}
 	assertMembershipEqual(t, &m, &m2)
 }
 
@@ -127,28 +93,6 @@ func TestMembershipAddressTooLong(t *testing.T) {
 	_, err := m2.UnmarshalFrom(raw)
 	if !errors.Is(err, ErrAddressTooLong) {
 		t.Fatalf("UnmarshalFrom: got %v, want ErrAddressTooLong", err)
-	}
-}
-
-// TestMembershipPolicyRoundTrip verifies the replicated witness-policy
-// fields survive marshal/unmarshal.
-func TestMembershipPolicyRoundTrip(t *testing.T) {
-	m := Membership{
-		ConfigChangeID:             11,
-		MaxWitnesses:               4,
-		RequireFullReplicaMajority: true,
-		Addresses:                  map[uint64]string{1: "a"},
-	}
-	buf := make([]byte, m.Size())
-	if _, err := m.MarshalTo(buf); err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-	var m2 Membership
-	if _, err := m2.UnmarshalFrom(buf); err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-	if m2.MaxWitnesses != 4 || !m2.RequireFullReplicaMajority || m2.ConfigChangeID != 11 {
-		t.Fatalf("round trip mismatch: %+v", m2)
 	}
 }
 

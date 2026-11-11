@@ -233,32 +233,7 @@ func TestInstallSnapshot_HigherTermSenderStillInstalls(t *testing.T) {
 	}
 }
 
-// TestInstallSnapshot_CandidateStillInstalls is the fourth liveness control.
-// stepCandidate calls stepDownToFollower(msg) before handleSnapshot, which sets
-// leaderID = msg.From, so a candidate must still accept the install that ends
-// its candidacy. This is the path a follower catching up by snapshot takes when
-// its election timer fires mid-transfer.
-func TestInstallSnapshot_CandidateStillInstalls(t *testing.T) {
-	quietLogs(t)
-
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeFollower(5, 2)
-	r.becomeCandidate()
-	r.drainMessages()
-	if r.state != candidate || r.leaderID != noLeader {
-		t.Fatalf("fixture: state=%v leaderID=%d, want candidate and noLeader",
-			r.state, r.leaderID)
-	}
-
-	if err := r.step(proto.Message{
-		Type: proto.InstallSnapshot, From: 2, To: 1, Term: r.term, Origin: proto.OriginLocal,
-		Snapshot: proto.Snapshot{Index: 30, Term: r.term},
-	}); err != nil {
-		t.Fatalf("step: %v", err)
-	}
-	if r.state != follower || r.log.committed != 30 {
-		t.Fatalf("state=%v committed=%d, want follower and 30: a candidate must "+
-			"still step down to and install from the term's real leader",
-			r.state, r.log.committed)
-	}
-}
+// The fourth liveness control, a candidate that must still accept the install
+// that ends its candidacy (stepCandidate calls stepDownToFollower(msg) before
+// handleSnapshot, which sets leaderID = msg.From), is
+// TestRaft_Candidate_RevertsToFollowerOnSnapshot.

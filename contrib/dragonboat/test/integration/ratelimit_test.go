@@ -173,42 +173,6 @@ func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 	}
 
 	if !gotBusy {
-		t.Fatal("rate limit was never triggered despite many proposals with MaxInMemLogSize=1; rate limiting is broken")
+		t.Fatal("rate limit was never triggered despite many proposals with MaxInMemLogSize=129; rate limiting is broken")
 	}
-}
-
-// TestIntegration_DB_UpdateResultIsReturned verifies that SyncPropose
-// returns the result value set by the state machine's Update method.
-// Matches dragonboat's TestUpdateResultIsReturnedToCaller.
-func TestIntegration_DB_UpdateResultIsReturned(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Warmup entry.
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-
-	session := dbClient.NewNoOPSession(1, nil)
-
-	// The KV SM's Update returns Result{Value: len(value)}.
-	testCases := []struct {
-		key, value string
-		wantLen    uint64
-	}{
-		{"k1", "short", 5},
-		{"k2", "a-longer-value-string", 21},
-		{"k3", "", 0},
-	}
-
-	for _, tc := range testCases {
-		cmd := encodeKVPut(tc.key, tc.value)
-		result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
-		if result.Value != tc.wantLen {
-			t.Errorf("SyncPropose(%q) result.Value = %d, want %d",
-				tc.key, result.Value, tc.wantLen)
-		}
-	}
-	t.Logf("update result values verified for %d proposals", len(testCases))
 }

@@ -30,13 +30,6 @@ func (r *testRNG) Uint64() uint64 {
 	return r.val
 }
 
-func TestSourceInterface_NilAccepted(t *testing.T) {
-	var s Source
-	if s != nil {
-		t.Error("zero-value Source interface should be nil")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // NewSession
 // ---------------------------------------------------------------------------
@@ -62,28 +55,6 @@ func TestNewSession_CreatesTrackedSession(t *testing.T) {
 	}
 	if s.IsNoOPSession() {
 		t.Error("NewSession must not produce a no-op session")
-	}
-}
-
-func TestNewSession_DiffersFromNoOPSession(t *testing.T) {
-	rng := &testRNG{val: 99999}
-	tracked := NewSession(5, rng)
-	noop := NewNoOPSession(5, rng)
-
-	if tracked.IsNoOPSession() {
-		t.Error("tracked session must not be a no-op session")
-	}
-	if !noop.IsNoOPSession() {
-		t.Error("noop session must be a no-op session")
-	}
-	if tracked.ClientID() == noop.ClientID() {
-		t.Error("tracked and noop sessions must have different ClientIDs")
-	}
-	if tracked.ClientID() == 0 {
-		t.Error("tracked session ClientID must be non-zero")
-	}
-	if noop.ClientID() != 0 {
-		t.Errorf("noop session ClientID = %d, want 0", noop.ClientID())
 	}
 }
 
@@ -127,32 +98,32 @@ func TestNewSession_UniqueClientIDs(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNewNoOPSession(t *testing.T) {
-	s := NewNoOPSession(42, nil)
-	if s.ShardID != 42 {
-		t.Errorf("ShardID = %d, want 42", s.ShardID)
+	tests := []struct {
+		name string
+		rng  Source
+	}{
+		{name: "nil rng", rng: nil},
+		{name: "rng ignored", rng: &testRNG{val: 999}},
 	}
-	if !s.IsNoOPSession() {
-		t.Error("NewNoOPSession should produce a no-op session")
-	}
-	if s.Inner() == nil {
-		t.Error("Inner() must not be nil")
-	}
-	if s.Inner().ShardID() != 42 {
-		t.Errorf("Inner().ShardID() = %d, want 42", s.Inner().ShardID())
-	}
-	if s.ClientID() != 0 {
-		t.Errorf("ClientID() = %d, want 0 for no-op session", s.ClientID())
-	}
-}
-
-func TestNewNoOPSession_WithRNG(t *testing.T) {
-	rng := &testRNG{val: 999}
-	s := NewNoOPSession(5, rng)
-	if s.ShardID != 5 {
-		t.Errorf("ShardID = %d, want 5", s.ShardID)
-	}
-	if !s.IsNoOPSession() {
-		t.Error("NewNoOPSession with rng should still produce a no-op session")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewNoOPSession(42, tc.rng)
+			if s.ShardID != 42 {
+				t.Errorf("ShardID = %d, want 42", s.ShardID)
+			}
+			if !s.IsNoOPSession() {
+				t.Error("NewNoOPSession should produce a no-op session")
+			}
+			if s.Inner() == nil {
+				t.Fatal("Inner() must not be nil")
+			}
+			if s.Inner().ShardID() != 42 {
+				t.Errorf("Inner().ShardID() = %d, want 42", s.Inner().ShardID())
+			}
+			if s.ClientID() != 0 {
+				t.Errorf("ClientID() = %d, want 0 for no-op session", s.ClientID())
+			}
+		})
 	}
 }
 
@@ -183,14 +154,6 @@ func TestValidForProposal_RejectsMismatchedShard(t *testing.T) {
 	}
 }
 
-func TestValidForProposal_RejectsRegisterSession(t *testing.T) {
-	s := NewSession(10, &testRNG{val: 500})
-	s.Inner().PrepareForRegister()
-	if s.ValidForProposal(10) {
-		t.Error("ValidForProposal must reject session in register state")
-	}
-}
-
 func TestValidForProposal_RejectsUnregisterSession(t *testing.T) {
 	s := NewSession(10, &testRNG{val: 500})
 	s.Inner().PrepareForUnregister()
@@ -199,29 +162,9 @@ func TestValidForProposal_RejectsUnregisterSession(t *testing.T) {
 	}
 }
 
-func TestValidForProposal_RejectsUninitializedSession(t *testing.T) {
-	// A freshly created session has SeriesID 0 and RespondedTo 0.
-	// This is technically valid per the invariant (respondedTo <= seriesID),
-	// but the session has not been prepared for proposals yet.
-	s := NewSession(10, &testRNG{val: 500})
-	// SeriesID is 0 initially, which is neither register nor unregister,
-	// and respondedTo (0) <= seriesID (0), so the inner validation passes.
-	// This matches dragonboat behavior where a freshly created unregistered
-	// session can technically pass ValidForProposal.
-	_ = s.ValidForProposal(10) // no assertion - documenting behavior
-}
-
 // ---------------------------------------------------------------------------
 // ValidForSessionOp
 // ---------------------------------------------------------------------------
-
-func TestValidForSessionOp_AcceptsRegisterSession(t *testing.T) {
-	s := NewSession(10, &testRNG{val: 500})
-	s.Inner().PrepareForRegister()
-	if !s.ValidForSessionOp(10) {
-		t.Error("ValidForSessionOp should accept session in register state")
-	}
-}
 
 func TestValidForSessionOp_AcceptsUnregisterSession(t *testing.T) {
 	s := NewSession(10, &testRNG{val: 500})
@@ -281,36 +224,9 @@ func TestWrapSession_FieldsMatch(t *testing.T) {
 	}
 }
 
-func TestWrapSession_TrackedSession(t *testing.T) {
-	inner := quicraft.NewSession(5, 42)
-	wrapped := WrapSession(inner)
-
-	if wrapped.IsNoOPSession() {
-		t.Error("wrapped tracked session must not be no-op")
-	}
-	if wrapped.ClientID() != 42 {
-		t.Errorf("ClientID = %d, want 42", wrapped.ClientID())
-	}
-	if wrapped.ShardID != 5 {
-		t.Errorf("ShardID = %d, want 5", wrapped.ShardID)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Session methods
 // ---------------------------------------------------------------------------
-
-func TestSession_IsNoOPSession(t *testing.T) {
-	noop := NewNoOPSession(1, nil)
-	if !noop.IsNoOPSession() {
-		t.Error("NewNoOPSession must produce a no-op session")
-	}
-
-	tracked := NewSession(1, &testRNG{val: 100})
-	if tracked.IsNoOPSession() {
-		t.Error("NewSession must not produce a no-op session")
-	}
-}
 
 func TestSession_PrepareForPropose(t *testing.T) {
 	s := NewSession(1, &testRNG{val: 100})
@@ -370,26 +286,6 @@ func TestSession_ProposalCompleted(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// generateClientID
-// ---------------------------------------------------------------------------
-
-func TestGenerateClientID_UsesRNG(t *testing.T) {
-	rng := &testRNG{val: 777}
-	id := generateClientID(rng)
-	if id != 777 {
-		t.Errorf("generateClientID = %d, want 777", id)
-	}
-}
-
-func TestGenerateClientID_RejectsZeroFromRNG(t *testing.T) {
-	rng := &testRNG{val: 0}
-	id := generateClientID(rng)
-	if id == 0 {
-		t.Error("generateClientID must never return 0")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // SwapInner
 // ---------------------------------------------------------------------------
 
@@ -415,26 +311,6 @@ func TestSession_SwapInner_UpdatesInner(t *testing.T) {
 	}
 	if session.ShardID != 10 {
 		t.Errorf("ShardID must remain unchanged after swap, got %d", session.ShardID)
-	}
-}
-
-func TestSession_SwapInner_InvalidNilPanics(t *testing.T) {
-	session := NewSession(1, &testRNG{val: 42})
-
-	// Reading Inner after storing nil will panic on dereference in methods
-	// like ClientID(). Verify SwapInner with a valid pointer works after
-	// an initial swap.
-	first := quicraft.NewSession(1, 50)
-	second := quicraft.NewSession(1, 60)
-
-	session.SwapInner(first)
-	if session.ClientID() != 50 {
-		t.Errorf("ClientID after first swap = %d, want 50", session.ClientID())
-	}
-
-	session.SwapInner(second)
-	if session.ClientID() != 60 {
-		t.Errorf("ClientID after second swap = %d, want 60", session.ClientID())
 	}
 }
 

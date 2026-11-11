@@ -37,7 +37,7 @@ func TestPrintTerminalEmptyReport(t *testing.T) {
 	}
 }
 
-func TestPrintTerminalContainsScenarioLabel(t *testing.T) {
+func TestPrintTerminalContainsScenarioLabelAndWinner(t *testing.T) {
 	report := buildSampleReport()
 
 	var buf bytes.Buffer
@@ -50,17 +50,6 @@ func TestPrintTerminalContainsScenarioLabel(t *testing.T) {
 	if !strings.Contains(output, "Propose Sequential (WAL)") {
 		t.Fatalf("expected scenario label in output, got:\n%s", output)
 	}
-}
-
-func TestPrintTerminalContainsWinner(t *testing.T) {
-	report := buildSampleReport()
-
-	var buf bytes.Buffer
-	if err := report.PrintTerminal(&buf); err != nil {
-		t.Fatalf("PrintTerminal: %v", err)
-	}
-	output := buf.String()
-
 	if !strings.Contains(output, "WINNER") {
 		t.Fatal("expected 'WINNER' label in output")
 	}
@@ -187,102 +176,52 @@ func TestPrintTerminalUnknownScenarioKeyUsedAsLabel(t *testing.T) {
 	}
 }
 
-func TestFormatOpsNA(t *testing.T) {
-	if got := FormatOps(0); got != "N/A" {
-		t.Fatalf("expected 'N/A', got %q", got)
+func TestFormatOps(t *testing.T) {
+	tests := []struct {
+		name string
+		ops  float64
+		want string
+	}{
+		{name: "zero_na", ops: 0, want: "N/A"},
+		{name: "small", ops: 500.5, want: "500.5"},
+		{name: "k_lower_bound", ops: 1000, want: "1.00K"},
+		{name: "m_lower_bound", ops: 1_000_000, want: "1.00M"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FormatOps(tt.ops); got != tt.want {
+				t.Fatalf("FormatOps(%v) = %q, want %q", tt.ops, got, tt.want)
+			}
+		})
 	}
 }
 
-func TestFormatOpsSmall(t *testing.T) {
-	got := FormatOps(500.5)
-	if got != "500.5" {
-		t.Fatalf("expected '500.5', got %q", got)
-	}
-}
-
-func TestFormatOpsExactBoundary(t *testing.T) {
-	// Exactly 1000 -> should be K format.
-	got := FormatOps(1000)
-	if got != "1.00K" {
-		t.Fatalf("expected '1.00K', got %q", got)
-	}
-
-	// Exactly 1,000,000 -> should be M format.
-	got = FormatOps(1_000_000)
-	if got != "1.00M" {
-		t.Fatalf("expected '1.00M', got %q", got)
-	}
-}
-
-func TestFormatDurationNsZero(t *testing.T) {
-	if got := FormatDurationNs(0); got != "N/A" {
-		t.Fatalf("expected 'N/A', got %q", got)
-	}
-}
-
-func TestFormatDurationNsNanoseconds(t *testing.T) {
-	got := FormatDurationNs(500)
-	if got != "500ns" {
-		t.Fatalf("expected '500ns', got %q", got)
-	}
-}
-
-func TestFormatDurationNsMicroseconds(t *testing.T) {
-	got := FormatDurationNs(5000)
-	if got != "5.0us" {
-		t.Fatalf("expected '5.0us', got %q", got)
-	}
-}
-
-func TestFormatDurationNsMilliseconds(t *testing.T) {
-	got := FormatDurationNs(5_000_000)
-	if got != "5.00ms" {
-		t.Fatalf("expected '5.00ms', got %q", got)
-	}
-}
-
-func TestFormatDurationNsSeconds(t *testing.T) {
-	got := FormatDurationNs(2_500_000_000)
-	if got != "2.500s" {
-		t.Fatalf("expected '2.500s', got %q", got)
-	}
-}
-
-func TestFormatDurationNsBoundaries(t *testing.T) {
-	// 999ns should still be ns format.
-	got := FormatDurationNs(999)
-	if !strings.HasSuffix(got, "ns") {
-		t.Fatalf("expected ns suffix for 999ns, got %q", got)
+func TestFormatDurationNs(t *testing.T) {
+	tests := []struct {
+		name string
+		ns   int64
+		want string
+	}{
+		{name: "zero", ns: 0, want: "N/A"},
+		{name: "nanoseconds", ns: 500, want: "500ns"},
+		{name: "ns_upper_bound", ns: 999, want: "999ns"},
+		{name: "us_lower_bound", ns: 1000, want: "1.0us"},
+		{name: "microseconds", ns: 5000, want: "5.0us"},
+		{name: "us_upper_bound", ns: 999_999, want: "1000.0us"},
+		{name: "ms_lower_bound", ns: 1_000_000, want: "1.00ms"},
+		{name: "milliseconds", ns: 5_000_000, want: "5.00ms"},
+		{name: "ms_upper_bound", ns: 999_999_999, want: "1000.00ms"},
+		{name: "s_lower_bound", ns: 1_000_000_000, want: "1.000s"},
+		{name: "seconds", ns: 2_500_000_000, want: "2.500s"},
 	}
 
-	// 1000ns should be us format.
-	got = FormatDurationNs(1000)
-	if !strings.HasSuffix(got, "us") {
-		t.Fatalf("expected us suffix for 1000ns, got %q", got)
-	}
-
-	// 999999ns should still be us format.
-	got = FormatDurationNs(999_999)
-	if !strings.HasSuffix(got, "us") {
-		t.Fatalf("expected us suffix for 999999ns, got %q", got)
-	}
-
-	// 1000000ns should be ms format.
-	got = FormatDurationNs(1_000_000)
-	if !strings.HasSuffix(got, "ms") {
-		t.Fatalf("expected ms suffix for 1000000ns, got %q", got)
-	}
-
-	// 999999999ns should still be ms format.
-	got = FormatDurationNs(999_999_999)
-	if !strings.HasSuffix(got, "ms") {
-		t.Fatalf("expected ms suffix for 999999999ns, got %q", got)
-	}
-
-	// 1000000000ns should be s format.
-	got = FormatDurationNs(1_000_000_000)
-	if !strings.HasSuffix(got, "s") && !strings.HasSuffix(got, "ms") {
-		t.Fatalf("expected s suffix for 1s, got %q", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := FormatDurationNs(tt.ns); got != tt.want {
+				t.Fatalf("FormatDurationNs(%d) = %q, want %q", tt.ns, got, tt.want)
+			}
+		})
 	}
 }
 

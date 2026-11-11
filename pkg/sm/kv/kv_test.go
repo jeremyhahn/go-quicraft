@@ -575,95 +575,53 @@ func TestConcurrentStore_PrepareSnapshotInvalidCtx(t *testing.T) {
 // List tests: run against both backends
 // ---------------------------------------------------------------------------
 
-func TestKV_ListWithPrefix(t *testing.T) {
-	for _, b := range backends() {
-		t.Run(b.name, func(t *testing.T) {
-			ctx := context.Background()
-
-			entries := []sm.Entry{
-				{Index: 1, Cmd: mustEncodePut([]byte("users/alice"), []byte("a"))},
-				{Index: 2, Cmd: mustEncodePut([]byte("users/bob"), []byte("b"))},
-				{Index: 3, Cmd: mustEncodePut([]byte("certs/ca"), []byte("c"))},
-			}
-			results := make([]sm.Result, 3)
-			if err := b.update(ctx, entries, results); err != nil {
-				t.Fatalf("Update = %v", err)
-			}
-
-			val, err := b.lookup(ctx, ListQuery{Prefix: "users/"})
-			if err != nil {
-				t.Fatalf("Lookup(ListQuery) = %v", err)
-			}
-			keys, ok := val.([]string)
-			if !ok {
-				t.Fatalf("Lookup returned %T, want []string", val)
-			}
-			if len(keys) != 2 {
-				t.Fatalf("len(keys) = %d, want 2", len(keys))
-			}
-			if keys[0] != "users/alice" || keys[1] != "users/bob" {
-				t.Errorf("keys = %v, want [users/alice users/bob]", keys)
-			}
-		})
+func TestKV_ListQuery(t *testing.T) {
+	cases := []struct {
+		name   string
+		keys   []string
+		prefix string
+		want   []string
+	}{
+		{"prefix", []string{"users/alice", "users/bob", "certs/ca"}, "users/", []string{"users/alice", "users/bob"}},
+		// Unsorted inserts: the result must come back sorted.
+		{"empty_prefix_sorted", []string{"b", "a", "c"}, "", []string{"a", "b", "c"}},
+		// No match yields an empty, non-nil slice.
+		{"no_matches", []string{"foo"}, "nonexistent/", []string{}},
 	}
-}
+	for _, tc := range cases {
+		for _, b := range backends() {
+			t.Run(tc.name+"/"+b.name, func(t *testing.T) {
+				ctx := context.Background()
+				entries := make([]sm.Entry, len(tc.keys))
+				for i, k := range tc.keys {
+					entries[i] = sm.Entry{Index: uint64(i + 1), Cmd: mustEncodePut([]byte(k), []byte("v"))}
+				}
+				if err := b.update(ctx, entries, make([]sm.Result, len(entries))); err != nil {
+					t.Fatalf("Update = %v", err)
+				}
 
-func TestKV_ListEmptyPrefix(t *testing.T) {
-	for _, b := range backends() {
-		t.Run(b.name, func(t *testing.T) {
-			ctx := context.Background()
-
-			entries := []sm.Entry{
-				{Index: 1, Cmd: mustEncodePut([]byte("b"), []byte("2"))},
-				{Index: 2, Cmd: mustEncodePut([]byte("a"), []byte("1"))},
-				{Index: 3, Cmd: mustEncodePut([]byte("c"), []byte("3"))},
-			}
-			results := make([]sm.Result, 3)
-			if err := b.update(ctx, entries, results); err != nil {
-				t.Fatalf("Update = %v", err)
-			}
-
-			val, err := b.lookup(ctx, ListQuery{Prefix: ""})
-			if err != nil {
-				t.Fatalf("Lookup(ListQuery) = %v", err)
-			}
-			keys := val.([]string)
-			if len(keys) != 3 {
-				t.Fatalf("len(keys) = %d, want 3", len(keys))
-			}
-			// Must be sorted
-			if keys[0] != "a" || keys[1] != "b" || keys[2] != "c" {
-				t.Errorf("keys = %v, want [a b c]", keys)
-			}
-		})
-	}
-}
-
-func TestKV_ListNoMatches(t *testing.T) {
-	for _, b := range backends() {
-		t.Run(b.name, func(t *testing.T) {
-			ctx := context.Background()
-
-			entries := []sm.Entry{
-				{Index: 1, Cmd: mustEncodePut([]byte("foo"), []byte("bar"))},
-			}
-			results := make([]sm.Result, 1)
-			if err := b.update(ctx, entries, results); err != nil {
-				t.Fatalf("Update = %v", err)
-			}
-
-			val, err := b.lookup(ctx, ListQuery{Prefix: "nonexistent/"})
-			if err != nil {
-				t.Fatalf("Lookup(ListQuery) = %v", err)
-			}
-			keys := val.([]string)
-			if keys == nil {
-				t.Fatal("keys should not be nil, want empty []string{}")
-			}
-			if len(keys) != 0 {
-				t.Errorf("len(keys) = %d, want 0", len(keys))
-			}
-		})
+				val, err := b.lookup(ctx, ListQuery{Prefix: tc.prefix})
+				if err != nil {
+					t.Fatalf("Lookup(ListQuery) = %v", err)
+				}
+				keys, ok := val.([]string)
+				if !ok {
+					t.Fatalf("Lookup returned %T, want []string", val)
+				}
+				if keys == nil {
+					t.Fatal("keys = nil, want non-nil []string")
+				}
+				if len(keys) != len(tc.want) {
+					t.Fatalf("keys = %v, want %v", keys, tc.want)
+				}
+				for i := range keys {
+					if keys[i] != tc.want[i] {
+						t.Errorf("keys = %v, want %v", keys, tc.want)
+						break
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -679,6 +637,7 @@ func TestErrors_Message(t *testing.T) {
 		{&KeyNotFoundError{Key: "missing"}, "kv: key not found: missing"},
 		{&InvalidCommandError{Reason: "bad data"}, "kv: invalid command: bad data"},
 		{&HashWriteError{Err: &InvalidCommandError{Reason: "test error"}}, "kv: hash write failed: kv: invalid command: test error"},
+		{&KeyTooLongError{Length: 70000}, "kv: key length 70000 exceeds maximum 65535"},
 	}
 	for _, tc := range cases {
 		if got := tc.err.Error(); got != tc.want {
@@ -838,29 +797,6 @@ func TestProtocol_Encode_KeyTooLong(t *testing.T) {
 		})
 	}
 }
-
-func TestKeyTooLongError_Message(t *testing.T) {
-	err := &KeyTooLongError{Length: 70000}
-	msg := err.Error()
-	if msg == "" {
-		t.Fatal("error message should not be empty")
-	}
-	// Verify it contains the length and the max.
-	if !bytes.Contains([]byte(msg), []byte("70000")) {
-		t.Errorf("error message should contain length 70000, got: %s", msg)
-	}
-	if !bytes.Contains([]byte(msg), []byte("65535")) {
-		t.Errorf("error message should contain max length 65535, got: %s", msg)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ConcurrentStore default case in Update switch
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// ConcurrentStore recover partial read errors
-// ---------------------------------------------------------------------------
 
 func TestKV_Overwrite(t *testing.T) {
 	for _, b := range backends() {

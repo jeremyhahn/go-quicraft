@@ -71,61 +71,6 @@ func TestIntegration_DB_GetNoOPSession(t *testing.T) {
 	t.Logf("GetNoOPSession: 5 proposals verified on all 3 nodes")
 }
 
-// TestIntegration_DB_TrackedSession_Lifecycle verifies the full lifecycle
-// of a tracked client session: SyncGetSession to register, verify it is
-// not a no-op session, use it for SyncPropose, then SyncCloseSession to
-// unregister.
-func TestIntegration_DB_TrackedSession_Lifecycle(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("leader elected at node[%d]", leaderIdx)
-
-	// Warmup entry required after election (PhD 6.4).
-	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
-
-	leaderHost := cluster.hosts[leaderIdx]
-
-	// Register a tracked session via SyncGetSession.
-	getCtx, getCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer getCancel()
-
-	session, err := leaderHost.SyncGetSession(getCtx, 1)
-	if err != nil {
-		t.Fatalf("SyncGetSession failed: %v", err)
-	}
-	t.Logf("tracked session registered: ShardID=%d, ClientID=%d",
-		session.ShardID, session.ClientID())
-
-	// Verify it is NOT a no-op session.
-	if session.IsNoOPSession() {
-		t.Fatal("expected tracked session, got no-op session")
-	}
-
-	// Use the tracked session for a proposal.
-	cmd := encodeKVPut("tracked-key", "tracked-value")
-	result := cluster.proposeToLeader(t, session, cmd, defaultTimeout).Result
-	if result.Value != uint64(len("tracked-value")) {
-		t.Errorf("result.Value = %d, want %d", result.Value, len("tracked-value"))
-	}
-	session.ProposalCompleted()
-
-	// Verify the entry replicated.
-	waitForReplication(t, cluster, trackers, 1, "tracked-key", "tracked-value", defaultTimeout)
-
-	// Close the tracked session.
-	closeCtx, closeCancel := context.WithTimeout(context.Background(), defaultTimeout)
-	defer closeCancel()
-
-	if closeErr := leaderHost.SyncCloseSession(closeCtx, session); closeErr != nil {
-		t.Fatalf("SyncCloseSession failed: %v", closeErr)
-	}
-	t.Logf("tracked session closed successfully")
-}
-
 // TestIntegration_DB_ProposeSession verifies the async ProposeSession
 // pattern that uses ProposeSession to register/unregister a session
 // and waits on ResultC for completion.

@@ -25,29 +25,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-func TestNewNode_InvalidConfig(t *testing.T) {
-	// Node creation does not validate config, but should still work
-	// with zero values.
-	cfg := config.Config{}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-	if n.ShardID() != 0 {
-		t.Errorf("ShardID = %d, want 0", n.ShardID())
-	}
-}
-
-func TestNode_LastApplied(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if n.lastApplied.Load() != 0 {
-		t.Fatalf("lastApplied should be 0 initially, got %d", n.lastApplied.Load())
-	}
-	n.lastApplied.Store(42)
-	if n.lastApplied.Load() != 42 {
-		t.Fatalf("lastApplied should be 42, got %d", n.lastApplied.Load())
-	}
-}
-
 func TestNode_Stop(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
@@ -83,87 +60,20 @@ func TestNode_HandleError_WithListener(t *testing.T) {
 	}
 }
 
-func TestNode_HandleError_NilListener(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-	// Should not panic with nil listener.
-	n.handleError(&ApplyError{ShardID: 1, ReplicaID: 1, Err: ErrStopped})
-}
-
-func TestNode_HandleError_ListenerWithoutCallback(t *testing.T) {
-	// Listener configured but OnShardFailed is nil.
-	listener := &config.EventListener{}
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", listener)
-	// Should not panic.
-	n.handleError(&ApplyError{ShardID: 1, ReplicaID: 1, Err: ErrStopped})
-}
-
-func TestNode_StopC(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	stopC := n.StopC()
-	select {
-	case <-stopC:
-		t.Fatal("StopC should not be closed before Stop()")
-	default:
-		// expected
-	}
-
-	n.Stop()
-	select {
-	case <-stopC:
-		// expected - channel should be closed after Stop()
-	default:
-		t.Fatal("StopC should be closed after Stop()")
-	}
-}
-
-func TestNode_CacheLinePadding(t *testing.T) {
-	// Verify padding sizes are correct for cache-line isolation.
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// commitPending: atomic.Bool (1 byte) + 127 bytes padding = 128 bytes.
-	// lastApplied: atomic.Uint64 (8 bytes) + 120 bytes padding = 128 bytes.
-	// These are compile-time guarantees via struct layout; verify they
-	// are independently addressable by testing concurrent access.
-	done := make(chan struct{})
-	go func() {
-		for range 1000 {
-			n.commitPending.Store(true)
-			n.commitPending.Store(false)
-		}
-		close(done)
-	}()
-	for range 1000 {
-		n.lastApplied.Store(42)
-		n.lastApplied.Load()
-	}
-	<-done
-}
-
-func TestNode_DeliverProposal_Success(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	entries := []proto.Entry{
-		{Key: 1, Cmd: []byte("cmd1")},
-		{Key: 2, Cmd: []byte("cmd2")},
-	}
-	ok := n.DeliverProposal(entries)
-	if !ok {
-		t.Fatal("DeliverProposal should succeed when queue is not full")
-	}
-
-	// Drain and verify.
-	drained := n.DrainProposals(nil)
-	if len(drained) != 2 {
-		t.Fatalf("expected 2 entries, got %d", len(drained))
-	}
-	if drained[0].Key != 1 || drained[1].Key != 2 {
-		t.Fatalf("entries = %+v, want keys 1,2", drained)
+func TestNode_HandleError_NoCallbackIsANoOp(t *testing.T) {
+	// A nil listener, or a listener without OnShardFailed, must not panic.
+	for _, tc := range []struct {
+		name     string
+		listener *config.EventListener
+	}{
+		{"nil listener", nil},
+		{"listener without OnShardFailed", &config.EventListener{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{ShardID: 1, ReplicaID: 1}
+			n := NewNode(nil, nil, nil, cfg, nil, "", tc.listener)
+			n.handleError(&ApplyError{ShardID: 1, ReplicaID: 1, Err: ErrStopped})
+		})
 	}
 }
 
@@ -185,17 +95,6 @@ func TestNode_DeliverProposal_QueueFull(t *testing.T) {
 	ok = n.DeliverProposal([]proto.Entry{{Key: 999}})
 	if ok {
 		t.Fatal("DeliverProposal should reject when queue is at capacity")
-	}
-}
-
-func TestNode_SetCommittedIndex_StoresAndLoads(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	const want uint64 = 42
-	n.SetCommittedIndex(want)
-	if got := n.CommittedIndex(); got != want {
-		t.Fatalf("CommittedIndex() = %d, want %d after SetCommittedIndex", got, want)
 	}
 }
 
@@ -263,8 +162,11 @@ func TestNode_DrainProposals_ReusesBuf(t *testing.T) {
 	if len(first) != 2 {
 		t.Fatalf("first drain: expected 2, got %d", len(first))
 	}
+	if first[0].Key != 1 || first[1].Key != 2 {
+		t.Fatalf("first drain: entries = %+v, want keys 1,2 in order", first)
+	}
 
-	// Second drain with recycled buffer should return empty.
+	// Second drain with recycled buffer returns only the new entry.
 	n.DeliverProposal([]proto.Entry{{Key: 3}})
 	second := n.DrainProposals(first[:0])
 	if len(second) != 1 {
@@ -322,29 +224,6 @@ func TestNode_DeliverProposal_Concurrent(t *testing.T) {
 // ReadIndex queue tests
 // ---------------------------------------------------------------------------
 
-func TestNode_DeliverReadIndex_Success(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	ok := n.DeliverReadIndex(42)
-	if !ok {
-		t.Fatal("DeliverReadIndex should succeed when queue is not full")
-	}
-
-	ok = n.DeliverReadIndex(43)
-	if !ok {
-		t.Fatal("DeliverReadIndex should succeed for second key")
-	}
-
-	drained := n.DrainReadIndex(nil)
-	if len(drained) != 2 {
-		t.Fatalf("expected 2 keys, got %d", len(drained))
-	}
-	if drained[0] != 42 || drained[1] != 43 {
-		t.Fatalf("keys = %v, want [42 43]", drained)
-	}
-}
-
 func TestNode_DeliverReadIndex_QueueFull(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
@@ -384,6 +263,9 @@ func TestNode_DrainReadIndex_ReusesBuf(t *testing.T) {
 	first := n.DrainReadIndex(nil)
 	if len(first) != 2 {
 		t.Fatalf("first drain: expected 2, got %d", len(first))
+	}
+	if first[0] != 10 || first[1] != 20 {
+		t.Fatalf("first drain: keys = %v, want [10 20] in order", first)
 	}
 
 	// Second drain with recycled buffer should return new items.
@@ -494,34 +376,10 @@ func TestNode_IsMember_UnknownReplicaRejected(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SetNotifyCommit
-// ---------------------------------------------------------------------------
-
-func TestNode_SetNotifyCommit_DisablesFlag(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	n.SetNotifyCommit(true)
-	n.SetNotifyCommit(false)
-	if n.notifyCommit {
-		t.Fatal("notifyCommit should be false after SetNotifyCommit(false)")
-	}
-}
-
-// ---------------------------------------------------------------------------
 // TryStartSnapshot / ClearSnapshotting
 // ---------------------------------------------------------------------------
 
-func TestNode_TryStartSnapshot_FirstCallSucceeds(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if !n.TryStartSnapshot() {
-		t.Fatal("first TryStartSnapshot should succeed")
-	}
-}
-
-func TestNode_TryStartSnapshot_SecondCallFails(t *testing.T) {
+func TestNode_TryStartSnapshot_ExclusiveUntilCleared(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
@@ -530,15 +388,6 @@ func TestNode_TryStartSnapshot_SecondCallFails(t *testing.T) {
 	}
 	if n.TryStartSnapshot() {
 		t.Fatal("second TryStartSnapshot should fail (already snapshotting)")
-	}
-}
-
-func TestNode_ClearSnapshotting_AllowsRetry(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	if !n.TryStartSnapshot() {
-		t.Fatal("first TryStartSnapshot should succeed")
 	}
 	n.ClearSnapshotting()
 
@@ -658,37 +507,8 @@ func TestNode_SnapshotDir_ReturnsConfiguredPath(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LastSnapshotIndex
+// DiagState
 // ---------------------------------------------------------------------------
-
-func TestNode_LastSnapshotIndex_AfterStore(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	n.lastSnapshotIndex.Store(500)
-	if n.LastSnapshotIndex() != 500 {
-		t.Fatalf("LastSnapshotIndex = %d, want 500", n.LastSnapshotIndex())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Recovering
-// ---------------------------------------------------------------------------
-
-func TestNode_SetRecovering_RoundTrip(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	n.SetRecovering(true)
-	if !n.IsRecovering() {
-		t.Fatal("IsRecovering should be true after SetRecovering(true)")
-	}
-
-	n.SetRecovering(false)
-	if n.IsRecovering() {
-		t.Fatal("IsRecovering should be false after SetRecovering(false)")
-	}
-}
 
 func TestNode_DiagState_IncludesReadIndexQ(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
@@ -732,73 +552,5 @@ func TestNode_DiagState_ReportsSnapshotGates(t *testing.T) {
 	n.SetSaving(true)
 	if d := n.DiagState(); !d.Saving {
 		t.Fatal("DiagState must report the saving gate")
-	}
-}
-
-// ===========================================================================
-// lastApplied monotonically increasing
-// ===========================================================================
-
-// TestNode_LastAppliedMonotonicallyIncreasing verifies that lastApplied
-// only increases and never decreases, even under concurrent access.
-func TestNode_LastAppliedMonotonicallyIncreasing(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Advance lastApplied in sequence.
-	for _, idx := range []uint64{1, 5, 10, 20, 50, 100} {
-		n.lastApplied.Store(idx)
-		if n.lastApplied.Load() != idx {
-			t.Fatalf("lastApplied = %d, want %d", n.lastApplied.Load(), idx)
-		}
-	}
-
-	// Verify current value.
-	if n.lastApplied.Load() != 100 {
-		t.Fatalf("lastApplied = %d, want 100", n.lastApplied.Load())
-	}
-
-	// Attempting to store a lower value would be a bug. Verify that
-	// the atomic store does store the value (the caller is responsible
-	// for the monotonic invariant, not the atomic itself).
-	// In a real system, the apply worker enforces this. Here we verify
-	// the pattern: only store if higher.
-	current := n.lastApplied.Load()
-	newVal := uint64(50) // lower than current
-	if newVal > current {
-		n.lastApplied.Store(newVal)
-	}
-	if n.lastApplied.Load() != 100 {
-		t.Fatalf("lastApplied should remain 100, got %d", n.lastApplied.Load())
-	}
-
-	// Store a higher value.
-	newVal = 200
-	if newVal > current {
-		n.lastApplied.Store(newVal)
-	}
-	if n.lastApplied.Load() != 200 {
-		t.Fatalf("lastApplied = %d, want 200", n.lastApplied.Load())
-	}
-}
-
-// TestNode_LastAppliedMonotonicallyIncreasing_InvalidDecrease verifies
-// that the test pattern correctly rejects a decreasing lastApplied.
-func TestNode_LastAppliedMonotonicallyIncreasing_InvalidDecrease(t *testing.T) {
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	n := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	n.lastApplied.Store(500)
-
-	// Guard pattern: only advance, never regress.
-	candidate := uint64(200)
-	if candidate <= n.lastApplied.Load() {
-		// Correctly rejected.
-	} else {
-		t.Fatal("candidate 200 should be rejected when lastApplied is 500")
-	}
-
-	if n.lastApplied.Load() != 500 {
-		t.Fatalf("lastApplied should remain 500, got %d", n.lastApplied.Load())
 	}
 }

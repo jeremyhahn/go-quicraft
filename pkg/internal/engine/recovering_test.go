@@ -15,6 +15,8 @@
 package engine
 
 import (
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,98 +25,40 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestRecovering_BlocksEntryApplication verifies that when the
-// recovering flag is set on a node, the apply worker skips entry
-// application and does not advance lastApplied. This prevents
-// concurrent state machine access between the snapshot recovery
-// goroutine and the apply pipeline.
-func TestRecovering_BlocksEntryApplication(t *testing.T) {
-	applyC := make(chan *applyItem, 64)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	ws := NewWorkSignal(1)
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, ws, stopC, nil)
-
-	goodSM := newTestSM()
-	rsmSM := newTestApplier(goodSM)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, rsmSM, nil, cfg, nil, "", nil)
-
-	// Set recovering BEFORE sending the apply item. This simulates
-	// snapshot recovery starting before entries arrive.
-	node.SetRecovering(true)
-
-	// Start the apply worker.
-	go aw.run()
-
-	// Send an item with committed entries while recovering. The apply
-	// worker must hold the batch until the gate clears — never touch the
-	// state machine, and never discard the batch (raft's processed marker
-	// has already advanced past it, so it would not be re-delivered).
-	node.commitPending.Store(true)
-	item := applyPool.Get().(*applyItem)
-	item.update = proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Index: 5, Term: 1, Cmd: []byte("a")},
-			{Index: 6, Term: 1, Cmd: []byte("b")},
-		},
+// applyBatchParked reports whether a shard apply goroutine is asleep in the
+// recovery gate's wait loop, the only time.Sleep in runShardApply. The
+// dispatcher spawns that goroutine, so all goroutines are scanned.
+func applyBatchParked() bool {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
 	}
-	item.node = node
-	applyC <- item
-
-	// While recovering, the batch stays parked: the SM is untouched and
-	// commitPending remains set.
-	// Kept: a parked batch exposes no signal, so the test observes a fixed window for the absence of an apply.
-	time.Sleep(20 * time.Millisecond)
-	if goodSM.applyCount.Load() != 0 {
-		t.Fatalf("expected 0 SM.Apply calls during recovery, got %d", goodSM.applyCount.Load())
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		// Line 1 is the innermost frame, line 3 its caller.
+		lines := strings.Split(g, "\n")
+		if len(lines) > 3 && strings.HasPrefix(lines[1], "time.Sleep(") &&
+			strings.Contains(lines[3], "runShardApply") {
+			return true
+		}
 	}
-	if got := node.lastApplied.Load(); got != 0 {
-		t.Fatalf("expected lastApplied to remain 0 during recovery, got %d", got)
-	}
-	if !node.commitPending.Load() {
-		t.Fatal("expected commitPending to stay set while the batch waits on the recovery gate")
-	}
-
-	// Complete the recovery: the recovered snapshot covers both queued
-	// entries, so the parked batch resumes, filters them as
-	// snapshot-covered, and releases the pipeline without applying.
-	node.lastApplied.Store(6)
-	node.SetRecovering(false)
-
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for commitPending to clear after recovery completed", func() bool {
-		return !node.commitPending.Load()
-	})
-
-	// Entries covered by the recovered snapshot must not reach the SM.
-	if goodSM.applyCount.Load() != 0 {
-		t.Fatalf("expected 0 SM.Apply calls for snapshot-covered entries, got %d", goodSM.applyCount.Load())
-	}
-
-	// OnApplied callback should NOT have been called.
-	if cb.appliedCount.Load() != 0 {
-		t.Fatalf("expected 0 OnApplied calls for snapshot-covered entries, got %d", cb.appliedCount.Load())
-	}
-
-	close(stopC)
+	return false
 }
 
-// TestRecovering_ClearedAfterRecoveryCompletes verifies that the
-// recovering flag is set before recovery starts and cleared after
-// recovery completes (both on success and error paths).
+// TestRecovering_ClearedAfterRecoveryCompletes verifies that a recovery
+// request through the snapshot pool clears the recovering and snapshotting
+// flags when it completes, wakes the owning step worker through the work
+// signal, and fires the completion callback.
 func TestRecovering_ClearedAfterRecoveryCompletes(t *testing.T) {
 	stopC := make(chan struct{})
 	ws := NewWorkSignal(1)
+	cb := newTestCallback()
 
-	// Create a snapshot pool with a real work signal to verify
-	// notification after recovery.
-	p := newSnapshotPool(1, nil, nil, nil, ws, stopC, nil)
+	p := newSnapshotPool(1, nil, nil, cb, ws, stopC, nil)
 
 	var wg sync.WaitGroup
 	p.start(&wg)
@@ -127,7 +71,6 @@ func TestRecovering_ClearedAfterRecoveryCompletes(t *testing.T) {
 	// flag lifecycle is still exercised.
 	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
 
-	// Verify initial state.
 	if node.IsRecovering() {
 		t.Fatal("node should not be recovering initially")
 	}
@@ -143,25 +86,29 @@ func TestRecovering_ClearedAfterRecoveryCompletes(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	// Wait for the pool worker to process the request by reading
-	// from completedC. This is the only reliable synchronization
-	// point because it is written AFTER the worker clears both
-	// the recovering and snapshotting flags. Polling the flags
-	// directly has a race: the loop can exit before the worker
-	// picks up the request (both flags are initially false), and
-	// then the worker sets recovering=true, causing the assertion
-	// at line 151 to fail.
+	// completedC is written AFTER the worker clears the recovering and
+	// snapshotting flags and notifies the work signal. Polling the flags
+	// directly would race: both are false before the worker picks the
+	// request up.
 	awaitSnapshotResult(t, p, "recovery")
 
-	// Verify the flag was cleared.
 	if node.IsRecovering() {
 		t.Fatal("recovering flag should be cleared after recovery completes")
 	}
-
-	// Verify the snapshotting flag was also cleared.
 	if node.snapshotting.Load() {
 		t.Fatal("snapshotting flag should be cleared after recovery completes")
 	}
+
+	// The step worker that owns shard 1 (1 % 1 = worker 0) is woken at
+	// once to re-process the node instead of waiting for the next tick.
+	if !ws.HasWork(0) {
+		t.Fatal("expected work signal to be notified after recovery")
+	}
+
+	// The completion callback fires after the result is published.
+	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for snapshot completion callback", func() bool {
+		return cb.snapshotCallCount.Load() != 0
+	})
 
 	close(stopC)
 	wg.Wait()
@@ -206,9 +153,12 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	item1.node = node
 	applyC <- item1
 
-	// The batch stays parked while recovery is in progress.
-	// Kept: a parked batch exposes no signal, so the test observes a fixed window for the absence of an apply.
-	time.Sleep(20 * time.Millisecond)
+	// The batch stays parked while recovery is in progress: wait until a
+	// shard apply goroutine sleeps in the recovery gate's wait loop.
+	waitFor(t, 5*time.Second, time.Millisecond, "batch never parked on the recovery gate", applyBatchParked)
+	if !node.commitPending.Load() {
+		t.Fatal("expected commitPending to stay set while the batch waits on the recovery gate")
+	}
 	if node.lastApplied.Load() != 0 {
 		t.Fatalf("expected lastApplied=0 during recovery, got %d", node.lastApplied.Load())
 	}
@@ -384,106 +334,13 @@ func TestRecovering_FlagOnlySetsForRecoveryNotSave(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	// Wait for completion.
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for snapshot save to complete", func() bool {
-		return !node.snapshotting.Load()
-	})
+	// Wait for the worker to finish the request. Polling snapshotting would
+	// pass before the worker picked the request up: it starts false.
+	awaitSnapshotResult(t, p, "save")
 
 	// The recovering flag should NEVER have been set for a save request.
 	if node.IsRecovering() {
 		t.Fatal("recovering flag should not be set for snapshot save requests")
-	}
-
-	close(stopC)
-	wg.Wait()
-}
-
-// TestRecovering_SnapshotPoolSetsRecoveringBeforeExecution verifies
-// that the snapshot pool worker sets the recovering flag BEFORE calling
-// handleSnapshot for recovery requests. This ensures the flag is set
-// before any state machine mutation begins.
-func TestRecovering_SnapshotPoolSetsRecoveringBeforeExecution(t *testing.T) {
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-	cb := newTestCallback()
-
-	p := newSnapshotPool(1, nil, nil, cb, ws, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-
-	// Use a node without a snapshotter (recovery is a no-op).
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Submit recovery.
-	err := p.requestSnapshot(snapshotRequest{
-		shardID:   1,
-		replicaID: 1,
-		node:      node,
-		save:      false,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	// Wait for completion via the snapshot callback.
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for snapshot completion callback", func() bool {
-		return cb.snapshotCallCount.Load() != 0
-	})
-
-	// After completion, both flags should be cleared.
-	if node.IsRecovering() {
-		t.Fatal("recovering should be cleared after recovery completes")
-	}
-	if node.snapshotting.Load() {
-		t.Fatal("snapshotting should be cleared after recovery completes")
-	}
-
-	close(stopC)
-	wg.Wait()
-}
-
-// TestRecovering_WorkSignalNotifiedAfterRecovery verifies that the
-// snapshot pool notifies the work signal after recovery completes,
-// ensuring the step worker wakes up immediately to re-process the
-// node instead of waiting for the next tick.
-func TestRecovering_WorkSignalNotifiedAfterRecovery(t *testing.T) {
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-
-	p := newSnapshotPool(1, nil, nil, nil, ws, stopC, nil)
-
-	var wg sync.WaitGroup
-	p.start(&wg)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-
-	// Submit recovery.
-	err := p.requestSnapshot(snapshotRequest{
-		shardID:   1,
-		replicaID: 1,
-		node:      node,
-		save:      false,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	// Wait for recovery to complete by reading from completedC.
-	// This is the most reliable synchronization point because
-	// completedC is written AFTER the Notify call in the worker.
-	awaitSnapshotResult(t, p, "recovery")
-
-	// The work signal should have been notified. Check by seeing
-	// if the signal has work pending for the worker that owns
-	// shard 1 (workerID = shardID % numWorkers = 1 % 1 = 0).
-	if !ws.HasWork(0) {
-		t.Fatal("expected work signal to be notified after recovery")
 	}
 
 	close(stopC)

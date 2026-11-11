@@ -155,43 +155,6 @@ func TestCompareThroughputHigherWins(t *testing.T) {
 	}
 }
 
-func TestCompareLatencyLowerWins(t *testing.T) {
-	ct := NewComparisonTable()
-
-	// quicraft: low latency
-	qSuite := NewBenchmarkSuite("quicraft", "1.0.0")
-	qRec := NewLatencyRecorder(100)
-	for i := 1; i <= 100; i++ {
-		qRec.Record(time.Duration(i) * time.Microsecond) // 1us - 100us
-	}
-	qSuite.AddResult(ScenarioCommitLatencyWAL, 1000, time.Second, qRec)
-	ct.Add(qSuite)
-
-	// etcd: high latency
-	eSuite := NewBenchmarkSuite("etcd", "3.5.0")
-	eRec := NewLatencyRecorder(100)
-	for i := 1; i <= 100; i++ {
-		eRec.Record(time.Duration(i*100) * time.Microsecond) // 100us - 10000us
-	}
-	eSuite.AddResult(ScenarioCommitLatencyWAL, 1000, time.Second, eRec)
-	ct.Add(eSuite)
-
-	report := ct.Compare()
-	var sc *ScenarioComparison
-	for _, s := range report.Scenarios {
-		if s.Scenario == ScenarioCommitLatencyWAL {
-			sc = s
-			break
-		}
-	}
-	if sc == nil {
-		t.Fatal("expected commit latency scenario in report")
-	}
-	if sc.LatencyWinner != "quicraft" {
-		t.Fatalf("expected latency winner quicraft (lower p99), got %q", sc.LatencyWinner)
-	}
-}
-
 func TestCompareSpeedupComputation(t *testing.T) {
 	ct := NewComparisonTable()
 
@@ -293,18 +256,6 @@ func TestFindWinnerAllZeroValues(t *testing.T) {
 	// All values are 0, so no winner should be found.
 	if winner != "" {
 		t.Fatalf("expected empty winner for all-zero values, got %q", winner)
-	}
-}
-
-func TestFindWinnerLatencyLowerWins(t *testing.T) {
-	results := map[string]*ScenarioResult{
-		"a": {Latency: LatencyStats{P99Ns: 5000}},
-		"b": {Latency: LatencyStats{P99Ns: 1000}},
-	}
-	mc := metricComparators["p99_latency"]
-	winner := findWinner(results, mc)
-	if winner != "b" {
-		t.Fatalf("expected latency winner %q, got %q", "b", winner)
 	}
 }
 

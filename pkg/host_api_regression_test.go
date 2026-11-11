@@ -629,31 +629,3 @@ func TestNewClientID_FailsOnADegenerateEntropySource(t *testing.T) {
 			src.n, clientIDRerollLimit)
 	}
 }
-
-// TestGetNewSession_MintsAUsableSession is the end-to-end companion: the
-// session NewSession hands back must actually be session-managed, so a
-// proposal made with it is deduplicated rather than silently unsessioned.
-func TestGetNewSession_MintsAUsableSession(t *testing.T) {
-	h := newTestHost(t)
-	members := map[uint64]string{1: "127.0.0.1:5000"}
-	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
-		t.Fatalf("StartShard failed: %v", err)
-	}
-	waitForLeader(t, h, 1)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	session, err := h.NewSession(ctx, 1)
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
-	}
-	if session.ClientID() == proto.NotSessionManagedClientID {
-		t.Fatal("NewSession reported SUCCESS for a session carrying the " +
-			"reserved no-session client ID: every proposal made with it is " +
-			"unsessioned, so at-most-once delivery is off for this client")
-	}
-	if session.IsNoOPSession() {
-		t.Fatal("NewSession returned a no-op session")
-	}
-}

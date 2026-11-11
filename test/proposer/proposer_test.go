@@ -66,38 +66,35 @@ func scripted(attempts *int, value string, errs ...error) func(*quicraft.Host, t
 // TestDrive_ReResolvesBeforeEveryAttempt is the mutation guard for the class
 // this package exists to end. Hoisting the resolve out of the loop makes the
 // second attempt go to the first attempt's replica; this test sees that as a
-// resolver asked once for two attempts.
+// resolver asked once for two attempts. The post-delivery row is the form a
+// pending read or proposal sees when the leader loses the shard underneath it,
+// wrapped in MaybeAppliedError, and must still be retried.
 func TestDrive_ReResolvesBeforeEveryAttempt(t *testing.T) {
-	var resolves, attempts int
-	got, err := drive(countingResolver(&resolves), 1, time.Second, IsNotLeaderRejection,
-		scripted(&attempts, "ok", preflightNotLeader()))
-	if err != nil {
-		t.Fatalf("drive returned %v, want success after one not-leader rejection", err)
-	}
-	if got != "ok" {
-		t.Fatalf("drive returned %q, want %q", got, "ok")
-	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want 2 (one refusal, one success)", attempts)
-	}
-	if resolves != attempts {
-		t.Fatalf("resolver asked %d time(s) for %d attempt(s): the leader must be "+
-			"resolved before EVERY attempt, not once before the loop", resolves, attempts)
-	}
-}
-
-// TestDrive_PostDeliveryNotLeaderIsRetried covers the form a pending read or
-// proposal sees when the leader loses the shard underneath it, which is wrapped in MaybeAppliedError and
-// must still be recognised as the not-leader rejection.
-func TestDrive_PostDeliveryNotLeaderIsRetried(t *testing.T) {
-	var resolves, attempts int
-	_, err := drive(countingResolver(&resolves), 1, time.Second, IsNotLeaderRejection,
-		scripted(&attempts, "ok", postDeliveryNotLeader()))
-	if err != nil {
-		t.Fatalf("drive returned %v, want success after a post-delivery not-leader", err)
-	}
-	if attempts != 2 || resolves != 2 {
-		t.Fatalf("attempts = %d, resolves = %d, want 2 and 2", attempts, resolves)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"pre-flight", preflightNotLeader()},
+		{"post-delivery", postDeliveryNotLeader()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resolves, attempts int
+			got, err := drive(countingResolver(&resolves), 1, time.Second, IsNotLeaderRejection,
+				scripted(&attempts, "ok", tc.err))
+			if err != nil {
+				t.Fatalf("drive returned %v, want success after one not-leader rejection", err)
+			}
+			if got != "ok" {
+				t.Fatalf("drive returned %q, want %q", got, "ok")
+			}
+			if attempts != 2 {
+				t.Fatalf("attempts = %d, want 2 (one refusal, one success)", attempts)
+			}
+			if resolves != attempts {
+				t.Fatalf("resolver asked %d time(s) for %d attempt(s): the leader must be "+
+					"resolved before EVERY attempt, not once before the loop", resolves, attempts)
+			}
+		})
 	}
 }
 
@@ -198,13 +195,10 @@ func TestIsNotLeaderRejection(t *testing.T) {
 // leader rejects ReadIndex with ErrReadIndexNotReady until it commits its
 // term's no-op, and that error is Temporary but is NOT a not-leader rejection.
 // A TryReadWith wired to IsNotLeaderRejection instead of the caller's predicate
-// would fail on the first such refusal.
+// would fail on the first such refusal; that IsNotLeaderRejection does not
+// retry it is TestDrive_RetriesOnlyTheNotLeaderRejection/read_index_not_ready.
 func TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes(t *testing.T) {
 	notReady := quicraft.ErrReadIndexNotReady
-	if IsNotLeaderRejection(notReady) {
-		t.Fatal("ErrReadIndexNotReady is a not-leader rejection, so this test " +
-			"cannot tell the two policies apart any more")
-	}
 	if !quicraft.Temporary(notReady) {
 		t.Fatal("ErrReadIndexNotReady is not Temporary, so the pinned policy " +
 			"would not retry it and syncReadExact's wait is unfounded")
@@ -218,15 +212,6 @@ func TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes(t *testing.T) {
 	}
 	if got != "value" || attempts != 3 {
 		t.Fatalf("got %q after %d attempt(s), want \"value\" after 3", got, attempts)
-	}
-
-	// The proposal policy is the control: it must NOT retry this, or the
-	// pinned read would pass with the wrong predicate wired in.
-	attempts = 0
-	if _, err := drive(Pinned(host), 1, time.Second, IsNotLeaderRejection,
-		scripted(&attempts, "value", notReady)); err == nil {
-		t.Fatal("IsNotLeaderRejection retried ErrReadIndexNotReady; the pinned " +
-			"and proposal policies must differ on exactly this")
 	}
 }
 

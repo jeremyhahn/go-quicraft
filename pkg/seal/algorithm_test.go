@@ -37,105 +37,28 @@ func randKey(t *testing.T, size int) []byte {
 	return key
 }
 
-// ----- TestSymmetricAlgorithm_KeySize ----------------------------------------
+// ----- TestSymmetricAlgorithm_Accessors -------------------------------------
 
-func TestSymmetricAlgorithm_KeySize(t *testing.T) {
-	t.Run("known algorithms return correct key size", func(t *testing.T) {
-		for _, tc := range knownAlgorithms {
-			t.Run(tc.name, func(t *testing.T) {
-				got := tc.alg.KeySize()
-				if got != tc.keySize {
-					t.Fatalf("KeySize() = %d, want %d", got, tc.keySize)
-				}
-			})
-		}
-	})
-
-	t.Run("unknown algorithm returns 0", func(t *testing.T) {
-		if got := unknownAlg.KeySize(); got != 0 {
-			t.Fatalf("KeySize() = %d, want 0 for unknown algorithm", got)
-		}
-	})
-}
-
-// ----- TestSymmetricAlgorithm_NonceSize --------------------------------------
-
-func TestSymmetricAlgorithm_NonceSize(t *testing.T) {
-	t.Run("known algorithms return correct nonce size", func(t *testing.T) {
-		for _, tc := range knownAlgorithms {
-			t.Run(tc.name, func(t *testing.T) {
-				got := tc.alg.NonceSize()
-				if got != tc.nonceSize {
-					t.Fatalf("NonceSize() = %d, want %d", got, tc.nonceSize)
-				}
-			})
-		}
-	})
-
-	t.Run("unknown algorithm returns 0", func(t *testing.T) {
-		if got := unknownAlg.NonceSize(); got != 0 {
-			t.Fatalf("NonceSize() = %d, want 0 for unknown algorithm", got)
-		}
-	})
-}
-
-// ----- TestSymmetricAlgorithm_String -----------------------------------------
-
-func TestSymmetricAlgorithm_String(t *testing.T) {
-	t.Run("known algorithms return readable names", func(t *testing.T) {
-		for _, tc := range knownAlgorithms {
-			t.Run(tc.name, func(t *testing.T) {
-				got := tc.alg.String()
-				if got != tc.name {
-					t.Fatalf("String() = %q, want %q", got, tc.name)
-				}
-			})
-		}
-	})
-
-	t.Run("unknown algorithm returns formatted unknown string", func(t *testing.T) {
-		want := fmt.Sprintf("unknown(0x%02x)", byte(unknownAlg))
-		got := unknownAlg.String()
-		if got != want {
-			t.Fatalf("String() = %q, want %q", got, want)
-		}
-	})
-
-	t.Run("zero value algorithm returns formatted unknown string", func(t *testing.T) {
-		var zero SymmetricAlgorithm
-		want := fmt.Sprintf("unknown(0x%02x)", byte(zero))
-		got := zero.String()
-		if got != want {
-			t.Fatalf("String() = %q, want %q", got, want)
-		}
-	})
-}
-
-// ----- TestSymmetricAlgorithm_Valid ------------------------------------------
-
-func TestSymmetricAlgorithm_Valid(t *testing.T) {
-	t.Run("known algorithms return true", func(t *testing.T) {
-		for _, tc := range knownAlgorithms {
-			t.Run(tc.name, func(t *testing.T) {
-				if !tc.alg.Valid() {
-					t.Fatalf("Valid() = false for known algorithm %s", tc.name)
-				}
-			})
-		}
-	})
-
-	t.Run("unknown algorithm returns false", func(t *testing.T) {
-		if unknownAlg.Valid() {
-			t.Fatal("Valid() = true for unknown algorithm, want false")
-		}
-	})
-
-	t.Run("zero value algorithm returns false", func(t *testing.T) {
-		var zero SymmetricAlgorithm
-		if zero.Valid() {
-			t.Fatal("Valid() = true for zero-value algorithm, want false")
-		}
-	})
+// TestSymmetricAlgorithm_Accessors checks every registry-backed accessor of each
+// registered algorithm. The unregistered side of the same accessors is asserted
+// by TestUnregisteredAlgorithmsAreRefused.
+func TestSymmetricAlgorithm_Accessors(t *testing.T) {
+	for _, tc := range knownAlgorithms {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.alg.Valid() {
+				t.Fatalf("Valid() = false for known algorithm %s", tc.name)
+			}
+			if got := tc.alg.KeySize(); got != tc.keySize {
+				t.Fatalf("KeySize() = %d, want %d", got, tc.keySize)
+			}
+			if got := tc.alg.NonceSize(); got != tc.nonceSize {
+				t.Fatalf("NonceSize() = %d, want %d", got, tc.nonceSize)
+			}
+			if got := tc.alg.String(); got != tc.name {
+				t.Fatalf("String() = %q, want %q", got, tc.name)
+			}
+		})
+	}
 }
 
 // ----- TestNewAEADForAlgorithm -----------------------------------------------
@@ -207,13 +130,15 @@ func TestNewAEADForAlgorithm_InvalidKeySize(t *testing.T) {
 // build tag mean something. In a FIPS build the ChaCha20 family is defined as a
 // wire identifier but has no entry in algorithmRegistry, because
 // algorithm_chacha.go is not compiled; every accessor must therefore treat it
-// exactly as it treats an identifier nobody has ever defined, and
-// newAEADForAlgorithm must refuse rather than construct.
+// exactly as it treats an identifier nobody has ever defined (unknownAlg) and
+// the zero value, and newAEADForAlgorithm must refuse rather than construct.
 //
-// In a non-FIPS build unregisteredAlgorithms is empty and this test is a no-op,
-// which is the correct reading: nothing is excluded there.
+// In a non-FIPS build unregisteredAlgorithms is empty, so only unknownAlg and
+// the zero value run: nothing is excluded there.
 func TestUnregisteredAlgorithmsAreRefused(t *testing.T) {
-	for _, alg := range unregisteredAlgorithms {
+	var zero SymmetricAlgorithm
+	cases := append(append([]SymmetricAlgorithm{}, unregisteredAlgorithms...), unknownAlg, zero)
+	for _, alg := range cases {
 		t.Run(fmt.Sprintf("%#x", byte(alg)), func(t *testing.T) {
 			if alg.Valid() {
 				t.Fatal("Valid() = true for an algorithm this build does not register")
@@ -227,6 +152,9 @@ func TestUnregisteredAlgorithmsAreRefused(t *testing.T) {
 			if got := alg.MaxPlaintextSize(); got != 0 {
 				t.Fatalf("MaxPlaintextSize() = %d, want 0", got)
 			}
+			if want := fmt.Sprintf("unknown(0x%02x)", byte(alg)); alg.String() != want {
+				t.Fatalf("String() = %q, want %q", alg.String(), want)
+			}
 			// 32 bytes is the correct key length for both excluded algorithms,
 			// so a registry that still held them would succeed here.
 			if _, err := newAEADForAlgorithm(alg, make([]byte, 32)); !errors.Is(err, ErrUnsupportedAlgorithm) {
@@ -234,31 +162,6 @@ func TestUnregisteredAlgorithmsAreRefused(t *testing.T) {
 			}
 		})
 	}
-}
-
-// ----- TestNewAEADForAlgorithm_UnsupportedAlgorithm --------------------------
-
-func TestNewAEADForAlgorithm_UnsupportedAlgorithm(t *testing.T) {
-	t.Run("unknown algorithm returns ErrUnsupportedAlgorithm", func(t *testing.T) {
-		_, err := newAEADForAlgorithm(unknownAlg, make([]byte, 32))
-		if err == nil {
-			t.Fatal("newAEADForAlgorithm() expected error for unknown algorithm, got nil")
-		}
-		if !errors.Is(err, ErrUnsupportedAlgorithm) {
-			t.Fatalf("errors.Is(err, ErrUnsupportedAlgorithm) = false, got: %v", err)
-		}
-	})
-
-	t.Run("zero algorithm returns ErrUnsupportedAlgorithm", func(t *testing.T) {
-		var zero SymmetricAlgorithm
-		_, err := newAEADForAlgorithm(zero, make([]byte, 32))
-		if err == nil {
-			t.Fatal("newAEADForAlgorithm() expected error for zero algorithm, got nil")
-		}
-		if !errors.Is(err, ErrUnsupportedAlgorithm) {
-			t.Fatalf("errors.Is(err, ErrUnsupportedAlgorithm) = false, got: %v", err)
-		}
-	})
 }
 
 // ----- TestHasAESNI ----------------------------------------------------------
@@ -282,96 +185,29 @@ func TestSelectOptimalAlgorithm(t *testing.T) {
 	})
 }
 
-// ----- TestNewAESGCM_AllKeySizes ---------------------------------------------
+// ----- TestNewAESGCM_InvalidKeyWrapsCipherError ------------------------------
 
-func TestNewAESGCM_AllKeySizes(t *testing.T) {
-	tests := []struct {
-		keySize int
-		label   string
-	}{
-		{16, "AES-128"},
-		{24, "AES-192"},
-		{32, "AES-256"},
+// TestNewAESGCM_InvalidKeyWrapsCipherError covers the cipher-construction
+// error path that newAEADForAlgorithm's exact-length check never reaches. The
+// valid AES-128/192/256 nonce and overhead shape is asserted per algorithm by
+// TestNewAEADForAlgorithm.
+func TestNewAESGCM_InvalidKeyWrapsCipherError(t *testing.T) {
+	_, err := newAESGCM(make([]byte, 7)) // AES requires 16, 24, or 32 bytes
+	if err == nil {
+		t.Fatal("newAESGCM() expected error for invalid key, got nil")
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.label, func(t *testing.T) {
-			key := randKey(t, tc.keySize)
-
-			aead, err := newAESGCM(key)
-			if err != nil {
-				t.Fatalf("newAESGCM(%d-byte key) unexpected error: %v", tc.keySize, err)
-			}
-			if aead == nil {
-				t.Fatal("newAESGCM() returned nil AEAD")
-			}
-
-			// newAESGCM builds a module-nonce GCM (cipher.NewGCMWithRandomNonce),
-			// which takes no caller nonce at all.
-			if got := aead.NonceSize(); got != 0 {
-				t.Fatalf("AEAD.NonceSize() = %d, want 0 (module-generated nonce)", got)
-			}
-
-			// Overhead is the 12-byte nonce the module prepends plus the
-			// 16-byte GCM tag, which is exactly the number of bytes the
-			// pre-migration framing spent on nonce + tag.
-			const wantOverhead = 12 + aeadTagSize
-			if got := aead.Overhead(); got != wantOverhead {
-				t.Fatalf("AEAD.Overhead() = %d, want %d", got, wantOverhead)
-			}
-		})
+	var cipherErr *CipherError
+	if !errors.As(err, &cipherErr) {
+		t.Fatalf("expected *CipherError, got %T: %v", err, err)
 	}
-
-	t.Run("invalid key size wraps error in CipherError", func(t *testing.T) {
-		_, err := newAESGCM(make([]byte, 7)) // AES requires 16, 24, or 32 bytes
-		if err == nil {
-			t.Fatal("newAESGCM() expected error for invalid key, got nil")
-		}
-		var cipherErr *CipherError
-		if !errors.As(err, &cipherErr) {
-			t.Fatalf("expected *CipherError, got %T: %v", err, err)
-		}
-	})
 }
 
 // ----- TestAlgorithmRoundtrip ------------------------------------------------
 
-// TestAlgorithmRoundtrip verifies that plaintext encrypted with each algorithm
-// decrypts back to the original plaintext, ensuring the AEAD seal/open cycle
-// is correct for every supported algorithm.
-// TestAlgorithmRoundtrip_TamperedCiphertextFails verifies that modifying even
-// a single byte of the ciphertext causes authentication failure.
-func TestAlgorithmRoundtrip_TamperedCiphertextFails(t *testing.T) {
-	plaintext := []byte("sensitive payload")
-
-	for _, tc := range knownAlgorithms {
-		t.Run(tc.name, func(t *testing.T) {
-			key := randKey(t, tc.keySize)
-			nonce := tc.sealNonce(t)
-
-			aead, err := newAEADForAlgorithm(tc.alg, key)
-			if err != nil {
-				t.Fatalf("newAEADForAlgorithm() error: %v", err)
-			}
-
-			ciphertext := aead.Seal(nil, nonce, plaintext, nil)
-
-			// Flip the first byte to simulate tampering.
-			tampered := make([]byte, len(ciphertext))
-			copy(tampered, ciphertext)
-			tampered[0] ^= 0xFF
-
-			_, err = aead.Open(nil, nonce, tampered, nil)
-			if err == nil {
-				t.Fatal("Open() expected error for tampered ciphertext, got nil")
-			}
-		})
-	}
-}
-
-// TestAlgorithmRoundtrip_WrongAdditionalDataFails verifies that mismatched
-// additional data is detected by the authentication tag.
-func TestAlgorithmRoundtrip_WrongAdditionalDataFails(t *testing.T) {
+// TestAlgorithmRoundtrip_TamperingFails verifies, for every registered
+// algorithm, that the authentication tag rejects both a flipped ciphertext
+// byte and mismatched additional data.
+func TestAlgorithmRoundtrip_TamperingFails(t *testing.T) {
 	plaintext := []byte("authenticated payload")
 	authData := []byte("original AD")
 	wrongAD := []byte("tampered AD")
@@ -388,8 +224,15 @@ func TestAlgorithmRoundtrip_WrongAdditionalDataFails(t *testing.T) {
 
 			ciphertext := aead.Seal(nil, nonce, plaintext, authData)
 
-			_, err = aead.Open(nil, nonce, ciphertext, wrongAD)
-			if err == nil {
+			// Flip the first byte to simulate tampering.
+			tampered := make([]byte, len(ciphertext))
+			copy(tampered, ciphertext)
+			tampered[0] ^= 0xFF
+			if _, err := aead.Open(nil, nonce, tampered, authData); err == nil {
+				t.Fatal("Open() expected error for tampered ciphertext, got nil")
+			}
+
+			if _, err := aead.Open(nil, nonce, ciphertext, wrongAD); err == nil {
 				t.Fatal("Open() expected error for wrong additional data, got nil")
 			}
 		})

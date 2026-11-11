@@ -19,38 +19,28 @@ import (
 	"testing"
 )
 
-func TestNewLogger_TextFormat(t *testing.T) {
-	cfg := LogConfig{Format: LogFormatText, Level: LogLevelInfo}
-	logger := NewLogger(cfg)
-
-	handler := logger.Handler()
-	if _, ok := handler.(*slog.TextHandler); !ok {
-		t.Errorf("expected *slog.TextHandler, got %T", handler)
+func TestNewLogger_Format(t *testing.T) {
+	tests := []struct {
+		format LogFormat
+		isJSON bool
+	}{
+		{LogFormatText, false},
+		{LogFormatJSON, true},
 	}
-}
 
-func TestNewLogger_JSONFormat(t *testing.T) {
-	cfg := LogConfig{Format: LogFormatJSON, Level: LogLevelInfo}
-	logger := NewLogger(cfg)
-
-	handler := logger.Handler()
-	if _, ok := handler.(*slog.JSONHandler); !ok {
-		t.Errorf("expected *slog.JSONHandler, got %T", handler)
-	}
-}
-
-func TestNewLogger_DefaultsToInfoOnUnknownLevel(t *testing.T) {
-	// If an unvalidated level slips through, NewLogger falls back to info.
-	cfg := LogConfig{Format: LogFormatText, Level: "unknown"}
-	logger := NewLogger(cfg)
-
-	// The handler should be enabled for info but the exact level
-	// is verified indirectly: debug should be disabled.
-	if logger.Handler().Enabled(t.Context(), slog.LevelDebug) {
-		t.Error("expected debug to be disabled at default info level")
-	}
-	if !logger.Handler().Enabled(t.Context(), slog.LevelInfo) {
-		t.Error("expected info to be enabled at default info level")
+	for _, tt := range tests {
+		t.Run(string(tt.format), func(t *testing.T) {
+			handler := NewLogger(LogConfig{Format: tt.format, Level: LogLevelInfo}).Handler()
+			if tt.isJSON {
+				if _, ok := handler.(*slog.JSONHandler); !ok {
+					t.Errorf("expected *slog.JSONHandler, got %T", handler)
+				}
+				return
+			}
+			if _, ok := handler.(*slog.TextHandler); !ok {
+				t.Errorf("expected *slog.TextHandler, got %T", handler)
+			}
+		})
 	}
 }
 
@@ -66,6 +56,8 @@ func TestNewLogger_LevelFiltering(t *testing.T) {
 		{LogLevelInfo, false, true, true, true},
 		{LogLevelWarn, false, false, true, true},
 		{LogLevelError, false, false, false, true},
+		// If an unvalidated level slips through, NewLogger falls back to info.
+		{"unknown", false, true, true, true},
 	}
 
 	for _, tt := range tests {

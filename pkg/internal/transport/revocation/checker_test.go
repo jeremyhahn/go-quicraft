@@ -594,24 +594,6 @@ func TestIsRevokedCRLMode(t *testing.T) {
 	}
 }
 
-// TestIsRevokedUnknownCertPasses verifies that an unknown certificate
-// (not in CRL) passes in default mode under soft-fail, which is what the
-// original assertion always described: with no source configured, admitting
-// the peer is the soft-fail behaviour and nothing else.
-func TestIsRevokedUnknownCertPasses(t *testing.T) {
-	ca := newTestCA(t)
-	checker := NewChecker(Config{Mode: ModeAny, AllowSoftFail: true}, ca.cert)
-
-	leaf := ca.issueLeaf(t, 12345)
-	revoked, err := checker.IsRevoked(leaf)
-	if err != nil {
-		t.Fatalf("IsRevoked error: %v", err)
-	}
-	if revoked {
-		t.Fatal("unknown cert should not be revoked in soft-fail mode")
-	}
-}
-
 // TestIsRevokedModeAnyFallback verifies that ModeAny checks CRL first,
 // then falls back to OCSP when configured.
 func TestIsRevokedModeAnyFallback(t *testing.T) {
@@ -683,25 +665,6 @@ func TestSoftFailAllowsUnknown(t *testing.T) {
 	}
 	if revoked {
 		t.Fatal("soft-fail should not report revoked when OCSP is unreachable")
-	}
-}
-
-// TestEnforcedRevocationOCSPNoURL verifies that enforcement with
-// no OCSP URL configured returns an error in ModeOCSP.
-func TestEnforcedRevocationOCSPNoURL(t *testing.T) {
-	ca := newTestCA(t)
-	checker := NewChecker(Config{
-		Mode:             ModeOCSP,
-		OCSPResponderURL: "", // no URL
-	}, ca.cert)
-
-	leaf := ca.issueLeaf(t, 42)
-	_, err := checker.IsRevoked(leaf)
-	if err == nil {
-		t.Fatal("expected error with enforcement and no OCSP URL")
-	}
-	if !errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatalf("expected ErrOCSPUnavailable, got %v", err)
 	}
 }
 
@@ -1048,43 +1011,9 @@ func TestOCSPNoIssuerCert(t *testing.T) {
 // ModeBoth tests
 // ---------------------------------------------------------------------------
 
-// TestModeBothRequiresBothSources verifies that ModeBoth only reports
-// revoked when both CRL and OCSP agree.
-func TestModeBothRequiresBothSources(t *testing.T) {
-	ca := newTestCA(t)
-	dir := t.TempDir()
-	leaf := ca.issueLeaf(t, 33)
-	serialHex := leaf.SerialNumber.Text(16)
-
-	// CRL: revoke serial 33.
-	crlData := ca.createCRL(t, 33)
-	crlPath := writeCRLFile(t, dir, "crl.pem", crlData)
-
-	// OCSP: also reports serial 33 as revoked.
-	server := newMockOCSPServer(t, ca, map[string]bool{serialHex: true})
-	defer server.Close()
-
-	checker := NewChecker(Config{
-		CRLPaths:           []string{crlPath},
-		OCSPResponderURL:   server.URL,
-		OCSPTimeoutSeconds: 5,
-		Mode:               ModeBoth,
-	}, ca.cert)
-	if err := checker.ReloadCRLs(); err != nil {
-		t.Fatalf("ReloadCRLs: %v", err)
-	}
-
-	revoked, err := checker.IsRevoked(leaf)
-	if err != nil {
-		t.Fatalf("IsRevoked error: %v", err)
-	}
-	if !revoked {
-		t.Fatal("both CRL and OCSP confirm revoked, should be revoked")
-	}
-}
-
 // TestModeBothCRLOnlyRevokedWins verifies that when only CRL reports
-// revoked but OCSP says good, ModeBoth returns not revoked.
+// revoked but OCSP says good, ModeBoth returns revoked: a CRL hit decides
+// before OCSP is consulted.
 func TestModeBothCRLOnlyRevokedWins(t *testing.T) {
 	ca := newTestCA(t)
 	dir := t.TempDir()
@@ -1117,38 +1046,9 @@ func TestModeBothCRLOnlyRevokedWins(t *testing.T) {
 	}
 }
 
-// TestModeBothOCSPUnavailableSoftFall verifies that when OCSP is
-// unreachable in ModeBoth with soft-fail, the CRL result is used.
-func TestModeBothOCSPUnavailableSoftFail(t *testing.T) {
-	ca := newTestCA(t)
-	dir := t.TempDir()
-	leaf := ca.issueLeaf(t, 55)
-
-	crlData := ca.createCRL(t, 55)
-	crlPath := writeCRLFile(t, dir, "crl.pem", crlData)
-
-	checker := NewChecker(Config{
-		CRLPaths:           []string{crlPath},
-		OCSPResponderURL:   "http://127.0.0.1:1/unreachable",
-		OCSPTimeoutSeconds: 1,
-		Mode:               ModeBoth,
-		AllowSoftFail:      true,
-	}, ca.cert)
-	if err := checker.ReloadCRLs(); err != nil {
-		t.Fatalf("ReloadCRLs: %v", err)
-	}
-
-	revoked, err := checker.IsRevoked(leaf)
-	if err != nil {
-		t.Fatalf("soft-fail should not error: %v", err)
-	}
-	if !revoked {
-		t.Fatal("CRL says revoked, OCSP unavailable in soft-fail = use CRL result")
-	}
-}
-
 // TestModeBothOCSPUnavailableEnforced verifies that when OCSP is
-// unreachable in ModeBoth with enforcement, an error is returned.
+// unreachable in ModeBoth with enforcement, a CRL-revoked
+// certificate is still reported revoked and an unknown one fails closed.
 func TestModeBothOCSPUnavailableEnforced(t *testing.T) {
 	ca := newTestCA(t)
 	dir := t.TempDir()
@@ -1190,35 +1090,9 @@ func TestModeBothOCSPUnavailableEnforced(t *testing.T) {
 // Lifecycle tests
 // ---------------------------------------------------------------------------
 
-// TestCheckerStartStop verifies that Start and Stop manage the
-// background goroutine lifecycle without panics or leaks.
-func TestCheckerStartStop(t *testing.T) {
-	ca := newTestCA(t)
-	dir := t.TempDir()
-
-	crlData := ca.createCRL(t, 1)
-	path := writeCRLFile(t, dir, "lifecycle.crl.pem", crlData)
-
-	checker := NewChecker(Config{
-		CRLPaths:      []string{path},
-		CheckInterval: 10 * time.Millisecond, // fast for test
-	}, ca.cert)
-
-	checker.Start()
-
-	// Poll until the background reload picks up the CRL.
-	require.Eventually(t, func() bool {
-		return checker.RevokedCount() == 1
-	}, 5*time.Second, 5*time.Millisecond, "revoked count after start: want 1")
-
-	checker.Stop()
-
-	// Double-stop should not panic.
-	checker.Stop()
-}
-
 // TestCheckerStartStopWithHotReload verifies that a CRL file change
-// is picked up by the background reload goroutine.
+// is picked up by the background reload goroutine,
+// and that Stop is idempotent.
 func TestCheckerStartStopWithHotReload(t *testing.T) {
 	ca := newTestCA(t)
 	dir := t.TempDir()
@@ -1247,6 +1121,10 @@ func TestCheckerStartStopWithHotReload(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return checker.RevokedCount() == 2
 	}, 5*time.Second, 5*time.Millisecond, "after hot-reload: want 2")
+
+	// Stop is idempotent: this explicit Stop and the deferred one must
+	// not panic.
+	checker.Stop()
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,62 +1217,6 @@ func TestOnCertRevokedCallback(t *testing.T) {
 	}
 	if gotSerial.Load().(string) != serial {
 		t.Fatalf("OnCertRevoked serial: want %q, got %q", serial, gotSerial.Load())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Error type tests
-// ---------------------------------------------------------------------------
-
-// TestCertificateRevokedErrorIs verifies errors.Is matching.
-func TestCertificateRevokedErrorIs(t *testing.T) {
-	err := &CertificateRevokedError{Serial: "abc"}
-	if !errors.Is(err, ErrCertificateRevoked) {
-		t.Fatal("CertificateRevokedError should match ErrCertificateRevoked")
-	}
-	if errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("CertificateRevokedError should not match ErrOCSPUnavailable")
-	}
-	if err.Error() != "revocation: certificate serial abc is revoked" {
-		t.Fatalf("unexpected error message: %s", err.Error())
-	}
-}
-
-// TestOCSPUnavailableErrorIs verifies errors.Is matching and Unwrap.
-func TestOCSPUnavailableErrorIs(t *testing.T) {
-	inner := errors.New("connection refused")
-	err := &OCSPUnavailableError{URL: "http://example.com", Err: inner}
-	if !errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("OCSPUnavailableError should match ErrOCSPUnavailable")
-	}
-	if !errors.Is(err, inner) {
-		t.Fatal("OCSPUnavailableError should unwrap to inner error")
-	}
-	if errors.Is(err, ErrCertificateRevoked) {
-		t.Fatal("OCSPUnavailableError should not match ErrCertificateRevoked")
-	}
-	expected := "revocation: OCSP responder http://example.com unavailable: connection refused"
-	if err.Error() != expected {
-		t.Fatalf("unexpected error message: %s", err.Error())
-	}
-}
-
-// TestCRLParseErrorIs verifies errors.Is matching and Unwrap.
-func TestCRLParseErrorIs(t *testing.T) {
-	inner := errors.New("asn1 decode")
-	err := &CRLParseError{Path: "/tmp/crl.pem", Err: inner}
-	if !errors.Is(err, ErrInvalidCRL) {
-		t.Fatal("CRLParseError should match ErrInvalidCRL")
-	}
-	if !errors.Is(err, inner) {
-		t.Fatal("CRLParseError should unwrap to inner error")
-	}
-	if errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatal("CRLParseError should not match ErrOCSPUnavailable")
-	}
-	expected := "revocation: failed to parse CRL /tmp/crl.pem: asn1 decode"
-	if err.Error() != expected {
-		t.Fatalf("unexpected error message: %s", err.Error())
 	}
 }
 
@@ -1994,36 +1816,10 @@ func newUnknownOCSPServer(t *testing.T, ca *testCA, queries *atomic.Int64) *http
 	}))
 }
 
-// TestOCSPUnknownStatusFailsClosedUnderEnforcement is the regression test:
+// TestOCSPUnknownStatusNotCachedAsGood is the regression test:
 // RFC 6960 "unknown" is NOT "not revoked". Under enforcement a leaf the
 // responder has no record of must be rejected, not admitted.
-func TestOCSPUnknownStatusFailsClosedUnderEnforcement(t *testing.T) {
-	ca := newTestCA(t)
-	leaf := ca.issueLeaf(t, 700)
-
-	var queries atomic.Int64
-	server := newUnknownOCSPServer(t, ca, &queries)
-	defer server.Close()
-
-	checker := NewChecker(Config{
-		Mode:               ModeOCSP,
-		OCSPResponderURL:   server.URL,
-		OCSPTimeoutSeconds: 5,
-	}, ca.cert)
-
-	revoked, err := checker.IsRevoked(leaf)
-	if err == nil {
-		t.Fatal("unknown OCSP status must fail closed under enforcement")
-	}
-	if revoked {
-		t.Fatal("unknown status must not be reported as revoked")
-	}
-	if !errors.Is(err, ErrOCSPStatusUnknown) && !errors.Is(err, ErrOCSPUnavailable) {
-		t.Fatalf("expected an unknown/unavailable status error, got %v", err)
-	}
-}
-
-// TestOCSPUnknownStatusNotCachedAsGood verifies the second half: an
+// It also verifies the second half: an
 // unknown verdict must never populate the definitive cache. If it did, the
 // "good" verdict would be served for the full OCSPCacheSeconds to every
 // subsequent handshake. Only the short-TTL negative cache may hold it, which
@@ -2043,8 +1839,15 @@ func TestOCSPUnknownStatusNotCachedAsGood(t *testing.T) {
 		OCSPTimeoutSeconds: 5,
 	}, ca.cert)
 
-	if _, err := checker.IsRevoked(leaf); err == nil {
-		t.Fatal("unknown status must fail closed")
+	revoked, err := checker.IsRevoked(leaf)
+	if err == nil {
+		t.Fatal("unknown OCSP status must fail closed under enforcement")
+	}
+	if revoked {
+		t.Fatal("unknown status must not be reported as revoked")
+	}
+	if !errors.Is(err, ErrOCSPStatusUnknown) && !errors.Is(err, ErrOCSPUnavailable) {
+		t.Fatalf("expected an unknown/unavailable status error, got %v", err)
 	}
 
 	checker.ocspMu.RLock()

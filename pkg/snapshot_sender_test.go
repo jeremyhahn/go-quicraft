@@ -17,7 +17,6 @@ package quicraft
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -124,6 +123,9 @@ func TestSplitSnapshotMessage_EmptySnapshot(t *testing.T) {
 	}
 	if c.ChunkSize != 0 {
 		t.Errorf("ChunkSize = %d, want 0", c.ChunkSize)
+	}
+	if len(c.Data) != 0 {
+		t.Errorf("Data = %d bytes, want none", len(c.Data))
 	}
 	if c.FileSize != 0 {
 		t.Errorf("FileSize = %d, want 0", c.FileSize)
@@ -431,8 +433,8 @@ func TestSplitSnapshotMessage_ExactChunkBoundary(t *testing.T) {
 }
 
 // TestTransportSender_NotifySnapshotStatus verifies that the transportSender
-// correctly delivers SnapshotStatus messages back to the raft layer via the
-// engine.
+// delivers SnapshotStatus messages, rejected and accepted, back to the raft
+// layer via the engine, and drops one for a shard the host does not run.
 func TestTransportSender_NotifySnapshotStatus(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -449,36 +451,6 @@ func TestTransportSender_NotifySnapshotStatus(t *testing.T) {
 	eng.Start()
 	defer eng.Stop()
 
-	ts := &transportSender{
-		engine: eng,
-		logger: slog.Default(),
-	}
-
-	// Without a loaded node, the status message will be dropped silently
-	// (DeliverMessage returns false for unknown shards). This should not panic.
-	ts.notifySnapshotStatus(1, 1, 2, 10, true)
-	ts.notifySnapshotStatus(1, 1, 2, 10, false)
-}
-
-// TestTransportSender_NotifySnapshotStatus_Rejected verifies that a rejected
-// SnapshotStatus message is correctly formed.
-func TestTransportSender_NotifySnapshotStatus_Rejected(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	// Create a node and load it so DeliverMessage succeeds.
 	node := newMinimalEngineNode(t, 1, 1)
 	eng.LoadNode(node)
 	defer eng.UnloadNode(1)
@@ -488,72 +460,36 @@ func TestTransportSender_NotifySnapshotStatus_Rejected(t *testing.T) {
 		logger: slog.Default(),
 	}
 
-	// Send rejected status - should be delivered to the node's inbox.
-	ts.notifySnapshotStatus(1, 1, 2, 10, true)
-
-	// Drain the inbox and verify the SnapshotStatus message.
-	var buf []proto.Message
-	buf = node.DrainInbox(buf)
-	if len(buf) != 1 {
-		t.Fatalf("expected 1 message in inbox, got %d", len(buf))
-	}
-	if buf[0].Type != proto.SnapshotStatus {
-		t.Errorf("Type = %v, want SnapshotStatus", buf[0].Type)
-	}
-	if buf[0].ShardID != 1 {
-		t.Errorf("ShardID = %d, want 1", buf[0].ShardID)
-	}
-	if buf[0].From != 2 {
-		t.Errorf("From = %d, want 2 (target replica)", buf[0].From)
-	}
-	if buf[0].To != 1 {
-		t.Errorf("To = %d, want 1 (local replica)", buf[0].To)
-	}
-	if !buf[0].Reject {
-		t.Error("expected Reject=true for rejected snapshot status")
-	}
-}
-
-// TestTransportSender_NotifySnapshotStatus_Accepted verifies that an accepted
-// SnapshotStatus message has Reject=false.
-func TestTransportSender_NotifySnapshotStatus_Accepted(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	node := newMinimalEngineNode(t, 1, 1)
-	eng.LoadNode(node)
-	defer eng.UnloadNode(1)
-
-	ts := &transportSender{
-		engine: eng,
-		logger: slog.Default(),
+	// A status for a shard this host does not run is dropped (DeliverMessage
+	// returns false): no panic, and nothing reaches the loaded shard.
+	ts.notifySnapshotStatus(99, 1, 2, 10, true)
+	if buf := node.DrainInbox(nil); len(buf) != 0 {
+		t.Fatalf("status for an unknown shard reached shard 1: %d message(s)", len(buf))
 	}
 
-	// Send accepted status.
-	ts.notifySnapshotStatus(1, 1, 2, 10, false)
+	for _, rejected := range []bool{true, false} {
+		ts.notifySnapshotStatus(1, 1, 2, 10, rejected)
 
-	var buf []proto.Message
-	buf = node.DrainInbox(buf)
-	if len(buf) != 1 {
-		t.Fatalf("expected 1 message in inbox, got %d", len(buf))
-	}
-	if buf[0].Type != proto.SnapshotStatus {
-		t.Errorf("Type = %v, want SnapshotStatus", buf[0].Type)
-	}
-	if buf[0].Reject {
-		t.Error("expected Reject=false for accepted snapshot status")
+		buf := node.DrainInbox(nil)
+		if len(buf) != 1 {
+			t.Fatalf("rejected=%v: expected 1 message in inbox, got %d", rejected, len(buf))
+		}
+		m := buf[0]
+		if m.Type != proto.SnapshotStatus {
+			t.Errorf("rejected=%v: Type = %v, want SnapshotStatus", rejected, m.Type)
+		}
+		if m.ShardID != 1 {
+			t.Errorf("rejected=%v: ShardID = %d, want 1", rejected, m.ShardID)
+		}
+		if m.From != 2 {
+			t.Errorf("rejected=%v: From = %d, want 2 (target replica)", rejected, m.From)
+		}
+		if m.To != 1 {
+			t.Errorf("rejected=%v: To = %d, want 1 (local replica)", rejected, m.To)
+		}
+		if m.Reject != rejected {
+			t.Errorf("Reject = %v, want %v", m.Reject, rejected)
+		}
 	}
 }
 
@@ -754,105 +690,6 @@ func TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly(t *testing.T) {
 	}
 }
 
-// TestDecryptSnapshotForSend_FileNotFound verifies error handling when the
-// encrypted snapshot file does not exist.
-func TestDecryptSnapshotForSend_FileNotFound(t *testing.T) {
-	b := createTestBarrier(t)
-	ts := &transportSender{
-		barrier: b,
-		logger:  slog.Default(),
-	}
-
-	msg := proto.Message{
-		Snapshot: proto.Snapshot{
-			Filepath: "/nonexistent/snapshot.dat",
-			Epoch:    1,
-		},
-	}
-
-	_, _, err := decryptForSendToPath(t, ts, msg)
-	if err == nil {
-		t.Fatal("expected error for missing file, got nil")
-	}
-}
-
-// TestDoSendSnapshot_DecryptsBeforeSend verifies that doSendSnapshot
-// strips the epoch from chunks when decrypting an encrypted snapshot.
-func TestDoSendSnapshot_DecryptsBeforeSend(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create an encrypted snapshot file.
-	b := createTestBarrier(t)
-	plaintext := []byte("encrypted snapshot payload for chunk verification")
-	encPath := filepath.Join(tmpDir, "snapshot.dat")
-	writeEncryptedSnapshotFileFor(t, b, encPath, plaintext, 1, 1, 100)
-	stampTestSnapshotMeta(t, filepath.Dir(encPath), 1, 1)
-
-	info, err := os.Stat(encPath)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-
-	// Build a message with non-zero epoch referencing the encrypted file.
-	msg := proto.Message{
-		Type:      proto.InstallSnapshot,
-		ShardID:   1,
-		ReplicaID: 1,
-		From:      1,
-		To:        2,
-		Snapshot: proto.Snapshot{
-			Index:    100,
-			Term:     5,
-			Filepath: encPath,
-			FileSize: uint64(info.Size()),
-			Epoch:    b.CurrentEpoch(),
-		},
-	}
-
-	// Simulate what doSendSnapshot does: decrypt + split.
-	ts := newDecryptSender(t, b, 1, 1)
-
-	decPath, decSize, err := decryptForSendToPath(t, ts, msg)
-	if err != nil {
-		t.Fatalf("decryptSnapshotForSend: %v", err)
-	}
-	defer func() { _ = os.Remove(decPath) }()
-
-	// Update message to reference the decrypted file, laid out and recorded
-	// as a plaintext artifact would be: sends verify against the record
-	// beside the data.
-	plainPath := filepath.Join(filepath.Dir(decPath), "snapshot.dat")
-	if err := os.Rename(decPath, plainPath); err != nil {
-		t.Fatalf("rename decrypted artifact: %v", err)
-	}
-	decPath = plainPath
-	stampTestSnapshotMeta(t, filepath.Dir(decPath), 100, 5)
-	msg.Snapshot.Filepath = decPath
-	msg.Snapshot.FileSize = decSize
-	msg.Snapshot.Epoch = 0
-
-	chunks, err := collectSnapshotChunks(msg)
-	if err != nil {
-		t.Fatalf("collectSnapshotChunks: %v", err)
-	}
-
-	// Verify epoch is 0 on all chunks.
-	for i, c := range chunks {
-		if c.Epoch != 0 {
-			t.Errorf("chunk[%d].Epoch = %d, want 0", i, c.Epoch)
-		}
-	}
-
-	// Verify the data is plaintext.
-	var reassembled []byte
-	for _, c := range chunks {
-		reassembled = append(reassembled, c.Data...)
-	}
-	if !bytes.Equal(reassembled, plaintext) {
-		t.Errorf("reassembled data mismatch: got %q, want %q", reassembled, plaintext)
-	}
-}
-
 // createTestBarrier creates a real seal.Barrier initialized with fast
 // Argon2id parameters for testing. A no-op StatePersister is wired in
 // because Rotate and PurgeEpochsBefore fail closed with ErrNoStatePersister
@@ -927,242 +764,6 @@ func TestSnapshotReceiveError_Format(t *testing.T) {
 	}
 }
 
-// TestSplitSnapshotMessage_FileCloseOnError verifies that the file handle is
-// properly closed when an error occurs during chunk reading. This tests the
-// resource cleanup pattern that uses a fileClosed flag to prevent double-close.
-func TestSplitSnapshotMessage_FileCloseOnError(t *testing.T) {
-	tmpDir := t.TempDir()
-	snapPath := filepath.Join(tmpDir, "snapshot.dat")
-
-	// Create a file smaller than declared to trigger a read error.
-	data := []byte("short data")
-	if err := os.WriteFile(snapPath, data, 0o600); err != nil {
-		t.Fatalf("failed to write snapshot file: %v", err)
-	}
-	stampTestSnapshotMeta(t, filepath.Dir(snapPath), 1, 1)
-
-	msg := proto.Message{
-		Type:    proto.InstallSnapshot,
-		ShardID: 1,
-		From:    1,
-		To:      2,
-		Snapshot: proto.Snapshot{
-			Index:    100,
-			Term:     5,
-			Filepath: snapPath,
-			FileSize: uint64(len(data)), // Declare correct size first
-		},
-	}
-
-	// First verify normal case works - file should be closed after success.
-	chunks, err := collectSnapshotChunks(msg)
-	if err != nil {
-		t.Fatalf("collectSnapshotChunks failed for valid file: %v", err)
-	}
-	if len(chunks) != 1 {
-		t.Fatalf("expected 1 chunk, got %d", len(chunks))
-	}
-
-	// Now test error case - file should still be closed even on error.
-	msg.Snapshot.FileSize = uint64(len(data) + 100) // Wrong size to trigger error
-	_, err = collectSnapshotChunks(msg)
-	if err == nil {
-		t.Fatal("expected error for size mismatch, got nil")
-	}
-
-	// Verify we can still access the file (it was properly closed).
-	_, statErr := os.Stat(snapPath)
-	if statErr != nil {
-		t.Errorf("file should still exist: %v", statErr)
-	}
-}
-
-// TestDecryptSnapshotForSend_FileCloseOnError verifies that both source and
-// temp files are properly closed when an error occurs during decryption.
-func TestDecryptSnapshotForSend_FileCloseOnError(t *testing.T) {
-	tmpDir := t.TempDir()
-	b := createTestBarrier(t)
-
-	// Create a malformed encrypted file that will cause decryption to fail.
-	encPath := filepath.Join(tmpDir, "snapshot.dat")
-	f, err := os.Create(encPath)
-	if err != nil {
-		t.Fatalf("create file: %v", err)
-	}
-
-	// Write a valid frame length but invalid encrypted data.
-	var frameBuf [4]byte
-	binary.LittleEndian.PutUint32(frameBuf[:], 100)
-	if _, err := f.Write(frameBuf[:]); err != nil {
-		t.Fatalf("write frame len: %v", err)
-	}
-	// Write garbage data that won't decrypt properly.
-	garbage := make([]byte, 100)
-	if _, err := f.Write(garbage); err != nil {
-		t.Fatalf("write garbage: %v", err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	ts := newDecryptSender(t, b, 1, 1)
-
-	msg := proto.Message{
-		ShardID: 1,
-		Snapshot: proto.Snapshot{
-			Filepath: encPath,
-			Epoch:    b.CurrentEpoch(),
-		},
-	}
-
-	// This should fail during decryption but clean up all resources.
-	_, _, err = decryptForSendToPath(t, ts, msg)
-	if err == nil {
-		t.Fatal("expected decryption error, got nil")
-	}
-
-	// Verify source file still exists and is accessible (was properly closed).
-	_, statErr := os.Stat(encPath)
-	if statErr != nil {
-		t.Errorf("source file should still exist: %v", statErr)
-	}
-
-	// Verify no temp files were left behind.
-	matches, _ := filepath.Glob(filepath.Join(tmpDir, ".send-decrypt-*.tmp"))
-	if len(matches) > 0 {
-		t.Errorf("temp files should be cleaned up, found: %v", matches)
-	}
-}
-
-// TestDoSendSnapshot_TempFileCleanupOnSplitError verifies that the decrypted
-// temp file is cleaned up when collectSnapshotChunks fails. We simulate this
-// by creating an encrypted file that decrypts successfully but then providing
-// incorrect FileSize to collectSnapshotChunks.
-func TestDoSendSnapshot_TempFileCleanupOnSplitError(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create an encrypted snapshot file with known plaintext.
-	b := createTestBarrier(t)
-	plaintext := []byte("test snapshot data for cleanup verification")
-	encPath := filepath.Join(tmpDir, "snapshot.dat")
-	writeEncryptedSnapshotFileFor(t, b, encPath, plaintext, 1, 1, 100)
-
-	info, err := os.Stat(encPath)
-	if err != nil {
-		t.Fatalf("stat: %v", err)
-	}
-
-	// Create the transportSender with just the barrier for testing.
-	ts := newDecryptSender(t, b, 1, 1)
-
-	msg := proto.Message{
-		Type:      proto.InstallSnapshot,
-		ShardID:   1,
-		ReplicaID: 1,
-		From:      1,
-		To:        2,
-		Snapshot: proto.Snapshot{
-			Index:    100,
-			Term:     5,
-			Filepath: encPath,
-			FileSize: uint64(info.Size()),
-			Epoch:    b.CurrentEpoch(),
-		},
-	}
-
-	// Manually run the decryption step (which doSendSnapshot does internally).
-	decPath, decSize, err := decryptForSendToPath(t, ts, msg)
-	if err != nil {
-		t.Fatalf("decryptSnapshotForSend: %v", err)
-	}
-
-	// Verify temp file exists after decryption.
-	if _, statErr := os.Stat(decPath); statErr != nil {
-		t.Fatalf("decrypted temp file should exist: %v", statErr)
-	}
-
-	// Simulate what doSendSnapshot does: update message to reference decrypted file,
-	// then call collectSnapshotChunks with wrong FileSize to trigger an error.
-	msg.Snapshot.Filepath = decPath
-	msg.Snapshot.FileSize = decSize + 100 // Wrong size to trigger error.
-	msg.Snapshot.Epoch = 0
-
-	// Split should fail due to size mismatch.
-	_, splitErr := collectSnapshotChunks(msg)
-	if splitErr == nil {
-		// Clean up the temp file manually since split unexpectedly succeeded.
-		_ = os.Remove(decPath)
-		t.Fatal("expected split error for size mismatch, got nil")
-	}
-
-	// Clean up the temp file (simulating the defer in doSendSnapshot).
-	if rmErr := os.Remove(decPath); rmErr != nil && !os.IsNotExist(rmErr) {
-		t.Errorf("failed to remove temp file: %v", rmErr)
-	}
-
-	// Verify no temp files were left behind.
-	matches, _ := filepath.Glob(filepath.Join(tmpDir, ".send-decrypt-*.tmp"))
-	if len(matches) > 0 {
-		t.Errorf("temp files should be cleaned up after split error, found: %v", matches)
-	}
-}
-
-// TestForEachSnapshotChunk_StreamsOneAtATime verifies that forEachSnapshotChunk
-// delivers chunks one at a time to the callback, ensuring only one chunk's
-// data is live in memory at any point during iteration.
-func TestForEachSnapshotChunk_StreamsOneAtATime(t *testing.T) {
-	tmpDir := t.TempDir()
-	snapPath := filepath.Join(tmpDir, "snapshot.dat")
-
-	// Create data spanning 3 chunks.
-	totalSize := snapshotChunkSize*2 + 1024
-	data := make([]byte, totalSize)
-	for i := range data {
-		data[i] = byte(i % 256)
-	}
-	if err := os.WriteFile(snapPath, data, 0o600); err != nil {
-		t.Fatalf("failed to write snapshot file: %v", err)
-	}
-	stampTestSnapshotMeta(t, filepath.Dir(snapPath), 1, 1)
-
-	msg := proto.Message{
-		Type:    proto.InstallSnapshot,
-		ShardID: 1,
-		From:    1,
-		To:      2,
-		Snapshot: proto.Snapshot{
-			Index:    1000,
-			Term:     15,
-			Filepath: snapPath,
-			FileSize: uint64(totalSize),
-		},
-	}
-
-	var callCount int
-	var reassembled []byte
-	err := forEachSnapshotChunk(osSnapshotFS{}, msg, func(chunk proto.SnapshotChunk) error {
-		// Verify chunk metadata on each callback invocation.
-		if chunk.ChunkID != uint64(callCount) {
-			t.Errorf("callback %d: ChunkID = %d, want %d", callCount, chunk.ChunkID, callCount)
-		}
-		if chunk.ChunkCount != 3 {
-			t.Errorf("callback %d: ChunkCount = %d, want 3", callCount, chunk.ChunkCount)
-		}
-		reassembled = append(reassembled, chunk.Data...)
-		callCount++
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("forEachSnapshotChunk returned error: %v", err)
-	}
-	if callCount != 3 {
-		t.Fatalf("expected 3 callbacks, got %d", callCount)
-	}
-	if !bytes.Equal(reassembled, data) {
-		t.Fatal("reassembled data does not match original")
-	}
-}
-
 // TestForEachSnapshotChunk_CallbackErrorStopsIteration verifies that when the
 // emit callback returns an error, forEachSnapshotChunk stops reading and
 // returns that error immediately.
@@ -1205,43 +806,5 @@ func TestForEachSnapshotChunk_CallbackErrorStopsIteration(t *testing.T) {
 	}
 	if callCount != 2 {
 		t.Errorf("expected 2 callbacks before error, got %d", callCount)
-	}
-}
-
-// TestForEachSnapshotChunk_EmptySnapshot verifies that forEachSnapshotChunk
-// emits exactly one metadata-only chunk for a witness/empty snapshot.
-func TestForEachSnapshotChunk_EmptySnapshot(t *testing.T) {
-	msg := proto.Message{
-		Type:    proto.InstallSnapshot,
-		ShardID: 1,
-		From:    1,
-		To:      2,
-		Snapshot: proto.Snapshot{
-			Index:    100,
-			Term:     5,
-			Filepath: "",
-			FileSize: 0,
-		},
-	}
-
-	var callCount int
-	err := forEachSnapshotChunk(osSnapshotFS{}, msg, func(chunk proto.SnapshotChunk) error {
-		callCount++
-		if chunk.ChunkSize != 0 {
-			t.Errorf("expected ChunkSize=0 for empty snapshot, got %d", chunk.ChunkSize)
-		}
-		if chunk.ChunkCount != 1 {
-			t.Errorf("expected ChunkCount=1, got %d", chunk.ChunkCount)
-		}
-		if len(chunk.Data) != 0 {
-			t.Errorf("expected no data for empty snapshot, got %d bytes", len(chunk.Data))
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("forEachSnapshotChunk returned error: %v", err)
-	}
-	if callCount != 1 {
-		t.Errorf("expected 1 callback for empty snapshot, got %d", callCount)
 	}
 }

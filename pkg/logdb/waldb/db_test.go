@@ -128,6 +128,9 @@ func TestOperationsAfterClose(t *testing.T) {
 	if _, err := db.GetEntries(1, 1, 1, 2, 0); err != logdb.ErrClosed {
 		t.Fatalf("GetEntries: got %v, want %v", err, logdb.ErrClosed)
 	}
+	if _, _, err := db.EntryRange(1, 1); !errors.Is(err, logdb.ErrClosed) {
+		t.Fatalf("EntryRange: got %v, want %v", err, logdb.ErrClosed)
+	}
 }
 
 // TestName verifies the Name method.
@@ -410,6 +413,7 @@ func TestSaveAndGetSnapshot(t *testing.T) {
 		Filepath:    "/data/snapshot-100",
 		FileSize:    4096,
 		OnDiskIndex: 95,
+		Epoch:       7,
 	}
 
 	if err := db.SaveSnapshot(1, 1, ss); err != nil {
@@ -431,6 +435,9 @@ func TestSaveAndGetSnapshot(t *testing.T) {
 	}
 	if got.OnDiskIndex != 95 {
 		t.Fatalf("GetSnapshot: OnDiskIndex=%d, want 95", got.OnDiskIndex)
+	}
+	if got.Epoch != 7 {
+		t.Fatalf("GetSnapshot: Epoch=%d, want 7", got.Epoch)
 	}
 }
 
@@ -462,86 +469,60 @@ func TestSnapshotOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
-	if got.Index != 100 || got.Term != 5 {
-		t.Fatalf("GetSnapshot: got %+v, want Index=100 Term=5", got)
+	if got.Index != 100 || got.Term != 5 || got.Epoch != 0 {
+		t.Fatalf("GetSnapshot: got %+v, want Index=100 Term=5 Epoch=0", got)
 	}
 }
 
 // TestSaveSnapshotRejectsStale verifies that SaveSnapshot returns
-// ErrSnapshotOutOfDate when the new snapshot index is less than the
-// currently stored snapshot index.
+// ErrSnapshotOutOfDate, and keeps the stored snapshot, when the new snapshot
+// index is less than or equal to the stored index, whether the stored
+// snapshot came from SaveSnapshot or from SaveState.
 func TestSaveSnapshotRejectsStale(t *testing.T) {
-	db := openTestDB(t)
-
-	ss1 := logdb.Snapshot{Index: 100, Term: 5}
-	if err := db.SaveSnapshot(1, 1, ss1); err != nil {
-		t.Fatalf("SaveSnapshot(100): %v", err)
+	seedSaveSnapshot := func(t *testing.T, db *DB) {
+		if err := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 100, Term: 5}); err != nil {
+			t.Fatalf("SaveSnapshot(100): %v", err)
+		}
 	}
-
-	// Stale: index 50 < stored index 100.
-	ss2 := logdb.Snapshot{Index: 50, Term: 3}
-	err := db.SaveSnapshot(1, 1, ss2)
-	if !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-		t.Fatalf("SaveSnapshot(50) = %v, want ErrSnapshotOutOfDate", err)
+	// SaveState still applies the snapshot in memory; SaveSnapshot is the
+	// gatekeeper against a stored snapshot from either route.
+	seedSaveState := func(t *testing.T, db *DB) {
+		if err := db.SaveState([]logdb.Update{{
+			ShardID:   1,
+			ReplicaID: 1,
+			Snapshot:  logdb.Snapshot{Index: 100, Term: 5},
+		}}); err != nil {
+			t.Fatalf("SaveState(ss100): %v", err)
+		}
 	}
-
-	// Verify the stored snapshot was not overwritten.
-	got, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
+	cases := []struct {
+		name string
+		seed func(*testing.T, *DB)
+		ss   logdb.Snapshot
+	}{
+		{"older index", seedSaveSnapshot, logdb.Snapshot{Index: 50, Term: 3}},
+		{"equal index", seedSaveSnapshot, logdb.Snapshot{Index: 100, Term: 6}},
+		{"older index after SaveState", seedSaveState, logdb.Snapshot{Index: 50, Term: 3}},
 	}
-	if got.Index != 100 || got.Term != 5 {
-		t.Fatalf("GetSnapshot: got %+v, want Index=100 Term=5", got)
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			tc.seed(t, db)
 
-// TestSaveSnapshotRejectsEqual verifies that SaveSnapshot returns
-// ErrSnapshotOutOfDate when the new snapshot index equals the stored index.
-func TestSaveSnapshotRejectsEqual(t *testing.T) {
-	db := openTestDB(t)
+			err := db.SaveSnapshot(1, 1, tc.ss)
+			if !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
+				t.Fatalf("SaveSnapshot(%d) = %v, want ErrSnapshotOutOfDate", tc.ss.Index, err)
+			}
 
-	ss1 := logdb.Snapshot{Index: 100, Term: 5}
-	if err := db.SaveSnapshot(1, 1, ss1); err != nil {
-		t.Fatalf("SaveSnapshot(100): %v", err)
-	}
-
-	// Equal: index 100 == stored index 100.
-	ss2 := logdb.Snapshot{Index: 100, Term: 6}
-	err := db.SaveSnapshot(1, 1, ss2)
-	if !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-		t.Fatalf("SaveSnapshot(100 again) = %v, want ErrSnapshotOutOfDate", err)
-	}
-
-	// Verify the stored snapshot was not overwritten (still Term 5).
-	got, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
-	}
-	if got.Term != 5 {
-		t.Fatalf("GetSnapshot.Term = %d, want 5", got.Term)
-	}
-}
-
-// TestSaveSnapshotViaUpdateRejectsStale verifies that stale snapshots
-// are rejected when saved through the SaveState path (batch updates).
-func TestSaveSnapshotViaUpdateRejectsStale(t *testing.T) {
-	db := openTestDB(t)
-
-	// Save initial snapshot via SaveState.
-	err := db.SaveState([]logdb.Update{{
-		ShardID:   1,
-		ReplicaID: 1,
-		Snapshot:  logdb.Snapshot{Index: 100, Term: 5},
-	}})
-	if err != nil {
-		t.Fatalf("SaveState(ss100): %v", err)
-	}
-
-	// Stale snapshot via SaveState should silently succeed (saveUpdate
-	// still calls writeSnapshot which updates in-memory). SaveSnapshot
-	// is the gatekeeper.
-	if err := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 50, Term: 3}); !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-		t.Fatalf("SaveSnapshot(50) = %v, want ErrSnapshotOutOfDate", err)
+			// The stored snapshot was not overwritten.
+			got, err := db.GetSnapshot(1, 1)
+			if err != nil {
+				t.Fatalf("GetSnapshot: %v", err)
+			}
+			if got.Index != 100 || got.Term != 5 {
+				t.Fatalf("GetSnapshot: got %+v, want Index=100 Term=5", got)
+			}
+		})
 	}
 }
 
@@ -602,20 +583,6 @@ func TestEntryRangeAfterCompaction(t *testing.T) {
 	}
 }
 
-// TestEntryRangeOnClosedDBReturnsError verifies error on closed DB.
-func TestEntryRangeOnClosedDBReturnsError(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, WithNoSync(true))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	db.Close()
-	_, _, err = db.EntryRange(1, 1)
-	if !errors.Is(err, logdb.ErrClosed) {
-		t.Errorf("EntryRange on closed DB: got %v, want ErrClosed", err)
-	}
-}
-
 // --- Compaction tests ---
 
 // TestRemoveEntriesTo verifies entry compaction.
@@ -654,20 +621,6 @@ func TestRemoveEntriesToNonExistentNode(t *testing.T) {
 	// Should not error -- just writes a compaction marker.
 	if err := db.RemoveEntriesTo(99, 99, 100); err != nil {
 		t.Fatalf("RemoveEntriesTo: %v", err)
-	}
-}
-
-// TestCompactTriggersGC verifies Compact does not error.
-func TestCompactTriggersGC(t *testing.T) {
-	db := openTestDB(t)
-
-	entries := makeEntries(1, 10, 1)
-	if err := db.SaveEntries(1, 1, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	if err := db.Compact(1, 1); err != nil {
-		t.Fatalf("Compact: %v", err)
 	}
 }
 
@@ -1439,53 +1392,27 @@ func TestIterateEntriesNonExistentNode(t *testing.T) {
 
 // --- Error type tests ---
 
-// TestDBOpenError verifies the error type.
-func TestDBOpenError(t *testing.T) {
-	inner := os.ErrPermission
-	e := &DBOpenError{Dir: "/test", Err: inner}
-
-	msg := e.Error()
-	if msg == "" {
-		t.Fatal("Error() returned empty string")
+// TestOpenPathErrorTypes verifies that DBOpenError, RecoveryError and
+// SegmentCreateError each format a message and unwrap to their cause.
+func TestOpenPathErrorTypes(t *testing.T) {
+	tests := []struct {
+		name  string
+		err   interface{ Unwrap() error }
+		inner error
+	}{
+		{"DBOpenError", &DBOpenError{Dir: "/test", Err: os.ErrPermission}, os.ErrPermission},
+		{"RecoveryError", &RecoveryError{SegmentID: 42, Err: os.ErrNotExist}, os.ErrNotExist},
+		{"SegmentCreateError", &SegmentCreateError{SegmentID: 7, Err: os.ErrPermission}, os.ErrPermission},
 	}
-	if e.Unwrap() != inner {
-		t.Fatalf("Unwrap: got %v, want %v", e.Unwrap(), inner)
-	}
-}
-
-// TestRecoveryError verifies the error type.
-func TestRecoveryError(t *testing.T) {
-	inner := os.ErrNotExist
-	e := &RecoveryError{SegmentID: 42, Err: inner}
-
-	msg := e.Error()
-	if msg == "" {
-		t.Fatal("Error() returned empty string")
-	}
-	if e.Unwrap() != inner {
-		t.Fatalf("Unwrap: got %v, want %v", e.Unwrap(), inner)
-	}
-}
-
-// TestSegmentCreateError verifies the error type.
-func TestSegmentCreateError(t *testing.T) {
-	inner := os.ErrPermission
-	e := &SegmentCreateError{SegmentID: 7, Err: inner}
-
-	msg := e.Error()
-	if msg == "" {
-		t.Fatal("Error() returned empty string")
-	}
-	if e.Unwrap() != inner {
-		t.Fatalf("Unwrap: got %v, want %v", e.Unwrap(), inner)
-	}
-}
-
-// TestSyncDirFSSuccess verifies syncDirFS succeeds on a valid directory.
-func TestSyncDirFSSuccess(t *testing.T) {
-	dir := t.TempDir()
-	if err := syncDirFS(defaultFS(), dir); err != nil {
-		t.Fatalf("syncDirFS on valid directory: unexpected error: %v", err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if msg := tc.err.(error).Error(); msg == "" {
+				t.Fatal("Error() returned empty string")
+			}
+			if got := tc.err.Unwrap(); got != tc.inner {
+				t.Fatalf("Unwrap: got %v, want %v", got, tc.inner)
+			}
+		})
 	}
 }
 
@@ -1505,82 +1432,6 @@ func TestSyncDirFSNonExistentDir(t *testing.T) {
 	}
 }
 
-// TestEnsureActiveSegmentSyncsDirOnCreate verifies that ensureActiveSegment
-// creates the segment file and makes it durable via syncDir when noSync is
-// false. The segment file must exist on disk after the call returns.
-func TestEnsureActiveSegmentSyncsDirOnCreate(t *testing.T) {
-	dir := t.TempDir()
-
-	// Open with sync enabled (the default) to exercise the syncDir path.
-	db, err := Open(dir, WithBlockSize(4096), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	// Write one entry to trigger ensureActiveSegment.
-	entry := logdb.Entry{Index: 1, Term: 1, Cmd: []byte("hello")}
-	if err := db.SaveEntries(1, 1, []logdb.Entry{entry}); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	// Verify the segment file exists on disk. The shard directory and
-	// segment file must be present because syncDir was called after
-	// segment creation.
-	shard := db.getShard(1)
-	shard.mu.Lock()
-	segID := shard.activeSegmentID
-	shardDir := shard.dir
-	shard.mu.Unlock()
-
-	path := filepath.Join(shardDir, segmentFilename(segID))
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("segment file %s does not exist after ensureActiveSegment: %v", path, err)
-	}
-}
-
-// TestRotateSegmentSyncsDirOnNewSegment verifies that rotateSegment creates
-// a new segment with a durable directory entry via ensureActiveSegment.
-func TestRotateSegmentSyncsDirOnNewSegment(t *testing.T) {
-	dir := t.TempDir()
-
-	// Use a very small MaxFileSize to force rotation after a few entries.
-	db, err := Open(dir, WithBlockSize(512), WithMaxFileSize(2*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	// Write enough entries to force at least one segment rotation.
-	for i := 1; i <= 50; i++ {
-		entry := logdb.Entry{
-			Index: uint64(i),
-			Term:  1,
-			Cmd:   make([]byte, 100),
-		}
-		if err := db.SaveEntries(1, 1, []logdb.Entry{entry}); err != nil {
-			t.Fatalf("SaveEntries(%d): %v", i, err)
-		}
-	}
-
-	// Verify multiple segment files exist on disk.
-	shardDir := db.getShard(1).dir
-	dirEntries, err := os.ReadDir(shardDir)
-	if err != nil {
-		t.Fatalf("ReadDir(%s): %v", shardDir, err)
-	}
-
-	segCount := 0
-	for _, de := range dirEntries {
-		if !de.IsDir() {
-			segCount++
-		}
-	}
-	if segCount < 2 {
-		t.Fatalf("expected at least 2 segment files after rotation, got %d", segCount)
-	}
-}
-
 // TestShardDirName verifies shard directory naming.
 func TestShardDirName(t *testing.T) {
 	tests := []struct {
@@ -1594,24 +1445,6 @@ func TestShardDirName(t *testing.T) {
 		got := shardDirName(tt.idx)
 		if got != tt.want {
 			t.Fatalf("shardDirName(%d) = %q, want %q", tt.idx, got, tt.want)
-		}
-	}
-}
-
-// TestItoa verifies the internal itoa helper.
-func TestItoa(t *testing.T) {
-	tests := []struct {
-		n    int
-		want string
-	}{
-		{0, "0"},
-		{1, "1"},
-		{100, "100"},
-	}
-	for _, tt := range tests {
-		got := itoa(tt.n)
-		if got != tt.want {
-			t.Fatalf("itoa(%d) = %q, want %q", tt.n, got, tt.want)
 		}
 	}
 }
@@ -1758,59 +1591,6 @@ func makeMembership() logdb.Membership {
 			6: true,
 			7: true,
 		},
-	}
-}
-
-// TestSnapshotEpochPersistence verifies that Epoch is correctly persisted
-// in snapshots and survives a save/get cycle.
-func TestSnapshotEpochPersistence(t *testing.T) {
-	db := openTestDB(t)
-
-	ss := logdb.Snapshot{
-		Index:       200,
-		Term:        10,
-		Filepath:    "/data/snapshot-200",
-		FileSize:    8192,
-		OnDiskIndex: 190,
-		Epoch:       7,
-	}
-
-	if err := db.SaveSnapshot(1, 1, ss); err != nil {
-		t.Fatalf("SaveSnapshot: %v", err)
-	}
-
-	got, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
-	}
-	if got.Epoch != 7 {
-		t.Fatalf("GetSnapshot: Epoch=%d, want 7", got.Epoch)
-	}
-	if got.Index != 200 || got.Term != 10 {
-		t.Fatalf("GetSnapshot: Index=%d Term=%d, want 200 10", got.Index, got.Term)
-	}
-}
-
-// TestSnapshotEpochZero verifies that Epoch=0 (no encryption) roundtrips.
-func TestSnapshotEpochZero(t *testing.T) {
-	db := openTestDB(t)
-
-	ss := logdb.Snapshot{
-		Index: 50,
-		Term:  3,
-		Epoch: 0,
-	}
-
-	if err := db.SaveSnapshot(1, 1, ss); err != nil {
-		t.Fatalf("SaveSnapshot: %v", err)
-	}
-
-	got, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
-	}
-	if got.Epoch != 0 {
-		t.Fatalf("GetSnapshot: Epoch=%d, want 0", got.Epoch)
 	}
 }
 
@@ -2228,49 +2008,58 @@ func TestMembershipSizeHelper(t *testing.T) {
 	}
 }
 
-// TestUnmarshalAddrMapTruncated verifies unmarshalAddrMap returns -1
-// on truncated data.
-func TestUnmarshalAddrMapTruncated(t *testing.T) {
-	// Too short for count.
-	_, pos := unmarshalAddrMap([]byte{0x01, 0x02}, 0)
-	if pos != -1 {
-		t.Fatalf("unmarshalAddrMap(short count): pos=%d, want -1", pos)
+// TestUnmarshalAddrMapRejects verifies unmarshalAddrMap returns -1 on
+// truncated data and on a hostile count: a count one past the cap is
+// rejected even if the body were large, and a count at the cap with a body
+// too small for its entries is rejected by the per-entry bounds check (and
+// does not over-allocate, since boundedMapHint clamps the make hint to
+// remaining/12 == 0).
+func TestUnmarshalAddrMapRejects(t *testing.T) {
+	withCount := func(n uint32, size int) []byte {
+		buf := make([]byte, size)
+		binary.LittleEndian.PutUint32(buf, n)
+		return buf
 	}
-
-	// Count=1 but no entry data follows.
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, 1) // 1 entry
-	_, pos = unmarshalAddrMap(buf, 0)
-	if pos != -1 {
-		t.Fatalf("unmarshalAddrMap(missing entry): pos=%d, want -1", pos)
+	truncAddr := withCount(1, 4+8+4) // count + replicaID + addrLen header
+	binary.LittleEndian.PutUint64(truncAddr[4:], 1)
+	binary.LittleEndian.PutUint32(truncAddr[12:], 10) // addrLen=10 but no data
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{"short count", []byte{0x01, 0x02}},
+		{"missing entry", withCount(1, 4)},
+		{"truncated addr", truncAddr},
+		{"just over cap", withCount(maxMembershipMapEntries+1, 4)},
+		{"at cap truncated", withCount(maxMembershipMapEntries, 4)},
 	}
-
-	// Count=1, ReplicaID present but AddrLen data missing.
-	buf = make([]byte, 4+8+4) // count + replicaID + addrLen header
-	binary.LittleEndian.PutUint32(buf, 1)
-	binary.LittleEndian.PutUint64(buf[4:], 1)
-	binary.LittleEndian.PutUint32(buf[12:], 10) // addrLen=10 but no data
-	_, pos = unmarshalAddrMap(buf, 0)
-	if pos != -1 {
-		t.Fatalf("unmarshalAddrMap(truncated addr): pos=%d, want -1", pos)
+	for _, tc := range tests {
+		if _, pos := unmarshalAddrMap(tc.data, 0); pos != -1 {
+			t.Errorf("unmarshalAddrMap(%s): pos=%d, want -1", tc.name, pos)
+		}
 	}
 }
 
-// TestUnmarshalRemovedMapTruncated verifies unmarshalRemovedMap returns -1
-// on truncated data.
-func TestUnmarshalRemovedMapTruncated(t *testing.T) {
-	// Too short for count.
-	_, pos := unmarshalRemovedMap([]byte{0x01}, 0)
-	if pos != -1 {
-		t.Fatalf("unmarshalRemovedMap(short count): pos=%d, want -1", pos)
+// TestUnmarshalRemovedMapRejects verifies unmarshalRemovedMap returns -1
+// on truncated data and on a count above the cap.
+func TestUnmarshalRemovedMapRejects(t *testing.T) {
+	withCount := func(n uint32) []byte {
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, n)
+		return buf
 	}
-
-	// Count=1 but no ReplicaID follows.
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, 1)
-	_, pos = unmarshalRemovedMap(buf, 0)
-	if pos != -1 {
-		t.Fatalf("unmarshalRemovedMap(missing rid): pos=%d, want -1", pos)
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{"short count", []byte{0x01}},
+		{"missing rid", withCount(1)},
+		{"huge count", withCount(^uint32(0))},
+	}
+	for _, tc := range tests {
+		if m, pos := unmarshalRemovedMap(tc.data, 0); pos != -1 {
+			t.Errorf("unmarshalRemovedMap(%s): pos=%d m=%v, want -1", tc.name, pos, m)
+		}
 	}
 }
 
@@ -3296,38 +3085,6 @@ func TestRotateSegmentSyncsBeforeClose(t *testing.T) {
 	}
 }
 
-// TestRotateSegmentNoSyncMode verifies that rotateSegment skips fdatasync
-// when noSync is enabled, preventing unnecessary I/O overhead in test mode.
-func TestRotateSegmentNoSyncMode(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(1*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	// Write enough to force rotation with noSync enabled.
-	for i := 1; i <= 30; i++ {
-		entry := logdb.Entry{
-			Index: uint64(i),
-			Term:  1,
-			Cmd:   make([]byte, 64),
-		}
-		if err := db.SaveEntries(1, 1, []logdb.Entry{entry}); err != nil {
-			t.Fatalf("SaveEntries(%d): %v", i, err)
-		}
-	}
-
-	// Verify all entries are readable.
-	got, err := db.GetEntries(1, 1, 1, 31, 0)
-	if err != nil {
-		t.Fatalf("GetEntries: %v", err)
-	}
-	if len(got) != 30 {
-		t.Errorf("expected 30 entries, got %d", len(got))
-	}
-}
-
 // TestSaveStateMidBatchFailureNoPhantomEntries verifies that when a batch
 // write fails mid-way, in-memory entries from successful shards are NOT
 // readable. This tests the two-phase in-memory update design: in-memory
@@ -3611,42 +3368,6 @@ func TestSaveStateSuccessAppliesInMemoryUpdates(t *testing.T) {
 	}
 	if ss.Index != 3 || ss.Term != 1 {
 		t.Errorf("shard 1 snapshot: %+v", ss)
-	}
-}
-
-// TestUnmarshalAddrMapJustOverCap verifies the boundary: a count one past the
-// cap is rejected even if (hypothetically) the body were large.
-func TestUnmarshalAddrMapJustOverCap(t *testing.T) {
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, maxMembershipMapEntries+1)
-
-	if _, ok := unmarshalAddrMap(data, 0); ok != -1 {
-		t.Fatalf("count %d should be rejected (> cap %d)", maxMembershipMapEntries+1, maxMembershipMapEntries)
-	}
-}
-
-// TestUnmarshalAddrMapAtCapTruncated verifies that a count at the cap but with
-// a body too small to contain the entries is still rejected by the existing
-// per-entry bounds check (and does not over-allocate, since boundedMapHint
-// clamps the make hint to remaining/12 == 0 here).
-func TestUnmarshalAddrMapAtCapTruncated(t *testing.T) {
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, maxMembershipMapEntries)
-
-	if _, ok := unmarshalAddrMap(data, 0); ok != -1 {
-		t.Fatalf("at-cap count with empty body must be rejected as truncated")
-	}
-}
-
-// TestUnmarshalRemovedMapRejectsHugeCount mirrors the address-map case for the
-// removed map decoder.
-func TestUnmarshalRemovedMapRejectsHugeCount(t *testing.T) {
-	data := make([]byte, 4)
-	binary.LittleEndian.PutUint32(data, ^uint32(0))
-
-	m, ok := unmarshalRemovedMap(data, 0)
-	if ok != -1 {
-		t.Fatalf("expected -1 (corruption) for count > cap, got ok=%d m=%v", ok, m)
 	}
 }
 

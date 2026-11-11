@@ -28,28 +28,9 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// TestE2E_Replication_SingleEntry verifies that a single key-value entry
-// proposed through the leader is replicated to all 3 nodes.
-func TestE2E_Replication_SingleEntry(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	cmd := encodeKVPut("hello", "world")
-	result := proposeToLeader(t, cluster, 1, cmd, defaultTimeout)
-
-	if result.Value != uint64(len("world")) {
-		t.Errorf("result.Value = %d, want %d", result.Value, len("world"))
-	}
-
-	// Verify all nodes replicate the entry.
-	waitForReplication(t, cluster, trackers, 1, "hello", "world", defaultTimeout)
-}
-
 // TestE2E_Replication_MultipleEntries verifies that 50 entries are
-// replicated in order to all nodes.
+// replicated in order to all nodes, that each proposal returns the state
+// machine's result, and that a 64 KB value replicates intact.
 func TestE2E_Replication_MultipleEntries(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -62,7 +43,10 @@ func TestE2E_Replication_MultipleEntries(t *testing.T) {
 	for i := range numEntries {
 		key := fmt.Sprintf("key-%03d", i)
 		value := fmt.Sprintf("value-%03d", i)
-		proposeToLeader(t, cluster, 1, encodeKVPut(key, value), defaultTimeout)
+		result := proposeToLeader(t, cluster, 1, encodeKVPut(key, value), defaultTimeout)
+		if result.Value != uint64(len(value)) {
+			t.Errorf("entry %d: result.Value = %d, want %d", i, result.Value, len(value))
+		}
 	}
 
 	// Verify all entries on all nodes.
@@ -71,6 +55,12 @@ func TestE2E_Replication_MultipleEntries(t *testing.T) {
 		value := fmt.Sprintf("value-%03d", i)
 		waitForReplication(t, cluster, trackers, 1, key, value, defaultTimeout)
 	}
+
+	// A 64 KB value replicates intact: waitForReplication compares the full
+	// value on every live node.
+	largeValue := strings.Repeat("A", 64*1024)
+	proposeToLeader(t, cluster, 1, encodeKVPut("large-key", largeValue), defaultTimeout)
+	waitForReplication(t, cluster, trackers, 1, "large-key", largeValue, defaultTimeout)
 }
 
 // TestE2E_Replication_ConcurrentProposals verifies that proposals from
@@ -177,43 +167,6 @@ func TestE2E_Replication_StaleReadFromFollower(t *testing.T) {
 	}
 	if val != "" {
 		t.Errorf("expected empty string for nonexistent key, got %q", val)
-	}
-}
-
-// TestE2E_Replication_LargeValue verifies that a 64KB value is correctly
-// replicated across all nodes.
-func TestE2E_Replication_LargeValue(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Create a 64KB value.
-	largeValue := strings.Repeat("A", 64*1024)
-
-	proposeToLeader(t, cluster, 1, encodeKVPut("large-key", largeValue), defaultTimeout)
-
-	// Verify replication on all nodes.
-	waitForReplication(t, cluster, trackers, 1, "large-key", largeValue, defaultTimeout)
-
-	// Double-check the value length on each node.
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() {
-			continue
-		}
-		replicaID := uint64(i + 1)
-		sm := trackers[i].Get(1, replicaID)
-		if sm == nil {
-			continue
-		}
-		val, ok := sm.Get("large-key")
-		if !ok {
-			t.Fatalf("node[%d] missing large-key", i)
-		}
-		if len(val) != 64*1024 {
-			t.Fatalf("node[%d] large-key length = %d, want %d", i, len(val), 64*1024)
-		}
 	}
 }
 

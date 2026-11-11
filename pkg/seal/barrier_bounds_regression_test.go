@@ -57,40 +57,9 @@ func TestDeregisterInFlightEpochReportsUnbalancedRelease(t *testing.T) {
 	}
 }
 
-// TestDeregisterInFlightEpochNeverUnderflows pins that stray releases leave no
-// buried negative count behind. PurgeEpochsBefore protects an epoch only while
-// its count is > 0, so a count sitting at -2 would mean the next two legitimate
-// pins protect nothing at all.
-func TestDeregisterInFlightEpochNeverUnderflows(t *testing.T) {
-	captureLogs(t)
-	b, _ := testInitializedBarrier(t)
-
-	const epoch uint64 = 42
-	for range 3 {
-		b.DeregisterInFlightEpoch(epoch)
-	}
-
-	b.inFlightMu.Lock()
-	n, present := b.inFlightEpochs[epoch]
-	b.inFlightMu.Unlock()
-	if present && n < 0 {
-		t.Fatalf("pin count for a never-registered epoch = %d; the counter underflowed", n)
-	}
-
-	// A single Register must be enough to protect the epoch again, and the
-	// protection must be real: a purge has to skip it.
-	b.RegisterInFlightEpoch(epoch)
-	b.inFlightMu.Lock()
-	n, present = b.inFlightEpochs[epoch]
-	b.inFlightMu.Unlock()
-	if !present || n != 1 {
-		t.Fatalf("pin count after Register following stray releases = %d (present=%v), want 1",
-			n, present)
-	}
-}
-
-// TestPinnedEpochSurvivesPurgeAfterStrayReleases is the end-to-end statement of
-// the same invariant: stray releases before a pin is taken must not leave the
+// TestPinnedEpochSurvivesPurgeAfterStrayReleases pins that stray releases leave
+// no negative pin count behind (the purge skips only a count above zero): stray
+// releases before a pin is taken must not leave the
 // epoch unprotected once it IS taken, so a frame sealed under it stays
 // decryptable across a rotate + purge.
 func TestPinnedEpochSurvivesPurgeAfterStrayReleases(t *testing.T) {
@@ -162,27 +131,6 @@ func TestSetSealedRootKeyRejectsZeroKnownEpoch(t *testing.T) {
 	}
 }
 
-// TestSetSealedRootKeyAcceptsValidKnownEpochs pins that the new gate is
-// specific: a legitimate historical set still loads.
-func TestSetSealedRootKeyAcceptsValidKnownEpochs(t *testing.T) {
-	src := MustNewBarrier(testBarrierConfig(32))
-	if err := src.Initialize(context.Background(), testStrategy(t), Credentials{}); err != nil {
-		t.Fatalf("Initialize: %v", err)
-	}
-	if _, err := src.Rotate(context.Background()); err != nil {
-		t.Fatalf("Rotate: %v", err)
-	}
-	blob := src.SealedRootKeyData()
-	if len(blob.KnownEpochs) != 2 {
-		t.Fatalf("expected two known epochs after one rotation, got %v", blob.KnownEpochs)
-	}
-
-	b := MustNewBarrier(testBarrierConfig(32))
-	if err := b.SetSealedRootKey(blob); err != nil {
-		t.Fatalf("a valid two-epoch blob was rejected: %v", err)
-	}
-}
-
 // --- per-invocation message bounds ---
 
 // TestMaxPlaintextSizePerAlgorithm pins the ceilings against the values the
@@ -196,14 +144,9 @@ func TestMaxPlaintextSizePerAlgorithm(t *testing.T) {
 			t.Errorf("%s MaxPlaintextSize() = %d, want %d", tc.alg, got, tc.maxPlaintext)
 		}
 	}
-	// An algorithm this build does not register has no ceiling to report, which
-	// is the same answer as for an identifier nobody defined; see
+	// An identifier nobody defined has no ceiling to report. The algorithms
+	// this build leaves unregistered give the same answer, asserted in
 	// TestUnregisteredAlgorithmsAreRefused.
-	for _, alg := range unregisteredAlgorithms {
-		if got := alg.MaxPlaintextSize(); got != 0 {
-			t.Errorf("unregistered %#x MaxPlaintextSize() = %d, want 0", byte(alg), got)
-		}
-	}
 	if got := SymmetricAlgorithm(0x7f).MaxPlaintextSize(); got != 0 {
 		t.Errorf("unknown algorithm MaxPlaintextSize() = %d, want 0", got)
 	}

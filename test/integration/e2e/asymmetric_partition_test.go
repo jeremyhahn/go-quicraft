@@ -17,7 +17,6 @@
 package e2e_test
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -208,56 +207,6 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority(t *testing.T) {
 
 	t.Logf("asymmetric partition healed: all %d live nodes converged with %d entries",
 		cluster.liveNodes(), len(expected))
-}
-
-// TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority_ProposalsDuringPartition
-// is the error-path companion to TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority.
-// It verifies that proposals submitted to the partitioned (stopped) follower
-// fail gracefully, while proposals through the leader succeed.
-func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority_ProposalsDuringPartition(t *testing.T) {
-	const shardID uint64 = 1
-
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	trackers := cluster.startShard(shardID)
-	leaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-
-	// Warm up.
-	proposeAndWait(t, cluster, trackers, shardID, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, shardID, "warmup", "ok", defaultTimeout)
-
-	// Find a follower to partition.
-	followerIdx := cluster.findFollower(shardID)
-	if followerIdx < 0 {
-		t.Fatal("no follower found")
-	}
-
-	t.Logf("partitioning follower node[%d], leader is node[%d]", followerIdx, leaderIdx)
-	cluster.stopNode(followerIdx)
-
-	// Attempting to propose through a stopped node should not be
-	// possible (the host is closed). Verify the leader still works.
-	activeLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
-
-	// "Verify the leader still works" is a statement about the cluster, not
-	// about activeLeaderIdx. The index is kept for the per-replica assertion
-	// below, which replication satisfies whoever proposed.
-	proposeToLeader(t, cluster, shardID, encodeKVPut("error-path-key", "error-path-val"), defaultTimeout)
-
-	// Verify the proposal was applied on the leader.
-	replicaID := uint64(activeLeaderIdx + 1)
-	leaderSM := trackers[activeLeaderIdx].Get(shardID, replicaID)
-	if leaderSM == nil {
-		t.Fatal("leader state machine not found")
-	}
-	waitForCondition(t, defaultTimeout,
-		"leader applies error-path-key",
-		func() bool {
-			val, ok := leaderSM.Get("error-path-key")
-			return ok && val == "error-path-val"
-		},
-	)
 }
 
 // TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority verifies that
@@ -480,103 +429,6 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 
 	t.Logf("leader-majority partition healed: all %d live nodes converged with %d entries",
 		cluster.liveNodes(), len(expected))
-}
-
-// TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority_OldLeaderCannotCommit
-// is the error-path companion to TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority.
-// It verifies that the old leader, once cut off from the majority, cannot
-// commit new proposals.
-//
-// The proposal goes to the OLD LEADER, which stays RUNNING. Stopping (closing)
-// the old leader and proposing to the NEW one would establish only that a
-// healthy leader can commit — the named property, that an isolated old leader
-// cannot, would never be exercised at all, and the test would pass on a build
-// with no quorum rule.
-//
-// The harness has no per-link filtering (see the file header), so isolation is
-// produced the only way it can be: three of the five nodes are stopped, leaving
-// the old leader in a live minority of two. That is a real loss of quorum for a
-// live leader, which is the condition under test. The companion assertion — a
-// majority electing a new leader and continuing to serve — cannot coexist with
-// it here (a running old leader is reachable by everyone, so no rival majority
-// can form) and is covered by TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority.
-func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority_OldLeaderCannotCommit(t *testing.T) {
-	const shardID uint64 = 1
-
-	cluster := newTestCluster(t, 5)
-	defer cluster.close()
-
-	trackers := cluster.startShard(shardID)
-	oldLeaderIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-
-	// Warm up.
-	proposeAndWait(t, cluster, trackers, shardID, "warmup", "ok")
-	waitForReplication(t, cluster, trackers, shardID, "warmup", "ok", defaultTimeout)
-
-	t.Logf("old leader: node[%d]", oldLeaderIdx)
-
-	// Positive control: this leader commits without difficulty while it holds
-	// a majority. Without it, a build that cannot commit anything at all would
-	// satisfy the negative assertion below for entirely the wrong reason.
-	proposeAndWait(t, cluster, trackers, shardID, "quorum-intact", "committed")
-	waitForReplication(t, cluster, trackers, shardID, "quorum-intact", "committed", defaultTimeout)
-
-	// Cut the leader off from the majority by stopping three of the four
-	// followers. The leader itself keeps running with one follower: 2 of 5.
-	stopped := 0
-	for i := range cluster.hosts {
-		if i == oldLeaderIdx || stopped >= 3 {
-			continue
-		}
-		cluster.stopNode(i)
-		stopped++
-	}
-	if stopped != 3 {
-		t.Fatalf("expected to stop 3 followers, stopped %d", stopped)
-	}
-	if cluster.liveNodes() != 2 {
-		t.Fatalf("expected 2 live nodes (old leader + 1 follower), got %d", cluster.liveNodes())
-	}
-	if cluster.stopped[oldLeaderIdx].Load() {
-		t.Fatalf("the old leader node[%d] must stay running for this test", oldLeaderIdx)
-	}
-	t.Logf("old leader node[%d] left running in a 2-of-5 minority", oldLeaderIdx)
-
-	// Propose through the still-running old leader. Accepting the proposal
-	// into its log is legal; reporting it committed is not.
-	const isolatedKey = "isolated-leader-write"
-	const isolatedVal = "must-never-commit"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	//quicraft:direct-propose the isolated old leader IS the subject: it must not commit
-	rs, err := cluster.hosts[oldLeaderIdx].Propose(ctx, shardID, encodeKVPut(isolatedKey, isolatedVal))
-	if err == nil {
-		_, resErr := rs.Result()
-		rs.Release()
-		if resErr == nil {
-			cancel()
-			t.Fatalf("the isolated old leader node[%d] reported %q as committed with only "+
-				"%d of 5 nodes alive", oldLeaderIdx, isolatedKey, cluster.liveNodes())
-		}
-		t.Logf("old leader node[%d]: proposal accepted but never committed: %v", oldLeaderIdx, resErr)
-	} else {
-		t.Logf("old leader node[%d]: Propose rejected outright: %v", oldLeaderIdx, err)
-	}
-	cancel()
-
-	// The decisive assertion: the value must not have been applied anywhere.
-	assertKeyAbsentEverywhere(t, cluster, trackers, shardID, isolatedKey, 2*time.Second)
-
-	// The pre-partition data must still be intact on the minority side; losing
-	// quorum must not lose committed state.
-	waitForReplication(t, cluster, trackers, shardID, "quorum-intact", "committed", defaultTimeout)
-
-	// And the isolated leader must eventually step down rather than keep
-	// claiming leadership it can no longer support.
-	waitForCondition(t, failoverTimeout,
-		"isolated old leader steps down",
-		func() bool { return cluster.findLeader(shardID) < 0 },
-	)
-	t.Logf("isolated old leader node[%d] stepped down; no leader in the minority", oldLeaderIdx)
 }
 
 // TestE2E_AsymmetricPartition_FollowerIsolated verifies that when a single

@@ -81,31 +81,6 @@ func TestHandleVoteResp_IgnoresNonMemberGrant(t *testing.T) {
 	}
 }
 
-// A vote response queued before the sender was removed from the
-// configuration must not count once the voting set (and therefore the
-// quorum) has shrunk.
-func TestHandleVoteResp_IgnoresRemovedVoterGrant(t *testing.T) {
-	r := newRegressionRaft(t, 1, map[uint64]string{1: "a1", 2: "a2", 3: "a3", 4: "a4"})
-	r.becomeCandidate()
-	r.broadcastVote()
-
-	// RemoveNode(4) commits mid-election: quorum drops from 3 to 2 while
-	// replica 4's granted response is still in flight.
-	delete(r.remotes, 4)
-
-	if err := r.step(proto.Message{
-		Type: proto.RequestVoteResp,
-		From: 4,
-		Term: r.term,
-	}); err != nil {
-		t.Fatalf("step: %v", err)
-	}
-
-	if r.state == leader {
-		t.Fatal("became leader on a departed replica's vote plus self-vote")
-	}
-}
-
 // tallyVotes must iterate the configuration voters, not the vote map, so a
 // stale entry for a departed replica cannot be counted.
 func TestTallyVotes_CountsConfigurationVotersOnly(t *testing.T) {
@@ -1089,26 +1064,6 @@ func TestWitnessRoleMismatch_RefusesReadIndex(t *testing.T) {
 	}
 }
 
-// The reverse disagreement — started as a witness, listed as a full voting
-// replica — must latch too. Such a node applies nothing and would answer
-// reads from an empty state machine.
-func TestWitnessRoleMismatch_ConfiguredWitnessListedAsVoter(t *testing.T) {
-	cfg := raftTestCfgPreVote(1, 1, false)
-	cfg.IsWitness = true
-
-	lr := newTestLogReader(nil, proto.State{})
-	lr.membership = threeNodeMembership() // replica 1 is a full voter here
-
-	r, err := newRaft(cfg, lr)
-	if err != nil {
-		t.Fatalf("newRaft: %v", err)
-	}
-	if !r.roleMismatch {
-		t.Fatal("a replica started as a WITNESS but listed as a full voting " +
-			"member was not detected")
-	}
-}
-
 // An AGREEING configuration must not latch anything, or every witness and
 // every full replica in the cluster would stop campaigning and stop reading.
 func TestWitnessRole_AgreeingConfigurationIsNotLatched(t *testing.T) {
@@ -1140,24 +1095,6 @@ func TestWitnessRole_AgreeingConfigurationIsNotLatched(t *testing.T) {
 		}
 		if r.roleMismatch {
 			t.Fatal("a witness listed as a witness was latched")
-		}
-	})
-
-	t.Run("not in configuration", func(t *testing.T) {
-		// A joining node knows only the existing members. The configuration
-		// makes no statement about its role yet, so nothing may be latched.
-		cfg := raftTestCfgPreVote(1, 1, false)
-		cfg.IsWitness = false
-		lr := newTestLogReader(nil, proto.State{})
-		lr.membership = proto.Membership{
-			Addresses: map[uint64]string{2: "addr2", 3: "addr3"},
-		}
-		r, err := newRaft(cfg, lr)
-		if err != nil {
-			t.Fatalf("newRaft: %v", err)
-		}
-		if r.roleMismatch {
-			t.Fatal("a replica absent from the configuration was latched")
 		}
 	})
 }

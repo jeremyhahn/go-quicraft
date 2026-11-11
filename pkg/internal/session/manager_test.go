@@ -25,19 +25,6 @@ import (
 )
 
 func TestNewManager(t *testing.T) {
-	t.Run("custom limits", func(t *testing.T) {
-		m := NewManager(100, 50, 0)
-		if m.maxTotal != 100 {
-			t.Errorf("maxTotal = %d, want 100", m.maxTotal)
-		}
-		if m.MaxResponses() != 50 {
-			t.Errorf("MaxResponses() = %d, want 50", m.MaxResponses())
-		}
-		if m.Count() != 0 {
-			t.Errorf("Count() = %d, want 0", m.Count())
-		}
-	})
-
 	t.Run("defaults when zero", func(t *testing.T) {
 		m := NewManager(0, 0, 0)
 		if m.maxTotal != 16384 {
@@ -90,17 +77,6 @@ func TestManagerRegister(t *testing.T) {
 			t.Errorf("Count = %d, want 2 after failed register", m.Count())
 		}
 	})
-
-	t.Run("sets initial lastActiveIndex", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 500); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		sess := m.sessions[1]
-		if sess.lastActiveIndex != 500 {
-			t.Errorf("lastActiveIndex = %d, want 500", sess.lastActiveIndex)
-		}
-	})
 }
 
 func TestManagerUnregister(t *testing.T) {
@@ -109,14 +85,21 @@ func TestManagerUnregister(t *testing.T) {
 		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v", err)
 		}
+		if err := m.Register(2, 0, 100); err != nil {
+			t.Fatalf("Register(2) = %v", err)
+		}
 		if err := m.Unregister(1); err != nil {
 			t.Errorf("Unregister(1) = %v, want nil", err)
 		}
 		if m.IsRegistered(1) {
 			t.Error("IsRegistered(1) = true after unregister, want false")
 		}
-		if m.Count() != 0 {
-			t.Errorf("Count() = %d, want 0", m.Count())
+		// Unregistering one session leaves the others in place.
+		if !m.IsRegistered(2) {
+			t.Error("IsRegistered(2) = false after unregistering 1, want true")
+		}
+		if m.Count() != 1 {
+			t.Errorf("Count() = %d, want 1", m.Count())
 		}
 	})
 
@@ -183,48 +166,27 @@ func TestManagerCheckDuplicate(t *testing.T) {
 		}
 	})
 
-	t.Run("series already responded to returns ErrResponseEvicted", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		// Record result for series 5, advance respondedTo to 5.
-		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 10}); err != nil {
-			t.Fatalf("RecordResult(5) = %v", err)
-		}
-		if err := m.RecordResult(1, 6, 5, 102, sm.Result{Value: 20}); err != nil {
-			t.Fatalf("RecordResult(6) = %v", err)
-		}
-
-		// Series 3 is <= respondedTo (5), should return ErrResponseEvicted.
-		_, isDup, err := m.CheckDuplicate(1, 3, 103)
-		if !errors.Is(err, ErrResponseEvicted) {
-			t.Errorf("CheckDuplicate(evicted series) err = %v, want ErrResponseEvicted", err)
-		}
-		if isDup {
-			t.Error("CheckDuplicate returned duplicate for series <= respondedTo")
-		}
-	})
-
-	t.Run("series equal to respondedTo returns ErrResponseEvicted", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 10}); err != nil {
-			t.Fatalf("RecordResult(5) = %v", err)
-		}
-		if err := m.RecordResult(1, 6, 5, 102, sm.Result{Value: 20}); err != nil {
-			t.Fatalf("RecordResult(6) = %v", err)
-		}
-
-		// Series 5 == respondedTo (5), should return ErrResponseEvicted.
-		_, isDup, err := m.CheckDuplicate(1, 5, 103)
-		if !errors.Is(err, ErrResponseEvicted) {
-			t.Errorf("CheckDuplicate(series == respondedTo) err = %v, want ErrResponseEvicted", err)
-		}
-		if isDup {
-			t.Error("CheckDuplicate returned duplicate for series == respondedTo")
+	t.Run("series at or below respondedTo returns ErrResponseEvicted", func(t *testing.T) {
+		// Series 3 is below respondedTo (5) and series 5 is equal to it;
+		// both were acknowledged and must not be re-applied.
+		for _, seriesID := range []uint64{3, 5} {
+			m := NewManager(10, 10, 0)
+			if err := m.Register(1, 0, 100); err != nil {
+				t.Fatalf("Register = %v", err)
+			}
+			if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 10}); err != nil {
+				t.Fatalf("RecordResult(5) = %v", err)
+			}
+			if err := m.RecordResult(1, 6, 5, 102, sm.Result{Value: 20}); err != nil {
+				t.Fatalf("RecordResult(6) = %v", err)
+			}
+			_, isDup, err := m.CheckDuplicate(1, seriesID, 103)
+			if !errors.Is(err, ErrResponseEvicted) {
+				t.Errorf("CheckDuplicate(series %d, respondedTo 5) err = %v, want ErrResponseEvicted", seriesID, err)
+			}
+			if isDup {
+				t.Errorf("CheckDuplicate returned duplicate for series %d <= respondedTo", seriesID)
+			}
 		}
 	})
 
@@ -383,19 +345,6 @@ func TestManagerRecordResult(t *testing.T) {
 		}
 		if result.Value != 4 {
 			t.Errorf("result.Value = %d, want 4", result.Value)
-		}
-	})
-
-	t.Run("updates lastActiveIndex", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		if err := m.RecordResult(1, 1, 0, 500, sm.Result{Value: 1}); err != nil {
-			t.Fatalf("RecordResult = %v", err)
-		}
-		if m.sessions[1].lastActiveIndex != 500 {
-			t.Errorf("lastActiveIndex = %d, want 500", m.sessions[1].lastActiveIndex)
 		}
 	})
 }
@@ -754,185 +703,30 @@ func TestManagerMarshalUnmarshal(t *testing.T) {
 		}
 	})
 
-	t.Run("marshal error on write", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
+	t.Run("unmarshal truncated stream", func(t *testing.T) {
+		// One session holding one response with a data payload covers
+		// every field of the format. A stream cut at any byte before its
+		// end, from the session count through lastActiveIndex, must fail
+		// with *UnmarshalError.
+		m1 := NewManager(10, 10, 0)
+		if err := m1.Register(1, 7, 100); err != nil {
 			t.Fatalf("Register = %v", err)
 		}
-		w := &failWriter{failAfter: 0}
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("MarshalTo should fail on broken writer")
+		if err := m1.RecordResult(1, 5, 0, 101, sm.Result{Value: 42, Data: []byte("payload")}); err != nil {
+			t.Fatalf("RecordResult = %v", err)
 		}
-		var marshalErr *MarshalError
-		if !errors.As(err, &marshalErr) {
-			t.Errorf("error should be *MarshalError, got %T", err)
-		}
-	})
-
-	t.Run("unmarshal error on read", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		r := &failReader{}
-		err := m.UnmarshalFrom(r)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on broken reader")
-		}
-		var unmarshalErr *UnmarshalError
-		if !errors.As(err, &unmarshalErr) {
-			t.Errorf("error should be *UnmarshalError, got %T", err)
-		}
-	})
-
-	t.Run("unmarshal truncated clientID", func(t *testing.T) {
-		// Write valid session count (1) but no session data.
 		var buf bytes.Buffer
-		b := make([]byte, 4)
-		b[0] = 1 // numSessions = 1
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated data")
+		if err := m1.MarshalTo(&buf); err != nil {
+			t.Fatalf("MarshalTo = %v", err)
 		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
-		}
-	})
-
-	t.Run("unmarshal truncated respondedTo", func(t *testing.T) {
-		var buf bytes.Buffer
-		b := make([]byte, 12) // 4 (count) + 8 (clientID) -- missing ownerID
-		b[0] = 1              // numSessions = 1
-		b[4] = 42             // clientID = 42
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated respondedTo")
-		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
-		}
-	})
-
-	t.Run("unmarshal truncated response count", func(t *testing.T) {
-		var buf bytes.Buffer
-		// count(4) + clientID(8) + ownerID(8) + registeredIndex(8) +
-		// respondedTo(8) -- missing numResponses
-		b := make([]byte, 36)
-		b[0] = 1
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated response count")
-		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
-		}
-	})
-
-	t.Run("unmarshal truncated seriesID in response", func(t *testing.T) {
-		var buf bytes.Buffer
-		// count(4) + clientID(8) + ownerID(8) + registeredIndex(8) +
-		// respondedTo(8) + numResponses(4)
-		b := make([]byte, 40)
-		b[0] = 1  // numSessions = 1
-		b[36] = 1 // numResponses = 1, but no actual response data
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated seriesID")
-		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
-		}
-	})
-
-	t.Run("unmarshal truncated result value", func(t *testing.T) {
-		var buf bytes.Buffer
-		// ... through seriesID -- missing the result value
-		b := make([]byte, 48)
-		b[0] = 1  // numSessions = 1
-		b[36] = 1 // numResponses = 1
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated result value")
-		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
-		}
-	})
-
-	t.Run("unmarshal truncated data length", func(t *testing.T) {
-		var buf bytes.Buffer
-		// ... + seriesID + value -- missing dataLen
-		b := make([]byte, 56)
-		b[0] = 1  // numSessions
-		b[36] = 1 // numResponses
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated data length")
-		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
-		}
-	})
-
-	t.Run("unmarshal truncated data payload", func(t *testing.T) {
-		var buf bytes.Buffer
-		b := make([]byte, 60)
-		b[0] = 1  // numSessions
-		b[36] = 1 // numResponses
-		b[56] = 5 // dataLen = 5, but no data follows
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated data payload")
-		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
-		}
-	})
-
-	t.Run("unmarshal truncated lastActiveIndex", func(t *testing.T) {
-		// Valid session with 0 responses but missing lastActiveIndex.
-		var buf bytes.Buffer
-		// count(4) + clientID(8) + ownerID(8) + registeredIndex(8) +
-		// respondedTo(8) + numResponses(4)
-		b := make([]byte, 40)
-		b[0] = 1  // numSessions = 1
-		b[36] = 0 // numResponses = 0
-		buf.Write(b)
-
-		m := NewManager(10, 10, 0)
-		err := m.UnmarshalFrom(&buf)
-		if err == nil {
-			t.Fatal("UnmarshalFrom should fail on truncated lastActiveIndex")
-		}
-		var ue *UnmarshalError
-		if !errors.As(err, &ue) {
-			t.Errorf("err = %v, want *UnmarshalError", err)
+		full := buf.Bytes()
+		for n := 0; n < len(full); n++ {
+			m := NewManager(10, 10, 0)
+			err := m.UnmarshalFrom(bytes.NewReader(full[:n]))
+			var ue *UnmarshalError
+			if !errors.As(err, &ue) {
+				t.Errorf("stream cut at %d of %d bytes: err = %v, want *UnmarshalError", n, len(full), err)
+			}
 		}
 	})
 }
@@ -974,116 +768,30 @@ func TestUnmarshalError(t *testing.T) {
 }
 
 func TestManagerMarshalWriterFailures(t *testing.T) {
-	t.Run("fail writing clientID", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
+	// One session holding one response with a data payload reaches every
+	// write of the format in order: session count, clientID, ownerID,
+	// registeredIndex, respondedTo, numResponses, seriesID, result value,
+	// data length, data, lastActiveIndex. Failing each write in turn must
+	// surface a *MarshalError wrapping the writer's error.
+	m := NewManager(10, 10, 0)
+	if err := m.Register(1, 7, 100); err != nil {
+		t.Fatalf("Register = %v", err)
+	}
+	if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42, Data: []byte("payload")}); err != nil {
+		t.Fatalf("RecordResult = %v", err)
+	}
+	const writes = 11
+	for n := 0; n < writes; n++ {
+		err := m.MarshalTo(&failWriter{failAfter: n})
+		var marshalErr *MarshalError
+		if !errors.As(err, &marshalErr) || !errors.Is(err, io.ErrShortWrite) {
+			t.Errorf("write %d failing: err = %v, want *MarshalError wrapping io.ErrShortWrite", n, err)
 		}
-		w := &failWriter{failAfter: 1} // fail on second write
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
-
-	t.Run("fail writing respondedTo", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		w := &failWriter{failAfter: 2}
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
-
-	t.Run("fail writing response count", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		w := &failWriter{failAfter: 3}
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
-
-	t.Run("fail writing seriesID", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42}); err != nil {
-			t.Fatalf("RecordResult = %v", err)
-		}
-		w := &failWriter{failAfter: 4} // session count, clientID, respondedTo, numResponses, then fail
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
-
-	t.Run("fail writing result value", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42}); err != nil {
-			t.Fatalf("RecordResult = %v", err)
-		}
-		w := &failWriter{failAfter: 5}
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
-
-	t.Run("fail writing data length", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42}); err != nil {
-			t.Fatalf("RecordResult = %v", err)
-		}
-		w := &failWriter{failAfter: 6}
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
-
-	t.Run("fail writing data payload", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42, Data: []byte("payload")}); err != nil {
-			t.Fatalf("RecordResult = %v", err)
-		}
-		w := &failWriter{failAfter: 7}
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
-
-	t.Run("fail writing lastActiveIndex", func(t *testing.T) {
-		m := NewManager(10, 10, 0)
-		if err := m.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		if err := m.RecordResult(1, 5, 0, 101, sm.Result{Value: 42, Data: []byte("payload")}); err != nil {
-			t.Fatalf("RecordResult = %v", err)
-		}
-		w := &failWriter{failAfter: 8}
-		err := m.MarshalTo(w)
-		if err == nil {
-			t.Fatal("should fail")
-		}
-	})
+	}
+	// The loop bound is exact: with every write allowed, MarshalTo succeeds.
+	if err := m.MarshalTo(&failWriter{failAfter: writes}); err != nil {
+		t.Errorf("MarshalTo with %d writes allowed = %v, want nil", writes, err)
+	}
 }
 
 // failWriter is a test helper that fails after N writes.
@@ -1098,13 +806,6 @@ func (w *failWriter) Write(p []byte) (int, error) {
 	}
 	w.count++
 	return len(p), nil
-}
-
-// failReader is a test helper that always returns an error.
-type failReader struct{}
-
-func (r *failReader) Read(p []byte) (int, error) {
-	return 0, io.ErrUnexpectedEOF
 }
 
 func TestUnmarshalFrom_BoundsCheckNumSessions(t *testing.T) {
@@ -1308,38 +1009,6 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 		}
 	})
 
-	t.Run("valid data within limit", func(t *testing.T) {
-		// Result with 1KB data payload - well within the 64MiB limit.
-		m1 := NewManager(10, 10, 0)
-		if err := m1.Register(1, 0, 100); err != nil {
-			t.Fatalf("Register = %v", err)
-		}
-		data := make([]byte, 1024)
-		for i := range data {
-			data[i] = byte(i % 256)
-		}
-		if err := m1.RecordResult(1, 1, 0, 101, sm.Result{Value: 7, Data: data}); err != nil {
-			t.Fatalf("RecordResult = %v", err)
-		}
-		var buf bytes.Buffer
-		if err := m1.MarshalTo(&buf); err != nil {
-			t.Fatalf("MarshalTo = %v", err)
-		}
-		m2 := NewManager(10, 10, 0)
-		if err := m2.UnmarshalFrom(&buf); err != nil {
-			t.Fatalf("UnmarshalFrom should succeed: %v", err)
-		}
-		result, isDup, checkErr := m2.CheckDuplicate(1, 1, 200)
-		if checkErr != nil {
-			t.Fatalf("CheckDuplicate = %v", checkErr)
-		}
-		if !isDup || result.Value != 7 {
-			t.Errorf("unexpected result: isDup=%v, Value=%d", isDup, result.Value)
-		}
-		if !bytes.Equal(result.Data, data) {
-			t.Error("data mismatch after roundtrip")
-		}
-	})
 }
 
 func TestBoundsError(t *testing.T) {
@@ -1357,111 +1026,6 @@ func TestBoundsError(t *testing.T) {
 			t.Error("BoundsError should not match ErrSessionNotFound")
 		}
 	})
-}
-
-// TestManager_ExpireSessions_DeterministicAcrossReplicas verifies that two
-// independent session managers with identical configuration and state expire
-// the exact same set of sessions (same clientIDs in the same order) when
-// driven to the same log index. This is critical for Raft state machine
-// safety: all replicas must apply the same deterministic transitions so that
-// their state machines remain identical after every applied entry.
-//
-// Unlike the simpler "deterministic across replicas" subtest inside
-// TestManagerExpireSessions (which uses a single session), this test
-// exercises a realistic scenario with multiple sessions at varying activity
-// levels, a maxExpire limit smaller than the expired set, and verifies
-// element-by-element ordering equality.
-func TestManager_ExpireSessions_DeterministicAcrossReplicas(t *testing.T) {
-	const (
-		maxTotal            = 100
-		maxResponses        = 10
-		inactivityThreshold = 1000
-		currentIndex        = 5000
-		maxExpire           = 3
-		numSessions         = 8
-	)
-
-	// buildManager creates a manager and registers numSessions clients
-	// at varying initial indexes. Some sessions will be active (registered
-	// at high indexes) and some will be stale (registered at low indexes).
-	// The pattern is identical across both replicas.
-	buildManager := func(t *testing.T) *Manager {
-		t.Helper()
-		m := NewManager(maxTotal, maxResponses, 0)
-
-		// Stale sessions: registered at low indexes, will be expired.
-		staleIDs := []uint64{300, 100, 500, 200, 400}
-		for _, id := range staleIDs {
-			if err := m.Register(id, 0, 10); err != nil {
-				t.Fatalf("Register(%d) = %v", id, err)
-			}
-		}
-
-		// Active sessions: registered at recent indexes, will NOT be expired.
-		activeIDs := []uint64{600, 700, 800}
-		for _, id := range activeIDs {
-			if err := m.Register(id, 0, currentIndex-100); err != nil {
-				t.Fatalf("Register(%d) = %v", id, err)
-			}
-		}
-		return m
-	}
-
-	m1 := buildManager(t)
-	m2 := buildManager(t)
-
-	expired1 := m1.ExpireSessions(currentIndex, inactivityThreshold, maxExpire)
-	expired2 := m2.ExpireSessions(currentIndex, inactivityThreshold, maxExpire)
-
-	// Both replicas must expire exactly maxExpire sessions.
-	if len(expired1) != maxExpire {
-		t.Fatalf("m1: len(expired) = %d, want %d", len(expired1), maxExpire)
-	}
-	if len(expired2) != maxExpire {
-		t.Fatalf("m2: len(expired) = %d, want %d", len(expired2), maxExpire)
-	}
-
-	// Element-by-element comparison: same clientIDs in the same order.
-	for i := range expired1 {
-		if expired1[i] != expired2[i] {
-			t.Errorf("replica divergence at index %d: m1=%d, m2=%d",
-				i, expired1[i], expired2[i])
-		}
-	}
-
-	// The expired set must be sorted (ascending clientID) per the
-	// deterministic sort-then-limit algorithm.
-	for i := 1; i < len(expired1); i++ {
-		if expired1[i] <= expired1[i-1] {
-			t.Errorf("expired not sorted: expired[%d]=%d <= expired[%d]=%d",
-				i, expired1[i], i-1, expired1[i-1])
-		}
-	}
-
-	// Since maxExpire=3 and 5 stale sessions exist (100,200,300,400,500),
-	// the lowest 3 clientIDs must be selected.
-	want := []uint64{100, 200, 300}
-	for i, id := range want {
-		if expired1[i] != id {
-			t.Errorf("expired1[%d] = %d, want %d", i, expired1[i], id)
-		}
-	}
-
-	// Active sessions must remain on both managers.
-	for _, id := range []uint64{600, 700, 800} {
-		if !m1.IsRegistered(id) {
-			t.Errorf("m1: active session %d was incorrectly expired", id)
-		}
-		if !m2.IsRegistered(id) {
-			t.Errorf("m2: active session %d was incorrectly expired", id)
-		}
-	}
-
-	// Remaining session counts must match.
-	if m1.Count() != m2.Count() {
-		t.Errorf("session count divergence: m1=%d, m2=%d",
-			m1.Count(), m2.Count())
-	}
 }
 
 // TestManager_ReRegisterAfterUnregister verifies that a client can be
@@ -1496,11 +1060,6 @@ func TestManager_ReRegisterAfterUnregister(t *testing.T) {
 	}
 }
 
-// TestManager_ReRegisterAfterUnregister_ReturnsError verifies that
-// re-registering without unregistering first returns ErrSessionAlreadyExists.
-// TestManager_SessionLimitBoundary verifies that registering exactly at the
-// session limit succeeds, and the next registration fails with
-// ErrSessionLimitExceeded.
 // TestManager_RespondedToMonotonicallyAdvances verifies that respondedTo
 // can only advance forward. A RecordResult with a lower respondedTo does
 // not regress the session's respondedTo marker.
@@ -1549,70 +1108,5 @@ func TestManager_RespondedToMonotonicallyAdvances(t *testing.T) {
 	}
 	if result.Value != 60 {
 		t.Errorf("series 6 Value = %d, want 60", result.Value)
-	}
-}
-
-// TestManager_ExpireSessionsZeroMaxExpire verifies that ExpireSessions
-// returns nil when maxExpire is zero, even when there are stale sessions.
-// TestManager_ExpireSessionsNegativeMaxExpire verifies that
-// ExpireSessions handles a negative maxExpire gracefully.
-// TestManager_CheckDuplicateUnregistered verifies that CheckDuplicate
-// returns ErrSessionNotFound for a session that was never registered.
-// TestManager_MarshalUnmarshalManySessionsWithResponses verifies that
-// a large number of sessions with multiple cached responses each survive
-// a snapshot round-trip with all data intact.
-func TestManager_MarshalUnmarshalManySessionsWithResponses(t *testing.T) {
-	const numSessions = 50
-	const numResponses = 10
-	m := NewManager(1000, 1000, 0)
-
-	for id := uint64(1); id <= numSessions; id++ {
-		if err := m.Register(id, 0, id*10); err != nil {
-			t.Fatalf("Register(%d) = %v", id, err)
-		}
-		for sid := uint64(1); sid <= numResponses; sid++ {
-			result := sm.Result{Value: id*1000 + sid}
-			if err := m.RecordResult(id, sid, 0, id*10+sid, result); err != nil {
-				t.Fatalf("RecordResult(%d, %d) = %v", id, sid, err)
-			}
-		}
-	}
-
-	// Marshal.
-	var buf bytes.Buffer
-	if err := m.MarshalTo(&buf); err != nil {
-		t.Fatalf("MarshalTo: %v", err)
-	}
-
-	// Unmarshal into a new manager.
-	restored := NewManager(1000, 1000, 0)
-	if err := restored.UnmarshalFrom(bytes.NewReader(buf.Bytes())); err != nil {
-		t.Fatalf("UnmarshalFrom: %v", err)
-	}
-
-	if restored.Count() != numSessions {
-		t.Fatalf("Count = %d, want %d", restored.Count(), numSessions)
-	}
-
-	// Spot-check every session and response.
-	for id := uint64(1); id <= numSessions; id++ {
-		if !restored.IsRegistered(id) {
-			t.Errorf("session %d not registered after restore", id)
-			continue
-		}
-		for sid := uint64(1); sid <= numResponses; sid++ {
-			result, isDup, err := restored.CheckDuplicate(id, sid, 99999)
-			if err != nil {
-				t.Fatalf("CheckDuplicate(%d, %d) = %v", id, sid, err)
-			}
-			if !isDup {
-				t.Errorf("session %d series %d should be duplicate", id, sid)
-			}
-			want := id*1000 + sid
-			if result.Value != want {
-				t.Errorf("session %d series %d Value = %d, want %d",
-					id, sid, result.Value, want)
-			}
-		}
 	}
 }

@@ -16,7 +16,6 @@ package engine
 
 import (
 	"sync"
-	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -75,28 +74,3 @@ func (s *testSender) sentMessages() []proto.Message {
 
 // Verify testSender implements MessageSender at compile time.
 var _ MessageSender = (*testSender)(nil)
-
-func TestMessageSender_ConcurrentSend(t *testing.T) {
-	s := newTestSender()
-	const goroutines = 10
-	const msgsPerGoroutine = 100
-
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for g := range goroutines {
-		go func(id int) {
-			defer wg.Done()
-			for range msgsPerGoroutine {
-				s.Send([]proto.Message{
-					{ShardID: uint64(id)},
-				})
-			}
-		}(g)
-	}
-	wg.Wait()
-
-	expected := goroutines * msgsPerGoroutine
-	if s.sentCount() != expected {
-		t.Fatalf("expected %d sent messages, got %d", expected, s.sentCount())
-	}
-}

@@ -109,153 +109,24 @@ func TestSetDefaultsPreservesExplicitValues(t *testing.T) {
 	}
 }
 
-// TestValidateAcceptsValidConfig verifies that a valid configuration passes.
-func TestValidateAcceptsValidConfig(t *testing.T) {
-	cfg := Config{
-		ListenAddress: ":0",
-		MTLSConfig:    testMTLSConfig(t),
-	}
-	cfg.SetDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("unexpected validation error: %v", err)
-	}
-}
-
-// TestValidateRejectsEmptyListenAddress verifies missing listen address.
-func TestValidateRejectsEmptyListenAddress(t *testing.T) {
-	cfg := Config{}
-	cfg.SetDefaults()
-	err := cfg.Validate()
-	if !errors.Is(err, ErrEmptyListenAddress) {
-		t.Fatalf("expected ErrEmptyListenAddress, got %v", err)
-	}
-}
-
-// TestValidateRejectsInvalidStreamPoolSize verifies out-of-range pool sizes.
-func TestValidateRejectsInvalidStreamPoolSize(t *testing.T) {
-	tests := []struct {
-		name          string
-		poolSize      int
-		maxPoolSize   int
-		expectedError error
-	}{
-		{
-			name:          "pool size zero",
-			poolSize:      0,
-			maxPoolSize:   256,
-			expectedError: ErrInvalidStreamPoolSize,
-		},
-		{
-			name:          "pool size exceeds max",
-			poolSize:      300,
-			maxPoolSize:   256,
-			expectedError: ErrInvalidStreamPoolSize,
-		},
-		{
-			name:          "negative max pool size",
-			poolSize:      1,
-			maxPoolSize:   0,
-			expectedError: ErrInvalidMaxStreamPoolSize,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{
-				ListenAddress: ":0",
-				MTLSConfig:    testMTLSConfig(t),
-			}
-			cfg.SetDefaults()
-			cfg.StreamPoolSize = tc.poolSize
-			cfg.MaxStreamPoolSize = tc.maxPoolSize
-			err := cfg.Validate()
-			if !errors.Is(err, tc.expectedError) {
-				t.Fatalf("expected %v, got %v", tc.expectedError, err)
-			}
-		})
-	}
-}
-
-// TestValidateRejectsInvalidSnapshotConfig verifies snapshot config validation.
-func TestValidateRejectsInvalidSnapshotConfig(t *testing.T) {
+// TestValidateRejectsInvalidConfig verifies that Validate rejects each
+// out-of-range field of an otherwise valid, defaulted Config with the
+// sentinel that names it.
+func TestValidateRejectsInvalidConfig(t *testing.T) {
 	tests := []struct {
 		name          string
 		mutate        func(*Config)
 		expectedError error
 	}{
-		{
-			name: "negative snapshot receive rate",
-			mutate: func(c *Config) {
-				c.MaxSnapshotReceiveRate = -1
-			},
-			expectedError: ErrInvalidMaxSnapshotReceiveRate,
-		},
-		{
-			name: "zero concurrent snapshot recv",
-			mutate: func(c *Config) {
-				c.MaxConcurrentSnapshotRecv = 0
-			},
-			expectedError: ErrInvalidMaxConcurrentSnapshotRecv,
-		},
-		{
-			name: "negative snapshot memory",
-			mutate: func(c *Config) {
-				c.MaxSnapshotReceiveMemory = -1
-			},
-			expectedError: ErrInvalidMaxSnapshotReceiveMemory,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{ListenAddress: ":0", MTLSConfig: testMTLSConfig(t)}
-			cfg.SetDefaults()
-			tc.mutate(&cfg)
-			err := cfg.Validate()
-			if !errors.Is(err, tc.expectedError) {
-				t.Fatalf("expected %v, got %v", tc.expectedError, err)
-			}
-		})
-	}
-}
-
-// TestValidateRejectsInvalidBatchConfig verifies batch config validation.
-func TestValidateRejectsInvalidBatchConfig(t *testing.T) {
-	tests := []struct {
-		name          string
-		mutate        func(*Config)
-		expectedError error
-	}{
-		{
-			name: "zero batch max size",
-			mutate: func(c *Config) {
-				c.SendBatchMaxSize = 0
-			},
-			expectedError: ErrInvalidSendBatchMaxSize,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{ListenAddress: ":0", MTLSConfig: testMTLSConfig(t)}
-			cfg.SetDefaults()
-			tc.mutate(&cfg)
-			err := cfg.Validate()
-			if !errors.Is(err, tc.expectedError) {
-				t.Fatalf("expected %v, got %v", tc.expectedError, err)
-			}
-		})
-	}
-}
-
-// TestValidateRejectsInvalidDecompressedSize verifies decompressed size bounds.
-func TestValidateRejectsInvalidDecompressedSize(t *testing.T) {
-	tests := []struct {
-		name string
-		size uint32
-	}{
-		{"zero", 0},
-		{"exceeds max frame size", MaxFrameSize + 1},
+		{"pool size zero", func(c *Config) { c.StreamPoolSize, c.MaxStreamPoolSize = 0, 256 }, ErrInvalidStreamPoolSize},
+		{"pool size exceeds max", func(c *Config) { c.StreamPoolSize, c.MaxStreamPoolSize = 300, 256 }, ErrInvalidStreamPoolSize},
+		{"zero max pool size", func(c *Config) { c.StreamPoolSize, c.MaxStreamPoolSize = 1, 0 }, ErrInvalidMaxStreamPoolSize},
+		{"negative snapshot receive rate", func(c *Config) { c.MaxSnapshotReceiveRate = -1 }, ErrInvalidMaxSnapshotReceiveRate},
+		{"zero concurrent snapshot recv", func(c *Config) { c.MaxConcurrentSnapshotRecv = 0 }, ErrInvalidMaxConcurrentSnapshotRecv},
+		{"negative snapshot memory", func(c *Config) { c.MaxSnapshotReceiveMemory = -1 }, ErrInvalidMaxSnapshotReceiveMemory},
+		{"zero batch max size", func(c *Config) { c.SendBatchMaxSize = 0 }, ErrInvalidSendBatchMaxSize},
+		{"zero decompressed size", func(c *Config) { c.MaxDecompressedSize = 0 }, ErrInvalidMaxDecompressedSize},
+		{"decompressed size exceeds max frame size", func(c *Config) { c.MaxDecompressedSize = MaxFrameSize + 1 }, ErrInvalidMaxDecompressedSize},
 		// Below the frame size is the dangerous direction and the reason the
 		// value is pinned. MaxFrameSize is a compile-time constant and is what
 		// the SEND path admits against (messageFrameError/sendableGroup), so a
@@ -268,112 +139,23 @@ func TestValidateRejectsInvalidDecompressedSize(t *testing.T) {
 		// bought in exchange — a peer that wants this node to buffer MaxFrameSize
 		// bytes can just send an uncompressed frame of that size — so a lower
 		// decompression ceiling is pure downside and must fail at startup.
-		{"below max frame size", MaxFrameSize - 1},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{ListenAddress: ":0", MTLSConfig: testMTLSConfig(t)}
-			cfg.SetDefaults()
-			cfg.MaxDecompressedSize = tc.size
-			err := cfg.Validate()
-			if !errors.Is(err, ErrInvalidMaxDecompressedSize) {
-				t.Fatalf("expected ErrInvalidMaxDecompressedSize, got %v", err)
-			}
-		})
-	}
-}
-
-// TestValidateRejectsIncompleteMTLSConfig verifies that partial mTLS
-// config is rejected.
-func TestValidateRejectsIncompleteMTLSConfig(t *testing.T) {
-	tests := []struct {
-		name string
-		cfg  *MTLSConfig
-	}{
-		{
-			name: "missing CA cert",
-			cfg:  &MTLSConfig{Cert: []byte("cert"), Key: []byte("key")},
-		},
-		{
-			name: "missing cert",
-			cfg:  &MTLSConfig{CACert: []byte("ca"), Key: []byte("key")},
-		},
-		{
-			name: "missing key",
-			cfg:  &MTLSConfig{CACert: []byte("ca"), Cert: []byte("cert")},
-		},
-		{
-			name: "all empty",
-			cfg:  &MTLSConfig{},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{
-				ListenAddress: ":0",
-				MTLSConfig:    tc.cfg,
-			}
-			cfg.SetDefaults()
-			err := cfg.Validate()
-			if !errors.Is(err, ErrIncompleteMTLSConfig) {
-				t.Fatalf("expected ErrIncompleteMTLSConfig, got %v", err)
-			}
-		})
-	}
-}
-
-// TestValidateRejectsNilMTLSConfig verifies that nil MTLSConfig is rejected
-// since mTLS is now mandatory.
-func TestValidateRejectsNilMTLSConfig(t *testing.T) {
-	cfg := Config{
-		ListenAddress: ":0",
-		MTLSConfig:    nil,
-	}
-	cfg.SetDefaults()
-	err := cfg.Validate()
-	if !errors.Is(err, ErrMTLSConfigRequired) {
-		t.Fatalf("expected ErrMTLSConfigRequired, got %v", err)
-	}
-}
-
-// TestValidateRejectsInvalidConnectionLimits verifies that connection limit
-// fields are validated.
-func TestValidateRejectsInvalidConnectionLimits(t *testing.T) {
-	tests := []struct {
-		name          string
-		mutate        func(*Config)
-		expectedError error
-	}{
-		{
-			name: "zero MaxIncomingConnections",
-			mutate: func(c *Config) {
-				c.MaxIncomingConnections = 0
-			},
-			expectedError: ErrInvalidMaxIncomingConnections,
-		},
-		{
-			name: "negative MaxIncomingConnections",
-			mutate: func(c *Config) {
-				c.MaxIncomingConnections = -1
-			},
-			expectedError: ErrInvalidMaxIncomingConnections,
-		},
-		{
-			name: "zero MaxConnectionsPerIP",
-			mutate: func(c *Config) {
-				c.MaxConnectionsPerIP = 0
-			},
-			expectedError: ErrInvalidMaxConnectionsPerIP,
-		},
-		{
-			name: "negative MaxConnectionsPerIP",
-			mutate: func(c *Config) {
-				c.MaxConnectionsPerIP = -1
-			},
-			expectedError: ErrInvalidMaxConnectionsPerIP,
-		},
+		{"decompressed size below max frame size", func(c *Config) { c.MaxDecompressedSize = MaxFrameSize - 1 }, ErrInvalidMaxDecompressedSize},
+		{"zero MaxIncomingConnections", func(c *Config) { c.MaxIncomingConnections = 0 }, ErrInvalidMaxIncomingConnections},
+		{"negative MaxIncomingConnections", func(c *Config) { c.MaxIncomingConnections = -1 }, ErrInvalidMaxIncomingConnections},
+		{"zero MaxConnectionsPerIP", func(c *Config) { c.MaxConnectionsPerIP = 0 }, ErrInvalidMaxConnectionsPerIP},
+		{"negative MaxConnectionsPerIP", func(c *Config) { c.MaxConnectionsPerIP = -1 }, ErrInvalidMaxConnectionsPerIP},
+		{"zero MaxStreamsPerConnection", func(c *Config) { c.MaxStreamsPerConnection = 0 }, ErrInvalidMaxStreamsPerConnection},
+		{"negative MaxStreamsPerConnection", func(c *Config) { c.MaxStreamsPerConnection = -1 }, ErrInvalidMaxStreamsPerConnection},
+		{"mTLS missing CA cert", func(c *Config) { c.MTLSConfig = &MTLSConfig{Cert: []byte("cert"), Key: []byte("key")} }, ErrIncompleteMTLSConfig},
+		{"mTLS missing cert", func(c *Config) { c.MTLSConfig = &MTLSConfig{CACert: []byte("ca"), Key: []byte("key")} }, ErrIncompleteMTLSConfig},
+		{"mTLS missing key", func(c *Config) { c.MTLSConfig = &MTLSConfig{CACert: []byte("ca"), Cert: []byte("cert")} }, ErrIncompleteMTLSConfig},
+		{"mTLS all empty", func(c *Config) { c.MTLSConfig = &MTLSConfig{} }, ErrIncompleteMTLSConfig},
+		// The 0-RTT check precedes the general MTLSConfig requirement for
+		// defense-in-depth: even if the mTLS mandate were relaxed in the
+		// future, 0-RTT would still require it.
+		{"0-RTT without mTLS", func(c *Config) { c.Enable0RTT, c.MTLSConfig = true, nil }, ErrInsecure0RTT},
+		{"zero MaxMessageReceiveMemory", func(c *Config) { c.MaxMessageReceiveMemory = 0 }, ErrInvalidMaxMessageReceiveMemory},
+		{"negative MaxMessageReceiveMemory", func(c *Config) { c.MaxMessageReceiveMemory = -1 }, ErrInvalidMaxMessageReceiveMemory},
 	}
 
 	for _, tc := range tests {
@@ -389,88 +171,29 @@ func TestValidateRejectsInvalidConnectionLimits(t *testing.T) {
 	}
 }
 
-// TestValidateAcceptsMinimumConnectionLimits verifies that minimum valid
-// connection limit values pass validation.
-func TestValidateAcceptsMinimumConnectionLimits(t *testing.T) {
-	cfg := Config{ListenAddress: ":0", MTLSConfig: testMTLSConfig(t)}
-	cfg.SetDefaults()
-	cfg.MaxIncomingConnections = 1
-	cfg.MaxConnectionsPerIP = 1
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("minimum connection limits should be valid, got: %v", err)
-	}
-}
-
-// TestValidateRejects0RTTWithoutMTLS verifies that enabling 0-RTT without
-// mTLS returns ErrInsecure0RTT. The 0-RTT check precedes the general
-// MTLSConfig requirement for defense-in-depth: even if the mTLS mandate
-// were relaxed in the future, 0-RTT would still require it.
-func TestValidateRejects0RTTWithoutMTLS(t *testing.T) {
-	cfg := Config{
-		ListenAddress: ":0",
-		Enable0RTT:    true,
-		MTLSConfig:    nil,
-	}
-	cfg.SetDefaults()
-	err := cfg.Validate()
-	if !errors.Is(err, ErrInsecure0RTT) {
-		t.Fatalf("expected ErrInsecure0RTT, got %v", err)
-	}
-}
-
-// TestValidateAccepts0RTTWithMTLS verifies that enabling 0-RTT with a
-// complete mTLS configuration passes validation.
-func TestValidateAccepts0RTTWithMTLS(t *testing.T) {
-	cfg := Config{
-		ListenAddress: ":0",
-		Enable0RTT:    true,
-		MTLSConfig: &MTLSConfig{
-			CACert: []byte("ca"),
-			Cert:   []byte("cert"),
-			Key:    []byte("key"),
-		},
-	}
-	cfg.SetDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("0-RTT with mTLS should be valid, got: %v", err)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// MaxStreamsPerConnection config + validation
-// ---------------------------------------------------------------------------
-
-// TestConfigMaxStreamsPerConnectionValidation verifies that
-// MaxStreamsPerConnection < 1 returns ErrInvalidMaxStreamsPerConnection.
-func TestConfigMaxStreamsPerConnectionValidation(t *testing.T) {
+// TestValidateAcceptsBoundaryValues verifies that the minimum valid limits,
+// and 0-RTT with complete mTLS material, pass validation.
+func TestValidateAcceptsBoundaryValues(t *testing.T) {
 	tests := []struct {
-		name  string
-		value int
+		name   string
+		mutate func(*Config)
 	}{
-		{"zero", 0},
-		{"negative", -1},
+		{"minimum connection limits", func(c *Config) { c.MaxIncomingConnections, c.MaxConnectionsPerIP = 1, 1 }},
+		{"minimum MaxStreamsPerConnection", func(c *Config) { c.MaxStreamsPerConnection = 1 }},
+		{"0-RTT with mTLS", func(c *Config) {
+			c.Enable0RTT = true
+			c.MTLSConfig = &MTLSConfig{CACert: []byte("ca"), Cert: []byte("cert"), Key: []byte("key")}
+		}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Config{ListenAddress: ":0", MTLSConfig: testMTLSConfig(t)}
 			cfg.SetDefaults()
-			cfg.MaxStreamsPerConnection = tc.value
-			err := cfg.Validate()
-			if !errors.Is(err, ErrInvalidMaxStreamsPerConnection) {
-				t.Fatalf("expected ErrInvalidMaxStreamsPerConnection, got %v", err)
+			tc.mutate(&cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("%s should be valid, got: %v", tc.name, err)
 			}
 		})
-	}
-}
-
-// TestConfigMaxStreamsPerConnectionMinimumValid verifies that
-// MaxStreamsPerConnection = 1 passes validation.
-func TestConfigMaxStreamsPerConnectionMinimumValid(t *testing.T) {
-	cfg := Config{ListenAddress: ":0", MTLSConfig: testMTLSConfig(t)}
-	cfg.SetDefaults()
-	cfg.MaxStreamsPerConnection = 1
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("MaxStreamsPerConnection=1 should be valid, got: %v", err)
 	}
 }

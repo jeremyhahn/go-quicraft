@@ -581,6 +581,9 @@ func TestDragonboat_SnapshotFailureResetToProbe(t *testing.T) {
 	if rm.state != remoteSnapshot || !rm.isPaused() {
 		t.Fatalf("expected paused snapshot backoff after failure, got %s", rm.state)
 	}
+	if rm.snapshotWaitTicks != r.electionTimeout {
+		t.Fatalf("expected backoff %d, got %d", r.electionTimeout, rm.snapshotWaitTicks)
+	}
 	for i := 0; i < r.electionTimeout; i++ {
 		r.tickSnapshotWaits()
 	}

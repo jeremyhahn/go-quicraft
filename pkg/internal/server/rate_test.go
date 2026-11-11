@@ -156,14 +156,9 @@ func TestInMemRateLimiter_Enabled(t *testing.T) {
 	if rl.MaxSize() != 1000 {
 		t.Fatalf("MaxSize = %d, want 1000", rl.MaxSize())
 	}
-}
-
-func TestInMemRateLimiter_BasicIncreaseDecrease(t *testing.T) {
-	rl := NewInMemRateLimiter(1000)
+	// The local size is held by the wrapped RateLimiter; the arithmetic is
+	// TestRateLimiter_IncreaseDecrease, this checks only the delegation.
 	rl.Increase(500)
-	if rl.Get() != 500 {
-		t.Fatalf("Get = %d, want 500", rl.Get())
-	}
 	rl.Decrease(200)
 	if rl.Get() != 300 {
 		t.Fatalf("Get = %d, want 300", rl.Get())

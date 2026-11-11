@@ -75,6 +75,12 @@ func corruptTailFixture(t *testing.T) *Peer {
 // The error must reach the caller; the watermark must ALSO still be armed, so a
 // caller that ignores the error keeps the old fail-closed campaigning behaviour
 // rather than getting nothing.
+//
+// The controls over the same fixture with the tail intact are in
+// processed_fold_divergence_regression_test.go: a readable tail folds and
+// reports no error (TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign),
+// and an unreadable but not corrupt one arms the watermark and reports no error
+// either (TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign).
 func TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry(t *testing.T) {
 	quietLogs(t)
 
@@ -102,60 +108,5 @@ func TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry(t *testing.T) {
 	if c := p.UnfoldedConfig(); !c.Recorded() || c.Index != 31 ||
 		c.StaleThrough != p.staleConfigThrough || !errors.Is(c.Err, ErrCorruptConfigEntry) {
 		t.Fatalf("UnfoldedConfig = %+v, want a recorded fold to 31 carrying ErrCorruptConfigEntry", c)
-	}
-}
-
-// TestSetProcessedIndex_CleanFoldReportsNoError is the POSITIVE CONTROL, and it
-// is what stops the assertion above from being satisfied by a method that
-// returns an error unconditionally. A readable tail must fold, clear the
-// watermark, and report success.
-func TestSetProcessedIndex_CleanFoldReportsNoError(t *testing.T) {
-	quietLogs(t)
-
-	p, _ := staleTailFixture(t)
-	applied, err := p.SetProcessedIndex(31)
-	if err != nil {
-		t.Fatalf("SetProcessedIndex over a readable tail: %v; a shard whose log is "+
-			"intact must start", err)
-	}
-	if applied != 31 {
-		t.Fatalf("applied = %d, want 31", applied)
-	}
-	if p.staleConfigThrough != 0 {
-		t.Fatalf("staleConfigThrough = %d after a complete fold", p.staleConfigThrough)
-	}
-	if !p.membership.isVoter(4) {
-		t.Fatal("the readable tail was not folded")
-	}
-	if c := p.UnfoldedConfig(); c.Recorded() {
-		t.Fatalf("UnfoldedConfig = %+v after a complete fold, want none", c)
-	}
-}
-
-// TestSetProcessedIndex_UnreadableButNotCorruptIsNotAnError pins the
-// distinction the return value has to make. A window this replica could not READ
-// is not a window it can never read: the commit pipeline or
-// resolveStaleStartupConfig may cover it later, so it arms the watermark and
-// reports no error. Only "these committed bytes will never decode" is terminal.
-//
-// Without this the fix would turn every transient log-read failure at startup
-// into a refusal to start the shard, which is a far worse availability
-// regression than the safety hole it closes.
-func TestSetProcessedIndex_UnreadableButNotCorruptIsNotAnError(t *testing.T) {
-	quietLogs(t)
-
-	p, lr := staleTailFixture(t)
-	lr.failing = true
-	applied, err := p.SetProcessedIndex(31)
-	if err != nil {
-		t.Fatalf("SetProcessedIndex over an UNREADABLE (not corrupt) tail returned "+
-			"%v; a transient read failure must arm the watermark and let the shard "+
-			"start, or every such failure becomes a refusal to load the shard", err)
-	}
-	if applied != 31 {
-		t.Fatalf("applied = %d, want 31", applied)
-	}
-	if p.staleConfigThrough == 0 {
-		t.Fatal("the watermark was cleared over a window that was never read")
 	}
 }

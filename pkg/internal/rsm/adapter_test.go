@@ -149,7 +149,6 @@ func TestSMWrappers_UserSMErrorsPropagate(t *testing.T) {
 		{"concurrent recover", recoverFrom(&concurrentSMWrapper{sm: &testConcurrentKVRecoverErr{testConcurrentKV: *newTestConcurrentKV()}}), isType(new(*testAdapterRecoverError))},
 		{"concurrent close", closeW(&concurrentSMWrapper{sm: &testConcurrentKVCloseErr{testConcurrentKV: *newTestConcurrentKV()}}), isType(new(*testAdapterCloseError))},
 		{"concurrent lookup", lookup(&concurrentSMWrapper{sm: newTestConcurrentKV()}), anyErr},
-		{"on-disk sync stops save", save(&onDiskSMWrapper{sm: &testOnDiskKVSyncErr{testOnDiskKV: *newTestOnDiskKV()}}), isType(new(*testAdapterSyncError))},
 		{"on-disk prepare stops save", save(&onDiskSMWrapper{sm: &testOnDiskKVPrepErr{testOnDiskKV: *newTestOnDiskKV()}}), isType(new(*testPrepareError))},
 		{"on-disk save", save(&onDiskSMWrapper{sm: &testOnDiskKVSaveErr{testOnDiskKV: *newTestOnDiskKV()}}), isType(new(*testAdapterSaveError))},
 		{"on-disk update", update(&onDiskSMWrapper{sm: &testOnDiskKVUpdateErr{testOnDiskKV: *newTestOnDiskKV()}}), isType(new(*testAdapterUpdateError))},
@@ -279,20 +278,6 @@ type testConcurrentKVPrepError struct {
 
 func (kv *testConcurrentKVPrepError) PrepareSnapshot() (interface{}, error) {
 	return nil, &testPrepareError{}
-}
-
-// testOnDiskKVSyncErr fails Sync.
-type testOnDiskKVSyncErr struct {
-	testOnDiskKV
-}
-
-// testAdapterSyncError is a typed error for Sync.
-type testAdapterSyncError struct{}
-
-func (e *testAdapterSyncError) Error() string { return "test adapter sync error" }
-
-func (kv *testOnDiskKVSyncErr) Sync() error {
-	return &testAdapterSyncError{}
 }
 
 // testOnDiskKVPrepErr fails PrepareSnapshot.
@@ -441,7 +426,6 @@ func (kv *testConcurrentKVSaveErr) SaveSnapshot(_ context.Context, _ interface{}
 // On-disk SM wrapper: SaveSnapshot error from underlying SM
 // ---------------------------------------------------------------------------
 
-// testOnDiskKVSaveErr fails SaveSnapshot after Sync and PrepareSnapshot succeed.
 // testRegularKVSaveErr fails SaveSnapshot.
 type testRegularKVSaveErr struct {
 	testKV
@@ -451,6 +435,7 @@ func (kv *testRegularKVSaveErr) SaveSnapshot(_ context.Context, _ io.Writer, _ <
 	return &testAdapterSaveError{}
 }
 
+// testOnDiskKVSaveErr fails SaveSnapshot after Sync and PrepareSnapshot succeed.
 type testOnDiskKVSaveErr struct {
 	testOnDiskKV
 }

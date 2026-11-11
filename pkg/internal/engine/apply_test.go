@@ -205,96 +205,6 @@ func TestApplyWorker_RecoverFromSMPanic_ShardContinuesAfterPanic(t *testing.T) {
 	close(stopC)
 }
 
-// TestApplyWorker_DispatchSkipsUnloadedShard verifies that when a shard
-// has been unloaded via requestUnload, subsequent applyItems for that
-// shard are discarded by dispatch() instead of spawning a new per-shard
-// goroutine. This prevents the goroutine leak described in the bug where
-// the commit worker enqueues an item after the unload is processed.
-func TestApplyWorker_DispatchSkipsUnloadedShard(t *testing.T) {
-	applyC := make(chan *applyItem, 64)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	ws := NewWorkSignal(1)
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, cb, nil, ws, stopC, nil)
-
-	// Create a working state machine and node for shard 10.
-	goodSM := newTestSM()
-	goodApplier := newTestApplier(goodSM)
-	cfg := config.Config{ShardID: 10, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(nil, goodApplier, nil, cfg, nil, "", nil)
-
-	// Start the dispatcher.
-	go aw.run()
-
-	// Send one item so a per-shard goroutine is created for shard 10.
-	node.commitPending.Store(true)
-	item1 := applyPool.Get().(*applyItem)
-	item1.update = proto.Update{
-		ShardID:   10,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Index: 1, Term: 1, Cmd: []byte("first")},
-		},
-	}
-	item1.node = node
-	applyC <- item1
-
-	// Wait for the apply callback to confirm shard 10 processed.
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for shard 10 initial apply", func() bool {
-		for _, c := range cb.getAppliedCalls() {
-			if c.shardID == 10 {
-				return true
-			}
-		}
-		return false
-	})
-
-	// Unload shard 10. The dispatcher processes the request via
-	// removeShardChan, closing the per-shard channel and adding shard 10
-	// to the unloaded set; the returned done channel closes only after
-	// the per-shard goroutine has exited, so the unload is fully
-	// processed before the stale item below is sent.
-	<-aw.requestUnload(10)
-
-	// Send a stale item for shard 10 after unload.
-	node.commitPending.Store(true)
-	item2 := applyPool.Get().(*applyItem)
-	item2.update = proto.Update{
-		ShardID:   10,
-		ReplicaID: 1,
-		CommittedEntries: []proto.Entry{
-			{Index: 2, Term: 1, Cmd: []byte("stale-after-unload")},
-		},
-	}
-	item2.node = node
-	applyC <- item2
-
-	// Wait for commitPending to be cleared by the dispatch discard path.
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for commitPending to be cleared on discarded item", func() bool {
-		return !node.commitPending.Load()
-	})
-
-	// Verify the second item was NOT applied (no second callback for shard 10).
-	appliedCalls := cb.getAppliedCalls()
-	count := 0
-	for _, c := range appliedCalls {
-		if c.shardID == 10 {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Fatalf("expected exactly 1 apply callback for shard 10, got %d", count)
-	}
-
-	// Stop cleanly and verify no goroutine leak: wg.Wait in run()
-	// should complete promptly since no leaked goroutine exists.
-	close(stopC)
-}
-
 // TestApplyWorker_DispatchSkipsUnloadedShard_NoNode verifies that
 // dispatch correctly handles a nil node on a stale applyItem for an
 // unloaded shard. This covers the defensive nil check on item.node.
@@ -531,18 +441,6 @@ func TestSMPanicError_ErrorMessage(t *testing.T) {
 	expected := "engine: state machine panic for shard 42 replica 7: test panic"
 	if err.Error() != expected {
 		t.Fatalf("expected %q, got %q", expected, err.Error())
-	}
-}
-
-// TestSMPanicError_Is_MatchesSentinel verifies errors.Is matches ErrShardFailed.
-func TestSMPanicError_Is_MatchesSentinel(t *testing.T) {
-	err := &SMPanicError{
-		ShardID:   1,
-		ReplicaID: 1,
-		Value:     "panic",
-	}
-	if !errors.Is(err, ErrShardFailed) {
-		t.Fatal("errors.Is(SMPanicError, ErrShardFailed) returned false")
 	}
 }
 

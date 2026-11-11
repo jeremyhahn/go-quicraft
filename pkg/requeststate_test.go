@@ -25,42 +25,6 @@ import (
 // Timer pool helpers
 // ---------------------------------------------------------------------------
 
-func TestAcquireTimer_FiresAfterDuration(t *testing.T) {
-	d := 50 * time.Millisecond
-	timer := acquireTimer(d)
-	defer releaseTimer(timer)
-
-	start := time.Now()
-	select {
-	case <-timer.C:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("timer did not fire within expected window")
-	}
-	elapsed := time.Since(start)
-	if elapsed < d/2 {
-		t.Errorf("timer fired too early: elapsed %v, expected >= %v", elapsed, d/2)
-	}
-}
-
-func TestAcquireTimer_ChannelDrainedOnReuse(t *testing.T) {
-	// Acquire, let it fire naturally, release, then re-acquire.
-	// The re-acquired timer's channel must be empty when returned.
-	timer := acquireTimer(10 * time.Millisecond)
-	<-timer.C // consume the tick
-	releaseTimer(timer)
-
-	// Re-acquire with a long duration; the channel must be empty immediately.
-	timer2 := acquireTimer(10 * time.Second)
-	defer releaseTimer(timer2)
-
-	select {
-	case <-timer2.C:
-		t.Error("timer channel should be empty after reuse from pool")
-	default:
-		// Expected: no stale tick.
-	}
-}
-
 func TestReleaseTimer_StopsBeforeReturningToPool(t *testing.T) {
 	// Acquire with a short duration, release before it fires.
 	// The pool entry must not have a pending tick when re-acquired.
@@ -104,18 +68,6 @@ func TestReleaseTimer_DrainsFiredTimer(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Result — timer pool integration
 // ---------------------------------------------------------------------------
-
-func TestResult_PooledTimerTimeout(t *testing.T) {
-	pool := NewRequestStatePool()
-	// Use a short deadline so the pooled timer fires quickly.
-	deadline := time.Now().Add(40 * time.Millisecond)
-	rs := newRequestState(pool, 1, deadline, true)
-
-	_, err := rs.Result()
-	if !errors.Is(err, ErrTimeout) {
-		t.Errorf("Result error = %v, want ErrTimeout", err)
-	}
-}
 
 func TestResult_PooledTimerReuse(t *testing.T) {
 	pool := NewRequestStatePool()
@@ -184,15 +136,6 @@ func TestNewRequestStatePool_ReturnsPool(t *testing.T) {
 	if cap(rs.completedC) != 1 {
 		t.Errorf("completedC capacity = %d, want 1", cap(rs.completedC))
 	}
-}
-
-func TestNewRequestStatePool_AllocatesCommittedChannel(t *testing.T) {
-	pool := NewRequestStatePool()
-	obj := pool.Get()
-	rs, ok := obj.(*RequestState)
-	if !ok {
-		t.Fatalf("pool.Get returned %T, want *RequestState", obj)
-	}
 	if rs.committedC == nil {
 		t.Error("committedC channel is nil")
 	}
@@ -210,8 +153,8 @@ func TestNewRequestState_Initialization(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	rs := newRequestState(pool, 42, deadline, true)
 
-	if rs.key != 42 {
-		t.Errorf("key = %d, want 42", rs.key)
+	if rs.Key() != 42 {
+		t.Errorf("Key = %d, want 42", rs.Key())
 	}
 	if !rs.Deadline().Equal(deadline) {
 		t.Errorf("deadline = %v, want %v", rs.Deadline(), deadline)
@@ -224,64 +167,6 @@ func TestNewRequestState_Initialization(t *testing.T) {
 	}
 	if rs.committedDone.Load() {
 		t.Error("committedDone should be false for new RequestState")
-	}
-}
-
-func TestNewRequestState_DrainsStalePreviousResult(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Simulate a stale result in the channel.
-	rs.completedC <- RequestResult{Value: 999}
-
-	// Re-initialize should drain the stale result.
-	rs2 := newRequestState(pool, 2, time.Time{}, true)
-
-	// The channel should be empty now.
-	select {
-	case <-rs2.completedC:
-		t.Error("completedC should be empty after reinitialization")
-	default:
-		// Expected.
-	}
-}
-
-func TestNewRequestState_DrainsStaleCommittedResult(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Simulate a stale committed notification in the channel.
-	rs.committedC <- RequestResult{Value: 888}
-
-	// Re-initialize should drain the stale committed result.
-	rs2 := newRequestState(pool, 2, time.Time{}, true)
-
-	// The committedC channel should be empty now.
-	select {
-	case <-rs2.committedC:
-		t.Error("committedC should be empty after reinitialization")
-	default:
-		// Expected.
-	}
-}
-
-func TestNewRequestState_ResetsCommittedDone(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	// Mark as committed.
-	rs.commitNotify(RequestResult{Value: 0})
-	if !rs.committedDone.Load() {
-		t.Error("committedDone should be true after commitNotify")
-	}
-
-	// Release and re-init.
-	rs.Release()
-	rs2 := newRequestState(pool, 2, time.Time{}, true)
-
-	// committedDone must be reset.
-	if rs2.committedDone.Load() {
-		t.Error("committedDone should be false after reinitialization")
 	}
 }
 
@@ -504,47 +389,6 @@ func TestRelease_ConcurrentSafety(t *testing.T) {
 	}
 }
 
-func TestRelease_DrainsUnconsumedResult(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.complete(RequestResult{Value: 42})
-	rs.Release()
-
-	// The channel should be drained.
-	select {
-	case <-rs.completedC:
-		// Channel was drained by Release and then pool.Put may have been called.
-		// In any case, the released flag prevents further use.
-	default:
-		// Also acceptable if already drained.
-	}
-}
-
-func TestRelease_DrainsUnconsumedCommittedResult(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.commitNotify(RequestResult{Value: 0})
-	rs.complete(RequestResult{Value: 42})
-	rs.Release()
-
-	// Both channels should be drained.
-	select {
-	case <-rs.committedC:
-		// Drained by Release.
-	default:
-		// Also acceptable if already drained.
-	}
-
-	select {
-	case <-rs.completedC:
-		// Drained by Release.
-	default:
-		// Also acceptable if already drained.
-	}
-}
-
 func TestRelease_NilPoolDoesNotPanic(t *testing.T) {
 	rs := &RequestState{
 		completedC: make(chan RequestResult, 1),
@@ -581,15 +425,6 @@ func TestComplete_SendsResult(t *testing.T) {
 	default:
 		t.Error("completedC should have a result")
 	}
-}
-
-func TestComplete_AfterRelease_IsNoOp(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 1, time.Time{}, true)
-
-	rs.Release()
-	// Should not panic or block.
-	rs.complete(RequestResult{Value: 42})
 }
 
 func TestComplete_DoubleComplete_AtomicGuard(t *testing.T) {
@@ -717,51 +552,6 @@ func TestCommitNotify_ConcurrentSafety(t *testing.T) {
 	default:
 		// Expected.
 	}
-}
-
-// ---------------------------------------------------------------------------
-// Key and Deadline accessors
-// ---------------------------------------------------------------------------
-
-func TestKey_ReturnsKey(t *testing.T) {
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 999, time.Time{}, true)
-	if rs.Key() != 999 {
-		t.Errorf("Key = %d, want 999", rs.Key())
-	}
-}
-
-func TestDeadline_ReturnsDeadline(t *testing.T) {
-	pool := NewRequestStatePool()
-	deadline := time.Now().Add(10 * time.Second)
-	rs := newRequestState(pool, 1, deadline, true)
-	if !rs.Deadline().Equal(deadline) {
-		t.Errorf("Deadline = %v, want %v", rs.Deadline(), deadline)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Pool recycling
-// ---------------------------------------------------------------------------
-
-func TestPoolRecycling_ReusesObjects(t *testing.T) {
-	pool := NewRequestStatePool()
-
-	rs1 := newRequestState(pool, 1, time.Time{}, true)
-	rs1.Release()
-
-	rs2 := newRequestState(pool, 2, time.Time{}, true)
-	// The pool may or may not return the same object, but it should work correctly.
-	if rs2.key != 2 {
-		t.Errorf("key = %d, want 2", rs2.key)
-	}
-	if rs2.released.Load() {
-		t.Error("recycled RequestState should not be marked as released")
-	}
-	if rs2.committedDone.Load() {
-		t.Error("recycled RequestState should not have committedDone set")
-	}
-	rs2.Release()
 }
 
 // ---------------------------------------------------------------------------

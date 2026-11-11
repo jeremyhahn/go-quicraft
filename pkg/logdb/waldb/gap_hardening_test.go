@@ -119,8 +119,9 @@ func findRawShardRecord(t *testing.T, walDir string, shardIdx int, payloadType b
 func TestOpenFailsOnTruncatedEntryBatch(t *testing.T) {
 	dir := t.TempDir()
 
-	// Payload type + 40 garbage bytes: shorter than the 84-byte entry header.
-	payload := make([]byte, 1+40)
+	// Payload type + one byte less than the entry header: the largest
+	// truncated header.
+	payload := make([]byte, 1+entryRecordHeaderSize-1)
 	payload[0] = payloadTypeEntries
 	writeRawShardRecord(t, dir, 1, payload)
 
@@ -152,15 +153,6 @@ func TestOpenFailsOnOversizedReplayCmdLen(t *testing.T) {
 	_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
 	if !errors.Is(err, ErrCmdTooLarge) {
 		t.Fatalf("Open = %v, want ErrCmdTooLarge", err)
-	}
-}
-
-// TestReplayEntriesTruncatedHeaderIsFatal verifies the unit-level contract:
-// a batch that ends mid-header aborts with ErrTruncatedEntryRecord.
-func TestReplayEntriesTruncatedHeaderIsFatal(t *testing.T) {
-	s := newBareShard()
-	if err := s.replayEntries(make([]byte, entryRecordHeaderSize-1), 0); !errors.Is(err, ErrTruncatedEntryRecord) {
-		t.Fatalf("replayEntries = %v, want ErrTruncatedEntryRecord", err)
 	}
 }
 
@@ -399,51 +391,43 @@ func TestReencryptPropagatesCompactionFloor(t *testing.T) {
 
 // --- Retired snapshot payload types fail loud ---
 
-// TestOpenFailsOnRetiredSnapshotPayloadType0x03 verifies that a snapshot
-// record carrying the retired 0x03 payload type fails recovery with
-// ErrUnknownPayloadType instead of soft-skipping it and booting the node with
-// empty membership.
-func TestOpenFailsOnRetiredSnapshotPayloadType0x03(t *testing.T) {
-	dir := t.TempDir()
-
-	// A retired-layout snapshot record: base header + zero fpLen + a membership
-	// section of ConfigChangeID + four empty map counts, no witness fields.
-	payload := make([]byte, 1+snapshotRecordBaseSize+8+4*4)
-	payload[0] = 0x03                               // retired snapshot payload type, pinned as a literal
-	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
-	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
-	binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
-	binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
-	writeRawShardRecord(t, dir, 1, payload)
-
-	_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if !errors.Is(err, ErrUnknownPayloadType) {
-		t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
+// TestOpenFailsOnRetiredSnapshotPayloadType verifies that a snapshot record
+// carrying a retired payload type fails recovery with ErrUnknownPayloadType.
+// A soft-skipped 0x03 record would boot the node with empty membership; a
+// 0x08 record parsed with the current layout would have its ConfigChangeID
+// low byte consumed as a version byte, shifting every later field.
+func TestOpenFailsOnRetiredSnapshotPayloadType(t *testing.T) {
+	cases := []struct {
+		name string
+		// typ is the retired snapshot payload type, pinned as a literal.
+		typ byte
+		// membershipLen is the length of the membership section that layout
+		// wrote after the base header and a zero fpLen.
+		membershipLen int
+	}{
+		// ConfigChangeID + four empty map counts, no witness fields.
+		{"0x03", 0x03, 8 + 4*4},
+		// No leading version byte:
+		// ConfigChangeID + MaxWitnesses + PolicyFlags + four empty map counts.
+		{"0x08", 0x08, 8 + 8 + 1 + 4*4},
 	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
 
-// TestOpenFailsOnRetiredSnapshotPayloadType0x08 verifies that a snapshot
-// record carrying the retired 0x08 payload type fails recovery with
-// ErrUnknownPayloadType instead of being parsed with the current layout, which
-// would consume the ConfigChangeID low byte as a version byte and shift every
-// later field.
-func TestOpenFailsOnRetiredSnapshotPayloadType0x08(t *testing.T) {
-	dir := t.TempDir()
+			payload := make([]byte, 1+snapshotRecordBaseSize+tc.membershipLen)
+			payload[0] = tc.typ
+			binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
+			binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
+			binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
+			binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
+			writeRawShardRecord(t, dir, 1, payload)
 
-	// A retired-layout snapshot record: base header + zero fpLen + membership
-	// section without the leading version byte
-	// (ConfigChangeID + MaxWitnesses + PolicyFlags + four empty map counts).
-	payload := make([]byte, 1+snapshotRecordBaseSize+8+8+1+4*4)
-	payload[0] = 0x08                               // retired snapshot payload type, pinned as a literal
-	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
-	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
-	binary.LittleEndian.PutUint64(payload[17:], 10) // snapshot index
-	binary.LittleEndian.PutUint64(payload[25:], 2)  // snapshot term
-	writeRawShardRecord(t, dir, 1, payload)
-
-	_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if !errors.Is(err, ErrUnknownPayloadType) {
-		t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
+			_, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
+			if !errors.Is(err, ErrUnknownPayloadType) {
+				t.Fatalf("Open = %v, want ErrUnknownPayloadType", err)
+			}
+		})
 	}
 }
 
@@ -515,45 +499,6 @@ func TestSnapshotRecordCarriesMembershipVersionByte(t *testing.T) {
 	}
 	if got, want := len(rec)-memberOff, membershipSize(snap.Membership); got != want {
 		t.Fatalf("membership section = %d bytes, want membershipSize()=%d", got, want)
-	}
-}
-
-// TestSnapshotRoundTripUsesCurrentPayloadType verifies the current write
-// path emits the discriminated payload type and replays cleanly with
-// the full witness-policy membership intact.
-func TestSnapshotRoundTripUsesCurrentPayloadType(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	snap := logdb.Snapshot{
-		Index: 7, Term: 3, Filepath: "snap-7.dat",
-		Membership: logdb.Membership{
-			ConfigChangeID:             9,
-			MaxWitnesses:               2,
-			RequireFullReplicaMajority: true,
-			Addresses:                  map[uint64]string{1: "127.0.0.1:1"},
-		},
-	}
-	if err := db.SaveSnapshot(1, 1, snap); err != nil {
-		t.Fatalf("SaveSnapshot: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	db2, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Reopen: %v", err)
-	}
-	defer db2.Close()
-	got, err := db2.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
-	}
-	if got.Index != 7 || got.Membership.MaxWitnesses != 2 || !got.Membership.RequireFullReplicaMajority {
-		t.Fatalf("snapshot after reopen = %+v, want witness policy preserved", got)
 	}
 }
 
@@ -746,45 +691,6 @@ func TestOpenFailsOnMalformedMetadataRecords(t *testing.T) {
 				t.Fatalf("Open error %v is not a RecoveryError", err)
 			}
 		})
-	}
-}
-
-// TestReplaySnapshotAcceptsFullMembershipSection is the positive control for
-// the stricter snapshot parser: a record written by writeSnapshot must still
-// round-trip, including an empty (but present) membership section.
-func TestReplaySnapshotAcceptsFullMembershipSection(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	ss := logdb.Snapshot{
-		Index: 9, Term: 3, Filepath: "snap-9.bin", FileSize: 128,
-		Membership: logdb.Membership{
-			ConfigChangeID: 4,
-			MaxWitnesses:   2,
-			Addresses:      map[uint64]string{1: "n1", 2: "n2"},
-		},
-	}
-	if err := db.SaveSnapshot(1, 1, ss); err != nil {
-		t.Fatalf("SaveSnapshot: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	db2, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Reopen: %v", err)
-	}
-	defer db2.Close()
-	got, err := db2.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
-	}
-	if got.Index != 9 || got.Filepath != "snap-9.bin" || got.Membership.ConfigChangeID != 4 ||
-		got.Membership.MaxWitnesses != 2 || len(got.Membership.Addresses) != 2 {
-		t.Fatalf("snapshot round-trip mismatch: %+v", got)
 	}
 }
 

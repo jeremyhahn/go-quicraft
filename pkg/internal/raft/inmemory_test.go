@@ -244,11 +244,16 @@ func TestInMemory_Merge_ContiguousAppend(t *testing.T) {
 func TestInMemory_Merge_OverlapReplace(t *testing.T) {
 	im := newInMemory(4)
 	im.merge(makeEntries(5, 10, 1))
+	im.savedTo = 9 // all saved
 
 	// Overlap: new entries start at index 7 with different term.
 	newEntries := makeEntries(7, 12, 2)
 	im.merge(newEntries)
 
+	// savedTo clamps to firstNewIndex-1 so the replaced suffix is saved again.
+	if im.savedTo != 6 {
+		t.Fatalf("expected savedTo clamped to 6, got %d", im.savedTo)
+	}
 	if len(im.entries) != 7 {
 		t.Fatalf("expected 7 entries, got %d", len(im.entries))
 	}
@@ -492,18 +497,6 @@ func TestInMemory_GetSnapshotIndex_WithSnapshot(t *testing.T) {
 	}
 	if idx != 8 {
 		t.Fatalf("expected snapshot index 8, got %d", idx)
-	}
-}
-
-func TestInMemory_Merge_SavedToClampedOnOverlap(t *testing.T) {
-	im := newInMemory(4)
-	im.merge(makeEntries(5, 10, 1))
-	im.savedTo = 9 // all saved
-
-	// Overlap at index 7: savedTo should clamp to 6 (firstNewIndex-1).
-	im.merge(makeEntries(7, 12, 2))
-	if im.savedTo != 6 {
-		t.Fatalf("expected savedTo clamped to 6, got %d", im.savedTo)
 	}
 }
 

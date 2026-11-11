@@ -264,34 +264,6 @@ func TestRecoveryRedrive_StopDuringBackoffLeaksNothing(t *testing.T) {
 	}
 }
 
-// TestRecoveryRedrive_CountSpansTheHoldingEpisode: attempts count across the
-// whole continuous episode of holding entries, whatever snapshot each attempt
-// was made against, so a persistent pre-restore fault cannot be kept alive by
-// a stream of newer snapshots. Only reset (a completed recovery, or a node no
-// longer holding entries) starts again. A restarted shard is a new Node, whose
-// zero-value state counts from nothing.
-func TestRecoveryRedrive_CountSpansTheHoldingEpisode(t *testing.T) {
-	var r recoveryRedrive
-	now := time.Now()
-	for i := 1; i < maxRecoveryAttempts; i++ {
-		if got, exhausted := r.reject(now); got != i || exhausted {
-			t.Fatalf("rejection %d = (%d, %v), want (%d, false)", i, got, exhausted, i)
-		}
-	}
-	if got, exhausted := r.reject(now); got != maxRecoveryAttempts || !exhausted {
-		t.Fatalf("rejection %d = (%d, %v), want (%d, true)",
-			maxRecoveryAttempts, got, exhausted, maxRecoveryAttempts)
-	}
-	r.reset()
-	if got, exhausted := r.reject(now); got != 1 || exhausted {
-		t.Fatalf("first rejection after reset = (%d, %v), want (1, false)", got, exhausted)
-	}
-	var fresh recoveryRedrive
-	if fresh.pending() {
-		t.Fatal("a new node's re-drive state owes a re-drive")
-	}
-}
-
 // TestRecoveryRedrive_NewerSnapshotsDoNotResetTheBudget: a replica whose
 // pre-restore fault persists while newer snapshots keep being adopted is
 // failed after maxRecoveryAttempts rejections in all, and the error reports

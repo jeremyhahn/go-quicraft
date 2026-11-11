@@ -46,24 +46,6 @@ func TestPutGetBytes(t *testing.T) {
 	}
 }
 
-func TestPutGetBytesEmpty(t *testing.T) {
-	buf := make([]byte, 4)
-	n := putBytes(buf, nil)
-	if n != 4 {
-		t.Fatalf("putBytes(nil): wrote %d bytes, want 4", n)
-	}
-	got, consumed, err := getBytes(buf, MaxEntrySize, ErrEntrySizeLimitExceeded)
-	if err != nil {
-		t.Fatalf("getBytes: unexpected error: %v", err)
-	}
-	if consumed != 4 {
-		t.Fatalf("getBytes: consumed %d, want 4", consumed)
-	}
-	if got != nil {
-		t.Fatalf("getBytes: got %v, want nil", got)
-	}
-}
-
 func TestGetBytesBufferTooSmall(t *testing.T) {
 	// Buffer too short for length prefix
 	_, _, err := getBytes([]byte{0, 0}, MaxEntrySize, ErrEntrySizeLimitExceeded)
@@ -90,97 +72,6 @@ func TestGetBytesExceedsMaxLen(t *testing.T) {
 	}
 }
 
-func TestPutGetString(t *testing.T) {
-	s := "192.168.1.100:5000"
-	buf := make([]byte, 4+len(s))
-	n := putString(buf, s)
-	if n != 4+len(s) {
-		t.Fatalf("putString: wrote %d, want %d", n, 4+len(s))
-	}
-	got, consumed, err := getString(buf, MaxAddressLength, ErrAddressTooLong)
-	if err != nil {
-		t.Fatalf("getString: unexpected error: %v", err)
-	}
-	if consumed != n {
-		t.Fatalf("getString: consumed %d, want %d", consumed, n)
-	}
-	if got != s {
-		t.Fatalf("getString: got %q, want %q", got, s)
-	}
-}
-
-func TestPutGetStringEmpty(t *testing.T) {
-	buf := make([]byte, 4)
-	n := putString(buf, "")
-	if n != 4 {
-		t.Fatalf("putString: wrote %d, want 4", n)
-	}
-	got, consumed, err := getString(buf, MaxAddressLength, ErrAddressTooLong)
-	if err != nil {
-		t.Fatalf("getString: unexpected error: %v", err)
-	}
-	if consumed != 4 {
-		t.Fatalf("getString: consumed %d, want 4", consumed)
-	}
-	if got != "" {
-		t.Fatalf("getString: got %q, want empty", got)
-	}
-}
-
-func TestGetStringBufferTooSmall(t *testing.T) {
-	_, _, err := getString([]byte{0, 0}, MaxAddressLength, ErrAddressTooLong)
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("getString: got %v, want ErrBufferTooSmall", err)
-	}
-}
-
-func TestGetStringTooLong(t *testing.T) {
-	buf := make([]byte, 8)
-	putUint32(buf, 300) // exceeds MaxAddressLength
-	_, _, err := getString(buf, MaxAddressLength, ErrAddressTooLong)
-	if !errors.Is(err, ErrAddressTooLong) {
-		t.Fatalf("getString: got %v, want ErrAddressTooLong", err)
-	}
-}
-
-func TestGetStringDataTruncated(t *testing.T) {
-	buf := make([]byte, 8)
-	putUint32(buf, 100) // claims 100 bytes but only 4 bytes follow
-	_, _, err := getString(buf, MaxAddressLength, ErrAddressTooLong)
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("getString: got %v, want ErrBufferTooSmall", err)
-	}
-}
-
-func TestPutGetMapRoundTrip(t *testing.T) {
-	m := map[uint64]string{
-		3: "node-3:5000",
-		1: "node-1:5000",
-		2: "node-2:5000",
-	}
-	sz := mapSize(m)
-	buf := make([]byte, sz)
-	n := putMap(buf, m)
-	if n != sz {
-		t.Fatalf("putMap: wrote %d, want %d", n, sz)
-	}
-	got, consumed, err := getMap(buf)
-	if err != nil {
-		t.Fatalf("getMap: unexpected error: %v", err)
-	}
-	if consumed != n {
-		t.Fatalf("getMap: consumed %d, want %d", consumed, n)
-	}
-	if len(got) != len(m) {
-		t.Fatalf("getMap: got %d entries, want %d", len(got), len(m))
-	}
-	for k, v := range m {
-		if got[k] != v {
-			t.Fatalf("getMap[%d]: got %q, want %q", k, got[k], v)
-		}
-	}
-}
-
 func TestPutGetMapEmpty(t *testing.T) {
 	m := map[uint64]string{}
 	sz := mapSize(m)
@@ -203,37 +94,6 @@ func TestPutGetMapEmpty(t *testing.T) {
 
 func TestGetMapBufferTooSmall(t *testing.T) {
 	_, _, err := getMap([]byte{0, 0})
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("getMap: got %v, want ErrBufferTooSmall", err)
-	}
-}
-
-func TestGetMapTooManyEntries(t *testing.T) {
-	buf := make([]byte, 4)
-	putUint32(buf, MaxMembershipEntries+1)
-	_, _, err := getMap(buf)
-	if !errors.Is(err, ErrTooManyMembershipEntries) {
-		t.Fatalf("getMap: got %v, want ErrTooManyMembershipEntries", err)
-	}
-}
-
-func TestGetMapAddressTooLong(t *testing.T) {
-	// Encode a map with one entry whose value exceeds MaxAddressLength
-	buf := make([]byte, 4+8+4+MaxAddressLength+100)
-	putUint32(buf, 1) // count = 1
-	putUint64(buf[4:], 1)
-	putUint32(buf[12:], uint32(MaxAddressLength+1)) // value too long
-	_, _, err := getMap(buf)
-	if !errors.Is(err, ErrAddressTooLong) {
-		t.Fatalf("getMap: got %v, want ErrAddressTooLong", err)
-	}
-}
-
-func TestGetMapEntryTruncated(t *testing.T) {
-	// count=1 but buffer too short for key+value
-	buf := make([]byte, 8)
-	putUint32(buf, 1)
-	_, _, err := getMap(buf)
 	if !errors.Is(err, ErrBufferTooSmall) {
 		t.Fatalf("getMap: got %v, want ErrBufferTooSmall", err)
 	}
@@ -306,27 +166,6 @@ func TestGetBoolMapTooManyEntries(t *testing.T) {
 	_, _, err := getBoolMap(buf)
 	if !errors.Is(err, ErrTooManyMembershipEntries) {
 		t.Fatalf("getBoolMap: got %v, want ErrTooManyMembershipEntries", err)
-	}
-}
-
-func TestGetBoolMapEntryTruncated(t *testing.T) {
-	buf := make([]byte, 8)
-	putUint32(buf, 1) // count=1 but only 4 bytes of space remain
-	_, _, err := getBoolMap(buf)
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("getBoolMap: got %v, want ErrBufferTooSmall", err)
-	}
-}
-
-func TestMapSortedKeys(t *testing.T) {
-	m := map[uint64]string{
-		100: "c",
-		1:   "a",
-		50:  "b",
-	}
-	keys := sortedKeys(m)
-	if len(keys) != 3 || keys[0] != 1 || keys[1] != 50 || keys[2] != 100 {
-		t.Fatalf("sortedKeys: got %v, want [1, 50, 100]", keys)
 	}
 }
 

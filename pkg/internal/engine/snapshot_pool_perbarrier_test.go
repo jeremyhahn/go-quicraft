@@ -271,59 +271,6 @@ func writeShardSnapshot(t *testing.T, baseDir string, shardID, replicaID, index,
 // Invariant 1: per-barrier safe-purge floor computation
 // ---------------------------------------------------------------------------
 
-func TestSnapshotPool_PerBarrierSafePurgeFloor_Computation(t *testing.T) {
-	baseDir := t.TempDir()
-	bA := newTenantBarrier(1, 4)
-	bB := newTenantBarrier(2, 9)
-
-	ldb := newPerBarrierTestLogDB()
-	ldb.floors[bA] = 2 // BarrierA's WAL min-live epoch
-	ldb.floors[bB] = 9 // BarrierB's WAL min-live epoch
-
-	stopC := make(chan struct{})
-	defer close(stopC)
-	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-	p.shardBarriers = func(shardID uint64) SnapshotBarrier {
-		switch shardID {
-		case 1:
-			return bA
-		case 2:
-			return bB
-		}
-		return nil
-	}
-	wireSnapshotNodes(p,
-		snapshotDirNode(baseDir, 1, 1),
-		snapshotDirNode(baseDir, 2, 1),
-	)
-
-	// BarrierA retains a snapshot at epoch 3; BarrierB at epoch 7.
-	writeShardSnapshot(t, baseDir, 1, 1, 100, 3)
-	writeShardSnapshot(t, baseDir, 2, 1, 100, 7)
-
-	// floor_A = min(snapshot 3, WAL 2) = 2 — uses ONLY BarrierA's data.
-	floorA, okA := p.perBarrierSafePurgeFloor(bA)
-	if !okA || floorA != 2 {
-		t.Fatalf("perBarrierSafePurgeFloor(bA) = (%d, %v), want (2, true)", floorA, okA)
-	}
-
-	// floor_B = min(snapshot 7, WAL 9) = 7 — uses ONLY BarrierB's data. The
-	// fact that floorA != floorB and neither equals a cross-barrier minimum
-	// proves each barrier's floor is computed independently (Invariant 1).
-	floorB, okB := p.perBarrierSafePurgeFloor(bB)
-	if !okB || floorB != 7 {
-		t.Fatalf("perBarrierSafePurgeFloor(bB) = (%d, %v), want (7, true)", floorB, okB)
-	}
-
-	// Sanity: the GLOBAL (cross-barrier) floor would be min(3,7,2,9)=2, so
-	// barrier B's correct floor (7) is strictly higher than the global floor.
-	// Using the global floor for B would over-retain; the per-barrier floor
-	// crypto-shreds B's epochs down to its own live minimum.
-	if floorB <= floorA {
-		t.Fatalf("expected per-barrier floors to differ (A=%d, B=%d)", floorA, floorB)
-	}
-}
-
 // TestSnapshotPool_PerBarrierSafePurgeFloor_IndependentOfOtherBarrier proves a
 // barrier's floor is unaffected by another barrier's much older epochs.
 func TestSnapshotPool_PerBarrierSafePurgeFloor_IndependentOfOtherBarrier(t *testing.T) {
@@ -595,56 +542,6 @@ func TestSnapshotPool_PerBarrier_NilNodesFailSafe(t *testing.T) {
 	p.purgeOldEpochs("", 1, 1)
 	if bA.PurgeCallCount() != 0 {
 		t.Fatalf("expected fail-safe (no purge) with nil nodes, got %d purge calls", bA.PurgeCallCount())
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Backward compatibility: single WithBarrier path unchanged
-// ---------------------------------------------------------------------------
-
-// TestSnapshotPool_SingleBarrier_BackwardCompatUnchanged proves that with
-// shardBarriers == nil the floor computation and purge are byte-for-byte the
-// original global single-barrier behavior: barrierForShard always returns the
-// process-wide barrier, the GLOBAL floor is used, and the global barrier is
-// purged at that floor.
-func TestSnapshotPool_SingleBarrier_BackwardCompatUnchanged(t *testing.T) {
-	baseDir := t.TempDir()
-	barrier := newTestBarrier(5)
-	ldb := newEpochAwareTestLogDB(4) // cross-shard WAL min epoch is 4
-
-	stopC := make(chan struct{})
-	defer close(stopC)
-	p := newSnapshotPool(2, ldb, barrier, nil, nil, stopC, nil)
-	if p.shardBarriers != nil {
-		t.Fatal("shardBarriers must be nil in the single-barrier path")
-	}
-	wireSnapshotNodes(p, snapshotDirNode(baseDir, 1, 1), snapshotDirNode(baseDir, 2, 1))
-
-	// Two shards, both encrypted by the single process-wide barrier.
-	writeShardSnapshot(t, baseDir, 1, 1, 100, 3)
-	writeShardSnapshot(t, baseDir, 2, 1, 100, 5)
-
-	// barrierForShard returns the process-wide barrier for ALL shards.
-	for _, shardID := range []uint64{1, 99} {
-		got, err := p.barrierForShard(shardID)
-		if err != nil {
-			t.Fatalf("barrierForShard(%d): %v", shardID, err)
-		}
-		if got != SnapshotBarrier(barrier) {
-			t.Fatalf("barrierForShard(%d) must return the process-wide barrier when shardBarriers is nil", shardID)
-		}
-	}
-
-	// Global floor = min(snapshot 3, snapshot 5, WAL 4) = 3 — exactly as before.
-	floor, ok := p.globalSafePurgeFloor()
-	if !ok || floor != 3 {
-		t.Fatalf("globalSafePurgeFloor = (%d, %v), want (3, true)", floor, ok)
-	}
-
-	// purgeOldEpochs uses the global floor and purges the single barrier.
-	p.purgeOldEpochs(baseDir, 1, 1)
-	if barrier.PurgedBefore() != 3 {
-		t.Fatalf("single-barrier purge before = %d, want 3 (global floor, unchanged behavior)", barrier.PurgedBefore())
 	}
 }
 

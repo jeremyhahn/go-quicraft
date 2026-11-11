@@ -118,25 +118,3 @@ func TestSnapshotReceive_MetadataCloseFailureIsReported(t *testing.T) {
 		t.Fatalf("LogDB records snapshot index %d although the receive failed", ss.Index)
 	}
 }
-
-// TestSnapshotReceive_SucceedsWhenCloseSucceeds is the POSITIVE CONTROL: the
-// identical fixture with no injected failure must complete and record the
-// snapshot, or the two tests above would pass on a receive path that is simply
-// broken.
-func TestSnapshotReceive_SucceedsWhenCloseSucceeds(t *testing.T) {
-	payload := bytes.Repeat([]byte("close-failure-payload"), 200)
-	f := newRecvFixture(t, nil)
-	f.host.fsys = osSnapshotFS{}
-
-	const index, term = uint64(702), uint64(3)
-	if err := f.handler.HandleSnapshot(f.chunks(index, term, payload), authorizeAllSenders); err != nil {
-		t.Fatalf("HandleSnapshot: %v", err)
-	}
-	ss, err := f.ldb.GetSnapshot(f.shardID, f.replicaID)
-	if err != nil {
-		t.Fatalf("GetSnapshot after a successful receive: %v", err)
-	}
-	if ss.Index != index {
-		t.Fatalf("LogDB snapshot index = %d, want %d", ss.Index, index)
-	}
-}

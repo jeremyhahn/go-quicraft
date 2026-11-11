@@ -22,392 +22,139 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// CACertificateParseError
+// Typed error contracts: message, sentinel and Unwrap
 // ---------------------------------------------------------------------------
 
-// TestCACertificateParseErrorErrorWithUnderlyingError verifies that the
-// Error() method includes both the reason and the underlying error when
-// Err is non-nil. This is the common case when x509.ParseCertificate
-// returns a parse failure.
-func TestCACertificateParseErrorErrorWithUnderlyingError(t *testing.T) {
-	underlying := errors.New("asn1: structure error")
-	err := &CACertificateParseError{
-		Reason: "x509.ParseCertificate failed",
-		Err:    underlying,
+// TestTypedErrorContracts pins, per typed error, the text Error() carries,
+// the sentinel errors.Is reports (and the unrelated ones it must not), and
+// the cause Unwrap exposes.
+func TestTypedErrorContracts(t *testing.T) {
+	asn1Err := errors.New("asn1: structure error")
+	x509Err := errors.New("x509: malformed certificate")
+	ioTimeout := errors.New("i/o timeout")
+	refused := errors.New("connection refused")
+	corrupt := errors.New("snappy: corrupt input")
+
+	tests := []struct {
+		name     string
+		err      error
+		exact    string   // full Error() text, when pinned
+		wants    []string // substrings Error() must carry
+		notWants []string // substrings Error() must not carry
+		is       error    // sentinel errors.Is must report
+		notIs    []error  // sentinels errors.Is must not report
+		unwrap   error    // cause Unwrap must return
+	}{
+		{
+			name:  "CA parse error with cause",
+			err:   &CACertificateParseError{Reason: "x509.ParseCertificate failed", Err: asn1Err},
+			exact: "transport: CA certificate parse failed: x509.ParseCertificate failed: asn1: structure error",
+		},
+		{
+			// Must not carry a trailing ": <nil>" artifact.
+			name:  "CA parse error without cause",
+			err:   &CACertificateParseError{Reason: "PEM decode returned nil block"},
+			exact: "transport: CA certificate parse failed: PEM decode returned nil block",
+		},
+		{
+			name:   "CA parse error unwraps",
+			err:    &CACertificateParseError{Reason: "x509.ParseCertificate failed", Err: x509Err},
+			notIs:  []error{ErrStreamClosed, ErrSnapshotChunkWriteTimeout, ErrInvalidMagic},
+			unwrap: x509Err,
+		},
+		{
+			name:  "invalid shard ID",
+			err:   &InvalidShardIDError{From: 5, MsgType: 12},
+			wants: []string{"ShardID=0", "replica 5", "type 12"},
+			is:    ErrInvalidShardID,
+			notIs: []error{ErrStreamClosed},
+		},
+		{
+			name:  "chunk filepath traversal",
+			err:   &ChunkFilepathTraversalError{ShardID: 7, Filepath: "../etc/passwd"},
+			wants: []string{"path traversal", "shard 7"},
+			is:    ErrChunkFilepathTraversal,
+			notIs: []error{ErrChunkFilepathTooLong},
+		},
+		{
+			name:  "type assertion",
+			err:   &TypeAssertionError{Context: "Start UDP listener", ExpectedType: "*net.UDPConn", ActualValue: "not-a-conn"},
+			wants: []string{"type assertion failed", "Start UDP listener", "*net.UDPConn", "string"},
+		},
+		{
+			name:  "snapshot memory budget exceeded",
+			err:   &SnapshotMemoryBudgetExceededError{Accumulated: 1024 * 1024, Budget: 512 * 1024},
+			wants: []string{"memory budget exceeded", "1048576", "524288"},
+			is:    ErrSnapshotMemoryBudgetExceeded,
+			notIs: []error{ErrStreamClosed},
+		},
+		{
+			name:  "worker panic with target",
+			err:   &WorkerPanicError{WorkerName: "sendQueueWorker", Target: "127.0.0.1:9999", Value: "index out of range", Stack: []byte("goroutine 1...")},
+			wants: []string{"sendQueueWorker", "127.0.0.1:9999", "index out of range"},
+		},
+		{
+			// Global workers like connectionCleanup have no target, so no brackets.
+			name:     "worker panic without target",
+			err:      &WorkerPanicError{WorkerName: "connectionCleanup", Value: "nil pointer dereference", Stack: []byte("goroutine 1...")},
+			wants:    []string{"connectionCleanup", "nil pointer dereference"},
+			notWants: []string{"["},
+		},
+		{
+			name:   "snapshot chunk write timeout",
+			err:    &SnapshotChunkWriteTimeoutError{ShardID: 5, ReplicaID: 3, ChunkID: 17, Err: ioTimeout},
+			wants:  []string{"shard 5", "replica 3", "chunk 17", "i/o timeout"},
+			is:     ErrSnapshotChunkWriteTimeout,
+			notIs:  []error{ErrStreamClosed},
+			unwrap: ioTimeout,
+		},
+		{
+			name:   "dial error",
+			err:    &DialError{Target: "192.168.1.1:9999", Err: refused},
+			wants:  []string{"dial", "192.168.1.1:9999", "connection refused"},
+			unwrap: refused,
+		},
+		{
+			name:   "frame decompress error",
+			err:    &FrameDecompressError{Err: corrupt},
+			wants:  []string{"frame decompression failed", "corrupt input"},
+			unwrap: corrupt,
+		},
 	}
 
-	msg := err.Error()
-	if !strings.Contains(msg, "CA certificate parse failed") {
-		t.Fatalf("error message missing prefix: %s", msg)
-	}
-	if !strings.Contains(msg, "x509.ParseCertificate failed") {
-		t.Fatalf("error message missing reason: %s", msg)
-	}
-	if !strings.Contains(msg, "asn1: structure error") {
-		t.Fatalf("error message missing underlying error: %s", msg)
-	}
-
-	expected := "transport: CA certificate parse failed: x509.ParseCertificate failed: asn1: structure error"
-	if msg != expected {
-		t.Fatalf("Error() = %q, want %q", msg, expected)
-	}
-}
-
-// TestCACertificateParseErrorErrorWithoutUnderlyingError verifies that the
-// Error() method omits the underlying error suffix when Err is nil. This
-// is the case when PEM decoding returns a nil block (no parse error to wrap).
-func TestCACertificateParseErrorErrorWithoutUnderlyingError(t *testing.T) {
-	err := &CACertificateParseError{
-		Reason: "PEM decode returned nil block",
-		Err:    nil,
-	}
-
-	msg := err.Error()
-	expected := "transport: CA certificate parse failed: PEM decode returned nil block"
-	if msg != expected {
-		t.Fatalf("Error() = %q, want %q", msg, expected)
-	}
-
-	// Must not contain a trailing ": <nil>" artifact.
-	if strings.Contains(msg, "<nil>") {
-		t.Fatalf("error message should not contain <nil>: %s", msg)
-	}
-}
-
-// TestCACertificateParseErrorUnwrapReturnsUnderlyingError verifies that
-// Unwrap() returns the original error for errors.Is/As chain traversal.
-func TestCACertificateParseErrorUnwrapReturnsUnderlyingError(t *testing.T) {
-	underlying := errors.New("x509: malformed certificate")
-	err := &CACertificateParseError{
-		Reason: "x509.ParseCertificate failed",
-		Err:    underlying,
-	}
-
-	unwrapped := err.Unwrap()
-	if unwrapped != underlying {
-		t.Fatalf("Unwrap() = %v, want %v", unwrapped, underlying)
-	}
-
-	// errors.Is must traverse the chain.
-	if !errors.Is(err, underlying) {
-		t.Fatal("errors.Is should match the underlying error through Unwrap")
-	}
-}
-
-// TestCACertificateParseErrorDoesNotMatchOtherSentinels verifies that the
-// error does not falsely match unrelated sentinel errors.
-func TestCACertificateParseErrorDoesNotMatchOtherSentinels(t *testing.T) {
-	err := &CACertificateParseError{
-		Reason: "test",
-		Err:    errors.New("inner"),
-	}
-
-	if errors.Is(err, ErrStreamClosed) {
-		t.Fatal("CACertificateParseError should not match ErrStreamClosed")
-	}
-	if errors.Is(err, ErrSnapshotChunkWriteTimeout) {
-		t.Fatal("CACertificateParseError should not match ErrSnapshotChunkWriteTimeout")
-	}
-	if errors.Is(err, ErrInvalidMagic) {
-		t.Fatal("CACertificateParseError should not match ErrInvalidMagic")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// InvalidShardIDError
-// ---------------------------------------------------------------------------
-
-// TestInvalidShardIDErrorMessage verifies the error message format includes
-// the replica ID and message type for diagnostic purposes.
-func TestInvalidShardIDErrorMessage(t *testing.T) {
-	err := &InvalidShardIDError{
-		From:    5,
-		MsgType: 12,
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "ShardID=0") {
-		t.Fatalf("error message missing ShardID=0: %s", msg)
-	}
-	if !strings.Contains(msg, "replica 5") {
-		t.Fatalf("error message missing replica ID: %s", msg)
-	}
-	if !strings.Contains(msg, "type 12") {
-		t.Fatalf("error message missing message type: %s", msg)
-	}
-}
-
-// TestInvalidShardIDErrorIsSentinel verifies that the typed error matches
-// the ErrInvalidShardID sentinel via errors.Is().
-func TestInvalidShardIDErrorIsSentinel(t *testing.T) {
-	err := &InvalidShardIDError{From: 1, MsgType: 7}
-
-	if !errors.Is(err, ErrInvalidShardID) {
-		t.Fatal("InvalidShardIDError should match ErrInvalidShardID sentinel")
-	}
-
-	// Should not match unrelated sentinels.
-	if errors.Is(err, ErrStreamClosed) {
-		t.Fatal("InvalidShardIDError should not match ErrStreamClosed")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ChunkFilepathTraversalError
-// ---------------------------------------------------------------------------
-
-// TestChunkFilepathTraversalErrorMessage verifies the error message includes
-// the shard ID for diagnostic purposes.
-func TestChunkFilepathTraversalErrorMessage(t *testing.T) {
-	err := &ChunkFilepathTraversalError{
-		ShardID:  7,
-		Filepath: "../etc/passwd",
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "path traversal") {
-		t.Fatalf("error message missing 'path traversal': %s", msg)
-	}
-	if !strings.Contains(msg, "shard 7") {
-		t.Fatalf("error message missing shard ID: %s", msg)
-	}
-}
-
-// TestChunkFilepathTraversalErrorIs verifies the sentinel matching.
-func TestChunkFilepathTraversalErrorIs(t *testing.T) {
-	err := &ChunkFilepathTraversalError{ShardID: 1, Filepath: "../hack"}
-	if !errors.Is(err, ErrChunkFilepathTraversal) {
-		t.Fatal("should match ErrChunkFilepathTraversal sentinel")
-	}
-	if errors.Is(err, ErrChunkFilepathTooLong) {
-		t.Fatal("should not match ErrChunkFilepathTooLong")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// TypeAssertionError
-// ---------------------------------------------------------------------------
-
-// TestTypeAssertionErrorMessage verifies the error message includes context,
-// expected type, and actual value type.
-func TestTypeAssertionErrorMessage(t *testing.T) {
-	err := &TypeAssertionError{
-		Context:      "Start UDP listener",
-		ExpectedType: "*net.UDPConn",
-		ActualValue:  "not-a-conn",
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "type assertion failed") {
-		t.Fatalf("error message missing 'type assertion failed': %s", msg)
-	}
-	if !strings.Contains(msg, "Start UDP listener") {
-		t.Fatalf("error message missing context: %s", msg)
-	}
-	if !strings.Contains(msg, "*net.UDPConn") {
-		t.Fatalf("error message missing expected type: %s", msg)
-	}
-	if !strings.Contains(msg, "string") {
-		t.Fatalf("error message missing actual type: %s", msg)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SnapshotMemoryBudgetExceededError
-// ---------------------------------------------------------------------------
-
-// TestSnapshotMemoryBudgetExceededErrorMessage verifies the error message
-// includes accumulated bytes and budget.
-func TestSnapshotMemoryBudgetExceededErrorMessage(t *testing.T) {
-	err := &SnapshotMemoryBudgetExceededError{
-		Accumulated: 1024 * 1024,
-		Budget:      512 * 1024,
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "memory budget exceeded") {
-		t.Fatalf("error message missing 'memory budget exceeded': %s", msg)
-	}
-	if !strings.Contains(msg, "1048576") {
-		t.Fatalf("error message missing accumulated bytes: %s", msg)
-	}
-	if !strings.Contains(msg, "524288") {
-		t.Fatalf("error message missing budget bytes: %s", msg)
-	}
-}
-
-// TestSnapshotMemoryBudgetExceededErrorIs verifies sentinel matching.
-func TestSnapshotMemoryBudgetExceededErrorIs(t *testing.T) {
-	err := &SnapshotMemoryBudgetExceededError{
-		Accumulated: 100,
-		Budget:      50,
-	}
-	if !errors.Is(err, ErrSnapshotMemoryBudgetExceeded) {
-		t.Fatal("should match ErrSnapshotMemoryBudgetExceeded")
-	}
-	if errors.Is(err, ErrStreamClosed) {
-		t.Fatal("should not match ErrStreamClosed")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// WorkerPanicError
-// ---------------------------------------------------------------------------
-
-// TestWorkerPanicErrorWithTarget verifies the error message format when
-// Target is set.
-func TestWorkerPanicErrorWithTarget(t *testing.T) {
-	err := &WorkerPanicError{
-		WorkerName: "sendQueueWorker",
-		Target:     "127.0.0.1:9999",
-		Value:      "index out of range",
-		Stack:      []byte("goroutine 1..."),
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "sendQueueWorker") {
-		t.Fatalf("error message missing worker name: %s", msg)
-	}
-	if !strings.Contains(msg, "127.0.0.1:9999") {
-		t.Fatalf("error message missing target: %s", msg)
-	}
-	if !strings.Contains(msg, "index out of range") {
-		t.Fatalf("error message missing panic value: %s", msg)
-	}
-}
-
-// TestWorkerPanicErrorWithoutTarget verifies the error message format when
-// Target is empty (global workers like connectionCleanup).
-func TestWorkerPanicErrorWithoutTarget(t *testing.T) {
-	err := &WorkerPanicError{
-		WorkerName: "connectionCleanup",
-		Target:     "",
-		Value:      "nil pointer dereference",
-		Stack:      []byte("goroutine 1..."),
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "connectionCleanup") {
-		t.Fatalf("error message missing worker name: %s", msg)
-	}
-	if strings.Contains(msg, "[") {
-		t.Fatalf("error message should not contain brackets when target is empty: %s", msg)
-	}
-	if !strings.Contains(msg, "nil pointer dereference") {
-		t.Fatalf("error message missing panic value: %s", msg)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SnapshotChunkWriteTimeoutError
-// ---------------------------------------------------------------------------
-
-// TestSnapshotChunkWriteTimeoutErrorMessage verifies the error message
-// includes shard, replica, chunk, and underlying error.
-func TestSnapshotChunkWriteTimeoutErrorMessage(t *testing.T) {
-	underlying := errors.New("i/o timeout")
-	err := &SnapshotChunkWriteTimeoutError{
-		ShardID:   5,
-		ReplicaID: 3,
-		ChunkID:   17,
-		Err:       underlying,
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "shard 5") {
-		t.Fatalf("error message missing shard ID: %s", msg)
-	}
-	if !strings.Contains(msg, "replica 3") {
-		t.Fatalf("error message missing replica ID: %s", msg)
-	}
-	if !strings.Contains(msg, "chunk 17") {
-		t.Fatalf("error message missing chunk ID: %s", msg)
-	}
-	if !strings.Contains(msg, "i/o timeout") {
-		t.Fatalf("error message missing underlying error: %s", msg)
-	}
-}
-
-// TestSnapshotChunkWriteTimeoutErrorIs verifies sentinel matching.
-func TestSnapshotChunkWriteTimeoutErrorIs(t *testing.T) {
-	err := &SnapshotChunkWriteTimeoutError{
-		ShardID: 1, ReplicaID: 2, ChunkID: 3,
-		Err: errors.New("timeout"),
-	}
-	if !errors.Is(err, ErrSnapshotChunkWriteTimeout) {
-		t.Fatal("should match ErrSnapshotChunkWriteTimeout")
-	}
-	if errors.Is(err, ErrStreamClosed) {
-		t.Fatal("should not match ErrStreamClosed")
-	}
-}
-
-// TestSnapshotChunkWriteTimeoutErrorUnwrap verifies Unwrap returns the
-// underlying error.
-func TestSnapshotChunkWriteTimeoutErrorUnwrap(t *testing.T) {
-	underlying := errors.New("network unreachable")
-	err := &SnapshotChunkWriteTimeoutError{
-		ShardID: 1, ReplicaID: 2, ChunkID: 3,
-		Err: underlying,
-	}
-	if err.Unwrap() != underlying {
-		t.Fatalf("Unwrap() = %v, want %v", err.Unwrap(), underlying)
-	}
-	if !errors.Is(err, underlying) {
-		t.Fatal("errors.Is should traverse through Unwrap")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// DialError
-// ---------------------------------------------------------------------------
-
-// TestDialErrorMessage verifies the error message includes the target
-// and the underlying error.
-func TestDialErrorMessage(t *testing.T) {
-	err := &DialError{
-		Target: "192.168.1.1:9999",
-		Err:    errors.New("connection refused"),
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "dial") {
-		t.Fatalf("error message missing 'dial': %s", msg)
-	}
-	if !strings.Contains(msg, "192.168.1.1:9999") {
-		t.Fatalf("error message missing target: %s", msg)
-	}
-	if !strings.Contains(msg, "connection refused") {
-		t.Fatalf("error message missing underlying error: %s", msg)
-	}
-}
-
-// TestDialErrorUnwrap verifies Unwrap returns the underlying error.
-func TestDialErrorUnwrap(t *testing.T) {
-	underlying := errors.New("host not found")
-	err := &DialError{Target: "bad-host:1234", Err: underlying}
-	if err.Unwrap() != underlying {
-		t.Fatalf("Unwrap() = %v, want %v", err.Unwrap(), underlying)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// FrameDecompressError
-// ---------------------------------------------------------------------------
-
-// TestFrameDecompressErrorMessage verifies the error message format.
-func TestFrameDecompressErrorMessage(t *testing.T) {
-	err := &FrameDecompressError{Err: errors.New("corrupt input")}
-	msg := err.Error()
-	if !strings.Contains(msg, "frame decompression failed") {
-		t.Fatalf("error message missing expected prefix: %s", msg)
-	}
-	if !strings.Contains(msg, "corrupt input") {
-		t.Fatalf("error message missing underlying error: %s", msg)
-	}
-}
-
-// TestFrameDecompressErrorUnwrap verifies chain traversal.
-func TestFrameDecompressErrorUnwrap(t *testing.T) {
-	underlying := errors.New("snappy: corrupt input")
-	err := &FrameDecompressError{Err: underlying}
-	if err.Unwrap() != underlying {
-		t.Fatalf("Unwrap() = %v, want %v", err.Unwrap(), underlying)
-	}
-	if !errors.Is(err, underlying) {
-		t.Fatal("errors.Is should match through Unwrap")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := tc.err.Error()
+			if tc.exact != "" && msg != tc.exact {
+				t.Fatalf("Error() = %q, want %q", msg, tc.exact)
+			}
+			for _, want := range tc.wants {
+				if !strings.Contains(msg, want) {
+					t.Errorf("error message %q missing %q", msg, want)
+				}
+			}
+			for _, bad := range tc.notWants {
+				if strings.Contains(msg, bad) {
+					t.Errorf("error message %q must not contain %q", msg, bad)
+				}
+			}
+			if tc.is != nil && !errors.Is(tc.err, tc.is) {
+				t.Errorf("errors.Is(%T, %v) = false, want true", tc.err, tc.is)
+			}
+			for _, other := range tc.notIs {
+				if errors.Is(tc.err, other) {
+					t.Errorf("%T matches the unrelated sentinel %v", tc.err, other)
+				}
+			}
+			if tc.unwrap != nil {
+				if got := errors.Unwrap(tc.err); got != tc.unwrap {
+					t.Errorf("Unwrap() = %v, want %v", got, tc.unwrap)
+				}
+				if !errors.Is(tc.err, tc.unwrap) {
+					t.Errorf("errors.Is should match the cause through Unwrap")
+				}
+			}
+		})
 	}
 }
 

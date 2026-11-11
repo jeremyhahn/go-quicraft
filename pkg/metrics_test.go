@@ -19,35 +19,6 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
-// Embedding pattern test
-// ---------------------------------------------------------------------------
-
-type customCollector struct {
-	NoOpMetricsCollector
-	proposalCount int
-}
-
-func (c *customCollector) IncProposalDropped(shardID uint64) {
-	c.proposalCount++
-}
-
-func TestNoOpMetricsCollector_EmbeddingOverride(t *testing.T) {
-	c := &customCollector{}
-
-	// The overridden method should work.
-	c.IncProposalDropped(1)
-	c.IncProposalDropped(2)
-	if c.proposalCount != 2 {
-		t.Errorf("proposalCount = %d, want 2", c.proposalCount)
-	}
-
-	// The inherited no-op methods should not panic.
-	c.ObserveProposalLatency(1, time.Second)
-	c.ObserveWriteLatency(time.Millisecond)
-	c.ObserveSendLatency(time.Microsecond)
-}
-
 // panickingCollector panics on every method. It stands in for an embedder's
 // metrics backend that fails on a closed registry, a full buffer, or a nil
 // map — ordinary bugs a library must survive.

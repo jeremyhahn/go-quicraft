@@ -145,11 +145,9 @@ func TestIntegration_DB_SnapshotTimeout(t *testing.T) {
 
 	// Use an already-expired context.
 	expiredCtx, expiredCancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	// Ensure the context is truly expired before proceeding.
-	expireTimer := time.NewTimer(1 * time.Millisecond)
-	<-expireTimer.C
-	expireTimer.Stop()
 	defer expiredCancel()
+	// Wait until the context has expired before proceeding.
+	<-expiredCtx.Done()
 
 	_, snapErr := leaderHost.SyncRequestSnapshot(expiredCtx, 1, dragonboat.DefaultSnapshotOption)
 	if snapErr == nil {

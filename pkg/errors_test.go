@@ -136,218 +136,189 @@ func TestSentinelErrors_NoFalsePositives(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// NotLeaderError
+// Typed errors
 // ---------------------------------------------------------------------------
 
-func TestNotLeaderError_ErrorWithLeader(t *testing.T) {
-	err := &NotLeaderError{
-		ShardID:       1,
-		LeaderID:      2,
-		LeaderAddress: "10.0.0.1:5000",
+// TestTypedErrors_Error pins what each typed error's message carries: the
+// identifiers an operator needs to act on it, and the package prefix where the
+// type promises one. want, when set, is the whole message.
+func TestTypedErrors_Error(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		prefix   string
+		want     string
+		contains []string
+	}{
+		{
+			name:     "NotLeaderError with leader",
+			err:      &NotLeaderError{ShardID: 1, LeaderID: 2, LeaderAddress: "10.0.0.1:5000"},
+			contains: []string{"shard 1", "replica 2", "10.0.0.1:5000"},
+		},
+		{
+			name:     "NotLeaderError without leader",
+			err:      &NotLeaderError{ShardID: 3, LeaderID: 0},
+			contains: []string{"shard 3", "unknown"},
+		},
+		{
+			name:     "EntryTooLargeError",
+			err:      &EntryTooLargeError{Size: 16_000_000, MaxSize: 8_000_000},
+			prefix:   "quicraft:",
+			contains: []string{"16000000", "8000000"},
+		},
+		{
+			name:     "BusyError",
+			err:      &BusyError{ShardID: 42, CurrentSize: 300_000_000, MaxSize: 256_000_000},
+			prefix:   "quicraft:",
+			contains: []string{"shard 42", "300000000", "256000000"},
+		},
+		{
+			name: "BusyError with custom message",
+			err:  &BusyError{message: "quicraft: custom busy message"},
+			want: "quicraft: custom busy message",
+		},
+		{
+			name:     "ErrSystemBusy",
+			err:      ErrSystemBusy,
+			prefix:   "quicraft:",
+			contains: []string{"global rate limit"},
+		},
+		{
+			name:     "UnauthorizedMessageError",
+			err:      &UnauthorizedMessageError{ShardID: 5, From: 42, MsgType: 3},
+			prefix:   "quicraft:",
+			contains: []string{"replica 42", "shard 5", "type=3"},
+		},
+		{
+			name:     "SessionExpiredError",
+			err:      &SessionExpiredError{ShardID: 10, ClientID: 42},
+			prefix:   "quicraft:",
+			contains: []string{"client 42", "shard 10"},
+		},
+		{
+			name:     "StaleConfigChangeError",
+			err:      &StaleConfigChangeError{ShardID: 1, Expected: 5, Got: 3},
+			contains: []string{"stale config change", "shard 1", "expected ConfigChangeID 5", "got 3"},
+		},
+		{
+			name:     "SessionError",
+			err:      &SessionError{ClientID: 42, Op: "register", Err: errors.New("connection lost")},
+			contains: []string{"42", "register", "connection lost"},
+		},
+		{
+			name:     "SessionError with nil inner error",
+			err:      &SessionError{ClientID: 1, Op: "unregister", Err: nil},
+			contains: []string{"unregister", "<nil>"},
+		},
+		{
+			name:     "ShardNotStoppedError",
+			err:      &ShardNotStoppedError{ShardID: 5, ReplicaID: 3},
+			contains: []string{"5", "3", "still running"},
+		},
+		{
+			name:     "ReplicaNotFoundError",
+			err:      &ReplicaNotFoundError{ShardID: 8, ReplicaID: 4},
+			contains: []string{"4", "8", "not found"},
+		},
+		{
+			name:     "LoopPanicError",
+			err:      &LoopPanicError{LoopName: "key-rotation", Value: "test panic value", Stack: []byte("fake stack")},
+			contains: []string{"key-rotation", "test panic value"},
+		},
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "shard 1") {
-		t.Errorf("expected shard ID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "replica 2") {
-		t.Errorf("expected leader replica ID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "10.0.0.1:5000") {
-		t.Errorf("expected leader address in message, got %q", msg)
-	}
-}
-
-func TestNotLeaderError_ErrorWithoutLeader(t *testing.T) {
-	err := &NotLeaderError{
-		ShardID:  3,
-		LeaderID: 0,
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "shard 3") {
-		t.Errorf("expected shard ID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "unknown") {
-		t.Errorf("expected 'unknown' for no-leader case, got %q", msg)
-	}
-}
-
-func TestNotLeaderError_Is_MatchesSentinel(t *testing.T) {
-	err := &NotLeaderError{ShardID: 1, LeaderID: 5, LeaderAddress: "host:9000"}
-	if !errors.Is(err, ErrNotLeader) {
-		t.Error("errors.Is(NotLeaderError, ErrNotLeader) returned false")
-	}
-}
-
-func TestNotLeaderError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &NotLeaderError{ShardID: 1}
-	if errors.Is(err, ErrBusy) {
-		t.Error("errors.Is(NotLeaderError, ErrBusy) unexpectedly returned true")
-	}
-	if errors.Is(err, ErrClosed) {
-		t.Error("errors.Is(NotLeaderError, ErrClosed) unexpectedly returned true")
-	}
-	if errors.Is(err, ErrTimeout) {
-		t.Error("errors.Is(NotLeaderError, ErrTimeout) unexpectedly returned true")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// EntryTooLargeError
-// ---------------------------------------------------------------------------
-
-func TestEntryTooLargeError_Error(t *testing.T) {
-	err := &EntryTooLargeError{Size: 16_000_000, MaxSize: 8_000_000}
-	msg := err.Error()
-	if !strings.Contains(msg, "16000000") {
-		t.Errorf("expected size in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "8000000") {
-		t.Errorf("expected max size in message, got %q", msg)
-	}
-	if !strings.HasPrefix(msg, "quicraft:") {
-		t.Errorf("message does not start with 'quicraft:' prefix, got %q", msg)
-	}
-}
-
-func TestEntryTooLargeError_Is_MatchesSentinel(t *testing.T) {
-	err := &EntryTooLargeError{Size: 100, MaxSize: 50}
-	if !errors.Is(err, ErrEntryTooLarge) {
-		t.Error("errors.Is(EntryTooLargeError, ErrEntryTooLarge) returned false")
-	}
-}
-
-func TestEntryTooLargeError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &EntryTooLargeError{Size: 100, MaxSize: 50}
-	if errors.Is(err, ErrBusy) {
-		t.Error("errors.Is(EntryTooLargeError, ErrBusy) unexpectedly returned true")
-	}
-	if errors.Is(err, ErrNotLeader) {
-		t.Error("errors.Is(EntryTooLargeError, ErrNotLeader) unexpectedly returned true")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// BusyError
-// ---------------------------------------------------------------------------
-
-func TestBusyError_Error(t *testing.T) {
-	err := &BusyError{ShardID: 42, CurrentSize: 300_000_000, MaxSize: 256_000_000}
-	msg := err.Error()
-	if !strings.Contains(msg, "shard 42") {
-		t.Errorf("expected shard ID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "300000000") {
-		t.Errorf("expected current size in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "256000000") {
-		t.Errorf("expected max size in message, got %q", msg)
-	}
-	if !strings.HasPrefix(msg, "quicraft:") {
-		t.Errorf("message does not start with 'quicraft:' prefix, got %q", msg)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := tc.err.Error()
+			if tc.want != "" && msg != tc.want {
+				t.Errorf("Error() = %q, want %q", msg, tc.want)
+			}
+			if tc.prefix != "" && !strings.HasPrefix(msg, tc.prefix) {
+				t.Errorf("Error() = %q, want prefix %q", msg, tc.prefix)
+			}
+			for _, sub := range tc.contains {
+				if !strings.Contains(msg, sub) {
+					t.Errorf("Error() = %q, want it to contain %q", msg, sub)
+				}
+			}
+		})
 	}
 }
 
-func TestBusyError_Is_MatchesSentinel(t *testing.T) {
-	err := &BusyError{ShardID: 1, CurrentSize: 100, MaxSize: 50}
-	if !errors.Is(err, ErrBusy) {
-		t.Error("errors.Is(BusyError, ErrBusy) returned false")
+// TestTypedErrors_Is pins that each typed error matches its own sentinel
+// through errors.Is and no unrelated one.
+func TestTypedErrors_Is(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		matches error
+		others  []error
+	}{
+		{
+			name:    "NotLeaderError",
+			err:     &NotLeaderError{ShardID: 1, LeaderID: 5, LeaderAddress: "host:9000"},
+			matches: ErrNotLeader,
+			others:  []error{ErrBusy, ErrClosed, ErrTimeout},
+		},
+		{
+			name:    "EntryTooLargeError",
+			err:     &EntryTooLargeError{Size: 100, MaxSize: 50},
+			matches: ErrEntryTooLarge,
+			others:  []error{ErrBusy, ErrNotLeader},
+		},
+		{
+			name:    "BusyError",
+			err:     &BusyError{ShardID: 1, CurrentSize: 100, MaxSize: 50},
+			matches: ErrBusy,
+			others:  []error{ErrNotLeader, ErrClosed, ErrEntryTooLarge},
+		},
+		{
+			// ErrSystemBusy is a *BusyError, so it must match ErrBusy.
+			name:    "ErrSystemBusy",
+			err:     ErrSystemBusy,
+			matches: ErrBusy,
+		},
+		{
+			name:    "SessionExpiredError",
+			err:     &SessionExpiredError{ShardID: 1, ClientID: 99},
+			matches: ErrSessionExpired,
+			others:  []error{ErrBusy, ErrNotLeader, ErrSessionNotFound},
+		},
+		{
+			name:    "StaleConfigChangeError",
+			err:     &StaleConfigChangeError{ShardID: 1, Expected: 5, Got: 3},
+			matches: ErrStaleConfigChange,
+			others:  []error{ErrClosed},
+		},
+		{
+			name:    "ShardNotStoppedError",
+			err:     &ShardNotStoppedError{ShardID: 1, ReplicaID: 2},
+			matches: ErrShardNotStopped,
+			others:  []error{ErrClosed},
+		},
+		{
+			name:    "ReplicaNotFoundError",
+			err:     &ReplicaNotFoundError{ShardID: 1, ReplicaID: 2},
+			matches: ErrReplicaNotFound,
+			others:  []error{ErrShardNotReady},
+		},
+		{
+			name:    "InvalidMemberError",
+			err:     &InvalidMemberError{ShardID: 1, ReplicaID: 0, Reason: "zero replica id"},
+			matches: ErrInvalidMember,
+			others:  []error{ErrReplicaNotFound},
+		},
 	}
-}
-
-func TestBusyError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &BusyError{ShardID: 1}
-	if errors.Is(err, ErrNotLeader) {
-		t.Error("errors.Is(BusyError, ErrNotLeader) unexpectedly returned true")
-	}
-	if errors.Is(err, ErrClosed) {
-		t.Error("errors.Is(BusyError, ErrClosed) unexpectedly returned true")
-	}
-	if errors.Is(err, ErrEntryTooLarge) {
-		t.Error("errors.Is(BusyError, ErrEntryTooLarge) unexpectedly returned true")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// UnauthorizedMessageError
-// ---------------------------------------------------------------------------
-
-func TestUnauthorizedMessageError_Error(t *testing.T) {
-	err := &UnauthorizedMessageError{
-		ShardID: 5,
-		From:    42,
-		MsgType: 3,
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "replica 42") {
-		t.Errorf("expected 'replica 42' in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "shard 5") {
-		t.Errorf("expected 'shard 5' in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "type=3") {
-		t.Errorf("expected 'type=3' in message, got %q", msg)
-	}
-	if !strings.HasPrefix(msg, "quicraft:") {
-		t.Errorf("message does not start with 'quicraft:' prefix, got %q", msg)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SessionExpiredError
-// ---------------------------------------------------------------------------
-
-func TestSessionExpiredError_Error(t *testing.T) {
-	err := &SessionExpiredError{ShardID: 10, ClientID: 42}
-	msg := err.Error()
-	if !strings.Contains(msg, "client 42") {
-		t.Errorf("expected client ID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "shard 10") {
-		t.Errorf("expected shard ID in message, got %q", msg)
-	}
-	if !strings.HasPrefix(msg, "quicraft:") {
-		t.Errorf("message does not start with 'quicraft:' prefix, got %q", msg)
-	}
-}
-
-func TestSessionExpiredError_Is_MatchesSentinel(t *testing.T) {
-	err := &SessionExpiredError{ShardID: 1, ClientID: 99}
-	if !errors.Is(err, ErrSessionExpired) {
-		t.Error("errors.Is(SessionExpiredError, ErrSessionExpired) returned false")
-	}
-}
-
-func TestSessionExpiredError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &SessionExpiredError{ShardID: 1, ClientID: 99}
-	if errors.Is(err, ErrBusy) {
-		t.Error("errors.Is(SessionExpiredError, ErrBusy) unexpectedly returned true")
-	}
-	if errors.Is(err, ErrNotLeader) {
-		t.Error("errors.Is(SessionExpiredError, ErrNotLeader) unexpectedly returned true")
-	}
-	if errors.Is(err, ErrSessionNotFound) {
-		t.Error("errors.Is(SessionExpiredError, ErrSessionNotFound) unexpectedly returned true")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Error sentinel hierarchy
-// ---------------------------------------------------------------------------
-
-func TestErrSystemBusy_Is_ErrBusy(t *testing.T) {
-	// ErrSystemBusy is a *BusyError, so errors.Is must match ErrBusy.
-	if !errors.Is(ErrSystemBusy, ErrBusy) {
-		t.Error("errors.Is(ErrSystemBusy, ErrBusy) returned false")
-	}
-}
-
-func TestErrSystemBusy_ErrorMessage(t *testing.T) {
-	msg := ErrSystemBusy.Error()
-	if !strings.Contains(msg, "global rate limit") {
-		t.Errorf("ErrSystemBusy message %q does not mention global rate limit", msg)
-	}
-	if !strings.HasPrefix(msg, "quicraft:") {
-		t.Errorf("ErrSystemBusy message %q does not have quicraft: prefix", msg)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !errors.Is(tc.err, tc.matches) {
+				t.Errorf("errors.Is(%s, %v) = false, want true", tc.name, tc.matches)
+			}
+			for _, other := range tc.others {
+				if errors.Is(tc.err, other) {
+					t.Errorf("errors.Is(%s, %v) = true, want false", tc.name, other)
+				}
+			}
+		})
 	}
 }
 
@@ -358,186 +329,11 @@ func TestErrTooManySessions_SamePointer(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// BusyError with custom message
-// ---------------------------------------------------------------------------
-
-func TestBusyError_CustomMessage(t *testing.T) {
-	err := &BusyError{message: "quicraft: custom busy message"}
-	msg := err.Error()
-	if msg != "quicraft: custom busy message" {
-		t.Errorf("Error() = %q, want %q", msg, "quicraft: custom busy message")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// StaleConfigChangeError
-// ---------------------------------------------------------------------------
-
-func TestStaleConfigChangeError_Error(t *testing.T) {
-	err := &StaleConfigChangeError{ShardID: 1, Expected: 5, Got: 3}
-	msg := err.Error()
-	if !strings.Contains(msg, "stale config change") {
-		t.Errorf("expected 'stale config change' in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "shard 1") {
-		t.Errorf("expected shard ID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "expected ConfigChangeID 5") {
-		t.Errorf("expected expected ID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "got 3") {
-		t.Errorf("expected got ID in message, got %q", msg)
-	}
-}
-
-func TestStaleConfigChangeError_Is_MatchesSentinel(t *testing.T) {
-	err := &StaleConfigChangeError{ShardID: 1, Expected: 5, Got: 3}
-	if !errors.Is(err, ErrStaleConfigChange) {
-		t.Error("StaleConfigChangeError should match ErrStaleConfigChange")
-	}
-}
-
-func TestStaleConfigChangeError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &StaleConfigChangeError{ShardID: 1, Expected: 5, Got: 3}
-	if errors.Is(err, ErrClosed) {
-		t.Error("StaleConfigChangeError should not match ErrClosed")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// SessionError
-// ---------------------------------------------------------------------------
-
-func TestSessionError_Error_FormatsMessage(t *testing.T) {
-	inner := errors.New("connection lost")
-	err := &SessionError{ClientID: 42, Op: "register", Err: inner}
-
-	msg := err.Error()
-	if !strings.Contains(msg, "42") {
-		t.Errorf("expected ClientID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "register") {
-		t.Errorf("expected Op in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "connection lost") {
-		t.Errorf("expected inner error in message, got %q", msg)
-	}
-}
-
-func TestSessionError_Error_NilInnerError(t *testing.T) {
-	err := &SessionError{ClientID: 1, Op: "unregister", Err: nil}
-	msg := err.Error()
-	if !strings.Contains(msg, "unregister") {
-		t.Errorf("expected Op in message even with nil Err, got %q", msg)
-	}
-	if !strings.Contains(msg, "<nil>") {
-		t.Errorf("expected <nil> in message for nil Err, got %q", msg)
-	}
-}
-
 func TestSessionError_Unwrap_ReturnsInner(t *testing.T) {
 	inner := errors.New("timeout")
 	err := &SessionError{ClientID: 7, Op: "propose", Err: inner}
 	if err.Unwrap() != inner {
 		t.Error("Unwrap should return the inner error")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ShardNotStoppedError
-// ---------------------------------------------------------------------------
-
-func TestShardNotStoppedError_Error_FormatsMessage(t *testing.T) {
-	err := &ShardNotStoppedError{ShardID: 5, ReplicaID: 3}
-	msg := err.Error()
-	if !strings.Contains(msg, "5") {
-		t.Errorf("expected ShardID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "3") {
-		t.Errorf("expected ReplicaID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "still running") {
-		t.Errorf("expected 'still running' in message, got %q", msg)
-	}
-}
-
-func TestShardNotStoppedError_Is_MatchesSentinel(t *testing.T) {
-	err := &ShardNotStoppedError{ShardID: 1, ReplicaID: 2}
-	if !errors.Is(err, ErrShardNotStopped) {
-		t.Error("ShardNotStoppedError should match ErrShardNotStopped")
-	}
-}
-
-func TestShardNotStoppedError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &ShardNotStoppedError{ShardID: 1, ReplicaID: 2}
-	if errors.Is(err, ErrClosed) {
-		t.Error("ShardNotStoppedError should not match ErrClosed")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ReplicaNotFoundError
-// ---------------------------------------------------------------------------
-
-func TestReplicaNotFoundError_Error_FormatsMessage(t *testing.T) {
-	err := &ReplicaNotFoundError{ShardID: 8, ReplicaID: 4}
-	msg := err.Error()
-	if !strings.Contains(msg, "4") {
-		t.Errorf("expected ReplicaID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "8") {
-		t.Errorf("expected ShardID in message, got %q", msg)
-	}
-	if !strings.Contains(msg, "not found") {
-		t.Errorf("expected 'not found' in message, got %q", msg)
-	}
-}
-
-func TestReplicaNotFoundError_Is_MatchesSentinel(t *testing.T) {
-	err := &ReplicaNotFoundError{ShardID: 1, ReplicaID: 2}
-	if !errors.Is(err, ErrReplicaNotFound) {
-		t.Error("ReplicaNotFoundError should match ErrReplicaNotFound")
-	}
-}
-
-func TestReplicaNotFoundError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &ReplicaNotFoundError{ShardID: 1, ReplicaID: 2}
-	if errors.Is(err, ErrShardNotReady) {
-		t.Error("ReplicaNotFoundError should not match ErrShardNotReady")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// LoopPanicError
-// ---------------------------------------------------------------------------
-
-func TestLoopPanicError_ErrorMessage(t *testing.T) {
-	err := &LoopPanicError{
-		LoopName: "key-rotation",
-		Value:    "test panic value",
-		Stack:    []byte("fake stack"),
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "key-rotation") {
-		t.Errorf("expected loop name in error, got: %s", msg)
-	}
-	if !strings.Contains(msg, "test panic value") {
-		t.Errorf("expected panic value in error, got: %s", msg)
-	}
-}
-
-func TestInvalidMemberError_Is_MatchesSentinel(t *testing.T) {
-	err := &InvalidMemberError{ShardID: 1, ReplicaID: 0, Reason: "zero replica id"}
-	if !errors.Is(err, ErrInvalidMember) {
-		t.Error("InvalidMemberError should match ErrInvalidMember")
-	}
-}
-
-func TestInvalidMemberError_Is_DoesNotMatchOther(t *testing.T) {
-	err := &InvalidMemberError{ShardID: 1, ReplicaID: 0, Reason: "zero replica id"}
-	if errors.Is(err, ErrReplicaNotFound) {
-		t.Error("InvalidMemberError should not match ErrReplicaNotFound")
 	}
 }
 
