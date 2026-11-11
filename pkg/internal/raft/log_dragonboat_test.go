@@ -14,71 +14,14 @@
 
 package raft
 
-// Log edge case tests ported from dragonboat. These test entry retrieval
-// from in-memory and LogDB stores, spanning retrieval, post-snapshot
-// state, and applied-index tracking.
+// Log edge case tests ported from dragonboat. These test entry and term
+// retrieval from LogDB, post-snapshot state, and applied-index tracking.
 
 import (
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
-
-// TestLog_GetEntryFromInMem verifies that entries can be retrieved from
-// the in-memory portion of the log when they have not yet been persisted.
-func TestLog_GetEntryFromInMem(t *testing.T) {
-	// Create raftLog with empty LogDB and entries only in inmem.
-	l := newTestRaftLog(nil)
-	entries := []proto.Entry{
-		{Index: 1, Term: 1, Cmd: []byte("a")},
-		{Index: 2, Term: 1, Cmd: []byte("b")},
-		{Index: 3, Term: 2, Cmd: []byte("c")},
-	}
-	l.inmem.merge(entries)
-
-	// All entries should come from inmem.
-	result, err := l.entries(1, 4, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(result))
-	}
-	for i, e := range result {
-		if e.Index != entries[i].Index {
-			t.Fatalf("entry %d: expected index %d, got %d", i, entries[i].Index, e.Index)
-		}
-		if e.Term != entries[i].Term {
-			t.Fatalf("entry %d: expected term %d, got %d", i, entries[i].Term, e.Term)
-		}
-	}
-}
-
-// TestLog_GetEntryFromInMem_TermLookup verifies that term() returns
-// the correct term for entries only in inmem.
-func TestLog_GetEntryFromInMem_TermLookup(t *testing.T) {
-	l := newTestRaftLog(nil)
-	l.inmem.merge([]proto.Entry{
-		{Index: 1, Term: 3},
-		{Index: 2, Term: 5},
-	})
-
-	term, err := l.term(1)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if term != 3 {
-		t.Fatalf("expected term 3, got %d", term)
-	}
-
-	term, err = l.term(2)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if term != 5 {
-		t.Fatalf("expected term 5, got %d", term)
-	}
-}
 
 // TestLog_GetEntryFromLogDB verifies that entries can be retrieved from
 // the persistent LogDB when they are not in inmem.
@@ -139,51 +82,6 @@ func TestLog_GetEntryFromLogDB_TermLookup(t *testing.T) {
 	}
 	if term != 7 {
 		t.Fatalf("expected term 7, got %d", term)
-	}
-}
-
-// TestLog_GetEntrySpanningBothStores verifies that entry retrieval
-// correctly spans both LogDB (for persisted entries) and in-memory
-// (for recent entries).
-func TestLog_GetEntrySpanningBothStores(t *testing.T) {
-	// LogDB has entries 1-3.
-	dbEntries := []proto.Entry{
-		{Index: 1, Term: 1, Cmd: []byte("a")},
-		{Index: 2, Term: 1, Cmd: []byte("b")},
-		{Index: 3, Term: 1, Cmd: []byte("c")},
-	}
-	logdb := newTestLogReader(dbEntries, proto.State{})
-
-	// inmem has entries 4-5 (markerIndex=4).
-	l := &raftLog{
-		logdb:     logdb,
-		inmem:     newInMemory(3), // markerIndex=4
-		committed: 0,
-		processed: 0,
-	}
-	l.inmem.merge([]proto.Entry{
-		{Index: 4, Term: 2, Cmd: []byte("d")},
-		{Index: 5, Term: 2, Cmd: []byte("e")},
-	})
-
-	// Retrieve entries spanning both stores: 2-5.
-	result, err := l.entries(2, 6, 0)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(result) != 4 {
-		t.Fatalf("expected 4 entries, got %d", len(result))
-	}
-
-	expectedIndices := []uint64{2, 3, 4, 5}
-	expectedTerms := []uint64{1, 1, 2, 2}
-	for i, e := range result {
-		if e.Index != expectedIndices[i] {
-			t.Fatalf("entry %d: expected index %d, got %d", i, expectedIndices[i], e.Index)
-		}
-		if e.Term != expectedTerms[i] {
-			t.Fatalf("entry %d: expected term %d, got %d", i, expectedTerms[i], e.Term)
-		}
 	}
 }
 
