@@ -350,7 +350,7 @@ func TestBarrier_ContextBinding_ClearedAfterSeal(t *testing.T) {
 		t.Fatalf("Seal failed: %v", err)
 	}
 	// A sealed barrier has NO encryptor, so it has no capability to report --
-	// not the software one. See TestBarrier_ContextBinding_UnresolvedUntilUnsealed.
+	// not the software one. See TestBarrier_ContextBinding_UnresolvedBeforeUnseal.
 	if b.ContextBinding() != ContextBindingUnresolved {
 		t.Fatalf("sealed barrier reports binding %v, want %v",
 			b.ContextBinding(), ContextBindingUnresolved)
