@@ -626,6 +626,29 @@ func TestMultiNode_RequestSnapshot_OnLeader(t *testing.T) {
 		leaderReplicaID, firstIndex, secondIndex, leaderDir)
 }
 
+// TestMultiNode_GetNodeHostInfo verifies that each node in the cluster
+// returns accurate shard information from NodeHostInfo.
+func TestMultiNode_GetNodeHostInfo(t *testing.T) {
+	cluster := newTestCluster(t, 3)
+	defer cluster.close()
+
+	cluster.startShard(1)
+	cluster.waitForClusterLeader(1, leaderElectionTimeout)
+
+	for i, h := range cluster.hosts {
+		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
+		if info == nil {
+			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
+		}
+		if len(info.ShardInfoList) != 1 {
+			t.Errorf("node[%d] ShardInfoList length = %d, want 1", i, len(info.ShardInfoList))
+		}
+		if info.RaftAddress != cluster.addrs[i] {
+			t.Errorf("node[%d] RaftAddress = %q, want %q", i, info.RaftAddress, cluster.addrs[i])
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Multi-Node NodeHostInfo
 // ---------------------------------------------------------------------------
