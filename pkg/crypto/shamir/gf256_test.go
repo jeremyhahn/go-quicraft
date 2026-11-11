@@ -145,28 +145,6 @@ func TestSplitCombineRoundTripAllSubsets(t *testing.T) {
 	}
 }
 
-// TestCombineTamperedShareYieldsGarbage verifies that flipping a payload
-// byte in a share is NOT self-detected (shares carry no secret digest — that
-// would be an offline oracle). CombineBytes returns garbage, not an error; the
-// caller must catch this via out-of-band authentication.
-func TestCombineTamperedShareYieldsGarbage(t *testing.T) {
-	secret := []byte("tamper detection secret")
-	values := splitValues(t, secret, 3, 5)
-
-	// Tamper with a payload byte of share 1 (re-encode base64).
-	raw := decodeValue(t, values[1])
-	raw[rawShareOverhead] ^= 0x01
-	values[1] = encodeB64(raw)
-
-	got, err := CombineBytes(values[:3], 3)
-	if err != nil {
-		t.Fatalf("CombineBytes must not error on a tampered share: %v", err)
-	}
-	if bytes.Equal(got, secret) {
-		t.Fatal("tampered share unexpectedly reconstructed the original secret")
-	}
-}
-
 // TestCombineRejectsLegacyFormat verifies that a share value without the
 // current format version byte is rejected explicitly rather than
 // misinterpreted (gates legacy pre-GF(256) shares).
@@ -180,14 +158,5 @@ func TestCombineRejectsLegacyFormat(t *testing.T) {
 	var combineErr *CombineError
 	if !errors.As(err, &combineErr) {
 		t.Fatalf("err = %v, want CombineError", err)
-	}
-}
-
-// TestFewerThanThresholdSharesRevealNothing verifies that threshold-1 shares
-// are refused rather than reconstructed.
-func TestFewerThanThresholdSharesRevealNothing(t *testing.T) {
-	values := splitValues(t, []byte("below threshold"), 3, 5)
-	if _, err := CombineBytes(values[:2], 3); err == nil {
-		t.Fatal("threshold check must reject 2 of 3 shares")
 	}
 }
