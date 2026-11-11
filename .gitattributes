@@ -9,12 +9,10 @@
 # (docs/release/public-releasability.md).
 #
 # The private forge's own workflows stay out. They are not the CI template:
-# they drive only the private forge's SDLC -- arming its auto-merge
-# (automerge), opening its revert PR when a merge turns main red
-# (revert-red-main) and running its pull-request review on its own runners
+# they drive only the private forge's SDLC -- opening its revert PR when a
+# merge turns main red (revert-red-main) and running its pull-request review on its own runners
 # (code-review, the company template verbatim) -- and nothing a public reader
 # runs calls or reads them.
-.github/workflows/automerge.yml export-ignore
 .github/workflows/revert-red-main.yml export-ignore
 .github/workflows/code-review.yml export-ignore
 

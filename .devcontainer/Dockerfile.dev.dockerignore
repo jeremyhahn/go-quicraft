@@ -41,7 +41,6 @@ go.work.sum
 .codex/
 
 # The rest of the .gitattributes exclusion list. No image build reads them.
-.github/workflows/automerge.yml
 .github/workflows/revert-red-main.yml
 .github/workflows/code-review.yml
 .release-allowed-signers
