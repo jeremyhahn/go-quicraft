@@ -1882,14 +1882,15 @@ func TestConnectionCleanup_PanicRestartsAndExitsOnStop(t *testing.T) {
 	tr.connMu.Unlock()
 
 	done := make(chan struct{})
+	idC := make(chan uint64, 1)
 	go func() {
 		defer close(done)
+		idC <- goroutineID()
 		tr.connectionCleanup()
 	}()
 
-	// Kept on purpose: the window spans a panicking sweep and a restart delay
-	// (supervise.RestartDelay, 100ms), which expose no signal to wait on.
-	time.Sleep(300 * time.Millisecond)
+	// The sweep has panicked once the loop parks in the restart delay.
+	waitBlockedIn(t, idC, "supervise.AwaitRestart", 5*time.Second)
 
 	// Close stopC to exit the loop.
 	close(testStopC)
