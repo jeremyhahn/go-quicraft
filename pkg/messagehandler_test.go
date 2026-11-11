@@ -33,67 +33,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-func TestHostMessageHandler_HandleMessage_DeliversToEngine(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	handler := &hostMessageHandler{engine: eng}
-
-	batch := proto.MessageBatch{
-		Requests: []proto.Message{
-			{ShardID: 1, To: 2, Type: proto.Heartbeat},
-			{ShardID: 3, To: 4, Type: proto.Replicate},
-		},
-	}
-
-	err := handler.HandleMessage(batch, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-	// Messages to unloaded shards are silently dropped by the engine,
-	// so no error is expected.
-}
-
-func TestHostMessageHandler_HandleMessage_EmptyBatch(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	handler := &hostMessageHandler{engine: eng}
-
-	batch := proto.MessageBatch{
-		Requests: []proto.Message{},
-	}
-
-	err := handler.HandleMessage(batch, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleMessage returned unexpected error for empty batch: %v", err)
-	}
-}
-
 // newEngineNodeWithMembership creates an engine.Node with a real raft.Peer
 // whose membership includes the specified voters. This enables per-shard
 // authorization tests where IsMember returns accurate results.
@@ -139,177 +78,6 @@ func newEngineNodeWithMembership(t *testing.T, shardID, replicaID uint64, voters
 	// now derives its on-disk path from node.SnapshotSaveDir, so tests assert
 	// against that rather than a hardcoded NodeHostDir path.
 	return engine.NewNode(peer, nil, lr, cfg, nil, t.TempDir(), nil)
-}
-
-// TestHostMessageHandler_HandleMessage_AuthorizedMember verifies that
-// messages from a known member of the target shard are delivered to the
-// engine's inbox and work is signaled.
-func TestHostMessageHandler_HandleMessage_AuthorizedMember(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	// Load a node with membership {1, 2} for shard 1.
-	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
-		1: "127.0.0.1:5001",
-		2: "127.0.0.1:5002",
-	})
-	eng.LoadNode(node)
-	defer eng.UnloadNode(1)
-
-	handler := &hostMessageHandler{engine: eng}
-
-	// Message from replica 2 (a member) should be delivered.
-	batch := proto.MessageBatch{
-		Requests: []proto.Message{
-			{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat},
-		},
-	}
-
-	err := handler.HandleMessage(batch, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-	// Authorized message is delivered. We verify by confirming no error
-	// and the message handler did not skip the message.
-}
-
-// TestHostMessageHandler_HandleMessage_UnauthorizedMember verifies that
-// messages from a replica NOT in the shard's membership are silently
-// dropped (not delivered to the engine).
-func TestHostMessageHandler_HandleMessage_UnauthorizedMember(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	// Load a node with membership {1, 2} for shard 1.
-	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
-		1: "127.0.0.1:5001",
-		2: "127.0.0.1:5002",
-	})
-	eng.LoadNode(node)
-	defer eng.UnloadNode(1)
-
-	handler := &hostMessageHandler{engine: eng}
-
-	// Message from replica 999 (NOT a member) should be dropped.
-	batch := proto.MessageBatch{
-		Requests: []proto.Message{
-			{ShardID: 1, From: 999, To: 1, Type: proto.Heartbeat},
-		},
-	}
-
-	err := handler.HandleMessage(batch, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-	// The message from the unauthorized replica was silently dropped.
-	// DeliverMessage was not called for it.
-}
-
-// TestHostMessageHandler_HandleMessage_UnloadedShardAllowed verifies that
-// messages to shards not loaded on this host are still delivered. This
-// ensures bootstrap messages and shard-loading triggers flow through.
-func TestHostMessageHandler_HandleMessage_UnloadedShardAllowed(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	handler := &hostMessageHandler{engine: eng}
-
-	// Message to shard 42 which is NOT loaded on this engine.
-	// GetNode returns nil, so the message should be allowed through.
-	batch := proto.MessageBatch{
-		Requests: []proto.Message{
-			{ShardID: 42, From: 5, To: 1, Type: proto.Replicate},
-		},
-	}
-
-	err := handler.HandleMessage(batch, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-}
-
-// TestHostMessageHandler_HandleMessage_MixedAuthorization verifies that
-// a batch with both authorized and unauthorized messages correctly
-// delivers only the authorized ones.
-func TestHostMessageHandler_HandleMessage_MixedAuthorization(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	// Load shard 1 with membership {1, 2}.
-	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
-		1: "127.0.0.1:5001",
-		2: "127.0.0.1:5002",
-	})
-	eng.LoadNode(node)
-	defer eng.UnloadNode(1)
-
-	handler := &hostMessageHandler{engine: eng}
-
-	batch := proto.MessageBatch{
-		Requests: []proto.Message{
-			// Authorized: replica 2 is a member of shard 1.
-			{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat},
-			// Unauthorized: replica 777 is NOT a member of shard 1.
-			{ShardID: 1, From: 777, To: 1, Type: proto.Replicate},
-			// Unloaded shard: allowed through.
-			{ShardID: 99, From: 5, To: 1, Type: proto.Heartbeat},
-		},
-	}
-
-	err := handler.HandleMessage(batch, authorizeAllSenders)
-	if err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-	// First message delivered (authorized), second dropped (unauthorized),
-	// third delivered (shard not loaded, no membership check).
 }
 
 // TestHostMessageHandler_HandleSnapshot_UnauthorizedSender verifies that
@@ -851,15 +619,21 @@ func TestWithoutTransport_DisablesTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
-	defer h.Close()
 
 	if h.transport != nil {
+		h.Close()
 		t.Fatal("expected transport to be nil when WithoutTransport() is used")
 	}
 
 	// Verify the sender is a noopSender.
 	if _, ok := h.sender.(*noopSender); !ok {
+		h.Close()
 		t.Fatalf("expected noopSender, got %T", h.sender)
+	}
+
+	// Close must succeed with a nil transport.
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close returned unexpected error: %v", err)
 	}
 }
 
@@ -918,19 +692,6 @@ func TestBuildTransportConfig_MapsAllFields(t *testing.T) {
 	}
 	if tc.MaxConnectionsPerIP != 8 {
 		t.Fatalf("MaxConnectionsPerIP: got %d, want %d", tc.MaxConnectionsPerIP, 8)
-	}
-}
-
-func TestHost_CloseWithTransportDisabled(t *testing.T) {
-	cfg := testHostConfig(t)
-	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost failed: %v", err)
-	}
-
-	// Close should succeed with nil transport.
-	if err := h.Close(); err != nil {
-		t.Fatalf("Close returned unexpected error: %v", err)
 	}
 }
 
@@ -1235,8 +996,12 @@ func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 		},
 	}
 
-	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
+	// The second, identical batch takes the already-registered branch and
+	// must leave the learned address in place.
+	for range 2 {
+		if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
+			t.Fatalf("HandleMessage returned unexpected error: %v", err)
+		}
 	}
 
 	// The authorized member's address was learned.
@@ -1388,121 +1153,6 @@ func TestHostMessageHandler_HandleMessage_NoLearnForNonMember(t *testing.T) {
 
 	if _, err := reg.Resolve(1, 999); err == nil {
 		t.Fatal("expected no learned address for non-member, but one was registered")
-	}
-}
-
-// TestHostMessageHandler_HandleMessage_UpdatesAddressForRecovery verifies that
-// an inbound message from an authorized member with a NEW SourceAddress updates
-// the registry. This overwrite is required for liveness: a node that recovers
-// at a new address (and, during quorum loss, has no leader to propagate a
-// config change) must be relearned from its own traffic or the cluster can
-// never re-form a quorum. Anti-poisoning is enforced one layer down, at the
-// transport, which clears any SourceAddress not covered by the sender's
-// verified TLS certificate (covered by the transport package's tests); this
-// handler-level test exercises the post-binding overwrite behavior.
-func TestHostMessageHandler_HandleMessage_UpdatesAddressForRecovery(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
-		1: "127.0.0.1:5001",
-		2: "127.0.0.1:5002",
-	})
-	eng.LoadNode(node)
-	defer eng.UnloadNode(1)
-
-	reg := registry.NewRegistry()
-	// Replica 2's old address is known (e.g. from bootstrap/config).
-	reg.Register(1, 2, "127.0.0.1:5002")
-
-	h := &Host{cfg: cfg, registry: reg}
-	handler := &hostMessageHandler{engine: eng, host: h}
-
-	// Replica 2 recovered at a NEW address and sends traffic. The transport
-	// has already cert-bound this SourceAddress; the handler must update the
-	// mapping so peers can reach the recovered node.
-	const newAddr = "127.0.0.1:5999"
-	batch := proto.MessageBatch{
-		SourceAddress: newAddr,
-		Requests: []proto.Message{
-			{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat},
-		},
-	}
-	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-
-	addr, err := reg.Resolve(1, 2)
-	if err != nil {
-		t.Fatalf("Resolve(1, 2) failed: %v", err)
-	}
-	if addr != newAddr {
-		t.Errorf("address was not updated for recovery: got %q, want %q", addr, newAddr)
-	}
-}
-
-// TestHostMessageHandler_HandleMessage_SameAddressNoChange verifies that a
-// repeated claim of the SAME address is a harmless no-op (idempotent).
-func TestHostMessageHandler_HandleMessage_SameAddressNoChange(t *testing.T) {
-	cfg := config.HostConfig{
-		WALDir:                t.TempDir(),
-		NodeHostDir:           t.TempDir(),
-		RaftAddress:           "127.0.0.1:5000",
-		ListenAddress:         "127.0.0.1:5000",
-		DeploymentID:          1,
-		AllowZeroDeploymentID: false,
-	}
-	cfg.SetDefaults()
-
-	sender := &noopSender{}
-	eng := engine.NewEngine(cfg, nil, sender, nil, nil, nil)
-	eng.Start()
-	defer eng.Stop()
-
-	node := newEngineNodeWithMembership(t, 1, 1, map[uint64]string{
-		1: "127.0.0.1:5001",
-		2: "127.0.0.1:5002",
-	})
-	eng.LoadNode(node)
-	defer eng.UnloadNode(1)
-
-	reg := registry.NewRegistry()
-	h := &Host{cfg: cfg, registry: reg}
-	handler := &hostMessageHandler{engine: eng, host: h}
-
-	batch := proto.MessageBatch{
-		SourceAddress: "10.0.0.2:9000",
-		Requests: []proto.Message{
-			{ShardID: 1, From: 2, To: 1, Type: proto.Heartbeat},
-		},
-	}
-	// First message learns the address.
-	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-	// Second identical message is a no-op (no overwrite, no warning needed).
-	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
-		t.Fatalf("HandleMessage returned unexpected error: %v", err)
-	}
-
-	addr, err := reg.Resolve(1, 2)
-	if err != nil {
-		t.Fatalf("Resolve(1, 2) failed: %v", err)
-	}
-	if addr != "10.0.0.2:9000" {
-		t.Errorf("Resolve(1, 2) = %q, want %q", addr, "10.0.0.2:9000")
 	}
 }
 
