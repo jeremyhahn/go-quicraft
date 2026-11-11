@@ -52,46 +52,48 @@ func capturePurgeLogs(t *testing.T) *logCapture {
 	return buf
 }
 
-// TestApplyPurge_LifetimeCancelAbandonsAtDebug pins that a purge the pool's
-// own stop cut short is logged at DEBUG, not reported as a failure.
-func TestApplyPurge_LifetimeCancelAbandonsAtDebug(t *testing.T) {
-	logs := capturePurgeLogs(t)
-	stopC := make(chan struct{})
-	barrier := &blockingPurgeBarrier{testBarrier: newTestBarrier(5)}
-	p := newSnapshotPool(1, nil, barrier, nil, nil, stopC, nil)
-	close(stopC)
+// TestApplyPurge_DuringStop pins how a purge that ends while the pool is
+// stopping is logged. One the pool's own stop cut short is logged at DEBUG, not
+// reported as a failure; the carve-out is keyed to the error's cause, so a
+// persister failure that surfaces while the pool is stopping is still the WARN
+// failure line.
+func TestApplyPurge_DuringStop(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		failure error
+		want    []string
+		notWant string
+	}{
+		{
+			name:    "lifetime cancel abandons at debug",
+			want:    []string{"level=DEBUG", "epoch purge abandoned"},
+			notWant: "epoch purge failed",
+		},
+		{
+			name:    "real failure logs warn",
+			failure: errors.New("quicraft/seal: no state persister configured"),
+			want:    []string{"level=WARN", "epoch purge failed"},
+			notWant: "epoch purge abandoned",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := capturePurgeLogs(t)
+			stopC := make(chan struct{})
+			barrier := &blockingPurgeBarrier{testBarrier: newTestBarrier(5), failure: tc.failure}
+			p := newSnapshotPool(1, nil, barrier, nil, nil, stopC, nil)
+			close(stopC)
 
-	p.applyPurge(barrier, 3, 1, 1)
+			p.applyPurge(barrier, 3, 1, 1)
 
-	out := logs.String()
-	if !strings.Contains(out, "level=DEBUG") || !strings.Contains(out, "epoch purge abandoned") {
-		t.Fatalf("want a DEBUG abandonment line, got:\n%s", out)
-	}
-	if strings.Contains(out, "epoch purge failed") {
-		t.Fatalf("a cancelled purge was logged as a failure:\n%s", out)
-	}
-}
-
-// TestApplyPurge_RealFailureDuringStopLogsWarn pins that the carve-out is keyed
-// to the error's cause: a persister failure that surfaces while the pool is
-// stopping is still the WARN failure line.
-func TestApplyPurge_RealFailureDuringStopLogsWarn(t *testing.T) {
-	logs := capturePurgeLogs(t)
-	stopC := make(chan struct{})
-	barrier := &blockingPurgeBarrier{
-		testBarrier: newTestBarrier(5),
-		failure:     errors.New("quicraft/seal: no state persister configured"),
-	}
-	p := newSnapshotPool(1, nil, barrier, nil, nil, stopC, nil)
-	close(stopC)
-
-	p.applyPurge(barrier, 3, 1, 1)
-
-	out := logs.String()
-	if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "epoch purge failed") {
-		t.Fatalf("want the WARN failure line, got:\n%s", out)
-	}
-	if strings.Contains(out, "epoch purge abandoned") {
-		t.Fatalf("a persister failure was reported as a stop abandonment:\n%s", out)
+			out := logs.String()
+			for _, w := range tc.want {
+				if !strings.Contains(out, w) {
+					t.Fatalf("want %q in the purge log, got:\n%s", w, out)
+				}
+			}
+			if strings.Contains(out, tc.notWant) {
+				t.Fatalf("the purge log carries %q, the other outcome's line:\n%s", tc.notWant, out)
+			}
+		})
 	}
 }
