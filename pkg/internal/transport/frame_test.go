@@ -30,48 +30,50 @@ import (
 // TestWriteFrameAndReadFrameHeaderRoundTrip verifies that a frame written
 // by WriteFrame can be fully read back by ReadFrameHeader plus payload read.
 func TestWriteFrameAndReadFrameHeaderRoundTrip(t *testing.T) {
-	payload := []byte("hello quicraft")
+	tests := []struct {
+		name    string
+		payload []byte
+		flags   FrameFlags
+	}{
+		{name: "payload", payload: []byte("hello quicraft"), flags: FlagNone},
+		{name: "empty payload", payload: nil, flags: FlagNone},
+		{name: "compressed flag", payload: []byte("compressed-data"), flags: FlagCompressed},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			if err := WriteFrame(&buf, tc.payload, tc.flags); err != nil {
+				t.Fatalf("WriteFrame failed: %v", err)
+			}
 
-	var buf bytes.Buffer
-	if err := WriteFrame(&buf, payload, FlagNone); err != nil {
-		t.Fatalf("WriteFrame failed: %v", err)
-	}
+			raw := buf.Bytes()
+			if raw[2] != WireVersion {
+				t.Fatalf("expected version %d in frame, got %d", WireVersion, raw[2])
+			}
+			if err := ValidateFrameHeader(raw[:FrameHeaderSize]); err != nil {
+				t.Fatalf("WriteFrame produced invalid header: %v", err)
+			}
 
-	r := bytes.NewReader(buf.Bytes())
-	length, flags, err := ReadFrameHeader(r)
-	if err != nil {
-		t.Fatalf("ReadFrameHeader failed: %v", err)
-	}
-	if flags != FlagNone {
-		t.Fatalf("expected FlagNone, got %d", flags)
-	}
-	if length != uint32(len(payload)) {
-		t.Fatalf("expected length %d, got %d", len(payload), length)
-	}
+			r := bytes.NewReader(raw)
+			length, flags, err := ReadFrameHeader(r)
+			if err != nil {
+				t.Fatalf("ReadFrameHeader failed: %v", err)
+			}
+			if flags != tc.flags {
+				t.Fatalf("expected flags %d, got %d", tc.flags, flags)
+			}
+			if length != uint32(len(tc.payload)) {
+				t.Fatalf("expected length %d, got %d", len(tc.payload), length)
+			}
 
-	result := make([]byte, length)
-	if _, err := io.ReadFull(r, result); err != nil {
-		t.Fatalf("payload read failed: %v", err)
-	}
-	if !bytes.Equal(result, payload) {
-		t.Fatalf("payload mismatch: got %q, want %q", result, payload)
-	}
-}
-
-// TestWriteFrameEmptyPayload verifies that writing an empty payload works.
-func TestWriteFrameEmptyPayload(t *testing.T) {
-	var buf bytes.Buffer
-	if err := WriteFrame(&buf, nil, FlagNone); err != nil {
-		t.Fatalf("WriteFrame failed: %v", err)
-	}
-
-	r := bytes.NewReader(buf.Bytes())
-	length, _, err := ReadFrameHeader(r)
-	if err != nil {
-		t.Fatalf("ReadFrameHeader failed: %v", err)
-	}
-	if length != 0 {
-		t.Fatalf("expected length 0, got %d", length)
+			result := make([]byte, length)
+			if _, err := io.ReadFull(r, result); err != nil {
+				t.Fatalf("payload read failed: %v", err)
+			}
+			if !bytes.Equal(result, tc.payload) {
+				t.Fatalf("payload mismatch: got %q, want %q", result, tc.payload)
+			}
+		})
 	}
 }
 
@@ -88,43 +90,21 @@ func TestWriteFramePayloadTooLarge(t *testing.T) {
 	}
 }
 
-// TestWriteFrameCompressedFlag verifies the compression flag round-trip.
-func TestWriteFrameCompressedFlag(t *testing.T) {
-	payload := []byte("compressed-data")
-	var buf bytes.Buffer
-	if err := WriteFrame(&buf, payload, FlagCompressed); err != nil {
-		t.Fatalf("WriteFrame failed: %v", err)
-	}
-
-	r := bytes.NewReader(buf.Bytes())
-	length, flags, err := ReadFrameHeader(r)
-	if err != nil {
-		t.Fatalf("ReadFrameHeader failed: %v", err)
-	}
-	if flags != FlagCompressed {
-		t.Fatalf("expected FlagCompressed, got %d", flags)
-	}
-	if length != uint32(len(payload)) {
-		t.Fatalf("expected length %d, got %d", len(payload), length)
-	}
-}
-
 // TestWriteFrameWriterError verifies WriteFrame propagates writer errors.
 func TestWriteFrameWriterError(t *testing.T) {
-	w := &failWriter{failAfter: 0}
-	err := WriteFrame(w, []byte("data"), FlagNone)
-	if err == nil {
-		t.Fatal("expected error from failing writer")
-	}
-}
-
-// TestWriteFrameWriterErrorOnPayload verifies WriteFrame propagates
-// writer errors that occur during payload write.
-func TestWriteFrameWriterErrorOnPayload(t *testing.T) {
-	w := &failWriter{failAfter: FrameHeaderSize}
-	err := WriteFrame(w, []byte("data"), FlagNone)
-	if err == nil {
-		t.Fatal("expected error from failing writer on payload")
+	for _, tc := range []struct {
+		name      string
+		failAfter int
+	}{
+		{name: "header write", failAfter: 0},
+		{name: "payload write", failAfter: FrameHeaderSize},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &failWriter{failAfter: tc.failAfter}
+			if err := WriteFrame(w, []byte("data"), FlagNone); err == nil {
+				t.Fatal("expected error from failing writer")
+			}
+		})
 	}
 }
 
@@ -169,29 +149,15 @@ func TestReadFrameHeaderOversizedLength(t *testing.T) {
 	}
 }
 
-// TestValidateFrameHeaderValid verifies a valid header passes validation.
-func TestValidateFrameHeaderValid(t *testing.T) {
-	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion, 0x00}
-	binary.BigEndian.PutUint32(header[4:8], 1024)
-	if err := ValidateFrameHeader(header[:]); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-// TestValidateFrameHeaderZeroLength verifies zero-length frames pass.
-func TestValidateFrameHeaderZeroLength(t *testing.T) {
-	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion, 0x00, 0, 0, 0, 0}
-	if err := ValidateFrameHeader(header[:]); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-// TestValidateFrameHeaderMaxLength verifies max length passes.
-func TestValidateFrameHeaderMaxLength(t *testing.T) {
-	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion, 0x00}
-	binary.BigEndian.PutUint32(header[4:8], MaxFrameSize)
-	if err := ValidateFrameHeader(header[:]); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+// TestValidateFrameHeaderAcceptsLengthBounds verifies the zero and maximum
+// lengths pass validation.
+func TestValidateFrameHeaderAcceptsLengthBounds(t *testing.T) {
+	for _, length := range []uint32{0, MaxFrameSize} {
+		header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion, 0x00}
+		binary.BigEndian.PutUint32(header[4:8], length)
+		if err := ValidateFrameHeader(header[:]); err != nil {
+			t.Fatalf("length %d: unexpected error: %v", length, err)
+		}
 	}
 }
 
@@ -236,17 +202,10 @@ func TestValidateFrameHeaderOversized(t *testing.T) {
 
 // TestValidateFrameHeaderBufferTooSmall verifies short buffer detection.
 func TestValidateFrameHeaderBufferTooSmall(t *testing.T) {
-	err := ValidateFrameHeader([]byte{0x51, 0x43})
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("expected ErrBufferTooSmall, got %v", err)
-	}
-}
-
-// TestValidateFrameHeaderEmptyBuffer verifies empty buffer detection.
-func TestValidateFrameHeaderEmptyBuffer(t *testing.T) {
-	err := ValidateFrameHeader(nil)
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("expected ErrBufferTooSmall, got %v", err)
+	for _, buf := range [][]byte{nil, {0x51, 0x43}} {
+		if err := ValidateFrameHeader(buf); !errors.Is(err, ErrBufferTooSmall) {
+			t.Fatalf("buffer of %d bytes: expected ErrBufferTooSmall, got %v", len(buf), err)
+		}
 	}
 }
 
@@ -315,29 +274,6 @@ func TestMarshalFramePayloadTooLarge(t *testing.T) {
 	}
 }
 
-// TestMarshalFrameWithCompressedFlag verifies flag preservation.
-func TestMarshalFrameWithCompressedFlag(t *testing.T) {
-	payload := []byte("compressed-content")
-	buf := make([]byte, FrameHeaderSize+len(payload))
-	n, err := MarshalFrame(buf, payload, FlagCompressed)
-	if err != nil {
-		t.Fatalf("MarshalFrame failed: %v", err)
-	}
-
-	// Read back via ReadFrameHeader.
-	r := bytes.NewReader(buf[:n])
-	length, flags, err := ReadFrameHeader(r)
-	if err != nil {
-		t.Fatalf("ReadFrameHeader failed: %v", err)
-	}
-	if flags != FlagCompressed {
-		t.Fatalf("expected FlagCompressed, got %d", flags)
-	}
-	if length != uint32(len(payload)) {
-		t.Fatalf("expected length %d, got %d", len(payload), length)
-	}
-}
-
 // TestMarshalFrameAndWriteFrameConsistency verifies that MarshalFrame and
 // WriteFrame produce identical output for the same input.
 func TestMarshalFrameAndWriteFrameConsistency(t *testing.T) {
@@ -385,10 +321,6 @@ func TestFrameConstantValues(t *testing.T) {
 	if maxPoolBufSize != 256*1024 {
 		t.Fatalf("maxPoolBufSize: expected %d, got %d", 256*1024, maxPoolBufSize)
 	}
-}
-
-// TestFrameFlagsValues verifies the flag constants.
-func TestFrameFlagsValues(t *testing.T) {
 	if FlagNone != 0x00 {
 		t.Fatalf("FlagNone: expected 0x00, got 0x%02x", FlagNone)
 	}
@@ -512,24 +444,6 @@ func TestValidateFrameHeaderVersionGateIsNotARange(t *testing.T) {
 	}
 	if got := DefaultWireWindow(); got.FrameCurrent != WireVersion || got.FramePrevious != PreviousWireVersion {
 		t.Fatalf("DefaultWireWindow() = %+v, want {WireVersion, PreviousWireVersion}", got)
-	}
-}
-
-// TestWriteFrameVersion1ProducesValidHeader verifies that WriteFrame
-// produces a header with WireVersion=1 that passes validation.
-func TestWriteFrameVersion1ProducesValidHeader(t *testing.T) {
-	payload := []byte("test payload")
-	var buf bytes.Buffer
-	if err := WriteFrame(&buf, payload, FlagNone); err != nil {
-		t.Fatalf("WriteFrame failed: %v", err)
-	}
-
-	raw := buf.Bytes()
-	if raw[2] != WireVersion {
-		t.Fatalf("expected version %d in frame, got %d", WireVersion, raw[2])
-	}
-	if err := ValidateFrameHeader(raw[:FrameHeaderSize]); err != nil {
-		t.Fatalf("WriteFrame produced invalid header: %v", err)
 	}
 }
 
