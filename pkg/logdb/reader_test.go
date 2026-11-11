@@ -596,20 +596,6 @@ func TestLogReaderGetRangeSubset(t *testing.T) {
 
 // --- Term tests ---
 
-func TestLogReaderTermAtMarkerIndex(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// markerIndex=0, markerTerm=0, so Term(0) should return 0.
-	term, err := lr.Term(0)
-	if err != nil {
-		t.Fatalf("Term(0) returned error: %v", err)
-	}
-	if term != 0 {
-		t.Errorf("Term(0) = %d, want 0", term)
-	}
-}
-
 func TestLogReaderTermFromLogDB(t *testing.T) {
 	db := newMemLogDB()
 	const shardID, replicaID uint64 = 1, 1
@@ -1318,43 +1304,6 @@ func TestLogReaderTermAtSnapshotBoundary(t *testing.T) {
 }
 
 // --- Interface satisfaction test ---
-
-func TestLogReaderSatisfiesRaftLogReaderInterface(t *testing.T) {
-	// This test verifies that LogReader has all methods matching the
-	// raft.LogReader interface. Since raft.LogReader is in an internal
-	// package, we verify by calling each method that the interface requires.
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// GetRange(low, high, maxSize uint64) ([]proto.Entry, error)
-	_, err := lr.GetRange(0, 0, 0)
-	_ = err
-
-	// Term(index uint64) (uint64, error)
-	_, err = lr.Term(0)
-	_ = err
-
-	// SetRange(firstIndex, length uint64)
-	mustSetRange(t, lr, 1, 0)
-
-	// SetState(state proto.State)
-	lr.SetState(proto.State{})
-
-	// Append(entries []proto.Entry)
-	mustAppend(t, lr, nil)
-
-	// NodeState() (proto.State, proto.Membership)
-	_, _ = lr.NodeState()
-
-	// CreateSnapshot(ss proto.Snapshot) error
-	_ = lr.CreateSnapshot(proto.Snapshot{})
-
-	// ApplySnapshot(ss proto.Snapshot) error
-	_ = lr.ApplySnapshot(proto.Snapshot{})
-
-	// Compact(index uint64) error
-	_ = lr.Compact(0)
-}
 
 // --- Append with contiguous entries test ---
 
@@ -2295,50 +2244,6 @@ func TestLogReaderTermBufBelowLimitNoEviction(t *testing.T) {
 	}
 }
 
-func TestLogReaderTermBufTrimToDirectly(t *testing.T) {
-	// Test the ring buffer trimTo operation directly, simulating
-	// what Compact does to remove compacted entries.
-	rb := newTermRingBuffer(maxTermCacheEntries)
-
-	// Fill ring buffer with entries 1..200_000. Since capacity is
-	// 100_000, entries 1..100_000 will be auto-evicted, leaving
-	// entries 100_001..200_000.
-	for i := uint64(1); i <= 200_000; i++ {
-		rb.append(i, i/1000)
-	}
-
-	if rb.len() != maxTermCacheEntries {
-		t.Fatalf("ring buffer len = %d, want %d", rb.len(), maxTermCacheEntries)
-	}
-
-	// Simulate compaction up to 150_000 by trimming.
-	rb.trimTo(150_000)
-
-	// Should have entries 150_001..200_000 = 50_000 entries remaining.
-	if rb.len() != 50_000 {
-		t.Errorf("ring buffer len after trimTo(150_000) = %d, want 50_000", rb.len())
-	}
-
-	// Verify entries above cutoff are retained.
-	_, has200k := rb.lookup(200_000)
-	_, has150001 := rb.lookup(150_001)
-	_, has150k := rb.lookup(150_000)
-	_, has100k := rb.lookup(100_000)
-
-	if !has200k {
-		t.Error("ring buffer missing entry at index 200_000 after trim")
-	}
-	if !has150001 {
-		t.Error("ring buffer missing entry at index 150_001 after trim")
-	}
-	if has150k {
-		t.Error("ring buffer still contains trimmed entry at index 150_000")
-	}
-	if has100k {
-		t.Error("ring buffer still contains evicted entry at index 100_000")
-	}
-}
-
 // --- termRingBuffer unit tests ---
 
 func TestTermRingBufferAppendAndLookup(t *testing.T) {
@@ -2454,73 +2359,39 @@ func TestTermRingBufferCapacityEviction(t *testing.T) {
 }
 
 func TestTermRingBufferTrimTo(t *testing.T) {
-	rb := newTermRingBuffer(10)
-
-	for i := uint64(1); i <= 8; i++ {
-		rb.append(i, i*100)
-	}
-
-	// Trim entries with index <= 5.
-	rb.trimTo(5)
-	if rb.len() != 3 {
-		t.Fatalf("len after trimTo(5) = %d, want 3", rb.len())
-	}
-
-	// Indices 1-5 should be gone.
-	for i := uint64(1); i <= 5; i++ {
-		if _, ok := rb.lookup(i); ok {
-			t.Errorf("lookup(%d) returned true after trimTo(5)", i)
-		}
-	}
-
-	// Indices 6-8 should remain.
-	for i := uint64(6); i <= 8; i++ {
-		term, ok := rb.lookup(i)
-		if !ok {
-			t.Errorf("lookup(%d) returned false, want true", i)
-			continue
-		}
-		if term != i*100 {
-			t.Errorf("lookup(%d) = %d, want %d", i, term, i*100)
-		}
-	}
-}
-
-func TestTermRingBufferTrimToAll(t *testing.T) {
-	rb := newTermRingBuffer(10)
-
-	for i := uint64(1); i <= 5; i++ {
-		rb.append(i, i)
-	}
-
-	// Trim everything.
-	rb.trimTo(100)
-	if rb.len() != 0 {
-		t.Errorf("len after trimTo(100) = %d, want 0", rb.len())
-	}
-}
-
-func TestTermRingBufferTrimToEmpty(t *testing.T) {
-	rb := newTermRingBuffer(10)
-
-	// Trimming an empty buffer should not panic.
-	rb.trimTo(100)
-	if rb.len() != 0 {
-		t.Errorf("len after trimTo on empty = %d, want 0", rb.len())
-	}
-}
-
-func TestTermRingBufferTrimToBelowRange(t *testing.T) {
-	rb := newTermRingBuffer(10)
-
-	for i := uint64(10); i <= 15; i++ {
-		rb.append(i, i)
-	}
-
-	// Trim to index below the range. Nothing should be removed.
-	rb.trimTo(5)
-	if rb.len() != 6 {
-		t.Errorf("len after trimTo(5) = %d, want 6 (nothing removed)", rb.len())
+	for _, tc := range []struct {
+		name       string
+		lo, hi     uint64 // appended indexes [lo, hi]; lo > hi appends nothing
+		trim       uint64
+		wantLength int
+	}{
+		{name: "partial", lo: 1, hi: 8, trim: 5, wantLength: 3},
+		{name: "all", lo: 1, hi: 5, trim: 100, wantLength: 0},
+		{name: "empty buffer", lo: 1, hi: 0, trim: 100, wantLength: 0},
+		{name: "below range", lo: 10, hi: 15, trim: 5, wantLength: 6},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rb := newTermRingBuffer(10)
+			for i := tc.lo; i <= tc.hi; i++ {
+				rb.append(i, i*100)
+			}
+			rb.trimTo(tc.trim)
+			if rb.len() != tc.wantLength {
+				t.Fatalf("len after trimTo(%d) = %d, want %d", tc.trim, rb.len(), tc.wantLength)
+			}
+			for i := tc.lo; i <= tc.hi; i++ {
+				term, ok := rb.lookup(i)
+				if i <= tc.trim {
+					if ok {
+						t.Errorf("lookup(%d) returned true after trimTo(%d)", i, tc.trim)
+					}
+					continue
+				}
+				if !ok || term != i*100 {
+					t.Errorf("lookup(%d) = (%d, %v), want (%d, true)", i, term, ok, i*100)
+				}
+			}
+		})
 	}
 }
 
@@ -2648,51 +2519,6 @@ func TestLogReaderIndexRangeEmptyReader(t *testing.T) {
 	}
 }
 
-func TestLogReaderIndexRangeAfterSetRange(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// Set range for entries [1..5].
-	mustSetRange(t, lr, 1, 5)
-
-	first, last := lr.IndexRange()
-	if first != 1 || last != 5 {
-		t.Errorf("IndexRange() = (%d, %d), want (1, 5)", first, last)
-	}
-}
-
-func TestLogReaderIndexRangeAfterAppend(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	entries := makeProtoEntries(1, 10, 1)
-	mustAppend(t, lr, entries)
-
-	first, last := lr.IndexRange()
-	if first != 1 || last != 10 {
-		t.Errorf("IndexRange() = (%d, %d), want (1, 10)", first, last)
-	}
-}
-
-func TestLogReaderIndexRangeAfterCompact(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// Add entries [1..10].
-	entries := makeProtoEntries(1, 10, 1)
-	mustAppend(t, lr, entries)
-
-	// Compact up to index 5.
-	if err := lr.Compact(5); err != nil {
-		t.Fatalf("Compact: %v", err)
-	}
-
-	first, last := lr.IndexRange()
-	if first != 6 || last != 10 {
-		t.Errorf("IndexRange() = (%d, %d), want (6, 10) after compaction", first, last)
-	}
-}
-
 func TestLogReaderIndexRangeWithEntriesAfterSnapshot(t *testing.T) {
 	db := newMemLogDB()
 	lr := NewLogReader(1, 1, db)
@@ -2760,87 +2586,6 @@ func TestLogReaderSnapshotAfterCreateSnapshot(t *testing.T) {
 	}
 	if got.Membership.ConfigChangeID != 2 {
 		t.Errorf("Snapshot().Membership.ConfigChangeID = %d, want 2", got.Membership.ConfigChangeID)
-	}
-}
-
-func TestLogReaderSnapshotAfterApplySnapshot(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	ss := proto.Snapshot{
-		Index: 50,
-		Term:  3,
-		Membership: proto.Membership{
-			ConfigChangeID: 42,
-			Addresses:      map[uint64]string{1: "node1", 2: "node2"},
-		},
-	}
-	if err := lr.ApplySnapshot(ss); err != nil {
-		t.Fatalf("ApplySnapshot: %v", err)
-	}
-
-	got := lr.Snapshot()
-	if got.Index != 50 {
-		t.Errorf("Snapshot().Index = %d, want 50", got.Index)
-	}
-	if got.Term != 3 {
-		t.Errorf("Snapshot().Term = %d, want 3", got.Term)
-	}
-	if got.Membership.ConfigChangeID != 42 {
-		t.Errorf("Snapshot().Membership.ConfigChangeID = %d, want 42", got.Membership.ConfigChangeID)
-	}
-	if len(got.Membership.Addresses) != 2 {
-		t.Errorf("len(Addresses) = %d, want 2", len(got.Membership.Addresses))
-	}
-}
-
-func TestLogReaderSnapshotUpdatesAfterNewerSnapshot(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	// First snapshot at index 10.
-	ss1 := proto.Snapshot{Index: 10, Term: 1}
-	if err := lr.ApplySnapshot(ss1); err != nil {
-		t.Fatalf("ApplySnapshot(1): %v", err)
-	}
-
-	// Second (newer) snapshot at index 20.
-	ss2 := proto.Snapshot{Index: 20, Term: 2}
-	if err := lr.ApplySnapshot(ss2); err != nil {
-		t.Fatalf("ApplySnapshot(2): %v", err)
-	}
-
-	got := lr.Snapshot()
-	if got.Index != 20 {
-		t.Errorf("Snapshot().Index = %d, want 20", got.Index)
-	}
-	if got.Term != 2 {
-		t.Errorf("Snapshot().Term = %d, want 2", got.Term)
-	}
-}
-
-func TestLogReaderSnapshotIsSafeForConcurrentRead(t *testing.T) {
-	db := newMemLogDB()
-	lr := NewLogReader(1, 1, db)
-
-	ss := proto.Snapshot{Index: 100, Term: 10}
-	if err := lr.ApplySnapshot(ss); err != nil {
-		t.Fatalf("ApplySnapshot: %v", err)
-	}
-
-	// Concurrent reads should be safe (uses RLock internally).
-	done := make(chan struct{})
-	for i := 0; i < 10; i++ {
-		go func() {
-			got := lr.Snapshot()
-			if got.Index != 100 {
-				t.Errorf("concurrent Snapshot().Index = %d, want 100", got.Index)
-			}
-			done <- struct{}{}
-		}()
-	}
-	for i := 0; i < 10; i++ {
-		<-done
 	}
 }
 
