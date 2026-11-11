@@ -182,8 +182,21 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			key := fmt.Sprintf("k-%d", i)
-			deadline := time.Now().Add(proposeTimeout)
+			// Retry refusals for as long as the in-flight wait below can
+			// still succeed (failoverTimeout), plus one proposeTimeout for a
+			// proposal still pending when the gate is released -- not for
+			// proposeTimeout alone: a restarted follower that learns the
+			// leader more than 5s after the proposers start would otherwise
+			// see every proposer gone, and the wait fail with "only 0 of 64".
+			// Each SyncPropose keeps its own proposeTimeout context, and a
+			// closed stop ends the retries at once.
+			deadline := time.Now().Add(failoverTimeout + proposeTimeout)
 			for time.Now().Before(deadline) {
+				select {
+				case <-stop:
+					return
+				default:
+				}
 				var appliedAtSubmit uint64
 				if info, err := follower.ShardInfo(shardID); err == nil {
 					appliedAtSubmit = info.LastApplied
