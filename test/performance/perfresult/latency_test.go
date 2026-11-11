@@ -31,18 +31,6 @@ func TestNewLatencyRecorderMinCapacity(t *testing.T) {
 	}
 }
 
-func TestReset(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	rec.Record(5 * time.Millisecond)
-	rec.Record(10 * time.Millisecond)
-
-	rec.Reset()
-
-	if rec.Count() != 0 {
-		t.Fatalf("expected count 0 after reset, got %d", rec.Count())
-	}
-}
-
 func TestResetRetainsAllocation(t *testing.T) {
 	rec := NewLatencyRecorder(100)
 	for i := 0; i < 50; i++ {
@@ -53,19 +41,35 @@ func TestResetRetainsAllocation(t *testing.T) {
 	rec.Reset()
 	capAfter := cap(rec.samples)
 
+	if rec.Count() != 0 {
+		t.Fatalf("expected count 0 after reset, got %d", rec.Count())
+	}
 	if capAfter < capBefore {
 		t.Fatalf("expected capacity retained after reset, before=%d, after=%d", capBefore, capAfter)
 	}
 }
 
-func TestPercentileEmptyRecorder(t *testing.T) {
+func TestEmptyRecorderReturnsZero(t *testing.T) {
 	rec := NewLatencyRecorder(10)
 
-	if rec.Percentile(0.50) != 0 {
-		t.Fatal("expected 0 for p50 on empty recorder")
+	tests := []struct {
+		name string
+		get  func() time.Duration
+	}{
+		{name: "p50", get: func() time.Duration { return rec.Percentile(0.50) }},
+		{name: "p99", get: func() time.Duration { return rec.Percentile(0.99) }},
+		{name: "min", get: rec.Min},
+		{name: "max", get: rec.Max},
+		{name: "mean", get: rec.Mean},
+		{name: "sum", get: rec.Sum},
 	}
-	if rec.Percentile(0.99) != 0 {
-		t.Fatal("expected 0 for p99 on empty recorder")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.get(); got != 0 {
+				t.Fatalf("expected 0 for %s on empty recorder, got %v", tt.name, got)
+			}
+		})
 	}
 }
 
@@ -101,87 +105,6 @@ func TestPercentileP0Edge(t *testing.T) {
 	got := rec.Percentile(0.0)
 	if got != 1*time.Millisecond {
 		t.Fatalf("expected p0=1ms, got %v", got)
-	}
-}
-
-func TestPercentileKnownDistribution(t *testing.T) {
-	rec := NewLatencyRecorder(100)
-	// Record 1ms through 100ms.
-	for i := 1; i <= 100; i++ {
-		rec.Record(time.Duration(i) * time.Millisecond)
-	}
-
-	// Nearest-rank: rank = ceil(p * n)
-	// P50: ceil(0.50 * 100) = 50 -> samples[49] = 50ms
-	if rec.P50() != 50*time.Millisecond {
-		t.Fatalf("expected p50=50ms, got %v", rec.P50())
-	}
-	// P90: ceil(0.90 * 100) = 90 -> samples[89] = 90ms
-	if rec.P90() != 90*time.Millisecond {
-		t.Fatalf("expected p90=90ms, got %v", rec.P90())
-	}
-	// P95: ceil(0.95 * 100) = 95 -> samples[94] = 95ms
-	if rec.P95() != 95*time.Millisecond {
-		t.Fatalf("expected p95=95ms, got %v", rec.P95())
-	}
-	// P99: ceil(0.99 * 100) = 99 -> samples[98] = 99ms
-	if rec.P99() != 99*time.Millisecond {
-		t.Fatalf("expected p99=99ms, got %v", rec.P99())
-	}
-}
-
-func TestMinEmpty(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	if rec.Min() != 0 {
-		t.Fatal("expected 0 for Min on empty recorder")
-	}
-}
-
-func TestMaxEmpty(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	if rec.Max() != 0 {
-		t.Fatal("expected 0 for Max on empty recorder")
-	}
-}
-
-func TestMinMax(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	rec.Record(50 * time.Microsecond)
-	rec.Record(10 * time.Microsecond)
-	rec.Record(100 * time.Microsecond)
-	rec.Record(1 * time.Microsecond)
-
-	if rec.Min() != 1*time.Microsecond {
-		t.Fatalf("expected min=1us, got %v", rec.Min())
-	}
-	if rec.Max() != 100*time.Microsecond {
-		t.Fatalf("expected max=100us, got %v", rec.Max())
-	}
-}
-
-func TestMeanEmpty(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	if rec.Mean() != 0 {
-		t.Fatal("expected 0 for Mean on empty recorder")
-	}
-}
-
-func TestMean(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	rec.Record(10 * time.Millisecond)
-	rec.Record(20 * time.Millisecond)
-	rec.Record(30 * time.Millisecond)
-
-	// Mean = (10+20+30)/3 = 20ms
-	if rec.Mean() != 20*time.Millisecond {
-		t.Fatalf("expected mean=20ms, got %v", rec.Mean())
-	}
-}
-
-func TestSumEmpty(t *testing.T) {
-	rec := NewLatencyRecorder(10)
-	if rec.Sum() != 0 {
-		t.Fatal("expected 0 for Sum on empty recorder")
 	}
 }
 
@@ -227,6 +150,13 @@ func TestStatsPopulated(t *testing.T) {
 	}
 	if stats.P50Ns != (50 * time.Microsecond).Nanoseconds() {
 		t.Fatalf("expected p50=50us, got %dns", stats.P50Ns)
+	}
+	// Nearest-rank: rank = ceil(p * n).
+	if stats.P90Ns != (90 * time.Microsecond).Nanoseconds() {
+		t.Fatalf("expected p90=90us, got %dns", stats.P90Ns)
+	}
+	if stats.P95Ns != (95 * time.Microsecond).Nanoseconds() {
+		t.Fatalf("expected p95=95us, got %dns", stats.P95Ns)
 	}
 	if stats.P99Ns != (99 * time.Microsecond).Nanoseconds() {
 		t.Fatalf("expected p99=99us, got %dns", stats.P99Ns)
