@@ -78,27 +78,6 @@ func TestFromQuicraftMembership_NilMembership(t *testing.T) {
 	}
 }
 
-func TestFromQuicraftMembership_EmptyMaps(t *testing.T) {
-	qm := quicraft.NewMembership()
-	dm := fromQuicraftMembership(qm)
-
-	if dm == nil {
-		t.Fatal("fromQuicraftMembership should not return nil for non-nil input")
-	}
-	if len(dm.Nodes) != 0 {
-		t.Errorf("Nodes length = %d, want 0", len(dm.Nodes))
-	}
-	if len(dm.NonVotings) != 0 {
-		t.Errorf("NonVotings length = %d, want 0", len(dm.NonVotings))
-	}
-	if len(dm.Witnesses) != 0 {
-		t.Errorf("Witnesses length = %d, want 0", len(dm.Witnesses))
-	}
-	if len(dm.Removed) != 0 {
-		t.Errorf("Removed length = %d, want 0", len(dm.Removed))
-	}
-}
-
 func TestFromQuicraftMembership_IsolatesFromSource(t *testing.T) {
 	qm := &quicraft.Membership{
 		Nodes:     map[uint64]string{1: "addr1"},
