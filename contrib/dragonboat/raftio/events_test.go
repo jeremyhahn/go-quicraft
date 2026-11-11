@@ -103,6 +103,9 @@ func TestConvertEventListeners_LeaderUpdated(t *testing.T) {
 	if el.OnLeaderUpdated == nil {
 		t.Fatal("OnLeaderUpdated callback must not be nil when raft listener is provided")
 	}
+	if el.OnNodeReady != nil {
+		t.Error("OnNodeReady should be nil when system listener is nil")
+	}
 
 	el.OnLeaderUpdated(qcConfig.LeaderInfo{
 		ShardID:   1,
@@ -188,6 +191,10 @@ func TestConvertEventListeners_NilListeners(t *testing.T) {
 func TestConvertEventListeners_SystemEvents(t *testing.T) {
 	sl := &testSystemListener{}
 	el := ConvertEventListeners(nil, sl)
+
+	if el.OnLeaderUpdated != nil {
+		t.Error("OnLeaderUpdated should be nil when raft listener is nil")
+	}
 
 	// NodeReady
 	el.OnNodeReady(qcConfig.EventShardInfo{ShardID: 10, ReplicaID: 20})
@@ -316,30 +323,6 @@ func TestConvertEventListeners_SystemEvents(t *testing.T) {
 	}
 	if got := sl.logDBCompactedCalls[0]; got.ShardID != 22 || got.ReplicaID != 32 || got.Index != 5200 {
 		t.Errorf("LogDBCompacted info = %+v, want shard 22 replica 32 index 5200", got)
-	}
-}
-
-func TestConvertEventListeners_NilRaftOnlySystemProvided(t *testing.T) {
-	sl := &testSystemListener{}
-	el := ConvertEventListeners(nil, sl)
-
-	if el.OnLeaderUpdated != nil {
-		t.Error("OnLeaderUpdated should be nil when raft listener is nil")
-	}
-	if el.OnNodeReady == nil {
-		t.Error("OnNodeReady should not be nil when system listener is provided")
-	}
-}
-
-func TestConvertEventListeners_NilSystemOnlyRaftProvided(t *testing.T) {
-	rl := &testRaftListener{}
-	el := ConvertEventListeners(rl, nil)
-
-	if el.OnLeaderUpdated == nil {
-		t.Error("OnLeaderUpdated should not be nil when raft listener is provided")
-	}
-	if el.OnNodeReady != nil {
-		t.Error("OnNodeReady should be nil when system listener is nil")
 	}
 }
 
