@@ -154,6 +154,8 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		// defense-in-depth: even if the mTLS mandate were relaxed in the
 		// future, 0-RTT would still require it.
 		{"0-RTT without mTLS", func(c *Config) { c.Enable0RTT, c.MTLSConfig = true, nil }, ErrInsecure0RTT},
+		{"zero MaxMessageReceiveMemory", func(c *Config) { c.MaxMessageReceiveMemory = 0 }, ErrInvalidMaxMessageReceiveMemory},
+		{"negative MaxMessageReceiveMemory", func(c *Config) { c.MaxMessageReceiveMemory = -1 }, ErrInvalidMaxMessageReceiveMemory},
 	}
 
 	for _, tc := range tests {

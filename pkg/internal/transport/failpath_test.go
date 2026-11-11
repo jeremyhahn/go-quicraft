@@ -418,25 +418,6 @@ func TestInboundAuthorizedFor_FailsClosed(t *testing.T) {
 // Configuration and advertisement
 // ---------------------------------------------------------------------------
 
-// TestConfigValidate_RejectsZeroMessageReceiveMemory pins the fail-closed
-// validation of the aggregate receive budget. A zero budget would disable the
-// OOM guard entirely rather than meaning "unlimited".
-func TestConfigValidate_RejectsZeroMessageReceiveMemory(t *testing.T) {
-	cfg := Config{ListenAddress: "127.0.0.1:0", MTLSConfig: testMTLSConfig(t)}
-	cfg.SetDefaults()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("defaulted config must validate, got %v", err)
-	}
-	cfg.MaxMessageReceiveMemory = 0
-	if err := cfg.Validate(); !errors.Is(err, ErrInvalidMaxMessageReceiveMemory) {
-		t.Fatalf("Validate with zero MaxMessageReceiveMemory = %v, want ErrInvalidMaxMessageReceiveMemory", err)
-	}
-	cfg.MaxMessageReceiveMemory = -1
-	if err := cfg.Validate(); !errors.Is(err, ErrInvalidMaxMessageReceiveMemory) {
-		t.Fatalf("Validate with negative MaxMessageReceiveMemory = %v, want ErrInvalidMaxMessageReceiveMemory", err)
-	}
-}
-
 // TestLocalAddr_AdvertiseAddressWins pins the NAT/container advertisement rule:
 // a configured AdvertiseAddress takes priority over the OS-reported socket
 // address, which for a wildcard bind would otherwise put 0.0.0.0 on the wire as
