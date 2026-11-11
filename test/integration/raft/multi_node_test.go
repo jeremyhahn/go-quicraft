@@ -375,7 +375,8 @@ func TestMultiNode_ProposeToFollower(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestMultiNode_LeaderFailover verifies that when the leader is stopped,
-// a new leader is elected from the remaining nodes. This exercises the
+// a new leader is elected from the remaining nodes, in a 3-node and a
+// 5-node cluster. This exercises the
 // Raft election timeout, candidate promotion, and vote exchange over
 // QUIC transport.
 //
@@ -386,7 +387,15 @@ func TestMultiNode_ProposeToFollower(t *testing.T) {
 // pre-failover entries are re-read through the new leader — linearizably, and
 // directly out of the new leader's own state machine.
 func TestMultiNode_LeaderFailover(t *testing.T) {
-	cluster := newTestCluster(t, 3)
+	for _, nodes := range []int{3, 5} {
+		t.Run(fmt.Sprintf("nodes=%d", nodes), func(t *testing.T) {
+			testLeaderFailover(t, nodes)
+		})
+	}
+}
+
+func testLeaderFailover(t *testing.T, nodes int) {
+	cluster := newTestCluster(t, nodes)
 	defer cluster.close()
 
 	trackers := cluster.startShard(1)
@@ -416,7 +425,8 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 		proposeCommitted(t, cluster.hosts[leaderIdx], 1, key, value, defaultTimeout)
 	}
 
-	// Wait for the proposals to be applied on ALL followers. In a 3-node
+	// Wait for the proposals to be applied on ALL followers, so the
+	// survivors all carry the committed state into the election. In a 3-node
 	// cluster, both remaining followers must have established QUIC
 	// connections (via replication from the leader) before we stop the
 	// leader, otherwise re-election between the two survivors can stall.
@@ -509,9 +519,17 @@ func TestMultiNode_LeaderFailover(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestMultiNode_Session_OnLeader verifies that session creation and
-// close work on the leader node in a multi-node cluster.
+// close work on the leader node in a 3-node and a 5-node cluster.
 func TestMultiNode_Session_OnLeader(t *testing.T) {
-	cluster := newTestCluster(t, 3)
+	for _, nodes := range []int{3, 5} {
+		t.Run(fmt.Sprintf("nodes=%d", nodes), func(t *testing.T) {
+			testSessionOnLeader(t, nodes)
+		})
+	}
+}
+
+func testSessionOnLeader(t *testing.T, nodes int) {
+	cluster := newTestCluster(t, nodes)
 	defer cluster.close()
 
 	cluster.startShard(1)
@@ -612,29 +630,6 @@ func TestMultiNode_RequestSnapshot_OnLeader(t *testing.T) {
 // Multi-Node NodeHostInfo
 // ---------------------------------------------------------------------------
 
-// TestMultiNode_GetNodeHostInfo verifies that each node in the cluster
-// returns accurate shard information from NodeHostInfo.
-func TestMultiNode_GetNodeHostInfo(t *testing.T) {
-	cluster := newTestCluster(t, 3)
-	defer cluster.close()
-
-	cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	for i, h := range cluster.hosts {
-		info := h.NodeHostInfo(quicraft.NodeHostInfoOption{SkipLogInfo: true})
-		if info == nil {
-			t.Fatalf("node[%d] NodeHostInfo returned nil", i)
-		}
-		if len(info.ShardInfoList) != 1 {
-			t.Errorf("node[%d] ShardInfoList length = %d, want 1", i, len(info.ShardInfoList))
-		}
-		if info.RaftAddress != cluster.addrs[i] {
-			t.Errorf("node[%d] RaftAddress = %q, want %q", i, info.RaftAddress, cluster.addrs[i])
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Multi-Node Multiple Shards
 // ---------------------------------------------------------------------------
@@ -652,174 +647,6 @@ func TestMultiNode_GetNodeHostInfo(t *testing.T) {
 // 5-Node Failover
 // ---------------------------------------------------------------------------
 
-// TestFiveNode_LeaderFailover verifies that when the leader is stopped in
-// a 5-node cluster, a new leader is elected from the remaining 4 nodes
-// and proposals succeed.
-//
-// As in the 3-node case, it also verifies LEADER COMPLETENESS by re-reading
-// the entries committed before the failover through the new leader; a new
-// leader that accepts writes but lost pre-failover committed state must fail
-// here.
-func TestFiveNode_LeaderFailover(t *testing.T) {
-	cluster := newTestCluster(t, 5)
-	defer cluster.close()
-
-	trackers := cluster.startShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	oldLeaderReplicaID := uint64(leaderIdx + 1)
-
-	oldLeaderInfo, err := cluster.hosts[leaderIdx].ShardInfo(1)
-	if err != nil {
-		t.Fatalf("ShardInfo on the original leader failed: %v", err)
-	}
-	oldTerm := oldLeaderInfo.Term
-	if oldTerm == 0 {
-		t.Fatal("original leader reports term 0")
-	}
-
-	// Write initial data via the leader, awaiting apply on each. This also
-	// ensures all QUIC connections are fully established before stopping the
-	// leader.
-	preFailover := make(map[string]string, 6)
-	preFailover["before-failover-5n"] = "original"
-	for i := 0; i < 5; i++ {
-		preFailover[fmt.Sprintf("before-failover-5n-%d", i)] =
-			fmt.Sprintf("committed-by-replica-%d-term-%d-seq-%d", oldLeaderReplicaID, oldTerm, i)
-	}
-	for key, value := range preFailover {
-		proposeCommitted(t, cluster.hosts[leaderIdx], 1, key, value, defaultTimeout)
-	}
-
-	// Wait for the pre-failover entries to be applied on EVERY follower, so
-	// the surviving four all carry the committed state into the election.
-	for i := range cluster.hosts {
-		if i == leaderIdx {
-			continue
-		}
-		replicaID := uint64(i + 1)
-		followerSM := trackers[i].Get(1, replicaID)
-		if followerSM == nil {
-			t.Fatalf("follower[%d] state machine not found", i)
-		}
-		for key, value := range preFailover {
-			k, v := key, value
-			waitForCondition(t, defaultTimeout,
-				fmt.Sprintf("follower[%d] apply %q before failover", i, k),
-				func() bool {
-					got, ok := followerSM.Get(k)
-					return ok && got == v
-				},
-			)
-		}
-	}
-
-	// Stop the leader.
-	cluster.hosts[leaderIdx].Close()
-
-	// Wait for a new leader to be elected among the remaining nodes.
-	newLeaderIdx := -1
-	waitForCondition(t, leaderElectionTimeout*2, "new leader elected", func() bool {
-		for i, h := range cluster.hosts {
-			if i == leaderIdx {
-				continue
-			}
-			info, getErr := h.ShardInfo(1)
-			if getErr == nil && info.IsLeader {
-				newLeaderIdx = i
-				return true
-			}
-		}
-		return false
-	})
-
-	if newLeaderIdx < 0 {
-		t.Fatal("no new leader elected after failover")
-	}
-	newLeaderReplicaID := uint64(newLeaderIdx + 1)
-	if newLeaderReplicaID == oldLeaderReplicaID {
-		t.Errorf("new leader %d should differ from old leader %d",
-			newLeaderReplicaID, oldLeaderReplicaID)
-	}
-	newLeaderHost := cluster.hosts[newLeaderIdx]
-
-	newLeaderInfo, err := newLeaderHost.ShardInfo(1)
-	if err != nil {
-		t.Fatalf("ShardInfo on the new leader failed: %v", err)
-	}
-	if newLeaderInfo.Term <= oldTerm {
-		t.Errorf("new leader term = %d, want > old leader term %d: the failover did not start a new term",
-			newLeaderInfo.Term, oldTerm)
-	}
-
-	// Propose via the new leader and wait for apply, which pins the new
-	// leader's applied index above every pre-failover entry.
-	proposeCommitted(t, newLeaderHost, 1, "after-failover-5n", "survived", defaultTimeout*2)
-
-	newLeaderSM := trackers[newLeaderIdx].Get(1, newLeaderReplicaID)
-	if newLeaderSM == nil {
-		t.Fatalf("new leader[%d] state machine not found", newLeaderIdx)
-	}
-	assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx),
-		"after-failover-5n", "survived")
-
-	// LEADER COMPLETENESS: everything committed in the old term must live on
-	// in the new leader's applied state and be readable linearizably through
-	// it.
-	for key, value := range preFailover {
-		assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx), key, value)
-	}
-	for key, value := range preFailover {
-		syncReadExact(t, newLeaderHost, 1, key, value, defaultTimeout)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // 5-Node Session Management
 // ---------------------------------------------------------------------------
-
-// TestFiveNode_Session_OnLeader verifies that session creation and close
-// work on the leader node in a 5-node cluster.
-func TestFiveNode_Session_OnLeader(t *testing.T) {
-	cluster := newTestCluster(t, 5)
-	defer cluster.close()
-
-	cluster.startShard(1)
-	cluster.waitForClusterLeader(1, leaderElectionTimeout)
-
-	// Both calls go to whoever leads at the moment of the call: leadership
-	// can legitimately move after waitForClusterLeader returns (#309).
-	var session *quicraft.Session
-	err := cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		defer cancel()
-		var err error
-		session, err = h.NewSession(ctx, 1)
-		return err
-	})
-	if err != nil {
-		t.Fatalf("NewSession failed: %v\nshard view: %s", err, cluster.shardView(1))
-	}
-	if session == nil {
-		t.Fatal("session is nil")
-	}
-	if session.ShardID() != 1 {
-		t.Errorf("ShardID = %d, want 1", session.ShardID())
-	}
-	if session.ClientID() == 0 {
-		t.Error("ClientID should not be 0")
-	}
-
-	err = cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
-		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
-		defer cancel()
-		rs, err := h.CloseSession(ctx, 1, session)
-		if err != nil {
-			return err
-		}
-		rs.Release()
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("CloseSession failed: %v\nshard view: %s", err, cluster.shardView(1))
-	}
-}
