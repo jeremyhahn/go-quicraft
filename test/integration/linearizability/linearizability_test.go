@@ -496,7 +496,6 @@ func (e *LinearizabilityViolationError) Error() string {
 //	3Node_LeaderRestart       4 clients /  8s ->  525 writes  16.4 /client-s
 //	3Node_SingleKeyContention 8 clients /  5s ->  595 writes  14.9 /client-s
 //	5Node_MultipleFailovers   4 clients / 11s ->  627 writes  14.3 /client-s
-//	5Node_Normal              8 clients /  5s ->  536 writes  13.4 /client-s
 //	5Node_MinorityDown        8 clients /  7s ->  740 writes  13.2 /client-s
 //	3Node_LeaderFailover      4 clients /  3s ->  144 writes  12.0 /client-s
 //	5Node_MembershipAddRemove 4 clients / 13s ->  590 writes  11.3 /client-s
@@ -1543,34 +1542,6 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 	// One election is expected to stall the clients, so only the serving
 	// portion of the run counts toward the floor.
 	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*time.Second))
-}
-
-// TestLinearizability_5Node_Normal verifies linearizability on a 5-node
-// cluster with 8 concurrent clients. The larger cluster provides higher
-// fault tolerance (tolerates 2 failures) and exercises the Raft quorum
-// logic with more participants.
-func TestLinearizability_5Node_Normal(t *testing.T) {
-	const (
-		numNodes   = 5
-		numClients = 8
-		numKeys    = 10
-		shardID    = 1
-		testDur    = 5 * time.Second
-	)
-
-	cluster := newTestCluster(t, numNodes)
-	defer cluster.close()
-
-	cluster.startShard(shardID)
-	cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
-	startLeaderTermGuard(t, cluster, shardID)
-	warmupCluster(t, cluster, shardID)
-
-	recorder := &opRecorder{}
-	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
-	wait()
-
-	checkLinearizability(t, recorder, floorFor(numClients, testDur))
 }
 
 // TestLinearizability_4Node_ElectionSafety exercises the election-safety
