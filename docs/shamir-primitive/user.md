@@ -9,7 +9,7 @@ belong to the database layer above; this package has no commands.
 
 ## Before you start
 
-- Go 1.27.3 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
+- Go 1.27.4 or later, and `github.com/jeremyhahn/go-quicraft` as a dependency.
 - A plan for where the shares go. This package hands them back and forgets them;
   it stores nothing.
 - A plan for how you will know the reconstruction worked. The package cannot do

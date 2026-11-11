@@ -12,7 +12,7 @@ go-quicraft does.
 
 ## Before you start
 
-- Go 1.27.3 or later, and `github.com/jeremyhahn/go-enclave` as a dependency.
+- Go 1.27.4 or later, and `github.com/jeremyhahn/go-enclave` as a dependency.
 - A process memory-lock limit (`RLIMIT_MEMLOCK`) large enough for the keys you
   hold. Containers often ship with a small default; if allocations report a
   locked-memory failure, raise the limit rather than reduce protection.
