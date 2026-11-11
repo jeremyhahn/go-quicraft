@@ -85,14 +85,21 @@ func TestManagerUnregister(t *testing.T) {
 		if err := m.Register(1, 0, 100); err != nil {
 			t.Fatalf("Register(1) = %v", err)
 		}
+		if err := m.Register(2, 0, 100); err != nil {
+			t.Fatalf("Register(2) = %v", err)
+		}
 		if err := m.Unregister(1); err != nil {
 			t.Errorf("Unregister(1) = %v, want nil", err)
 		}
 		if m.IsRegistered(1) {
 			t.Error("IsRegistered(1) = true after unregister, want false")
 		}
-		if m.Count() != 0 {
-			t.Errorf("Count() = %d, want 0", m.Count())
+		// Unregistering one session leaves the others in place.
+		if !m.IsRegistered(2) {
+			t.Error("IsRegistered(2) = false after unregistering 1, want true")
+		}
+		if m.Count() != 1 {
+			t.Errorf("Count() = %d, want 1", m.Count())
 		}
 	})
 
