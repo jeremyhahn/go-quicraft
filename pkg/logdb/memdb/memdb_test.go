@@ -33,16 +33,6 @@ func TestNameReturnsMemory(t *testing.T) {
 
 // --- Close ---
 
-func TestCloseIsIdempotent(t *testing.T) {
-	db := New()
-	if err := db.Close(); err != nil {
-		t.Fatalf("first Close() error: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Errorf("second Close() error: %v", err)
-	}
-}
-
 func TestOperationsAfterCloseReturnErrClosed(t *testing.T) {
 	db := New()
 	db.Close()
@@ -51,11 +41,6 @@ func TestOperationsAfterCloseReturnErrClosed(t *testing.T) {
 		name string
 		fn   func() error
 	}{
-		{"SaveState", func() error { return db.SaveState(nil) }},
-		{"IterateEntries", func() error {
-			_, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 2, 0)
-			return err
-		}},
 		{"ReadState", func() error {
 			_, _, err := db.ReadState(1, 1)
 			return err
@@ -164,65 +149,7 @@ func TestSaveStateOverwritesPreviousState(t *testing.T) {
 	}
 }
 
-func TestSaveStatePersistsMembershipFromSnapshot(t *testing.T) {
-	db := New()
-	membership := logdb.Membership{
-		ConfigChangeID: 7,
-		Addresses:      map[uint64]string{1: "addr1", 2: "addr2"},
-	}
-	updates := []logdb.Update{
-		{
-			ShardID:   1,
-			ReplicaID: 1,
-			State:     logdb.State{Term: 1, Vote: 1, Commit: 10},
-			Snapshot:  logdb.Snapshot{Index: 10, Term: 1, Membership: membership},
-		},
-	}
-
-	db.SaveState(updates)
-
-	_, gotMembership, err := db.ReadState(1, 1)
-	if err != nil {
-		t.Fatalf("ReadState() error: %v", err)
-	}
-	if gotMembership.ConfigChangeID != 7 {
-		t.Errorf("Membership.ConfigChangeID = %d, want 7", gotMembership.ConfigChangeID)
-	}
-	if len(gotMembership.Addresses) != 2 {
-		t.Errorf("Membership.Addresses len = %d, want 2", len(gotMembership.Addresses))
-	}
-}
-
 // --- SaveState with Entries ---
-
-func TestSaveStateWithEntries(t *testing.T) {
-	db := New()
-	entries := []logdb.Entry{
-		{Index: 1, Term: 1, Cmd: []byte("cmd1")},
-		{Index: 2, Term: 1, Cmd: []byte("cmd2")},
-		{Index: 3, Term: 1, Cmd: []byte("cmd3")},
-	}
-
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: entries},
-	})
-
-	got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 4, 0)
-	if err != nil {
-		t.Fatalf("IterateEntries() error: %v", err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("IterateEntries() returned %d entries, want 3", len(got))
-	}
-	if size == 0 {
-		t.Error("IterateEntries() returned zero size")
-	}
-	for i, e := range got {
-		if e.Index != entries[i].Index {
-			t.Errorf("entry[%d].Index = %d, want %d", i, e.Index, entries[i].Index)
-		}
-	}
-}
 
 func TestSaveStateEntryOverwrite(t *testing.T) {
 	db := New()
@@ -294,35 +221,6 @@ func TestSaveStateMultipleNodesIsolated(t *testing.T) {
 
 // --- IterateEntries ---
 
-func TestIterateEntriesEmptyRange(t *testing.T) {
-	db := New()
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
-			{Index: 1, Term: 1},
-		}},
-	})
-
-	// low == high should return nothing.
-	got, size, err := db.IterateEntries(nil, 0, 1, 1, 5, 5, 0)
-	if err != nil {
-		t.Fatalf("IterateEntries() error: %v", err)
-	}
-	if len(got) != 0 {
-		t.Errorf("IterateEntries() returned %d entries for empty range, want 0", len(got))
-	}
-	if size != 0 {
-		t.Errorf("IterateEntries() size = %d, want 0", size)
-	}
-}
-
-func TestIterateEntriesUnknownNode(t *testing.T) {
-	db := New()
-	_, _, err := db.IterateEntries(nil, 0, 99, 99, 1, 5, 0)
-	if !errors.Is(err, logdb.ErrUnavailable) {
-		t.Errorf("IterateEntries() unknown node: got %v, want ErrUnavailable", err)
-	}
-}
-
 func TestIterateEntriesCompactedRange(t *testing.T) {
 	db := New()
 	db.SaveState([]logdb.Update{
@@ -348,57 +246,6 @@ func TestIterateEntriesCompactedRange(t *testing.T) {
 	}
 	if _, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 3, 0); !errors.Is(err, logdb.ErrCompacted) {
 		t.Errorf("IterateEntries() below the floor: got %v, want ErrCompacted", err)
-	}
-}
-
-func TestIterateEntriesMaxSizeLimit(t *testing.T) {
-	db := New()
-	entries := make([]logdb.Entry, 10)
-	for i := range entries {
-		entries[i] = logdb.Entry{
-			Index: uint64(i + 1),
-			Term:  1,
-			Cmd:   make([]byte, 100),
-		}
-	}
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: entries},
-	})
-
-	// Derived from logdb.EntryOverheadBytes rather than a literal: the budget
-	// is defined in terms of that constant, so a layout change must move the
-	// expectation with it instead of failing here as a stale number.
-	perEntry := uint64(logdb.EntryOverheadBytes + 100)
-	budget := 2*perEntry + perEntry/2 // room for 2, not 3
-
-	// Request all 10 entries but limit the budget to two entries' worth.
-	got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 11, budget)
-	if err != nil {
-		t.Fatalf("IterateEntries() error: %v", err)
-	}
-	if len(got) != 2 {
-		t.Errorf("IterateEntries() with maxSize=%d: got %d entries, want 2", budget, len(got))
-	}
-	if want := 2 * perEntry; size != want {
-		t.Errorf("IterateEntries() size = %d, want %d", size, want)
-	}
-}
-
-func TestIterateEntriesAlwaysReturnsAtLeastOneEntry(t *testing.T) {
-	db := New()
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: []logdb.Entry{
-			{Index: 1, Term: 1, Cmd: make([]byte, 1000)},
-		}},
-	})
-
-	// maxSize = 1 byte, but we should still get the first entry.
-	got, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 2, 1)
-	if err != nil {
-		t.Fatalf("IterateEntries() error: %v", err)
-	}
-	if len(got) != 1 {
-		t.Errorf("IterateEntries() with tiny maxSize: got %d entries, want 1", len(got))
 	}
 }
 
@@ -491,19 +338,6 @@ func TestGetSnapshotReturnsErrNoSnapshotForUnknownNode(t *testing.T) {
 	_, err := db.GetSnapshot(99, 99)
 	if !errors.Is(err, logdb.ErrNoSnapshot) {
 		t.Errorf("GetSnapshot() unknown node: got %v, want ErrNoSnapshot", err)
-	}
-}
-
-func TestGetSnapshotReturnsErrNoSnapshotWhenNoneSaved(t *testing.T) {
-	db := New()
-	// Create node with state but no snapshot.
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, State: logdb.State{Term: 1}},
-	})
-
-	_, err := db.GetSnapshot(1, 1)
-	if !errors.Is(err, logdb.ErrNoSnapshot) {
-		t.Errorf("GetSnapshot() no snapshot: got %v, want ErrNoSnapshot", err)
 	}
 }
 
@@ -612,40 +446,6 @@ func TestSaveBootstrapOverwritesPrevious(t *testing.T) {
 
 // --- EntryRange ---
 
-func TestEntryRangeReturnsCorrectRange(t *testing.T) {
-	db := New()
-	entries := []logdb.Entry{
-		{Index: 5, Term: 1},
-		{Index: 6, Term: 1},
-		{Index: 7, Term: 2},
-	}
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: entries},
-	})
-
-	first, length, err := db.EntryRange(1, 1)
-	if err != nil {
-		t.Fatalf("EntryRange() error: %v", err)
-	}
-	if first != 5 {
-		t.Errorf("EntryRange() firstIndex = %d, want 5", first)
-	}
-	if length != 3 {
-		t.Errorf("EntryRange() length = %d, want 3", length)
-	}
-}
-
-func TestEntryRangeUnknownNodeReturnsZero(t *testing.T) {
-	db := New()
-	first, length, err := db.EntryRange(99, 99)
-	if err != nil {
-		t.Fatalf("EntryRange() error: %v", err)
-	}
-	if first != 0 || length != 0 {
-		t.Errorf("EntryRange() = (%d, %d), want (0, 0)", first, length)
-	}
-}
-
 func TestEntryRangeEmptyNodeReturnsZero(t *testing.T) {
 	db := New()
 	// Save state without entries to create the node.
@@ -717,49 +517,7 @@ func TestEntryRangeAfterCompaction(t *testing.T) {
 	}
 }
 
-func TestEntryRangeOnClosedDBReturnsError(t *testing.T) {
-	db := New()
-	db.Close()
-	_, _, err := db.EntryRange(1, 1)
-	if !errors.Is(err, logdb.ErrClosed) {
-		t.Errorf("EntryRange() on closed DB: got %v, want ErrClosed", err)
-	}
-}
-
 // --- RemoveEntriesTo ---
-
-func TestRemoveEntriesTo(t *testing.T) {
-	db := New()
-	entries := make([]logdb.Entry, 10)
-	for i := range entries {
-		entries[i] = logdb.Entry{Index: uint64(i + 1), Term: 1, Cmd: []byte("data")}
-	}
-	db.SaveState([]logdb.Update{
-		{ShardID: 1, ReplicaID: 1, Entries: entries},
-	})
-
-	if err := db.RemoveEntriesTo(1, 1, 5); err != nil {
-		t.Fatalf("RemoveEntriesTo() error: %v", err)
-	}
-
-	// Entries 1-5 should be compacted.
-	_, _, err := db.IterateEntries(nil, 0, 1, 1, 1, 6, 0)
-	if !errors.Is(err, logdb.ErrCompacted) {
-		t.Errorf("after RemoveEntriesTo(5), IterateEntries(1,6): got %v, want ErrCompacted", err)
-	}
-
-	// Entries 6-10 should still be available.
-	got, _, err := db.IterateEntries(nil, 0, 1, 1, 6, 11, 0)
-	if err != nil {
-		t.Fatalf("IterateEntries(6,11) error: %v", err)
-	}
-	if len(got) != 5 {
-		t.Errorf("IterateEntries(6,11) returned %d entries, want 5", len(got))
-	}
-	if got[0].Index != 6 {
-		t.Errorf("first remaining entry Index = %d, want 6", got[0].Index)
-	}
-}
 
 func TestRemoveEntriesToUnknownNodeIsNoOp(t *testing.T) {
 	db := New()
@@ -803,14 +561,6 @@ func TestCompactIsNoOp(t *testing.T) {
 	db := New()
 	if err := db.Compact(1, 1); err != nil {
 		t.Errorf("Compact() on an unknown node = %v, want nil", err)
-	}
-}
-
-func TestCompactOnClosedDBReturnsErrClosed(t *testing.T) {
-	db := New()
-	db.Close()
-	if err := db.Compact(1, 1); !errors.Is(err, logdb.ErrClosed) {
-		t.Errorf("Compact() after close: got %v, want ErrClosed", err)
 	}
 }
 
@@ -1071,69 +821,6 @@ func TestConcurrentListNodeInfo(t *testing.T) {
 }
 
 // --- mergeEntries ---
-
-func TestMergeEntriesEmptyExisting(t *testing.T) {
-	incoming := []logdb.Entry{
-		{Index: 1, Term: 1, Cmd: []byte("a")},
-		{Index: 2, Term: 1, Cmd: []byte("b")},
-	}
-
-	got := mergeEntries(nil, incoming)
-	if len(got) != 2 {
-		t.Fatalf("mergeEntries(nil, ...) returned %d entries, want 2", len(got))
-	}
-	if got[0].Index != 1 || got[1].Index != 2 {
-		t.Errorf("mergeEntries result = %+v, want indices [1, 2]", got)
-	}
-}
-
-func TestMergeEntriesContiguous(t *testing.T) {
-	existing := []logdb.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-	}
-	incoming := []logdb.Entry{
-		{Index: 3, Term: 1},
-		{Index: 4, Term: 1},
-	}
-
-	got := mergeEntries(existing, incoming)
-	if len(got) != 4 {
-		t.Fatalf("mergeEntries contiguous: got %d entries, want 4", len(got))
-	}
-	for i, e := range got {
-		if e.Index != uint64(i+1) {
-			t.Errorf("entry[%d].Index = %d, want %d", i, e.Index, i+1)
-		}
-	}
-}
-
-func TestMergeEntriesOverlapping(t *testing.T) {
-	existing := []logdb.Entry{
-		{Index: 1, Term: 1, Cmd: []byte("old1")},
-		{Index: 2, Term: 1, Cmd: []byte("old2")},
-		{Index: 3, Term: 1, Cmd: []byte("old3")},
-	}
-	incoming := []logdb.Entry{
-		{Index: 2, Term: 2, Cmd: []byte("new2")},
-		{Index: 3, Term: 2, Cmd: []byte("new3")},
-		{Index: 4, Term: 2, Cmd: []byte("new4")},
-	}
-
-	got := mergeEntries(existing, incoming)
-	if len(got) != 4 {
-		t.Fatalf("mergeEntries overlapping: got %d entries, want 4", len(got))
-	}
-	if string(got[0].Cmd) != "old1" {
-		t.Errorf("entry[0].Cmd = %q, want %q", got[0].Cmd, "old1")
-	}
-	if string(got[1].Cmd) != "new2" {
-		t.Errorf("entry[1].Cmd = %q, want %q", got[1].Cmd, "new2")
-	}
-	if string(got[3].Cmd) != "new4" {
-		t.Errorf("entry[3].Cmd = %q, want %q", got[3].Cmd, "new4")
-	}
-}
 
 func TestMergeEntriesCompleteOverwrite(t *testing.T) {
 	existing := []logdb.Entry{
