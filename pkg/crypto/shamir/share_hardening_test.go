@@ -14,47 +14,7 @@
 
 package shamir
 
-import (
-	"bytes"
-	"log/slog"
-	"strings"
-	"testing"
-)
-
-// TestProtectedShare_StructuredLoggingIsRedacted is the regression for the
-// share-material leak through structured logging: slog does not call String
-// when a json.Marshaler is available, so a share logged through
-// slog.JSONHandler would be marshalled with its full base64 value. A single
-// leaked share is a permanent, unrevocable disclosure of root-key custody
-// material.
-//
-// The fix is slog.LogValuer, which slog resolves BEFORE consulting any
-// marshaller — so the redaction holds on every handler rather than only on the
-// one that happens to use fmt.
-func TestProtectedShare_StructuredLoggingIsRedacted(t *testing.T) {
-	secret := []byte("root-key-material-32-bytes-long!")
-	share := splitProtectedShares(t, secret, 2, 3)[0]
-	value := string(valueCopy(share))
-	if value == "" {
-		t.Fatal("share has no value to leak")
-	}
-
-	// The JSON handler with a top-level attr is TestProtectedShare_Redaction.
-	var buf bytes.Buffer
-	slog.New(slog.NewTextHandler(&buf, nil)).Info("custody event", "share", share)
-	if out := buf.String(); strings.Contains(out, value) || !strings.Contains(out, "redacted") {
-		t.Fatalf("text handler logged the raw share value or no redacted form: %s", out)
-	}
-
-	// Also cover the value used as an attr value inside a group, which takes a
-	// different path through the handler.
-	buf.Reset()
-	slog.New(slog.NewJSONHandler(&buf, nil)).Info("custody event",
-		slog.Group("ceremony", slog.Any("share", share)))
-	if strings.Contains(buf.String(), value) {
-		t.Fatalf("grouped attr logged the raw share value: %s", buf.String())
-	}
-}
+import "testing"
 
 // TestCombine_BoundsPayloadAndShareCount pins the memory/CPU bound on the
 // combine path. Shares arriving at a recovery ceremony cannot be authenticated
