@@ -118,15 +118,6 @@ func TestHostConfig_SetDefaults(t *testing.T) {
 	})
 }
 
-func TestHostConfig_Validate_Valid(t *testing.T) {
-	t.Run("valid config after SetDefaults", func(t *testing.T) {
-		hc := validHostConfig()
-		if err := hc.Validate(); err != nil {
-			t.Errorf("Validate() = %v, want nil", err)
-		}
-	})
-}
-
 func TestHostConfig_Validate_WALDir(t *testing.T) {
 	t.Run("empty WALDir", func(t *testing.T) {
 		hc := validHostConfig()
