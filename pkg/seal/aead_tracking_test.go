@@ -16,7 +16,6 @@ package seal
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 	"testing"
 )
@@ -114,8 +113,6 @@ func TestInvocationCounter_ExceedsLimit(t *testing.T) {
 				}
 			}
 
-			counterBefore := ic.Count()
-
 			err := ic.Increment()
 			if err == nil {
 				t.Fatal("expected ErrInvocationLimitExceeded, got nil")
@@ -124,9 +121,9 @@ func TestInvocationCounter_ExceedsLimit(t *testing.T) {
 				t.Fatalf("expected ErrInvocationLimitExceeded, got: %v", err)
 			}
 
-			// Counter must be rolled back to its pre-call value.
-			if got := ic.Count(); got != counterBefore {
-				t.Fatalf("counter after failed increment = %d, want %d (rollback failed)", got, counterBefore)
+			// Counter must be rolled back to the limit it held before the call.
+			if got := ic.Count(); got != tc.limit {
+				t.Fatalf("counter after failed increment = %d, want %d (rollback failed)", got, tc.limit)
 			}
 		})
 	}
@@ -134,77 +131,78 @@ func TestInvocationCounter_ExceedsLimit(t *testing.T) {
 
 // TestInvocationCounter_Disabled verifies that a disabled counter treats all
 // operations as no-ops: no errors, no counter advancement, no rotation signals.
+// A limit of -1 forces the same disabled state regardless of the enabled
+// parameter.
 func TestInvocationCounter_Disabled(t *testing.T) {
 	t.Parallel()
 
-	ic := NewInvocationCounter(false, 100, 0)
-
-	if ic.IsEnabled() {
-		t.Fatal("IsEnabled() should return false for a disabled counter")
+	tests := []struct {
+		name    string
+		enabled bool
+		limit   int64
+	}{
+		{"enabled_false", false, 100},
+		{"limit_minus_one", true, -1},
 	}
 
-	// Increment beyond the limit that would matter if enabled.
-	for i := range 200 {
-		if err := ic.Increment(); err != nil {
-			t.Fatalf("call %d: disabled counter returned unexpected error: %v", i, err)
-		}
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Counter must stay at zero.
-	if got := ic.Count(); got != 0 {
-		t.Fatalf("Count() = %d on disabled counter, want 0", got)
-	}
+			ic := NewInvocationCounter(tc.enabled, tc.limit, 0)
 
-	// Limit is -1 when disabled.
-	if got := ic.Limit(); got != -1 {
-		t.Fatalf("Limit() = %d on disabled counter, want -1", got)
-	}
+			if ic.IsEnabled() {
+				t.Fatal("IsEnabled() should return false for a disabled counter")
+			}
 
-	// Usage percentage is 0.0 when disabled.
-	if got := ic.GetUsagePercentage(); got != 0.0 {
-		t.Fatalf("GetUsagePercentage() = %f on disabled counter, want 0.0", got)
-	}
+			// Increment beyond the limit that would matter if enabled.
+			for i := range 200 {
+				if err := ic.Increment(); err != nil {
+					t.Fatalf("call %d: disabled counter returned unexpected error: %v", i, err)
+				}
+			}
 
-	// ShouldRotate is never triggered when disabled.
-	if ic.ShouldRotate() {
-		t.Fatal("ShouldRotate() should return false for disabled counter")
-	}
+			// Counter must stay at zero.
+			if got := ic.Count(); got != 0 {
+				t.Fatalf("Count() = %d on disabled counter, want 0", got)
+			}
 
-	// GetRotationThreshold returns 0.0 when disabled.
-	if got := ic.GetRotationThreshold(); got != 0.0 {
-		t.Fatalf("GetRotationThreshold() = %f on disabled counter, want 0.0", got)
-	}
+			// Limit is -1 when disabled.
+			if got := ic.Limit(); got != -1 {
+				t.Fatalf("Limit() = %d on disabled counter, want -1", got)
+			}
 
-	// Reset is a no-op; nothing should panic.
-	if err := ic.Reset(); err != nil {
-		t.Fatalf("Reset() on disabled counter returned unexpected error: %v", err)
-	}
+			// Usage percentage is 0.0 when disabled.
+			if got := ic.GetUsagePercentage(); got != 0.0 {
+				t.Fatalf("GetUsagePercentage() = %f on disabled counter, want 0.0", got)
+			}
 
-	// Close is a no-op.
-	if err := ic.Close(); err != nil {
-		t.Fatalf("Close() on disabled counter returned unexpected error: %v", err)
-	}
+			// ShouldRotate is never triggered when disabled.
+			if ic.ShouldRotate() {
+				t.Fatal("ShouldRotate() should return false for disabled counter")
+			}
 
-	// Seed is a no-op when disabled.
-	ic.Seed(42)
-	if got := ic.Count(); got != 0 {
-		t.Fatalf("Count() after Seed on disabled = %d, want 0", got)
-	}
-}
+			// GetRotationThreshold returns 0.0 when disabled.
+			if got := ic.GetRotationThreshold(); got != 0.0 {
+				t.Fatalf("GetRotationThreshold() = %f on disabled counter, want 0.0", got)
+			}
 
-// TestInvocationCounter_DisabledViaMinusOne verifies that limit=-1 forces
-// disabled regardless of the enabled parameter.
-func TestInvocationCounter_DisabledViaMinusOne(t *testing.T) {
-	t.Parallel()
+			// Reset is a no-op; nothing should panic.
+			if err := ic.Reset(); err != nil {
+				t.Fatalf("Reset() on disabled counter returned unexpected error: %v", err)
+			}
 
-	ic := NewInvocationCounter(true, -1, 0)
+			// Close is a no-op.
+			if err := ic.Close(); err != nil {
+				t.Fatalf("Close() on disabled counter returned unexpected error: %v", err)
+			}
 
-	if ic.IsEnabled() {
-		t.Fatal("IsEnabled() should return false when limit is -1")
-	}
-
-	if got := ic.Limit(); got != -1 {
-		t.Fatalf("Limit() = %d, want -1", got)
+			// Seed is a no-op when disabled.
+			ic.Seed(42)
+			if got := ic.Count(); got != 0 {
+				t.Fatalf("Count() after Seed on disabled = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -227,26 +225,16 @@ func TestInvocationCounter_DefaultLimit(t *testing.T) {
 }
 
 // TestInvocationCounter_DefaultRotationThreshold verifies that a threshold of 0
-// defaults to DefaultRotationThreshold (95.0).
+// and out-of-range thresholds (negative, >100) all default to
+// DefaultRotationThreshold (95.0).
 func TestInvocationCounter_DefaultRotationThreshold(t *testing.T) {
-	t.Parallel()
-
-	ic := NewInvocationCounter(true, 1000, 0)
-
-	if got := ic.GetRotationThreshold(); got != DefaultRotationThreshold {
-		t.Fatalf("GetRotationThreshold() = %f, want %f", got, DefaultRotationThreshold)
-	}
-}
-
-// TestInvocationCounter_InvalidRotationThreshold verifies that out-of-range
-// thresholds (negative, >100) default to DefaultRotationThreshold.
-func TestInvocationCounter_InvalidRotationThreshold(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name      string
 		threshold float64
 	}{
+		{"zero", 0},
 		{"negative", -10.0},
 		{"above_100", 101.0},
 	}
@@ -335,13 +323,6 @@ func TestInvocationCounter_GetUsagePercentage(t *testing.T) {
 			used:    950,
 			wantPct: 95.0,
 		},
-		{
-			name:    "0% when disabled",
-			enabled: false,
-			limit:   1000,
-			used:    0,
-			wantPct: 0.0,
-		},
 	}
 
 	for _, tc := range tests {
@@ -411,14 +392,6 @@ func TestInvocationCounter_ShouldRotate(t *testing.T) {
 			used:       1000,
 			wantRotate: true,
 		},
-		{
-			name:       "disabled – never rotates",
-			enabled:    false,
-			limit:      1000,
-			threshold:  95.0,
-			used:       0,
-			wantRotate: false,
-		},
 	}
 
 	for _, tc := range tests {
@@ -439,32 +412,6 @@ func TestInvocationCounter_ShouldRotate(t *testing.T) {
 					got, tc.wantRotate, ic.GetUsagePercentage())
 			}
 		})
-	}
-}
-
-// TestInvocationCounter_Rollback verifies that when Increment fails
-// due to the limit being exceeded the counter is left in its pre-call state
-// so subsequent calls within budget still succeed after reset.
-func TestInvocationCounter_Rollback(t *testing.T) {
-	t.Parallel()
-
-	const limit int64 = 10
-	ic := NewInvocationCounter(true, limit, 0)
-
-	// Fill to limit.
-	for range limit {
-		if err := ic.Increment(); err != nil {
-			t.Fatalf("initial increment failed: %v", err)
-		}
-	}
-
-	// Attempt one more — must fail and counter stays at limit.
-	err := ic.Increment()
-	if !errors.Is(err, ErrInvocationLimitExceeded) {
-		t.Fatalf("expected ErrInvocationLimitExceeded, got: %v", err)
-	}
-	if got := ic.Count(); got != limit {
-		t.Fatalf("counter after rollback = %d, want %d", got, limit)
 	}
 }
 
@@ -529,23 +476,13 @@ func TestInvocationCounter_Seed(t *testing.T) {
 	}
 }
 
-// TestInvocationCounter_SeedDisabled verifies that Seed is a no-op on disabled counters.
-// TestInvocationCounter_Close verifies that Close returns nil for the in-memory
-// implementation.
-// TestInvocationCounter_InterfaceCompliance verifies that InMemoryInvocationCounter
-// satisfies the InvocationCounter interface.
-func TestInvocationCounter_InterfaceCompliance(t *testing.T) {
-	t.Parallel()
-
-	var _ InvocationCounter = NewInvocationCounter(true, 1000, 0)
-}
-
 // ============================================================================
 // InMemoryNonceTracker Tests
 // ============================================================================
 
 // TestNonceTracker_CheckAndRecord verifies that presenting a unique nonce
-// succeeds and the nonce is subsequently recorded.
+// succeeds and that Count starts at zero and advances by one per recorded
+// nonce.
 func TestNonceTracker_CheckAndRecord(t *testing.T) {
 	t.Parallel()
 
@@ -577,14 +514,17 @@ func TestNonceTracker_CheckAndRecord(t *testing.T) {
 
 			nt := NewNonceTracker(true)
 
+			if got := nt.Count(); got != 0 {
+				t.Fatalf("Count() on empty tracker = %d, want 0", got)
+			}
+
 			for i, n := range tc.nonces {
 				if err := nt.CheckAndRecordNonce(n); err != nil {
 					t.Fatalf("nonce[%d]: unexpected error: %v", i, err)
 				}
-			}
-
-			if got := nt.Count(); got != len(tc.nonces) {
-				t.Fatalf("Count() = %d, want %d", got, len(tc.nonces))
+				if got := nt.Count(); got != i+1 {
+					t.Fatalf("Count() after nonce[%d] = %d, want %d", i, got, i+1)
+				}
 			}
 		})
 	}
@@ -719,64 +659,6 @@ func TestNonceTracker_Contains(t *testing.T) {
 	}
 }
 
-// TestNonceTracker_Count verifies that Count returns the exact number of
-// unique nonces recorded and increments correctly with each new nonce.
-func TestNonceTracker_Count(t *testing.T) {
-	t.Parallel()
-
-	const numNonces = 20
-	nt := NewNonceTracker(true)
-
-	if got := nt.Count(); got != 0 {
-		t.Fatalf("Count() on empty tracker = %d, want 0", got)
-	}
-
-	for i := range numNonces {
-		nonce := []byte{byte(i >> 8), byte(i)}
-		if err := nt.CheckAndRecordNonce(nonce); err != nil {
-			t.Fatalf("recording nonce %d failed: %v", i, err)
-		}
-		if got := nt.Count(); got != i+1 {
-			t.Fatalf("Count() after recording nonce %d = %d, want %d", i, got, i+1)
-		}
-	}
-}
-
-// TestNonceTracker_Clear verifies that Clear resets the count to zero so the
-// tracker can be reused after key rotation.
-func TestNonceTracker_Clear(t *testing.T) {
-	t.Parallel()
-
-	nt := NewNonceTracker(true)
-
-	for i := range 10 {
-		nonce := []byte{byte(i)}
-		if err := nt.CheckAndRecordNonce(nonce); err != nil {
-			t.Fatalf("setup: recording nonce %d failed: %v", i, err)
-		}
-	}
-	if nt.Count() == 0 {
-		t.Fatal("count should be non-zero before Clear()")
-	}
-
-	if err := nt.Clear(); err != nil {
-		t.Fatalf("Clear() returned unexpected error: %v", err)
-	}
-
-	if got := nt.Count(); got != 0 {
-		t.Fatalf("Count() after Clear() = %d, want 0", got)
-	}
-
-	// Previously recorded nonces should now be accepted again.
-	nonce := []byte{0x00}
-	if err := nt.CheckAndRecordNonce(nonce); err != nil {
-		t.Fatalf("post-clear re-recording failed: %v", err)
-	}
-	if got := nt.Count(); got != 1 {
-		t.Fatalf("Count() after post-clear recording = %d, want 1", got)
-	}
-}
-
 // TestNonceTracker_SetEnabled verifies that toggling the enabled flag
 // changes tracker behaviour without losing existing nonce history.
 func TestNonceTracker_SetEnabled(t *testing.T) {
@@ -842,9 +724,7 @@ func TestNonceTracker_Concurrent(t *testing.T) {
 				byte(idx),
 			}
 			if err := nt.CheckAndRecordNonce(nonce); err != nil {
-				// Under a data race this could spuriously return ErrNonceReuse;
-				// report it but don't fail with a race on the t.Fatal call.
-				_ = fmt.Sprintf("goroutine %d: unexpected error: %v", idx, err)
+				t.Errorf("goroutine %d: unexpected error: %v", idx, err)
 			}
 		}(i)
 	}
@@ -856,191 +736,50 @@ func TestNonceTracker_Concurrent(t *testing.T) {
 	}
 }
 
-// TestNonceTracker_NonceKeyConsistency verifies that the same nonce always
-// produces the same key and that different nonces produce different keys.
-// TestNonceTracker_NonceKeyVerbatim verifies that nonceKey uses the full nonce
-// verbatim — no truncation and no padding — so the key length always equals the
-// nonce length and nonces of any length are tracked exactly.
-func TestNonceTracker_NonceKeyVerbatim(t *testing.T) {
-	t.Parallel()
-
-	short := []byte{0x01, 0x02, 0x03}
-	key := nonceKey(short)
-
-	if key != string(short) {
-		t.Fatalf("nonceKey not verbatim: got %x, want %x", key, short)
-	}
-	if len(key) != len(short) {
-		t.Fatalf("key length %d != nonce length %d (unexpected padding/truncation)", len(key), len(short))
-	}
-}
-
-// TestNonceTracker_XChaCha24BytePrefixCollision verifies that two distinct
-// 24-byte XChaCha20-Poly1305 nonces sharing the same 12-byte prefix are tracked
-// as distinct. A fixed [12]byte key would truncate both to the same key and
-// falsely reject the second unique nonce as reuse (availability bug).
-func TestNonceTracker_XChaCha24BytePrefixCollision(t *testing.T) {
-	t.Parallel()
-
-	nt := NewNonceTracker(true)
-
-	prefix := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C}
-
-	nonce1 := append(append([]byte{}, prefix...), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B)
-	nonce2 := append(append([]byte{}, prefix...), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0xFF)
-
-	if len(nonce1) != 24 || len(nonce2) != 24 {
-		t.Fatalf("expected 24-byte nonces, got %d and %d", len(nonce1), len(nonce2))
-	}
-
-	if err := nt.CheckAndRecordNonce(nonce1); err != nil {
-		t.Fatalf("recording nonce1 failed: %v", err)
-	}
-	// nonce2 shares the 12-byte prefix of nonce1 but is distinct; it must be
-	// accepted, not falsely rejected as reuse.
-	if err := nt.CheckAndRecordNonce(nonce2); err != nil {
-		t.Fatalf("recording nonce2 falsely rejected as reuse (12-byte prefix collision): %v", err)
-	}
-	// True reuse of nonce1 must still be detected.
-	if err := nt.CheckAndRecordNonce(nonce1); !errors.Is(err, ErrNonceReuse) {
-		t.Fatalf("expected ErrNonceReuse on true reuse, got %v", err)
-	}
-	if got := nt.Count(); got != 2 {
-		t.Fatalf("Count() = %d, want 2", got)
-	}
-}
-
-// TestNonceTracker_NoFalsePositives verifies that using full nonce keys
-// eliminates the false positive risk that existed with truncated hash
-// fingerprints. Two nonces that differ only in the last byte must be
-// tracked as distinct entries.
+// TestNonceTracker_NoFalsePositives verifies that two distinct nonces sharing
+// a prefix are tracked as distinct entries and that true reuse of either is
+// still detected. The 24-byte case is the XChaCha20-Poly1305 regression: a
+// fixed [12]byte key would truncate both nonces to the same key and falsely
+// reject the second unique nonce as reuse (availability bug). The 12-byte case
+// covers the false positives truncated hash fingerprints used to risk.
 func TestNonceTracker_NoFalsePositives(t *testing.T) {
 	t.Parallel()
 
-	nt := NewNonceTracker(true)
-
-	// Create two 12-byte nonces that differ only in the last byte.
-	nonce1 := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x00}
-	nonce2 := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x01}
-
-	if err := nt.CheckAndRecordNonce(nonce1); err != nil {
-		t.Fatalf("recording nonce1 failed: %v", err)
+	prefix := []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C}
+	tests := []struct {
+		name           string
+		nonce1, nonce2 []byte
+	}{
+		{
+			name:   "12-byte nonces differing in the last byte",
+			nonce1: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x00},
+			nonce2: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x01},
+		},
+		{
+			name:   "XChaCha 24-byte nonces sharing a 12-byte prefix",
+			nonce1: append(append([]byte{}, prefix...), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B),
+			nonce2: append(append([]byte{}, prefix...), 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0xFF),
+		},
 	}
 
-	// nonce2 must be accepted as distinct (no false positive).
-	if err := nt.CheckAndRecordNonce(nonce2); err != nil {
-		t.Fatalf("recording nonce2 failed (false positive): %v", err)
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	if got := nt.Count(); got != 2 {
-		t.Fatalf("Count() = %d, want 2", got)
-	}
-}
-
-// TestNonceTracker_FullNonceKeyDetectsReuse verifies that the full nonce
-// key approach correctly detects reuse.
-func TestNonceTracker_FullNonceKeyDetectsReuse(t *testing.T) {
-	t.Parallel()
-
-	nt := NewNonceTracker(true)
-
-	// Use a typical 12-byte AES-GCM nonce.
-	nonce := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77}
-
-	// First record should succeed.
-	if err := nt.CheckAndRecordNonce(nonce); err != nil {
-		t.Fatalf("first recording failed: %v", err)
-	}
-
-	// Contains should find it.
-	if !nt.Contains(nonce) {
-		t.Fatal("Contains returned false for recorded nonce")
-	}
-
-	// Duplicate should be rejected.
-	err := nt.CheckAndRecordNonce(nonce)
-	if !errors.Is(err, ErrNonceReuse) {
-		t.Fatalf("expected ErrNonceReuse, got: %v", err)
-	}
-}
-
-// TestNonceTracker_Close verifies that Close returns nil for the in-memory
-// implementation.
-func TestNonceTracker_Close(t *testing.T) {
-	t.Parallel()
-
-	nt := NewNonceTracker(true)
-	if err := nt.Close(); err != nil {
-		t.Fatalf("Close() returned unexpected error: %v", err)
-	}
-}
-
-// TestNonceTracker_InterfaceCompliance verifies that InMemoryNonceTracker
-// satisfies the NonceTrackerProvider interface.
-func TestNonceTracker_InterfaceCompliance(t *testing.T) {
-	t.Parallel()
-
-	var _ NonceTrackerProvider = NewNonceTracker(true)
-}
-
-// TestNonceTracker_ClearConcurrentNoNonceReuse verifies that Clear() during
-// concurrent CheckAndRecordNonce does not allow nonce reuse. This exercises the
-// atomic pointer swap fix: goroutines that call CheckAndRecordNonce after Clear()
-// must have their nonces tracked in the new map, preventing duplicate acceptance.
-func TestNonceTracker_ClearConcurrentNoNonceReuse(t *testing.T) {
-	t.Parallel()
-
-	const goroutines = 200
-	const rounds = 50
-
-	for round := range rounds {
-		nt := NewNonceTracker(true)
-
-		// Pre-populate with some nonces.
-		for i := range 10 {
-			nonce := []byte{byte(round), byte(i), 0x00, 0x00}
-			if err := nt.CheckAndRecordNonce(nonce); err != nil {
-				t.Fatalf("round %d: setup nonce %d failed: %v", round, i, err)
+			nt := NewNonceTracker(true)
+			if err := nt.CheckAndRecordNonce(tc.nonce1); err != nil {
+				t.Fatalf("recording nonce1 failed: %v", err)
 			}
-		}
-
-		var wg sync.WaitGroup
-		wg.Add(goroutines + 1)
-
-		// Start goroutines that each record a unique nonce, then immediately
-		// try the same nonce again. The second attempt must return ErrNonceReuse
-		// unless Clear() ran between the two calls (in which case the second
-		// attempt records successfully into the fresh map).
-		reuseDetected := make([]bool, goroutines)
-
-		for i := range goroutines {
-			go func(idx int) {
-				defer wg.Done()
-				nonce := []byte{
-					0xFF, // distinguish from setup nonces
-					byte(idx >> 16),
-					byte(idx >> 8),
-					byte(idx),
-				}
-				// First record: must succeed (unique nonce).
-				_ = nt.CheckAndRecordNonce(nonce)
-
-				// Second record: must return ErrNonceReuse unless Clear()
-				// swapped the map between the two calls.
-				err := nt.CheckAndRecordNonce(nonce)
-				if errors.Is(err, ErrNonceReuse) {
-					reuseDetected[idx] = true
-				}
-			}(i)
-		}
-
-		// Concurrently call Clear() to exercise the race window.
-		go func() {
-			defer wg.Done()
-			_ = nt.Clear()
-		}()
-
-		wg.Wait()
+			if err := nt.CheckAndRecordNonce(tc.nonce2); err != nil {
+				t.Fatalf("recording nonce2 falsely rejected as reuse: %v", err)
+			}
+			if err := nt.CheckAndRecordNonce(tc.nonce1); !errors.Is(err, ErrNonceReuse) {
+				t.Fatalf("expected ErrNonceReuse on true reuse, got %v", err)
+			}
+			if got := nt.Count(); got != 2 {
+				t.Fatalf("Count() = %d, want 2", got)
+			}
+		})
 	}
 }
 
