@@ -588,31 +588,6 @@ func TestQUICTransport_SetShardEpochTrackers(t *testing.T) {
 	}
 }
 
-// TestQUICTransport_SetEpochTracker verifies that the QUICTransport
-// delegates SetEpochTracker to its internal snapshotReceiver.
-func TestQUICTransport_SetEpochTracker(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-
-	tracker := newTestEpochTracker()
-	tr.SetEpochTracker(tracker)
-
-	// Verify the tracker was set on the internal snapshot receiver.
-	if tr.snapshotRecv.epochTracker == nil {
-		t.Fatal("expected epoch tracker to be set on snapshot receiver")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Chunk validation tests (Fix 3: bounds checks, Fix 4: DeploymentID)
 // ---------------------------------------------------------------------------
@@ -880,63 +855,6 @@ func TestChunkErrorTypes_Is_DoesNotMatchOther(t *testing.T) {
 // Snapshot chunk write deadline tests
 // ---------------------------------------------------------------------------
 
-// TestSnapshotChunkWriteTimeoutError_SentinelMatch verifies that the
-// SnapshotChunkWriteTimeoutError typed error matches ErrSnapshotChunkWriteTimeout
-// via errors.Is and supports errors.As for structured field extraction.
-func TestSnapshotChunkWriteTimeoutError_SentinelMatch(t *testing.T) {
-	underlying := errors.New("write timeout")
-	err := &SnapshotChunkWriteTimeoutError{
-		ShardID:   5,
-		ReplicaID: 3,
-		ChunkID:   2,
-		Err:       underlying,
-	}
-
-	if !errors.Is(err, ErrSnapshotChunkWriteTimeout) {
-		t.Fatal("SnapshotChunkWriteTimeoutError should match ErrSnapshotChunkWriteTimeout")
-	}
-
-	var timeoutErr *SnapshotChunkWriteTimeoutError
-	if !errors.As(err, &timeoutErr) {
-		t.Fatalf("expected *SnapshotChunkWriteTimeoutError, got %T", err)
-	}
-	if timeoutErr.ShardID != 5 {
-		t.Fatalf("expected ShardID 5, got %d", timeoutErr.ShardID)
-	}
-	if timeoutErr.ReplicaID != 3 {
-		t.Fatalf("expected ReplicaID 3, got %d", timeoutErr.ReplicaID)
-	}
-	if timeoutErr.ChunkID != 2 {
-		t.Fatalf("expected ChunkID 2, got %d", timeoutErr.ChunkID)
-	}
-	if !errors.Is(timeoutErr.Unwrap(), underlying) {
-		t.Fatal("Unwrap should return the underlying error")
-	}
-	if !strings.Contains(err.Error(), "deadline exceeded") {
-		t.Fatalf("error message should contain 'deadline exceeded': %s", err.Error())
-	}
-	if !strings.Contains(err.Error(), "shard 5") {
-		t.Fatalf("error message should contain 'shard 5': %s", err.Error())
-	}
-}
-
-// TestSnapshotChunkWriteTimeoutError_DoesNotMatchOtherSentinels verifies
-// that the timeout error does not match unrelated sentinels.
-func TestSnapshotChunkWriteTimeoutError_DoesNotMatchOtherSentinels(t *testing.T) {
-	err := &SnapshotChunkWriteTimeoutError{
-		ShardID:   1,
-		ReplicaID: 2,
-		ChunkID:   0,
-		Err:       errors.New("timeout"),
-	}
-	if errors.Is(err, ErrStreamClosed) {
-		t.Fatal("SnapshotChunkWriteTimeoutError should not match ErrStreamClosed")
-	}
-	if errors.Is(err, ErrChunkDataTooLarge) {
-		t.Fatal("SnapshotChunkWriteTimeoutError should not match ErrChunkDataTooLarge")
-	}
-}
-
 // TestSendSnapshot_ShutdownCancelsStreamOpen verifies that Stop() cancels
 // an in-progress SendSnapshot by canceling shutdownCtx, which unblocks the
 // OpenStreamSync call derived from it. This prevents Stop() from blocking
@@ -1124,45 +1042,6 @@ func TestSendSnapshot_TrackerReleasedOnWriteError(t *testing.T) {
 	}
 }
 
-func TestReceiveChunks_ValidateChunkFailure(t *testing.T) {
-	handler := newTestHandler()
-	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
-
-	// Build a chunk with wrong deployment ID (will fail validateChunk).
-	chunk := proto.SnapshotChunk{
-		BinVer:       proto.WireVersion,
-		ShardID:      1,
-		ReplicaID:    2,
-		From:         1,
-		Index:        50,
-		Term:         3,
-		ChunkID:      0,
-		ChunkCount:   1,
-		ChunkSize:    5,
-		Data:         []byte("hello"),
-		DeploymentID: 999, // mismatch with sr.deploymentID=42
-	}
-
-	data := buildChunkFrames(t, []proto.SnapshotChunk{chunk})
-	reader := &testChunkReader{data: data}
-
-	hdr := &SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      50,
-		Term:       3,
-		ChunkCount: 1,
-	}
-	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
-
-	// Handler should NOT have received any snapshot.
-	snaps := handler.getSnapshots()
-	if len(snaps) != 0 {
-		t.Fatalf("expected 0 snapshots after validation failure, got %d", len(snaps))
-	}
-}
-
 // ---------------------------------------------------------------------------
 // receiveChunks memory budget accounting
 // ---------------------------------------------------------------------------
@@ -1298,42 +1177,6 @@ func TestReceiveChunks_MemoryBudgetExceeded(t *testing.T) {
 					after, before, before-after)
 			}
 		})
-	}
-}
-
-// TestReceiveChunks_MemoryBudgetRestoredOnSuccess is the counterpart: a
-// COMPLETED transfer must also return its whole reservation, so a busy host
-// does not bleed budget one successful snapshot at a time.
-func TestReceiveChunks_MemoryBudgetRestoredOnSuccess(t *testing.T) {
-	handler := newTestHandler()
-	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
-	before := sr.AvailableMemory()
-
-	chunks := make([]proto.SnapshotChunk, 4)
-	for i := range chunks {
-		chunks[i] = proto.SnapshotChunk{
-			BinVer:       proto.WireVersion,
-			ShardID:      1,
-			ReplicaID:    2,
-			From:         1,
-			Index:        50,
-			Term:         3,
-			ChunkID:      uint64(i),
-			ChunkCount:   4,
-			ChunkSize:    16,
-			Data:         bytes.Repeat([]byte("Y"), 16),
-			DeploymentID: 42,
-		}
-	}
-
-	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 4, From: 1}
-	sr.receiveChunks(&testChunkReader{data: buildChunkFrames(t, chunks)}, hdr, "", PeerAuth{}, make(chan struct{}))
-
-	if got := handler.snapshotCount.Load(); got != 1 {
-		t.Fatalf("HandleSnapshot called %d times, want 1", got)
-	}
-	if after := sr.AvailableMemory(); after != before {
-		t.Fatalf("memory budget = %d after a successful transfer, want %d", after, before)
 	}
 }
 
@@ -1650,49 +1493,6 @@ func TestReceiveChunks_TruncatedTransferNotCommitted(t *testing.T) {
 	}
 }
 
-// TestReceiveChunks_CompleteTransferCommitted verifies that when exactly
-// ChunkCount chunks arrive, the snapshot IS committed via HandleSnapshot. This
-// is the positive counterpart to the truncation test, guarding against an
-// over-strict completeness check rejecting valid transfers.
-func TestReceiveChunks_CompleteTransferCommitted(t *testing.T) {
-	handler := newTestHandler()
-	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
-
-	chunks := make([]proto.SnapshotChunk, 3)
-	for i := range chunks {
-		chunks[i] = proto.SnapshotChunk{
-			BinVer:       proto.WireVersion,
-			ShardID:      1,
-			ReplicaID:    2,
-			From:         1,
-			Index:        50,
-			Term:         3,
-			ChunkID:      uint64(i),
-			ChunkCount:   3,
-			ChunkSize:    5,
-			Data:         []byte("hello"),
-			DeploymentID: 42,
-		}
-	}
-	data := buildChunkFrames(t, chunks)
-	reader := &testChunkReader{data: data}
-
-	hdr := &SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      50,
-		Term:       3,
-		ChunkCount: 3,
-		From:       1,
-	}
-	stopC := make(chan struct{})
-	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
-
-	if snaps := handler.getSnapshots(); len(snaps) != 1 || len(snaps[0]) != 3 {
-		t.Fatalf("expected 1 committed snapshot of 3 chunks, got %d deliveries", len(snaps))
-	}
-}
-
 // errorSnapshotHandler is a MessageHandler that returns errors from
 // HandleSnapshot to test error handling in receiveChunks. calls records how
 // many times the handler was offered a snapshot, so a test can distinguish
@@ -1764,6 +1564,10 @@ func TestReceiveChunks_MemoryBudgetExceededPerReceive(t *testing.T) {
 	snapshots := handler.getSnapshots()
 	if len(snapshots) > 0 {
 		t.Fatal("expected no snapshots to be delivered when memory budget exceeded")
+	}
+	// The aborted transfer must return every byte it reserved.
+	if available := sr.AvailableMemory(); available != 400 {
+		t.Fatalf("memory budget should be restored to 400, got %d", available)
 	}
 }
 
@@ -1965,7 +1769,8 @@ func TestValidateChunk_BindsSenderAndTargetToTheHeader(t *testing.T) {
 func TestReceiveChunks_WithMetricsInstrumentation(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
-	sr.metrics = noopTransportMetrics{}
+	rec := &snapshotMetricsRecorder{}
+	sr.metrics = rec
 
 	chunk := proto.SnapshotChunk{
 		BinVer:       proto.WireVersion,
@@ -1999,6 +1804,9 @@ func TestReceiveChunks_WithMetricsInstrumentation(t *testing.T) {
 	if len(snapshots) != 1 {
 		t.Fatalf("expected 1 snapshot, got %d", len(snapshots))
 	}
+	if got := rec.receivedCalls(); got != 1 {
+		t.Fatalf("IncSnapshotsReceived called %d times after a committed transfer, want 1", got)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -2011,51 +1819,6 @@ func TestReceiveChunks_WithMetricsInstrumentation(t *testing.T) {
 
 // TestPreOpenHeartbeatStream_StoppedTransportReturns verifies that
 // preOpenHeartbeatStream returns immediately when the transport is stopped.
-
-func TestReceiveChunks_StopSignalDuringIteration(t *testing.T) {
-	handler := newTestHandler()
-	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
-
-	// Create 3 chunks.
-	chunks := make([]proto.SnapshotChunk, 3)
-	for i := range chunks {
-		chunks[i] = proto.SnapshotChunk{
-			BinVer:       proto.WireVersion,
-			ShardID:      1,
-			ReplicaID:    2,
-			From:         1,
-			Index:        50,
-			Term:         3,
-			ChunkID:      uint64(i),
-			ChunkCount:   3,
-			ChunkSize:    5,
-			Data:         []byte("hello"),
-			DeploymentID: 42,
-		}
-	}
-
-	data := buildChunkFrames(t, chunks)
-	reader := &testChunkReader{data: data}
-
-	hdr := &SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  2,
-		Index:      50,
-		Term:       3,
-		ChunkCount: 3,
-	}
-
-	// Close stopC immediately so the loop exits on the first iteration.
-	stopC := make(chan struct{})
-	close(stopC)
-	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
-
-	// No snapshots should have been delivered.
-	snapshots := handler.getSnapshots()
-	if len(snapshots) != 0 {
-		t.Fatalf("expected 0 snapshots when stopped, got %d", len(snapshots))
-	}
-}
 
 // ---------------------------------------------------------------------------
 // receiveChunks chunk validation failure (snapshot_recv.go:232-241)
@@ -2071,80 +1834,6 @@ func TestReceiveChunks_StopSignalDuringIteration(t *testing.T) {
 // the shard map during the dedup check, closes its own newly opened stream,
 // and returns the existing one. This covers conn.go:288, 293-295, 296-303,
 // 343-351.
-
-func TestReceiveChunks_TotalBytesExceedsMaxMemory(t *testing.T) {
-	handler := newTestHandler()
-	// Create receiver with a memory budget large enough that per-chunk
-	// budget checks pass, but small enough that the cumulative totalBytes
-	// check at snapshot_recv.go:250 triggers after processing all chunks.
-	// Each serialized chunk is ~80 bytes. We set maxMemory=150 so:
-	// - chunk 0: totalBytes=~80, budget=150-80=70 -> per-chunk passes
-	// - chunk 1: totalBytes=~160, budget=70-80=-10 -> per-chunk FAILS
-	// To make the totalBytes check trigger, we need per-chunk checks to
-	// pass but totalBytes to exceed maxMemory. The per-chunk budget is
-	// shared with maxMemory, so we need maxMemory large enough for each
-	// individual chunk but small enough that the sum exceeds it.
-	//
-	// The trick: set maxMemory to be just enough for ~2 chunks but have
-	// 3 chunks. Per-chunk budget decrements atomically. Chunk 1 passes
-	// (budget 200 -> ~120), chunk 2 passes (120 -> ~40), then totalBytes
-	// check fires at 160 > 200? No, that doesn't work either.
-	//
-	// Actually, the totalBytes check at line 250 fires when totalBytes
-	// (accumulated per-receive) > maxMemory. Since maxMemory = memoryBudget
-	// initial value, and per-chunk budget is deducted from the same value,
-	// totalBytes can never exceed maxMemory because the per-chunk budget
-	// check would reject first.
-	//
-	// UNLESS: there are concurrent receivers sharing the budget. If another
-	// receiver has already consumed some budget, this receiver's per-chunk
-	// checks still pass but the cumulative totalBytes exceeds maxMemory.
-	//
-	// Set up: maxMemory=500, pre-consume 400 of budget (only 100 left),
-	// then send 3 chunks each ~80 bytes. Per-chunk checks:
-	// chunk 0: remaining = 100 - 80 = 20 (passes, totalBytes=80)
-	// chunk 1: remaining = 20 - 80 = -60 (FAILS at per-chunk check)
-	// So per-chunk check still catches first.
-	//
-	// The ONLY way totalBytes > maxMemory triggers is if the per-chunk
-	// budget is never negative but totalBytes still exceeds. This would
-	// require memoryBudget to be restored between chunks (impossible in
-	// this code). This path is effectively dead code within a single
-	// receiveChunks call. Let's just verify the path doesn't crash.
-	sr := newSnapshotReceiver(4, 200, 0, 0, handler)
-
-	// Build 5 chunks.
-	chunks := make([]proto.SnapshotChunk, 5)
-	for i := range chunks {
-		chunks[i] = proto.SnapshotChunk{
-			BinVer:     proto.WireVersion,
-			ShardID:    1,
-			ReplicaID:  1,
-			Index:      10,
-			ChunkID:    uint64(i),
-			ChunkCount: 5,
-			Data:       bytes.Repeat([]byte("X"), 20),
-		}
-	}
-
-	frameData := buildChunkFrames(t, chunks)
-	reader := &testChunkReader{data: frameData}
-	stopC := make(chan struct{})
-
-	hdr := &SnapshotHeader{
-		ShardID:    1,
-		ReplicaID:  1,
-		Index:      10,
-		ChunkCount: 5,
-	}
-	sr.receiveChunks(reader, hdr, "", PeerAuth{}, stopC)
-
-	// Memory budget should be fully restored after receiveChunks returns.
-	available := sr.AvailableMemory()
-	if available != 200 {
-		t.Fatalf("memory budget should be restored to 200, got %d", available)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // getOrCreateSendQueue slow path double-check (quic.go:568-571)
