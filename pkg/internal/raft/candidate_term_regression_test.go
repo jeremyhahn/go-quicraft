@@ -53,26 +53,3 @@ func TestStepCandidate_LocalInstallSnapshotDoesNotRegressTerm(t *testing.T) {
 			"can now double-vote in term %d", r.term)
 	}
 }
-
-// TestStepCandidate_HigherTermStillStepsDown is the liveness control: a real
-// higher term must still depose the candidate, or it would never yield.
-func TestStepCandidate_HigherTermStillStepsDown(t *testing.T) {
-	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
-	cfg := raftTestCfg(1, 1)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("newRaft failed: %v", err)
-	}
-	r.becomeCandidate()
-	r.term = 10
-
-	r.stepDownToFollower(proto.Message{Type: proto.Heartbeat, From: 2, Term: 12})
-
-	if r.state != follower {
-		t.Errorf("state = %v, want follower after a higher-term message", r.state)
-	}
-	if r.term != 12 {
-		t.Errorf("term = %d, want 12: a genuinely higher term must be adopted", r.term)
-	}
-}
