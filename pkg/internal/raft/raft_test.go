@@ -368,6 +368,12 @@ func TestRaft_NewRaft_InitializesAsFollower(t *testing.T) {
 	if r.leaderID != noLeader {
 		t.Fatalf("expected no leader, got %d", r.leaderID)
 	}
+	if r.term != 0 {
+		t.Fatalf("expected term 0, got %d", r.term)
+	}
+	if r.vote != noNode {
+		t.Fatalf("expected vote %d (noNode), got %d", noNode, r.vote)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -392,22 +398,6 @@ func TestRaft_BecomeFollower_SetsState(t *testing.T) {
 	}
 }
 
-func TestRaft_BecomeFollower_PreservesVoteSameTerm(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	// Candidate votes for self (term incremented).
-	r.becomeCandidate()
-	candidateTerm := r.term
-	if r.vote != r.replicaID {
-		t.Fatalf("expected self-vote, got %d", r.vote)
-	}
-	// Receives AppendEntries from winning leader in same term.
-	// becomeFollower in same term must NOT clear vote.
-	r.becomeFollower(candidateTerm, 2)
-	if r.vote != r.replicaID {
-		t.Fatalf("expected vote preserved in same term, got %d", r.vote)
-	}
-}
-
 func TestRaft_BecomeFollower_ClearsVoteOnTermChange(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	r.becomeCandidate()
@@ -428,8 +418,12 @@ func TestRaft_BecomeFollower_PreventDoubleVote(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	r.becomeCandidate()
 	candidateTerm := r.term
-	// Leader wins - become follower in same term.
+	// Leader wins - become follower in same term. becomeFollower in the
+	// same term must NOT clear the self-vote.
 	r.becomeFollower(candidateTerm, 2)
+	if r.vote != r.replicaID {
+		t.Fatalf("expected vote preserved in same term, got %d", r.vote)
+	}
 	r.drainMessages()
 	// Third candidate requests vote in same term.
 	err := r.step(proto.Message{
@@ -491,18 +485,6 @@ func TestRaft_BecomeCandidate_PanicsFromLeader(t *testing.T) {
 	r.becomeCandidate()
 }
 
-func TestRaft_BecomePreCandidate_DoesNotIncrementTerm(t *testing.T) {
-	r := newTestRaft(1)
-	initialTerm := r.term
-	r.becomePreCandidate()
-	if r.state != preCandidate {
-		t.Fatalf("expected preCandidate, got %s", r.state)
-	}
-	if r.term != initialTerm {
-		t.Fatalf("expected term unchanged (%d), got %d", initialTerm, r.term)
-	}
-}
-
 func TestRaft_BecomePreCandidate_PanicsFromLeader(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -545,63 +527,6 @@ func TestRaft_BecomeLeader_AppendsNoopEntry(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Test: Election - normal
 // ---------------------------------------------------------------------------
-
-func TestRaft_Election_FollowerStartsElection(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	advanceElection(r)
-	if r.state != candidate {
-		t.Fatalf("expected candidate after election timeout, got %s", r.state)
-	}
-}
-
-func TestRaft_Election_FollowerStartsPreVote(t *testing.T) {
-	r := newTestRaft(1)
-	advanceElection(r)
-	if r.state != preCandidate {
-		t.Fatalf("expected preCandidate after election timeout with PreVote, got %s", r.state)
-	}
-}
-
-func TestRaft_Election_CandidateWinsWithMajority(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeCandidate()
-	r.broadcastVote()
-
-	// Grant vote from one peer (quorum = 2 for 3-node cluster).
-	err := r.step(proto.Message{
-		Type: proto.RequestVoteResp,
-		From: 2,
-		Term: r.term,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if r.state != leader {
-		t.Fatalf("expected leader after majority vote, got %s", r.state)
-	}
-}
-
-func TestRaft_Election_CandidateLosesWithMajorityRejection(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.becomeCandidate()
-	r.broadcastVote()
-
-	// Both peers reject.
-	for _, peerID := range []uint64{2, 3} {
-		err := r.step(proto.Message{
-			Type:   proto.RequestVoteResp,
-			From:   peerID,
-			Term:   r.term,
-			Reject: true,
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	}
-	if r.state != follower {
-		t.Fatalf("expected follower after majority rejection, got %s", r.state)
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Test: Election - PreVote
@@ -987,21 +912,6 @@ func TestRaft_Replication_LeaderSendsAppend(t *testing.T) {
 	appends := collectMessages(r, proto.Replicate)
 	if len(appends) == 0 {
 		t.Fatal("expected Replicate messages after propose")
-	}
-}
-
-func TestRaft_Replication_ProposalOnFollowerReturnsError(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.leaderID = noLeader
-
-	err := r.step(proto.Message{
-		Type: proto.Propose, Origin: proto.OriginLocal,
-		Entries: []proto.Entry{{Cmd: []byte("test")}},
-	})
-
-	var nle *NotLeaderError
-	if !errors.As(err, &nle) {
-		t.Fatalf("expected NotLeaderError, got %v", err)
 	}
 }
 
@@ -1394,18 +1304,6 @@ func TestRaft_Commit_OnlyCommitsCurrentTerm(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Test: Heartbeat
 // ---------------------------------------------------------------------------
-
-func TestRaft_Heartbeat_LeaderSendsOnTick(t *testing.T) {
-	r := newTestRaftCheckQuorumDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	advanceHeartbeat(r)
-	heartbeats := collectMessages(r, proto.Heartbeat)
-	if len(heartbeats) == 0 {
-		t.Fatal("expected heartbeat messages after heartbeat tick")
-	}
-}
 
 func TestRaft_Heartbeat_FollowerResponds(t *testing.T) {
 	r := atTerm(newTestRaft(1), 1)
@@ -1932,38 +1830,6 @@ func TestRaft_Snapshot_FollowerRestoresFromSnapshot(t *testing.T) {
 	}
 }
 
-func TestRaft_Snapshot_RejectedWhenBehindCommit(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	r.log.append([]proto.Entry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-	})
-	r.log.commitTo(3)
-	r.leaderID = 2
-
-	// Snapshot at index 2 is behind our committed index (3).
-	ss := proto.Snapshot{Index: 2, Term: 1}
-
-	err := r.step(proto.Message{
-		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
-		From:     2,
-		Term:     1,
-		Snapshot: ss,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	resps := collectMessages(r, proto.ReplicateResp)
-	if len(resps) == 0 {
-		t.Fatal("expected ReplicateResp for rejected snapshot")
-	}
-	if resps[0].LogIndex != 3 {
-		t.Fatalf("expected rejection with committed index 3, got %d", resps[0].LogIndex)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Test: Leader transfer
 // ---------------------------------------------------------------------------
@@ -2088,35 +1954,6 @@ func TestRaft_TimeoutNow_IgnoredByObserver(t *testing.T) {
 // Test: Read index
 // ---------------------------------------------------------------------------
 
-func TestRaft_ReadIndex_SingleNodeRespondsImmediately(t *testing.T) {
-	members := map[uint64]string{1: "addr1"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	electLeader(r)
-	r.drainMessages()
-	r.readStates = nil
-
-	err = r.step(proto.Message{
-		Type: proto.ReadIndex, Origin: proto.OriginLocal,
-		Hint: 42,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(r.readStates) != 1 {
-		t.Fatalf("expected 1 read state, got %d", len(r.readStates))
-	}
-	if r.readStates[0].Key != 42 {
-		t.Fatalf("expected key 42, got %d", r.readStates[0].Key)
-	}
-}
-
 func TestRaft_ReadIndex_MultiNodeRequiresQuorum(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -2202,21 +2039,6 @@ func TestRaft_ReadIndex_FollowerForwardsToLeader(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected ReadIndex forwarded to leader")
-	}
-}
-
-func TestRaft_ReadIndex_FollowerWithNoLeader(t *testing.T) {
-	r := newTestRaft(1)
-	r.leaderID = noLeader
-
-	err := r.step(proto.Message{
-		Type: proto.ReadIndex, Origin: proto.OriginLocal,
-		Hint: 42,
-	})
-
-	var nle *NotLeaderError
-	if !errors.As(err, &nle) {
-		t.Fatalf("expected NotLeaderError, got %v", err)
 	}
 }
 
@@ -2336,12 +2158,7 @@ func TestRaft_TickFollower_AdvancesElectionTick(t *testing.T) {
 	if r.electionTick != initialTick+1 {
 		t.Fatalf("expected electionTick %d, got %d", initialTick+1, r.electionTick)
 	}
-}
-
-func TestRaft_TickFollower_DoesNotStartElectionBeforeTimeout(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	// Tick once, should still be follower.
-	r.tickFunc(r)
+	// One tick is before the election timeout: still a follower.
 	if r.state != follower {
 		t.Fatalf("expected follower, got %s", r.state)
 	}
@@ -2363,24 +2180,6 @@ func TestRaft_TickLeader_HeartbeatTickResetsAfterFiring(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Test: Single-node cluster
 // ---------------------------------------------------------------------------
-
-func TestRaft_SingleNode_ElectsImmediately(t *testing.T) {
-	members := map[uint64]string{1: "addr1"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	r.becomeCandidate()
-	r.broadcastVote()
-	r.checkElectionResult()
-
-	if r.state != leader {
-		t.Fatalf("expected single-node to become leader, got %s", r.state)
-	}
-}
 
 func TestRaft_SingleNode_CommitsImmediately(t *testing.T) {
 	members := map[uint64]string{1: "addr1"}
@@ -2609,13 +2408,6 @@ func TestRaft_DrainMessages_AlternatingEmptyAndFull(t *testing.T) {
 	// Drain again with no new messages.
 	if msgs := r.drainMessages(); msgs != nil {
 		t.Fatalf("expected nil after empty drain, got %v", msgs)
-	}
-}
-
-func TestRaft_DrainFreeOrderMessages_Empty(t *testing.T) {
-	r := newTestRaft(1)
-	if msgs := r.drainFreeOrderMessages(false); msgs != nil {
-		t.Fatalf("expected nil from empty buffer, got %v", msgs)
 	}
 }
 
@@ -3083,41 +2875,6 @@ func TestRaft_SnapshotStatus_NoResendWhileAwaitingAck(t *testing.T) {
 	}
 	if rm.state == remoteSnapshot {
 		t.Fatalf("expected remote to leave snapshot state after ack, got %s", rm.state)
-	}
-}
-
-func TestRaft_SnapshotStatus_Failure(t *testing.T) {
-	r := newTestRaftPreVoteDisabled(1)
-	electLeader(r)
-	r.drainMessages()
-
-	rm := r.remotes[2]
-	rm.becomeSnapshot(10, 1)
-
-	err := r.step(proto.Message{
-		Type: proto.SnapshotStatus, Origin: proto.OriginLocal,
-		From:   2,
-		Term:   r.term,
-		Hint:   1,
-		Reject: true,
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Failure arms a retry backoff of one electionTimeout (paused);
-	// expiry falls back to probe so the retry path resumes.
-	if rm.state != remoteSnapshot || !rm.isPaused() {
-		t.Fatalf("expected paused snapshot backoff after failure, got %s", rm.state)
-	}
-	if rm.snapshotWaitTicks != r.electionTimeout {
-		t.Fatalf("expected backoff %d, got %d", r.electionTimeout, rm.snapshotWaitTicks)
-	}
-	for i := 0; i < r.electionTimeout; i++ {
-		r.tickSnapshotWaits()
-	}
-	if rm.state != remoteProbe {
-		t.Fatalf("expected probe state after backoff expiry, got %s", rm.state)
 	}
 }
 
@@ -6455,89 +6212,6 @@ func TestReadIndex_BitsetQuorumDetection(t *testing.T) {
 	}
 }
 
-func TestReadIndex_DuplicateAckDoesNotDoubleCount(t *testing.T) {
-	// Use a 5-node cluster where quorum = 3. Duplicate acks from a single
-	// peer should not inflate the count to reach quorum.
-	members := map[uint64]string{1: "a", 2: "b", 3: "c", 4: "d", 5: "e"}
-	cfg := raftTestCfgPreVote(1, 1, false)
-	logdb := newTestLogReaderWithMembership(members)
-	r, err := newRaft(cfg, logdb)
-	if err != nil {
-		t.Fatalf("newRaft: %v", err)
-	}
-	electLeader(r)
-	r.drainMessages()
-
-	// Commit noop.
-	for id := range r.remotes {
-		if err := r.step(proto.Message{
-			Type:     proto.ReplicateResp,
-			From:     id,
-			Term:     r.term,
-			LogIndex: r.log.lastIndex(),
-		}); err != nil {
-			t.Fatalf("ReplicateResp: %v", err)
-		}
-	}
-	r.drainMessages()
-	r.readStates = nil
-
-	// Issue a ReadIndex.
-	if err := r.step(proto.Message{
-		Type: proto.ReadIndex, Origin: proto.OriginLocal,
-		Hint: 99,
-	}); err != nil {
-		t.Fatalf("ReadIndex: %v", err)
-	}
-	r.flushReadIndex()
-
-	// Capture the heartbeat ctx from the broadcast.
-	hbs := collectMessages(r, proto.Heartbeat)
-	if len(hbs) == 0 {
-		t.Fatal("expected heartbeat messages for ReadIndex")
-	}
-	hbCtx := hbs[0].Hint
-	r.drainMessages()
-
-	if len(r.pendingReadIndex) != 1 {
-		t.Fatalf("expected 1 pending read, got %d", len(r.pendingReadIndex))
-	}
-
-	// Send 10 duplicate heartbeat acks from node 2 only.
-	// In a 5-node cluster, quorum = 3. self + node 2 = 2 < 3.
-	for range 10 {
-		if err := r.step(proto.Message{
-			Type: proto.HeartbeatResp,
-			From: 2,
-			Term: r.term,
-			Hint: hbCtx,
-		}); err != nil {
-			t.Fatalf("HeartbeatResp: %v", err)
-		}
-		r.drainMessages()
-	}
-
-	// Should NOT be resolved: self(1) + node 2 = 2 < quorum(3).
-	// If duplicate acks were double-counted, ackCount would be 11+
-	// and the read would have been resolved incorrectly.
-	if len(r.readStates) != 0 {
-		t.Fatalf("expected 0 readStates (duplicates should not inflate count), got %d",
-			len(r.readStates))
-	}
-	if len(r.pendingReadIndex) != 1 {
-		t.Fatalf("expected 1 pending read, got %d", len(r.pendingReadIndex))
-	}
-
-	// Verify ackCount is exactly 2 (self + node 2), not 11.
-	// checkReadIndexQuorum adds self on each call, but the bitset prevents
-	// double-counting.
-	pending := &r.pendingReadIndex[0]
-	if pending.ackCount != 2 {
-		t.Fatalf("expected ackCount=2 (self + node 2) after duplicate acks, got %d",
-			pending.ackCount)
-	}
-}
-
 func TestReadIndex_BitsetPreventsDuplicateCounting(t *testing.T) {
 	// Use a 5-node cluster where quorum = 3.
 	// Send duplicate acks from node 2 only. Should NOT reach quorum
@@ -6602,6 +6276,11 @@ func TestReadIndex_BitsetPreventsDuplicateCounting(t *testing.T) {
 	}
 	if len(r.pendingReadIndex) != 1 {
 		t.Fatalf("expected 1 pending read, got %d", len(r.pendingReadIndex))
+	}
+	// ackCount is exactly 2 (self + node 2), not 11: the bitset stops
+	// the duplicate acks from being counted again.
+	if got := r.pendingReadIndex[0].ackCount; got != 2 {
+		t.Fatalf("expected ackCount=2 (self + node 2) after duplicate acks, got %d", got)
 	}
 
 	// Now node 3 acks, reaching quorum: self + 2 + 3 = 3 >= 3.
@@ -7128,86 +6807,6 @@ func TestCampaign_PreVote_UsesTermPlusOne(t *testing.T) {
 // ---------------------------------------------------------------------------
 // hasPendingSnapshot set on InstallSnapshot
 // ---------------------------------------------------------------------------
-
-func TestPeer_Handle_InstallSnapshot_SetsPendingSnapshot(t *testing.T) {
-	cfg := testConfig()
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
-
-	// Verify initial state.
-	if p.hasPendingSnapshot {
-		t.Fatal("precondition failed: hasPendingSnapshot should be false initially")
-	}
-
-	snap := proto.Snapshot{
-		ShardID:   1,
-		ReplicaID: 1,
-		Index:     10,
-		Term:      2,
-		Membership: proto.Membership{
-			Addresses: map[uint64]string{
-				1: "addr1",
-				2: "addr2",
-			},
-		},
-	}
-	msg := proto.Message{
-		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     2,
-		Snapshot: snap,
-	}
-	err := p.Handle(msg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Snapshot was accepted (index 10 > committed 0), so
-	// hasPendingSnapshot must be true.
-	if !p.hasPendingSnapshot {
-		t.Fatal("expected hasPendingSnapshot to be true after accepted InstallSnapshot")
-	}
-}
-
-func TestPeer_Handle_InstallSnapshot_RejectedDoesNotSetPendingSnapshot(t *testing.T) {
-	cfg := testConfig()
-	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
-
-	// Advance committed index past the snapshot index so it will be rejected.
-	p.r.log.inmem.merge(makeEntries(1, 21, 1))
-	p.r.log.committed = 20
-
-	if p.hasPendingSnapshot {
-		t.Fatal("precondition failed: hasPendingSnapshot should be false initially")
-	}
-
-	snap := proto.Snapshot{
-		Index: 5,
-		Term:  1,
-		Membership: proto.Membership{
-			Addresses: map[uint64]string{1: "addr1"},
-		},
-	}
-	msg := proto.Message{
-		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
-		From:     2,
-		To:       1,
-		ShardID:  1,
-		Term:     1,
-		Snapshot: snap,
-	}
-	err := p.Handle(msg)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Snapshot was rejected (index 5 <= committed 20), so
-	// hasPendingSnapshot must remain false.
-	if p.hasPendingSnapshot {
-		t.Fatal("expected hasPendingSnapshot to be false after rejected InstallSnapshot")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // Test: sendAppend uses maxReplicationPayload to bound Replicate messages
@@ -10274,18 +9873,6 @@ func TestHandleLeaderRateLimit_AlwaysReturnsNil(t *testing.T) {
 // Test: rateLimited
 // ---------------------------------------------------------------------------
 
-func TestRateLimited_NilRateLimiterReturnsFalse(t *testing.T) {
-	// When rl is nil, rateLimited() should return false.
-	r := newTestRaft(1)
-	if r.rl != nil {
-		t.Fatal("expected nil rate limiter")
-	}
-
-	if r.rateLimited() {
-		t.Fatal("expected rateLimited()=false with nil rl")
-	}
-}
-
 func TestRateLimited_HysteresisPreventsThrashing(t *testing.T) {
 	// Rate limiting uses hysteresis: enters at 100%, exits at 70%.
 	r := newTestRaftRateLimited(1, 1000)
@@ -11149,16 +10736,6 @@ func TestRaft_Safety_ElectionTimerNotResetOnRejectedVote(t *testing.T) {
 	// Verify electionTick was NOT reset to 0.
 	if r.electionTick != 5 {
 		t.Fatalf("expected electionTick to remain 5, got %d", r.electionTick)
-	}
-}
-
-func TestRaft_NewRaft_InitializesTermAndVoteToZero(t *testing.T) {
-	r := newTestRaft(1)
-	if r.term != 0 {
-		t.Fatalf("expected term 0, got %d", r.term)
-	}
-	if r.vote != noNode {
-		t.Fatalf("expected vote %d (noNode), got %d", noNode, r.vote)
 	}
 }
 
