@@ -2980,21 +2980,6 @@ func (s *sequencingSender) SendSnapshot(_ proto.Message) {}
 
 var _ MessageSender = (*sequencingSender)(nil)
 
-// sequencingLogDB wraps testLogDB and calls a hook on each SaveState
-// for ordering verification.
-type sequencingLogDB struct {
-	*testLogDB
-	onSave func()
-}
-
-func (s *sequencingLogDB) SaveState(updates []logdb.Update) error {
-	err := s.testLogDB.SaveState(updates)
-	if s.onSave != nil {
-		s.onSave()
-	}
-	return err
-}
-
 // ---------------------------------------------------------------------------
 // clearStepCommitPending tests
 // ---------------------------------------------------------------------------

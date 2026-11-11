@@ -371,14 +371,6 @@ func (c *testCallback) getProposalFailedCalls() []proposalFailedCall {
 	return result
 }
 
-func (c *testCallback) getReadIndexBatchCalls() []readIndexBatchCall {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	result := make([]readIndexBatchCall, len(c.readIndexBatchCalls))
-	copy(result, c.readIndexBatchCalls)
-	return result
-}
-
 func (c *testCallback) getReadIndexFailedCalls() []readIndexFailedCall {
 	c.mu.Lock()
 	defer c.mu.Unlock()
