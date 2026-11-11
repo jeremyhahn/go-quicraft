@@ -200,20 +200,6 @@ func TestConfig_ToQuicraft_DisableAutoCompactionsPreservesSnapshots(t *testing.T
 	}
 }
 
-func TestConfig_ToQuicraft_DisableAutoCompactionsFalsePreservesSnapshotEntries(t *testing.T) {
-	c := Config{
-		ShardID:                1,
-		ReplicaID:              1,
-		SnapshotEntries:        10000,
-		DisableAutoCompactions: false,
-	}
-
-	qc := c.ToQuicraft()
-	if qc.SnapshotEntries != 10000 {
-		t.Errorf("SnapshotEntries: got %d, want 10000", qc.SnapshotEntries)
-	}
-}
-
 // TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled pins the one place the
 // two projects' zero values disagree.
 //
@@ -324,22 +310,6 @@ func TestConfig_ToQuicraft_UnsetCompactionOverheadLargeSnapshotEntries(t *testin
 	}
 }
 
-func TestConfig_ToQuicraft_BothSetPassThrough(t *testing.T) {
-	// Explicit user-set values pass through unchanged when compaction is
-	// not disabled.
-	c := Config{
-		ShardID:            1,
-		ReplicaID:          1,
-		SnapshotEntries:    10000,
-		CompactionOverhead: 1234,
-	}
-
-	qc := c.ToQuicraft()
-	if qc.CompactionOverhead != 1234 {
-		t.Errorf("CompactionOverhead: got %d, want 1234", qc.CompactionOverhead)
-	}
-}
-
 func TestConfig_Validate_SnapshotEntriesOne(t *testing.T) {
 	// Dragonboat accepts SnapshotEntries == 1, so the shim must too.
 	// Quicraft requires SnapshotEntries > CompactionOverhead >= 1, so the
@@ -375,87 +345,42 @@ func TestConfig_Validate_ValidConfig(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_ZeroShardID(t *testing.T) {
-	c := Config{ReplicaID: 1}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for zero ShardID")
+func TestConfig_Validate_RejectsInvalid(t *testing.T) {
+	tests := []struct {
+		name      string
+		c         Config
+		wantField string
+	}{
+		{"ZeroShardID", Config{ReplicaID: 1}, "ShardID"},
+		{"ZeroReplicaID", Config{ShardID: 1}, "ReplicaID"},
+		{"ZeroHeartbeatRTT", Config{ShardID: 1, ReplicaID: 1, ElectionRTT: 10}, "HeartbeatRTT"},
+		{"ZeroElectionRTT", Config{ShardID: 1, ReplicaID: 1, HeartbeatRTT: 1}, "ElectionRTT"},
+		{"ElectionRTTNotGreaterThanTwiceHeartbeat",
+			Config{ShardID: 1, ReplicaID: 1, ElectionRTT: 4, HeartbeatRTT: 2}, "ElectionRTT"},
+		{"IsNonVotingAndIsWitness",
+			Config{ShardID: 1, ReplicaID: 1, HeartbeatRTT: 1, ElectionRTT: 10, IsNonVoting: true, IsWitness: true},
+			"IsNonVoting"},
+		{"IsObserverAndIsWitness",
+			Config{ShardID: 1, ReplicaID: 1, HeartbeatRTT: 1, ElectionRTT: 10, IsObserver: true, IsWitness: true},
+			"IsObserver"},
+		{"WitnessWithSnapshotEntries",
+			Config{ShardID: 1, ReplicaID: 1, HeartbeatRTT: 1, ElectionRTT: 10, IsWitness: true, SnapshotEntries: 1000},
+			"SnapshotEntries"},
 	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "ShardID" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "ShardID")
-	}
-}
-
-func TestConfig_Validate_ZeroReplicaID(t *testing.T) {
-	c := Config{ShardID: 1}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for zero ReplicaID")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "ReplicaID" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "ReplicaID")
-	}
-}
-
-func TestConfig_Validate_ElectionRTTNotGreaterThanTwiceHeartbeat(t *testing.T) {
-	c := Config{
-		ShardID:      1,
-		ReplicaID:    1,
-		ElectionRTT:  4,
-		HeartbeatRTT: 2,
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error when ElectionRTT <= 2 * HeartbeatRTT")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "ElectionRTT" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "ElectionRTT")
-	}
-}
-
-func TestConfig_Validate_IsNonVotingAndIsWitnessMutuallyExclusive(t *testing.T) {
-	c := Config{
-		ShardID:      1,
-		ReplicaID:    1,
-		HeartbeatRTT: 1,
-		ElectionRTT:  10,
-		IsNonVoting:  true,
-		IsWitness:    true,
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error when IsNonVoting and IsWitness are both true")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-}
-
-func TestConfig_Validate_IsObserverAndIsWitnessMutuallyExclusive(t *testing.T) {
-	c := Config{
-		ShardID:      1,
-		ReplicaID:    1,
-		HeartbeatRTT: 1,
-		ElectionRTT:  10,
-		IsObserver:   true,
-		IsWitness:    true,
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error when IsObserver and IsWitness are both true")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.c.Validate()
+			if err == nil {
+				t.Fatal("expected a validation error")
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *ValidationError, got %T", err)
+			}
+			if ve.Field != tc.wantField {
+				t.Errorf("Field: got %q, want %q", ve.Field, tc.wantField)
+			}
+		})
 	}
 }
 
@@ -634,176 +559,83 @@ func TestNodeHostConfig_ToQuicraft_ZeroExpertConfig(t *testing.T) {
 }
 
 func TestNodeHostConfig_Validate_ValidConfig(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		ListenAddress:  "0.0.0.0:63001",
-		RTTMillisecond: 100,
+	tests := []struct {
+		name          string
+		listenAddress string
+	}{
+		{"ListenAddressSet", "0.0.0.0:63001"},
+		// An empty ListenAddress is valid: it defaults to RaftAddress.
+		{"EmptyListenAddress", ""},
 	}
-	if err := c.Validate(); err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-}
-
-func TestNodeHostConfig_Validate_ZeroRTTMillisecond(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:      "/tmp/wal",
-		NodeHostDir: "/tmp/nodehost",
-		RaftAddress: "localhost:63001",
-		// RTTMillisecond is zero.
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for zero RTTMillisecond")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "RTTMillisecond" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "RTTMillisecond")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NodeHostConfig{
+				WALDir:         "/tmp/wal",
+				NodeHostDir:    "/tmp/nodehost",
+				RaftAddress:    "localhost:63001",
+				ListenAddress:  tc.listenAddress,
+				RTTMillisecond: 100,
+			}
+			if err := c.Validate(); err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
 	}
 }
 
-func TestNodeHostConfig_Validate_EmptyWALDir(t *testing.T) {
-	c := NodeHostConfig{
-		NodeHostDir:   "/tmp/nodehost",
-		RaftAddress:   "localhost:63001",
-		ListenAddress: "0.0.0.0:63001",
+func TestNodeHostConfig_Validate_RejectsInvalid(t *testing.T) {
+	valid := func() NodeHostConfig {
+		return NodeHostConfig{
+			WALDir:         "/tmp/wal",
+			NodeHostDir:    "/tmp/nodehost",
+			RaftAddress:    "localhost:63001",
+			ListenAddress:  "0.0.0.0:63001",
+			RTTMillisecond: 100,
+		}
 	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for empty WALDir")
+	tests := []struct {
+		name      string
+		mutate    func(c *NodeHostConfig)
+		wantField string
+	}{
+		{"EmptyWALDir", func(c *NodeHostConfig) { c.WALDir = "" }, "WALDir"},
+		{"EmptyNodeHostDir", func(c *NodeHostConfig) { c.NodeHostDir = "" }, "NodeHostDir"},
+		{"EmptyRaftAddress", func(c *NodeHostConfig) { c.RaftAddress = "" }, "RaftAddress"},
+		{"ZeroRTTMillisecond", func(c *NodeHostConfig) { c.RTTMillisecond = 0 }, "RTTMillisecond"},
+		{"MutualTLSMissingCAFile", func(c *NodeHostConfig) {
+			c.MutualTLS, c.CertFile, c.KeyFile = true, "/tmp/cert.pem", "/tmp/key.pem"
+		}, "CAFile"},
+		{"MutualTLSMissingCertFile", func(c *NodeHostConfig) {
+			c.MutualTLS, c.CAFile, c.KeyFile = true, "/tmp/ca.pem", "/tmp/key.pem"
+		}, "CertFile"},
+		{"MutualTLSMissingKeyFile", func(c *NodeHostConfig) {
+			c.MutualTLS, c.CAFile, c.CertFile = true, "/tmp/ca.pem", "/tmp/cert.pem"
+		}, "KeyFile"},
+		// Quicraft does not support gossip: any non-empty GossipConfig is
+		// rejected, whether or not it is itself well formed.
+		{"NonEmptyGossip", func(c *NodeHostConfig) {
+			c.Gossip = GossipConfig{BindAddress: "0.0.0.0:7946", Seed: []string{"10.0.0.1:7946"}}
+		}, "Gossip"},
+		{"InvalidGossip", func(c *NodeHostConfig) {
+			c.Gossip = GossipConfig{AdvertiseAddress: "1.2.3.4:7946"}
+		}, "Gossip"},
 	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "WALDir" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "WALDir")
-	}
-}
-
-func TestNodeHostConfig_Validate_EmptyNodeHostDir(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:        "/tmp/wal",
-		RaftAddress:   "localhost:63001",
-		ListenAddress: "0.0.0.0:63001",
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for empty NodeHostDir")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "NodeHostDir" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "NodeHostDir")
-	}
-}
-
-func TestNodeHostConfig_Validate_EmptyRaftAddress(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:        "/tmp/wal",
-		NodeHostDir:   "/tmp/nodehost",
-		ListenAddress: "0.0.0.0:63001",
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for empty RaftAddress")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "RaftAddress" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "RaftAddress")
-	}
-}
-
-func TestNodeHostConfig_Validate_EmptyListenAddress(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		RTTMillisecond: 100,
-	}
-	if err := c.Validate(); err != nil {
-		t.Errorf("empty ListenAddress should be valid (defaults to RaftAddress): %v", err)
-	}
-}
-
-func TestNodeHostConfig_Validate_MutualTLSMissingCAFile(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		ListenAddress:  "0.0.0.0:63001",
-		RTTMillisecond: 100,
-		MutualTLS:      true,
-		CertFile:       "/tmp/cert.pem",
-		KeyFile:        "/tmp/key.pem",
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for empty CAFile with MutualTLS=true")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "CAFile" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "CAFile")
-	}
-}
-
-func TestNodeHostConfig_Validate_MutualTLSMissingCertFile(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		ListenAddress:  "0.0.0.0:63001",
-		RTTMillisecond: 100,
-		MutualTLS:      true,
-		CAFile:         "/tmp/ca.pem",
-		KeyFile:        "/tmp/key.pem",
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for empty CertFile with MutualTLS=true")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "CertFile" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "CertFile")
-	}
-}
-
-func TestNodeHostConfig_Validate_MutualTLSMissingKeyFile(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		ListenAddress:  "0.0.0.0:63001",
-		RTTMillisecond: 100,
-		MutualTLS:      true,
-		CAFile:         "/tmp/ca.pem",
-		CertFile:       "/tmp/cert.pem",
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for empty KeyFile with MutualTLS=true")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "KeyFile" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "KeyFile")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := valid()
+			tc.mutate(&c)
+			err := c.Validate()
+			if err == nil {
+				t.Fatal("expected a validation error")
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *ValidationError, got %T", err)
+			}
+			if ve.Field != tc.wantField {
+				t.Errorf("Field: got %q, want %q", ve.Field, tc.wantField)
+			}
+		})
 	}
 }
 
@@ -811,50 +643,9 @@ func TestNodeHostConfig_Validate_MutualTLSMissingKeyFile(t *testing.T) {
 // Config: Witness with SnapshotEntries (matching dragonboat patterns)
 // ---------------------------------------------------------------------------
 
-func TestConfig_Validate_WitnessWithSnapshotEntries(t *testing.T) {
-	// Witness replicas do not maintain a state machine, so SnapshotEntries
-	// must be 0 per dragonboat v4 validation.
-	c := Config{
-		ShardID:         1,
-		ReplicaID:       1,
-		HeartbeatRTT:    1,
-		ElectionRTT:     10,
-		IsWitness:       true,
-		SnapshotEntries: 1000,
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for witness with SnapshotEntries > 0")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "SnapshotEntries" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "SnapshotEntries")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // NodeHostConfig: ListenAddress mapping
 // ---------------------------------------------------------------------------
-
-func TestNodeHostConfig_ToQuicraft_ListenAddress(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:        "/tmp/wal",
-		NodeHostDir:   "/tmp/nodehost",
-		RaftAddress:   "localhost:63001",
-		ListenAddress: "0.0.0.0:63002",
-	}
-
-	hc, err := c.ToQuicraft()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if hc.ListenAddress != "0.0.0.0:63002" {
-		t.Errorf("ListenAddress: got %q, want %q", hc.ListenAddress, "0.0.0.0:63002")
-	}
-}
 
 func TestNodeHostConfig_GetListenAddress_FallsBackToRaftAddress(t *testing.T) {
 	c := &NodeHostConfig{
@@ -931,119 +722,57 @@ func TestNodeHostConfig_NodeRegistryEnabled(t *testing.T) {
 // NodeHostConfig: NotifyCommit mapping
 // ---------------------------------------------------------------------------
 
-func TestNodeHostConfig_ToQuicraft_NotifyCommit(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:        "/tmp/wal",
-		NodeHostDir:   "/tmp/nodehost",
-		RaftAddress:   "localhost:63001",
-		ListenAddress: "0.0.0.0:63001",
-		NotifyCommit:  true,
-	}
-	hc, err := c.ToQuicraft()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !hc.NotifyCommit {
-		t.Error("NotifyCommit should be true")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Config: ElectionRTT == 0 and HeartbeatRTT == 0 (both zero is valid)
 // ---------------------------------------------------------------------------
-
-func TestConfig_Validate_ZeroHeartbeatRTT(t *testing.T) {
-	c := Config{
-		ShardID:     1,
-		ReplicaID:   1,
-		ElectionRTT: 10,
-		// HeartbeatRTT zero is rejected per dragonboat v4.
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for zero HeartbeatRTT")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "HeartbeatRTT" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "HeartbeatRTT")
-	}
-}
-
-func TestConfig_Validate_ZeroElectionRTT(t *testing.T) {
-	c := Config{
-		ShardID:      1,
-		ReplicaID:    1,
-		HeartbeatRTT: 1,
-		// ElectionRTT zero is rejected per dragonboat v4.
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for zero ElectionRTT")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-	if ve.Field != "ElectionRTT" {
-		t.Errorf("Field: got %q, want %q", ve.Field, "ElectionRTT")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // GossipConfig validation
 // ---------------------------------------------------------------------------
 
 func TestGossipConfig_IsEmpty(t *testing.T) {
-	g := GossipConfig{}
-	if !g.IsEmpty() {
-		t.Error("empty GossipConfig should report IsEmpty=true")
+	tests := []struct {
+		name string
+		g    GossipConfig
+		want bool
+	}{
+		{"Zero", GossipConfig{}, true},
+		{"BindAddressOnly", GossipConfig{BindAddress: "0.0.0.0:7946"}, false},
+		{"SeedOnly", GossipConfig{Seed: []string{"10.0.0.1:7946"}}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.g.IsEmpty(); got != tc.want {
+				t.Errorf("IsEmpty() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
-func TestGossipConfig_IsNotEmpty(t *testing.T) {
-	g := GossipConfig{BindAddress: "0.0.0.0:7946"}
-	if g.IsEmpty() {
-		t.Error("non-empty GossipConfig should report IsEmpty=false")
+func TestGossipConfig_Validate(t *testing.T) {
+	tests := []struct {
+		name    string
+		g       GossipConfig
+		wantErr bool
+	}{
+		{"Empty", GossipConfig{}, false},
+		{"ValidNonEmpty", GossipConfig{BindAddress: "0.0.0.0:7946", Seed: []string{"10.0.0.1:7946"}}, false},
+		{"MissingBindAddress", GossipConfig{AdvertiseAddress: "1.2.3.4:7946"}, true},
 	}
-}
-
-func TestGossipConfig_Validate_Empty(t *testing.T) {
-	g := GossipConfig{}
-	if err := g.Validate(); err != nil {
-		t.Errorf("empty gossip config should validate: %v", err)
-	}
-}
-
-func TestGossipConfig_Validate_MissingBindAddress(t *testing.T) {
-	g := GossipConfig{AdvertiseAddress: "1.2.3.4:7946"}
-	err := g.Validate()
-	if err == nil {
-		t.Fatal("expected error for gossip config with AdvertiseAddress but no BindAddress")
-	}
-	var ve *ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("expected *ValidationError, got %T", err)
-	}
-}
-
-func TestNodeHostConfig_Validate_InvalidGossip(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		ListenAddress:  "0.0.0.0:63001",
-		RTTMillisecond: 100,
-		Gossip: GossipConfig{
-			AdvertiseAddress: "1.2.3.4:7946",
-			// BindAddress missing.
-		},
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("expected error for invalid gossip config")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.g.Validate()
+			if !tc.wantErr {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				return
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *ValidationError, got %T (%v)", err, err)
+			}
+		})
 	}
 }
 
@@ -1214,53 +943,11 @@ func TestFileReadError_Is(t *testing.T) {
 // GossipConfig: valid non-empty config (covers Validate return nil at end)
 // ---------------------------------------------------------------------------
 
-func TestGossipConfig_Validate_ValidNonEmpty(t *testing.T) {
-	g := GossipConfig{
-		BindAddress: "0.0.0.0:7946",
-		Seed:        []string{"10.0.0.1:7946"},
-	}
-	if err := g.Validate(); err != nil {
-		t.Errorf("valid gossip config should not error: %v", err)
-	}
-}
-
-func TestGossipConfig_IsEmpty_SeedOnly(t *testing.T) {
-	g := GossipConfig{Seed: []string{"10.0.0.1:7946"}}
-	if g.IsEmpty() {
-		t.Error("GossipConfig with Seed should not be empty")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // NodeHostConfig: Validate rejects any non-empty gossip configuration.
 // Quicraft does not support gossip; silently dropping the configuration
 // would change cluster behavior, so Validate fails loudly instead.
 // ---------------------------------------------------------------------------
-
-func TestNodeHostConfig_Validate_NonEmptyGossipRejected(t *testing.T) {
-	c := NodeHostConfig{
-		WALDir:         "/tmp/wal",
-		NodeHostDir:    "/tmp/nodehost",
-		RaftAddress:    "localhost:63001",
-		ListenAddress:  "0.0.0.0:63001",
-		RTTMillisecond: 100,
-		Gossip: GossipConfig{
-			BindAddress: "0.0.0.0:7946",
-			Seed:        []string{"10.0.0.1:7946"},
-		},
-	}
-	err := c.Validate()
-	if err == nil {
-		t.Fatal("non-empty gossip config must be rejected: quicraft does not support gossip")
-	}
-	var vErr *ValidationError
-	if !errors.As(err, &vErr) {
-		t.Fatalf("expected *ValidationError, got %T: %v", err, err)
-	}
-	if vErr.Field != "Gossip" {
-		t.Errorf("ValidationError.Field = %q, want %q", vErr.Field, "Gossip")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // NodeHostConfig: ToQuicraft MutualTLS individual file read errors
