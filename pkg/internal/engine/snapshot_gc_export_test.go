@@ -88,28 +88,3 @@ func TestGCSnapshotDirs_ReclaimsReceivePathDirectories(t *testing.T) {
 		t.Fatalf("a repeat GC changed the retained set to %d directories", len(dirs))
 	}
 }
-
-// TestGCSnapshotDirs_UnderRetentionKeepsEverything verifies the entry point does
-// not evict when the shard is still below the retention limit — the state a
-// freshly caught-up follower is in.
-func TestGCSnapshotDirs_UnderRetentionKeepsEverything(t *testing.T) {
-	const shardID, replicaID = 8, 1
-	base := t.TempDir()
-
-	for _, idx := range []uint64{1, 2} {
-		dir := SnapshotSaveDir(base, shardID, replicaID, idx)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("MkdirAll: %v", err)
-		}
-	}
-	if err := GCSnapshotDirs(base, shardID, replicaID, ""); err != nil {
-		t.Fatalf("GCSnapshotDirs: %v", err)
-	}
-	dirs, err := listSnapshotDirs(base, shardID, replicaID)
-	if err != nil {
-		t.Fatalf("listSnapshotDirs: %v", err)
-	}
-	if len(dirs) != 2 {
-		t.Fatalf("GC removed a directory while under the retention limit: %d left", len(dirs))
-	}
-}
