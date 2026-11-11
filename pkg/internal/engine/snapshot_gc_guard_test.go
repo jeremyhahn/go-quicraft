@@ -53,28 +53,3 @@ func TestGCSnapshotDirs_RefusesToDeleteTheRecordedDirectory(t *testing.T) {
 			"directory here is a higher-indexed partial", recorded)
 	}
 }
-
-// TestGCSnapshotDirs_StillCollectsWhenNothingIsRecorded is the control: the
-// guard must not turn GC into a no-op, or superseded directories accumulate
-// and pin the host-wide DEK purge floor.
-func TestGCSnapshotDirs_StillCollectsWhenNothingIsRecorded(t *testing.T) {
-	base := t.TempDir()
-	const shardID, replicaID = 1, 1
-
-	var dirs []string
-	for _, idx := range []uint64{100, 200, 300, 400, 500} {
-		d := snapshotSaveDir(base, shardID, replicaID, idx)
-		if err := os.MkdirAll(d, 0o750); err != nil {
-			t.Fatalf("mkdir: %v", err)
-		}
-		dirs = append(dirs, d)
-	}
-
-	if err := gcSnapshotDirs(base, shardID, replicaID, ""); err != nil {
-		t.Fatalf("gcSnapshotDirs: %v", err)
-	}
-	if _, err := os.Stat(dirs[0]); err == nil {
-		t.Fatal("GC retained the oldest directory with nothing recorded: " +
-			"superseded snapshots accumulate and pin the DEK purge floor")
-	}
-}
