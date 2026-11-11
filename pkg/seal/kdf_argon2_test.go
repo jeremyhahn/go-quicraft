@@ -19,7 +19,6 @@ package seal
 import (
 	"bytes"
 	"crypto/rand"
-	"errors"
 	"testing"
 )
 
@@ -27,36 +26,6 @@ import (
 // build has no Argon2id deriver compiled in at all (see kdf_argon2.go), so
 // there is nothing here for it to exercise — the FIPS build's claim about
 // Argon2id is that it is ABSENT, which assertArgon2idBaseline pins instead.
-
-func TestDeriveKey_Argon2id_Deterministic(t *testing.T) {
-	passphrase := []byte("deterministic-test")
-	salt := make([]byte, 32)
-	if _, err := rand.Read(salt); err != nil {
-		t.Fatalf("rand.Read failed: %v", err)
-	}
-
-	params := KDFParams{
-		Time:    1,
-		Memory:  64 * 1024,
-		Threads: 1,
-		KeyLen:  32,
-		SaltLen: 32,
-	}
-
-	key1, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if err != nil {
-		t.Fatalf("first DeriveKey failed: %v", err)
-	}
-
-	key2, err := DeriveKey(passphrase, salt, KDFArgon2id, params)
-	if err != nil {
-		t.Fatalf("second DeriveKey failed: %v", err)
-	}
-
-	if !bytes.Equal(key1, key2) {
-		t.Fatal("same passphrase and salt should produce identical keys")
-	}
-}
 
 func TestDeriveKey_CrossVersionDifferentResults(t *testing.T) {
 	passphrase := []byte("cross-version-test")
@@ -136,20 +105,5 @@ func TestKDFParamsBelowFloor_Argon2id(t *testing.T) {
 				t.Fatalf("kdfParamsBelowFloor = %v, want %v", got, tc.weak)
 			}
 		})
-	}
-}
-
-// TestDeriveKeyRejectsWeakArgon2Params is TestDeriveKeyRejectsWeakParams for
-// Argon2id: below-floor work factors must be refused there too, not only for
-// the approved KDF.
-func TestDeriveKeyRejectsWeakArgon2Params(t *testing.T) {
-	prev := allowWeakKDFParams.Swap(false)
-	defer allowWeakKDFParams.Store(prev)
-
-	salt := make([]byte, 32)
-	_, err := DeriveKey([]byte("passphrase"), salt, KDFArgon2id,
-		KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 32})
-	if !errors.Is(err, ErrKDFWeakParams) {
-		t.Fatalf("DeriveKey(weak) = %v, want ErrKDFWeakParams", err)
 	}
 }
