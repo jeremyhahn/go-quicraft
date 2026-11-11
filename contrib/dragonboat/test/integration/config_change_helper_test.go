@@ -158,31 +158,31 @@ func postDeliverySubmitted() error {
 	return &quicraft.MaybeAppliedError{Err: dragonboat.ErrShardNotReady}
 }
 
-func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsAfterSubmissionLands(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), errAlreadyExistsHere}}
-	reads := readsOf(
-		membershipOf(nil, nil, nil),
-		membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil),
-	)
-	if err := driveConfigChange(addTen(), helperBudget, attempts.attempt, reads.read); err != nil {
-		t.Fatalf("a submitted add refused as already-existing, with the voter at the requested address, must land: %v", err)
+func TestIntegration_DB_ConfigChangeRetry_RefusalAfterSubmissionLands(t *testing.T) {
+	cases := map[string]struct{ submitted, refusal error }{
+		"already-exists after post-delivery not-leader": {postDeliverySubmitted(), errAlreadyExistsHere},
+		// An ErrTimeout is produced only after delivery, so it is a submission.
+		"already-exists after timeout": {dragonboat.ErrTimeout, errAlreadyExistsHere},
+		// The caller's ConfigChangeID describes the configuration BEFORE its
+		// own change; once that change commits under a new leader, the retry
+		// is refused as stale. Only the read can say the change is the loop's
+		// own.
+		"stale ID after post-delivery not-leader": {postDeliverySubmitted(), dragonboat.ErrStaleConfigChange},
 	}
-	if attempts.calls != 2 || reads.calls != 2 {
-		t.Fatalf("attempts=%d reads=%d, want 2 and 2: the refusal is accepted on the read that confirms it", attempts.calls, reads.calls)
-	}
-}
-
-func TestIntegration_DB_ConfigChangeRetry_TimeoutIsASubmission(t *testing.T) {
-	attempts := &scriptedAttempts{errs: []error{dragonboat.ErrTimeout, errAlreadyExistsHere}}
-	reads := readsOf(
-		membershipOf(nil, nil, nil),
-		membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil),
-	)
-	if err := driveConfigChange(addTen(), helperBudget, attempts.attempt, reads.read); err != nil {
-		t.Fatalf("an ErrTimeout is produced only after delivery, so the later already-exists must land: %v", err)
-	}
-	if attempts.calls != 2 || reads.calls != 2 {
-		t.Fatalf("attempts=%d reads=%d, want 2 and 2", attempts.calls, reads.calls)
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			attempts := &scriptedAttempts{errs: []error{tc.submitted, tc.refusal}}
+			reads := readsOf(
+				membershipOf(nil, nil, nil),
+				membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil),
+			)
+			if err := driveConfigChange(addTen(), helperBudget, attempts.attempt, reads.read); err != nil {
+				t.Fatalf("a submitted add refused after delivery, with the voter at the requested address, must land: %v", err)
+			}
+			if attempts.calls != 2 || reads.calls != 2 {
+				t.Fatalf("attempts=%d reads=%d, want 2 and 2: the refusal is accepted on the read that confirms it", attempts.calls, reads.calls)
+			}
+		})
 	}
 }
 
@@ -311,23 +311,6 @@ func TestIntegration_DB_ConfigChangeRetry_DeleteStillPresentFails(t *testing.T) 
 		t.Fatal("not-found while the read still shows replica 2 as a voter: the change did not land and must not be reported as landed")
 	}
 	requireFailedWith(t, err, quicraft.ErrNodeNotFound)
-}
-
-func TestIntegration_DB_ConfigChangeRetry_StaleIDAfterSubmissionLands(t *testing.T) {
-	// The caller's ConfigChangeID describes the configuration BEFORE its own
-	// change; once that change commits under a new leader, the retry is
-	// refused as stale. Only the read can say the change is the loop's own.
-	attempts := &scriptedAttempts{errs: []error{postDeliverySubmitted(), dragonboat.ErrStaleConfigChange}}
-	reads := readsOf(
-		membershipOf(nil, nil, nil),
-		membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil),
-	)
-	if err := driveConfigChange(addTen(), helperBudget, attempts.attempt, reads.read); err != nil {
-		t.Fatalf("a submitted add refused as stale, with the voter at the requested address, must land: %v", err)
-	}
-	if attempts.calls != 2 || reads.calls != 2 {
-		t.Fatalf("attempts=%d reads=%d, want 2 and 2", attempts.calls, reads.calls)
-	}
 }
 
 func TestIntegration_DB_ConfigChangeRetry_StaleIDWithoutSubmissionFails(t *testing.T) {
