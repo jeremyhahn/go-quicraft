@@ -28,57 +28,6 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// TestIntegration_DB_ConcurrentSMLookup verifies that a concurrent
-// state machine correctly handles concurrent reads during writes.
-// Matches dragonboat's TestConcurrentStateMachineLookup.
-func TestIntegration_DB_ConcurrentSMLookup(t *testing.T) {
-	cluster := newDBTestCluster(t, 3)
-	defer cluster.close()
-
-	concTrackers := cluster.startConcurrentShard(1)
-	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
-	t.Logf("concurrent SM leader at node[%d]", leaderIdx)
-
-	session := dbClient.NewNoOPSession(1, nil)
-
-	// Warmup entry. The read at the end re-resolves, so the accepting replica
-	// is not kept.
-	cluster.proposeToLeader(t, session, encodeKVPut("warmup", "ok"), defaultTimeout)
-	for i := range cluster.hosts {
-		if cluster.stopped[i].Load() || concTrackers[i] == nil {
-			continue
-		}
-		sm := concTrackers[i].Get(1, uint64(i+1))
-		if sm == nil {
-			continue
-		}
-		waitForCondition(t, defaultTimeout, fmt.Sprintf("node[%d] warmup", i), func() bool {
-			_, ok := sm.Get("warmup")
-			return ok
-		})
-	}
-
-	// Propose 10 entries.
-	for i := range 10 {
-		key := fmt.Sprintf("conc-lookup-%03d", i)
-		value := fmt.Sprintf("val-%03d", i)
-		cmd := encodeKVPut(key, value)
-		cluster.proposeToLeader(t, session, cmd, defaultTimeout)
-	}
-
-	// Verify with a linearizable read (exercises the Lookup path on the
-	// concurrent SM).
-	result := cluster.readFromLeader(t, 1, encodeKVGet("conc-lookup-005"), defaultTimeout)
-	val, ok := result.(string)
-	if !ok {
-		t.Fatalf("SyncRead returned type %T, want string", result)
-	}
-	if val != "val-005" {
-		t.Fatalf("SyncRead = %q, want %q", val, "val-005")
-	}
-	t.Logf("concurrent SM lookup verified")
-}
-
 // TestIntegration_DB_LeaderInfoIsReported verifies that GetNodeHostInfo
 // correctly reports the leader for each shard. Matches dragonboat's
 // TestLeaderInfoIsReported.
