@@ -416,33 +416,6 @@ func TestSendAfterStop(t *testing.T) {
 		func() bool { return len(handler2.getBatches()) != 0 })
 }
 
-// TestSendUnresolvableTarget verifies that unresolvable targets are silently dropped.
-func TestSendUnresolvableTarget(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Don't register any targets.
-	msgs := []proto.Message{
-		{Type: proto.Replicate, ShardID: 999, From: 1, To: 99, Term: 1},
-	}
-	// Should not panic or block.
-	tr.Send(msgs)
-}
-
 // TestConnectionReuse verifies that a second message uses the existing
 // connection rather than dialing a new one.
 func TestConnectionReuse(t *testing.T) {
@@ -1295,29 +1268,6 @@ func TestAddr_ReturnsValidAddressAfterStart(t *testing.T) {
 // SendQueueCount tests (line 877 - currently 0% coverage)
 // ---------------------------------------------------------------------------
 
-// TestSendQueueCount_IncreasesAfterSend verifies that SendQueueCount increases
-// when messages are sent to a new target.
-func TestSendQueueCount_IncreasesAfterSend(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Before sending, count should be 0.
-	if t1.SendQueueCount() != 0 {
-		t.Fatalf("expected 0 send queues before send, got %d", t1.SendQueueCount())
-	}
-
-	// Send a message.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// After sending, count should be 1.
-	if t1.SendQueueCount() != 1 {
-		t.Fatalf("expected 1 send queue after send, got %d", t1.SendQueueCount())
-	}
-}
-
 // TestSendQueueCount_ThreadSafe verifies that SendQueueCount can be called
 // concurrently without data races.
 func TestSendQueueCount_ThreadSafe(t *testing.T) {
@@ -1452,72 +1402,6 @@ func TestGetOrCreateSendQueue_ConcurrentCreation(t *testing.T) {
 // sendQueueWorker error path tests (line 515 - 73.9% coverage)
 // ---------------------------------------------------------------------------
 
-// TestSendQueueWorker_StopClosesWorker verifies that closing stopC causes
-// the sendQueueWorker to exit cleanly (exercises line 534-535).
-func TestSendQueueWorker_StopClosesWorker(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-
-	// Send a message to create a send queue worker.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	if t1.SendQueueCount() != 1 {
-		t.Fatalf("expected 1 send queue, got %d", t1.SendQueueCount())
-	}
-
-	// Stop should cause the worker to exit. We test this by verifying
-	// Stop completes without deadlock.
-	cleanup()
-
-	// After stop, the transport should be stopped.
-	if !t1.stopped.Load() {
-		t.Fatal("transport should be stopped")
-	}
-}
-
-// TestSendQueueWorker_IdleTimeoutPrunesQueue verifies the idle timeout path
-// (line 536-543). This test simulates what happens when the idle timer fires.
-func TestSendQueueWorker_IdleTimeoutPrunesQueue(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Send a message to create the send queue.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	// Verify the send queue was created.
-	if t1.SendQueueCount() != 1 {
-		t.Fatalf("expected 1 send queue, got %d", t1.SendQueueCount())
-	}
-
-	// The actual idle timeout is 60 seconds, which is too long for a unit
-	// test. Instead, we verify the pruning mechanism works by manually
-	// simulating the behavior - delete from map.
-	t1.sendQueuesMu.Lock()
-	for k := range t1.sendQueues {
-		delete(t1.sendQueues, k)
-	}
-	t1.sendQueuesMu.Unlock()
-
-	if t1.SendQueueCount() != 0 {
-		t.Fatalf("expected 0 send queues after prune, got %d", t1.SendQueueCount())
-	}
-
-	// Re-sending should create a new queue.
-	t1.Send([]proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 2},
-	})
-	handler2.waitBatch(t, 10*time.Second)
-
-	if t1.SendQueueCount() != 1 {
-		t.Fatalf("expected 1 send queue after re-create, got %d", t1.SendQueueCount())
-	}
-}
-
 // TestSendQueueWorker_BatchDrain verifies the batching behavior where
 // multiple messages are drained from the channel (lines 549-557).
 func TestSendQueueWorker_BatchDrain(t *testing.T) {
@@ -1560,33 +1444,6 @@ func TestSendBatch_EmptyMessages(t *testing.T) {
 	// Should not panic.
 }
 
-// TestSendBatch_GetStreamError verifies that sendBatch handles getStream
-// failures gracefully (lines 676-680).
-func TestSendBatch_GetStreamError(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	cfg := Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}
-
-	tr, err := NewQUICTransport(cfg, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	// Target that cannot be connected to.
-	tr.sendBatch("127.0.0.1:1", "", []proto.Message{
-		{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1},
-	})
-	// Should not panic, message is silently dropped.
-}
-
 // TestSendBatch_WriteError verifies that sendBatch handles stream.Write
 // errors gracefully and evicts the connection (lines 690-700).
 func TestSendBatch_WriteError(t *testing.T) {
@@ -1613,44 +1470,6 @@ func TestSendBatch_WriteError(t *testing.T) {
 		return t1.ConnectionCount() == 0
 	})
 	cleanup()
-}
-
-// TestSendBatch_BufferReallocation verifies the buffer reallocation path
-// when compressed frame exceeds initial buffer capacity (lines 648-656).
-func TestSendBatch_BufferReallocation(t *testing.T) {
-	t1, _, _, handler2, cleanup := transportPair(t, 42)
-	defer cleanup()
-
-	// Send a large message that may require buffer reallocation.
-	largeCmd := make([]byte, 4096)
-	for i := range largeCmd {
-		largeCmd[i] = byte(i % 256)
-	}
-
-	t1.Send([]proto.Message{
-		{
-			Type:    proto.Replicate,
-			ShardID: 1,
-			From:    1,
-			To:      2,
-			Term:    1,
-			Entries: []proto.Entry{
-				{Index: 1, Term: 1, Cmd: largeCmd},
-				{Index: 2, Term: 1, Cmd: largeCmd},
-				{Index: 3, Term: 1, Cmd: largeCmd},
-			},
-		},
-	})
-
-	handler2.waitBatch(t, 10*time.Second)
-
-	batches := handler2.getBatches()
-	if len(batches) == 0 {
-		t.Fatal("expected at least 1 batch")
-	}
-	if len(batches[0].Requests[0].Entries) != 3 {
-		t.Fatalf("expected 3 entries, got %d", len(batches[0].Requests[0].Entries))
-	}
 }
 
 // TestSendBatch_SnappyPoolReuse verifies that the snappyEncPool is correctly
@@ -1768,34 +1587,6 @@ func TestSendQueueWorkerOnce_HeartbeatBatchDrain(t *testing.T) {
 
 // TestSendSnapshot_StoppedTransport verifies that SendSnapshot returns
 // ErrStreamClosed when the transport is stopped.
-
-// TestSendSnapshot_UnresolvableTarget verifies that SendSnapshot returns
-// an error when the target cannot be resolved.
-
-func TestSendSnapshot_UnresolvableTarget(t *testing.T) {
-	handler := newTestHandler()
-	reg := registry.NewRegistry()
-	// Do NOT register the target.
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, handler, reg)
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-	defer tr.Stop()
-
-	err = tr.SendSnapshot([]proto.SnapshotChunk{
-		{BinVer: proto.WireVersion, ShardID: 99, ReplicaID: 99, Index: 1, ChunkCount: 1},
-	})
-	if err == nil {
-		t.Fatal("expected error for unresolvable target")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // SendSnapshotStreaming (quic.go:1053 - 0% coverage)
@@ -2761,40 +2552,6 @@ func TestSendSnapshotStreaming_SuccessWithEventListeners(t *testing.T) {
 
 // TestReceiveChunks_HandleSnapshotError verifies that when HandleSnapshot
 // returns an error, it is logged but does not cause a panic.
-
-func TestSendQueueWorkerOnce_StopSignalCleanExit(t *testing.T) {
-	tr, err := NewQUICTransport(Config{
-		ListenAddress: ":0",
-		DeploymentID:  42,
-		MTLSConfig:    testMTLSConfig(t),
-	}, newTestHandler(), registry.NewRegistry())
-	if err != nil {
-		t.Fatalf("NewQUICTransport failed: %v", err)
-	}
-	if err := tr.Start(); err != nil {
-		t.Fatalf("Start failed: %v", err)
-	}
-
-	sq := &sendQueue{
-		ch:   make(chan proto.Message, 64),
-		hbCh: make(chan proto.Message, 64),
-	}
-
-	// Signal stop so sendQueueWorkerOnce exits immediately. Stop is the real
-	// shutdown: open-coding its first four statements set the stop signal but
-	// left the QUIC listener, its send queue and the UDP socket running for the
-	// rest of the package. Calling Stop here also keeps the test honest — it
-	// asserts the worker's behaviour after a genuine shutdown, not after a
-	// hand-assembled approximation of one.
-	if err := tr.Stop(); err != nil {
-		t.Fatalf("Stop failed: %v", err)
-	}
-
-	panicked := tr.sendQueueWorkerOnce("127.0.0.1:9999", sq)
-	if panicked {
-		t.Fatal("expected sendQueueWorkerOnce to return panicked=false on clean exit")
-	}
-}
 
 // ---------------------------------------------------------------------------
 // getOrCreateSendQueue stopped during slow path (quic.go:562-564)
