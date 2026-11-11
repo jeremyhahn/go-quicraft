@@ -34,33 +34,29 @@ import (
 // TestFIPSBuildKeepsWithParamsConstructor pins both halves of the contract: the
 // symbol is present (this file compiles), and calling it fails closed with the
 // same error the absent Argon2id deriver gives everywhere else in a FIPS build.
+//
+// It also guards the ORDER of the refusal. Work factors are meaningless in a
+// build with no Argon2id, so the answer must not depend on them: a caller
+// passing production-grade parameters and one passing near-trivial ones get the
+// identical error, and neither is told that some parameter choice would have
+// worked.
 func TestFIPSBuildKeepsWithParamsConstructor(t *testing.T) {
-	s, err := seal.NewSoftwareStrategyWithParams(context.Background(), []byte("a-passphrase-long-enough-to-not-warn"), 4, 128*1024, 4)
-	if !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
-		t.Fatalf("NewSoftwareStrategyWithParams in a FIPS build = %v, want ErrKDFUnsupportedVersion", err)
-	}
-	if s != nil {
-		t.Fatal("a refused constructor returned a strategy; nothing usable may escape a failed FIPS refusal")
-	}
-}
-
-// TestFIPSBuildRefusesWithParamsBeforeValidation guards the ORDER of the
-// refusal. Work factors are meaningless in a build with no Argon2id, so the
-// answer must not depend on them: a caller passing production-grade parameters
-// and one passing near-trivial ones get the identical error, and neither is
-// told that some parameter choice would have worked.
-func TestFIPSBuildRefusesWithParamsBeforeValidation(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		time, memory uint32
 		threads      uint8
 	}{
+		{"production grade", 4, 128 * 1024, 4},
 		{"below every floor", 1, 1, 1},
 		{"zero", 0, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := seal.NewSoftwareStrategyWithParams(context.Background(), []byte("a-passphrase-long-enough-to-not-warn"), tc.time, tc.memory, tc.threads); !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
-				t.Fatalf("NewSoftwareStrategyWithParams(%d, %d, %d) = %v, want ErrKDFUnsupportedVersion", tc.time, tc.memory, tc.threads, err)
+			s, err := seal.NewSoftwareStrategyWithParams(context.Background(), []byte("a-passphrase-long-enough-to-not-warn"), tc.time, tc.memory, tc.threads)
+			if !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
+				t.Fatalf("NewSoftwareStrategyWithParams(%d, %d, %d) in a FIPS build = %v, want ErrKDFUnsupportedVersion", tc.time, tc.memory, tc.threads, err)
+			}
+			if s != nil {
+				t.Fatal("a refused constructor returned a strategy; nothing usable may escape a failed FIPS refusal")
 			}
 		})
 	}
@@ -79,13 +75,28 @@ func TestFIPSBuildRefusesWithParamsBeforeValidation(t *testing.T) {
 // removed the symbol from FIPS builds entirely. That would break every consumer
 // that merely MENTIONS the call, including one whose use is already guarded by
 // its own runtime FIPS check.
+//
+// The refusal ORDER is guarded exactly as for its bound sibling above: with no
+// Argon2id deriver the work factors are meaningless, so no parameter choice may
+// change the answer or hint that some other choice would have worked.
 func TestFIPSBuildKeepsDeferredWithParamsConstructor(t *testing.T) {
-	s, err := seal.NewDeferredSoftwareStrategyWithParams(seal.KDFArgon2id, seal.DefaultKDFParams())
-	if !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
-		t.Fatalf("NewDeferredSoftwareStrategyWithParams(Argon2id) in a FIPS build = %v, want ErrKDFUnsupportedVersion", err)
-	}
-	if s != nil {
-		t.Fatal("a refused constructor returned a strategy; nothing usable may escape a failed FIPS refusal")
+	for _, tc := range []struct {
+		name   string
+		params seal.KDFParams
+	}{
+		{"defaults", seal.DefaultKDFParams()},
+		{"below every floor", seal.KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 1, SaltLen: 1}},
+		{"zero", seal.KDFParams{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := seal.NewDeferredSoftwareStrategyWithParams(seal.KDFArgon2id, tc.params)
+			if !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
+				t.Fatalf("NewDeferredSoftwareStrategyWithParams(Argon2id, %+v) in a FIPS build = %v, want ErrKDFUnsupportedVersion", tc.params, err)
+			}
+			if s != nil {
+				t.Fatal("a refused constructor returned a strategy; nothing usable may escape a failed FIPS refusal")
+			}
+		})
 	}
 }
 
@@ -120,25 +131,5 @@ func TestFIPSBuildAcceptsDeferredWithParamsPBKDF2(t *testing.T) {
 	}
 	if !s.DeferredPassphrase() {
 		t.Fatal("the strategy is bound; the barrier would stop authenticating its unsealer")
-	}
-}
-
-// TestFIPSBuildRefusesDeferredWithParamsBeforeValidation guards the refusal ORDER
-// for the deferred constructor, exactly as its bound sibling above does: with no
-// Argon2id deriver the work factors are meaningless, so no parameter choice may
-// change the answer or hint that some other choice would have worked.
-func TestFIPSBuildRefusesDeferredWithParamsBeforeValidation(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		params seal.KDFParams
-	}{
-		{"below every floor", seal.KDFParams{Time: 1, Memory: 1, Threads: 1, KeyLen: 1, SaltLen: 1}},
-		{"zero", seal.KDFParams{}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := seal.NewDeferredSoftwareStrategyWithParams(seal.KDFArgon2id, tc.params); !errors.Is(err, seal.ErrKDFUnsupportedVersion) {
-				t.Fatalf("NewDeferredSoftwareStrategyWithParams(Argon2id, %+v) = %v, want ErrKDFUnsupportedVersion", tc.params, err)
-			}
-		})
 	}
 }
