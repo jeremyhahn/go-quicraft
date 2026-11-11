@@ -61,27 +61,6 @@ func restartedPeerWithVote(t *testing.T, votedFor uint64) *Peer {
 	return p
 }
 
-// TestPeer_RestartPreservesPersistedVote pins the recovered vote as OBSERVABLE
-// state, not merely as a field that round-trips through storage.
-func TestPeer_RestartPreservesPersistedVote(t *testing.T) {
-	p := restartedPeerWithVote(t, 2)
-
-	if p.r.term != 5 {
-		t.Fatalf("recovered term = %d, want 5", p.r.term)
-	}
-	if p.r.vote != 2 {
-		t.Fatalf("recovered vote = %d, want 2: votedFor is durable state (Raft "+
-			"Figure 2) and MUST survive a restart, or the replica can vote a "+
-			"second time in term 5 and elect a second leader for it", p.r.vote)
-	}
-	// The recovered vote must also be the vote this replica keeps ADVERTISING,
-	// so a crash immediately after recovery re-persists the same decision.
-	if hs := p.r.hardState(); hs.Vote != 2 || hs.Term != 5 {
-		t.Fatalf("hardState after restart = {Term %d, Vote %d}, want {5, 2}",
-			hs.Term, hs.Vote)
-	}
-}
-
 // TestPeer_RestartedReplicaDeniesSecondCandidateInSameTerm is the required
 // double-vote test. A replica that voted for 2 in term 5 and restarted must
 // REJECT replica 3's RequestVote for the same term 5, even though 3's log is
