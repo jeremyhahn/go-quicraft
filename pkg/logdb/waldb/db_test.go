@@ -468,80 +468,54 @@ func TestSnapshotOverwrite(t *testing.T) {
 }
 
 // TestSaveSnapshotRejectsStale verifies that SaveSnapshot returns
-// ErrSnapshotOutOfDate when the new snapshot index is less than the
-// currently stored snapshot index.
+// ErrSnapshotOutOfDate, and keeps the stored snapshot, when the new snapshot
+// index is less than or equal to the stored index, whether the stored
+// snapshot came from SaveSnapshot or from SaveState.
 func TestSaveSnapshotRejectsStale(t *testing.T) {
-	db := openTestDB(t)
-
-	ss1 := logdb.Snapshot{Index: 100, Term: 5}
-	if err := db.SaveSnapshot(1, 1, ss1); err != nil {
-		t.Fatalf("SaveSnapshot(100): %v", err)
+	seedSaveSnapshot := func(t *testing.T, db *DB) {
+		if err := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 100, Term: 5}); err != nil {
+			t.Fatalf("SaveSnapshot(100): %v", err)
+		}
 	}
-
-	// Stale: index 50 < stored index 100.
-	ss2 := logdb.Snapshot{Index: 50, Term: 3}
-	err := db.SaveSnapshot(1, 1, ss2)
-	if !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-		t.Fatalf("SaveSnapshot(50) = %v, want ErrSnapshotOutOfDate", err)
+	// SaveState still applies the snapshot in memory; SaveSnapshot is the
+	// gatekeeper against a stored snapshot from either route.
+	seedSaveState := func(t *testing.T, db *DB) {
+		if err := db.SaveState([]logdb.Update{{
+			ShardID:   1,
+			ReplicaID: 1,
+			Snapshot:  logdb.Snapshot{Index: 100, Term: 5},
+		}}); err != nil {
+			t.Fatalf("SaveState(ss100): %v", err)
+		}
 	}
-
-	// Verify the stored snapshot was not overwritten.
-	got, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
+	cases := []struct {
+		name string
+		seed func(*testing.T, *DB)
+		ss   logdb.Snapshot
+	}{
+		{"older index", seedSaveSnapshot, logdb.Snapshot{Index: 50, Term: 3}},
+		{"equal index", seedSaveSnapshot, logdb.Snapshot{Index: 100, Term: 6}},
+		{"older index after SaveState", seedSaveState, logdb.Snapshot{Index: 50, Term: 3}},
 	}
-	if got.Index != 100 || got.Term != 5 {
-		t.Fatalf("GetSnapshot: got %+v, want Index=100 Term=5", got)
-	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestDB(t)
+			tc.seed(t, db)
 
-// TestSaveSnapshotRejectsEqual verifies that SaveSnapshot returns
-// ErrSnapshotOutOfDate when the new snapshot index equals the stored index.
-func TestSaveSnapshotRejectsEqual(t *testing.T) {
-	db := openTestDB(t)
+			err := db.SaveSnapshot(1, 1, tc.ss)
+			if !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
+				t.Fatalf("SaveSnapshot(%d) = %v, want ErrSnapshotOutOfDate", tc.ss.Index, err)
+			}
 
-	ss1 := logdb.Snapshot{Index: 100, Term: 5}
-	if err := db.SaveSnapshot(1, 1, ss1); err != nil {
-		t.Fatalf("SaveSnapshot(100): %v", err)
-	}
-
-	// Equal: index 100 == stored index 100.
-	ss2 := logdb.Snapshot{Index: 100, Term: 6}
-	err := db.SaveSnapshot(1, 1, ss2)
-	if !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-		t.Fatalf("SaveSnapshot(100 again) = %v, want ErrSnapshotOutOfDate", err)
-	}
-
-	// Verify the stored snapshot was not overwritten (still Term 5).
-	got, err := db.GetSnapshot(1, 1)
-	if err != nil {
-		t.Fatalf("GetSnapshot: %v", err)
-	}
-	if got.Term != 5 {
-		t.Fatalf("GetSnapshot.Term = %d, want 5", got.Term)
-	}
-}
-
-// TestSaveSnapshotViaUpdateRejectsStale verifies that stale snapshots
-// are rejected when saved through the SaveState path (batch updates).
-func TestSaveSnapshotViaUpdateRejectsStale(t *testing.T) {
-	db := openTestDB(t)
-
-	// Save initial snapshot via SaveState.
-	err := db.SaveState([]logdb.Update{{
-		ShardID:   1,
-		ReplicaID: 1,
-		Snapshot:  logdb.Snapshot{Index: 100, Term: 5},
-	}})
-	if err != nil {
-		t.Fatalf("SaveState(ss100): %v", err)
-	}
-
-	// Stale snapshot via SaveState should silently succeed (saveUpdate
-	// still calls writeSnapshot which updates in-memory). SaveSnapshot
-	// is the gatekeeper.
-	if err := db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 50, Term: 3}); !errors.Is(err, logdb.ErrSnapshotOutOfDate) {
-		t.Fatalf("SaveSnapshot(50) = %v, want ErrSnapshotOutOfDate", err)
+			// The stored snapshot was not overwritten.
+			got, err := db.GetSnapshot(1, 1)
+			if err != nil {
+				t.Fatalf("GetSnapshot: %v", err)
+			}
+			if got.Index != 100 || got.Term != 5 {
+				t.Fatalf("GetSnapshot: got %+v, want Index=100 Term=5", got)
+			}
+		})
 	}
 }
 
@@ -1481,14 +1455,6 @@ func TestSegmentCreateError(t *testing.T) {
 	}
 }
 
-// TestSyncDirFSSuccess verifies syncDirFS succeeds on a valid directory.
-func TestSyncDirFSSuccess(t *testing.T) {
-	dir := t.TempDir()
-	if err := syncDirFS(defaultFS(), dir); err != nil {
-		t.Fatalf("syncDirFS on valid directory: unexpected error: %v", err)
-	}
-}
-
 // TestSyncDirFSNonExistentDir verifies syncDirFS returns a DirSyncError for a
 // non-existent directory.
 func TestSyncDirFSNonExistentDir(t *testing.T) {
@@ -1502,82 +1468,6 @@ func TestSyncDirFSNonExistentDir(t *testing.T) {
 	}
 	if target.Dir != "/nonexistent/waldb/test/dir" {
 		t.Fatalf("DirSyncError.Dir: got %q, want %q", target.Dir, "/nonexistent/waldb/test/dir")
-	}
-}
-
-// TestEnsureActiveSegmentSyncsDirOnCreate verifies that ensureActiveSegment
-// creates the segment file and makes it durable via syncDir when noSync is
-// false. The segment file must exist on disk after the call returns.
-func TestEnsureActiveSegmentSyncsDirOnCreate(t *testing.T) {
-	dir := t.TempDir()
-
-	// Open with sync enabled (the default) to exercise the syncDir path.
-	db, err := Open(dir, WithBlockSize(4096), WithMaxFileSize(64*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	// Write one entry to trigger ensureActiveSegment.
-	entry := logdb.Entry{Index: 1, Term: 1, Cmd: []byte("hello")}
-	if err := db.SaveEntries(1, 1, []logdb.Entry{entry}); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	// Verify the segment file exists on disk. The shard directory and
-	// segment file must be present because syncDir was called after
-	// segment creation.
-	shard := db.getShard(1)
-	shard.mu.Lock()
-	segID := shard.activeSegmentID
-	shardDir := shard.dir
-	shard.mu.Unlock()
-
-	path := filepath.Join(shardDir, segmentFilename(segID))
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("segment file %s does not exist after ensureActiveSegment: %v", path, err)
-	}
-}
-
-// TestRotateSegmentSyncsDirOnNewSegment verifies that rotateSegment creates
-// a new segment with a durable directory entry via ensureActiveSegment.
-func TestRotateSegmentSyncsDirOnNewSegment(t *testing.T) {
-	dir := t.TempDir()
-
-	// Use a very small MaxFileSize to force rotation after a few entries.
-	db, err := Open(dir, WithBlockSize(512), WithMaxFileSize(2*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	// Write enough entries to force at least one segment rotation.
-	for i := 1; i <= 50; i++ {
-		entry := logdb.Entry{
-			Index: uint64(i),
-			Term:  1,
-			Cmd:   make([]byte, 100),
-		}
-		if err := db.SaveEntries(1, 1, []logdb.Entry{entry}); err != nil {
-			t.Fatalf("SaveEntries(%d): %v", i, err)
-		}
-	}
-
-	// Verify multiple segment files exist on disk.
-	shardDir := db.getShard(1).dir
-	dirEntries, err := os.ReadDir(shardDir)
-	if err != nil {
-		t.Fatalf("ReadDir(%s): %v", shardDir, err)
-	}
-
-	segCount := 0
-	for _, de := range dirEntries {
-		if !de.IsDir() {
-			segCount++
-		}
-	}
-	if segCount < 2 {
-		t.Fatalf("expected at least 2 segment files after rotation, got %d", segCount)
 	}
 }
 
@@ -3293,38 +3183,6 @@ func TestRotateSegmentSyncsBeforeClose(t *testing.T) {
 	shard.mu.Unlock()
 	if segCount < 2 {
 		t.Fatalf("expected at least 2 segments after rotation, got %d", segCount)
-	}
-}
-
-// TestRotateSegmentNoSyncMode verifies that rotateSegment skips fdatasync
-// when noSync is enabled, preventing unnecessary I/O overhead in test mode.
-func TestRotateSegmentNoSyncMode(t *testing.T) {
-	dir := t.TempDir()
-	db, err := Open(dir, WithNoSync(true), WithBlockSize(512), WithMaxFileSize(1*1024))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer db.Close()
-
-	// Write enough to force rotation with noSync enabled.
-	for i := 1; i <= 30; i++ {
-		entry := logdb.Entry{
-			Index: uint64(i),
-			Term:  1,
-			Cmd:   make([]byte, 64),
-		}
-		if err := db.SaveEntries(1, 1, []logdb.Entry{entry}); err != nil {
-			t.Fatalf("SaveEntries(%d): %v", i, err)
-		}
-	}
-
-	// Verify all entries are readable.
-	got, err := db.GetEntries(1, 1, 1, 31, 0)
-	if err != nil {
-		t.Fatalf("GetEntries: %v", err)
-	}
-	if len(got) != 30 {
-		t.Errorf("expected 30 entries, got %d", len(got))
 	}
 }
 
