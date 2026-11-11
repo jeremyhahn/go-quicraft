@@ -19,57 +19,46 @@ import (
 	"testing"
 )
 
-// TestNewIndexIsEmpty verifies that a newly created index has zero length.
-func TestNewIndexIsEmpty(t *testing.T) {
+// TestEmptyIndex checks every accessor of a new index, and that an empty
+// Append and a Compact leave it empty.
+func TestEmptyIndex(t *testing.T) {
 	idx := newIndex()
 	if idx.Len() != 0 {
 		t.Fatalf("Len: got %d, want 0", idx.Len())
 	}
-}
-
-// TestNewIndexFirstAndLastReturnFalse verifies First and Last on empty index.
-func TestNewIndexFirstAndLastReturnFalse(t *testing.T) {
-	idx := newIndex()
 	if _, ok := idx.First(); ok {
 		t.Fatal("First: got ok=true on empty index, want false")
 	}
 	if _, ok := idx.Last(); ok {
 		t.Fatal("Last: got ok=true on empty index, want false")
 	}
-}
-
-// TestAppendSingleEntry verifies appending a single entry.
-func TestAppendSingleEntry(t *testing.T) {
-	idx := newIndex()
-	e := indexEntry{Index: 1, Term: 1, SegmentID: 0, Offset: 0, Size: 64}
-	idx.Append(e)
-
-	if idx.Len() != 1 {
-		t.Fatalf("Len: got %d, want 1", idx.Len())
+	if result := idx.Range(1, 10); result != nil {
+		t.Fatalf("Range(1,10) on empty: got %d entries, want nil", len(result))
 	}
-	got, ok := idx.Lookup(1)
-	if !ok {
-		t.Fatal("Lookup(1): not found")
+	if segs := idx.AllSegmentIDs(); len(segs) != 0 {
+		t.Fatalf("AllSegmentIDs on empty: got %d, want 0", len(segs))
 	}
-	if got.Index != 1 || got.Term != 1 {
-		t.Fatalf("Lookup(1): got %+v, want Index=1 Term=1", got)
-	}
-}
-
-// TestAppendEmptyIsNoOp verifies appending zero entries is a no-op.
-func TestAppendEmptyIsNoOp(t *testing.T) {
-	idx := newIndex()
 	idx.Append()
+	idx.Compact(100)
 	if idx.Len() != 0 {
-		t.Fatalf("Len after empty Append: got %d, want 0", idx.Len())
+		t.Fatalf("Len after empty Append and Compact: got %d, want 0", idx.Len())
 	}
 }
 
-// TestAppendMultipleEntries verifies appending several entries in order.
+// TestAppendMultipleEntries checks a batch Append followed by single Appends
+// grows the index in order, with First and Last at the ends.
 func TestAppendMultipleEntries(t *testing.T) {
 	idx := newIndex()
-	for i := uint64(1); i <= 10; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1, SegmentID: 0, Offset: int64(i * 64), Size: 64})
+	idx.Append(
+		indexEntry{Index: 1, Term: 1},
+		indexEntry{Index: 2, Term: 2},
+		indexEntry{Index: 3, Term: 3},
+	)
+	if idx.Len() != 3 {
+		t.Fatalf("Len after batch Append: got %d, want 3", idx.Len())
+	}
+	for i := uint64(4); i <= 10; i++ {
+		idx.Append(indexEntry{Index: i, Term: i, SegmentID: 0, Offset: int64(i * 64), Size: 64})
 	}
 
 	if idx.Len() != 10 {
@@ -77,83 +66,59 @@ func TestAppendMultipleEntries(t *testing.T) {
 	}
 
 	first, ok := idx.First()
-	if !ok || first.Index != 1 {
-		t.Fatalf("First: got %+v, ok=%v, want Index=1", first, ok)
+	if !ok || first.Index != 1 || first.Term != 1 {
+		t.Fatalf("First: got %+v, ok=%v, want Index=1 Term=1", first, ok)
 	}
 	last, ok := idx.Last()
-	if !ok || last.Index != 10 {
-		t.Fatalf("Last: got %+v, ok=%v, want Index=10", last, ok)
+	if !ok || last.Index != 10 || last.Term != 10 {
+		t.Fatalf("Last: got %+v, ok=%v, want Index=10 Term=10", last, ok)
 	}
 }
 
-// TestAppendBatchEntries verifies appending multiple entries in a single call.
-func TestAppendBatchEntries(t *testing.T) {
-	idx := newIndex()
-	entries := []indexEntry{
-		{Index: 1, Term: 1},
-		{Index: 2, Term: 1},
-		{Index: 3, Term: 1},
-	}
-	idx.Append(entries...)
-
-	if idx.Len() != 3 {
-		t.Fatalf("Len: got %d, want 3", idx.Len())
-	}
-}
-
-// TestAppendOverwriteTruncates verifies that appending an entry with an
-// index that already exists truncates entries from that point onward.
+// TestAppendOverwriteTruncates checks an Append at or below the last index
+// replaces that entry and drops every entry after it.
 func TestAppendOverwriteTruncates(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 5; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1})
+	tests := []struct {
+		name    string
+		at      uint64
+		wantLen int
+	}{
+		{"middle", 3, 3},
+		{"first", 1, 1},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := newIndex()
+			for i := uint64(1); i <= 5; i++ {
+				idx.Append(indexEntry{Index: i, Term: 1})
+			}
 
-	// Overwrite from index 3 with a new term.
-	idx.Append(indexEntry{Index: 3, Term: 2})
+			idx.Append(indexEntry{Index: tc.at, Term: 2})
 
-	if idx.Len() != 3 {
-		t.Fatalf("Len after overwrite: got %d, want 3", idx.Len())
-	}
-
-	// Index 3 should have term 2.
-	e, ok := idx.Lookup(3)
-	if !ok || e.Term != 2 {
-		t.Fatalf("Lookup(3) after overwrite: got %+v ok=%v, want Term=2", e, ok)
-	}
-
-	// Index 4 and 5 should no longer exist.
-	if _, ok := idx.Lookup(4); ok {
-		t.Fatal("Lookup(4): should not exist after truncation")
-	}
-	if _, ok := idx.Lookup(5); ok {
-		t.Fatal("Lookup(5): should not exist after truncation")
-	}
-}
-
-// TestAppendOverwriteAtFirst verifies overwrite at the very first index.
-func TestAppendOverwriteAtFirst(t *testing.T) {
-	idx := newIndex()
-	idx.Append(indexEntry{Index: 1, Term: 1})
-	idx.Append(indexEntry{Index: 2, Term: 1})
-	idx.Append(indexEntry{Index: 3, Term: 1})
-
-	// Overwrite from the beginning.
-	idx.Append(indexEntry{Index: 1, Term: 5})
-	if idx.Len() != 1 {
-		t.Fatalf("Len: got %d, want 1", idx.Len())
-	}
-	e, ok := idx.Lookup(1)
-	if !ok || e.Term != 5 {
-		t.Fatalf("Lookup(1): got %+v ok=%v, want Term=5", e, ok)
+			if idx.Len() != tc.wantLen {
+				t.Fatalf("Len after overwrite: got %d, want %d", idx.Len(), tc.wantLen)
+			}
+			e, ok := idx.Lookup(tc.at)
+			if !ok || e.Term != 2 {
+				t.Fatalf("Lookup(%d) after overwrite: got %+v ok=%v, want Term=2", tc.at, e, ok)
+			}
+			for i := tc.at + 1; i <= 5; i++ {
+				if _, ok := idx.Lookup(i); ok {
+					t.Fatalf("Lookup(%d): should not exist after truncation", i)
+				}
+			}
+		})
 	}
 }
 
-// TestLookupExisting verifies lookup of an existing entry by index.
+// TestLookupExisting checks Lookup returns every field of the stored entry.
 func TestLookupExisting(t *testing.T) {
 	idx := newIndex()
 	idx.Append(indexEntry{Index: 10, Term: 3, SegmentID: 2, Offset: 100, Size: 50})
 
+	if idx.Len() != 1 {
+		t.Fatalf("Len: got %d, want 1", idx.Len())
+	}
 	e, ok := idx.Lookup(10)
 	if !ok {
 		t.Fatal("Lookup(10): not found")
@@ -163,81 +128,61 @@ func TestLookupExisting(t *testing.T) {
 	}
 }
 
-// TestLookupNonExistent verifies that lookup returns false for missing entries.
+// TestLookupNonExistent checks Lookup misses a gap, and indexes below and
+// above the stored range.
 func TestLookupNonExistent(t *testing.T) {
 	idx := newIndex()
 	idx.Append(indexEntry{Index: 1, Term: 1})
 	idx.Append(indexEntry{Index: 3, Term: 1})
 
-	if _, ok := idx.Lookup(2); ok {
-		t.Fatal("Lookup(2): found non-existent entry")
-	}
-	if _, ok := idx.Lookup(0); ok {
-		t.Fatal("Lookup(0): found non-existent entry")
-	}
-	if _, ok := idx.Lookup(100); ok {
-		t.Fatal("Lookup(100): found non-existent entry")
-	}
-}
-
-// TestRangeSubset verifies Range returns only entries in [low, high).
-func TestRangeSubset(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 10; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1})
-	}
-
-	result := idx.Range(3, 7)
-	if len(result) != 4 {
-		t.Fatalf("Range(3,7): got %d entries, want 4", len(result))
-	}
-	for i, e := range result {
-		expected := uint64(i + 3)
-		if e.Index != expected {
-			t.Fatalf("Range(3,7)[%d]: got Index=%d, want %d", i, e.Index, expected)
+	for _, i := range []uint64{2, 0, 100} {
+		if _, ok := idx.Lookup(i); ok {
+			t.Fatalf("Lookup(%d): found non-existent entry", i)
 		}
 	}
 }
 
-// TestRangeEmptyResult verifies Range returns nil for non-overlapping ranges.
-func TestRangeEmptyResult(t *testing.T) {
+// TestRange checks Range returns the entries in [low, high), and nil for a
+// window outside the stored range or an empty or inverted window.
+func TestRange(t *testing.T) {
 	idx := newIndex()
 	for i := uint64(5); i <= 10; i++ {
 		idx.Append(indexEntry{Index: i, Term: 1})
 	}
-
-	if result := idx.Range(1, 5); result != nil {
-		t.Fatalf("Range(1,5): got %d entries, want nil", len(result))
+	tests := []struct {
+		name      string
+		low, high uint64
+		want      []uint64
+	}{
+		{"subset", 6, 9, []uint64{6, 7, 8}},
+		{"below first", 1, 5, nil},
+		{"above last", 11, 20, nil},
+		{"inverted", 9, 6, nil},
+		{"empty window", 6, 6, nil},
 	}
-	if result := idx.Range(11, 20); result != nil {
-		t.Fatalf("Range(11,20): got %d entries, want nil", len(result))
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := idx.Range(tc.low, tc.high)
+			if tc.want == nil {
+				if result != nil {
+					t.Fatalf("Range(%d,%d): got %d entries, want nil", tc.low, tc.high, len(result))
+				}
+				return
+			}
+			if len(result) != len(tc.want) {
+				t.Fatalf("Range(%d,%d): got %d entries, want %d", tc.low, tc.high, len(result), len(tc.want))
+			}
+			for i, e := range result {
+				if e.Index != tc.want[i] {
+					t.Fatalf("Range(%d,%d)[%d]: got Index=%d, want %d", tc.low, tc.high, i, e.Index, tc.want[i])
+				}
+			}
+		})
 	}
 }
 
-// TestRangeInvalidBounds verifies Range returns nil when low >= high.
-func TestRangeInvalidBounds(t *testing.T) {
-	idx := newIndex()
-	idx.Append(indexEntry{Index: 1, Term: 1})
-
-	if result := idx.Range(5, 3); result != nil {
-		t.Fatalf("Range(5,3): got %d entries, want nil", len(result))
-	}
-	if result := idx.Range(1, 1); result != nil {
-		t.Fatalf("Range(1,1): got %d entries, want nil", len(result))
-	}
-}
-
-// TestRangeOnEmptyIndex verifies Range on empty index returns nil.
-func TestRangeOnEmptyIndex(t *testing.T) {
-	idx := newIndex()
-	if result := idx.Range(1, 10); result != nil {
-		t.Fatalf("Range(1,10) on empty: got %d entries, want nil", len(result))
-	}
-}
-
-// TestRangeReturnsCopy verifies that the returned slice is an independent
-// copy that does not alias internal state. Mutating the result must not
-// affect the index.
+// TestRangeReturnsCopy verifies that mutating the slice returned by Range
+// does not affect the index's internal state.
 func TestRangeReturnsCopy(t *testing.T) {
 	idx := newIndex()
 	idx.Append(indexEntry{Index: 1, Term: 1})
@@ -260,72 +205,53 @@ func TestRangeReturnsCopy(t *testing.T) {
 	}
 }
 
-// TestCompactRemovesEntriesUpTo verifies Compact removes all entries <= upTo.
-func TestCompactRemovesEntriesUpTo(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 10; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1})
+// TestCompact checks Compact(upTo) drops every entry at or below upTo and
+// keeps the rest, with First and Last at the ends of what remains.
+func TestCompact(t *testing.T) {
+	tests := []struct {
+		name string
+		upTo uint64
+	}{
+		{"none", 0},
+		{"partial", 7},
+		{"past last", 15},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := newIndex()
+			for i := uint64(1); i <= 10; i++ {
+				idx.Append(indexEntry{Index: i, Term: 1})
+			}
 
-	idx.Compact(5)
+			idx.Compact(tc.upTo)
 
-	if idx.Len() != 5 {
-		t.Fatalf("Len after Compact(5): got %d, want 5", idx.Len())
-	}
-
-	// Entries 1-5 should be gone.
-	for i := uint64(1); i <= 5; i++ {
-		if _, ok := idx.Lookup(i); ok {
-			t.Fatalf("Lookup(%d): found entry after compaction", i)
-		}
-	}
-
-	// Entries 6-10 should remain.
-	for i := uint64(6); i <= 10; i++ {
-		if _, ok := idx.Lookup(i); !ok {
-			t.Fatalf("Lookup(%d): not found after compaction", i)
-		}
-	}
-}
-
-// TestCompactAll verifies compacting all entries leaves an empty index.
-func TestCompactAll(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 5; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1})
-	}
-
-	idx.Compact(10) // Compact past the last entry.
-
-	if idx.Len() != 0 {
-		t.Fatalf("Len after full compaction: got %d, want 0", idx.Len())
-	}
-}
-
-// TestCompactNone verifies compacting to 0 when first entry is 1 is a no-op.
-func TestCompactNone(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 5; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1})
-	}
-
-	idx.Compact(0)
-
-	if idx.Len() != 5 {
-		t.Fatalf("Len after Compact(0): got %d, want 5", idx.Len())
+			lo := min(tc.upTo, 10) + 1 // first index that remains
+			if want := int(11 - lo); idx.Len() != want {
+				t.Fatalf("Len after Compact(%d): got %d, want %d", tc.upTo, idx.Len(), want)
+			}
+			for i := uint64(1); i <= 10; i++ {
+				if _, ok := idx.Lookup(i); ok != (i >= lo) {
+					t.Fatalf("Lookup(%d) after Compact(%d): found=%v, want %v", i, tc.upTo, ok, i >= lo)
+				}
+			}
+			first, ok := idx.First()
+			if lo > 10 {
+				if ok {
+					t.Fatalf("First after full Compact: got %+v, want none", first)
+				}
+				return
+			}
+			if !ok || first.Index != lo {
+				t.Fatalf("First after Compact(%d): got %+v ok=%v, want Index=%d", tc.upTo, first, ok, lo)
+			}
+			if last, ok := idx.Last(); !ok || last.Index != 10 {
+				t.Fatalf("Last after Compact(%d): got %+v ok=%v, want Index=10", tc.upTo, last, ok)
+			}
+		})
 	}
 }
 
-// TestCompactOnEmptyIndex verifies Compact on empty index does not panic.
-func TestCompactOnEmptyIndex(t *testing.T) {
-	idx := newIndex()
-	idx.Compact(100) // Should not panic.
-	if idx.Len() != 0 {
-		t.Fatalf("Len: got %d, want 0", idx.Len())
-	}
-}
-
-// TestCompactThenAppend verifies new entries can be appended after compaction.
+// TestCompactThenAppend checks an Append after a Compact extends what remains.
 func TestCompactThenAppend(t *testing.T) {
 	idx := newIndex()
 	for i := uint64(1); i <= 5; i++ {
@@ -346,7 +272,7 @@ func TestCompactThenAppend(t *testing.T) {
 	}
 }
 
-// TestAllSegmentIDs verifies AllSegmentIDs returns all referenced segments.
+// TestAllSegmentIDs checks AllSegmentIDs returns each distinct segment once.
 func TestAllSegmentIDs(t *testing.T) {
 	idx := newIndex()
 	idx.Append(indexEntry{Index: 1, Term: 1, SegmentID: 5})
@@ -359,15 +285,6 @@ func TestAllSegmentIDs(t *testing.T) {
 	}
 	if !segs[5] || !segs[10] {
 		t.Fatalf("AllSegmentIDs: expected 5 and 10, got %v", segs)
-	}
-}
-
-// TestAllSegmentIDsEmptyIndex verifies AllSegmentIDs on empty index.
-func TestAllSegmentIDsEmptyIndex(t *testing.T) {
-	idx := newIndex()
-	segs := idx.AllSegmentIDs()
-	if len(segs) != 0 {
-		t.Fatalf("AllSegmentIDs on empty: got %d, want 0", len(segs))
 	}
 }
 
@@ -444,43 +361,5 @@ func TestConcurrentRangeAndCompact(t *testing.T) {
 	expected := count - count/2
 	if idx.Len() != expected {
 		t.Fatalf("Len after concurrent compact: got %d, want %d", idx.Len(), expected)
-	}
-}
-
-// TestFirstAndLast verifies First and Last return correct entries.
-func TestFirstAndLast(t *testing.T) {
-	idx := newIndex()
-	idx.Append(indexEntry{Index: 5, Term: 1})
-	idx.Append(indexEntry{Index: 10, Term: 2})
-	idx.Append(indexEntry{Index: 15, Term: 3})
-
-	first, ok := idx.First()
-	if !ok || first.Index != 5 {
-		t.Fatalf("First: got %+v ok=%v, want Index=5", first, ok)
-	}
-
-	last, ok := idx.Last()
-	if !ok || last.Index != 15 || last.Term != 3 {
-		t.Fatalf("Last: got %+v ok=%v, want Index=15 Term=3", last, ok)
-	}
-}
-
-// TestFirstAndLastAfterCompact verifies First/Last after partial compaction.
-func TestFirstAndLastAfterCompact(t *testing.T) {
-	idx := newIndex()
-	for i := uint64(1); i <= 10; i++ {
-		idx.Append(indexEntry{Index: i, Term: 1})
-	}
-
-	idx.Compact(7)
-
-	first, ok := idx.First()
-	if !ok || first.Index != 8 {
-		t.Fatalf("First after Compact(7): got %+v ok=%v, want Index=8", first, ok)
-	}
-
-	last, ok := idx.Last()
-	if !ok || last.Index != 10 {
-		t.Fatalf("Last after Compact(7): got %+v ok=%v, want Index=10", last, ok)
 	}
 }
