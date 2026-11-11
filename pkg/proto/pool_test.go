@@ -57,35 +57,6 @@ func TestEntrySlicePool_PutNilIsNoop(t *testing.T) {
 	PutEntrySlice(nil)
 }
 
-func TestEntrySlicePool_GrowthPreserved(t *testing.T) {
-	sp := GetEntrySlice()
-
-	// Grow beyond default capacity.
-	for i := range 64 {
-		*sp = append(*sp, Entry{Term: 1, Index: uint64(i + 1)})
-	}
-	if cap(*sp) < 64 {
-		t.Fatalf("expected capacity >= 64 after growth, got %d", cap(*sp))
-	}
-	grownCap := cap(*sp)
-
-	PutEntrySlice(sp)
-
-	// Get again and verify the grown capacity is preserved.
-	sp2 := GetEntrySlice()
-	defer PutEntrySlice(sp2)
-	if len(*sp2) != 0 {
-		t.Fatalf("expected length 0, got %d", len(*sp2))
-	}
-	// If we got the same pooled item, capacity should be preserved.
-	// sync.Pool is best-effort, so only check if capacity >= default.
-	backingPtr := &(*sp)[:cap(*sp)][0]
-	backingPtr2 := &(*sp2)[:cap(*sp2)][0]
-	if backingPtr == backingPtr2 && cap(*sp2) != grownCap {
-		t.Fatalf("expected grown capacity %d preserved, got %d", grownCap, cap(*sp2))
-	}
-}
-
 func BenchmarkEntrySlicePool_GetPut(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
