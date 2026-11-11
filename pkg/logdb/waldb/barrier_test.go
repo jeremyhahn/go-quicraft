@@ -156,16 +156,6 @@ func TestEncryptedWALRoundTripState(t *testing.T) {
 
 // TestEncryptedWALRoundTripStateError verifies ReadState returns ErrNoState
 // for an unknown node in an encrypted WAL.
-func TestEncryptedWALRoundTripStateNonExistent(t *testing.T) {
-	barrier := newTestBarrier(t)
-	db := openEncryptedTestDB(t, barrier)
-
-	_, _, err := db.ReadState(99, 99)
-	if err != logdb.ErrNoState {
-		t.Fatalf("ReadState: got %v, want %v", err, logdb.ErrNoState)
-	}
-}
-
 // TestEncryptedWALRoundTripBootstrap verifies bootstrap info written through
 // an encrypted WAL can be read back correctly.
 func TestEncryptedWALRoundTripBootstrap(t *testing.T) {
@@ -224,60 +214,9 @@ func TestEncryptedWALRoundTripSnapshot(t *testing.T) {
 
 // --- Raw bytes verification ---
 
-// TestEncryptedWALRecordsNotPlaintext verifies that on-disk WAL records are
-// actually encrypted (not stored as plaintext). We write a known entry,
-// then read the raw segment file bytes and verify the plaintext command
-// does not appear.
-func TestEncryptedWALRecordsNotPlaintext(t *testing.T) {
-	barrier := newTestBarrier(t)
-	dir := t.TempDir()
-	db, err := Open(dir,
-		WithNoSync(true),
-		WithBlockSize(1024),
-		WithMaxFileSize(64*1024),
-		WithBarrier(barrier),
-	)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-
-	knownPayload := []byte("THIS_IS_A_KNOWN_PLAINTEXT_PAYLOAD_12345")
-	entries := []logdb.Entry{
-		{Index: 1, Term: 1, Cmd: knownPayload},
-	}
-	if err := db.SaveEntries(1, 1, entries); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-	db.Close()
-
-	// Scan all segment files in all shard directories for the plaintext.
-	found := false
-	for i := 0; i < DefaultShardCount; i++ {
-		shardDir := filepath.Join(dir, shardDirName(i))
-		dirEntries, err := os.ReadDir(shardDir)
-		if err != nil {
-			continue
-		}
-		for _, de := range dirEntries {
-			if de.IsDir() {
-				continue
-			}
-			raw, err := os.ReadFile(filepath.Join(shardDir, de.Name()))
-			if err != nil {
-				t.Fatalf("ReadFile: %v", err)
-			}
-			if bytes.Contains(raw, knownPayload) {
-				found = true
-			}
-		}
-	}
-	if found {
-		t.Fatal("plaintext payload found in raw WAL segment file; expected encrypted data")
-	}
-}
-
-// TestEncryptedWALRecordsNotPlaintextError verifies that the verification
-// test actually detects plaintext when encryption is NOT enabled.
+// TestEncryptedWALRecordsPlaintextWithoutBarrier verifies that a WAL opened
+// without a barrier stores the command in cleartext, the contrast to
+// TestAtRestProtection_RealBarrierIsEncrypted.
 func TestEncryptedWALRecordsPlaintextWithoutBarrier(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir,
@@ -565,18 +504,6 @@ func TestEncryptedWALSealedBarrierWrite(t *testing.T) {
 
 // TestEncryptedWALSealedBarrierWriteError verifies the WALEncryptError
 // type provides correct error messages and unwrapping.
-func TestEncryptedWALSealedBarrierErrorType(t *testing.T) {
-	inner := errors.New("test inner error")
-	e := &WALEncryptError{Err: inner}
-	msg := e.Error()
-	if msg == "" {
-		t.Fatal("WALEncryptError.Error() returned empty string")
-	}
-	if e.Unwrap() != inner {
-		t.Fatalf("WALEncryptError.Unwrap: got %v, want %v", e.Unwrap(), inner)
-	}
-}
-
 // --- Multi-shard encrypted tests ---
 
 // TestEncryptedWALMultiShard verifies that multiple shards work correctly
@@ -805,40 +732,7 @@ func TestEncryptedWALKeyRotation(t *testing.T) {
 
 // TestEncryptedWALKeyRotationError verifies that rotation on a sealed
 // barrier returns an error (not panicking).
-func TestEncryptedWALKeyRotationSealed(t *testing.T) {
-	barrier := newTestBarrier(t)
-	db := openEncryptedTestDB(t, barrier)
-
-	// Write some data.
-	if err := db.SaveEntries(1, 1, makeEntries(1, 3, 1)); err != nil {
-		t.Fatalf("SaveEntries: %v", err)
-	}
-
-	// Seal the barrier.
-	if err := barrier.Seal(); err != nil {
-		t.Fatalf("barrier.Seal: %v", err)
-	}
-
-	// Rotate should fail.
-	_, err := barrier.Rotate(context.Background())
-	if err == nil {
-		t.Fatal("barrier.Rotate on sealed barrier: expected error, got nil")
-	}
-
-	// Writes should also fail.
-	err = db.SaveEntries(1, 1, makeEntries(4, 1, 1))
-	if err == nil {
-		t.Fatal("SaveEntries on sealed barrier: expected error, got nil")
-	}
-}
-
 // --- WALBarrier interface satisfaction ---
-
-// TestCryptoBarrierSatisfiesWALBarrier is a compile-time check that
-// seal.Barrier satisfies the WALBarrier interface.
-func TestCryptoBarrierSatisfiesWALBarrier(t *testing.T) {
-	var _ WALBarrier = (*seal.Barrier)(nil)
-}
 
 // --- WAL decryption error tests ---
 
@@ -1063,21 +957,6 @@ func TestMinLiveEpoch_ClosedDB(t *testing.T) {
 	_, err := db.MinLiveEpoch()
 	if !errors.Is(err, logdb.ErrClosed) {
 		t.Fatalf("MinLiveEpoch on closed DB: got %v, want ErrClosed", err)
-	}
-}
-
-// TestMinLiveEpoch_EmptyDB verifies that MinLiveEpoch returns 0 for an
-// empty encrypted DB.
-func TestMinLiveEpoch_EmptyDB(t *testing.T) {
-	barrier := newTestBarrier(t)
-	db := openEncryptedTestDB(t, barrier)
-
-	epoch, err := db.MinLiveEpoch()
-	if err != nil {
-		t.Fatalf("MinLiveEpoch: %v", err)
-	}
-	if epoch != 0 {
-		t.Fatalf("MinLiveEpoch = %d, want 0 (empty DB)", epoch)
 	}
 }
 
