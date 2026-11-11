@@ -1402,7 +1402,7 @@ jobs:
       # `make coverage-merge` reads them.
       - name: Download the shard profiles
         if: ${{ github.server_url == 'https://github.com' }}
-        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: coverage-shard-*
           merge-multiple: true
