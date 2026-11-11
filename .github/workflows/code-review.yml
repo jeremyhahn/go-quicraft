@@ -1,4 +1,4 @@
-# code-review-template: v5.10.8 -- the code review in Gitea or GitHub CI for a pull request
+# code-review-template: v5.10.11 -- the code review in Gitea or GitHub CI for a pull request
 # that carries `code-review` and `task:ready`, routed by its labels through
 # route-labels (labels.md §2). Codex on the `codex` runner reviews every such
 # PR; `agent:opencode` adds an advisory COMMENT review by the opencode job on
@@ -28,6 +28,59 @@
 #   COORDINATOR_TURNS         the codex rounds the project coordinator has
 #                             on a `needs-coordinator` PR after the two-round
 #                             stop (v5.9.8, Company Agent m2185); default 3
+#
+# v5.10.11 (2026-11-10, Software Department; go-qrdb #1368): `api_all` JOINS
+# ITS PAGES THROUGH STDIN. v5.10.10 passed the pages read so far to `jq` as
+# an `--argjson` argument, and one argument is at most 128 KiB on Linux: on
+# a pull request with a long review history the review job died with
+# "Argument list too long" before it read a verdict. Both copies of
+# `api_all` now print the two arrays to `jq -cs` (printf is a shell builtin,
+# so nothing passes through argv), and the first copy fails closed on a
+# failed join as the second already did. No other change.
+#
+# v5.10.10 (2026-11-10, Company Agent m2369, ruling 422; Codex's two P1s on
+# v5.10.9 at go-luks2 #436 and go-qrdb #1436): (a) TWINS ARE RUNS OF THE
+# SAME PULL REQUEST. Two PRs from one branch into different bases share the
+# head sha, and since v5.9.7 each run has a group of its own, so the twin
+# wait counted the other PR's run as a twin: the later run waited for it,
+# read its own PR's verdicts and died "ended with no verdict". The workflow
+# now has a run-name that names the PR, its base and its head; the guard
+# reads its own run's (`display_title`, which must be that run-name) and
+# waits only for runs on the head with the same one. The runs' own
+# `pull_requests` list is not read: it is not reliable for
+# pull_request_target on a shared head. (b) A LEFTOVER OWNER-RESUME IS NOT
+# EVIDENCE. A restarted round whose verdict was filed but whose label did
+# not come off (a failed delete, a cancelled job) left `owner-resume` on,
+# and a later cycle at the owner limit restarted the count on it without a
+# new word from the owner. The label is evidence only when its latest
+# addition in the issue timeline is after the latest verdict and is not the
+# addition a verdict already recorded: the verdict marker of a round started
+# on the label carries resume=<that addition's timeline id>. A label that is
+# not fresh, or whose addition the timeline does not date, is a leftover:
+# on every run that reaches the round count the guard takes it off, says
+# so, and counts as if it were absent. A fresh label stays until the
+# posting step files the restarted round's verdict (v5.10.9).
+# testdata/code-review-v51010-tests.py tests both.
+#
+# v5.10.9 (2026-11-10, Company Agent m2355 (1), ruling 418; Codex's three P1s
+# on v5.10.8 at go-luks2 #436, xkey-android #119 and go-qrdb #1436): (a) THE
+# BASE IS ONE COMMIT. The review key's diff compared the base BRANCH with
+# $EVENT_SHA when the guard ran, and the review diffed the checkout's
+# origin/<base> fetched later, so a base that moved in between gave the
+# approval key and codex two different changes. Both, and the deps step's
+# base go.mod reads, now use $BASE_SHA, the event's base commit; a checkout
+# without that commit ends red. (b) THE TWIN WAIT DOES NOT DEPEND ON RUN-ID
+# ORDER. v5.10.7 waited only for a LOWER run id, so a lower-id twin whose job
+# started after a higher-id twin's saw no older run and reviewed too. Now
+# the twins are ordered by when their codex jobs started, then by run id: a
+# run waits for any other run on its head whose codex job is in progress and
+# comes first in that order, and reads the runs again after a settle pause
+# before it reviews, so a twin the API showed late is still seen. (c) THE
+# OWNER-RESUME LABEL STAYS until the restarted round's verdict is posted.
+# v5.10.8 took it off in the guard, so a later failure (the checkout, the
+# login, codex, the post) lost the only evidence of the resume and the next
+# run went back to `needs-owner`. The guard now only reads it, and the
+# posting step takes it off after the round-1 verdict is filed.
 #
 # v5.10.8 (2026-11-09, Company Agent m2349 (2), ruling 416; Codex's five P1s
 # on v5.10.7 at go-luks2 #436, go-qrdb #1436, xkey-android #119 and
@@ -192,6 +245,8 @@
 #   marker, the stop and the labels.
 # v5.9.7 (2026-11-08, Company Agent m2149 item 4): on GitHub the job's
 # concurrency group carries the run id, so no same-head twin is dropped.
+# (v5.10.10: a twin is a run of the same PR, by run-name, on the head; a
+# run of another PR from the same branch is not one.)
 # The opened and labeled events of one head can create three runs in one
 # second; under one group GitHub cancelled the third before it had a job, its
 # check suite was the newest and held no `Code Review (codex)` check-run, and
@@ -480,6 +535,13 @@
 # with no Docker socket and no credential uid 1000 can read but its own
 # short-lived access token, is the boundary.
 name: Code Review
+# v5.10.10 (Company Agent m2369, ruling 422; Codex's P1 at go-luks2 #436):
+# the run-name names the PR, its base and its head. The runs API returns it
+# as display_title, and the guard's twin wait counts as twins only the runs
+# whose display_title is its own, so a PR from the same branch into another
+# base (the same head sha) is never one. Keep it verbatim: the guard refuses
+# a run whose display_title is not this text.
+run-name: "Code Review: PR #${{ github.event.pull_request.number }} into ${{ github.event.pull_request.base.ref }} at ${{ github.event.pull_request.head.sha }}"
 
 on:
   # The definition always comes from the base branch, never the PR head.
@@ -526,8 +588,13 @@ env:
   REPO_API: ${{ github.server_url == 'https://github.com' && format('https://api.github.com/repos/{0}', github.repository) || format('{0}/api/v1/repos/{1}', github.server_url, github.repository) }}
   PR_NUM: ${{ github.event.pull_request.number }}
   EVENT_SHA: ${{ github.event.pull_request.head.sha }}
-  # v5.10.6: the base branch the review key's diff is compared with.
+  # v5.10.6: the base branch the PR targets; the live guards refuse a PR
+  # retargeted off it.
   BASE_REF: ${{ github.event.pull_request.base.ref }}
+  # v5.10.9: the event's base COMMIT. The review key's diff, the deps step's
+  # base go.mod files and codex's diff all start from its merge base with
+  # $EVENT_SHA, so they read one change.
+  BASE_SHA: ${{ github.event.pull_request.base.sha }}
   # CUSTOMIZE (v5.9.8, Company Agent m2185; sdlc.md §2b): the codex rounds the
   # project coordinator has on a PR labelled `needs-coordinator` after the
   # two-round stop, before the PR goes to the owner (`needs-owner`). The
@@ -571,7 +638,9 @@ jobs:
     # run is cancelled with no `Code Review (codex)` check-run, and a ruleset
     # requiring that context then refuses the merge (go-quicraft #683). Twins
     # are serialized by the guard's twin wait instead, and a left-behind head
-    # ends skip=stale. (v5.9.4 had one group per PR on GitHub.) On Gitea the
+    # ends skip=stale. v5.10.10: the twins are the runs of the same PR (by
+    # run-name) on the head, never another PR's run on the same sha. (v5.9.4
+    # had one group per PR on GitHub.) On Gitea the
     # group stays
     # v5.3's, the PR and its head sha: a twin on the same sha waits for the
     # review in flight and its guard ends skip=reviewed, and Gitea cancels
@@ -589,8 +658,8 @@ jobs:
     # the refresh runs at most 130 s, the review lock 600 s, codex runs at most
     # 2730 s (a large head, v5.6; 1530 s otherwise), the module fetch at most
     # 300 s; the guard, checkout, retried API calls and posting keep the
-    # remaining 440 s, so the error comment always gets out before Gitea kills
-    # the job.
+    # remaining 440 s (less the 20 s twin settle on GitHub, v5.10.9), so the
+    # error comment always gets out before Gitea kills the job.
     timeout-minutes: 75
     steps:
       # Owner ruling 443 (2026-11-10): a pull request that changes only workflow
@@ -1065,12 +1134,16 @@ jobs:
           # $EVENT_SHA) in the diff media type, which a later push cannot
           # change. Gitea has no range diff in its API: it returns 1 there,
           # as does a base or head the URL cannot carry.
+          # v5.10.9 (Company Agent m2355 (1), ruling 418; Codex's P1 at
+          # xkey-android #119): the base is the event's base commit,
+          # $BASE_SHA, not the base branch as it is when this runs, so the
+          # key's diff is the one codex reviews (base_commit below).
           pr_diff() {
             local code url
             [ "$FORGE" = github ] || return 1
             [[ $EVENT_SHA =~ ^[0-9a-f]{40}$ ]] || return 1
-            [[ $BASE_REF =~ ^[A-Za-z0-9._/-]+$ ]] && [[ $BASE_REF != *..* ]] || return 1
-            url=$REPO_API/compare/$BASE_REF...$EVENT_SHA
+            [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || return 1
+            url=$REPO_API/compare/$BASE_SHA...$EVENT_SHA
             code=$(curl -sS --proto '=http,https' --max-time 60 --retry 3 --retry-all-errors \
                      -o "$1" -w '%{http_code}' -H @"$HDR" \
                      -H 'Accept: application/vnd.github.diff' -H 'X-GitHub-Api-Version: 2022-11-28' "$url") || return 1
@@ -1087,7 +1160,7 @@ jobs:
                 die "GET $1 did not answer a list"
               [[ $n =~ ^[0-9]+$ ]] || die "GET $1 page $page gave no count"
               [ "$n" -gt 0 ] || break
-              all=$(jq -c --argjson a "$all" '$a + .' <<<"$got")
+              all=$(printf '%s\n%s\n' "$all" "$got" | jq -cs '.[0] + .[1]') || exit 1
               page=$((page + 1))
             done
             printf '%s\n' "$all"
@@ -1115,7 +1188,8 @@ jobs:
           # v5.9.8: put label $1 on the PR and take label $2, when given, off
           # it, then read the PR's labels again: Gitea can answer 200 without
           # applying a label. GitHub takes names, Gitea the label ids.
-          # v5.10.8: an empty $1 adds nothing (the guard takes owner-resume off).
+          # v5.10.8: an empty $1 adds nothing (v5.10.9: the posting step takes
+          # owner-resume off; v5.10.10: the guard takes off only a leftover).
           relabel() {
             local add=$1 drop=${2:-} names id
             names=$(api GET "/pulls/$PR_NUM" | jq -c '[.labels[]?.name]')
@@ -1297,6 +1371,23 @@ jobs:
           # whose older twin's codex job is still reviewing this head waits
           # for that verdict and then reads it below. Only an in-progress codex
           # job is waited for: a queued one may be waiting for this runner.
+          # v5.10.9 (Company Agent m2355 (1), ruling 418; Codex's P1 at
+          # go-luks2 #436): "older" is not the lower run id, which let a
+          # lower-id twin whose job started later review beside a higher-id
+          # one. The twins are ordered by the key (codex job started_at, run
+          # id), the same for every twin that reads it: a run waits for any
+          # other run on $EVENT_SHA whose codex job is in progress with a key
+          # before its own. A run that finds none reads the runs once more
+          # after TWIN_SETTLE seconds, so a twin whose start the API showed
+          # late is still ordered, before this run takes the review.
+          # v5.10.10 (Company Agent m2369, ruling 422; Codex's P1 at go-luks2
+          # #436): a twin is a run of THIS pull request on $EVENT_SHA: its
+          # display_title (the workflow's run-name: PR, base, head) is this
+          # run's. Two PRs from one branch into different bases share the
+          # head sha, and the later one waited for the other's verdict, then
+          # read its own PR's and died with no verdict. The runs'
+          # pull_requests list is not read: it is not reliable for
+          # pull_request_target on a shared head.
           twin_waited=0
           if [ "$FORGE" = github ]; then
             printf 'Authorization: Bearer %s\n' "$ACTIONS_TOKEN" > "$WORK/gha.hdr"
@@ -1311,38 +1402,78 @@ jobs:
                 *)   die "GET $1 answered HTTP $code" ;;
               esac
             }
-            wf=$(gha "/actions/runs/$GITHUB_RUN_ID" | jq -r '.workflow_id // empty')
+            # v5.10.5's rule: assigned before jq reads it, and an unreadable
+            # body dies.
+            me_run=$(gha "/actions/runs/$GITHUB_RUN_ID") ||
+              die "could not read run $GITHUB_RUN_ID"
+            wf=$(jq -r '.workflow_id // empty' <<<"$me_run") ||
+              die "could not read the workflow of run $GITHUB_RUN_ID"
             [ -n "$wf" ] || die "could not read the workflow of run $GITHUB_RUN_ID"
+            # v5.10.10: this run's run-name, read once; it must be the
+            # workflow's, or the twins cannot be told from other PRs' runs.
+            my_title=$(jq -r '.display_title // empty' <<<"$me_run") ||
+              die "could not read the run-name of run $GITHUB_RUN_ID"
+            [ -n "$my_title" ] || die "could not read the run-name of run $GITHUB_RUN_ID"
+            [ "$my_title" = "Code Review: PR #$PR_NUM into $BASE_REF at $EVENT_SHA" ] ||
+              die "run $GITHUB_RUN_ID is named '$my_title', not the workflow's run-name for PR $PR_NUM into $BASE_REF at $EVENT_SHA (code-review.yml v5.10.10: keep the run-name verbatim)"
+            # This run's own key: when its codex job (this job) started.
+            jobs=$(gha "/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100") ||
+              die "could not read the jobs of run $GITHUB_RUN_ID"
+            my_start=$(jq -r '[ .jobs[]? | select(.name == "Code Review (codex)" and .status == "in_progress")
+                                | .started_at // empty ] | first // empty' <<<"$jobs") ||
+              die "could not read the jobs of run $GITHUB_RUN_ID"
+            [[ $my_start =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
+              die "could not read when this run's codex job started ('$my_start')"
+            TWIN_SETTLE=20
+            settled=0
             while :; do
               # v5.10.5: each lookup is assigned before jq reads it. In an `if`
               # condition `set -e` does not apply, so a failed lookup there
               # would read as no codex job in progress on this head.
               runs=$(gha "/actions/workflows/$wf/runs?head_sha=$EVENT_SHA&status=in_progress&per_page=100") ||
                 die "could not list the in-progress runs on $EVENT_SHA"
-              older=$(jq -r --argjson me "$GITHUB_RUN_ID" '.workflow_runs[]? | select(.id < $me) | .id' <<<"$runs") ||
+              # v5.10.10: only runs of this PR (the same run-name) are twins;
+              # a body with no list of runs is unreadable, not "no twins".
+              twins=$(jq -r --argjson me "$GITHUB_RUN_ID" --arg mine "$my_title" '
+                  if (.workflow_runs | type) == "array" then .workflow_runs[] else error("no workflow_runs") end
+                  | select(.id != $me and .display_title == $mine) | .id' <<<"$runs") ||
                 die "could not read the in-progress runs on $EVENT_SHA"
               busy=0
-              for id in $older; do
+              for id in $twins; do
+                [[ $id =~ ^[0-9]+$ ]] || die "the in-progress runs on $EVENT_SHA name a run '$id'"
                 jobs=$(gha "/actions/runs/$id/jobs?per_page=100") ||
                   die "could not read the jobs of run $id"
                 # jq -e exits 1 for false; any other non-zero is an unreadable body.
+                # TWIN ORDER (v5.10.9): run $id comes first when its codex job
+                # is in progress and (started_at, run id) sorts before
+                # ($my_start, this run id). A start the API does not give
+                # (null) sorts first: the run waits rather than review twice.
                 jrc=0
-                jq -e 'any(.jobs[]?; .name == "Code Review (codex)" and .status == "in_progress")' >/dev/null <<<"$jobs" || jrc=$?
+                jq -e --arg t "$my_start" --argjson id "$id" --argjson me "$GITHUB_RUN_ID" '
+                    any(.jobs[]?; .name == "Code Review (codex)" and .status == "in_progress"
+                                  and ((.started_at // "") < $t or ((.started_at // "") == $t and $id < $me)))' >/dev/null <<<"$jobs" || jrc=$?
                 case $jrc in
                   0) busy=1 ;;
                   1) ;;
                   *) die "could not read the jobs of run $id" ;;
                 esac
               done
-              [ "$busy" = 1 ] || break
-              [ "$twin_waited" -gt 0 ] || echo "An older run's codex job is reviewing $EVENT_SHA; waiting for its verdict."
+              if [ "$busy" = 0 ]; then
+                # Nothing first: settle once, then read again, unless a wait
+                # already ran (the twin it waited for has ended).
+                [ "$settled" = 0 ] && [ "$twin_waited" = 0 ] || break
+                settled=1
+                sleep "$TWIN_SETTLE"
+                continue
+              fi
+              [ "$twin_waited" -gt 0 ] || echo "A twin run's codex job that comes first (job start, then run id) is reviewing $EVENT_SHA; waiting for its verdict."
               [ "$twin_waited" -lt 2700 ] ||
-                die "an older run's codex job on $EVENT_SHA is still in progress after 2700 s; re-run this job when it ends"
+                die "a twin run's codex job on $EVENT_SHA that comes first is still in progress after 2700 s; re-run this job when it ends"
               sleep 30
               twin_waited=$((twin_waited + 30))
             done
             rm -f "$WORK/gha.hdr"
-            # A twin that waited ends on the older run's verdict, before any
+            # A twin that waited ends on the first twin's verdict, before any
             # route or label case: its approval ends skip=reviewed, its
             # rejection fails, and only no verdict asks for a re-run. Too little
             # of this job's budget is left to review after a wait.
@@ -1356,11 +1487,11 @@ jobs:
               if jq -e 'any(.[]; .state == "APPROVED")' <<<"$mine" >/dev/null; then
                 # v5.10.8: not past `needs-owner`, read live: the wait was long.
                 owner_hold
-                echo "$REVIEWER approved $EVENT_SHA in the older run after a $twin_waited s wait. Not reviewing it twice."
+                echo "$REVIEWER approved $EVENT_SHA in the twin run that came first, after a $twin_waited s wait. Not reviewing it twice."
                 echo "skip=reviewed" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
-              die "the older run on $EVENT_SHA ended with no verdict after a $twin_waited s wait; re-run this job"
+              die "the twin run on $EVENT_SHA that came first ended with no verdict after a $twin_waited s wait; re-run this job"
             fi
           fi
 
@@ -1504,7 +1635,9 @@ jobs:
           # read from the marker the posting step writes:
           #   <!-- codex-review:verdict head=<sha> patch=<patch-id> ctx=<sha1> round=<n> -->
           # A marker from v5.9.6 or before has head= alone; one from v5.10.1
-          # or before has no ctx=. A dismissed
+          # or before has no ctx=. v5.10.10: a round started on the
+          # owner-resume label adds resume=<the label addition's timeline
+          # id> after round=. A dismissed
           # verdict still counts as a round; it no longer stands.
           all=$(api_all "/pulls/$PR_NUM/reviews?")
           hist=$(jq -c --arg u "$REVIEWER" '
@@ -1518,7 +1651,8 @@ jobs:
                         state: (if .state == "DISMISSED" then "DISMISSED" else .state end),
                         patch: (($m.a | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // ""),
                         ctx: (($m.a | capture("\\bctx=(?<c>[0-9a-f]{40})\\b") | .c) // ""),
-                        round: (($m.a | capture("\\bround=(?<r>[0-9]+)\\b") | .r | tonumber) // null) } ]
+                        round: (($m.a | capture("\\bround=(?<r>[0-9]+)\\b") | .r | tonumber) // null),
+                        resume: (($m.a | capture("\\bresume=(?<i>[0-9]+)\\b") | .i) // "") } ]
               | sort_by(.id)' <<<"$all")
 
           # SAME PATCH: the latest standing verdict on another head with this
@@ -1618,6 +1752,70 @@ jobs:
           fi
           [[ $done_rounds =~ ^[0-9]+$ ]] || die "could not count the $REVIEWER rounds on PR $PR_NUM"
           latest=$(jq -r 'if length == 0 then "" elif (last | .stands) then last | .state else "DISMISSED" end' <<<"$hist")
+          # v5.10.10 (Company Agent m2369, ruling 422; Codex's P1 at go-qrdb
+          # #1436): A LEFTOVER OWNER-RESUME IS NOT EVIDENCE. A restarted
+          # round whose verdict was filed but whose label did not come off
+          # (a failed delete, a cancelled job) left it on, and a later cycle
+          # at the owner limit restarted the count on it. On every run that
+          # reaches here with `owner-resume` on, the guard dates the label's
+          # LATEST addition in the issue timeline (GitHub: a `labeled` event;
+          # Gitea: a `label` entry with body "1", an addition; body "" is a
+          # removal). The label is fresh only when that addition is after
+          # the latest verdict (any addition, with no verdict yet; both
+          # times are read as seconds since the epoch, Z or offset) and no
+          # verdict marker records its timeline id as resume=. A label that
+          # is not fresh, or one with an addition the timeline does not date,
+          # is a leftover: the guard takes it off, says so, and counts as if
+          # it were absent. A fresh label is never taken off here (v5.10.9):
+          # the posting step takes it off once the round's verdict is filed.
+          resume_id=""
+          if jq -e 'index("owner-resume") != null' <<<"$labels" >/dev/null; then
+            timeline=$(api_all "/issues/$PR_NUM/timeline?")
+            jq -c '[ .[] | {at, round, resume} ]' <<<"$hist" > "$WORK/resume-hist.json"
+            # OWNER-RESUME FRESHNESS. epoch reads an RFC 3339 time with Z
+            # (GitHub) or an offset (Gitea), to the second; anything else is
+            # null, and a null never makes the label fresh.
+            ores=$(jq -c --arg f "$FORGE" --slurpfile h "$WORK/resume-hist.json" '
+                def epoch:
+                  if type != "string" then null
+                  else (capture("^(?<b>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.[0-9]+)?(?<z>Z|(?<s>[+-])(?<h>[0-9]{2}):(?<m>[0-9]{2}))$") // null)
+                       | if . == null then null
+                         else (.b + "Z" | fromdateiso8601)
+                              - (if .z == "Z" then 0
+                                 else (if .s == "+" then 1 else -1 end) * ((.h | tonumber) * 3600 + (.m | tonumber) * 60) end) end end;
+                [ .[] | select((.label.name? // "") == "owner-resume"
+                               and (if $f == "github" then .event == "labeled"
+                                    else .type == "label" and .body == "1" end))
+                      | . + {t: (.created_at | epoch)} ] as $adds
+                | (if any($adds[]; .t == null) then null
+                   else $adds | sort_by(.t, .id) | last end) as $add
+                | $h[0] as $v
+                | ($v | last | .at | epoch) as $te
+                | if $add == null or ($add.id | type) != "number" or $add.t == null then
+                    {fresh: false, why: "undated"}
+                  elif any($v[]; .resume == ($add.id | tostring)) then
+                    {fresh: false, why: "consumed", id: $add.id,
+                     round: ([ $v[] | select(.resume == ($add.id | tostring)) | .round ] | first)}
+                  elif ($v | length) > 0 and ($te == null or $add.t <= $te) then
+                    {fresh: false, why: "stale", id: $add.id}
+                  else {fresh: true, id: $add.id} end' <<<"$timeline") ||
+              die "could not read the owner-resume additions in the timeline of PR $PR_NUM"
+            case "$(jq -r '.fresh' <<<"$ores")" in
+              true)
+                resume_id=$(jq -r '.id' <<<"$ores")
+                [[ $resume_id =~ ^[0-9]+$ ]] || die "the owner-resume addition on PR $PR_NUM has no timeline id ('$resume_id')"
+                ;;
+              false)
+                why=$(jq -r 'if .why == "consumed" then "already consumed by the verdict of round \(.round // "unknown")"
+                             elif .why == "stale" then "added before the latest verdict, not after it"
+                             else "the issue timeline does not date its addition" end' <<<"$ores")
+                relabel "" owner-resume
+                labels=$(jq -c 'map(select(. != "owner-resume"))' <<<"$labels")
+                echo "Took a leftover owner-resume off PR $PR_NUM ($why): it is not fresh evidence of the owner."
+                ;;
+              *) die "could not decide whether the owner-resume label on PR $PR_NUM is fresh" ;;
+            esac
+          fi
           # v5.10.7: THE OWNER RESUMES. A count at the last round reached
           # `needs-owner` (the posting step swaps the labels, and the hand-on
           # step fails red when a label does not stick). With `needs-owner`
@@ -1627,17 +1825,27 @@ jobs:
           # v5.10.8 (Company Agent m2349 (2), ruling 416; Codex's P1 on
           # v5.10.7 at go-qrdb #1436): ONLY ON EVIDENCE. A relabel can lose a
           # label, so `needs-owner` absent is not the owner. The count starts
-          # over on an `owner-resume` label, taken off here as it is used, or,
-          # on GitHub, when the issue timeline records `needs-owner` taken off
-          # after the latest verdict by a person: not a bot, not the reviewer,
-          # not an agent principal (a login that starts `agent-`). Otherwise
+          # over on an `owner-resume` label, taken off once used (v5.10.9:
+          # after the post), or, on GitHub, when the issue timeline records
+          # `needs-owner` taken off after the latest verdict by a person: not
+          # a bot, not the reviewer, not an agent principal (a login that starts `agent-`). Otherwise
           # the count stands, and the PR goes back to `needs-owner` below.
+          # v5.10.9 (Company Agent m2355 (1), ruling 418; Codex's P1 at go-qrdb
+          # #1436): the guard only READS `owner-resume`. It stays on until the
+          # posting step has filed the restarted round's verdict (its marker
+          # round=1 records the resume) and then takes it off, so a run that
+          # fails before that (the checkout, the login, codex, the post)
+          # leaves the evidence for the next run. v5.10.10: only a fresh
+          # label is evidence (above), and its marker records resume=.
           if [ "$done_rounds" -ge "$last_round" ] && [ "$latest" != APPROVED ] &&
              ! jq -e 'index("needs-coordinator") != null' <<<"$labels" >/dev/null; then
             resumed=""
-            if jq -e 'index("owner-resume") != null' <<<"$labels" >/dev/null; then
-              relabel "" owner-resume
-              resumed="the owner-resume label, now taken off"
+            # v5.10.10: only a fresh label (above); its addition's id goes
+            # into this round's marker as resume=.
+            if [ -n "$resume_id" ]; then
+              resumed="the owner-resume label added after the latest verdict (timeline id $resume_id), taken off when this round's verdict is posted"
+              echo "owner_resume=label" >> "$GITHUB_OUTPUT"
+              echo "owner_resume_id=$resume_id" >> "$GITHUB_OUTPUT"
             elif [ "$FORGE" = github ]; then
               at=$(jq -r 'last | .at // ""' <<<"$hist")
               if [ -n "$at" ]; then
@@ -1887,12 +2095,14 @@ jobs:
 
           # THE BASE BRANCH'S public requires, per go.mod, read through the
           # API, not git: a public module the base go.mod already requires at
-          # the same version is not fetched.
+          # the same version is not fetched. v5.10.9: read at the event's base
+          # commit, $BASE_SHA, the base the key and the review use.
           base_ref=$(api GET "/pulls/$PR_NUM" | jq -r '.base.ref // empty')
           [ -n "$base_ref" ] || die "could not read the base branch of PR $PR_NUM"
           [ "$base_ref" = "$BASE_REF" ] ||
             die "PR $PR_NUM was retargeted from $BASE_REF to $base_ref during the run; push a new head or re-add code-review"
-          ref_q=$(jq -rn --arg r "$base_ref" '$r | @uri')
+          [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || die "the event carries no base commit ('$BASE_SHA')"
+          ref_q=$BASE_SHA
           : > "$WORK/deps.pubbase"
           for f in "${mods[@]}"; do
             [[ $f =~ ^[A-Za-z0-9_./-]+$ ]] || continue
@@ -2161,8 +2371,13 @@ jobs:
           # v5.10.7: the base the key was computed on, or no review.
           [ "$base_ref" = "$BASE_REF" ] ||
             die "PR $PR_NUM was retargeted from $BASE_REF to $base_ref during the run; push a new head or re-add code-review"
-          base=$(as_codex git merge-base "refs/remotes/origin/$base_ref" HEAD) ||
-            die "no merge base between origin/$base_ref and $EVENT_SHA"
+          # v5.10.9 (ruling 418): from the event's base commit, as the key's
+          # diff is, never origin/<base> as the checkout fetched it later.
+          [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || die "the event carries no base commit ('$BASE_SHA')"
+          as_codex git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null ||
+            die "the checkout has no base commit $BASE_SHA (the base branch moved off it); push a new head or re-add code-review"
+          base=$(as_codex git merge-base "$BASE_SHA" HEAD) ||
+            die "no merge base between $BASE_SHA and $EVENT_SHA"
           files=$(as_codex git diff --name-only "$base" HEAD) || die "cannot diff $base..$EVENT_SHA"
           [ -n "$files" ] ||
             die "PR $PR_NUM changes no files against $base_ref; nothing to review"
@@ -2302,6 +2517,10 @@ jobs:
           HUNK_CTX: ${{ steps.guard.outputs.hunk_ctx }}
           ROUND: ${{ steps.guard.outputs.round }}
           LIMIT: ${{ steps.guard.outputs.limit }}
+          OWNER_RESUME: ${{ steps.guard.outputs.owner_resume }}
+          # v5.10.10: the timeline id of the owner-resume addition this round
+          # starts on, recorded in the marker as resume=.
+          OWNER_RESUME_ID: ${{ steps.guard.outputs.owner_resume_id }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # shellcheck source=/dev/null
@@ -2333,11 +2552,21 @@ jobs:
           fi
           # The marker (v5.9.8) carries the review key and the round, which
           # the guard reads on the next head: head=<sha> patch=<patch-id>
-          # ctx=<sha1> round=<n> (ctx= since v5.10.2).
+          # ctx=<sha1> round=<n> (ctx= since v5.10.2), then resume=<id> on a
+          # round the owner-resume label started (v5.10.10).
           [[ $PATCH_ID =~ ^[0-9a-f]{40}$ ]] || PATCH_ID=""
           [[ $HUNK_CTX =~ ^[0-9a-f]{40}$ ]] && [ -n "$PATCH_ID" ] || HUNK_CTX=""
           [[ $ROUND =~ ^[0-9]+$ ]] || die "the guard gave no round number"
           [[ $LIMIT =~ ^[0-9]+$ ]] || die "the guard gave no round limit"
+          # v5.10.10 (Company Agent m2369, ruling 422): a round started on
+          # the owner-resume label records which addition it consumed, so the
+          # guard never takes that addition as fresh evidence again, even if
+          # the label does not come off below.
+          resume=""
+          if [ "$OWNER_RESUME" = label ]; then
+            [[ $OWNER_RESUME_ID =~ ^[0-9]+$ ]] || die "the guard resumed on owner-resume but gave no timeline id for it"
+            resume=$OWNER_RESUME_ID
+          fi
           # v5.9.8: a rejection at the round limit hands the PR on (THE
           # TWO-ROUND STOP in the guard); the hand-on step sets the label.
           stop=""
@@ -2346,11 +2575,11 @@ jobs:
             [ "$ROUND" -lt $((2 + COORDINATOR_TURNS)) ] || stop=needs-owner
           fi
           jq -r --arg e "$event" --arg s "$EVENT_SHA" --arg m "$MODEL" --arg f "$EFFORT" --arg u "$RUN_URL" \
-                --arg p "$PATCH_ID" --arg x "$HUNK_CTX" --arg r "$ROUND" --arg t "$stop" '
+                --arg p "$PATCH_ID" --arg x "$HUNK_CTX" --arg r "$ROUND" --arg t "$stop" --arg o "$resume" '
               def where: if .file == "" then "" elif .line > 0 then " (`\(.file):\(.line)`)" else " (`\(.file)`)" end;
               def item: "- **\(.priority)** \(.title)\(where)\n\n  \(.body | gsub("\n"; "\n  "))\n";
               (if $e == "APPROVED" then "Approve" else "Request changes" end) as $v
-              | "<!-- codex-review:verdict head=\($s)\(if $p == "" then "" else " patch=\($p)" end)\(if $x == "" or $p == "" then "" else " ctx=\($x)" end) round=\($r) -->\n## Codex review: \($v)\n\n"
+              | "<!-- codex-review:verdict head=\($s)\(if $p == "" then "" else " patch=\($p)" end)\(if $x == "" or $p == "" then "" else " ctx=\($x)" end) round=\($r)\(if $o == "" then "" else " resume=\($o)" end) -->\n## Codex review: \($v)\n\n"
                 + "Head `\($s)`, model `\($m)`, effort `\($f)`, round \($r), [run](\($u)).\n\n\(.summary)\n\n"
                 + (if (.findings | length) == 0 then "No findings.\n"
                    else "### Findings\n\n" + (.findings | sort_by(.priority) | map(item) | join("\n")) end)
@@ -2407,6 +2636,16 @@ jobs:
           [ "$who" = "$REVIEWER" ] || die "$FORGE filed the review as '${who:-unknown}', not $REVIEWER"
           { echo "review_id=$(jq -r '.id' <<<"$posted")"; echo "verdict=$event"; echo "stop=$stop"; } >> "$GITHUB_OUTPUT"
           echo "Posted $event on $EVENT_SHA as $REVIEWER."
+          # v5.10.9 (ruling 418): the restarted round's verdict is filed, and
+          # its marker (round=1) now records the owner's resume, so the
+          # `owner-resume` label comes off; a label that does not come off
+          # fails the step (relabel). v5.10.10: the marker's resume= makes
+          # such a label a leftover, which the next run's guard takes off
+          # rather than resuming on it again.
+          if [ "$OWNER_RESUME" = label ]; then
+            relabel "" owner-resume
+            echo "Took owner-resume off PR $PR_NUM: round $ROUND's verdict records the resume."
+          fi
 
       # ROOT. THE JOB'S STATUS IS NOT A VERDICT. A step exiting 0 says nothing
       # about whether Gitea recorded a review (go-luks2 #137 went green over a
@@ -3059,7 +3298,7 @@ jobs:
                 die "GET $1 did not answer a list"
               [[ $n =~ ^[0-9]+$ ]] || die "GET $1 gave no count"
               [ "$n" -gt 0 ] || break
-              all=$(jq -c --argjson a "$all" '$a + .' <<<"$got") || exit 1
+              all=$(printf '%s\n%s\n' "$all" "$got" | jq -cs '.[0] + .[1]') || exit 1
               page=$((page + 1))
             done
             printf '%s\n' "$all"

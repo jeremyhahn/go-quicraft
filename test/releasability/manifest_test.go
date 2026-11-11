@@ -32,9 +32,8 @@ import (
 const exportIgnoreAttr = "export-ignore"
 
 // privateWorkflowFiles are exact root-relative paths that stay in the private
-// repository: the private forge's own workflows (forge-side auto-merge,
-// red-main revert and pull-request review automation, which are not the CI
-// template) and the release
+// repository: the private forge's own workflows (red-main revert and
+// pull-request review automation, which are not the CI template) and the release
 // trust anchor pinning the internal agent principal, which only the private
 // release recipe reads. Everything else is published -- the agent files
 // (CLAUDE.md, AGENTS.md, .claude/, .serena/) and every other workflow under
@@ -42,7 +41,6 @@ const exportIgnoreAttr = "export-ignore"
 // and scanned like any other file. The list is exact on purpose: a file of
 // the same name elsewhere is published.
 var privateWorkflowFiles = []string{
-	".github/workflows/automerge.yml",
 	".github/workflows/revert-red-main.yml",
 	".github/workflows/code-review.yml",
 	".release-allowed-signers",

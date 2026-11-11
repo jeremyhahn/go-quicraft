@@ -41,7 +41,6 @@ go.work.sum
 
 # The private forge's workflows and the release trust anchor (the .gitattributes
 # exclusions). No image build reads them.
-.github/workflows/automerge.yml
 .github/workflows/revert-red-main.yml
 .github/workflows/code-review.yml
 .release-allowed-signers

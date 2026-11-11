@@ -53,19 +53,18 @@ and each such line carries an inline waiver.
 
 ## What is published
 
-Every tracked file is published except four:
+Every tracked file is published except three:
 
 | Path | What it is |
 |---|---|
-| `.github/workflows/automerge.yml` | The private forge's auto-merge driver: part of its SDLC, not the CI template |
 | `.github/workflows/revert-red-main.yml` | The private forge's red-main revert driver: part of its SDLC, not the CI template |
 | `.github/workflows/code-review.yml` | The private forge's pull-request review on its own runners (company template, verbatim): part of its SDLC, not the CI template |
 | `.release-allowed-signers` | The private repository's release trust anchor: the internal principal and its public key |
 
-Nothing a public reader runs calls or reads the three workflows. `make
+Nothing a public reader runs calls or reads the two workflows. `make
 release-alpha` reads the trust anchor from the checkout it runs in by default; a
 maintainer releasing from an export names their own allowed-signers file with
-`RELEASE_ALLOWED_SIGNERS` (Releasing, in `CONTRIBUTING.md`). The four are
+`RELEASE_ALLOWED_SIGNERS` (Releasing, in `CONTRIBUTING.md`). The three are
 `privateWorkflowFiles` in `test/releasability/manifest_test.go`, exact paths.
 
 `CLAUDE.md`, `AGENTS.md` and `.claude/` are no longer tracked. `.serena/` and

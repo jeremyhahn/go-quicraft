@@ -34,14 +34,12 @@ import (
 // development tooling, published or not.
 var (
 	gitattributesEntries = []string{
-		".github/workflows/automerge.yml export-ignore",
 		".github/workflows/revert-red-main.yml export-ignore",
 		".github/workflows/code-review.yml export-ignore",
 		"/.release-allowed-signers export-ignore",
 	}
 	dockerignoreEntries = []string{
 		"**/CLAUDE.md", "**/AGENTS.md", "**/.claude", "**/.serena",
-		".github/workflows/automerge.yml",
 		".github/workflows/revert-red-main.yml",
 		".github/workflows/code-review.yml",
 		".release-allowed-signers",
@@ -236,7 +234,6 @@ func TestGitArchiveHonoursTheExclusionList(t *testing.T) {
 		"docs/claude-review.md":                 "public\n",
 		".github/workflows/ci.yml":              "public\n",
 		".github/dependabot.yml":                "public\n",
-		".github/workflows/automerge.yml":       "private\n",
 		".github/workflows/revert-red-main.yml": "private\n",
 		".release-allowed-signers":              "private\n",
 		"sub/.release-allowed-signers":          "public\n",
