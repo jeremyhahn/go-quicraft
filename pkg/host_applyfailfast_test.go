@@ -206,6 +206,17 @@ func TestApplyFailureFailsTheShardWithoutRetrying(t *testing.T) {
 				t.Fatalf("SyncPropose = %v (%T), want it to match %v",
 					proposeErr, proposeErr, tt.wantErr)
 			}
+			// The entry is committed and a reload replays it, so the caller
+			// must not be told it was not applied.
+			if !MaybeApplied(proposeErr) {
+				t.Fatalf("apply failure = %v reports MaybeApplied false: the entry is committed "+
+					"and a reload replays it", proposeErr)
+			}
+			var smPanic *SMPanicError
+			if tt.panicOnPoison && (!errors.As(proposeErr, &smPanic) || smPanic.Value != errPoisonedApply) {
+				t.Fatalf("apply panic = %v (%T): errors.As does not reach the *SMPanicError "+
+					"carrying the panic value", proposeErr, proposeErr)
+			}
 
 			// The latch must have tripped. This is what proves the single
 			// attempt was terminal rather than a retry still pending.
@@ -1118,39 +1129,6 @@ func TestProposalRejectedBeforeTheLogIsDefinite(t *testing.T) {
 	if MaybeApplied(err) {
 		t.Fatalf("rejection = %v reports MaybeApplied: raft refused the entry before "+
 			"appending it, so nothing can commit", err)
-	}
-}
-
-// TestProposalFailedByItsApplyReportsMaybeApplied is the end-to-end form: a
-// proposal whose committed entry failed to apply — returned error or panic —
-// reports MaybeApplied, since a reload replays the committed entry.
-func TestProposalFailedByItsApplyReportsMaybeApplied(t *testing.T) {
-	for name, panics := range map[string]bool{"returned error": false, "panic": true} {
-		t.Run(name, func(t *testing.T) {
-			h, machine, _ := newLatchableHost(t)
-			machine.panicOnPoison = panics
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			_, err := h.SyncPropose(ctx, 1, poisonCmd)
-			if err == nil {
-				t.Fatal("the poisoned proposal succeeded")
-			}
-			if !MaybeApplied(err) {
-				t.Fatalf("apply failure = %v reports MaybeApplied false: the entry is committed "+
-					"and a reload replays it", err)
-			}
-			if panics && !errors.Is(err, ErrShardFailed) {
-				t.Fatalf("apply panic = %v no longer matches ErrShardFailed", err)
-			}
-			var smPanic *SMPanicError
-			if panics && (!errors.As(err, &smPanic) || smPanic.Value != errPoisonedApply) {
-				t.Fatalf("apply panic = %v (%T): errors.As does not reach the *SMPanicError "+
-					"carrying the panic value", err, err)
-			}
-			if !panics && !errors.Is(err, errPoisonedApply) {
-				t.Fatalf("apply error = %v no longer carries the state machine's error", err)
-			}
-		})
 	}
 }
 
