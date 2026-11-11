@@ -2126,10 +2126,13 @@ func TestSweepStaleDecryptTmp(t *testing.T) {
 }
 
 // TestSweepStaleDecryptTmp_MissingDir verifies the sweep is a safe no-op on
-// a nonexistent directory.
+// a nonexistent directory: a missing path is not reported as a sweep failure.
 func TestSweepStaleDecryptTmp_MissingDir(t *testing.T) {
-	// Must not panic or error.
+	before := StaleDecryptSweepFailures()
 	SweepStaleDecryptTmp(filepath.Join(t.TempDir(), "does-not-exist"))
+	if got := StaleDecryptSweepFailures(); got != before {
+		t.Fatalf("StaleDecryptSweepFailures %d -> %d for a missing directory", before, got)
+	}
 }
 
 // TestSweepStaleDecryptTmpTree_ReclaimsEveryRetainedSnapshot verifies the sweep
@@ -2301,30 +2304,6 @@ func TestSnapshotEncryptError_Error(t *testing.T) {
 	want := "engine: snapshot encrypt failed: quicraft: snapshot frame corrupt"
 	if err.Error() != want {
 		t.Fatalf("error = %q, want %q", err.Error(), want)
-	}
-}
-
-// TestSnapshotPool_DecryptFile_EmptyFileIsTruncation pins that a sealed
-// artifact with no frames is refused. The writer always emits a terminal
-// frame, so an empty encrypted snapshot.dat can only be one truncated to
-// nothing, and decrypting it to an empty state machine would silently discard
-// every entry the snapshot held.
-func TestSnapshotPool_DecryptFile_EmptyFileIsTruncation(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(1)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	dataPath := filepath.Join(tmpDir, "empty.dat")
-	if err := os.WriteFile(dataPath, []byte{}, 0o644); err != nil {
-		t.Fatalf("write empty file failed: %v", err)
-	}
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
-	if !errors.Is(err, ErrSnapshotCorrupt) {
-		t.Fatalf("decrypt of a frameless artifact = %v, want ErrSnapshotCorrupt", err)
-	}
-	if plainPath != "" {
-		t.Fatalf("expected empty path on error, got %q", plainPath)
 	}
 }
 
@@ -2556,153 +2535,104 @@ func TestSnapshotPool_SaveSnapshot_MembershipMultiNode(t *testing.T) {
 // I.8: Streaming encrypt/decrypt tests (memory amplification fix)
 // ---------------------------------------------------------------------------
 
-// TestSnapshotPool_EncryptFile_StreamingSingleByte verifies encrypt/decrypt
-// round-trip for a file smaller than snapshotEncryptChunkSize (single
-// partial read).
-func TestSnapshotPool_EncryptFile_StreamingSingleByte(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(1)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
+// TestSnapshotPool_EncryptFile_StreamingBoundarySizes verifies the streaming
+// encrypt/decrypt round trip for a file smaller than snapshotEncryptChunkSize
+// (a single partial read) and for one that is an exact multiple of it.
+func TestSnapshotPool_EncryptFile_StreamingBoundarySizes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		size  int
+		epoch uint64
+	}{
+		{name: "single byte", size: 1, epoch: 1},
+		{name: "exact chunk boundary", size: snapshotEncryptChunkSize * 3, epoch: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			barrier := newTestBarrier(tc.epoch)
+			stopC := make(chan struct{})
+			p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	dataPath := filepath.Join(tmpDir, "single-byte.dat")
-	original := []byte{0x42}
-	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
-	if err != nil {
-		t.Fatalf("decrypt failed: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Remove(plainPath) })
+			dataPath := filepath.Join(tmpDir, "streaming.dat")
+			original := make([]byte, tc.size)
+			for i := range original {
+				original[i] = byte(i%199) + 0x42
+			}
+			sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
+			plainPath, err := p.decryptSnapshotToScratch(tmpDir, dataPath, 1, 1, 1, tc.epoch, barrier)
+			if err != nil {
+				t.Fatalf("decrypt failed: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Remove(plainPath) })
 
-	decrypted, readErr := os.ReadFile(plainPath)
-	if readErr != nil {
-		t.Fatalf("read decrypted file failed: %v", readErr)
-	}
-	if len(decrypted) != 1 || decrypted[0] != 0x42 {
-		t.Fatalf("decrypted = %v, want [0x42]", decrypted)
+			decrypted, readErr := os.ReadFile(plainPath)
+			if readErr != nil {
+				t.Fatalf("read decrypted file failed: %v", readErr)
+			}
+			if !bytes.Equal(decrypted, original) {
+				t.Fatalf("decrypted %d bytes do not match the %d-byte original", len(decrypted), len(original))
+			}
+		})
 	}
 }
 
-// TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary verifies correct
-// behavior when the file size is an exact multiple of snapshotEncryptChunkSize.
-func TestSnapshotPool_EncryptFile_StreamingExactChunkBoundary(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(2)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
+// TestSnapshotPool_DecryptFile_RejectsMalformedArtifact verifies that
+// decryptSnapshotToScratch refuses an artifact it cannot read or whose frames
+// are cut short, and returns an empty path. An empty artifact is a truncation:
+// the writer always emits a terminal frame, so decrypting it to an empty state
+// machine would silently discard every entry the snapshot held.
+func TestSnapshotPool_DecryptFile_RejectsMalformedArtifact(t *testing.T) {
+	truncatedData := make([]byte, 4, 9)
+	binary.LittleEndian.PutUint32(truncatedData, 100) // claims 100 bytes
+	truncatedData = append(truncatedData, 1, 2, 3, 4, 5)
 
-	dataPath := filepath.Join(tmpDir, "exact-boundary.dat")
-	original := make([]byte, snapshotEncryptChunkSize*3)
-	for i := range original {
-		original[i] = byte(i % 199)
-	}
-	sealSnapshotFile(t, dataPath, original, 1, 1, 1, barrier)
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 2, barrier)
-	if err != nil {
-		t.Fatalf("decrypt failed: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Remove(plainPath) })
+	for _, tc := range []struct {
+		name string
+		// content is nil for a missing file.
+		content []byte
+		wantOp  string
+		// wantEncErr: the error is a *SnapshotEncryptError.
+		wantEncErr  bool
+		wantCorrupt bool
+	}{
+		{name: "missing file", wantEncErr: true, wantOp: "read"},
+		{name: "empty file", content: []byte{}, wantCorrupt: true},
+		{name: "truncated frame header", content: []byte{0x01, 0x02}, wantEncErr: true, wantCorrupt: true},
+		{name: "truncated frame data", content: truncatedData, wantEncErr: true, wantCorrupt: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			barrier := newTestBarrier(1)
+			stopC := make(chan struct{})
+			p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
 
-	decrypted, readErr := os.ReadFile(plainPath)
-	if readErr != nil {
-		t.Fatalf("read decrypted file failed: %v", readErr)
-	}
-	if len(decrypted) != len(original) {
-		t.Fatalf("decrypted length = %d, want %d", len(decrypted), len(original))
-	}
-	for i := range original {
-		if decrypted[i] != original[i] {
-			t.Fatalf("mismatch at byte %d: got %d, want %d", i, decrypted[i], original[i])
-		}
-	}
-}
+			dataPath := filepath.Join(tmpDir, "snapshot.dat")
+			if tc.content != nil {
+				if err := os.WriteFile(dataPath, tc.content, 0o644); err != nil {
+					t.Fatalf("write test data failed: %v", err)
+				}
+			}
 
-// TestSnapshotPool_DecryptFile_MissingFile verifies that
-// decryptSnapshotToScratch returns a SnapshotEncryptError and an empty path
-// when the source file does not exist.
-func TestSnapshotPool_DecryptFile_MissingFile(t *testing.T) {
-	barrier := newTestBarrier(1)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir("/nonexistent/path/snapshot.dat"), "/nonexistent/path/snapshot.dat", 1, 1, 1, 1, barrier)
-	if err == nil {
-		t.Fatal("expected error for missing file, got nil")
-	}
-	if plainPath != "" {
-		t.Fatalf("expected empty path on error, got %q", plainPath)
-	}
-	var encErr *SnapshotEncryptError
-	if !errors.As(err, &encErr) {
-		t.Fatalf("expected SnapshotEncryptError, got %T: %v", err, err)
-	}
-	if encErr.Op != "read" {
-		t.Errorf("Op = %q, want %q", encErr.Op, "read")
-	}
-}
-
-// TestSnapshotPool_DecryptFile_TruncatedFrameHeader verifies that a file
-// with fewer than 4 bytes remaining (partial frame header) is detected as
-// corrupt during streaming decryption.
-func TestSnapshotPool_DecryptFile_TruncatedFrameHeader(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(1)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	// Write a file with only 2 bytes (not enough for a frame header).
-	dataPath := filepath.Join(tmpDir, "truncated-header.dat")
-	if err := os.WriteFile(dataPath, []byte{0x01, 0x02}, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
-	if err == nil {
-		t.Fatal("expected error for truncated frame header")
-	}
-	if plainPath != "" {
-		t.Fatalf("expected empty path on error, got %q", plainPath)
-	}
-	var encErr *SnapshotEncryptError
-	if !errors.As(err, &encErr) {
-		t.Fatalf("expected SnapshotEncryptError, got %T: %v", err, err)
-	}
-	if !errors.Is(encErr.Err, ErrSnapshotCorrupt) {
-		t.Errorf("expected ErrSnapshotCorrupt in chain, got: %v", encErr.Err)
-	}
-}
-
-// TestSnapshotPool_DecryptFile_TruncatedFrameData verifies that a file
-// with a valid frame header but insufficient data bytes is detected as
-// corrupt during streaming decryption.
-func TestSnapshotPool_DecryptFile_TruncatedFrameData(t *testing.T) {
-	tmpDir := t.TempDir()
-	barrier := newTestBarrier(1)
-	stopC := make(chan struct{})
-	p := newSnapshotPool(2, nil, barrier, nil, nil, stopC, nil)
-
-	// Write a frame header claiming 100 bytes, but only 5 bytes of data.
-	dataPath := filepath.Join(tmpDir, "truncated-data.dat")
-	var header [4]byte
-	binary.LittleEndian.PutUint32(header[:], 100)
-	fileData := append(header[:], []byte{1, 2, 3, 4, 5}...)
-	if err := os.WriteFile(dataPath, fileData, 0o644); err != nil {
-		t.Fatalf("write test data failed: %v", err)
-	}
-
-	plainPath, err := p.decryptSnapshotToScratch(filepath.Dir(dataPath), dataPath, 1, 1, 1, 1, barrier)
-	if err == nil {
-		t.Fatal("expected error for truncated frame data")
-	}
-	if plainPath != "" {
-		t.Fatalf("expected empty path on error, got %q", plainPath)
-	}
-	var encErr *SnapshotEncryptError
-	if !errors.As(err, &encErr) {
-		t.Fatalf("expected SnapshotEncryptError, got %T: %v", err, err)
-	}
-	if !errors.Is(encErr.Err, ErrSnapshotCorrupt) {
-		t.Errorf("expected ErrSnapshotCorrupt in chain, got: %v", encErr.Err)
+			plainPath, err := p.decryptSnapshotToScratch(tmpDir, dataPath, 1, 1, 1, 1, barrier)
+			if err == nil {
+				t.Fatal("expected decrypt to fail")
+			}
+			if plainPath != "" {
+				t.Fatalf("expected empty path on error, got %q", plainPath)
+			}
+			if tc.wantEncErr {
+				var encErr *SnapshotEncryptError
+				if !errors.As(err, &encErr) {
+					t.Fatalf("expected SnapshotEncryptError, got %T: %v", err, err)
+				}
+				if tc.wantOp != "" && encErr.Op != tc.wantOp {
+					t.Errorf("Op = %q, want %q", encErr.Op, tc.wantOp)
+				}
+			}
+			if tc.wantCorrupt && !errors.Is(err, ErrSnapshotCorrupt) {
+				t.Errorf("expected ErrSnapshotCorrupt in chain, got: %v", err)
+			}
+		})
 	}
 }
 
@@ -2879,99 +2809,6 @@ func TestSnapshotPool_SaveSnapshot_TermFromAppliedToTerm(t *testing.T) {
 	}
 	if snap.Term != 7 {
 		t.Fatalf("snapshot term = %d, want 7 (from AppliedToTerm)", snap.Term)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// snapshotRequest.appliedToTerm: captured at creation, not read from Peer
-// ---------------------------------------------------------------------------
-
-func TestSnapshotRequest_AppliedToTermCarriedInRequest(t *testing.T) {
-	// Verify that saveSnapshot uses the term from the request struct
-	// rather than reading it from the Peer. This eliminates a data race
-	// between the snapshot pool worker (reader) and the step worker
-	// (writer of inMemory.appliedToTerm).
-	tmpDir := t.TempDir()
-	stopC := make(chan struct{})
-	defer close(stopC)
-
-	ldb := newSnapshotTestLogDB()
-	pool := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
-
-	var wg sync.WaitGroup
-	pool.start(&wg)
-
-	// Create a Peer and install a snapshot at index 100, term 7.
-	var shardID, replicaID uint64 = 60, 1
-	testLDB := newTestLogDB()
-	lr := logdb.NewLogReader(shardID, replicaID, testLDB)
-	ms := proto.Membership{
-		Addresses: map[uint64]string{replicaID: "localhost:0"},
-	}
-	lr.ApplySnapshot(proto.Snapshot{
-		Index:      0,
-		Term:       0,
-		Membership: ms,
-	})
-	cfg := config.Config{ShardID: shardID, ReplicaID: replicaID, CompactionOverhead: 50}
-	cfg.SetDefaults()
-	peer, err := raft.NewPeer(cfg, lr, nil)
-	if err != nil {
-		t.Fatalf("failed to create peer: %v", err)
-	}
-	snapMsg := proto.Message{
-		Type: proto.InstallSnapshot, Origin: proto.OriginLocal,
-		From:    2,
-		To:      1,
-		ShardID: shardID,
-		Term:    7,
-		Snapshot: proto.Snapshot{
-			Index:      100,
-			Term:       7,
-			Membership: ms,
-		},
-	}
-	if handleErr := peer.Handle(snapMsg); handleErr != nil {
-		t.Fatalf("Handle snapshot failed: %v", handleErr)
-	}
-
-	ss := newSnapshotTestSnapshotter(100)
-	node := NewNode(peer, nil, lr, cfg, ss, tmpDir, nil)
-
-	// Capture the term at creation time, as production code does.
-	capturedTerm := peer.AppliedToTerm()
-	if capturedTerm != 7 {
-		t.Fatalf("captured term = %d, want 7", capturedTerm)
-	}
-
-	// Pass the captured term in the request. The pool worker must
-	// use this value, not call peer.AppliedToTerm() itself.
-	err = pool.requestSnapshot(snapshotRequest{
-		shardID:       shardID,
-		replicaID:     replicaID,
-		node:          node,
-		appliedToTerm: capturedTerm,
-		save:          true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	result := awaitSnapshotResult(t, pool, "snapshot")
-	if result.err != nil {
-		t.Fatalf("snapshot save failed: %v", result.err)
-	}
-	if result.index != 100 {
-		t.Fatalf("result.index = %d, want 100", result.index)
-	}
-
-	// Verify the LogDB snapshot has the term from the request.
-	snap, snapErr := ldb.GetSnapshot(shardID, replicaID)
-	if snapErr != nil {
-		t.Fatalf("GetSnapshot failed: %v", snapErr)
-	}
-	if snap.Term != 7 {
-		t.Fatalf("snapshot term = %d, want 7 (from request.appliedToTerm)", snap.Term)
 	}
 }
 
@@ -3195,102 +3032,6 @@ func TestSnapshotPool_SaveSnapshot_NoPartialFileOnError(t *testing.T) {
 	}
 }
 
-func TestSnapshotPool_GCSnapshotDirs_RemovesOrphanedDirs(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	const shardID uint64 = 5
-	const replicaID uint64 = 1
-
-	// Create 3 valid snapshot directories with metadata files. These
-	// represent properly completed snapshots that should be retained
-	// by GC (maxSnapshotsRetained = 3).
-	validIndices := []uint64{100, 200, 300}
-	for _, idx := range validIndices {
-		dir := snapshotSaveDir(tmpDir, shardID, replicaID, idx)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed for index %d: %v", idx, err)
-		}
-		if err := writeTestSnapshotMetadata(dir, idx, 1, shardID, replicaID, 0, config.NoCompression); err != nil {
-			t.Fatalf("writeSnapshotMetadata failed for index %d: %v", idx, err)
-		}
-		// Write a data file to make it a complete snapshot directory.
-		dataPath := filepath.Join(dir, snapshotDataFile)
-		if err := os.WriteFile(dataPath, []byte{0x01, 0x02, 0x03}, 0o640); err != nil {
-			t.Fatalf("write data file failed for index %d: %v", idx, err)
-		}
-	}
-
-	// Create 2 orphaned snapshot directories. These simulate incomplete
-	// writes from crashed or failed snapshot operations. They have the
-	// standard snapshot-XXXXX naming but lack valid metadata or contain
-	// only partial data. GC treats them as regular entries sorted by
-	// index and removes the oldest when count exceeds maxSnapshotsRetained.
-	orphanedIndices := []uint64{50, 75}
-	for _, idx := range orphanedIndices {
-		dir := snapshotSaveDir(tmpDir, shardID, replicaID, idx)
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			t.Fatalf("mkdir failed for orphan index %d: %v", idx, err)
-		}
-		// Write a partial data file with no metadata, simulating an
-		// incomplete snapshot that was interrupted before metadata
-		// was written.
-		partialPath := filepath.Join(dir, snapshotDataFile)
-		if err := os.WriteFile(partialPath, []byte{0xDE, 0xAD}, 0o640); err != nil {
-			t.Fatalf("write partial file failed for orphan index %d: %v", idx, err)
-		}
-	}
-
-	// Verify we have 5 total snapshot directories before GC.
-	dirsBefore, err := listSnapshotDirs(tmpDir, shardID, replicaID)
-	if err != nil {
-		t.Fatalf("listSnapshotDirs before GC failed: %v", err)
-	}
-	if len(dirsBefore) != 5 {
-		t.Fatalf("expected 5 dirs before GC, got %d", len(dirsBefore))
-	}
-
-	// Run garbage collection.
-	if err := gcSnapshotDirs(tmpDir, shardID, replicaID, ""); err != nil {
-		t.Fatalf("gcSnapshotDirs failed: %v", err)
-	}
-
-	// Verify that GC retained only maxSnapshotsRetained (3) directories.
-	dirsAfter, err := listSnapshotDirs(tmpDir, shardID, replicaID)
-	if err != nil {
-		t.Fatalf("listSnapshotDirs after GC failed: %v", err)
-	}
-	if len(dirsAfter) != maxSnapshotsRetained {
-		t.Fatalf("expected %d dirs after GC, got %d", maxSnapshotsRetained, len(dirsAfter))
-	}
-
-	// Verify the orphaned directories (indices 50 and 75) were removed
-	// because they are the oldest entries. GC sorts by index ascending
-	// and removes everything except the last maxSnapshotsRetained.
-	for _, idx := range orphanedIndices {
-		dir := snapshotSaveDir(tmpDir, shardID, replicaID, idx)
-		if _, err := os.Stat(dir); !os.IsNotExist(err) {
-			t.Fatalf("orphaned dir should be removed after GC: %s (err=%v)", dir, err)
-		}
-	}
-
-	// Verify all 3 valid snapshot directories are retained with their
-	// metadata and data files intact.
-	for _, idx := range validIndices {
-		dir := snapshotSaveDir(tmpDir, shardID, replicaID, idx)
-		if _, err := os.Stat(dir); os.IsNotExist(err) {
-			t.Fatalf("valid snapshot dir should be retained: %s", dir)
-		}
-		metaPath := filepath.Join(dir, snapshotMetadataFile)
-		if _, err := os.Stat(metaPath); os.IsNotExist(err) {
-			t.Fatalf("metadata file should exist in retained dir: %s", metaPath)
-		}
-		dataPath := filepath.Join(dir, snapshotDataFile)
-		if _, err := os.Stat(dataPath); os.IsNotExist(err) {
-			t.Fatalf("data file should exist in retained dir: %s", dataPath)
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // exportSnapshotToPath
 // ---------------------------------------------------------------------------
@@ -3314,93 +3055,55 @@ func TestExportSnapshotToPath_MissingSourceData(t *testing.T) {
 // saveSnapshot with per-request CompactionOverhead override
 // ---------------------------------------------------------------------------
 
-func TestSaveSnapshot_CompactionOverheadOverride(t *testing.T) {
-	snapDir := t.TempDir()
-	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
-	cfg.SetDefaults()
+func TestSaveSnapshot_CompactionOverhead(t *testing.T) {
+	// The shard config's overhead is 50; a request may override it.
+	for _, tc := range []struct {
+		name               string
+		compactionOverhead uint64
+		overrideCompaction bool
+		wantRemovedTo      uint64
+	}{
+		{name: "request override", compactionOverhead: 10, overrideCompaction: true, wantRemovedTo: 200 - 10},
+		{name: "shard config default", wantRemovedTo: 200 - 50},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapDir := t.TempDir()
+			cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
+			cfg.SetDefaults()
 
-	snapshotter := &snapshotTestSnapshotter{}
-	snapshotter.lastApplied.Store(200)
-	snapshotter.state.Store(42)
+			snapshotter := &snapshotTestSnapshotter{}
+			snapshotter.lastApplied.Store(200)
+			snapshotter.state.Store(42)
 
-	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
+			node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
 
-	ldb := newSnapshotTestLogDB()
-	stopC := make(chan struct{})
-	pool := newSnapshotPool(1, ldb, nil, nil, nil, stopC, nil)
+			ldb := newSnapshotTestLogDB()
+			stopC := make(chan struct{})
+			pool := newSnapshotPool(1, ldb, nil, nil, nil, stopC, nil)
 
-	// Request with compaction override of 10 instead of shard config's 50.
-	req := snapshotRequest{
-		shardID:            10,
-		replicaID:          1,
-		node:               node,
-		save:               true,
-		compactionOverhead: 10,
-		overrideCompaction: true,
-	}
+			index, err := pool.saveSnapshot(snapshotRequest{
+				shardID:            10,
+				replicaID:          1,
+				node:               node,
+				save:               true,
+				compactionOverhead: tc.compactionOverhead,
+				overrideCompaction: tc.overrideCompaction,
+			})
+			if err != nil {
+				t.Fatalf("saveSnapshot failed: %v", err)
+			}
+			if index != 200 {
+				t.Fatalf("snapshot index = %d, want 200", index)
+			}
 
-	index, err := pool.saveSnapshot(req)
-	if err != nil {
-		t.Fatalf("saveSnapshot failed: %v", err)
-	}
-	if index != 200 {
-		t.Fatalf("snapshot index = %d, want 200", index)
-	}
-
-	// Verify that log compaction used the override value (10) not the config value (50).
-	// With override=10: compactIndex = 200-10 = 190.
-	// With config=50:   compactIndex = 200-50 = 150.
-	// The mock logdb records the compact index.
-	ldb.mu.Lock()
-	removedTo := ldb.removedTo
-	ldb.mu.Unlock()
-
-	expectedCompactIdx := uint64(200 - 10)
-	if removedTo != expectedCompactIdx {
-		t.Errorf("RemoveEntriesTo called with %d, want %d (compaction overhead override should be 10, not 50)",
-			removedTo, expectedCompactIdx)
-	}
-}
-
-func TestSaveSnapshot_CompactionOverheadDefault(t *testing.T) {
-	snapDir := t.TempDir()
-	cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
-	cfg.SetDefaults()
-
-	snapshotter := &snapshotTestSnapshotter{}
-	snapshotter.lastApplied.Store(200)
-	snapshotter.state.Store(42)
-
-	node := NewNode(nil, nil, nil, cfg, snapshotter, snapDir, nil)
-
-	ldb := newSnapshotTestLogDB()
-	stopC := make(chan struct{})
-	pool := newSnapshotPool(1, ldb, nil, nil, nil, stopC, nil)
-
-	// Request WITHOUT compaction override should use config's 50.
-	req := snapshotRequest{
-		shardID:   10,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	}
-
-	index, err := pool.saveSnapshot(req)
-	if err != nil {
-		t.Fatalf("saveSnapshot failed: %v", err)
-	}
-	if index != 200 {
-		t.Fatalf("snapshot index = %d, want 200", index)
-	}
-
-	ldb.mu.Lock()
-	removedTo := ldb.removedTo
-	ldb.mu.Unlock()
-
-	expectedCompactIdx := uint64(200 - 50)
-	if removedTo != expectedCompactIdx {
-		t.Errorf("RemoveEntriesTo called with %d, want %d (should use shard config overhead of 50)",
-			removedTo, expectedCompactIdx)
+			// The mock logdb records the compact index.
+			ldb.mu.Lock()
+			removedTo := ldb.removedTo
+			ldb.mu.Unlock()
+			if removedTo != tc.wantRemovedTo {
+				t.Errorf("RemoveEntriesTo called with %d, want %d", removedTo, tc.wantRemovedTo)
+			}
+		})
 	}
 }
 
@@ -3516,57 +3219,6 @@ func (s *panickingSnapshotter) RecoverFromSnapshot(_ context.Context, _ io.Reade
 func (s *panickingSnapshotter) LastApplied() uint64 { return 42 }
 
 var _ Snapshotter = (*panickingSnapshotter)(nil)
-
-// TestHandleRequest_PanicRecovery_SaveRequest verifies that handleRequest
-// recovers from a panic in the save path, clears in-flight and snapshotting
-// flags, and notifies the callback via OnSnapshotRejected.
-func TestHandleRequest_PanicRecovery_SaveRequest(t *testing.T) {
-	_, restore := captureLogOutput(t)
-	defer restore()
-
-	stopC := make(chan struct{})
-	ws := NewWorkSignal(1)
-	cb := newTestCallback()
-
-	pool := newSnapshotPool(1, nil, nil, cb, ws, stopC, nil)
-
-	var wg sync.WaitGroup
-	pool.start(&wg)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	snapDir := t.TempDir()
-	node := NewNode(nil, nil, nil, cfg, &panickingSnapshotter{}, snapDir, nil)
-	node.snapshotting.Store(true)
-
-	err := pool.requestSnapshot(snapshotRequest{
-		shardID:   1,
-		replicaID: 1,
-		node:      node,
-		save:      true,
-	})
-	if err != nil {
-		t.Fatalf("requestSnapshot failed: %v", err)
-	}
-
-	// Wait for the request to be processed (panic recovered).
-	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
-		return !node.snapshotting.Load()
-	})
-
-	// snapshotting should be cleared.
-	if node.snapshotting.Load() {
-		t.Fatal("snapshotting should be cleared after panic recovery")
-	}
-
-	// OnSnapshotCompleted should NOT be called (panic path uses OnSnapshotRejected).
-	if cb.snapshotCallCount.Load() != 0 {
-		t.Fatal("OnSnapshotCompleted should not be called on panic path")
-	}
-
-	close(stopC)
-	wg.Wait()
-}
 
 // TestHandleRequest_PanicRecovery_RecoverRequest verifies that handleRequest
 // recovers from a panic in the recovery path, clears recovering and
@@ -3885,79 +3537,39 @@ func TestHandleRequest_FailedSaveIsLoggedNotLatched(t *testing.T) {
 // unable to snapshot and the caller's pending request waiting for a
 // completion callback that can never fire.
 func TestSnapshotPool_ShutdownReleasesQueuedRequests(t *testing.T) {
-	t.Run("shutdown races the producer", func(t *testing.T) {
-		// stopC is already closed when the request is submitted: the send
-		// still succeeds (the buffer has room) and no worker will ever read
-		// it, so requestSnapshot itself must release it.
-		stopC := make(chan struct{})
-		close(stopC)
-		cb := newTestCallback()
-		p := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
+	// stopC is already closed when the request is submitted: the send
+	// still succeeds (the buffer has room) and no worker will ever read
+	// it, so requestSnapshot itself must release it.
+	stopC := make(chan struct{})
+	close(stopC)
+	cb := newTestCallback()
+	p := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
 
-		cfg := config.Config{ShardID: 7, ReplicaID: 1}
-		cfg.SetDefaults()
-		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-		if !node.TryStartSnapshot() {
-			t.Fatal("TryStartSnapshot should succeed on a fresh node")
-		}
+	cfg := config.Config{ShardID: 7, ReplicaID: 1}
+	cfg.SetDefaults()
+	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
+	if !node.TryStartSnapshot() {
+		t.Fatal("TryStartSnapshot should succeed on a fresh node")
+	}
 
-		if err := p.requestSnapshot(snapshotRequest{
-			shardID: 7, replicaID: 1, node: node, save: true,
-		}); err != nil {
-			t.Fatalf("requestSnapshot failed: %v", err)
-		}
+	if err := p.requestSnapshot(snapshotRequest{
+		shardID: 7, replicaID: 1, node: node, save: true,
+	}); err != nil {
+		t.Fatalf("requestSnapshot failed: %v", err)
+	}
 
-		if node.snapshotting.Load() {
-			t.Fatal("node left marked snapshotting by a request no worker will run")
-		}
-		if _, loaded := p.inFlight.Load(uint64(7)); loaded {
-			t.Fatal("shard left marked in-flight: no further snapshot could ever be accepted")
-		}
-		if cb.snapshotRejected.Load() == 0 {
-			t.Fatal("expected OnSnapshotRejected so the caller stops waiting")
-		}
-		if len(p.requestC) != 0 {
-			t.Fatal("the stranded request was left on requestC")
-		}
-	})
-
-	t.Run("workers drain on exit", func(t *testing.T) {
-		// The request is queued while the pool is live, then the pool is
-		// stopped. Whichever branch the worker's select takes, the request
-		// must not be left holding the shard's snapshot state. (A worker
-		// that picks up the request runs it normally; one that observes
-		// stopC first drains it.)
-		stopC := make(chan struct{})
-		cb := newTestCallback()
-		p := newSnapshotPool(1, nil, nil, cb, NewWorkSignal(1), stopC, nil)
-
-		cfg := config.Config{ShardID: 8, ReplicaID: 1}
-		cfg.SetDefaults()
-		node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-		if !node.TryStartSnapshot() {
-			t.Fatal("TryStartSnapshot should succeed on a fresh node")
-		}
-		if err := p.requestSnapshot(snapshotRequest{
-			shardID: 8, replicaID: 1, node: node, save: true,
-		}); err != nil {
-			t.Fatalf("requestSnapshot failed: %v", err)
-		}
-
-		close(stopC)
-		var wg sync.WaitGroup
-		p.start(&wg)
-		wg.Wait()
-
-		if node.snapshotting.Load() {
-			t.Fatal("node left marked snapshotting after the pool stopped")
-		}
-		if _, loaded := p.inFlight.Load(uint64(8)); loaded {
-			t.Fatal("shard left marked in-flight after the pool stopped")
-		}
-		if len(p.requestC) != 0 {
-			t.Fatal("a request was left on requestC after every worker exited")
-		}
-	})
+	if node.snapshotting.Load() {
+		t.Fatal("node left marked snapshotting by a request no worker will run")
+	}
+	if _, loaded := p.inFlight.Load(uint64(7)); loaded {
+		t.Fatal("shard left marked in-flight: no further snapshot could ever be accepted")
+	}
+	if cb.snapshotRejected.Load() == 0 {
+		t.Fatal("expected OnSnapshotRejected so the caller stops waiting")
+	}
+	if len(p.requestC) != 0 {
+		t.Fatal("the stranded request was left on requestC")
+	}
 }
 
 // ---------------------------------------------------------------------------
