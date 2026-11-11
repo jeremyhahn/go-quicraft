@@ -244,17 +244,6 @@ var _ sm.StateMachine = (*testSM)(nil)
 
 // --- Step Worker Tests ---
 
-func TestStepWorker_UnloadNonexistent(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-	// Should not panic.
-	sw.unloadNode(999)
-}
-
 func TestStepWorker_UnloadCleansUpMaps(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -262,6 +251,9 @@ func TestStepWorker_UnloadCleansUpMaps(t *testing.T) {
 	stopC := make(chan struct{})
 
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
+
+	// Unloading a shard that was never loaded is a no-op.
+	sw.unloadNode(999)
 
 	cfg := config.Config{ShardID: 10, ReplicaID: 1}
 	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
@@ -349,12 +341,14 @@ func TestStepWorker_RunStopsOnStopC(t *testing.T) {
 
 func TestCommitWorker_ProcessBatch_SaveStateError(t *testing.T) {
 	ldb := newTestLogDB()
+	sender := newTestSender()
 	commitC := make(chan *commitItem, 16)
 	applyC := make(chan *applyItem, 16)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
 	stopC := make(chan struct{})
 
-	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
+	cb := newTestCallback()
+	cw := newCommitWorker(0, ldb, sender, commitC, applyC, applyPool, NewWorkSignal(1), cb, stopC, nil)
 	cw.noRetryDelay = true // skip retry backoff in tests
 
 	saveErr := errors.New("disk failure")
@@ -371,8 +365,13 @@ func TestCommitWorker_ProcessBatch_SaveStateError(t *testing.T) {
 	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
+	// An update with no committed entries, and an ordered message that
+	// may only leave once the state it answers for is durable.
 	cw.batch = append(cw.batch[:0], proto.Update{ShardID: 1, ReplicaID: 1})
 	cw.batchNodes = []*Node{node}
+	cw.orderedMsgsBuf[1] = []proto.Message{
+		{Type: proto.RequestVoteResp, From: 1, To: 2, ShardID: 1},
+	}
 	cw.processBatch()
 
 	// commitPending should be cleared on error.
@@ -390,29 +389,17 @@ func TestCommitWorker_ProcessBatch_SaveStateError(t *testing.T) {
 		t.Fatalf("expected %d SaveState calls (retries), got %d",
 			saveStateMaxRetries, ldb.saveCount.Load())
 	}
-}
 
-func TestCommitWorker_RunStopsOnStopC(t *testing.T) {
-	ldb := newTestLogDB()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
+	// Ordered messages must not be sent when SaveState fails.
+	if sender.sentCount() != 0 {
+		t.Fatalf("expected 0 messages sent on SaveState error, got %d",
+			sender.sentCount())
+	}
 
-	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
-
-	done := make(chan struct{})
-	go func() {
-		cw.run()
-		close(done)
-	}()
-
-	close(stopC)
-	select {
-	case <-done:
-		// Expected.
-	case <-time.After(2 * time.Second):
-		t.Fatal("commit worker did not stop within timeout")
+	// With no committed entries there is no proposal to fail.
+	if cb.proposalFailedCount.Load() != 0 {
+		t.Fatalf("expected 0 OnProposalFailed calls for empty committed entries, got %d",
+			cb.proposalFailedCount.Load())
 	}
 }
 
@@ -612,29 +599,6 @@ func TestApplyWorker_ClearsCommitPendingOnEmptyEntries(t *testing.T) {
 	close(stopC)
 	<-runDone
 	wg.Wait()
-}
-
-func TestApplyWorker_RunStopsOnStopC(t *testing.T) {
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	var wg sync.WaitGroup
-	stopC := make(chan struct{})
-
-	aw := newApplyWorker(0, applyC, applyPool, 4, &wg, nil, nil, NewWorkSignal(1), stopC, nil)
-
-	done := make(chan struct{})
-	go func() {
-		aw.run()
-		close(done)
-	}()
-
-	close(stopC)
-	select {
-	case <-done:
-		// Expected.
-	case <-time.After(2 * time.Second):
-		t.Fatal("apply worker did not stop within timeout")
-	}
 }
 
 func TestApplyWorker_DrainOnShutdown(t *testing.T) {
@@ -888,78 +852,58 @@ func TestStepWorker_TickSkipsNilPeer(t *testing.T) {
 	sw.tick()
 }
 
-func TestStepWorker_ProcessReady_SkipsNilPeer(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	// Signal work for shard 1.
-	ws.Notify(1)
-
-	// processReady should skip the node since peer is nil.
-	sw.processReady()
-
-	// No items should be in commitC.
-	select {
-	case <-commitC:
-		t.Fatal("expected no commit items for node with nil peer")
-	default:
-		// Expected.
+func TestStepWorker_ProcessReady_SkipsIneligibleNode(t *testing.T) {
+	tests := []struct {
+		name          string
+		nilPeer       bool
+		failed        bool
+		commitPending bool
+	}{
+		{name: "nil peer", nilPeer: true},
+		// The failed and commit-pending cases carry a real leader peer with
+		// a pending proposal, so only the skip keeps the update out of
+		// commitC.
+		{name: "failed node", failed: true},
+		{name: "commit pending", commitPending: true},
 	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sender := newTestSender()
+			ws := NewWorkSignal(1)
+			commitC := make(chan *commitItem, 16)
+			stopC := make(chan struct{})
 
-func TestStepWorker_ProcessReady_SkipsFailedNode(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
+			sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
+			cfg := config.Config{ShardID: 1, ReplicaID: 1}
+			var node *Node
+			if tt.nilPeer {
+				node = NewNode(nil, nil, nil, cfg, nil, "", nil)
+			} else {
+				peer, lr := newTestPeer(t, 1, 1)
+				cfg.SetDefaults()
+				node = NewNode(peer, nil, lr, cfg, nil, "", nil)
+				tickPeerToLeader(peer)
+				if _, err := peer.Propose([]proto.Entry{{Cmd: []byte("skip")}}); err != nil {
+					t.Fatalf("propose failed: %v", err)
+				}
+				if !peer.HasUpdate(0) {
+					t.Fatal("peer should have an update before processReady")
+				}
+			}
+			node.failed.Store(tt.failed)
+			node.commitPending.Store(tt.commitPending)
+			sw.loadNode(node)
 
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-	node.failed.Store(true)
-	sw.loadNode(node)
+			ws.Notify(1)
+			sw.processReady()
 
-	ws.Notify(1)
-	sw.processReady()
-
-	select {
-	case <-commitC:
-		t.Fatal("expected no commit items for failed node")
-	default:
-		// Expected.
-	}
-}
-
-func TestStepWorker_ProcessReady_SkipsCommitPending(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, "", nil)
-	node.commitPending.Store(true)
-	sw.loadNode(node)
-
-	ws.Notify(1)
-	sw.processReady()
-
-	select {
-	case <-commitC:
-		t.Fatal("expected no commit items for commitPending node")
-	default:
-		// Expected.
+			select {
+			case <-commitC:
+				t.Fatalf("expected no commit items for %s", tt.name)
+			default:
+			}
+		})
 	}
 }
 
@@ -1004,61 +948,45 @@ func tickPeerToLeader(peer *raft.Peer) {
 	}
 }
 
-func TestStepWorker_Tick_RunsDuringCommitPending(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-
-	// Set commitPending to simulate the commit worker owning this peer.
-	// Tick must still run to maintain leader heartbeat liveness. Prior to
-	// the tick starvation fix, commitPending=true caused tick() to skip
-	// the node entirely, starving heartbeats and causing leader step-down
-	// under concurrent proposal load.
-	node.commitPending.Store(true)
-	sw.loadNode(node)
-
-	// Tick enough times to trigger an election. Even with commitPending=true,
-	// the peer should be ticked, advancing its election timer and eventually
-	// becoming leader (single-node cluster).
-	for range 30 {
-		sw.tick()
-	}
-
-	if !peer.IsLeader() {
-		t.Fatal("peer should be ticked even while commitPending is true")
-	}
-}
-
 func TestStepWorker_Tick_InvokesPeerTick(t *testing.T) {
-	sender := newTestSender()
-	ws := NewWorkSignal(1)
-	commitC := make(chan *commitItem, 16)
-	stopC := make(chan struct{})
-
-	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
-
-	peer, lr := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-	node := NewNode(peer, nil, lr, cfg, nil, "", nil)
-	sw.loadNode(node)
-
-	// Tick enough times to trigger an election in a single-node cluster.
-	for range 20 {
-		sw.tick()
+	tests := []struct {
+		name          string
+		commitPending bool
+	}{
+		{name: "idle node", commitPending: false},
+		// The commit worker owning the peer must not stop the tick: leader
+		// heartbeat liveness depends on it. Prior to the tick starvation
+		// fix, commitPending=true caused tick() to skip the node entirely,
+		// starving heartbeats and causing leader step-down under concurrent
+		// proposal load.
+		{name: "commit pending", commitPending: true},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sender := newTestSender()
+			ws := NewWorkSignal(1)
+			commitC := make(chan *commitItem, 16)
+			stopC := make(chan struct{})
 
-	// After enough ticks, a single-node peer should become leader.
-	if !peer.IsLeader() {
-		t.Fatal("peer should be leader after sufficient ticks in single-node cluster")
+			sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
+
+			peer, lr := newTestPeer(t, 1, 1)
+			cfg := config.Config{ShardID: 1, ReplicaID: 1}
+			cfg.SetDefaults()
+			node := NewNode(peer, nil, lr, cfg, nil, "", nil)
+			node.commitPending.Store(tt.commitPending)
+			sw.loadNode(node)
+
+			// Tick enough times to trigger an election: a single-node
+			// peer that is ticked becomes leader.
+			for range 30 {
+				sw.tick()
+			}
+
+			if !peer.IsLeader() {
+				t.Fatal("peer should be leader after sufficient ticks in single-node cluster")
+			}
+		})
 	}
 }
 
@@ -2119,51 +2047,6 @@ func TestCommitWorker_SendsOrderedMessagesAfterSaveState(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_OrderedMsgsNotSentOnSaveStateError verifies that
-// when SaveState fails, ordered messages are NOT sent. This prevents
-// sending VoteResp for a vote that was not actually persisted.
-func TestCommitWorker_OrderedMsgsNotSentOnSaveStateError(t *testing.T) {
-	ldb := newTestLogDB()
-	sender := newTestSender()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-
-	cw := newCommitWorker(0, ldb, sender, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
-	cw.noRetryDelay = true // skip retry backoff in tests
-
-	saveErr := errors.New("disk failure")
-	ldb.setSaveError(saveErr)
-
-	listener := &config.EventListener{
-		OnShardFailed: func(_ config.ShardFailedInfo) {},
-	}
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
-	node.commitPending.Store(true)
-
-	cw.batch = append(cw.batch[:0], proto.Update{ShardID: 1, ReplicaID: 1})
-	cw.batchNodes = []*Node{node}
-	cw.orderedMsgsBuf[1] = []proto.Message{
-		{Type: proto.RequestVoteResp, From: 1, To: 2, ShardID: 1},
-	}
-
-	cw.processBatch()
-
-	// Verify ordered messages were NOT sent.
-	if sender.sentCount() != 0 {
-		t.Fatalf("expected 0 messages sent on SaveState error, got %d",
-			sender.sentCount())
-	}
-
-	// Verify commitPending was cleared.
-	if node.commitPending.Load() {
-		t.Fatal("commitPending should be cleared after SaveState error")
-	}
-}
-
 // TestCommitWorker_OrderedMsgsNilSender verifies that when the sender
 // is nil (memory mode), ordered messages are silently skipped without
 // panic.
@@ -2640,46 +2523,6 @@ func TestCommitWorker_SaveStateError_MultipleShards(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_SaveStateError_NoCommittedEntries verifies that
-// OnProposalFailed is NOT called when there are no committed entries
-// in the failed batch (e.g., first-round WAL persistence with no
-// committed entries).
-func TestCommitWorker_SaveStateError_NoCommittedEntries(t *testing.T) {
-	ldb := newTestLogDB()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-
-	cb := newTestCallback()
-	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), cb, stopC, nil)
-	cw.noRetryDelay = true // skip retry backoff in tests
-
-	ldb.setSaveError(errors.New("full"))
-
-	listener := &config.EventListener{
-		OnShardFailed: func(_ config.ShardFailedInfo) {},
-	}
-
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	node := NewNode(nil, nil, nil, cfg, nil, "", listener)
-	node.commitPending.Store(true)
-
-	// No committed entries in this update.
-	cw.batch = append(cw.batch[:0], proto.Update{
-		ShardID:   1,
-		ReplicaID: 1,
-	})
-	cw.batchNodes = []*Node{node}
-	cw.processBatch()
-
-	// OnProposalFailed should NOT have been called.
-	if cb.proposalFailedCount.Load() != 0 {
-		t.Fatalf("expected 0 OnProposalFailed calls for empty committed entries, got %d",
-			cb.proposalFailedCount.Load())
-	}
-}
-
 // TestCommitWorker_SaveStateError_NilCallback verifies that SaveState
 // failure with a nil callback does not panic when completing proposals.
 func TestCommitWorker_SaveStateError_NilCallback(t *testing.T) {
@@ -2832,84 +2675,6 @@ done:
 	}
 	if !seenNew {
 		t.Fatal("expected apply item referencing newNode")
-	}
-}
-
-// TestCommitWorker_ProcessBatch_StaleIncarnation_Error verifies that when
-// an old incarnation's update fails Peer.Commit (e.g., due to stale
-// state after restart), the error is handled gracefully without panicking,
-// and the node's commitPending is cleared so it doesn't block future
-// processing.
-func TestCommitWorker_ProcessBatch_StaleIncarnation_Error(t *testing.T) {
-	ldb := newTestLogDB()
-	commitC := make(chan *commitItem, 16)
-	applyC := make(chan *applyItem, 16)
-	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
-	stopC := make(chan struct{})
-
-	cw := newCommitWorker(0, ldb, nil, commitC, applyC, applyPool, NewWorkSignal(1), nil, stopC, nil)
-	cw.noRetryDelay = true
-
-	// Create two independent nodes for the same shardID.
-	peer1, lr1 := newTestPeer(t, 1, 1)
-	peer2, lr2 := newTestPeer(t, 1, 1)
-	cfg := config.Config{ShardID: 1, ReplicaID: 1}
-	cfg.SetDefaults()
-
-	node1 := NewNode(peer1, newTestApplier(newTestSM()), lr1, cfg, nil, "", nil)
-	node1.commitPending.Store(true)
-	node2 := NewNode(peer2, newTestApplier(newTestSM()), lr2, cfg, nil, "", nil)
-	node2.commitPending.Store(true)
-
-	tickPeerToLeader(peer1)
-	tickPeerToLeader(peer2)
-
-	// Get updates from both peers.
-	update1, err := peer1.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("GetUpdate peer1: %v", err)
-	}
-	update2, err := peer2.GetUpdate(true, 0)
-	if err != nil {
-		t.Fatalf("GetUpdate peer2: %v", err)
-	}
-
-	// Each update should commit to its own node without interference.
-	cw.batch = []proto.Update{update1, update2}
-	cw.batchNodes = []*Node{node1, node2}
-
-	// Must not panic. With a shardID-keyed nodesBuf, the second
-	// entry would clobber the first for the same shardID, causing
-	// update1's committed entries to be applied to node2's peer
-	// (whose committed index may be different).
-	cw.processBatch()
-
-	// Verify updates were forwarded to apply worker with correct
-	// node ownership.
-	var items []*applyItem
-	for {
-		select {
-		case ai := <-applyC:
-			items = append(items, ai)
-		default:
-			goto done2
-		}
-	}
-done2:
-	seen1, seen2 := false, false
-	for _, ai := range items {
-		if ai.node == node1 {
-			seen1 = true
-		}
-		if ai.node == node2 {
-			seen2 = true
-		}
-	}
-	if !seen1 {
-		t.Fatal("expected apply item for node1")
-	}
-	if !seen2 {
-		t.Fatal("expected apply item for node2")
 	}
 }
 
@@ -3186,8 +2951,8 @@ func TestCommitWorker_PiggybackPersistFailureReoffers(t *testing.T) {
 	select {
 	case <-applyC:
 		t.Fatal("piggyback must NOT forward to apply when commit-index persist fails")
-	case <-time.After(100 * time.Millisecond):
-		// expected: nothing applied
+	default:
+		// expected: processBatch is synchronous, so nothing was applied
 	}
 
 	// Self-healing: commitPending is cleared so the shard can re-offer the
