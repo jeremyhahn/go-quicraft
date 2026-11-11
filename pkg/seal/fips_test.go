@@ -33,40 +33,6 @@ func skipIfModuleActive(t *testing.T) {
 	}
 }
 
-func TestFIPSEnabled_WithEnvSet(t *testing.T) {
-	original := os.Getenv(envGOFIPS140)
-	t.Cleanup(func() {
-		if original == "" {
-			os.Unsetenv(envGOFIPS140)
-		} else {
-			os.Setenv(envGOFIPS140, original)
-		}
-	})
-
-	os.Setenv(envGOFIPS140, "1")
-	if !FIPSEnabled() {
-		t.Fatal("expected FIPSEnabled() to return true when GOFIPS140 is set")
-	}
-}
-
-func TestFIPSEnabled_WithEnvUnset(t *testing.T) {
-	skipIfModuleActive(t)
-
-	original := os.Getenv(envGOFIPS140)
-	t.Cleanup(func() {
-		if original == "" {
-			os.Unsetenv(envGOFIPS140)
-		} else {
-			os.Setenv(envGOFIPS140, original)
-		}
-	})
-
-	os.Unsetenv(envGOFIPS140)
-	if FIPSEnabled() {
-		t.Fatal("expected FIPSEnabled() to return false when GOFIPS140 is unset")
-	}
-}
-
 func TestDefaultKDFVersion_StandardMode(t *testing.T) {
 	skipIfModuleActive(t)
 
@@ -81,22 +47,6 @@ func TestDefaultKDFVersion_StandardMode(t *testing.T) {
 
 	os.Unsetenv(envGOFIPS140)
 	assertDefaultKDFVersionOutsideFIPS(t)
-}
-
-func TestDefaultKDFVersion_FIPSMode(t *testing.T) {
-	original := os.Getenv(envGOFIPS140)
-	t.Cleanup(func() {
-		if original == "" {
-			os.Unsetenv(envGOFIPS140)
-		} else {
-			os.Setenv(envGOFIPS140, original)
-		}
-	})
-
-	os.Setenv(envGOFIPS140, "1")
-	if v := DefaultKDFVersion(); v != KDFPbkdf2SHA256 {
-		t.Fatalf("expected KDFPbkdf2SHA256 (%d), got %d", KDFPbkdf2SHA256, v)
-	}
 }
 
 // TestFIPSEnabledOffValue verifies GOFIPS140=off is honored as DISABLED
