@@ -163,42 +163,34 @@ func TestNoneStrategy_SealRootKey_MarkerOnly(t *testing.T) {
 	if len(sealed.Ciphertext) != 0 {
 		t.Fatalf("sealed.Ciphertext should be empty for NoneStrategy, got %d bytes", len(sealed.Ciphertext))
 	}
-	if bytes.Contains(sealed.Ciphertext, rootKey) {
-		t.Fatal("sealed.Ciphertext leaked the input root key bytes")
-	}
 	if sealed.CreatedAt.IsZero() {
 		t.Fatal("sealed.CreatedAt should be set")
 	}
 }
 
-// TestNoneStrategy_UnsealRootKey_EmptyKey asserts that UnsealRootKey returns
-// an empty slice (no key material is needed because the identity encrypter
-// ignores keys).
-func TestNoneStrategy_UnsealRootKey_EmptyKey(t *testing.T) {
+// TestNoneStrategy_UnsealRootKey asserts that UnsealRootKey returns an empty
+// slice for a None marker (no key material is needed because the identity
+// encrypter ignores keys) and refuses a nil or another strategy's sealed key.
+func TestNoneStrategy_UnsealRootKey(t *testing.T) {
 	s := NewNoneStrategy()
-	sealed := &SealedRootKey{Strategy: StrategyNone}
-
-	key, err := s.UnsealRootKey(context.Background(), sealed, Credentials{})
-	if err != nil {
-		t.Fatalf("UnsealRootKey: %v", err)
-	}
-	if len(key) != 0 {
-		t.Fatalf("UnsealRootKey returned %d bytes, want 0", len(key))
-	}
-}
-
-func TestNoneStrategy_UnsealRootKey_NilSealedRejected(t *testing.T) {
-	s := NewNoneStrategy()
-	if _, err := s.UnsealRootKey(context.Background(), nil, Credentials{}); !errors.Is(err, ErrInvalidSealedKey) {
-		t.Fatalf("UnsealRootKey(nil) err = %v, want ErrInvalidSealedKey", err)
-	}
-}
-
-func TestNoneStrategy_UnsealRootKey_StrategyMismatchRejected(t *testing.T) {
-	s := NewNoneStrategy()
-	sealed := &SealedRootKey{Strategy: StrategyPassphrase}
-	if _, err := s.UnsealRootKey(context.Background(), sealed, Credentials{}); !errors.Is(err, ErrStrategyMismatch) {
-		t.Fatalf("UnsealRootKey(wrong strategy) err = %v, want ErrStrategyMismatch", err)
+	for _, tc := range []struct {
+		name    string
+		sealed  *SealedRootKey
+		wantErr error
+	}{
+		{"none marker yields an empty key", &SealedRootKey{Strategy: StrategyNone}, nil},
+		{"nil sealed key", nil, ErrInvalidSealedKey},
+		{"strategy mismatch", &SealedRootKey{Strategy: StrategyPassphrase}, ErrStrategyMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key, err := s.UnsealRootKey(context.Background(), tc.sealed, Credentials{})
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("UnsealRootKey err = %v, want %v", err, tc.wantErr)
+			}
+			if len(key) != 0 {
+				t.Fatalf("UnsealRootKey returned %d bytes, want 0", len(key))
+			}
+		})
 	}
 }
 
