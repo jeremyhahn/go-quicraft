@@ -74,30 +74,6 @@ func simpleExtractKV(cmd []byte) (string, []byte) {
 // CachedDiskStateMachine tests
 // ---------------------------------------------------------------------------
 
-func TestCachedDiskStateMachine_OpenDelegates(t *testing.T) {
-	inner := newTrackingDiskStateMachine()
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 100,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
-	}
-	ctx := context.Background()
-	stopper := make(chan struct{})
-
-	lastApplied, err := cached.Open(ctx, "/tmp/cached-disk", stopper)
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	if lastApplied != 0 {
-		t.Errorf("lastApplied = %d, want 0", lastApplied)
-	}
-	if !inner.openCalled {
-		t.Error("inner Open not called")
-	}
-}
-
 func TestCachedDiskStateMachine_SyncDelegates(t *testing.T) {
 	inner := newTrackingDiskStateMachine()
 	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
@@ -117,32 +93,44 @@ func TestCachedDiskStateMachine_SyncDelegates(t *testing.T) {
 }
 
 func TestCachedDiskStateMachine_CacheHitSkipsInnerLookup(t *testing.T) {
-	inner := newTrackingDiskStateMachine()
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 100,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
+	// A string query and a []byte query for the same key both hit the cache.
+	tests := []struct {
+		name  string
+		query func(key string) interface{}
+	}{
+		{name: "string", query: func(key string) interface{} { return key }},
+		{name: "bytes", query: func(key string) interface{} { return []byte(key) }},
 	}
-	ctx := context.Background()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			inner := newTrackingDiskStateMachine()
+			cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
+				MaxEntries: 100,
+				ExtractKV:  simpleExtractKV,
+			})
+			if err != nil {
+				t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
+			}
+			ctx := context.Background()
 
-	entries := []Entry{{Index: 1, Cmd: []byte("disk-key")}}
-	results := make([]Result, 1)
-	if err := cached.Update(ctx, entries, results); err != nil {
-		t.Fatalf("Update failed: %v", err)
-	}
+			entries := []Entry{{Index: 1, Cmd: []byte("disk-key")}}
+			results := make([]Result, 1)
+			if err := cached.Update(ctx, entries, results); err != nil {
+				t.Fatalf("Update failed: %v", err)
+			}
 
-	inner.lookupCount.Store(0)
-	val, err := cached.Lookup(ctx, "disk-key")
-	if err != nil {
-		t.Fatalf("Lookup failed: %v", err)
-	}
-	if string(val.([]byte)) != "disk-key" {
-		t.Errorf("Lookup = %q, want %q", val, "disk-key")
-	}
-	if inner.lookupCount.Load() != 0 {
-		t.Error("expected cache hit for disk SM")
+			inner.lookupCount.Store(0)
+			val, err := cached.Lookup(ctx, tt.query("disk-key"))
+			if err != nil {
+				t.Fatalf("Lookup failed: %v", err)
+			}
+			if string(val.([]byte)) != "disk-key" {
+				t.Errorf("Lookup = %q, want %q", val, "disk-key")
+			}
+			if inner.lookupCount.Load() != 0 {
+				t.Error("expected cache hit")
+			}
+		})
 	}
 }
 
@@ -201,11 +189,17 @@ func TestCachedDiskStateMachine_OpenClearsCache(t *testing.T) {
 	// Manually put something in cache.
 	cached.cache.Put("pre-open", []byte("stale"))
 
-	// Open should clear the cache.
-	if _, err := cached.Open(ctx, "/tmp/open-clear", stopper); err != nil {
+	// Open delegates to the inner SM and clears the cache.
+	lastApplied, err := cached.Open(ctx, "/tmp/open-clear", stopper)
+	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-
+	if lastApplied != 0 {
+		t.Errorf("lastApplied = %d, want 0", lastApplied)
+	}
+	if !inner.openCalled {
+		t.Error("inner Open not called")
+	}
 	if cached.cache.Len() != 0 {
 		t.Errorf("cache length = %d after Open, want 0", cached.cache.Len())
 	}
@@ -817,42 +811,6 @@ func TestCachedDiskStateMachine_CacheMissFallsThrough(t *testing.T) {
 	_, misses := cached.CacheStats()
 	if misses != 1 {
 		t.Errorf("misses = %d, want 1", misses)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// CachedDiskStateMachine Lookup with []byte query
-// ---------------------------------------------------------------------------
-
-func TestCachedDiskStateMachine_LookupBytesQuery(t *testing.T) {
-	inner := newTrackingDiskStateMachine()
-	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{
-		MaxEntries: 100,
-		ExtractKV:  simpleExtractKV,
-	})
-	if err != nil {
-		t.Fatalf("NewCachedDiskStateMachine failed: %v", err)
-	}
-	ctx := context.Background()
-
-	entries := []Entry{{Index: 1, Cmd: []byte("bytes-key")}}
-	results := make([]Result, 1)
-	if err := cached.Update(ctx, entries, results); err != nil {
-		t.Fatalf("Update failed: %v", err)
-	}
-
-	inner.lookupCount.Store(0)
-
-	// Query with []byte instead of string.
-	val, err := cached.Lookup(ctx, []byte("bytes-key"))
-	if err != nil {
-		t.Fatalf("Lookup failed: %v", err)
-	}
-	if string(val.([]byte)) != "bytes-key" {
-		t.Errorf("Lookup = %q, want %q", val, "bytes-key")
-	}
-	if inner.lookupCount.Load() != 0 {
-		t.Error("expected cache hit for []byte query")
 	}
 }
 
