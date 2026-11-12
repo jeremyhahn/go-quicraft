@@ -78,6 +78,30 @@ func seedSnapshotChunks(hdr SnapshotHeader) []proto.SnapshotChunk {
 	return chunks
 }
 
+// denseSnapshotMembership returns a Membership whose five string maps each
+// hold n zero-length entries: the shape that costs the decoder the most heap
+// per wire byte (pkg/proto getMap; MaxDecodeMemoryFactor).
+func denseSnapshotMembership(n int) proto.Membership {
+	mk := func() map[uint64]string {
+		m := make(map[uint64]string, n)
+		for i := 0; i < n; i++ {
+			m[uint64(i+1)] = ""
+		}
+		return m
+	}
+	return proto.Membership{
+		Addresses:         mk(),
+		Observers:         mk(),
+		Witnesses:         mk(),
+		Identities:        mk(),
+		RemovedIdentities: mk(),
+	}
+}
+
+// denseMembershipEntries is the per-map entry count of the membership-dense
+// seed; its frame fits the fuzz receiver's per-peer budget.
+const denseMembershipEntries = 897
+
 // FuzzSnapshotHeaderUnmarshalCrash feeds arbitrary bytes to the snapshot
 // header decoder. It must never panic, must refuse input shorter than
 // SnapshotHeaderSize, and a decoded header must re-encode to exactly the bytes
@@ -203,6 +227,22 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 	truncated := append([]byte{}, valid[:firstLen]...)
 	truncated = append(truncated, valid[firstLen:firstLen+FrameHeaderSize+1]...)
 	f.Add(uint8(2), truncated)
+	// A valid one-chunk stream whose Membership holds five dense maps of
+	// zero-length entries: within the budget, and decoded into far more heap
+	// than its wire length.
+	denseHdr := hdr
+	denseHdr.ChunkCount = 1
+	denseChunks := seedSnapshotChunks(denseHdr)
+	denseChunks[0].Membership = denseSnapshotMembership(denseMembershipEntries)
+	dense, err := encodeSnapshotChunkFrames(f, denseChunks)
+	if err != nil {
+		f.Fatalf("dense membership seed: %v", err)
+	}
+	if int64(len(dense))+snapshotChunkStructBytes > fuzzSnapshotMemory/2 {
+		f.Fatalf("dense membership seed of %d bytes exceeds the per-peer budget", len(dense))
+	}
+	f.Logf("dense membership seed: n=%d, %d wire bytes", denseMembershipEntries, len(dense))
+	f.Add(uint8(1), dense)
 
 	f.Fuzz(func(t *testing.T, chunkCount uint8, data []byte) {
 		handler := newTestHandler()
