@@ -56,7 +56,7 @@ func requireOwnerCapRefusal(t *testing.T, what string, err error) {
 	}
 }
 
-func closeOwnerCapSession(t *testing.T, ctx context.Context, h *Host, s *Session) {
+func closeOwnerCapSession(ctx context.Context, t *testing.T, h *Host, s *Session) {
 	t.Helper()
 	rs, err := h.CloseSession(ctx, 1, s)
 	if err != nil {
@@ -116,7 +116,7 @@ func TestSessionOwnerCap_NewSessionWithOwnerEnforcesCapAndCloseFreesSlot(t *test
 	}
 
 	// (d) Closing one owner-7 session frees its slot.
-	closeOwnerCapSession(t, ctx, h, owned[0])
+	closeOwnerCapSession(ctx, t, h, owned[0])
 	again, err := h.NewSessionWithOwner(ctx, 1, 7)
 	if err != nil {
 		t.Fatalf("NewSessionWithOwner(owner 7) after CloseSession failed: %v; "+
@@ -158,7 +158,7 @@ func TestSessionOwnerCap_RegisterSessionCountsAgainstSameCap(t *testing.T) {
 	requireOwnerCapRefusal(t, "RegisterSession(owner 7) past the cap", err)
 
 	// Closing the registered one frees a slot for a caller-built session.
-	closeOwnerCapSession(t, ctx, h, registered)
+	closeOwnerCapSession(ctx, t, h, registered)
 	if _, err := h.RegisterSession(ctx, NewSessionWithOwner(1, 0xBEEF, 7)); err != nil {
 		t.Fatalf("RegisterSession(owner 7) after CloseSession failed: %v", err)
 	}
