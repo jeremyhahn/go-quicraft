@@ -207,15 +207,27 @@ func proposeOnce(t *testing.T, h *Host, session *Session, cmd []byte) RequestRes
 	}
 }
 
-func newRetrySession(t *testing.T, h *Host) *Session {
+func newRetrySession(t *testing.T, c *sessionRetryCluster) (*Session, int) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.NewSession(ctx, retryShard)
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
+	for {
+		idx := c.leader()
+		session, err := c.nodes[idx].host.NewSession(ctx, retryShard)
+		if err == nil {
+			return session, idx
+		}
+		if !errors.Is(err, ErrNotLeader) || ctx.Err() != nil {
+			t.Fatalf("NewSession on node %d: %v", idx, err)
+		}
+		// Leadership moved, or this node's view is not settled yet:
+		// re-resolve the leader and try again within the deadline.
+		select {
+		case <-ctx.Done():
+			t.Fatalf("NewSession on node %d: %v (deadline: %v)", idx, err, ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	return session
 }
 
 // A proposal answered by the old leader and retried with the same session and
@@ -223,8 +235,7 @@ func newRetrySession(t *testing.T, h *Host) *Session {
 // retry returns the first result.
 func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 	c := newSessionRetryCluster(t)
-	old := c.leader()
-	session := newRetrySession(t, c.nodes[old].host)
+	session, old := newRetrySession(t, c)
 	series := session.SeriesID()
 
 	first := proposeOnce(t, c.nodes[old].host, session, []byte("once"))
@@ -268,8 +279,7 @@ func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 // cached response was discarded, PhD Figure 6.1 step 3) and applied nowhere.
 func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 	c := newSessionRetryCluster(t)
-	old := c.leader()
-	session := newRetrySession(t, c.nodes[old].host)
+	session, old := newRetrySession(t, c)
 	h := c.nodes[old].host
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
