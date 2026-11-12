@@ -3483,8 +3483,11 @@ type Host struct {
 	closeDone atomic.Bool
 	draining  atomic.Bool
 	diskFull  *atomic.Bool // set by disk full callback in buildWALOptions
-	id        string
-	stopOnce  sync.Once
+	// diskGate is the proposal-side disk monitor (newProposalDiskGate); nil
+	// without a MaxWALDiskSize or with a caller-supplied LogDB.
+	diskGate *waldb.DiskMonitor
+	id       string
+	stopOnce sync.Once
 	// closeErr is the shutdown outcome the FIRST Close computed. Every other
 	// Close returns it too, which is only safe because stopOnce.Do publishes
 	// the write to every caller that blocked on it.
@@ -4003,6 +4006,9 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// read by Host.HealthCheck(). Allocated before the WAL is opened so
 	// the callback closure captures the same atomic as the Host struct.
 	var diskFullFlag atomic.Bool
+	// diskGate refuses proposals below the WAL's own full threshold; built
+	// with the default WAL only (newProposalDiskGate).
+	var diskGate *waldb.DiskMonitor
 
 	// Per-shard barriers with no host-wide barrier require a Raft log that is
 	// already encrypted at rest. Without one, configuring per-shard encryption
@@ -4048,12 +4054,14 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		// The disk callbacks are built before the WAL they monitor is open,
 		// so they reach it through walDB, published once Open returns.
 		var walDB atomic.Pointer[waldb.DB]
-		walOpts := buildWALOptions(cfg, &diskFullFlag, func() []uint64 {
+		walShards := func() []uint64 {
 			if db := walDB.Load(); db != nil {
 				return walShardIDs(db)
 			}
 			return nil
-		})
+		}
+		walOpts := buildWALOptions(cfg, &diskFullFlag, walShards)
+		diskGate = newProposalDiskGate(cfg, &diskFullFlag, walShards)
 		// Wire barrier encryption into the WAL when a barrier is configured.
 		if options.barrier != nil {
 			walOpts = append(walOpts, waldb.WithBarrier(options.barrier))
@@ -4243,6 +4251,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		sender:             sender,
 		transport:          tr,
 		diskFull:           &diskFullFlag,
+		diskGate:           diskGate,
 		id:                 hostID,
 		keyRotStopC:        make(chan struct{}),
 		keyRotDone:         make(chan struct{}),
@@ -6160,7 +6169,7 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 
 	// Reject proposals when the WAL disk is full to prevent unbounded
 	// log growth and potential data loss.
-	if h.diskFull != nil && h.diskFull.Load() {
+	if h.proposalDiskFull() {
 		return nil, ErrDiskFull
 	}
 
@@ -6269,7 +6278,7 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 
 	// Reject proposals when the WAL disk is full to prevent unbounded
 	// log growth and potential data loss.
-	if h.diskFull != nil && h.diskFull.Load() {
+	if h.proposalDiskFull() {
 		return nil, ErrDiskFull
 	}
 
@@ -9284,7 +9293,7 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	// The import writes a full snapshot artifact to disk; starting one while
 	// the WAL disk monitor reports the volume full would only deepen the
 	// exhaustion and leave a truncated artifact behind.
-	if h.diskFull != nil && h.diskFull.Load() {
+	if h.proposalDiskFull() {
 		return 0, ErrDiskFull
 	}
 
@@ -12592,49 +12601,98 @@ func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards fu
 			diskFullFlag.Store(false)
 		}))
 
-		if cfg.EventListener != nil {
+		if cfg.EventListener != nil && cfg.EventListener.OnLogDBDiskWarning != nil {
 			walDir := cfg.WALDir
-			if cfg.EventListener.OnLogDBDiskWarning != nil {
-				warningCb := cfg.EventListener.OnLogDBDiskWarning
-				monOpts = append(monOpts, waldb.WithOnWarning(func(used, maxBytes uint64) {
-					warningCb(config.DiskInfo{
-						WALDir:    walDir,
-						UsedBytes: used,
-						MaxBytes:  maxBytes,
-						Shards:    diskShards(shards),
-					})
-				}))
-			}
-			if cfg.EventListener.OnLogDBDiskFull != nil {
-				fullCb := cfg.EventListener.OnLogDBDiskFull
-				monOpts = append(monOpts, waldb.WithOnFull(func(used, maxBytes uint64) {
-					diskFullFlag.Store(true)
-					fullCb(config.DiskInfo{
-						WALDir:    walDir,
-						UsedBytes: used,
-						MaxBytes:  maxBytes,
-						Shards:    diskShards(shards),
-					})
-				}))
-			} else {
-				// No user callback but disk monitoring is active.
-				// Still set the diskFull flag for HealthCheck.
-				monOpts = append(monOpts, waldb.WithOnFull(func(_, _ uint64) {
-					diskFullFlag.Store(true)
-				}))
-			}
-		} else {
-			// No event listener but disk monitoring is active.
-			// Set the diskFull flag for HealthCheck.
-			monOpts = append(monOpts, waldb.WithOnFull(func(_, _ uint64) {
-				diskFullFlag.Store(true)
+			warningCb := cfg.EventListener.OnLogDBDiskWarning
+			monOpts = append(monOpts, waldb.WithOnWarning(func(used, maxBytes uint64) {
+				warningCb(config.DiskInfo{
+					WALDir:    walDir,
+					UsedBytes: used,
+					MaxBytes:  maxBytes,
+					Shards:    diskShards(shards),
+				})
 			}))
 		}
+		monOpts = append(monOpts, waldb.WithOnFull(diskFullCallback(cfg, diskFullFlag, shards)))
 
 		opts = append(opts, waldb.WithDiskMonitorOpts(maxBytes, monOpts...))
 	}
 
 	return opts
+}
+
+// proposalDiskFullPercent is the share of HostConfig.MaxWALDiskSize at which
+// the host refuses new proposals with ErrDiskFull. It sits below the WAL's own
+// waldb.DefaultFullPercent on purpose: a WAL write the monitor refuses cannot
+// be persisted, so the engine fails the shard (the fail-closed latch), while a
+// refused proposal leaves the shard serving. Refusing proposals first keeps a
+// proposal-driven workload from ever driving the WAL to its own threshold.
+const proposalDiskFullPercent = 0.90
+
+// proposalDiskCheckEvery is the number of proposals between two disk usage
+// samples of the proposal gate: a tenth of the WAL's per-write cadence
+// (waldb.DefaultCheckEvery), so the gate samples before the WAL does. Every
+// proposal costs at least one WAL write, and concurrent proposals batch into
+// fewer writes, so the gate's samples come at least ten times as often as
+// the WAL's under a proposal-driven workload.
+const proposalDiskCheckEvery = waldb.DefaultCheckEvery / 10
+
+// diskFullCallback returns the full-threshold callback shared by the WAL's
+// disk monitor and the proposal gate. It sets diskFullFlag and calls
+// EventListener.OnLogDBDiskFull once per transition into the full state,
+// whichever monitor sees it first; a recovery clears the flag and re-arms it.
+func diskFullCallback(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) func(used, maxBytes uint64) {
+	var fullCb func(config.DiskInfo)
+	if cfg.EventListener != nil {
+		fullCb = cfg.EventListener.OnLogDBDiskFull
+	}
+	walDir := cfg.WALDir
+	return func(used, maxBytes uint64) {
+		if diskFullFlag.Swap(true) || fullCb == nil {
+			return
+		}
+		fullCb(config.DiskInfo{
+			WALDir:    walDir,
+			UsedBytes: used,
+			MaxBytes:  maxBytes,
+			Shards:    diskShards(shards),
+		})
+	}
+}
+
+// newProposalDiskGate builds the disk monitor the proposal path samples
+// before admitting a proposal, or nil when HostConfig.MaxWALDiskSize is zero.
+// It watches the WAL's volume at proposalDiskFullPercent, every
+// proposalDiskCheckEvery proposals, and shares diskFullFlag and the full and
+// recovery callbacks with the WAL's own monitor (buildWALOptions).
+func newProposalDiskGate(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) *waldb.DiskMonitor {
+	if cfg.MaxWALDiskSize == 0 {
+		return nil
+	}
+	return waldb.NewDiskMonitor(cfg.WALDir, cfg.MaxWALDiskSize,
+		waldb.WithFullPercent(proposalDiskFullPercent),
+		waldb.WithCheckEvery(proposalDiskCheckEvery),
+		waldb.WithOnFull(diskFullCallback(cfg, diskFullFlag, shards)),
+		waldb.WithOnRecovery(func(_, _ uint64) {
+			diskFullFlag.Store(false)
+		}),
+	)
+}
+
+// proposalDiskFull reports whether a new proposal (or a snapshot import) must
+// be refused with ErrDiskFull. It samples the proposal gate first, so a gate
+// that tripped re-checks usage on every call and recovers once usage drops,
+// and then reads the flag either monitor sets. While the gate refuses, it
+// keeps the flag set, so HealthCheck reports DiskOK false even after the
+// WAL's monitor (with its higher threshold) has recovered.
+func (h *Host) proposalDiskFull() bool {
+	if h.diskGate != nil && h.diskGate.MaybeCheck() != nil {
+		if h.diskFull != nil {
+			h.diskFull.Store(true)
+		}
+		return true
+	}
+	return h.diskFull != nil && h.diskFull.Load()
 }
 
 // diskShards calls shards when it is set, for DiskInfo.Shards.

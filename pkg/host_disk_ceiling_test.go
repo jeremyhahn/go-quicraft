@@ -98,8 +98,10 @@ func TestDiskCeiling_RefusesProposalsFiresOnceAndKeepsAcknowledgedEntries(t *tes
 	}
 
 	cfg := testHostConfig(t)
-	// Any real filesystem already uses more than 1 MiB, so the first statfs
-	// sample (every DefaultCheckEvery WAL writes) is past the 95% threshold.
+	// Any real filesystem already uses more than 1 MiB, so the proposal
+	// gate's first statfs sample (every proposalDiskCheckEvery proposals) is
+	// past its 90% threshold, and it refuses proposals before the WAL's own
+	// sample (every waldb.DefaultCheckEvery writes) reaches 95%.
 	cfg.MaxWALDiskSize = maxBytes
 	cfg.EventListener = listener
 
@@ -173,8 +175,8 @@ func TestDiskCeiling_RefusesProposalsFiresOnceAndKeepsAcknowledgedEntries(t *tes
 		if info.MaxBytes != maxBytes {
 			t.Errorf("(b) DiskInfo.MaxBytes = %d, want %d", info.MaxBytes, maxBytes)
 		}
-		if info.UsedBytes < maxBytes*95/100 {
-			t.Errorf("(b) DiskInfo.UsedBytes = %d, below the 95%% threshold of %d",
+		if info.UsedBytes < maxBytes*90/100 {
+			t.Errorf("(b) DiskInfo.UsedBytes = %d, below the 90%% proposal threshold of %d",
 				info.UsedBytes, maxBytes)
 		}
 		if !slices.Contains(info.Shards, shardID) {

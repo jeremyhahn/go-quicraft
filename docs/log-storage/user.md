@@ -77,15 +77,36 @@ Set a disk ceiling. Without one, the WAL fills the volume and the first sign is
 cfg.MaxWALDiskSize = 50 << 30 // bytes
 cfg.EventListener = &config.EventListener{
     OnLogDBDiskWarning: func(info config.DiskInfo) { /* alert: 85% used */ },
-    OnLogDBDiskFull:    func(info config.DiskInfo) { /* page: 95% used */ },
+    OnLogDBDiskFull:    func(info config.DiskInfo) { /* page: 90% used */ },
 }
 ```
 
 The ceiling is compared with the used space of the whole filesystem holding the
 WAL (Linux `statfs`), not with the WAL's own size, so other files on the volume
-count against it. Past 95% of the ceiling, proposals fail with `quicraft.ErrDiskFull`: a clean
-refusal instead of an unrecoverable one. Writes resume when usage drops below
-the threshold.
+count against it. Two thresholds apply:
+
+- **90%: proposals are refused.** The host samples usage every 10 proposals;
+  past 90% of the ceiling, `Propose`, `ProposeWithSession` and snapshot
+  imports fail with `quicraft.ErrDiskFull`, `OnLogDBDiskFull` fires once and
+  `HealthCheck` reports `DiskOK` false. The shard keeps serving reads.
+  Proposals resume once a sample sees usage below 90%.
+- **95%: the WAL refuses writes.** The WAL samples usage every 100 writes;
+  past 95% it refuses the write with `waldb: disk full`. An entry that cannot
+  be persisted must not be acknowledged, so the shard that issued the write
+  fails (`OnShardFailed`) and must be restarted once space is freed.
+
+Because the proposal threshold sits below the WAL's and the host samples ten
+times as often, a workload driven by this host's proposals is refused before
+the WAL fills. The shard still fails when the WAL reaches 95% first, which
+happens when:
+
+- usage jumps from below 90% to 95% or more between two proposal samples
+  (another process filling the volume, a large snapshot, a large batch);
+- the replica writes without proposing: a follower persisting the leader's
+  entries, or a node catching up, samples only through the WAL.
+
+Size `MaxWALDiskSize` so that 5% of it covers the volume's growth between
+samples, and alert on `OnLogDBDiskWarning` (85%).
 
 ## Encrypt it
 
