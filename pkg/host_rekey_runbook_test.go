@@ -312,6 +312,10 @@ func TestRekeyRunbook_NewBarrierServesOldBarrierRefuses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read new snapshot: %v", err)
 	}
+	if ss.FileSize != uint64(len(raw)) {
+		t.Errorf("new LogDB snapshot FileSize = %d, want %d (size of the re-encrypted snapshot.dat)",
+			ss.FileSize, len(raw))
+	}
 	if _, decErr := decryptSnapshotFrames(barrierA, shardID, replicaID, ss.Index,
 		bytes.NewReader(raw), io.Discard); decErr == nil {
 		t.Error("new snapshot decrypted under barrier A, want an error")
