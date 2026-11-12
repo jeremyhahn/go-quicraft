@@ -12,6 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package shamir implements Shamir's M-of-N secret sharing over GF(256).
+//
+// SplitBytes divides a secret into share values, any threshold of which
+// CombineBytes reconstructs; fewer reveal nothing about the secret.
+// ProtectedShare, SplitProtected and CombineProtected carry the same share
+// values in memory-locked, wipeable buffers, so share material never becomes
+// an immortal Go string. Shares carry no digest of the secret, and their
+// Threshold and Total are unauthenticated: integrity of a reconstructed
+// secret is the caller's to establish.
 package shamir
 
 import (
