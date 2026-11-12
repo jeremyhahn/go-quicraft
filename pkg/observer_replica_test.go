@@ -167,13 +167,10 @@ func (c *observerCluster) assertObserverNeverLeads(d time.Duration) {
 	}
 }
 
-func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing.T) {
-	c := newObserverCluster(t)
-	c.startVoters()
-	c.put("before", "the-observer")
-
-	// Admit the observer through a committed config change, then start it as
-	// a joiner anchored on the voters' committed identities.
+// admitObserver admits replica 4 through a committed config change, then
+// starts it as a joiner anchored on the voters' committed identities.
+func (c *observerCluster) admitObserver(t *testing.T) {
+	t.Helper()
 	obs := c.host(observerID)
 	if !waitUntil(20*time.Second, func() bool {
 		id := c.leader()
@@ -195,6 +192,15 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 	if err := obs.StartShard(nil, true, kv.NewMemoryCreateFunc(), scfg); err != nil {
 		t.Fatalf("observer StartShard(join=true): %v", err)
 	}
+}
+
+func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing.T) {
+	c := newObserverCluster(t)
+	c.startVoters()
+	c.put("before", "the-observer")
+
+	c.admitObserver(t)
+	obs := c.host(observerID)
 
 	const entries = 20
 	for i := range entries {
