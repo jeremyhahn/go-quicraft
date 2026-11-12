@@ -739,18 +739,43 @@ func TestRefcount_NoRefRecyclesOnRelease(t *testing.T) {
 }
 
 // TestTryAcquireRef_FailsAtZero verifies tryAcquireRef never increments from
-// zero: an object with no outstanding references may already be racing
-// recycling (or sitting in the pool), and pinning it would be unsafe.
+// zero holders: an object whose caller has released and whose pending-map
+// references are all dropped has been recycled (or is racing recycling), and
+// pinning it would be unsafe. While any holder remains, including only the
+// caller's own reference, tryAcquireRef succeeds.
 func TestTryAcquireRef_FailsAtZero(t *testing.T) {
 	pool := NewRequestStatePool()
+
+	// Reach zero holders through the real release path: the map's
+	// reference, then the caller's Release, then the map's releaseRef.
 	rs := newRequestState(pool, 1, time.Time{}, true)
+	rs.acquireRef()
+	rs.Release()
+	rs.releaseRef()
+	if !rs.recycled.Load() {
+		t.Fatal("RequestState not recycled after its last holder dropped")
+	}
 	if rs.tryAcquireRef() {
-		t.Fatal("tryAcquireRef succeeded with zero outstanding references")
+		t.Fatal("tryAcquireRef succeeded with zero holders")
+	}
+	if got := rs.holders.Load(); got != 0 {
+		t.Fatalf("holders = %d after failed tryAcquireRef, want 0", got)
 	}
 	if got := rs.outstanding.Load(); got != 0 {
 		t.Fatalf("outstanding = %d after failed tryAcquireRef, want 0", got)
 	}
-	rs.Release()
+
+	// Only the caller's reference held: tryAcquireRef pins the object and
+	// a paired releaseRef leaves it live.
+	live := newRequestState(NewRequestStatePool(), 2, time.Time{}, true)
+	if !live.tryAcquireRef() {
+		t.Fatal("tryAcquireRef failed while the caller's reference is held")
+	}
+	live.releaseRef()
+	if live.recycled.Load() {
+		t.Fatal("paired releaseRef recycled an object the caller still holds")
+	}
+	live.Release()
 }
 
 // TestTryAcquireRef_PinsAgainstRecycle verifies a successful tryAcquireRef
