@@ -89,7 +89,9 @@ func DecodeBatch(data []byte) ([][]byte, error) {
 		cmdLen := int(rawLen)
 		off += lengthPrefixSize
 
-		if off+cmdLen > len(data) {
+		// Compare against the remainder, not off+cmdLen: on 32-bit builds
+		// off+cmdLen overflows int for a prefix near MaxInt32.
+		if cmdLen > len(data)-off {
 			return nil, &DecodeError{Reason: "command data exceeds payload boundary"}
 		}
 		cmds = append(cmds, data[off:off+cmdLen])
@@ -118,7 +120,9 @@ func countCommands(data []byte) (int, error) {
 		cmdLen := int(rawLen)
 		off += lengthPrefixSize
 
-		if off+cmdLen > len(data) {
+		// See DecodeBatch: compare against the remainder so the sum cannot
+		// overflow int on 32-bit builds.
+		if cmdLen > len(data)-off {
 			return 0, &DecodeError{Reason: "command data exceeds payload boundary"}
 		}
 		off += cmdLen
