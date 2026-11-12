@@ -3503,6 +3503,11 @@ type Host struct {
 	sweepDone   chan struct{} // closed when the sweeper goroutine exits
 	drainC      chan struct{} // closed when pendingOps reaches 0 during drain
 	drainCMu    sync.Mutex    // protects drainC creation
+	// admitMu orders admissions against Drain (#1084): admitPendingOp
+	// checks closed/draining and counts under RLock, and Drain raises the
+	// draining flag under Lock, so every admission either is counted before
+	// Drain loads pendingOps or sees the flag and is refused.
+	admitMu sync.RWMutex
 	// drainOnce elects the one Drain attempt and JOINS every other caller on
 	// it, exactly as stopOnce does for Close. drainErr is written inside the
 	// Once and published by it, so every caller reports the same outcome.
@@ -6582,7 +6587,13 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 // pins the RS until this map entry is removed, even if the caller releases
 // first (e.g. a Sync* timeout).
 func (h *Host) registerPendingProposal(ns *nodeState, engNode *engine.Node, key uint64, pp *pendingProposal) error {
-	h.addPendingOp()
+	// Count before registering: a Drain that already returned nil refuses
+	// the proposal here, with nothing registered to undo (#1084). The
+	// caller's own reference is dropped as on the rollback below.
+	if err := h.admitPendingOp(); err != nil {
+		pp.rs.Release()
+		return err
+	}
 	pp.node = engNode
 	pp.rs.acquireRef()
 	// From here a completion or the caller's own wait can fail it, and both
@@ -6694,8 +6705,13 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	deadline := pendingDeadline(ctx)
 	rs := newRequestState(ns.requestPool, readKey, deadline, h.metrics != nil)
 
-	// Track this operation for drain notification.
-	h.addPendingOp()
+	// Track this operation for drain notification. Admission counts it, or
+	// refuses it once Drain has raised its flag (#1084), before anything is
+	// registered.
+	if err := h.admitPendingOp(); err != nil {
+		rs.Release()
+		return nil, err
+	}
 
 	// Register the pending read BEFORE delivering the message to avoid
 	// a race where OnReadyToRead fires before the map entry exists.
@@ -7889,8 +7905,14 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 	deadline := pendingDeadlineWithin(ctx, defaultPendingSnapshotTimeout)
 	rs := newRequestState(ns.requestPool, snapshotKey, deadline, h.metrics != nil)
 
-	// Track this operation for drain notification.
-	h.addPendingOp()
+	// Track this operation for drain notification. Admission counts it, or
+	// refuses it once Drain has raised its flag (#1084), before anything is
+	// registered; the snapshotting flag set above is cleared on refusal.
+	if err := h.admitPendingOp(); err != nil {
+		rs.Release()
+		engNode.ClearSnapshotting()
+		return nil, err
+	}
 
 	// Register the pending snapshot before submitting to avoid a race
 	// where OnSnapshotRequestCompleted fires before the map entry exists.
@@ -10172,7 +10194,12 @@ func (h *Host) Drain() error {
 	// The flag goes up before the Once so that new work is refused from the
 	// instant ANY caller asks for a drain, not from when the elected attempt
 	// gets scheduled. It is never cleared: see the irreversibility note.
+	// Raising it under admitMu waits out every admission between its
+	// draining check and its count, so the pendingOps load below sees each
+	// one (see admitPendingOp).
+	h.admitMu.Lock()
 	h.draining.Store(true)
+	h.admitMu.Unlock()
 
 	// sync.Once.Do does not return until f has completed, for EVERY caller —
 	// the losers of the election wait here for the winner's attempt and then
@@ -10216,8 +10243,31 @@ func (h *Host) drainOnceLocked() error {
 	}
 }
 
-// addPendingOp increments the outstanding pending operations counter.
-// Called when a proposal, read, or snapshot operation is registered.
+// admitPendingOp is the admission step of every operation Drain waits for: it
+// counts the operation in pendingOps unless the host is closed or draining,
+// and refuses with ErrClosed or ErrDraining (counting nothing) otherwise.
+// The check and the count run under admitMu.RLock, and Drain raises the
+// draining flag under admitMu.Lock before it loads pendingOps, so an
+// operation is either counted before Drain looks or refused: once Drain has
+// returned nil nothing new is admitted (#1084). Callers keep their own
+// earlier draining checks as fast paths, and call admitPendingOp before they
+// register anything, so a refusal has only the caller's own state to undo.
+func (h *Host) admitPendingOp() error {
+	h.admitMu.RLock()
+	defer h.admitMu.RUnlock()
+	if h.closed.Load() {
+		return ErrClosed
+	}
+	if h.draining.Load() {
+		return ErrDraining
+	}
+	h.pendingOps.Add(1)
+	return nil
+}
+
+// addPendingOp increments the outstanding pending operations counter
+// unconditionally. Admission paths use admitPendingOp, which refuses once the
+// host is closed or draining; this is for tests that seed pendingOps.
 func (h *Host) addPendingOp() {
 	h.pendingOps.Add(1)
 }
