@@ -5530,17 +5530,22 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	}
 	h.setShardAnchor(cfg.ShardID, cfg.MemberIdentities)
 
-	// Save bootstrap info if we have a LogDB and this is not a join.
-	if h.logdb != nil && !join {
+	// Save bootstrap info if we have a LogDB. A join records one too, with
+	// Join set and no Addresses (a joining replica has no initial
+	// membership), so the snapshot layout below is known for it as well.
+	if h.logdb != nil {
 		bootstrap := logdb.Bootstrap{
-			Addresses: nodesCopy,
-			Join:      join,
-			Type:      ns.smType,
+			Join: join,
+			Type: ns.smType,
 			// Record where this shard's on-disk tree is rooted. Operations
-			// that run while the shard is STOPPED — Host.ImportSnapshot — have
-			// no other way to discover it, and writing an artifact outside the
-			// tree costs the artifact's DEK at the next purge.
+			// that run while the shard is STOPPED — Host.ImportSnapshot and
+			// Host.RemoveData — have no other way to discover it, and writing
+			// an artifact outside the tree costs the artifact's DEK at the
+			// next purge.
 			DataDir: cfg.DataDir,
+		}
+		if !join {
+			bootstrap.Addresses = nodesCopy
 		}
 		if err := h.logdb.SaveBootstrap(cfg.ShardID, cfg.ReplicaID, bootstrap); err != nil {
 			// Mark the nodeState stopped BEFORE removing it from h.nodes
@@ -5553,6 +5558,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			h.clearShardJoining(cfg.ShardID)
 			h.anchors.Delete(cfg.ShardID)
 			h.activeNodes.Add(-1)
+			// A start that lost a race with Close finds the LogDB closed:
+			// report the host closed, as the publish check below would.
+			if h.closed.Load() || errors.Is(err, logdb.ErrClosed) {
+				return ErrClosed
+			}
 			return ErrLogDBWrite
 		}
 	}
@@ -8864,7 +8874,7 @@ func resolveImportMembership(
 // the next PurgeEpochsBefore destroy the DEK it needs.
 //
 // The option remains meaningful for a shard whose layout cannot be discovered:
-// one with NO bootstrap record (started with join=true, which records none).
+// one with NO bootstrap record (never started on this host, joined or not).
 // It fails closed with ErrImportLayoutUnknown unless the caller states the
 // layout here, and the stated value is trusted because there is nothing to
 // cross-check it against.
@@ -8895,8 +8905,8 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 	// With a record, its DataDir is authoritative: every bootstrap record
 	// states it ("" means the tree is rooted under NodeHostDir), and a
 	// WithImportDataDir that disagrees is a contradiction, refused below.
-	// Without one (a shard started with join=true records none), the layout
-	// is unknown.
+	// Without one (a shard this host never started, joined or not), the
+	// layout is unknown.
 	if !ok {
 		// No recorded layout. Only the caller can supply it, and a wrong
 		// guess costs the artifact's DEK, so refuse rather than assume.
@@ -11169,8 +11179,9 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	// Resolve the replica's snapshot directory before the LogDB removal
 	// drops the bootstrap record that states the shard's DataDir (the
 	// nodeState holding the Config is gone once the replica is unloaded).
-	// Without a record (a joining replica records none) the tree is rooted
-	// under NodeHostDir, the layout StartShard uses for an empty DataDir.
+	// StartShard records one for every start, a join included. Without a
+	// record (a replica never started on this host) the tree is rooted under
+	// NodeHostDir, the layout StartShard uses for an empty DataDir.
 	var dataDir string
 	if bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID); err != nil {
 		return err

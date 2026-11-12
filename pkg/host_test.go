@@ -891,17 +891,22 @@ func TestStartShard_Join_NoBootstrap(t *testing.T) {
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
+	scfg.DataDir = t.TempDir()
 	err = h.StartShard(members, true, testCreateFunc, scfg)
 	if err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	// Join should not save bootstrap.
+	// A join records its snapshot layout but no initial membership.
 	db.mu.Lock()
-	_, ok := db.bootstraps[mockNodeKey{1, 1}]
+	bs, ok := db.bootstraps[mockNodeKey{1, 1}]
 	db.mu.Unlock()
-	if ok {
-		t.Error("bootstrap should not be saved for join shard")
+	if !ok {
+		t.Fatal("no bootstrap record for a join shard: its DataDir is unknown once stopped")
+	}
+	if !bs.Join || len(bs.Addresses) != 0 || bs.DataDir != scfg.DataDir {
+		t.Errorf("join bootstrap = {Join:%v Addresses:%v DataDir:%q}, want "+
+			"{Join:true Addresses:none DataDir:%q}", bs.Join, bs.Addresses, bs.DataDir, scfg.DataDir)
 	}
 }
 
@@ -16839,8 +16844,8 @@ func TestStartShard_LosesRaceWithClose(t *testing.T) {
 
 	startErr := make(chan error, 1)
 	go func() {
-		// join=true so the shard never writes bootstrap state: this test is
-		// about the publish race, not about LogDB writes after Close.
+		// The bootstrap save after Close fails on the closed LogDB; the
+		// start must still report ErrClosed and roll back.
 		startErr <- h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, true,
 			create, testShardConfig(1, 1))
 	}()
