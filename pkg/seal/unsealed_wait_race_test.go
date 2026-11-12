@@ -107,38 +107,75 @@ func TestBarrier_UnsealedCRace_SealUnsealCycles(t *testing.T) {
 	defer s.Close()
 
 	const (
-		cycles  = 50
+		// Each Unseal derives the key, about 150ms under -race: ten
+		// periods keep the run well inside unsealedWaitBound.
+		cycles  = 10
 		waiters = 16
 	)
-	var stop atomic.Bool
-	var missed, wakes atomic.Int64
+	// sealed[p] closes once the cycler has sealed period p; taken[p] closes
+	// once every waiter holds an UnsealedC channel that was still open in
+	// period p. The cycler unseals period p only after taken[p], so every
+	// waiter takes part in every sealed period.
+	sealed := make([]chan struct{}, cycles)
+	taken := make([]chan struct{}, cycles)
+	takenN := make([]atomic.Int64, cycles)
+	for p := range sealed {
+		sealed[p] = make(chan struct{})
+		taken[p] = make(chan struct{})
+	}
+	var missed atomic.Int64
+	woke := make([]int, waiters)
 	var wg sync.WaitGroup
-	for i := 0; i < waiters; i++ {
+	for w := 0; w < waiters; w++ {
 		wg.Add(1)
-		go func() {
+		go func(w int) {
 			defer wg.Done()
-			// The last pass runs after stop is set: the barrier is unsealed
-			// for good by then, so its channel must be closed.
-			for {
-				last := stop.Load()
-				if !waitUnsealedC(ctx, b.UnsealedC()) {
+			for p := 0; p < cycles; p++ {
+				select {
+				case <-sealed[p]:
+				case <-ctx.Done():
 					missed.Add(1)
 					return
 				}
-				wakes.Add(1)
-				if last {
+				// The barrier stays sealed until every waiter is counted,
+				// so a closed channel here means it was unsealed early:
+				// retry, without counting, until the bound.
+				var c <-chan struct{}
+				for {
+					c = b.UnsealedC()
+					if !isClosedUnsealedC(c) {
+						break
+					}
+					if ctx.Err() != nil {
+						missed.Add(1)
+						return
+					}
+				}
+				if takenN[p].Add(1) == waiters {
+					close(taken[p])
+				}
+				if !waitUnsealedC(ctx, c) {
+					missed.Add(1)
 					return
 				}
+				woke[w]++
 			}
-		}()
+		}(w)
 	}
 
 	cycleErr := make(chan error, 1)
 	go func() {
 		defer close(cycleErr)
-		for i := 0; i < cycles; i++ {
+		for p := 0; p < cycles; p++ {
 			if err := b.Seal(); err != nil {
 				cycleErr <- err
+				return
+			}
+			close(sealed[p])
+			select {
+			case <-taken[p]:
+			case <-ctx.Done():
+				cycleErr <- ctx.Err()
 				return
 			}
 			if err := b.Unseal(ctx, s, Credentials{}); err != nil {
@@ -147,19 +184,19 @@ func TestBarrier_UnsealedCRace_SealUnsealCycles(t *testing.T) {
 			}
 		}
 	}()
-	if err := <-cycleErr; err != nil {
-		stop.Store(true)
-		wg.Wait()
-		t.Fatalf("Seal/Unseal cycle failed: %v", err)
-	}
-	stop.Store(true)
+	err := <-cycleErr
 	wg.Wait()
 
 	if n := missed.Load(); n != 0 {
 		t.Fatalf("%d UnsealedC waiters not woken within %v while Seal/Unseal cycled", n, unsealedWaitBound)
 	}
-	if wakes.Load() < waiters {
-		t.Fatalf("only %d wakes for %d waiters", wakes.Load(), waiters)
+	if err != nil {
+		t.Fatalf("Seal/Unseal cycle failed: %v", err)
+	}
+	for w, n := range woke {
+		if n != cycles {
+			t.Fatalf("waiter %d woke from an open UnsealedC channel in %d of %d sealed periods", w, n, cycles)
+		}
 	}
 	requireUnsealedNoWaiter(ctx, t, b)
 }
