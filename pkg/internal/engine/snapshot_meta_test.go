@@ -217,6 +217,31 @@ func TestSnapshotMeta_CorruptRejected(t *testing.T) {
 	}
 }
 
+// TestSnapshotMeta_CompressionOutOfRangeRejected patches the 8-byte
+// Compression field of an encoder-built record. config.CompressionType is a
+// uint16, so a wider value must not be truncated into a known type (0x10001
+// used to read as Snappy), and a value naming no known type is corrupt too.
+func TestSnapshotMeta_CompressionOutOfRangeRejected(t *testing.T) {
+	for _, v := range []uint64{0x10001, 0x10000, 1 << 63, ^uint64(0), 0xFFFF, 2} {
+		t.Run(fmt.Sprintf("%#x", v), func(t *testing.T) {
+			d := MarshalSnapshotMeta(SnapshotMeta{Index: 1, Epoch: 3, Compression: config.Snappy})
+			binary.LittleEndian.PutUint64(d[snapshotMetaHeaderSize+metaBodyCompressionOff:], v)
+			m, err := ParseSnapshotMeta(d)
+			if !errors.Is(err, ErrSnapshotMetaCorrupt) {
+				t.Fatalf("ParseSnapshotMeta(compression %#x) = (Compression %v, %v), want ErrSnapshotMetaCorrupt",
+					v, m.Compression, err)
+			}
+		})
+	}
+	for _, c := range []config.CompressionType{config.NoCompression, config.Snappy} {
+		d := MarshalSnapshotMeta(SnapshotMeta{Index: 1, Epoch: 3, Compression: c})
+		m, err := ParseSnapshotMeta(d)
+		if err != nil || m.Compression != c || !m.CompressionRecorded {
+			t.Fatalf("ParseSnapshotMeta(compression %v) = (%v, recorded %v, %v)", c, m.Compression, m.CompressionRecorded, err)
+		}
+	}
+}
+
 // TestReadSnapshotEpoch_Statuses pins the tri-state contract the purge floor
 // depends on. The two failing statuses have identical consequences (do not
 // purge) and differ only in what they tell an operator, but neither may ever
