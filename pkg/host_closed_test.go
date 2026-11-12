@@ -210,10 +210,10 @@ func callClosed(m reflect.Value, args []reflect.Value) (out []reflect.Value, fai
 }
 
 func TestHostClosedEveryMethod(t *testing.T) {
-	h := newTestHost(t)
+	h, closeH := newBoundedHost(t)
 	session := h.NoOPSession(1)
-	if err := h.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if !closeH("Close") || t.Failed() {
+		return
 	}
 
 	errType := reflect.TypeOf((*error)(nil)).Elem()
@@ -276,41 +276,79 @@ func TestHostClosedEveryMethod(t *testing.T) {
 }
 
 func TestHostClosedCloseIdempotent(t *testing.T) {
-	h := newTestHost(t)
+	_, closeH := newBoundedHost(t)
 	const callers = 8
 	var wg sync.WaitGroup
 	start := make(chan struct{})
-	panics := make(chan any, callers)
 	for i := 0; i < callers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					panics <- r
-				}
-			}()
 			<-start
-			if err := h.Close(); err != nil {
-				t.Errorf("concurrent Close: %v", err)
-			}
+			closeH("concurrent Close")
 		}()
 	}
 	close(start)
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("concurrent Close blocked")
-	}
-	close(panics)
-	for r := range panics {
-		t.Errorf("concurrent Close panicked: %v", r)
+	// Each closeH returns within closeDeadline, so Wait is bounded.
+	wg.Wait()
+	if t.Failed() {
+		return
 	}
 	for i := 0; i < 2; i++ {
-		if err := h.Close(); err != nil {
-			t.Errorf("repeat Close %d: %v", i, err)
+		if !closeH(fmt.Sprintf("repeat Close %d", i)) {
+			return
 		}
 	}
+}
+
+// closeDeadline bounds every Close call in the closed-host tests.
+const closeDeadline = 30 * time.Second
+
+// newBoundedHost builds a memory-backed Host without newTestHost's
+// auto-close cleanup, which calls Close synchronously and so would hang on
+// the same stuck stopOnce until the suite timeout. It returns the host and a
+// closer that runs Close in a goroutine under closeDeadline, recovers a
+// panic, and reports a failure with what. The closer returns false when
+// Close blocked; the registered cleanup then skips its own Close.
+func newBoundedHost(t *testing.T) (*Host, func(what string) bool) {
+	t.Helper()
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	var mu sync.Mutex
+	stuck := false
+	closeH := func(what string) bool {
+		errc := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					errc <- fmt.Errorf("panicked: %v", r)
+				}
+			}()
+			errc <- h.Close()
+		}()
+		select {
+		case err := <-errc:
+			if err != nil {
+				t.Errorf("%s: %v", what, err)
+			}
+			return true
+		case <-time.After(closeDeadline):
+			mu.Lock()
+			stuck = true
+			mu.Unlock()
+			t.Errorf("%s blocked past %v", what, closeDeadline)
+			return false
+		}
+	}
+	t.Cleanup(func() {
+		mu.Lock()
+		skip := stuck
+		mu.Unlock()
+		if !skip {
+			closeH("cleanup Close")
+		}
+	})
+	return h, closeH
 }
