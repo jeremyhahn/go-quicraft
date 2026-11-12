@@ -11198,9 +11198,17 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 	}
 }
 
-// RemoveData removes all LogDB data for the given shard/replica pair, removes
-// the replica's snapshot directory, and retires the replica ID on this host: StartShard refuses it from then on
-// (ReplicaRetiredError), across restarts. The shard must be
+// RemoveData removes all LogDB data for the given shard/replica pair, retires
+// the replica ID on this host (StartShard refuses it from then on with
+// ReplicaRetiredError, across restarts), and then removes the replica's
+// snapshot directory.
+//
+// The steps are ordered so a failure never strands a replica: the snapshot
+// directory is resolved, a durable removal intent naming it is written under
+// NodeHostDir/remove-data, the replica is retired, the directory is removed,
+// and the intent is dropped. A failure at any step returns its error and a
+// retry finishes the remaining steps from the intent; the snapshot of a
+// replica that was not retired is never touched. The shard must be
 // stopped on this host before calling RemoveData. This is used to clean up
 // persistent state after a node has been permanently removed from a shard; a
 // replica that is to rejoin does so under a new replica ID, as Raft requires.
@@ -11242,27 +11250,38 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	// Resolve the replica's snapshot directory before the LogDB removal
 	// drops the bootstrap record that states the shard's DataDir (the
 	// nodeState holding the Config is gone once the replica is unloaded).
-	// StartShard records one for every start, a join included. Without a
-	// record (a replica never started on this host) the tree is rooted under
-	// NodeHostDir, the layout StartShard uses for an empty DataDir.
-	var dataDir string
-	if bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID); err != nil {
+	snapDir, intentPending, err := h.removeDataSnapshotDir(shardID, replicaID)
+	if err != nil {
 		return err
-	} else if ok {
-		dataDir = bs.DataDir
 	}
-	snapDir := engine.ReplicaSnapshotDir(
-		shardSnapshotBaseDir(h.cfg.NodeHostDir, dataDir, shardID), shardID, replicaID)
 
-	// Remove the snapshot directory BEFORE RemoveNodeData retires the
-	// replica and drops its bootstrap record: a RemoveAll error or a crash
-	// between the two then leaves the record in place, so a retry resolves
-	// the same directory. RemoveAll of a missing directory is nil, so the
-	// retry is idempotent.
+	// Record the removal intent BEFORE anything is retired or deleted: once
+	// RemoveNodeData drops the bootstrap record, the intent is what still
+	// locates the snapshot directory for a retry after a failure or crash.
+	if !intentPending {
+		if err := h.writeRemoveDataIntent(shardID, replicaID, snapDir); err != nil {
+			return err
+		}
+	}
+
+	// Retire the replica BEFORE its snapshots are deleted. An unretired
+	// replica may still start, and its compacted log depends on its
+	// snapshot, so a failure here leaves the snapshot directory untouched.
+	// A retired replica is refused by StartShard, so its snapshot is never
+	// needed again. RemoveNodeData of an already retired replica is a no-op,
+	// so a retry from a pending intent repeats it safely.
+	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
+		return err
+	}
+
+	// Remove the retired replica's snapshot directory. RemoveAll of a missing
+	// directory is nil, so a retry is idempotent.
 	if err := h.snapshotFsys().RemoveAll(snapDir); err != nil {
 		return fmt.Errorf("remove snapshot directory %s: %w", snapDir, err)
 	}
-	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
+
+	// Every step is done: drop the intent.
+	if err := h.clearRemoveDataIntent(shardID, replicaID); err != nil {
 		return err
 	}
 
@@ -11290,6 +11309,128 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 	}
 	if retired {
 		return &ReplicaRetiredError{ShardID: shardID, ReplicaID: replicaID}
+	}
+	return nil
+}
+
+// removeDataSnapshotDir resolves the snapshot directory RemoveData removes
+// for the replica, and reports whether it came from a pending removal intent
+// (which then need not be written again). In order: the bootstrap record's
+// DataDir (StartShard records one for every start, a join included); else
+// a pending intent's path (a removal that retired the replica, dropping the
+// record, and then failed or crashed); else the NodeHostDir layout
+// StartShard uses for an empty DataDir.
+func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, error) {
+	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
+	if err != nil {
+		return "", false, err
+	}
+	if ok {
+		return engine.ReplicaSnapshotDir(
+			shardSnapshotBaseDir(h.cfg.NodeHostDir, bs.DataDir, shardID), shardID, replicaID), false, nil
+	}
+	if p, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil {
+		return "", false, err
+	} else if pending {
+		return p, true, nil
+	}
+	return engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, "", shardID), shardID, replicaID), false, nil
+}
+
+// removeDataIntentDir is the directory under NodeHostDir holding RemoveData's
+// removal intents, one file per replica being removed.
+const removeDataIntentDir = "remove-data"
+
+// removeDataIntentPath returns the removal intent file of the replica:
+// <NodeHostDir>/remove-data/shard-<S>-replica-<R>.
+//
+// The intent is a host-local file RemoveData alone writes and reads, holding
+// nothing but the replica's snapshot directory path. It is not part of any
+// versioned format (no LogDB record, snapshot artifact or wire message
+// changes) and carries no version of its own.
+func removeDataIntentPath(nodeHostDir string, shardID, replicaID uint64) string {
+	return filepath.Join(nodeHostDir, removeDataIntentDir,
+		fmt.Sprintf("shard-%d-replica-%d", shardID, replicaID))
+}
+
+// readRemoveDataIntent returns the snapshot directory a pending removal
+// intent of the replica names, and whether one exists.
+func (h *Host) readRemoveDataIntent(shardID, replicaID uint64) (string, bool, error) {
+	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
+	f, err := h.snapshotFsys().Open(p)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("open removal intent %s: %w", p, err)
+	}
+	data, readErr := io.ReadAll(f)
+	closeErr := f.Close()
+	if readErr != nil {
+		return "", false, fmt.Errorf("read removal intent %s: %w", p, readErr)
+	}
+	if closeErr != nil {
+		return "", false, fmt.Errorf("close removal intent %s: %w", p, closeErr)
+	}
+	if len(data) == 0 {
+		// An intent is published by rename only once complete, so an empty
+		// one was never written by RemoveData.
+		return "", false, fmt.Errorf("removal intent %s is empty", p)
+	}
+	return string(data), true, nil
+}
+
+// writeRemoveDataIntent durably records that the replica's snapshot
+// directory snapDir is being removed: a temporary file in the intent
+// directory, written and synced, renamed into place, and the directory synced.
+func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) error {
+	fsys := h.snapshotFsys()
+	dir := filepath.Join(h.cfg.NodeHostDir, removeDataIntentDir)
+	if err := fsys.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create removal intent directory %s: %w", dir, err)
+	}
+	tmp, err := fsys.CreateTemp(dir, ".intent-*")
+	if err != nil {
+		return fmt.Errorf("create removal intent in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write([]byte(snapDir)); err != nil {
+		_ = tmp.Close()
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("write removal intent %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("sync removal intent %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("close removal intent %s: %w", tmpPath, err)
+	}
+	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
+	if err := fsys.Rename(tmpPath, p); err != nil {
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("publish removal intent %s: %w", p, err)
+	}
+	if err := syncDir(fsys, dir); err != nil {
+		return fmt.Errorf("sync removal intent directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+// clearRemoveDataIntent durably removes the replica's removal intent once
+// every step it records is done. A missing intent is not an error.
+func (h *Host) clearRemoveDataIntent(shardID, replicaID uint64) error {
+	fsys := h.snapshotFsys()
+	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
+	if err := fsys.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove removal intent %s: %w", p, err)
+	}
+	dir := filepath.Dir(p)
+	if err := syncDir(fsys, dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("sync removal intent directory %s: %w", dir, err)
 	}
 	return nil
 }
