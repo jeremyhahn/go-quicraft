@@ -59,9 +59,6 @@ type sessionRetryCluster struct {
 	nodes   []*retryNode
 	applied [3]atomic.Uint64
 	last    [3]atomic.Uint64
-	// base is the number of entries every replica had applied once the
-	// stableLeader barrier settled; the tests count from it.
-	base uint64
 }
 
 func newSessionRetryCluster(t *testing.T) *sessionRetryCluster {
@@ -114,19 +111,7 @@ func (c *sessionRetryCluster) leader() int {
 	c.t.Helper()
 	idx := -1
 	if !waitUntil(20*time.Second, func() bool {
-		idx = -1
-		for i, n := range c.nodes {
-			info, err := n.host.ShardInfo(retryShard)
-			if err != nil {
-				return false
-			}
-			if info.IsLeader {
-				if idx >= 0 {
-					return false
-				}
-				idx = i
-			}
-		}
+		idx = c.leaderNow()
 		return idx >= 0
 	}) {
 		c.t.Fatal("no single leader elected")
@@ -134,60 +119,24 @@ func (c *sessionRetryCluster) leader() int {
 	return idx
 }
 
-// stableLeader returns the index of a leader that has committed a plain
-// barrier entry in its own term, so a session created on it next does not
-// race a leader that steps down right after its election. A barrier refused
-// with a not-leader error (or one that times out) is retried against a
-// re-sampled leader until ctx expires. Once the barrier commits, every
-// replica is waited on to apply through it, so any earlier refused barrier
-// that was "already submitted to raft" has either applied before it or been
-// truncated for good; the applied count at that point is recorded in c.base
-// and every later count is checked relative to it.
-func (c *sessionRetryCluster) stableLeader(ctx context.Context) int {
-	c.t.Helper()
-	for {
-		idx := c.leader()
-		attempt, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, err := c.nodes[idx].host.SyncPropose(attempt, retryShard, []byte("barrier"))
-		cancel()
-		if err == nil {
-			c.settle(idx)
-			return idx
+// leaderNow probes every node once and returns the index of the single
+// node that reports itself leader, or -1 when there is none or more than
+// one. It never blocks, so a caller can bound the wait by its own deadline.
+func (c *sessionRetryCluster) leaderNow() int {
+	idx := -1
+	for i, n := range c.nodes {
+		info, err := n.host.ShardInfo(retryShard)
+		if err != nil {
+			return -1
 		}
-		if !errors.Is(err, ErrNotLeader) && !errors.Is(err, context.DeadlineExceeded) {
-			c.t.Fatalf("barrier on replica %d: %v", idx+1, err)
-		}
-		if ctx.Err() != nil {
-			c.t.Fatalf("no leader committed a barrier before the deadline: last error %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// settle waits until every replica has applied through the leader's last
-// applied index and has applied the same number of entries, then records
-// that number as the baseline in c.base.
-func (c *sessionRetryCluster) settle(leader int) {
-	c.t.Helper()
-	final := c.last[leader].Load()
-	if !waitUntil(10*time.Second, func() bool {
-		for _, n := range c.nodes {
-			info, err := n.host.ShardInfo(retryShard)
-			if err != nil || info.LastApplied < final {
-				return false
+		if info.IsLeader {
+			if idx >= 0 {
+				return -1
 			}
+			idx = i
 		}
-		base := c.applied[0].Load()
-		for i := range c.applied {
-			if c.applied[i].Load() != base {
-				return false
-			}
-		}
-		return true
-	}) {
-		c.t.Fatalf("replicas did not settle through barrier index %d", final)
 	}
-	c.base = c.applied[0].Load()
+	return idx
 }
 
 // transfer moves leadership from the replica at index from to another one and
@@ -239,8 +188,8 @@ func (c *sessionRetryCluster) awaitApplied(leader int, want uint64) {
 		c.t.Fatalf("not every replica applied through index %d", final)
 	}
 	for i := range c.applied {
-		if got := c.applied[i].Load() - c.base; got != want {
-			c.t.Fatalf("replica %d applied %d entries after the barrier, want %d", i+1, got, want)
+		if got := c.applied[i].Load(); got != want {
+			c.t.Fatalf("replica %d applied %d entries, want %d", i+1, got, want)
 		}
 	}
 }
@@ -266,15 +215,34 @@ func proposeOnce(t *testing.T, h *Host, session *Session, cmd []byte) RequestRes
 	}
 }
 
-func newRetrySession(t *testing.T, h *Host) *Session {
+func newRetrySession(t *testing.T, c *sessionRetryCluster) (*Session, int) {
 	t.Helper()
+	// Resolve the initial leader before the registration deadline starts:
+	// a slow first election must not eat NewSession's budget.
+	idx := c.leader()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.NewSession(ctx, retryShard)
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
+	for {
+		session, err := c.nodes[idx].host.NewSession(ctx, retryShard)
+		if err == nil {
+			return session, idx
+		}
+		if !errors.Is(err, ErrNotLeader) || ctx.Err() != nil {
+			t.Fatalf("NewSession on node %d: %v", idx, err)
+		}
+		// Leadership moved, or this node's view is not settled yet:
+		// re-resolve the leader within the remaining deadline.
+		prev := idx
+		idx = -1
+		for idx < 0 {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("NewSession on node %d: %v (deadline: %v)", prev, err, ctx.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
+			idx = c.leaderNow()
+		}
 	}
-	return session
 }
 
 // A proposal answered by the old leader and retried with the same session and
@@ -282,19 +250,15 @@ func newRetrySession(t *testing.T, h *Host) *Session {
 // retry returns the first result.
 func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 	c := newSessionRetryCluster(t)
-	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer bcancel()
-	old := c.stableLeader(bctx)
-	resultBase := retryResultBase + c.base
-	session := newRetrySession(t, c.nodes[old].host)
+	session, old := newRetrySession(t, c)
 	series := session.SeriesID()
 
 	first := proposeOnce(t, c.nodes[old].host, session, []byte("once"))
 	if first.Err != nil {
 		t.Fatalf("first attempt: %v", first.Err)
 	}
-	if first.Value != resultBase+1 {
-		t.Fatalf("first result = %d, want %d", first.Value, resultBase+1)
+	if first.Value != retryResultBase+1 {
+		t.Fatalf("first result = %d, want %d", first.Value, retryResultBase+1)
 	}
 	c.awaitApplied(old, 1)
 
@@ -319,8 +283,8 @@ func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next series: %v", err)
 	}
-	if r.Value != resultBase+2 {
-		t.Fatalf("next series result = %d, want %d", r.Value, resultBase+2)
+	if r.Value != retryResultBase+2 {
+		t.Fatalf("next series result = %d, want %d", r.Value, retryResultBase+2)
 	}
 	c.awaitApplied(next, 2)
 }
@@ -330,11 +294,7 @@ func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 // cached response was discarded, PhD Figure 6.1 step 3) and applied nowhere.
 func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 	c := newSessionRetryCluster(t)
-	bctx, bcancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer bcancel()
-	old := c.stableLeader(bctx)
-	resultBase := retryResultBase + c.base
-	session := newRetrySession(t, c.nodes[old].host)
+	session, old := newRetrySession(t, c)
 	h := c.nodes[old].host
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -377,8 +337,8 @@ func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("series 4: %v", err)
 	}
-	if r2.Value != resultBase+4 {
-		t.Fatalf("series 4 result = %d, want %d", r2.Value, resultBase+4)
+	if r2.Value != retryResultBase+4 {
+		t.Fatalf("series 4 result = %d, want %d", r2.Value, retryResultBase+4)
 	}
 	c.awaitApplied(next, 4)
 }
