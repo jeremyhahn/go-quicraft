@@ -117,7 +117,7 @@ read the linked material before reporting:
   tamper control; an adversary with disk access can recompute it. Tamper
   protection comes from the barrier's AEAD.
 - **Shamir reconstruction performs no integrity check.** `shamir.CombineProtected`,
-  `CombineBytes` and the deprecated `Combine` all return whatever the shares
+  `CombineProtectedWith` and `CombineBytes` all return whatever the shares
   produce. Shares carry no digest by design, because one would be an offline
   brute-force oracle. The caller must authenticate the reconstructed secret out
   of band.
@@ -158,8 +158,9 @@ breached, so they are listed here:
 - Configure `TransportConfig.MTLSConfig`. QuicRaft never falls back to TCP and
   never runs QUIC without TLS: the only TLS config it builds requires TLS 1.3,
   `RequireAndVerifyClientCert` and the `quicraft` ALPN, with a fixed list of
-  key-exchange groups (X25519, P-256, P-384; P-256 and P-384 only in a
-  `-tags fips` build). It refuses to start without an mTLS config
+  key-exchange groups (the hybrid post-quantum X25519MLKEM768 and
+  SecP256r1MLKEM768, then X25519, P-256 and P-384; SecP256r1MLKEM768, P-256
+  and P-384 only in a `-tags fips` build). It refuses to start without an mTLS config
   (`ErrMTLSConfigRequired`). None of that is adjustable. What you control is
   which CAs go in the pool and which certificates you issue against them.
 - Give every member its node identity (`Config.MemberIdentities` at bootstrap
