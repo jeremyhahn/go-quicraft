@@ -25,6 +25,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/batch"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const batchAggregatorShard = uint64(921)
@@ -118,7 +119,7 @@ func newBatchAggregator(t *testing.T, h *Host) *batch.Aggregator {
 	t.Helper()
 	cfg := batch.DefaultConfig()
 	cfg.FlushInterval = 5 * time.Millisecond
-	agg, err := batch.NewAggregator(batch.HostProposer{Host: h}, batch.WithConfig(cfg))
+	agg, err := batch.NewAggregator(batch.HostProposer{Host: h}, batch.WithConfig(cfg), batch.WithRegistry(prometheus.NewRegistry()))
 	if err != nil {
 		t.Fatalf("NewAggregator: %v", err)
 	}
