@@ -17,6 +17,7 @@ package waldb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"os"
@@ -47,8 +48,9 @@ type repairClassCase struct {
 	sentinel   error
 	shardIndex int
 	segmentID  uint64
-	// readBack checks the reopened DB holds the entries below the cut.
-	readBack func(ctx context.Context, t *testing.T, db *DB)
+	// readBack checks the reopened DB holds exactly the entries below the
+	// cut; cleanEnd is the clean end the open reported and Repair cut at.
+	readBack func(ctx context.Context, t *testing.T, cleanEnd int64, db *DB)
 }
 
 // snapshotWALDir returns every regular file under dir, keyed by its path
@@ -178,7 +180,7 @@ func runRepairClassCase(ctx context.Context, t *testing.T, c repairClassCase) {
 		t.Fatalf("Open after Repair: %v", err)
 	}
 	defer db.Close()
-	c.readBack(ctx, t, db)
+	c.readBack(ctx, t, sce.CleanEnd, db)
 }
 
 // readEntryPrefix returns how many of the indexes first..last read back with
@@ -194,8 +196,13 @@ func readEntryPrefix(ctx context.Context, t *testing.T, db *DB, shardID, replica
 	var kept uint64
 	missing := false
 	for idx := first; idx <= last; idx++ {
+		// GetEntries answers (nil, nil) for an absent index or an unknown
+		// node, so absence is never an error: any error is a failure.
 		got, err := db.GetEntries(shardID, replicaID, idx, idx+1, 1<<30)
-		present := err == nil && len(got) == 1 && got[0].Index == idx
+		if err != nil {
+			t.Fatalf("GetEntries %d/%d/%d: %v", shardID, replicaID, idx, err)
+		}
+		present := len(got) == 1 && got[0].Index == idx
 		if present && !bytes.Equal(got[0].Cmd, want(idx)) {
 			t.Fatalf("entry %d/%d/%d read back with a different command", shardID, replicaID, idx)
 		}
@@ -209,6 +216,68 @@ func readEntryPrefix(ctx context.Context, t *testing.T, db *DB, shardID, replica
 		}
 	}
 	return kept
+}
+
+// entriesBelow walks image, an undamaged segment image written with
+// blockSize-byte blocks, reassembles its logical records, and counts the
+// entries carried by the entry records that end at or below cleanEnd: the
+// entries a repair cutting at cleanEnd must keep, no more and no fewer. One
+// logical entry record may carry several entries (one SaveState batch per
+// node), so the count is taken from each record's payload.
+func entriesBelow(ctx context.Context, t *testing.T, image []byte, blockSize int, cleanEnd int64) uint64 {
+	t.Helper()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("entriesBelow: %v", err)
+	}
+	var (
+		count   uint64
+		partial []byte
+	)
+	countPayload := func(rec []byte) {
+		if len(rec) == 0 || rec[0] != payloadTypeEntries {
+			return
+		}
+		for pos := 1; pos < len(rec); {
+			if len(rec)-pos < entryRecordHeaderSize {
+				t.Fatalf("entriesBelow: truncated entry header at %d", pos)
+			}
+			cmdLen := int(binary.LittleEndian.Uint32(rec[pos+80:]))
+			pos += entryRecordHeaderSize + cmdLen
+			count++
+		}
+	}
+	for blockStart := 0; blockStart < len(image); blockStart += blockSize {
+		block := image[blockStart:min(blockStart+blockSize, len(image))]
+		for pos := 0; pos+recordHeaderSize <= len(block); {
+			if block[pos+6] == 0 {
+				break // zero padding: the rest of the block is empty
+			}
+			data, recType, _, _, n, err := decodeRecord(block[pos:])
+			if err != nil {
+				t.Fatalf("entriesBelow: undamaged image fails to decode at %d: %v", blockStart+pos, err)
+			}
+			end := int64(blockStart + pos + n)
+			pos += n
+			switch recType {
+			case RecordFull:
+				partial = nil
+				if end <= cleanEnd {
+					countPayload(data)
+				}
+			case RecordFirst:
+				partial = append([]byte(nil), data...)
+			case RecordMiddle:
+				partial = append(partial, data...)
+			case RecordLast:
+				partial = append(partial, data...)
+				if end <= cleanEnd {
+					countPayload(partial)
+				}
+				partial = nil
+			}
+		}
+	}
+	return count
 }
 
 func TestRepairEveryRefusalClass_NonFinalSegmentCorruption(t *testing.T) {
@@ -237,6 +306,10 @@ func TestRepairEveryRefusalClass_NonFinalSegmentCorruption(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+	image, err := os.ReadFile(seg0Path)
+	if err != nil {
+		t.Fatalf("read segment image: %v", err)
+	}
 	corruptSegmentBlock(t, seg0Path, blockSize)
 
 	runRepairClassCase(ctx, t, repairClassCase{
@@ -246,10 +319,15 @@ func TestRepairEveryRefusalClass_NonFinalSegmentCorruption(t *testing.T) {
 		sentinel:   ErrNonFinalSegmentCorruption,
 		shardIndex: int(shardID % DefaultShardCount),
 		segmentID:  0,
-		readBack: func(ctx context.Context, t *testing.T, db *DB) {
+		readBack: func(ctx context.Context, t *testing.T, cleanEnd int64, db *DB) {
 			// writeSingleGenerationSegment gave replica r one entry at index 1
-			// whose command is 200 bytes of r. The replicas written below the
-			// zeroed block survive; the rest went with it.
+			// whose command is 200 bytes of r. Exactly the replicas whose
+			// records end at or below the clean end survive; the rest went
+			// with the zeroed block.
+			want := entriesBelow(ctx, t, image, blockSize, cleanEnd)
+			if want != 3 {
+				t.Fatalf("fixture drift: %d entries end below clean end %d, want 3", want, cleanEnd)
+			}
 			var kept uint64
 			missing := false
 			for r := uint64(1); r <= 15; r++ {
@@ -265,9 +343,8 @@ func TestRepairEveryRefusalClass_NonFinalSegmentCorruption(t *testing.T) {
 					missing = true
 				}
 			}
-			if kept == 0 || kept == 15 {
-				t.Fatalf("%d of 15 entries read back; want the ones below the zeroed block, "+
-					"and not the ones in it", kept)
+			if kept != want {
+				t.Fatalf("%d of 15 entries read back; want exactly the %d below the zeroed block", kept, want)
 			}
 			// The hard state lived in the segments above the cut, which the
 			// repair deleted.
@@ -356,15 +433,19 @@ func TestRepairEveryRefusalClass_AcknowledgedDataLost(t *testing.T) {
 		sentinel:   ErrAcknowledgedDataLost,
 		shardIndex: int(shardID % DefaultShardCount),
 		segmentID:  0,
-		readBack: func(ctx context.Context, t *testing.T, db *DB) {
+		readBack: func(ctx context.Context, t *testing.T, cleanEnd int64, db *DB) {
+			// The cut keeps every acknowledged entry below the damage and
+			// nothing of the in-flight batch above it.
+			want := entriesBelow(ctx, t, image, blockSize, cleanEnd)
+			if want != acked {
+				t.Fatalf("fixture drift: %d entries end below clean end %d, want %d", want, cleanEnd, acked)
+			}
 			kept := readEntryPrefix(ctx, t, db, shardID, replicaID, 1, acked+8, func(idx uint64) []byte {
 				return crashDurEntry(shardID, idx, 1).Cmd
 			})
-			// The cut keeps the acknowledged records below the damage and
-			// nothing of the in-flight batch above it.
-			if kept == 0 || kept > acked {
-				t.Fatalf("%d entries read back; want the acknowledged ones below the "+
-					"damage (at most %d, more than none)", kept, acked)
+			if kept != want {
+				t.Fatalf("%d entries read back; want exactly the %d acknowledged ones below the damage",
+					kept, want)
 			}
 		},
 	})
@@ -400,7 +481,7 @@ func TestRepairEveryRefusalClass_RecordSequenceRegression(t *testing.T) {
 		sentinel:   ErrRecordSequenceRegression,
 		shardIndex: 1,
 		segmentID:  0,
-		readBack: func(ctx context.Context, t *testing.T, db *DB) {
+		readBack: func(ctx context.Context, t *testing.T, _ int64, db *DB) {
 			// The acknowledged prefix — eight entries and the hard state after
 			// them — lies wholly below the lost page.
 			prefixCmd := make([]byte, 700)
