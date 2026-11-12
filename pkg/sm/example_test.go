@@ -243,7 +243,42 @@ func (f *fileStore) Sync() error {
 	f.mu.RLock()
 	data := f.encode()
 	f.mu.RUnlock()
-	return os.WriteFile(f.path, data, 0o600)
+	return writeStateFile(f.path, data)
+}
+
+// writeStateFile replaces path with data so that a crash leaves either the
+// old file or the new one, never a partial file that Open would accept.
+func writeStateFile(path string, data []byte) error {
+	// Write to a temporary file in the same directory: rename is atomic
+	// only within one file system.
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".state-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op once the rename succeeds
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	// Fsync before the rename, or the rename can reach disk before the data.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	// Fsync the directory so the rename itself survives a crash.
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (f *fileStore) PrepareSnapshot() (interface{}, error) {
@@ -271,7 +306,7 @@ func (f *fileStore) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan
 	if err := f.decode(data); err != nil {
 		return err
 	}
-	return os.WriteFile(f.path, data, 0o600)
+	return writeStateFile(f.path, data)
 }
 
 func (f *fileStore) Close(context.Context) error { return f.Sync() }
