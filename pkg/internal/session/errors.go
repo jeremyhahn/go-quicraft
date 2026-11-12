@@ -19,29 +19,27 @@ import (
 	"fmt"
 )
 
-// Session-specific sentinel errors. The quicraft package cannot be imported
-// here (quicraft imports session transitively via rsm), so the public
-// quicraft.ErrSessionLimitExceeded, ErrSessionNotFound,
-// ErrSessionAlreadyExists and ErrResponseLimitExceeded are assigned from
-// these values: an embedder matching the public name matches the error
-// returned here. Those four carry the public "quicraft:" prefix for that
-// reason.
+// Session-specific sentinel errors. These are independent of the quicraft
+// package to avoid import cycles (quicraft imports session transitively
+// via rsm, session must not import quicraft). The quicraft package
+// defines equivalent errors for the public API; these are the
+// session-internal variants.
 var (
 	// ErrSessionLimitExceeded is returned when the total session limit
 	// for a shard has been reached.
-	ErrSessionLimitExceeded = errors.New("quicraft: session limit exceeded")
+	ErrSessionLimitExceeded = errors.New("session: session limit exceeded")
 
 	// ErrSessionNotFound is returned when an operation references a
 	// client session that does not exist.
-	ErrSessionNotFound = errors.New("quicraft: session not found")
+	ErrSessionNotFound = errors.New("session: session not found")
 
 	// ErrSessionAlreadyExists is returned when registering a client
 	// session that is already registered.
-	ErrSessionAlreadyExists = errors.New("quicraft: session already exists")
+	ErrSessionAlreadyExists = errors.New("session: session already exists")
 
 	// ErrResponseLimitExceeded is returned when a session's response
 	// cache exceeds the configured maximum, indicating a misbehaving client.
-	ErrResponseLimitExceeded = errors.New("quicraft: response limit exceeded")
+	ErrResponseLimitExceeded = errors.New("session: response limit exceeded")
 
 	// ErrResponseEvicted is returned by CheckDuplicate when the
 	// seriesID has already been completed and its cached response was

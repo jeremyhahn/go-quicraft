@@ -23,7 +23,6 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
-	"github.com/jeremyhahn/go-quicraft/pkg/internal/session"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
@@ -255,9 +254,8 @@ var (
 	ErrDecompressionBomb = raft.ErrDecompressionBomb
 
 	// ErrSessionLimitExceeded is returned when the per-client or total
-	// session limit for a shard has been reached. It is the value the
-	// session manager returns, so errors.Is matches the returned error.
-	ErrSessionLimitExceeded = session.ErrSessionLimitExceeded
+	// session limit for a shard has been reached.
+	ErrSessionLimitExceeded = errors.New("quicraft: session limit exceeded")
 
 	// ErrTooManySessions is the legacy alias for ErrSessionLimitExceeded,
 	// kept for backward compatibility. It is the same pointer value so
@@ -296,9 +294,8 @@ var (
 	ErrEntryTooLarge = errors.New("quicraft: entry too large")
 
 	// ErrSessionNotFound is returned when an operation references a
-	// client session that does not exist. It is the value the session
-	// manager returns, so errors.Is matches the returned error.
-	ErrSessionNotFound = session.ErrSessionNotFound
+	// client session that does not exist.
+	ErrSessionNotFound = errors.New("quicraft: session not found")
 
 	// ErrSessionExpired is returned when a session-managed proposal
 	// references a clientID whose session is no longer registered.
@@ -309,15 +306,12 @@ var (
 	ErrSessionExpired = errors.New("quicraft: session expired")
 
 	// ErrSessionAlreadyExists is returned when registering a client
-	// session that is already registered. It is the value the session
-	// manager returns, so errors.Is matches the returned error.
-	ErrSessionAlreadyExists = session.ErrSessionAlreadyExists
+	// session that is already registered.
+	ErrSessionAlreadyExists = errors.New("quicraft: session already exists")
 
 	// ErrResponseLimitExceeded is returned when a session's cached
-	// response count exceeds the configured maximum per session. It is the
-	// value the session manager returns, so errors.Is matches the returned
-	// error.
-	ErrResponseLimitExceeded = session.ErrResponseLimitExceeded
+	// response count exceeds the configured maximum per session.
+	ErrResponseLimitExceeded = errors.New("quicraft: response limit exceeded")
 
 	// ErrInvalidSMType is returned when a CreateFunc returns an object
 	// that does not implement any known state machine interface.
