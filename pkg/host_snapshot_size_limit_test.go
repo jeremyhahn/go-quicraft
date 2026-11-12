@@ -40,6 +40,11 @@ import (
 // command it has applied, in apply order.
 const sizeLimitDigestQuery = "digest"
 
+// sizeLimitOverhead is the compaction overhead both snapshot requests in
+// the size-limit test use: small enough that each snapshot is eligible to
+// compact the log.
+const sizeLimitOverhead = 10
+
 // growingStateMachine keeps every applied command, so its snapshot grows
 // with the data proposed and its digest is a function of the exact applied
 // sequence: a lost, duplicated or reordered entry changes it.
@@ -212,17 +217,32 @@ func TestSnapshotSizeLimit_OversizedSnapshotFailsAndShardKeepsServing(t *testing
 		}
 	}
 
-	// (a) Under a large limit a snapshot succeeds: S1.
+	// Both snapshot requests use a small compaction overhead, so each is
+	// eligible to compact the log: S1 establishes a compaction point, and
+	// a refused snapshot that wrongly reached compaction would move it.
+	snapOpt := SnapshotOption{OverrideCompactionOverhead: true, CompactionOverhead: sizeLimitOverhead}
+
+	// (a) Under a large limit a snapshot succeeds and compacts the log: S1.
 	h := start(0)
-	propose(h, 10, 1024)
-	s1, err := h.SyncRequestSnapshot(ctx, shardID, SnapshotOption{})
+	propose(h, 3*sizeLimitOverhead, 1024)
+	s1, err := h.SyncRequestSnapshot(ctx, shardID, snapOpt)
 	if err != nil {
 		h.Close()
 		t.Fatalf("(a) SyncRequestSnapshot under the default limit: %v", err)
 	}
-	if s1 == 0 {
+	if s1 <= sizeLimitOverhead {
 		h.Close()
-		t.Fatal("(a) SyncRequestSnapshot returned index 0")
+		t.Fatalf("(a) SyncRequestSnapshot index = %d, want > the overhead %d", s1, sizeLimitOverhead)
+	}
+	compacted, err := h.LogRange(shardID)
+	if err != nil {
+		h.Close()
+		t.Fatalf("(a) LogRange: %v", err)
+	}
+	if compacted.FirstIndex != s1-sizeLimitOverhead+1 {
+		h.Close()
+		t.Fatalf("(a) LogRange.FirstIndex = %d after S1 = %d with overhead %d: S1 did not "+
+			"compact the log", compacted.FirstIndex, s1, sizeLimitOverhead)
 	}
 	h.Close()
 
@@ -233,8 +253,14 @@ func TestSnapshotSizeLimit_OversizedSnapshotFailsAndShardKeepsServing(t *testing
 		h.Close()
 		t.Fatalf("(b) LogRange: %v", err)
 	}
+	// After a restart the log starts no later than just past S1.
+	if before.FirstIndex > s1+1 {
+		h.Close()
+		t.Fatalf("(b) LogRange.FirstIndex after restart = %d, want <= S1+1 = %d",
+			before.FirstIndex, s1+1)
+	}
 	propose(h, 200, 1024)
-	_, snapErr := h.SyncRequestSnapshot(ctx, shardID, SnapshotOption{})
+	_, snapErr := h.SyncRequestSnapshot(ctx, shardID, snapOpt)
 	var tooLarge *SnapshotTooLargeError
 	if !errors.As(snapErr, &tooLarge) {
 		h.Close()
@@ -257,10 +283,13 @@ func TestSnapshotSizeLimit_OversizedSnapshotFailsAndShardKeepsServing(t *testing
 		h.Close()
 		t.Fatalf("(c) LogRange: %v", err)
 	}
-	if after.FirstIndex != before.FirstIndex || after.FirstIndex > s1+1 {
+	// With the small overhead, a refused snapshot that reached compaction
+	// would move FirstIndex to about S1+190; it must stay where it was.
+	if after.FirstIndex != before.FirstIndex {
 		h.Close()
-		t.Fatalf("(c) LogRange.FirstIndex moved from %d to %d (S1 = %d): the refused "+
-			"snapshot compacted the log", before.FirstIndex, after.FirstIndex, s1)
+		t.Fatalf("(c) LogRange.FirstIndex moved from %d to %d (S1 = %d, overhead %d): "+
+			"the refused snapshot compacted the log",
+			before.FirstIndex, after.FirstIndex, s1, sizeLimitOverhead)
 	}
 	base := filepath.Dir(engine.SnapshotSaveDir(
 		shardSnapshotBaseDir(hcfg.NodeHostDir, "", shardID), shardID, replicaID, s1))
@@ -276,6 +305,15 @@ func TestSnapshotSizeLimit_OversizedSnapshotFailsAndShardKeepsServing(t *testing
 		if e.Name() == s1Name {
 			sawS1 = true
 			continue
+		}
+		// The engine stages a snapshot in a save directory and refuses an
+		// oversized one before publishing it; a staging directory left here
+		// is the leaked artifact. This runs before any Close or restart, so
+		// a startup sweep cannot hide it.
+		if engine.IsSnapshotSaveStage(e.Name()) {
+			h.Close()
+			t.Fatalf("(c) save staging directory %q remains under %q after the refused "+
+				"snapshot: the oversized artifact was not discarded", e.Name(), base)
 		}
 		if !strings.HasPrefix(e.Name(), "snapshot-") {
 			continue
