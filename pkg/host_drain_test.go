@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
 // TestHost_Drain_InFlightSyncProposeThenClose drives Drain while 16
@@ -178,4 +181,137 @@ func TestHost_Drain_InFlightSyncProposeThenClose(t *testing.T) {
 
 	t.Logf("before Drain returned: %d committed, %d refused with ErrDraining",
 		preOK.Load(), preRefused.Load())
+}
+
+// drainHoldCmd is the proposal payload holdingStateMachine holds in Update.
+var drainHoldCmd = []byte("drain-813-hold")
+
+// holdingStateMachine holds an admitted proposal inside Update: when it meets
+// drainHoldCmd it closes entered and blocks until release is closed, then
+// sets applied before it returns.
+type holdingStateMachine struct {
+	mockStateMachine
+	entered     chan struct{}
+	release     chan struct{}
+	applied     atomic.Bool
+	enteredOnce sync.Once
+}
+
+func newHoldingStateMachine() *holdingStateMachine {
+	return &holdingStateMachine{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (m *holdingStateMachine) Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error {
+	held := false
+	for i := range entries {
+		if bytes.Equal(entries[i].Cmd, drainHoldCmd) {
+			held = true
+			m.enteredOnce.Do(func() { close(m.entered) })
+			select {
+			case <-m.release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	if err := m.mockStateMachine.Update(ctx, entries, results); err != nil {
+		return err
+	}
+	if held {
+		m.applied.Store(true)
+	}
+	return nil
+}
+
+// TestHost_Drain_WaitsForHeldProposal holds one admitted SyncPropose inside
+// the state machine's Update, so pendingOps is non-zero when Drain starts.
+// Drain must stay blocked while the proposal is held and must return only
+// after the released proposal has been applied.
+func TestHost_Drain_WaitsForHeldProposal(t *testing.T) {
+	const (
+		deadline     = 5 * time.Second
+		blockedProbe = 200 * time.Millisecond
+	)
+
+	hsm := newHoldingStateMachine()
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	// Cleanups run last-registered first: release a still-held Update
+	// before the host is closed.
+	var releaseOnce sync.Once
+	releaseHeld := func() { releaseOnce.Do(func() { close(hsm.release) }) }
+	t.Cleanup(releaseHeld)
+
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	create := func(shardID, replicaID uint64) interface{} { return hsm }
+	if err := h.StartShard(members, false, create, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	proposeDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*deadline)
+		defer cancel()
+		_, err := h.SyncPropose(ctx, 1, drainHoldCmd)
+		proposeDone <- err
+	}()
+
+	select {
+	case <-hsm.entered:
+	case err := <-proposeDone:
+		t.Fatalf("SyncPropose returned %v before Update held it", err)
+	case <-time.After(deadline):
+		t.Fatal("the held proposal never reached Update")
+	}
+	if n := h.pendingOps.Load(); n <= 0 {
+		t.Fatalf("pendingOps = %d while a proposal is held in Update, want > 0", n)
+	}
+
+	drainDone := make(chan error, 1)
+	go func() { drainDone <- h.Drain() }()
+
+	select {
+	case err := <-drainDone:
+		t.Fatalf("Drain returned %v while an admitted proposal was held", err)
+	case <-time.After(blockedProbe):
+	}
+	if !h.IsDraining() {
+		t.Fatal("IsDraining = false while Drain is waiting")
+	}
+	if _, err := h.SyncPropose(context.Background(), 1, []byte("late")); !errors.Is(err, ErrDraining) {
+		t.Errorf("SyncPropose during Drain = %v, want ErrDraining", err)
+	}
+	if hsm.applied.Load() {
+		t.Fatal("held proposal applied before it was released")
+	}
+
+	releaseHeld()
+
+	select {
+	case err := <-drainDone:
+		if err != nil {
+			t.Fatalf("Drain = %v, want nil", err)
+		}
+	case <-time.After(deadline):
+		t.Fatal("Drain did not return after the held proposal was released")
+	}
+	if !hsm.applied.Load() {
+		t.Error("Drain returned before the held proposal was applied")
+	}
+	select {
+	case err := <-proposeDone:
+		if err != nil {
+			t.Errorf("held SyncPropose = %v, want success", err)
+		}
+	case <-time.After(deadline):
+		t.Fatal("held SyncPropose did not return after Drain")
+	}
 }
