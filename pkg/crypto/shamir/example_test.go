@@ -36,9 +36,11 @@ func ExampleSplitBytes() {
 	}
 	defer clear(recovered)
 
-	// CombineBytes does not verify the result: with fewer than threshold
-	// shares it returns garbage, not an error. Callers authenticate the
-	// secret out of band; this example compares it directly.
+	// CombineBytes returns a CombineError when given fewer values than the
+	// threshold argument, but it does not verify the result: corrupted or
+	// mismatched shares, or a threshold below the one used to split, yield
+	// garbage, not an error. Callers authenticate the secret out of band;
+	// this example only prints it.
 	fmt.Println("recovered:", string(recovered))
 	// Output:
 	// shares: 5
