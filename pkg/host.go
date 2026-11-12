@@ -5924,12 +5924,16 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 // ErrReadIndexNotReady; see ReadIndex. A forwarded ReadIndex or response
 // lost in transit is bounded only by ctx, so callers must pass a deadline.
 //
-// SyncRead never answers from a replica that cannot reach a quorum. A
-// leader that has lost its quorum cannot confirm the read: the call fails
-// with ErrTimeout (or ErrCanceled) when ctx ends, or with a NotLeaderError
-// (errors.Is ErrNotLeader) when the leader steps down first. A replica that
-// knows no leader fails with a NotLeaderError or at ctx's end. Use StaleRead to
-// read a replica's applied state without a quorum.
+// With LeaseRead disabled, SyncRead never answers from a replica that
+// cannot reach a quorum. A leader that has lost its quorum cannot confirm
+// the read: the call fails with ErrTimeout (or ErrCanceled) when ctx ends,
+// or with a NotLeaderError (errors.Is ErrNotLeader) when the leader steps
+// down first. A replica that knows no leader fails with a NotLeaderError or
+// at ctx's end. The exception is LeaseRead enabled: a leader holding a valid
+// lease may answer SyncRead from its own state for the rest of that lease
+// after its peers become unreachable, and refuses as above once the lease
+// has expired. Use StaleRead to read a replica's applied state without a
+// quorum.
 func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
 	// Step 1: Get a confirmed read index via ReadIndex.
 	rs, err := h.ReadIndex(ctx, shardID)
