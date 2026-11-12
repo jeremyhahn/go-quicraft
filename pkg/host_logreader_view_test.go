@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // startLogReaderViewShard starts a single-replica shard 1 and waits for it
@@ -205,5 +208,28 @@ func TestLogReaderViewStoppedShardNotFound(t *testing.T) {
 	}
 	if _, err := h.LogReader(1); !errors.Is(err, ErrShardNotFound) {
 		t.Fatalf("LogReader after StopShard returned %v, want ErrShardNotFound", err)
+	}
+}
+
+// TestLogReaderViewTermAdvancesWithoutAppend pins NodeState to the live Raft
+// term when the term advances without a log append: a follower holding a
+// term-2 log that accepts a term-3 heartbeat is at term 3, while its log tail
+// and the reader's cached hard state still say 2.
+func TestLogReaderViewTermAdvancesWithoutAppend(t *testing.T) {
+	lr := logdb.NewLogReader(1, 1, nil)
+	if err := lr.Append([]proto.Entry{
+		{Index: 1, Term: 2},
+		{Index: 2, Term: 2},
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	lr.SetState(proto.State{Term: 2})
+	adapter := &logReaderAdapter{
+		reader:      lr,
+		currentTerm: func() uint64 { return 3 },
+	}
+	lastIndex, term := adapter.NodeState()
+	if lastIndex != 2 || term != 3 {
+		t.Fatalf("NodeState() = (%d, %d), want (2, 3)", lastIndex, term)
 	}
 }
