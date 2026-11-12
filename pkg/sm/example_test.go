@@ -98,7 +98,8 @@ func ExampleStateMachine() {
 }
 
 // register is a sm.ConcurrentStateMachine: Lookup may run while Update
-// applies, so the state lives in an atomic, and PrepareSnapshot captures a
+// applies, so the state lives in an atomic that Update stores once per batch
+// (never an intermediate value), and PrepareSnapshot captures a
 // point-in-time copy that SaveSnapshot writes while updates continue.
 type register struct {
 	value atomic.Uint64
@@ -107,14 +108,21 @@ type register struct {
 var _ sm.ConcurrentStateMachine = (*register)(nil)
 
 func (r *register) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
+	// Compute the batch locally and publish its final value with one Store,
+	// so a concurrent Lookup never sees a half-applied batch.
+	var last uint64
+	valid := false
 	for i, e := range entries {
 		if len(e.Cmd) != 8 {
 			results[i] = sm.Result{Value: sm.ResultInvalidCommand}
 			continue
 		}
-		v := binary.LittleEndian.Uint64(e.Cmd)
-		r.value.Store(v)
-		results[i] = sm.Result{Value: v}
+		last = binary.LittleEndian.Uint64(e.Cmd)
+		valid = true
+		results[i] = sm.Result{Value: last}
+	}
+	if valid {
+		r.value.Store(last)
 	}
 	return nil
 }
