@@ -350,6 +350,56 @@ type hidden interface {
 	}
 }
 
+// TestUndocumentedDeclsStructFields checks that each exported, named field
+// of an exported struct needs a doc or a trailing line comment, in a
+// standalone type and in a grouped type block, while unexported fields,
+// embedded fields and fields of an unexported struct are not reported.
+func TestUndocumentedDeclsStructFields(t *testing.T) {
+	const src = `// Package fixture is a doc comment gate fixture.
+package fixture
+
+// Info is a documented standalone struct.
+type Info struct {
+	ShardID uint64
+
+	// ReplicaID is documented.
+	ReplicaID uint64
+
+	Term uint64 // Term is documented by a trailing comment.
+
+	count int
+
+	Embedded
+}
+
+// Grouped types.
+type (
+	// Entry is documented.
+	Entry struct {
+		Index uint64
+	}
+)
+
+// hidden is unexported.
+type hidden struct {
+	Size int
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parsing fixture: %v", err)
+	}
+	var got []string
+	for _, g := range undocumentedDecls(fset, "fixture.go", file) {
+		got = append(got, g.what)
+	}
+	want := []string{"field Info.ShardID", "field Entry.Index"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("undocumentedDecls reported %q, want %q", got, want)
+	}
+}
+
 // receiverTypeName returns the base type name of a method receiver, looking
 // through pointers and type parameters.
 func receiverTypeName(recv *ast.FieldList) string {
