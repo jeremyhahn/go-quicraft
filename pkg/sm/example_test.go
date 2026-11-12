@@ -226,6 +226,12 @@ func (f *fileStore) Update(_ context.Context, entries []sm.Entry, results []sm.R
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for i, e := range entries {
+		// Replay after a restart can resend entries the state already
+		// holds: skip them, or the state would roll back to an older index.
+		if e.Index <= f.applied {
+			results[i] = sm.Result{}
+			continue
+		}
 		f.value = append(f.value[:0], e.Cmd...)
 		f.applied = e.Index
 		results[i] = sm.Result{Value: uint64(len(e.Cmd))}
@@ -312,7 +318,8 @@ func (f *fileStore) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan
 func (f *fileStore) Close(context.Context) error { return f.Sync() }
 
 // ExampleDiskStateMachine applies an entry, closes the state machine and
-// reopens it from the same directory, which reports the persisted index.
+// reopens it from the same directory, which reports the persisted index. It
+// then replays entries at and below that index, which change nothing.
 func ExampleDiskStateMachine() {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "disk-sm-example")
@@ -349,7 +356,32 @@ func ExampleDiskStateMachine() {
 	}
 	value, _ := reopened.Lookup(ctx, nil)
 	fmt.Println("reopened index:", index, "value:", value)
+
+	// A replay of entries at or below the applied index leaves the state
+	// unchanged, and the next Sync persists the same index.
+	replay := []sm.Entry{{Index: 41, Cmd: []byte("older")}, {Index: 42, Cmd: []byte("hello")}}
+	if err := reopened.Update(ctx, replay, make([]sm.Result, len(replay))); err != nil {
+		fmt.Println("replay:", err)
+		return
+	}
+	if err := reopened.Close(ctx); err != nil {
+		fmt.Println("close:", err)
+		return
+	}
+	again := create(1, 1).(sm.DiskStateMachine)
+	index, err = again.Open(ctx, dir, nil)
+	if err != nil {
+		fmt.Println("reopen:", err)
+		return
+	}
+	value, _ = again.Lookup(ctx, nil)
+	fmt.Println("after replay index:", index, "value:", value)
+	if err := again.Close(ctx); err != nil {
+		fmt.Println("close:", err)
+		return
+	}
 	// Output:
 	// fresh index: 0
 	// reopened index: 42 value: hello
+	// after replay index: 42 value: hello
 }
