@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,6 +123,33 @@ func (c *transferCluster) agreedLeader(timeout time.Duration) (uint64, uint64) {
 // leadership moves. Anything else is a defect.
 var transferProposalErrors = []error{ErrTransferInProgress, ErrNotLeader, ErrDropped, ErrTimeout}
 
+// transferWrite is an acknowledged write and the term it was acknowledged
+// in; term is zero when the acknowledging replica's term moved during the
+// proposal.
+type transferWrite struct {
+	key  string
+	term uint64
+}
+
+// awaitProgress waits until every proposer has an acknowledged write in
+// term or later: it ties proposal progress to each transfer.
+func (c *transferCluster) awaitProgress(progress []atomic.Uint64, term uint64) {
+	c.t.Helper()
+	if !waitUntil(20*time.Second, func() bool {
+		for g := range progress {
+			if progress[g].Load() < term {
+				return false
+			}
+		}
+		return true
+	}) {
+		for g := range progress {
+			c.t.Logf("proposer %d: last acknowledged term %d", g, progress[g].Load())
+		}
+		c.t.Fatalf("not every proposer had a write acknowledged in term %d", term)
+	}
+}
+
 func isTransferProposalError(err error) bool {
 	for _, want := range transferProposalErrors {
 		if errors.Is(err, want) {
@@ -134,7 +162,7 @@ func isTransferProposalError(err error) bool {
 // proposeUntil runs one proposer: distinct Puts through whichever replica it
 // believes leads, until stop closes. It returns the acknowledged keys and
 // every error outside transferProposalErrors.
-func (c *transferCluster) proposeUntil(g int, stop <-chan struct{}) (acked []string, bad []error) {
+func (c *transferCluster) proposeUntil(g int, stop <-chan struct{}, progress *atomic.Uint64) (acked []transferWrite, bad []error) {
 	target := 0
 	for n := 0; ; n++ {
 		select {
@@ -148,11 +176,24 @@ func (c *transferCluster) proposeUntil(g int, stop <-chan struct{}) (acked []str
 			bad = append(bad, err)
 			return acked, bad
 		}
+		_, before := c.leader(target)
 		ctx, cancel := context.WithTimeout(context.Background(), transferProposeTTL)
 		_, err = c.hosts[target].SyncPropose(ctx, transferShard, cmd)
 		cancel()
 		if err == nil {
-			acked = append(acked, key)
+			// The write belongs to a term only when the replica that
+			// acknowledged it reported that term before and after.
+			var term uint64
+			if _, after := c.leader(target); after == before {
+				term = after
+				for {
+					cur := progress.Load()
+					if cur >= term || progress.CompareAndSwap(cur, term) {
+						break
+					}
+				}
+			}
+			acked = append(acked, transferWrite{key: key, term: term})
 			continue
 		}
 		if !isTransferProposalError(err) {
@@ -229,17 +270,18 @@ func (c *transferCluster) converged(timeout time.Duration) {
 // every acknowledged proposal must be in the final state on every replica.
 func TestLeaderTransfer_MovesLeadershipAndKeepsEveryAcknowledgedWrite(t *testing.T) {
 	c := newTransferCluster(t)
-	c.agreedLeader(20 * time.Second)
+	_, term := c.agreedLeader(20 * time.Second)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
-	acked := make([][]string, transferProposers)
+	acked := make([][]transferWrite, transferProposers)
 	bad := make([][]error, transferProposers)
+	progress := make([]atomic.Uint64, transferProposers)
 	for g := range transferProposers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			acked[g], bad[g] = c.proposeUntil(g, stop)
+			acked[g], bad[g] = c.proposeUntil(g, stop, &progress[g])
 		}()
 	}
 	stopped := false
@@ -254,38 +296,52 @@ func TestLeaderTransfer_MovesLeadershipAndKeepsEveryAcknowledgedWrite(t *testing
 
 	// Each transfer targets the follower after the current leader, so the
 	// target is a follower when its transfer is requested and three
-	// transfers hand leadership to every replica once.
+	// transfers hand leadership to every replica once. Before the first
+	// transfer and after each one, every proposer must have a write
+	// acknowledged in the current term.
 	const transfers = 3
+	terms := []uint64{term}
+	c.awaitProgress(progress, term)
 	for range transfers {
-		time.Sleep(5 * c.electionTimeout())
-		c.transferNext()
+		term = c.transferNext()
+		terms = append(terms, term)
+		c.awaitProgress(progress, term)
 	}
-	time.Sleep(5 * c.electionTimeout())
 	stopLoad()
 
 	total := 0
+	byTerm := make(map[uint64]int)
 	for g := range transferProposers {
 		for _, err := range bad[g] {
 			t.Errorf("proposer %d: undocumented proposal error %T: %v", g, err, err)
 		}
 		total += len(acked[g])
+		for _, w := range acked[g] {
+			byTerm[w.term]++
+		}
 	}
-	if total == 0 {
-		t.Fatal("no proposal was acknowledged")
+	// Every barriered term, including every term before the last transfer,
+	// has an acknowledged write from each proposer.
+	for _, tm := range terms {
+		if byTerm[tm] < transferProposers {
+			t.Errorf("term %d: %d acknowledged writes, want at least %d", tm, byTerm[tm], transferProposers)
+		}
 	}
-	t.Logf("%d transfers, %d acknowledged proposals", transfers, total)
+	t.Logf("%d transfers, %d acknowledged proposals, by term %v", transfers, total, byTerm)
 
+	// Every acknowledged write, from every term before and after the last
+	// transfer, is present on every replica.
 	c.converged(20 * time.Second)
 	for i, h := range c.hosts {
 		missing := 0
 		for g := range transferProposers {
-			for _, key := range acked[g] {
+			for _, w := range acked[g] {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				v, err := h.StaleRead(ctx, transferShard, []byte(key))
+				v, err := h.StaleRead(ctx, transferShard, []byte(w.key))
 				cancel()
-				if b, ok := v.([]byte); err != nil || !ok || string(b) != key {
+				if b, ok := v.([]byte); err != nil || !ok || string(b) != w.key {
 					if missing < 5 {
-						t.Errorf("replica %d: acknowledged key %q: value %v, error %v", i+1, key, v, err)
+						t.Errorf("replica %d: key %q acknowledged in term %d: value %v, error %v", i+1, w.key, w.term, v, err)
 					}
 					missing++
 				}
