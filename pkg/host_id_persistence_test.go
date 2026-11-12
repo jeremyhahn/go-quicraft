@@ -108,8 +108,8 @@ func TestHostIDPersistAcrossRestart(t *testing.T) {
 }
 
 // TestHostIDPersistMalformedFile covers (e): a host.id that is not 32 hex
-// characters is replaced by a new valid ID, and the Host never reports the
-// malformed content.
+// characters is replaced by a new valid ID written with mode 0600, and the
+// Host never reports the malformed content.
 func TestHostIDPersistMalformedFile(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -136,9 +136,15 @@ func TestHostIDPersistMalformedFile(t *testing.T) {
 			if !lowerHex32.MatchString(id) {
 				t.Fatalf("ID() = %q, want 32 lowercase hex characters", id)
 			}
-			stored, _ := readHostIDFile(t, dir)
+			stored, perm := readHostIDFile(t, dir)
 			if stored != id {
 				t.Fatalf("host.id = %q, want the regenerated ID %q", stored, id)
+			}
+			// The malformed file was written 0644; os.WriteFile applies its
+			// mode only when it creates a file, so a regenerated ID must
+			// still end up 0600 rather than inheriting the old mode.
+			if perm != 0o600 {
+				t.Fatalf("regenerated host.id mode = %04o, want 0600", perm)
 			}
 
 			if again := newHostIDPersistHost(t, dir, ""); again != id {
