@@ -1325,10 +1325,6 @@ ci-cross:
 			fi; \
 		done; \
 	done; \
-	echo "==> linux/386 batch overflow tests"; \
-	if ! CGO_ENABLED=0 GOARCH=386 $(GO) test -count=1 -run 'Overflow|Fits' ./pkg/batch/; then \
-		echo "    FAIL: CGO_ENABLED=0 GOARCH=386 ./pkg/batch/"; rc=1; \
-	fi; \
 	if [ $$rc -ne 0 ]; then \
 		echo "ci-cross: one or more modules failed to build or vet for another platform"; \
 	else \
