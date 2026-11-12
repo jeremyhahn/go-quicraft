@@ -697,6 +697,37 @@ func TestEncodeBatch_RejectsOverMaxInt32(t *testing.T) {
 	}
 }
 
+// TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotWrapBound pins the bound check
+// that follows the uint32-to-int narrowing of a length prefix. A prefix of
+// exactly MaxInt32 passes the MaxInt32 guard, and on a 32-bit build the sum
+// off+cmdLen then overflows int to a negative value that slips past an
+// off+cmdLen > len(data) comparison and panics the slice expression. Both
+// decode paths must refuse it with a DecodeError on every platform; EncodeBatch
+// never writes a prefix larger than the bytes that follow it.
+func TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotWrapBound(t *testing.T) {
+	inputs := map[string][]byte{
+		"first prefix":  {0x7f, 0xff, 0xff, 0xff},
+		"second prefix": {0x00, 0x00, 0x00, 0x01, 0xaa, 0x7f, 0xff, 0xff, 0xff, 0xbb},
+	}
+	for name, data := range inputs {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("DecodeBatch panicked on a MaxInt32 length prefix: %v", r)
+				}
+			}()
+			cmds, err := DecodeBatch(data)
+			if err == nil {
+				t.Fatalf("DecodeBatch accepted a MaxInt32 length prefix: %d commands", len(cmds))
+			}
+			var de *DecodeError
+			if !errors.As(err, &de) {
+				t.Fatalf("DecodeBatch error = %v (%T), want *DecodeError", err, err)
+			}
+		})
+	}
+}
+
 // waitForBatchLen blocks until the aggregator's unflushed batch holds at least
 // n proposals, failing the test rather than proceeding on a wrong premise.
 func waitForBatchLen(t *testing.T, a *Aggregator, n int) {
