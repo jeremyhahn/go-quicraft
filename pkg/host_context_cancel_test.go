@@ -45,14 +45,6 @@ var contextCancelArgs = map[string]func(h *Host) []any{
 		}
 		return []any{uint64(1), s}
 	},
-	// ExportSnapshot refuses before it reads its context when the shard has
-	// no saved snapshot, so take one first where the shard can.
-	"ExportSnapshot": func(h *Host) []any {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_, _ = h.SyncRequestSnapshot(ctx, 1, SnapshotOption{})
-		return []any{uint64(1), io.Discard}
-	},
 	"SyncRemoveData": func(*Host) []any {
 		// Data removal needs the replica to be stopped first; replica 2 is
 		// not running on this host.
@@ -159,10 +151,17 @@ func contextCancelCall(ctx context.Context, h *Host, m reflect.Method, args []re
 	return err
 }
 
-// isContextCancelErr reports whether err is the caller's cancellation:
-// context.Canceled itself or the documented library error for it.
+// isContextCancelErr reports whether err is the caller's cancellation: it
+// must match both the documented library error and context.Canceled, so a
+// caller can test for either.
 func isContextCancelErr(err error) bool {
-	return errors.Is(err, context.Canceled) || errors.Is(err, ErrCanceled)
+	return errors.Is(err, context.Canceled) && errors.Is(err, ErrCanceled)
+}
+
+// isContextDeadlineErr reports whether err is the caller's expired deadline:
+// it must match both ErrTimeout and context.DeadlineExceeded.
+func isContextDeadlineErr(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && errors.Is(err, ErrTimeout)
 }
 
 // startNoQuorumShard starts shard 1 as replica 1 of three on a host without a
@@ -214,10 +213,31 @@ func TestHostContextCancel(t *testing.T) {
 			select {
 			case err := <-done:
 				if !isContextCancelErr(err) {
-					t.Errorf("%s with a cancelled context returned %v, want context.Canceled", m.Name, err)
+					t.Errorf("%s with a cancelled context returned %v, want ErrCanceled and context.Canceled", m.Name, err)
 				}
 			case <-time.After(contextCancelBound):
 				t.Fatalf("%s with a cancelled context did not return within %v", m.Name, contextCancelBound)
+			}
+			h.Close()
+			if n, ok := contextCancelSettle(base); !ok {
+				t.Errorf("%s left goroutines behind: %d, want <= %d", m.Name, n, base)
+			}
+		})
+		t.Run(m.Name+"/expired", func(t *testing.T) {
+			base := runtime.NumGoroutine()
+			h := startSingleVoterShard(t)
+			args := contextCancelCallArgs(h, m)
+			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- contextCancelCall(ctx, h, m, args) }()
+			select {
+			case err := <-done:
+				if !isContextDeadlineErr(err) {
+					t.Errorf("%s with an expired context returned %v, want ErrTimeout and context.DeadlineExceeded", m.Name, err)
+				}
+			case <-time.After(contextCancelBound):
+				t.Fatalf("%s with an expired context did not return within %v", m.Name, contextCancelBound)
 			}
 			h.Close()
 			if n, ok := contextCancelSettle(base); !ok {
@@ -241,7 +261,7 @@ func TestHostContextCancel(t *testing.T) {
 				select {
 				case err := <-done:
 					if !isContextCancelErr(err) {
-						t.Errorf("%s cancelled in flight returned %v, want context.Canceled", m.Name, err)
+						t.Errorf("%s cancelled in flight returned %v, want ErrCanceled and context.Canceled", m.Name, err)
 					}
 				case <-time.After(contextCancelBound):
 					t.Fatalf("%s cancelled in flight did not return within %v", m.Name, contextCancelBound)
