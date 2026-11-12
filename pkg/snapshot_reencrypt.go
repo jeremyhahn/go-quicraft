@@ -5,11 +5,14 @@ package quicraft
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // SnapshotCommittedNotDurableError reports a snapshot re-encryption whose
@@ -282,6 +285,16 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// the destination.
 	committed = true
 
+	// snapshot.meta records the epoch, length and hash of snapshot.dat AS
+	// STORED, so the source's record no longer describes the re-encrypted
+	// bytes: recovery verifies the artifact against it and refuses it as
+	// corrupt. Restamp it beside the destination, before the directory
+	// fsync below makes both durable. A failure comes back like the fsync
+	// failure below, epoch included, for the reason given there.
+	if err := restampReencryptedSnapshotMeta(fsys, srcPath, dstPath, epoch); err != nil {
+		return epoch, &SnapshotCommittedNotDurableError{Path: dstPath, Epoch: epoch, Err: err}
+	}
+
 	// Make the rename (and any directories MkdirAll created) durable before
 	// reporting success: without the directory fsync a crash could leave the
 	// caller's durably-recorded migration pointing at a directory entry that
@@ -307,4 +320,43 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 		}
 	}
 	return epoch, nil
+}
+
+// reencryptMetaReadLimit bounds the snapshot.meta read in
+// restampReencryptedSnapshotMeta. A record is a fixed header plus a body
+// whose declared length engine bounds at 64 KiB; anything longer is not a
+// record and is refused rather than read into memory.
+const reencryptMetaReadLimit = 1<<16 + 4096
+
+// restampReencryptedSnapshotMeta writes a snapshot.meta beside dstPath for
+// the re-encrypted data file, carrying the source record's index, term,
+// shard, replica and compression with the new epoch, length and hash. It
+// does nothing when dstPath is not a snapshot.dat or no snapshot.meta sits
+// beside srcPath.
+func restampReencryptedSnapshotMeta(fsys snapshotFS, srcPath, dstPath string, epoch uint64) error {
+	if filepath.Base(dstPath) != "snapshot.dat" {
+		return nil
+	}
+	f, err := fsys.Open(filepath.Join(filepath.Dir(srcPath), "snapshot.meta"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, reencryptMetaReadLimit+1))
+	// A read-only handle's Close error cannot indicate lost data.
+	_ = f.Close()
+	if err != nil {
+		return err
+	}
+	if len(data) > reencryptMetaReadLimit {
+		return fmt.Errorf("snapshot.meta beside %s exceeds %d bytes", srcPath, reencryptMetaReadLimit)
+	}
+	meta, err := engine.ParseSnapshotMeta(data)
+	if err != nil {
+		return err
+	}
+	return writeReceivedSnapshotMetadata(fsys, filepath.Dir(dstPath), meta.Index, meta.Term,
+		meta.ShardID, meta.ReplicaID, epoch, meta.Compression)
 }
