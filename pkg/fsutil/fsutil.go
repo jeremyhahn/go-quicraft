@@ -23,7 +23,9 @@ import (
 
 // Dir is the handle SyncDirWith needs from an opened directory.
 type Dir interface {
+	// Sync flushes the directory to stable storage.
 	Sync() error
+	// Close releases the directory handle.
 	Close() error
 }
 
@@ -33,13 +35,18 @@ type Dir interface {
 // SyncDirWith uses SyncMetadata when a handle provides it and Sync only when
 // Sync already covers metadata, as it does for *os.File.
 type MetadataSyncer interface {
+	// SyncMetadata flushes the directory, metadata included, to stable
+	// storage.
 	SyncMetadata() error
 }
 
 // FS is the filesystem surface MkdirAllSyncedWith needs to find the deepest
 // existing ancestor and create the tree.
 type FS interface {
+	// Stat returns the file info of the named file, as os.Stat does.
 	Stat(name string) (fs.FileInfo, error)
+	// MkdirAll creates the directory path and any missing parents with
+	// the given permissions, as os.MkdirAll does.
 	MkdirAll(path string, perm fs.FileMode) error
 }
 

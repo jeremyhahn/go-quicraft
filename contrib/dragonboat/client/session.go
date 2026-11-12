@@ -38,6 +38,7 @@ import (
 // This matches the random.Source interface from github.com/lni/goutils/random
 // for dragonboat v4 API compatibility.
 type Source interface {
+	// Uint64 returns the next pseudo-random 64-bit value.
 	Uint64() uint64
 }
 

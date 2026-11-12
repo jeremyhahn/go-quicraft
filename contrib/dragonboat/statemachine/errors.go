@@ -54,6 +54,8 @@ type AdapterResultLengthError struct {
 	Actual int
 }
 
+// Error reports how many results the update returned against how many
+// entries it was given.
 func (e *AdapterResultLengthError) Error() string {
 	return "statemachine adapter: update returned " + uitoa(uint64(e.Actual)) +
 		" results for " + uitoa(uint64(e.Expected)) + " entries"
@@ -69,10 +71,14 @@ type AdapterUpdateError struct {
 	Cause error
 }
 
+// Error reports the log index at which the update failed, followed by the
+// message of Cause.
 func (e *AdapterUpdateError) Error() string {
 	return "statemachine adapter: update failed at index: " + uitoa(e.Index) + ": " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterUpdateError) Unwrap() error {
 	return e.Cause
 }
@@ -83,10 +89,13 @@ type AdapterLookupError struct {
 	Cause error
 }
 
+// Error reports that the lookup failed, followed by the message of Cause.
 func (e *AdapterLookupError) Error() string {
 	return "statemachine adapter: lookup failed: " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterLookupError) Unwrap() error {
 	return e.Cause
 }
@@ -96,10 +105,13 @@ type AdapterSnapshotSaveError struct {
 	Cause error
 }
 
+// Error reports that the snapshot save failed, followed by the message of Cause.
 func (e *AdapterSnapshotSaveError) Error() string {
 	return "statemachine adapter: snapshot save failed: " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterSnapshotSaveError) Unwrap() error {
 	return e.Cause
 }
@@ -109,10 +121,13 @@ type AdapterSnapshotRecoverError struct {
 	Cause error
 }
 
+// Error reports that the snapshot recover failed, followed by the message of Cause.
 func (e *AdapterSnapshotRecoverError) Error() string {
 	return "statemachine adapter: snapshot recover failed: " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterSnapshotRecoverError) Unwrap() error {
 	return e.Cause
 }
@@ -123,10 +138,13 @@ type AdapterCloseError struct {
 	Cause error
 }
 
+// Error reports that the close failed, followed by the message of Cause.
 func (e *AdapterCloseError) Error() string {
 	return "statemachine adapter: close failed: " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterCloseError) Unwrap() error {
 	return e.Cause
 }
@@ -137,10 +155,13 @@ type AdapterOpenError struct {
 	Cause error
 }
 
+// Error reports that the open failed, followed by the message of Cause.
 func (e *AdapterOpenError) Error() string {
 	return "statemachine adapter: open failed: " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterOpenError) Unwrap() error {
 	return e.Cause
 }
@@ -151,10 +172,13 @@ type AdapterSyncError struct {
 	Cause error
 }
 
+// Error reports that the sync failed, followed by the message of Cause.
 func (e *AdapterSyncError) Error() string {
 	return "statemachine adapter: sync failed: " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterSyncError) Unwrap() error {
 	return e.Cause
 }
@@ -164,10 +188,13 @@ type AdapterPrepareSnapshotError struct {
 	Cause error
 }
 
+// Error reports that the prepare snapshot failed, followed by the message of Cause.
 func (e *AdapterPrepareSnapshotError) Error() string {
 	return "statemachine adapter: prepare snapshot failed: " + e.Cause.Error()
 }
 
+// Unwrap returns Cause, the inner state machine's error, so errors.Is and
+// errors.As can match it.
 func (e *AdapterPrepareSnapshotError) Unwrap() error {
 	return e.Cause
 }
