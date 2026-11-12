@@ -6,7 +6,9 @@ package quicraft
 import (
 	"bytes"
 	"errors"
+	"io/fs"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
@@ -170,4 +172,169 @@ func reencryptTestSourceMeta(srcData []byte) []byte {
 		DataLen:   size,
 		DataHash:  sum,
 	})
+}
+
+// closeFailFS fails Close on every file OpenFile returns for a path
+// containing match, after closing it: crashFS has no Close hook, and the
+// metadata restamp reports its write handle's Close error.
+type closeFailFS struct {
+	*crashFS
+	match string
+	err   error
+}
+
+func (c closeFailFS) OpenFile(name string, flag int, perm fs.FileMode) (snapshotFile, error) {
+	f, err := c.crashFS.OpenFile(name, flag, perm)
+	if err != nil || !strings.Contains(name, c.match) {
+		return f, err
+	}
+	return closeFailFile{snapshotFile: f, err: c.err}, nil
+}
+
+type closeFailFile struct {
+	snapshotFile
+	err error
+}
+
+func (f closeFailFile) Close() error {
+	_ = f.snapshotFile.Close()
+	return f.err
+}
+
+// TestReencryptSnapshotFile_RestampFaults drives every failure on the
+// snapshot.meta restamp path through crashFS. A failure before the data
+// rename returns epoch 0 and leaves no destination; a failure after it
+// returns the committed epoch, inside a *SnapshotCommittedNotDurableError as
+// well, with the migrated data live; and since the directory fsync never
+// completed, neither the data nor the restamped meta survives a crash.
+func TestReencryptSnapshotFile_RestampFaults(t *testing.T) {
+	cases := []struct {
+		name      string
+		inject    func(cfs *crashFS) snapshotFS
+		cause     error
+		committed bool
+	}{
+		{
+			name: "source meta read",
+			inject: func(cfs *crashFS) snapshotFS {
+				cfs.failOnce(opOpen, "src/snapshot.meta", errInjected)
+				return cfs
+			},
+			cause: errInjected,
+		},
+		{
+			name: "destination meta write",
+			inject: func(cfs *crashFS) snapshotFS {
+				cfs.failOnce(opWrite, "dst/snapshot.meta", errInjected)
+				return cfs
+			},
+			cause:     errInjected,
+			committed: true,
+		},
+		{
+			name: "destination meta sync",
+			inject: func(cfs *crashFS) snapshotFS {
+				cfs.failOnce(opSync, "dst/snapshot.meta", errInjected)
+				return cfs
+			},
+			cause:     errInjected,
+			committed: true,
+		},
+		{
+			name: "destination meta close",
+			inject: func(cfs *crashFS) snapshotFS {
+				return closeFailFS{crashFS: cfs, match: "dst/snapshot.meta", err: errInjected}
+			},
+			cause:     errInjected,
+			committed: true,
+		},
+		{
+			name: "crash between data rename and directory fsync",
+			inject: func(cfs *crashFS) snapshotFS {
+				cfs.crashOn(opDirSync, "dst")
+				return cfs
+			},
+			cause:     errCrashed,
+			committed: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srcBarrier := createTestBarrier(t)
+			dstBarrier := createTestBarrier(t)
+			migrated := bytes.Repeat([]byte("restamp-fault-content"), 200)
+
+			root := "/vol"
+			dstDir := filepath.Join(root, "dst")
+			cfs := newCrashFS(root, dstDir)
+			srcPath := filepath.Join(root, "src", "snapshot.dat")
+			dstPath := filepath.Join(dstDir, "snapshot.dat")
+			dstMeta := filepath.Join(dstDir, "snapshot.meta")
+			srcData := encryptToBytes(t, srcBarrier, migrated)
+			writeDurableFile(t, cfs, srcPath, srcData)
+			writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
+				reencryptTestSourceMeta(srcData))
+
+			epoch, err := reencryptSnapshotFile(tc.inject(cfs), srcPath, dstPath,
+				testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+			if !errors.Is(err, tc.cause) {
+				t.Fatalf("err = %v, want the injected cause %v", err, tc.cause)
+			}
+			var notDurable *SnapshotCommittedNotDurableError
+			isNotDurable := errors.As(err, &notDurable)
+
+			if !tc.committed {
+				if epoch != 0 {
+					t.Fatalf("epoch = %d for a failure before the commit, want 0", epoch)
+				}
+				if isNotDurable {
+					t.Fatalf("a failure before the commit reported %v as committed", err)
+				}
+				if names := cfs.entries(dstDir); len(names) != 0 {
+					t.Fatalf("%s holds %v after a failure before the commit", dstDir, names)
+				}
+				return
+			}
+
+			if epoch == 0 {
+				t.Fatal("a failure after the data rename returned epoch 0; the caller " +
+					"records no epoch and the next DEK purge orphans the artifact")
+			}
+			if !isNotDurable {
+				t.Fatalf("err = %v (%T), want a *SnapshotCommittedNotDurableError", err, err)
+			}
+			if notDurable.Epoch != epoch || notDurable.Path != dstPath {
+				t.Fatalf("error carries epoch %d path %q, want epoch %d path %q",
+					notDurable.Epoch, notDurable.Path, epoch, dstPath)
+			}
+
+			if tc.cause != errCrashed {
+				stored, ok := cfs.liveBytes(dstPath)
+				if !ok {
+					t.Fatalf("%s is missing although the data rename committed", dstPath)
+				}
+				var out bytes.Buffer
+				if _, decErr := decryptSnapshotFrames(dstBarrier, testSnapShardID,
+					testSnapReplicaID, testSnapIndex, bytes.NewReader(stored), &out); decErr != nil {
+					t.Fatalf("%s is not a complete image: %v", dstPath, decErr)
+				}
+				if !bytes.Equal(out.Bytes(), migrated) {
+					t.Fatal("the destination does not hold the migrated content")
+				}
+				cfs.setHook(nil)
+				cfs.Crash()
+			}
+
+			// The directory fsync never completed, so neither entry is durable.
+			if cfs.exists(dstPath) {
+				t.Fatalf("%s survived a crash before its directory fsync", dstPath)
+			}
+			if cfs.exists(dstMeta) {
+				t.Fatalf("%s survived a crash before its directory fsync", dstMeta)
+			}
+			if !cfs.exists(dstDir) {
+				t.Fatalf("the durable directory %s was lost", dstDir)
+			}
+		})
+	}
 }
