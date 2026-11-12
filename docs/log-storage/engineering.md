@@ -1,7 +1,7 @@
 # Log Storage — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-13
+> `pkg/logdb/memdb` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 Import paths:
@@ -1067,7 +1067,8 @@ snapshot plus log and loses nothing its peers hold.
 **With no peers: authorized repair.** For a single-node deployment or a cluster
 that has lost quorum, `waldb.Repair` truncates one segment at one offset and
 deletes the segments above it. It is a separate call made by hand: not an
-`Option`, not reachable from `Open`.
+`Option`, not reachable from `Open`. An excerpt; `err`, `walDir` and
+`blockSize` are the caller's:
 
 ```go
 var corrupt *waldb.SegmentCorruptionError
@@ -1204,27 +1205,28 @@ the latency histograms cover the same ground per batch.
 
 | File | Holds |
 |---|---|
-| `logdb/logdb.go` | `LogDB`, optional interfaces, `AtRestProtection`, `EntryOverheadBytes` |
-| `logdb/types.go` | storage-layer types, `CopyEntryCmd` |
-| `logdb/errors.go` | `logdb` sentinels, `EntriesBelowCompactionFloorError` |
-| `logdb/reader.go` | `LogReader` |
-| `logdb/memdb/memdb.go` | the in-memory implementation |
-| `waldb/db.go` | `DB`, sharding, `SaveState`, reads, replay, record layouts, recovery errors |
-| `waldb/segment.go` | segment I/O, blocks, `Sync`, sync mark, `ReadAll` and its damage classifier |
-| `waldb/record.go` | chunk encoding, chunk types, durability sequence, positional context-AAD |
-| `waldb/format.go` | the `WALFORMAT` marker |
-| `waldb/retired.go` | the retired-replica registry |
-| `waldb/repair.go` | `Repair` |
-| `waldb/reencrypt.go` | `Reencrypt` |
-| `waldb/index.go` | the in-memory index |
-| `waldb/compaction.go` | segment garbage collection |
-| `waldb/copy.go` | deep copies on the read boundary |
-| `waldb/options.go` | `Options`, defaults, validation |
-| `waldb/errors.go` | sentinels and typed errors |
-| `waldb/fs.go`, `sync_linux.go`, `sync_other.go` | `FS`/`File`, `osFS`, `fdatasync`/`fallocate` |
-| `waldb/diskmon.go` | `DiskMonitor`, `DiskUsageFunc` |
-| `waldb/diskmon_linux.go`, `diskmon_other.go` | the `statfs` probe and its zero-usage stub |
-| `logdb/barrier_identity.go` | `SameBarrier` |
+| `pkg/logdb/logdb.go` | `LogDB`, optional interfaces, `AtRestProtection`, `EntryOverheadBytes` |
+| `pkg/logdb/types.go` | storage-layer types, `CopyEntryCmd` |
+| `pkg/logdb/errors.go` | `logdb` sentinels, `EntriesBelowCompactionFloorError` |
+| `pkg/logdb/reader.go` | `LogReader` |
+| `pkg/logdb/memdb/memdb.go` | the in-memory implementation |
+| `pkg/logdb/waldb/db.go` | `DB`, sharding, `SaveState`, reads, replay, record layouts, recovery errors |
+| `pkg/logdb/waldb/segment.go` | segment I/O, blocks, `Sync`, sync mark, `ReadAll` and its damage classifier |
+| `pkg/logdb/waldb/record.go` | chunk encoding, chunk types, durability sequence, positional context-AAD |
+| `pkg/logdb/waldb/format.go` | the `WALFORMAT` marker |
+| `pkg/logdb/waldb/retired.go` | the retired-replica registry |
+| `pkg/logdb/waldb/repair.go` | `Repair` |
+| `pkg/logdb/waldb/reencrypt.go` | `Reencrypt` |
+| `pkg/logdb/waldb/index.go` | the in-memory index |
+| `pkg/logdb/waldb/compaction.go` | segment garbage collection |
+| `pkg/logdb/waldb/compaction_floor.go` | the durable per-node compaction floors file, `ErrCompactionFloorsMalformed` |
+| `pkg/logdb/waldb/copy.go` | deep copies on the read boundary |
+| `pkg/logdb/waldb/options.go` | `Options`, defaults, validation |
+| `pkg/logdb/waldb/errors.go` | sentinels and typed errors |
+| `pkg/logdb/waldb/fs.go`, `sync_linux.go`, `sync_other.go` | `FS`/`File`, `osFS`, `fdatasync`/`fallocate` |
+| `pkg/logdb/waldb/diskmon.go` | `DiskMonitor`, `DiskUsageFunc` |
+| `pkg/logdb/waldb/diskmon_linux.go`, `diskmon_other.go` | the `statfs` probe and its zero-usage stub |
+| `pkg/logdb/barrier_identity.go` | `SameBarrier` |
 | `pkg/fsutil` | `MkdirAllSyncedWith`, `SyncDirWith`; `waldb.FileMetadataSyncer` aliases its `MetadataSyncer` |
 
 ## Related documentation

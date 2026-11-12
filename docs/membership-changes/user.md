@@ -1,7 +1,9 @@
 # Membership changes: usage
 
-> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-10-13
+> **Status: NORMATIVE** · Scope: go-quicraft membership · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are fragments: they compile against the public API once `host`,
+> `ctx`, `shardID` and the other variables they name are in scope.
 
 This page covers adding, removing and re-roling replicas in a shard that
 already exists. Forming the shard in the first place is `StartShard`; see

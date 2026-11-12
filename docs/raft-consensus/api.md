@@ -2,8 +2,11 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, and the `Host` methods that drive them ·
-> Last verified: 2026-10-13
+> Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are excerpts: declarations quoted from the package, and fragments
+> that compile against the public API once `host`, `ctx`, `shardID` and the
+> other variables they name are in scope.
 
 ## Transport coverage
 
