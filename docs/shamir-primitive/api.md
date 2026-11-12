@@ -1,7 +1,7 @@
 # Shamir primitive: API
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir`, plus the
-> share-custody interfaces in `pkg/seal` · Last verified: 2026-10-13
+> share-custody interfaces in `pkg/seal` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage

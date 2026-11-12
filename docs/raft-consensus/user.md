@@ -1,8 +1,10 @@
 # Raft consensus: usage
 
 > **Status: NORMATIVE** · Scope: consensus behavior as an embedder experiences
-> it, through `pkg.Host` · Last verified: 2026-10-13
+> it, through `pkg.Host` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are fragments: they compile against the public API once `host`,
+> `ctx`, `shardID` and the other variables they name are in scope.
 
 This page covers proposing, reading, tuning timing, and reading the failures.
 Starting and stopping shards is in

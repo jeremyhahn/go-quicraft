@@ -1,6 +1,6 @@
 # Shamir primitive: CLI
 
-> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-10-11
+> **Status: NORMATIVE** · Scope: go-quicraft `pkg/crypto/shamir` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 No CLI: go-quicraft is a library and ships no binaries (there is no `cmd/`
