@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -259,6 +261,20 @@ func TestKeyRotationLive_EntriesAndSnapshotSurviveRestart(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			p := store.load()
+			floor, floorOK := h.engine.GlobalSafePurgeFloor()
+			var walMin uint64
+			var walErr error
+			if edb, ok := h.logdb.(interface{ MinLiveEpoch() (uint64, error) }); ok {
+				walMin, walErr = edb.MinLiveEpoch()
+			}
+			var segs []string
+			_ = filepath.WalkDir(walDir, func(path string, d fs.DirEntry, _ error) error {
+				if d != nil && !d.IsDir() {
+					segs = append(segs, strings.TrimPrefix(path, walDir))
+				}
+				return nil
+			})
+			t.Logf("DIAG floor=%d ok=%v walMin=%d walErr=%v files=%v", floor, floorOK, walMin, walErr, segs)
 			t.Fatalf("(d) epoch %d -> %d after a compacting snapshot at epoch %d, MaxRetainedEpochs %d: "+
 				"oldest value epoch %d never purged (persisted %+v)",
 				snapEpochAfter, b.CurrentEpoch(), snapEpochBefore, h.cfg.MaxRetainedEpochs, oldest, p)
