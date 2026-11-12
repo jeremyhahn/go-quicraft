@@ -7803,6 +7803,14 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 // When SnapshotOption.OverrideCompactionOverhead is true, the provided
 // CompactionOverhead replaces the shard-level value for this snapshot's
 // log compaction.
+//
+// A request made when nothing has been applied since the last recorded
+// snapshot is a no-op: it is accepted, writes nothing, and resolves with
+// Value 0 and no error. An export request in that state fails instead,
+// because the export it asked for cannot be produced. Each shard runs one
+// snapshot at a time: a request made while another is still in flight
+// returns ErrSnapshotInProgress without being queued, so of two concurrent
+// requests over the same applied state at most one creates a snapshot.
 func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt SnapshotOption) (*RequestState, error) {
 	// Same already-cancelled guard as Propose. Without it a cancelled call
 	// would claim the shard's single-flight snapshot slot and enqueue disk
