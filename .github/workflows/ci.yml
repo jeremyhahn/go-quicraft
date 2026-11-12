@@ -549,7 +549,9 @@ on:
     # >>> CUSTOMIZE (go-quicraft)
     # Gitea fires label_updated, not labeled; synchronize re-runs on a push.
     # Adding ci:full takes effect on the next push or a workflow_dispatch.
-    types: [opened, synchronize, reopened]
+    # ready_for_review: a draft marked ready gets a run of the jobs that skip
+    # drafts, without a new push.
+    types: [opened, synchronize, reopened, ready_for_review]
     # <<< CUSTOMIZE
   workflow_dispatch:                    # re-fire a whole workflow; also the
                                         # only retry when a run was never
