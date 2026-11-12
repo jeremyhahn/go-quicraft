@@ -224,6 +224,19 @@ func startBlockedShard(t *testing.T) (*Host, func(), func()) {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 	waitForLeader(t, h, 1)
+	// ExecuteOnLeader runs this handler on the local leader; it proposes to
+	// the shard, so the call waits behind the held Update until cancelled.
+	leaderHandler := func(ctx context.Context, _ uint64, request []byte) ([]byte, error) {
+		rs, err := h.Propose(ctx, 1, request)
+		if err != nil {
+			return nil, err
+		}
+		rs.Release()
+		return nil, nil
+	}
+	if err := h.RegisterLeaderHandler(1, leaderHandler); err != nil {
+		t.Fatalf("RegisterLeaderHandler failed: %v", err)
+	}
 	t.Cleanup(gate.open)
 	block := func() {
 		t.Helper()
