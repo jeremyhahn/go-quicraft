@@ -165,31 +165,31 @@ func (c *transferCluster) proposeUntil(g int, stop <-chan struct{}) (acked []str
 	}
 }
 
-// transferTo moves leadership to target and waits, at most ten election
-// timeouts, until target reports itself leader at a term above fromTerm.
-func (c *transferCluster) transferTo(target, fromTerm uint64) uint64 {
+// transferNext establishes the agreed leader and term, requests a transfer
+// from that leader to the follower after it (the request must succeed), and
+// waits, at most ten election timeouts, until the target reports itself
+// leader at a higher term. It returns that term. An ordinary election does
+// not count: the request must have succeeded first.
+func (c *transferCluster) transferNext() uint64 {
 	c.t.Helper()
 	deadline := 10 * c.electionTimeout()
-	start := time.Now()
-	requested := false
-	var lastErr error
-	for time.Since(start) < deadline {
-		if !requested {
-			if leaderID, _ := c.leader(int(target - 1)); leaderID != 0 && leaderID != target {
-				ctx, cancel := context.WithTimeout(context.Background(), deadline)
-				lastErr = c.hosts[leaderID-1].RequestLeaderTransfer(ctx, transferShard, target)
-				cancel()
-				requested = lastErr == nil
-			}
-		}
-		if id, term := c.leader(int(target - 1)); id == target && term > fromTerm {
-			return term
-		}
-		time.Sleep(time.Millisecond)
+	leaderID, fromTerm := c.agreedLeader(deadline)
+	target := leaderID%uint64(len(c.hosts)) + 1
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	err := c.hosts[leaderID-1].RequestLeaderTransfer(ctx, transferShard, target)
+	cancel()
+	if err != nil {
+		c.t.Fatalf("transfer to %d: request to leader %d at term %d: %v", target, leaderID, fromTerm, err)
 	}
-	id, term := c.leader(int(target - 1))
-	c.t.Fatalf("transfer to %d: after %v replica %d reports leader %d term %d (from term %d, requested %v, last error %v)",
-		target, deadline, target, id, term, fromTerm, requested, lastErr)
+	var id, term uint64
+	if waitUntil(deadline, func() bool {
+		id, term = c.leader(int(target - 1))
+		return id == target && term > fromTerm
+	}) {
+		return term
+	}
+	c.t.Fatalf("transfer to %d: after %v replica %d reports leader %d term %d (requested of leader %d at term %d)",
+		target, deadline, target, id, term, leaderID, fromTerm)
 	return 0
 }
 
@@ -229,7 +229,7 @@ func (c *transferCluster) converged(timeout time.Duration) {
 // every acknowledged proposal must be in the final state on every replica.
 func TestLeaderTransfer_MovesLeadershipAndKeepsEveryAcknowledgedWrite(t *testing.T) {
 	c := newTransferCluster(t)
-	first, term := c.agreedLeader(20 * time.Second)
+	c.agreedLeader(20 * time.Second)
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -252,18 +252,13 @@ func TestLeaderTransfer_MovesLeadershipAndKeepsEveryAcknowledgedWrite(t *testing
 	}
 	defer stopLoad()
 
-	// Each follower of the first leader in turn, then the first leader
-	// again: every target is a follower when its transfer is requested.
-	var targets []uint64
-	for id := uint64(1); id <= 3; id++ {
-		if id != first {
-			targets = append(targets, id)
-		}
-	}
-	targets = append(targets, first)
-	for _, target := range targets {
+	// Each transfer targets the follower after the current leader, so the
+	// target is a follower when its transfer is requested and three
+	// transfers hand leadership to every replica once.
+	const transfers = 3
+	for range transfers {
 		time.Sleep(5 * c.electionTimeout())
-		term = c.transferTo(target, term)
+		c.transferNext()
 	}
 	time.Sleep(5 * c.electionTimeout())
 	stopLoad()
@@ -278,7 +273,7 @@ func TestLeaderTransfer_MovesLeadershipAndKeepsEveryAcknowledgedWrite(t *testing
 	if total == 0 {
 		t.Fatal("no proposal was acknowledged")
 	}
-	t.Logf("%d transfers, %d acknowledged proposals", len(targets), total)
+	t.Logf("%d transfers, %d acknowledged proposals", transfers, total)
 
 	c.converged(20 * time.Second)
 	for i, h := range c.hosts {
