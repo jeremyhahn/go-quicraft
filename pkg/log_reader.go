@@ -37,8 +37,21 @@ func (a *logReaderAdapter) GetRange() (uint64, uint64) {
 }
 
 // NodeState returns the last log index and current term.
+//
+// The reader's persisted state is recorded at bootstrap and restart only,
+// so its term alone stays at the term the replica started in. The term of
+// the last log entry follows every election that appends to the log (a new
+// leader appends its no-op at once, and a follower's log takes the new
+// term with the first append it accepts), so the larger of the two is
+// reported.
 func (a *logReaderAdapter) NodeState() (uint64, uint64) {
 	_, lastIndex := a.reader.IndexRange()
 	state, _ := a.reader.NodeState()
-	return lastIndex, state.Term
+	term := state.Term
+	if lastIndex > 0 {
+		if lastTerm, err := a.reader.Term(lastIndex); err == nil && lastTerm > term {
+			term = lastTerm
+		}
+	}
+	return lastIndex, term
 }
