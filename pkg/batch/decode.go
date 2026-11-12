@@ -89,9 +89,9 @@ func DecodeBatch(data []byte) ([][]byte, error) {
 		cmdLen := int(rawLen)
 		off += lengthPrefixSize
 
-		// Compare against the remainder, not off+cmdLen: on 32-bit builds
-		// off+cmdLen overflows int for a prefix near MaxInt32.
-		if cmdLen > len(data)-off {
+		// fits compares against the remainder: off+cmdLen overflows int on
+		// 32-bit builds for a prefix near MaxInt32.
+		if !fits(off, cmdLen, len(data)) {
 			return nil, &DecodeError{Reason: "command data exceeds payload boundary"}
 		}
 		cmds = append(cmds, data[off:off+cmdLen])
@@ -120,13 +120,20 @@ func countCommands(data []byte) (int, error) {
 		cmdLen := int(rawLen)
 		off += lengthPrefixSize
 
-		// See DecodeBatch: compare against the remainder so the sum cannot
-		// overflow int on 32-bit builds.
-		if cmdLen > len(data)-off {
+		// See DecodeBatch: fits cannot overflow int on 32-bit builds.
+		if !fits(off, cmdLen, len(data)) {
 			return 0, &DecodeError{Reason: "command data exceeds payload boundary"}
 		}
 		off += cmdLen
 		count++
 	}
 	return count, nil
+}
+
+// fits reports whether a span of n bytes starting at off lies within a
+// payload of total bytes. It compares against the remainder rather than
+// forming off+n, which overflows int for values near math.MaxInt (a length
+// prefix near MaxInt32 on a 32-bit build) and would accept the span.
+func fits(off, n, total int) bool {
+	return off >= 0 && n >= 0 && off <= total && n <= total-off
 }
