@@ -42,18 +42,21 @@ const midSaveStep = 15 * time.Second
 // closed. It is shared by every incarnation of the shard's state machine, so
 // once released, later saves (after the restart) run straight through.
 type midSaveGate struct {
-	entered    chan struct{} // closed when the first save has begun
-	release    chan struct{} // closed by the test to unblock that save
-	returned   chan struct{} // closed when that save has returned
-	enterOnce  sync.Once
-	returnOnce sync.Once
+	entered       chan struct{} // closed when the first save has begun
+	release       chan struct{} // closed by the test to unblock that save
+	returned      chan struct{} // closed when that save has returned
+	stopperClosed chan struct{} // closed when a blocked save's stopper closes
+	enterOnce     sync.Once
+	returnOnce    sync.Once
+	stopperOnce   sync.Once
 }
 
 func newMidSaveGate() *midSaveGate {
 	return &midSaveGate{
-		entered:  make(chan struct{}),
-		release:  make(chan struct{}),
-		returned: make(chan struct{}),
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+		returned:      make(chan struct{}),
+		stopperClosed: make(chan struct{}),
 	}
 }
 
@@ -98,7 +101,7 @@ func (m *midSaveSM) Lookup(_ context.Context, _ interface{}) (interface{}, error
 	return m.state, nil
 }
 
-func (m *midSaveSM) SaveSnapshot(_ context.Context, w io.Writer, _ <-chan struct{}) error {
+func (m *midSaveSM) SaveSnapshot(_ context.Context, w io.Writer, stopper <-chan struct{}) error {
 	m.mu.Lock()
 	st := m.state
 	m.mu.Unlock()
@@ -108,7 +111,14 @@ func (m *midSaveSM) SaveSnapshot(_ context.Context, w io.Writer, _ <-chan struct
 	if first {
 		defer m.gate.returnOnce.Do(func() { close(m.gate.returned) })
 	}
-	<-m.gate.release
+	// Record that the stopper closed, but keep waiting for the release: the
+	// save's own return still ignores the stopper.
+	select {
+	case <-m.gate.release:
+	case <-stopper:
+		m.gate.stopperOnce.Do(func() { close(m.gate.stopperClosed) })
+		<-m.gate.release
+	}
 
 	var buf [8 + sha256.Size]byte
 	binary.BigEndian.PutUint64(buf[:8], st.count)
@@ -215,27 +225,26 @@ func (f *midSaveFixture) beginBlockedSave(t *testing.T, h *Host) *RequestState {
 	return rs
 }
 
-// stopDuringSave runs stop while the save is blocked, unblocks the save,
-// and waits for both stop and the save to return. Stop may or may not wait
-// for the save; either is allowed, but neither may hang.
+// stopDuringSave runs stop while the save is blocked, waits until stop has
+// closed the save's stopper, unblocks the save, and waits for both stop and
+// the save to return. Stop may or may not wait for the save; either is
+// allowed, but neither may hang, and the save is released only once it has
+// been told to stop, so the cleanup checked is that of an interrupted save.
 func (f *midSaveFixture) stopDuringSave(t *testing.T, what string, stop func() error) error {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- stop() }()
-	var stopErr error
-	stopped := false
 	select {
-	case stopErr = <-done:
-		stopped = true
-	case <-time.After(200 * time.Millisecond):
+	case <-f.gate.stopperClosed:
+	case <-time.After(midSaveStep):
+		t.Fatalf("%s did not close the blocked save's stopper within %v", what, midSaveStep)
 	}
 	close(f.gate.release)
-	if !stopped {
-		select {
-		case stopErr = <-done:
-		case <-time.After(midSaveStep):
-			t.Fatalf("%s did not return within %v of the save being released", what, midSaveStep)
-		}
+	var stopErr error
+	select {
+	case stopErr = <-done:
+	case <-time.After(midSaveStep):
+		t.Fatalf("%s did not return within %v of the save being released", what, midSaveStep)
 	}
 	awaitMidSave(t, f.gate.returned, "the blocked save to return")
 	return stopErr
