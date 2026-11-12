@@ -2,8 +2,10 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/internal/raft`,
 > `pkg/internal/engine`, `pkg/internal/queue`, `pkg/internal/server`,
-> `pkg/internal/invariant` · Last verified: 2026-10-13
+> `pkg/internal/invariant` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are excerpts: abridged from the source they describe, they do not
+> compile on their own.
 
 These packages are **internal** and not importable from outside the module.
 This document is therefore the implementation contract for work inside this

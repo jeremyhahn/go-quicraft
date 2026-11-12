@@ -1,8 +1,10 @@
 # Multi-Group Host — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — deploying, configuring,
-> monitoring and operating a `Host` · Last verified: 2026-10-13
+> monitoring and operating a `Host` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are fragments: they compile against the public API once `host`,
+> `ctx`, `shardID` and the other variables they name are in scope.
 
 How to run a `Host`: start it, form shards, change membership, read and write,
 watch it, back it up and shut it down. Topics that belong to another feature
