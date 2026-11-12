@@ -258,15 +258,18 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 		// after reserveChunkMemory admits its length (snapshot_recv.go), so
 		// a buffer allocated before that check, or for a frame the budget
 		// refuses, lands past allocBound.
-		admitted := fuzzAdmittedFrameBytes(sr, &h, data)
+		admitted, meta := fuzzAdmittedFrameBytes(sr, &h, data)
 		// k is 1: SnapshotChunk.UnmarshalFromWindow aliases Data into the
 		// frame buffer (pkg/proto getBytes returns a sub-slice) rather than
-		// copying it, so the frame buffers are the only per-frame
-		// allocation that scales with the frame. allocSlack covers the
-		// chunk slice, the timer, errors and log records, and stays below
-		// every rejected seed frame's length.
+		// copying it, so Data costs nothing beyond its frame buffer. The rest
+		// of a decoded frame, meta, is not aliased: Membership maps and
+		// copied strings are built from it, and proto.MaxDecodeMemoryFactor
+		// is the decoder's stated bound on that expansion per wire byte, so
+		// meta is charged at that factor. allocSlack covers the chunk
+		// slice, the timer, errors and log records, and stays below every
+		// rejected seed frame's length.
 		const k, allocSlack = 1, 64 << 10
-		allocBound := uint64(k*admitted + allocSlack)
+		allocBound := uint64(k*admitted + proto.MaxDecodeMemoryFactor*meta + allocSlack)
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
 		sr.receiveChunks(&testChunkReader{data: data}, &h, fuzzSnapshotPeer, PeerAuth{}, stopC)
@@ -324,9 +327,12 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 // frame the budget refuses is refused before its buffer exists, so it is not
 // counted; a frame that is admitted and then fails to read, decode or
 // validate is counted and ends the walk.
-func fuzzAdmittedFrameBytes(sr *snapshotReceiver, h *SnapshotHeader, data []byte) int {
+//
+// meta is, for each admitted frame that decodes, its length minus
+// len(chunk.Data): the bytes the decoder expands rather than aliases. A
+// frame admitted and then failing to read or decode adds to admitted only.
+func fuzzAdmittedFrameBytes(sr *snapshotReceiver, h *SnapshotHeader, data []byte) (admitted, meta int) {
 	r := bytes.NewReader(data)
-	var admitted int
 	var charged int64
 	for i := uint64(0); i < h.ChunkCount; i++ {
 		length, _, err := readFrameHeaderWindow(r, sr.wire)
@@ -351,11 +357,14 @@ func fuzzAdmittedFrameBytes(sr *snapshotReceiver, h *SnapshotHeader, data []byte
 		if _, err := chunk.UnmarshalFromWindow(body, sr.wire.Proto); err != nil {
 			break
 		}
+		// The frame decoded: everything in it but Data (membership,
+		// header fields, filepath) is what the decoder may expand.
+		meta += int(length) - len(chunk.Data)
 		if err := sr.validateChunk(&chunk, h); err != nil {
 			break
 		}
 	}
-	return admitted
+	return admitted, meta
 }
 
 // FuzzSnapshotChunkRoundTrip builds a chunk from fuzzed fields, frames it with
