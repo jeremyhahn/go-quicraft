@@ -238,3 +238,67 @@ func TestBusyLimit_Global(t *testing.T) {
 		return errors.Is(err, ErrSystemBusy) && errors.Is(err, ErrBusy)
 	})
 }
+
+// TestBusyLimit_PerShardLastBatchReleased proposes one entry larger than
+// MaxInMemLogSize on an idle shard. Once it is applied nothing else is
+// pending, so the in-memory log must still release it: the per-shard size
+// drops to zero and the next proposal is accepted.
+func TestBusyLimit_PerShardLastBatchReleased(t *testing.T) {
+	scfg := testShardConfig(1, 1)
+	scfg.MaxInMemLogSize = busyLimitBytes
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+
+	open := make(chan struct{})
+	close(open)
+	fsm := &busyLimitSM{release: open, applied: make(map[string]struct{})}
+	create := func(_, _ uint64) interface{} { return fsm }
+	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, create, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+
+	big := make([]byte, 2*busyLimitBytes)
+	copy(big, "big-")
+	for i := 4; i < len(big); i++ {
+		big[i] = 'y'
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), busyLimitCallTimeout)
+	_, err = h.SyncPropose(ctx, 1, big)
+	cancel()
+	if err != nil {
+		t.Fatalf("SyncPropose of the large entry failed: %v", err)
+	}
+	if !fsm.has(string(big)) {
+		t.Fatal("the large entry was not applied")
+	}
+
+	engNode := h.engine.GetNode(1)
+	if engNode == nil || engNode.Peer() == nil || engNode.Peer().RateLimiter() == nil {
+		t.Fatal("shard 1 has no per-shard rate limiter")
+	}
+	rl := engNode.Peer().RateLimiter()
+	deadline := time.Now().Add(5 * time.Second)
+	for rl.Get() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("in-memory log size %d bytes 5s after the last entry applied, want 0", rl.Get())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ctx, cancel = context.WithTimeout(context.Background(), busyLimitCallTimeout)
+	defer cancel()
+	for {
+		_, err = h.SyncPropose(ctx, 1, busyLimitCmd("after", 0))
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrBusy) || ctx.Err() != nil {
+			t.Fatalf("proposal after the log drained failed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
