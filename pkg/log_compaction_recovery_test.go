@@ -4,13 +4,41 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
 )
+
+// compactCountingLogDB wraps a LogDB and counts Compact calls per
+// (shardID, replicaID), so a test can see that a request reached the disk
+// compaction rather than infer it from markers another path also moves.
+type compactCountingLogDB struct {
+	logdb.LogDB
+	mu     sync.Mutex
+	counts map[[2]uint64]int
+}
+
+func newCompactCountingLogDB(inner logdb.LogDB) *compactCountingLogDB {
+	return &compactCountingLogDB{LogDB: inner, counts: make(map[[2]uint64]int)}
+}
+
+func (c *compactCountingLogDB) Compact(shardID, replicaID uint64) error {
+	c.mu.Lock()
+	c.counts[[2]uint64{shardID, replicaID}]++
+	c.mu.Unlock()
+	return c.LogDB.Compact(shardID, replicaID)
+}
+
+func (c *compactCountingLogDB) compactCalls(shardID, replicaID uint64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts[[2]uint64{shardID, replicaID}]
+}
 
 // compactionTestShardConfig keeps only a short tail behind each snapshot, so
 // a snapshot over a few hundred entries trims the log well above index 1.
@@ -44,8 +72,16 @@ func TestRequestCompaction_AfterSnapshotTrimsLogAndRestartRecovers(t *testing.T)
 	cfg := testHostConfig(t)
 	members := map[uint64]string{1: cfg.RaftAddress}
 
-	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
+	// The test opens the WAL itself, as NewHost does by default, so it can
+	// count the Compact calls that reach it. The Host closes it in Close.
+	wal, err := waldb.Open(cfg.WALDir)
 	if err != nil {
+		t.Fatalf("waldb.Open: %v", err)
+	}
+	counted := newCompactCountingLogDB(wal)
+	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption(), WithLogDB(counted))
+	if err != nil {
+		_ = wal.Close()
 		t.Fatalf("NewHost: %v", err)
 	}
 	closed := false
@@ -73,8 +109,16 @@ func TestRequestCompaction_AfterSnapshotTrimsLogAndRestartRecovers(t *testing.T)
 	if err != nil {
 		t.Fatalf("SyncRequestSnapshot: %v", err)
 	}
+	// SyncRequestSnapshot already compacts the log before it returns, so the
+	// checks below would pass without RequestCompaction. Its own effect is
+	// the one disk compaction it asks for.
+	compactsBefore := counted.compactCalls(1, 1)
 	if err := h.RequestCompaction(1, 1); err != nil {
 		t.Fatalf("RequestCompaction: %v", err)
+	}
+	if got := counted.compactCalls(1, 1); got != compactsBefore+1 {
+		t.Fatalf("LogDB.Compact(1, 1) calls after RequestCompaction = %d, want %d: "+
+			"the request must reach the disk compaction", got, compactsBefore+1)
 	}
 
 	lr, err := h.LogRange(1)
@@ -112,8 +156,14 @@ func TestRequestCompaction_AfterSnapshotTrimsLogAndRestartRecovers(t *testing.T)
 	}
 	closed = true
 
-	reopened, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())
+	reopenedWAL, err := waldb.Open(cfg.WALDir)
 	if err != nil {
+		t.Fatalf("waldb.Open (reopen): %v", err)
+	}
+	reopened, err := NewHost(cfg, WithoutTransport(), WithoutEncryption(),
+		WithLogDB(newCompactCountingLogDB(reopenedWAL)))
+	if err != nil {
+		_ = reopenedWAL.Close()
 		t.Fatalf("NewHost (reopen): %v", err)
 	}
 	defer reopened.Close()
