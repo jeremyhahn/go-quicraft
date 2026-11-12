@@ -43,9 +43,10 @@ type reloadFixture struct {
 
 // freeUDPAddr reserves a loopback UDP port and releases it, so a NodeHost
 // can bind an address its peers can dial (127.0.0.1:0 is not dialable).
-func freeUDPAddr(t *testing.T) string {
+func freeUDPAddr(ctx context.Context, t *testing.T) string {
 	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	pc, err := lc.ListenPacket(ctx, "udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserve UDP port: %v", err)
 	}
@@ -83,7 +84,7 @@ func newReloadFixture(t *testing.T) *reloadFixture {
 	t.Helper()
 	ca := testpki.NewCA(t)
 	files := ca.LeafFiles(t, t.TempDir())
-	nh := newMTLSNodeHost(t, files, freeUDPAddr(t))
+	nh := newMTLSNodeHost(t, files, freeUDPAddr(context.Background(), t))
 	f := &reloadFixture{
 		nh:       nh,
 		ca:       ca,
@@ -133,7 +134,7 @@ func (f *reloadFixture) requireIdentity(t *testing.T) {
 // both hosts to complete new mutual-TLS handshakes with each other.
 func (f *reloadFixture) requireServes(ctx context.Context, t *testing.T) {
 	t.Helper()
-	peer := newMTLSNodeHost(t, f.ca.LeafFiles(t, t.TempDir()), freeUDPAddr(t))
+	peer := newMTLSNodeHost(t, f.ca.LeafFiles(t, t.TempDir()), freeUDPAddr(ctx, t))
 	const shardID = 1
 	members := map[uint64]dragonboat.Target{
 		1: f.nh.RaftAddress(),
