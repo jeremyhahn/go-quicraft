@@ -706,12 +706,23 @@ func (b *Barrier) initializeWithRootKey(ctx context.Context, strategy SealingStr
 		// barrier uninitialized and retryable rather than half-installed. It
 		// consumes rootKey on EVERY path including this one, so a failure here
 		// still leaves nothing readable behind.
-		rootPK, sealErr := enclave.NewSealed(ctx, rootKey)
-		if sealErr != nil {
-			return &Error{Strategy: "initialize", Err: sealErr}
+		//
+		// No-encryption mode keeps NO root key, exactly as Unseal leaves it:
+		// RootKey, RootKeyProtected and StampSealedStateMAC document
+		// ErrNoRootKeyAvailable there. The generated key is wiped instead of
+		// sealed, so a fresh barrier and a restarted one agree.
+		if strategy.ID() == StrategyNone {
+			enclave.Wipe(rootKey)
+			b.hwEncryptor = hwEnc
+			b.rootKey = nil
+		} else {
+			rootPK, sealErr := enclave.NewSealed(ctx, rootKey)
+			if sealErr != nil {
+				return &Error{Strategy: "initialize", Err: sealErr}
+			}
+			b.hwEncryptor = hwEnc
+			b.rootKey = rootPK
 		}
-		b.hwEncryptor = hwEnc
-		b.rootKey = rootPK
 		b.salt = salt
 		b.epoch = initialEpoch
 		b.knownEpochs[initialEpoch] = struct{}{}
