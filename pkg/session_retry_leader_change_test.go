@@ -263,7 +263,7 @@ func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 	c.awaitApplied(next, 2)
 }
 
-// A retry whose series is at or below the session's responded-to watermark,
+// A retry whose series is strictly below the session's replicated responded-to watermark,
 // replayed against the new leader, is refused with *SessionExpiredError (the
 // cached response was discarded, PhD Figure 6.1 step 3) and applied nowhere.
 func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
@@ -281,10 +281,15 @@ func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 	if _, err := h.SyncProposeWithSession(ctx, session, []byte("two")); err != nil {
 		t.Fatalf("series 2: %v", err)
 	}
-	if session.RespondedTo() < SeriesIDFirstProposal+1 {
-		t.Fatalf("RespondedTo = %d, want at least %d", session.RespondedTo(), SeriesIDFirstProposal+1)
+	// Series 3 carries RespondedTo=2, so the replicated watermark is 2 and
+	// the series-1 retry below falls strictly below it, not on it.
+	if _, err := h.SyncProposeWithSession(ctx, session, []byte("three")); err != nil {
+		t.Fatalf("series 3: %v", err)
 	}
-	c.awaitApplied(old, 2)
+	if session.RespondedTo() < SeriesIDFirstProposal+2 {
+		t.Fatalf("RespondedTo = %d, want at least %d", session.RespondedTo(), SeriesIDFirstProposal+2)
+	}
+	c.awaitApplied(old, 3)
 
 	next := c.transfer(old)
 
@@ -303,12 +308,12 @@ func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 
 	// The live session is unaffected: its next series applies once, after
 	// the refused entry on every replica.
-	r2, err := c.nodes[next].host.SyncProposeWithSession(ctx, session, []byte("three"))
+	r2, err := c.nodes[next].host.SyncProposeWithSession(ctx, session, []byte("four"))
 	if err != nil {
-		t.Fatalf("series 3: %v", err)
+		t.Fatalf("series 4: %v", err)
 	}
-	if r2.Value != retryResultBase+3 {
-		t.Fatalf("series 3 result = %d, want %d", r2.Value, retryResultBase+3)
+	if r2.Value != retryResultBase+4 {
+		t.Fatalf("series 4 result = %d, want %d", r2.Value, retryResultBase+4)
 	}
-	c.awaitApplied(next, 3)
+	c.awaitApplied(next, 4)
 }
