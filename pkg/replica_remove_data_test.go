@@ -167,6 +167,27 @@ func (c *removeDataCluster) waitHashMatch(i int, live []int) {
 	c.t.Fatalf("host %d never reached the leader's state: %s", i, lastErr)
 }
 
+// waitAppliedMatch waits until host i has applied the leader's index. It is
+// waitHashMatch for a replica restarted from its own snapshot: the hashing
+// state machine keeps its digest out of its snapshot, so such a replica
+// reaches the leader's index with a digest of only the entries after it.
+func (c *removeDataCluster) waitAppliedMatch(i int, live []int) {
+	c.t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr string
+	for time.Now().Before(deadline) {
+		l := c.leader(live)
+		_, li, lok, lerr := c.hosts[l].StateMachineHash(removeDataShard)
+		_, fi, fok, ferr := c.hosts[i].StateMachineHash(removeDataShard)
+		if lerr == nil && ferr == nil && lok && fok && li == fi {
+			return
+		}
+		lastErr = fmt.Sprintf("leader (%d,%v,%v) host %d (%d,%v,%v)", li, lok, lerr, i, fi, fok, ferr)
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Fatalf("host %d never applied the leader's index: %s", i, lastErr)
+}
+
 // replicaSnapshotDir is the snapshot directory StartShard creates for the
 // replica on host i (the shard config sets no DataDir).
 func (c *removeDataCluster) replicaSnapshotDir(i int, replicaID uint64) string {
@@ -631,7 +652,7 @@ func TestSyncRemoveData_FailedRetirementKeepsCompactedSnapshot(t *testing.T) {
 	if err := fh.StartShard(c.members(), false, hashingCreateFunc, c.shardConfig(fid)); err != nil {
 		t.Fatalf("StartShard of the unretired replica: %v", err)
 	}
-	c.waitHashMatch(f, all)
+	c.waitAppliedMatch(f, all)
 	if err := fh.StopReplica(removeDataShard, fid); err != nil {
 		t.Fatalf("StopReplica (second): %v", err)
 	}
