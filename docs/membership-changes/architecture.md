@@ -2,7 +2,7 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft membership: `pkg/membership.go`,
 > the `Host` replica methods, `proto.ConfigChange`, `proto.Membership`,
-> `config.WitnessConfig` · Last verified: 2026-10-13
+> `config.WitnessConfig` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem

@@ -244,7 +244,7 @@ checking at all. That is a security tradeoff, not a FIPS one; see
 Four requirements. Three make it approved-only; the second is defence in
 depth, and you want it anyway:
 
-1. **`quic-go` v0.60.0 or later.** go-quicraft requires v0.63.0. Below v0.60.0
+1. **`quic-go` v0.60.0 or later.** go-quicraft requires v0.65.0. Below v0.60.0
    the process panics constructing the initial packet-protection AEAD, before
    any handshake.
 2. **`-tags fips`.** Not for the curve list: Go filters X25519 out of the
@@ -384,7 +384,7 @@ outside the stream pool, so they do not block replication, but they use the
 bandwidth you allow them.
 
 **The process panics inside the QUIC library under `GODEBUG=fips140=only`.**
-Your `quic-go` is older than v0.60.0. go-quicraft requires v0.63.0, so this
+Your `quic-go` is older than v0.60.0. go-quicraft requires v0.65.0, so this
 means a `replace` directive or a downgrade in the embedding module.
 
 **The process panics with `crypto/sha1: use of SHA-1 is not allowed` under

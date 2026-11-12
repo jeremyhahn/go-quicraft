@@ -200,7 +200,7 @@ the `slog` handler sends them.
 | per-shard mode splits by shard; the gauge reports the mode | `TestPrometheusMetrics_PerShardModeSplitsByShard`, `TestPrometheusMetrics_PerShardEnabledGauge` |
 | series budget per shard in aggregated mode | `TestPrometheusMetrics_AggregatedModeSeriesBudget` |
 | security and drop counters have bounded cardinality | `TestPrometheus_UnauthorizedMessageMetric_BoundedCardinality`, `TestPrometheusMetricsCollector_IncMessagesDropped_BoundedCardinality` |
-| sampling covers latency only and samples metrics independently | `TestSampledMetricsCollector_IncMessagesSent_Unsampled`, `TestSampledMetricsCollector_InterleavedSamplingIndependent` |
+| sampling covers latency only and samples metrics independently | `TestSampledMetricsCollector_MessageCountersAreUnsampled`, `TestSampledMetricsCollector_InterleavedSamplingIndependent` |
 | the safe forwarder contains panics, forwards every method, skips no-op | `TestSafeMetricsCollector_ContainsPanics`, `TestSafeMetricsCollector_ForwardsEveryMethod`, `TestSafeMetricsCollector_WrappingIsIdempotentAndSkipsNoOp` |
 
 A test here must never assert on a latency bucket without controlling the

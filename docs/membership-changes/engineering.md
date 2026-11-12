@@ -3,8 +3,10 @@
 > **Status: NORMATIVE** · Scope: go-quicraft membership: `pkg/membership.go`,
 > the `Host` replica methods, `proto.ConfigChange`, `proto.Membership`,
 > `config.WitnessConfig`, and the membership half of `pkg/internal/raft` ·
-> Last verified: 2026-10-13
+> Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are excerpts: abridged from the source they describe, they do not
+> compile on their own.
 
 Design rationale, the role model and the scope fence are in
 [`architecture.md`](architecture.md). The Go call surface is in
