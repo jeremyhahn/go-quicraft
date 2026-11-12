@@ -160,6 +160,27 @@ func copyTreeExceptSnapshotData(t *testing.T, src, dst string) {
 	}
 }
 
+// assertReencryptLeftSource reports each file Reencrypt or
+// ReencryptSnapshotFile removed, changed or created in a source directory,
+// which the runbook requires them to leave untouched.
+func assertReencryptLeftSource(t *testing.T, name string, before, after map[string]string) {
+	t.Helper()
+	for p, v := range before {
+		w, ok := after[p]
+		switch {
+		case !ok:
+			t.Errorf("%s: %s removed by Reencrypt", name, p)
+		case w != v:
+			t.Errorf("%s: %s changed by Reencrypt", name, p)
+		}
+	}
+	for p := range after {
+		if _, ok := before[p]; !ok {
+			t.Errorf("%s: %s created by Reencrypt", name, p)
+		}
+	}
+}
+
 // TestRekeyRunbook_NewBarrierServesOldBarrierRefuses runs the documented
 // root-key compromise runbook (docs/seal-barrier/user.md, "Respond to a key
 // compromise") against a real Host: data written under barrier A, copied
@@ -241,8 +262,8 @@ func TestRekeyRunbook_NewBarrierServesOldBarrierRefuses(t *testing.T) {
 	if snapCalls == 0 {
 		t.Fatal("waldb.Reencrypt never called the snapshot function")
 	}
-	assertSameFingerprint(t, "WALDir after Reencrypt", walBefore, dirFingerprint(t, walDir))
-	assertSameFingerprint(t, "NodeHostDir after Reencrypt", nodeBefore, dirFingerprint(t, nodeDir))
+	assertReencryptLeftSource(t, "WALDir after Reencrypt", walBefore, dirFingerprint(t, walDir))
+	assertReencryptLeftSource(t, "NodeHostDir after Reencrypt", nodeBefore, dirFingerprint(t, nodeDir))
 
 	// Swap the destination into place, keeping the originals aside.
 	for _, mv := range [][2]string{{walDir, oldWAL}, {nodeDir, oldNode}, {newWAL, walDir}, {newNode, nodeDir}} {
@@ -295,6 +316,6 @@ func TestRekeyRunbook_NewBarrierServesOldBarrierRefuses(t *testing.T) {
 		bytes.NewReader(raw), io.Discard); decErr == nil {
 		t.Error("new snapshot decrypted under barrier A, want an error")
 	}
-	assertSameFingerprint(t, "original WALDir", walBefore, dirFingerprint(t, oldWAL))
-	assertSameFingerprint(t, "original NodeHostDir", nodeBefore, dirFingerprint(t, oldNode))
+	assertReencryptLeftSource(t, "original WALDir", walBefore, dirFingerprint(t, oldWAL))
+	assertReencryptLeftSource(t, "original NodeHostDir", nodeBefore, dirFingerprint(t, oldNode))
 }
