@@ -20,6 +20,8 @@ import (
 	"maps"
 	"math/rand/v2"
 	"testing"
+
+	"github.com/jeremyhahn/go-enclave"
 )
 
 // fuzzSecret is the secret the share-set tests split.
@@ -130,6 +132,68 @@ func FuzzUnmarshalShareSet(f *testing.F) {
 			if !sameShare(shares[i], again[i]) {
 				t.Fatalf("share %d changed on round trip", i)
 			}
+		}
+	})
+}
+
+// FuzzUnmarshalShareSetWith decodes through a real enclave allocator whose
+// budget, one to eight pages, comes from the fuzz input, so budgets too small
+// for the set are fuzzed alongside ones that fit. On every input: no panic; a
+// refusal returns no shares and leaves no reservation behind; an accepted set
+// stays within the budget and round-trips; destroying it releases every
+// reservation.
+func FuzzUnmarshalShareSetWith(f *testing.F) {
+	_, sets := shareJSONFuzzSeeds(f)
+	for _, seed := range sets {
+		for _, pages := range []uint8{0, 1, 2, 7} {
+			f.Add(seed, pages)
+		}
+	}
+	f.Fuzz(func(t *testing.T, data []byte, pages uint8) {
+		limit := (int64(pages%8) + 1) * pageBytes()
+		a, err := enclave.NewAllocator(limit)
+		if err != nil {
+			t.Fatalf("NewAllocator(%d): %v", limit, err)
+		}
+		shares, err := UnmarshalShareSetWith(a, data)
+		if err != nil {
+			if shares != nil {
+				destroyAll(shares)
+				t.Fatalf("refused set returned %d shares", len(shares))
+			}
+			if got := a.InUse(); got != 0 {
+				t.Fatalf("InUse after a refusal = %d, want 0 (%v)", got, err)
+			}
+			return
+		}
+		if got := a.InUse(); got <= 0 || got > limit {
+			destroyAll(shares)
+			t.Fatalf("InUse after decoding %d shares = %d, want in (0, %d]", len(shares), got, limit)
+		}
+		enc, err := json.Marshal(shares)
+		if err != nil {
+			destroyAll(shares)
+			t.Fatalf("accepted set does not marshal: %v", err)
+		}
+		again, err := UnmarshalShareSet(enc)
+		if err != nil {
+			destroyAll(shares)
+			t.Fatalf("re-encoded set refused: %v", err)
+		}
+		defer destroyAll(again)
+		if len(again) != len(shares) {
+			destroyAll(shares)
+			t.Fatalf("re-encoded set has %d shares, want %d", len(again), len(shares))
+		}
+		for i := range shares {
+			if !sameShare(shares[i], again[i]) {
+				destroyAll(shares)
+				t.Fatalf("share %d changed on round trip", i)
+			}
+		}
+		destroyAll(shares)
+		if got := a.InUse(); got != 0 {
+			t.Fatalf("InUse after Destroy = %d, want 0", got)
 		}
 	})
 }
