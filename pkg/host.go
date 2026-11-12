@@ -8190,6 +8190,9 @@ func (e *SnapshotArtifactError) Unwrap() error { return e.Err }
 // never be imported, even by a caller that ignored the error. It is still not
 // an artifact and should be discarded.
 func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return mapContextError(err)
+	}
 	if h.closed.Load() {
 		return ErrClosed
 	}
@@ -8244,6 +8247,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
 		return ErrSnapshotEncryptedBarrierUnavailable
 	}
+	// Checked again: the lookups above may outlast the caller's context.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
 	}
