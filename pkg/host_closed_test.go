@@ -371,17 +371,21 @@ func TestHostClosedEmergencySealDuringClose(t *testing.T) {
 	}
 }
 
-// flakySealBarrier is a mockBarrier whose first Seal fails without sealing;
-// every later Seal behaves as mockBarrier's.
+// flakySealBarrier is a mockBarrier whose first failFirst Seals fail without
+// sealing; every later Seal behaves as mockBarrier's.
 type flakySealBarrier struct {
 	mockBarrier
-	failOnce sync.Once
-	failErr  error
+	mu        sync.Mutex
+	failFirst int // number of leading Seal calls that fail
+	calls     int
+	failErr   error
 }
 
 func (b *flakySealBarrier) Seal() error {
-	failed := false
-	b.failOnce.Do(func() { failed = true })
+	b.mu.Lock()
+	b.calls++
+	failed := b.calls <= b.failFirst
+	b.mu.Unlock()
 	if failed {
 		return b.failErr
 	}
@@ -394,7 +398,7 @@ func (b *flakySealBarrier) Seal() error {
 // does EmergencySeal report ErrClosed.
 func TestHostClosedEmergencySealRetriesFailedCloseSeal(t *testing.T) {
 	sealFailure := errors.New("seal failure")
-	b := &flakySealBarrier{failErr: sealFailure}
+	b := &flakySealBarrier{failFirst: 1, failErr: sealFailure}
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
@@ -414,6 +418,93 @@ func TestHostClosedEmergencySealRetriesFailedCloseSeal(t *testing.T) {
 	if err := h.EmergencySeal(); !errors.Is(err, ErrClosed) {
 		t.Errorf("EmergencySeal after a successful retry: got %v, want ErrClosed", err)
 	}
+}
+
+// TestHostClosedEmergencySealKeepsRetryingAfterFailedRetry checks that an
+// EmergencySeal retry that fails again returns the seal error and leaves the
+// host unsealed, so a later EmergencySeal still seals; only after a retry
+// that sealed every barrier does EmergencySeal return ErrClosed.
+func TestHostClosedEmergencySealKeepsRetryingAfterFailedRetry(t *testing.T) {
+	t.Run("host-wide barrier", func(t *testing.T) {
+		sealFailure := errors.New("seal failure")
+		b := &flakySealBarrier{failFirst: 2, failErr: sealFailure}
+		h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		if err := h.Close(); !errors.Is(err, sealFailure) {
+			t.Fatalf("Close: got %v, want the seal failure", err)
+		}
+		if b.IsSealed() {
+			t.Fatal("barrier sealed although Close's seal failed")
+		}
+		if err := h.EmergencySeal(); !errors.Is(err, sealFailure) {
+			t.Fatalf("first EmergencySeal: got %v, want the seal failure", err)
+		}
+		if b.IsSealed() {
+			t.Fatal("barrier sealed although the EmergencySeal retry failed")
+		}
+		if err := h.EmergencySeal(); err != nil {
+			t.Fatalf("second EmergencySeal: got %v, want nil", err)
+		}
+		if !b.IsSealed() {
+			t.Fatal("second EmergencySeal left the barrier unsealed")
+		}
+		if err := h.EmergencySeal(); !errors.Is(err, ErrClosed) {
+			t.Errorf("third EmergencySeal: got %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("per-shard barrier", func(t *testing.T) {
+		sealFailure := errors.New("per-shard seal failure")
+		hostWide := newSealCountingBarrier()
+		failing := &flakySealBarrier{failFirst: 2, failErr: sealFailure}
+		healthy := newSealCountingBarrier()
+		h, err := NewHost(testHostConfig(t),
+			WithLogDB(newMockLogDB()),
+			WithoutTransport(),
+			WithBarrier(hostWide),
+			WithShardBarriers(func(shardID uint64) Barrier {
+				switch shardID {
+				case 1:
+					return failing
+				case 2:
+					return healthy
+				}
+				return nil
+			}))
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		startShardBarrierTestShards(t, h, 1, 2)
+
+		if err := h.Close(); !errors.Is(err, sealFailure) {
+			t.Fatalf("Close: got %v, want the per-shard seal failure", err)
+		}
+		if !hostWide.IsSealed() || !healthy.IsSealed() {
+			t.Fatal("Close left a barrier whose seal succeeded unsealed")
+		}
+		if failing.IsSealed() {
+			t.Fatal("per-shard barrier sealed although Close's seal failed")
+		}
+		if err := h.EmergencySeal(); !errors.Is(err, sealFailure) {
+			t.Fatalf("first EmergencySeal: got %v, want the per-shard seal failure", err)
+		}
+		if failing.IsSealed() {
+			t.Fatal("per-shard barrier sealed although the EmergencySeal retry failed")
+		}
+		if err := h.EmergencySeal(); err != nil {
+			t.Fatalf("second EmergencySeal: got %v, want nil", err)
+		}
+		for name, b := range map[string]Barrier{"host-wide": hostWide, "shard 1": failing, "shard 2": healthy} {
+			if !b.IsSealed() {
+				t.Errorf("%s barrier unsealed after the second EmergencySeal", name)
+			}
+		}
+		if err := h.EmergencySeal(); !errors.Is(err, ErrClosed) {
+			t.Errorf("third EmergencySeal: got %v, want ErrClosed", err)
+		}
+	})
 }
 
 // closeDeadline bounds every Close call in the closed-host tests.
