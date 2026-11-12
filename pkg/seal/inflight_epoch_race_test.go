@@ -122,7 +122,10 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 	var (
 		racing   sync.WaitGroup // rotator and purger
 		workers  sync.WaitGroup
+		started  sync.WaitGroup // each worker holds a pin sealed before any rotation
+		sealed   sync.WaitGroup // each worker has stopped appending to frames
 		raceDone = make(chan struct{})
+		raceOnce sync.Once
 		errMu    sync.Mutex
 		errs     []error
 	)
@@ -131,12 +134,32 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 		errs = append(errs, err)
 		errMu.Unlock()
 	}
+	// Release the workers on every exit path, so a t.Fatal before the
+	// explicit release does not leave them blocked.
+	releaseWorkers := func() { raceOnce.Do(func() { close(raceDone) }) }
+	defer releaseWorkers()
 
 	frames := make([][]inFlightEpochRaceFrame, inFlightEpochRaceWorkers)
+	started.Add(inFlightEpochRaceWorkers)
+	sealed.Add(inFlightEpochRaceWorkers)
+	startedCh := make(chan struct{})
+	go func() {
+		started.Wait()
+		close(startedCh)
+	}()
 
 	racing.Add(2)
 	go func() {
 		defer racing.Done()
+		// Rotate only once every worker keeps a pin sealed under the
+		// initial epoch, so each encryption mode holds an old-epoch pin
+		// across the purges.
+		select {
+		case <-startedCh:
+		case <-ctx.Done():
+			report(fmt.Errorf("rotator waiting for workers to start: %w", ctx.Err()))
+			return
+		}
 		for i := 0; i < inFlightEpochRaceRotations; i++ {
 			if _, err := b.Rotate(ctx); err != nil {
 				report(fmt.Errorf("Rotate %d: %w", i, err))
@@ -164,12 +187,19 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 			if w%2 == 1 {
 				seal = inFlightEpochRaceSealRegistered
 			}
+			signalled := false
+			signalStarted := func() {
+				if !signalled {
+					signalled = true
+					started.Done()
+				}
+			}
 			for i := 0; i < inFlightEpochRaceFrames; i++ {
 				pt := []byte(fmt.Sprintf("worker %d frame %d", w, i))
 				f, err := seal(ctx, b, pt)
 				if err != nil {
 					report(fmt.Errorf("worker %d frame %d seal: %w", w, i, err))
-					return
+					break
 				}
 				runtime.Gosched()
 				if err := inFlightEpochRaceCheckDecrypt(ctx, b, f); err != nil {
@@ -183,7 +213,14 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 					f.pinned = false
 				}
 				frames[w] = append(frames[w], f)
+				if f.pinned {
+					signalStarted()
+				}
 			}
+			// On an early seal error the worker still signals, so the
+			// rotator and the main goroutine never wait on it.
+			signalStarted()
+			sealed.Done()
 			<-raceDone
 			for i := range frames[w] {
 				f := &frames[w][i]
@@ -200,11 +237,43 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 	}
 
 	racing.Wait()
+	// sealed.Wait orders every worker's appends to frames before the reads
+	// below.
+	sealed.Wait()
 	// One more purge with the remaining pins still held: pinned epochs stay.
 	if _, err := b.PurgeEpochsBefore(ctx, b.CurrentEpoch()); err != nil {
 		t.Fatalf("PurgeEpochsBefore with pins held: %v", err)
 	}
-	close(raceDone)
+	// (a) each encryption mode still holds a pin on an epoch older than the
+	// current one across the completed purges, and every such frame still
+	// decrypts: reference protection, not currency, kept those epochs.
+	afterPurge := b.CurrentEpoch()
+	var retainedPinned, retainedRegistered int
+	for w := range frames {
+		for i, f := range frames[w] {
+			if !f.pinned || f.epoch >= afterPurge {
+				continue
+			}
+			if w%2 == 1 {
+				retainedRegistered++
+			} else {
+				retainedPinned++
+			}
+			if err := inFlightEpochRaceCheckDecrypt(ctx, b, f); err != nil {
+				t.Errorf("worker %d frame %d pinned on old epoch %d after purge: %v", w, i, f.epoch, err)
+			}
+		}
+	}
+	if retainedPinned == 0 || retainedRegistered == 0 {
+		errMu.Lock()
+		for _, err := range errs {
+			t.Error(err)
+		}
+		errMu.Unlock()
+		t.Fatalf("old-epoch pins held across the purge (current epoch %d): EncryptWithEpochPinned %d, RegisterInFlightEpoch %d; want both > 0",
+			afterPurge, retainedPinned, retainedRegistered)
+	}
+	releaseWorkers()
 	workers.Wait()
 
 	for _, err := range errs {
@@ -251,9 +320,6 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 				t.Errorf("worker %d frame %d under purged epoch %d: err = %v, want ErrDecryptionFailed", w, i, f.epoch, err)
 			}
 		}
-	}
-	if old == 0 {
-		t.Fatalf("no frame was sealed under an epoch older than %d; the race did not exercise purge", current)
 	}
 	t.Logf("frames sealed under purged epochs: %d, under current epoch: %d", old, live)
 
