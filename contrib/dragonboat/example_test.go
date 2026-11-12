@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	dragonboat "github.com/jeremyhahn/go-quicraft/contrib/dragonboat"
@@ -170,19 +171,26 @@ func ExampleNodeHost_SyncPropose() {
 	// Until the shard has a leader, proposals fail with a temporary
 	// error; retry those, as a Dragonboat application does.
 	session := nh.GetNoOPSession(shardID)
-	var result sm.Result
-	for {
-		attempt, cancelAttempt := context.WithTimeout(ctx, time.Second)
-		result, err = nh.SyncPropose(attempt, session, []byte("greeting=hello"))
-		cancelAttempt()
-		if err == nil {
-			break
+	propose := func(cmd string) sm.Result {
+		for {
+			attempt, cancelAttempt := context.WithTimeout(ctx, time.Second)
+			result, err := nh.SyncPropose(attempt, session, []byte(cmd))
+			cancelAttempt()
+			if err == nil {
+				return result
+			}
+			if !dragonboat.IsTempError(err) || ctx.Err() != nil {
+				log.Fatal(err)
+			}
+			time.Sleep(10 * time.Millisecond)
 		}
-		if !dragonboat.IsTempError(err) || ctx.Err() != nil {
-			log.Fatal(err)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
+
+	// A malformed command is rejected in its result; the shard carries on.
+	rejected := propose("garbage")
+	fmt.Println("garbage rejected:", string(rejected.Data))
+
+	result := propose("greeting=hello")
 	fmt.Println("keys after update:", result.Value)
 
 	var value interface{}
@@ -201,6 +209,30 @@ func ExampleNodeHost_SyncPropose() {
 	fmt.Println("greeting:", value)
 
 	// Output:
+	// garbage rejected: malformed command
 	// keys after update: 1
 	// greeting: hello
+}
+
+func TestKVStore_MalformedCommandThenValid(t *testing.T) {
+	s := newKVStore(1, 1).(*kvStore)
+
+	result, err := s.Update(sm.Entry{Index: 1, Cmd: []byte("garbage")})
+	if err != nil {
+		t.Fatalf("Update(garbage) error = %v, want nil (a terminal apply failure)", err)
+	}
+	if got := string(result.Data); got != "malformed command" {
+		t.Fatalf("Update(garbage) result data = %q, want %q", got, "malformed command")
+	}
+	if len(s.data) != 0 {
+		t.Fatalf("map after garbage = %v, want empty", s.data)
+	}
+
+	result, err = s.Update(sm.Entry{Index: 2, Cmd: []byte("k=v")})
+	if err != nil {
+		t.Fatalf("Update(k=v) error = %v", err)
+	}
+	if result.Value != 1 || s.data["k"] != "v" {
+		t.Fatalf("after k=v: result %d, map %v; want 1, map[k:v]", result.Value, s.data)
+	}
 }
