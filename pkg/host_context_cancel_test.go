@@ -119,7 +119,7 @@ func contextCancelDefaultArg(h *Host, in reflect.Type, uints *int) reflect.Value
 	case reflect.TypeOf((*Session)(nil)):
 		return reflect.ValueOf(h.NoOPSession(1))
 	case reflect.TypeOf((*io.Writer)(nil)).Elem():
-		return reflect.ValueOf(io.Writer(io.Discard))
+		return reflect.ValueOf(io.Discard)
 	case reflect.TypeOf((*io.Reader)(nil)).Elem():
 		return reflect.ValueOf(io.Reader(bytes.NewReader(nil)))
 	case reflect.TypeOf((*interface{})(nil)).Elem():
@@ -201,7 +201,6 @@ func TestHostContextCancel(t *testing.T) {
 	newTestHost(t).Close()
 
 	for _, m := range methods {
-		m := m
 		t.Run(m.Name+"/precancelled", func(t *testing.T) {
 			base := runtime.NumGoroutine()
 			h := startSingleVoterShard(t)
