@@ -219,10 +219,15 @@ func TestHostAPI_CRLRevocation_ThreeNode(t *testing.T) {
 	waitCommits("host 3 restarted")
 	afterRestart, _ := lastKey.Load().(string)
 	waitCommits("host 3 refused")
-	if sm := victimTracker.Get(shardID, victim+1); sm != nil {
-		if _, ok := sm.Get(afterRestart); ok {
-			t.Fatalf("revoked host 3 applied %q, a write committed after its restart", afterRestart)
-		}
+	if afterRestart == "" {
+		t.Fatal("no write committed after host 3 restarted")
+	}
+	sm := victimTracker.Get(shardID, victim+1)
+	if sm == nil {
+		t.Fatalf("restarted host 3: no state machine for shard %d replica %d", shardID, victim+1)
+	}
+	if _, ok := sm.Get(afterRestart); ok {
+		t.Fatalf("revoked host 3 applied %q, a write committed after its restart", afterRestart)
 	}
 	for i := range victim {
 		requireProbe(t, addrs[i], leaves[victim], ca.PEM(), false,
