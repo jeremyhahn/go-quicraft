@@ -21,7 +21,8 @@ shard this host does not run. Dragonboat answers with `ErrShardNotFound`
      GetNodeUser.
    - (b) calls whose doc comment names another result:
      GetLogReader gives `ErrLogDBNotCreatedOrClosed`; GetShardInfo gives
-     `(nil, false, nil)` ("false when it is not loaded on this host");
+     `(nil, false, ErrShardNotFound)` (pinned by
+     TestNodeHost_GetShardInfo_InvalidShard; its doc comment now says so);
      HasNodeInfo gives false (no LogDB data for the pair);
      RequestCompaction succeeds with a completed SysOpState (its doc treats
      an unloaded shard as already retired via RemoveData).

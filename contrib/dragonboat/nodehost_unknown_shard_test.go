@@ -135,11 +135,12 @@ func unknownShardCases() []unknownShardCase {
 			return ""
 		}},
 		{"GetShardInfo", func(_ context.Context, nh *NodeHost) string {
-			// Doc: the bool is false when the shard is not loaded.
+			// Doc: a shard that is not loaded gives a nil ShardInfo,
+			// false and ErrShardNotFound.
 			info, ok, err := nh.GetShardInfo(unknownShardID)
-			if err != nil || ok || info != nil {
+			if !errors.Is(err, ErrShardNotFound) || ok || info != nil {
 				return "GetShardInfo = (" + boolString(info != nil) + " info, ok=" +
-					boolString(ok) + ", err=" + errString(err) + "), want (nil, false, nil)"
+					boolString(ok) + ", err=" + errString(err) + "), want (nil, false, ErrShardNotFound)"
 			}
 			return ""
 		}},

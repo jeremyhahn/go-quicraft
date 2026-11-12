@@ -1192,8 +1192,9 @@ func (nh *NodeHost) SyncGetShardMembership(ctx context.Context, shardID uint64) 
 
 // GetShardInfo returns information about the specified shard. The bool
 // return value is true when the shard is found, false when it is not
-// loaded on this host. This matches dragonboat's three-value return
-// signature for shard info queries.
+// loaded on this host; a shard that is not loaded also returns a nil
+// ShardInfo and ErrShardNotFound. This matches dragonboat's three-value
+// return signature for shard info queries.
 func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
 	info, err := nh.host.ShardInfo(shardID)
 	if err != nil {
