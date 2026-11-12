@@ -224,15 +224,12 @@ func startBlockedShard(t *testing.T) (*Host, func(), func()) {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 	waitForLeader(t, h, 1)
-	// ExecuteOnLeader runs this handler on the local leader; it proposes to
-	// the shard, so the call waits behind the held Update until cancelled.
+	// ExecuteOnLeader runs this handler on the local leader; it waits for its
+	// proposal to apply, so the call stays behind the held Update until its
+	// context is cancelled.
 	leaderHandler := func(ctx context.Context, _ uint64, request []byte) ([]byte, error) {
-		rs, err := h.Propose(ctx, 1, request)
-		if err != nil {
-			return nil, err
-		}
-		rs.Release()
-		return nil, nil
+		_, err := h.SyncPropose(ctx, 1, request)
+		return nil, err
 	}
 	if err := h.RegisterLeaderHandler(1, leaderHandler); err != nil {
 		t.Fatalf("RegisterLeaderHandler failed: %v", err)
@@ -439,10 +436,10 @@ func TestHostContextCancel(t *testing.T) {
 				cancel()
 				select {
 				case err := <-done:
-					// A request already handed to Raft returns ErrCanceled
-					// inside a MaybeAppliedError, without the context error.
-					if !errors.Is(err, ErrCanceled) {
-						t.Errorf("%s cancelled in flight returned %v, want ErrCanceled", m.Name, err)
+					// A request already handed to Raft returns ErrCanceled and
+					// the context error, inside a MaybeAppliedError.
+					if !isContextCancelErr(err) {
+						t.Errorf("%s cancelled in flight returned %v, want ErrCanceled and context.Canceled", m.Name, err)
 					}
 				case <-time.After(contextCancelBound):
 					t.Fatalf("%s cancelled in flight did not return within %v", m.Name, contextCancelBound)
