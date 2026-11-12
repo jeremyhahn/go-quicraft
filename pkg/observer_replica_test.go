@@ -99,6 +99,8 @@ func (c *observerCluster) startVoters() {
 	}
 	for id := uint64(1); id <= 3; id++ {
 		scfg := testShardConfig(observerShard, id)
+		// The negative phase needs a leader that cannot step down.
+		scfg.CheckQuorum = config.BoolPtr(false)
 		scfg.MemberIdentities = c.voterIdentities()
 		if err := c.host(id).StartShard(members, false, kv.NewMemoryCreateFunc(), scfg); err != nil {
 			c.t.Fatalf("StartShard[%d]: %v", id, err)
@@ -187,6 +189,8 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 	}
 	scfg := testShardConfig(observerShard, observerID)
 	scfg.IsObserver = true
+	// The negative phase needs a leader that cannot step down.
+	scfg.CheckQuorum = config.BoolPtr(false)
 	scfg.MemberIdentities = c.voterIdentities()
 	if err := obs.StartShard(nil, true, kv.NewMemoryCreateFunc(), scfg); err != nil {
 		t.Fatalf("observer StartShard(join=true): %v", err)
@@ -264,6 +268,11 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 	}) {
 		t.Fatal("no leader before stopping two voters")
 	}
+	before, err := c.host(survivor).ShardInfo(observerShard)
+	if err != nil {
+		t.Fatalf("survivor ShardInfo before the stop: %v", err)
+	}
+	leaderTerm := before.Term
 	for id := uint64(1); id <= 3; id++ {
 		if id == survivor {
 			continue
@@ -285,9 +294,29 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 			if perr == nil {
 				t.Fatalf("proposal through replica %d (attempt %d) committed with two of three voters stopped", id, attempt)
 			}
+			if id == survivor && errors.Is(perr, ErrNotLeader) {
+				t.Fatalf("proposal through the survivor %d (attempt %d) failed with ErrNotLeader: it stepped down", id, attempt)
+			}
 		}
 	}
 	c.assertObserverNeverLeads(time.Second)
+
+	// The survivor still leads in the same term, and the observer still
+	// follows it: only the commit rule stopped the proposals.
+	after, err := c.host(survivor).ShardInfo(observerShard)
+	if err != nil {
+		t.Fatalf("survivor ShardInfo after the proposals: %v", err)
+	}
+	if !after.IsLeader || after.Term != leaderTerm {
+		t.Fatalf("survivor ShardInfo = %+v, want IsLeader at term %d", after, leaderTerm)
+	}
+	oinfo, err := obs.ShardInfo(observerShard)
+	if err != nil {
+		t.Fatalf("observer ShardInfo after the proposals: %v", err)
+	}
+	if oinfo.LeaderID != survivor || oinfo.Term != leaderTerm {
+		t.Fatalf("observer ShardInfo = %+v, want LeaderID %d at term %d", oinfo, survivor, leaderTerm)
+	}
 
 	// Nothing the failed proposals carried reached the observer's state.
 	rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
