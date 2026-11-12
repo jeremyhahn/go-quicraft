@@ -174,5 +174,19 @@ func DecodeCommand(data []byte) (Command, error) {
 	if int(headerSize)+int(keyLen) < len(data) {
 		value = data[headerSize+int(keyLen):]
 	}
+	switch op {
+	case OpGet, OpDelete:
+		// EncodeGet and EncodeDelete write only the header and key; bytes
+		// after the key are not a command any encoder produced.
+		if len(value) != 0 {
+			return Command{}, &InvalidCommandError{Reason: "trailing bytes after key"}
+		}
+	default:
+		// No committed entry can carry a value this large (proposals are
+		// capped well below it); the bound matches snapshot recovery.
+		if len(value) > MaxValueLength {
+			return Command{}, &InvalidCommandError{Reason: "value length exceeds maximum"}
+		}
+	}
 	return Command{Op: op, Key: key, Value: value}, nil
 }
