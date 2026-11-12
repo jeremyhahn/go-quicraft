@@ -134,7 +134,7 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 	// The SOURCE is a read path: it was opened only so its records could be
 	// listed and decrypted, and nothing this call did needs to survive in it.
 	// Its close error is genuinely uninteresting and stays discarded.
-	defer func() { _ = src.Close() }()
+	defer closeReencryptSource(src)
 
 	dstOpts := make([]Option, 0, len(opts)+1)
 	dstOpts = append(dstOpts, opts...)
@@ -178,6 +178,23 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 		count++
 	}
 	return count, nil
+}
+
+// closeReencryptSource closes the source DB of a Reencrypt and leaves its
+// directory as it found it. Open's ensureActiveSegment creates a fresh,
+// empty segment in every shard it opens; a plain Close would keep those
+// files, so a migration that must not write to its source would leave one
+// new segment per shard behind. closeAfterFailedOpen closes each shard and
+// unlinks exactly the segment that open created, and only while it holds
+// no records, which a read-only source never gives it. DB.Close then
+// finds every shard already closed and releases the directory lock.
+func closeReencryptSource(src *DB) {
+	for _, s := range src.shards {
+		if s != nil {
+			s.closeAfterFailedOpen()
+		}
+	}
+	_ = src.Close()
 }
 
 // reencryptNode copies a single shard/replica's persisted Raft state from src
