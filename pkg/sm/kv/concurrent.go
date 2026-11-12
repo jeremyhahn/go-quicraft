@@ -330,7 +330,16 @@ func (cs *ConcurrentStore) SaveSnapshot(_ context.Context, snapshotCtx interface
 	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
 		return err
 	}
-	for k, v := range data {
+	// Serialise in key order, as MemoryStore does, so identical state gives
+	// identical snapshot bytes on every replica and in both store kinds. The
+	// decoder is order-independent, so this changes only what is written.
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := data[k]
 		select {
 		case <-stopper:
 			return context.Canceled
