@@ -270,7 +270,9 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 		// of a decoded frame, meta, is not aliased: Membership maps and
 		// copied strings are built from it, and proto.MaxDecodeMemoryFactor
 		// is the decoder's stated bound on that expansion per wire byte, so
-		// meta is charged at that factor. allocSlack covers the chunk
+		// meta is charged at that factor. A frame that fails to decode is
+		// charged its whole length as meta: the decoder may have built the
+		// maps before the failing field. allocSlack covers the chunk
 		// slice, the timer, errors and log records, and stays below every
 		// rejected seed frame's length.
 		const k, allocSlack = 1, 64 << 10
@@ -335,7 +337,10 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 //
 // meta is, for each admitted frame that decodes, its length minus
 // len(chunk.Data): the bytes the decoder expands rather than aliases. A
-// frame admitted and then failing to read or decode adds to admitted only.
+// frame admitted and then failing to decode is charged its whole length as
+// meta, since UnmarshalFromWindow may build the Membership maps before a
+// later field fails. A frame admitted and then failing to read adds to
+// admitted only.
 func fuzzAdmittedFrameBytes(sr *snapshotReceiver, h *SnapshotHeader, data []byte) (admitted, meta int) {
 	r := bytes.NewReader(data)
 	var charged int64
@@ -360,6 +365,9 @@ func fuzzAdmittedFrameBytes(sr *snapshotReceiver, h *SnapshotHeader, data []byte
 		_, _ = r.Read(body)
 		var chunk proto.SnapshotChunk
 		if _, err := chunk.UnmarshalFromWindow(body, sr.wire.Proto); err != nil {
+			// The decoder may have built the Membership maps before a
+			// later field failed, so the whole frame is charged as meta.
+			meta += int(length)
 			break
 		}
 		// The frame decoded: everything in it but Data (membership,
