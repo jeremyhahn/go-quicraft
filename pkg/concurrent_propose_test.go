@@ -266,32 +266,14 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 			len(maybe), len(refused))
 	}
 
-	// The leader may have moved; read the applied index from the current one.
-	var current *Host
-	if !waitUntil(20*time.Second, func() bool {
-		current = concurrentProposeLeader(hosts)
-		return current != nil
-	}) {
-		t.Fatal("no leader after the run")
-	}
-
-	// Every replica must reach the leader's applied index before its record
-	// is read; a follower may trail the acknowledgements.
-	_, want, _, err := current.StateMachineHash(concurrentProposeShard)
-	if err != nil {
-		t.Fatalf("leader StateMachineHash: %v", err)
-	}
-	if !waitUntil(30*time.Second, func() bool {
-		for _, n := range hosts {
-			_, idx, _, err := n.StateMachineHash(concurrentProposeShard)
-			if err != nil || idx < want {
-				return false
-			}
-		}
-		return true
-	}) {
-		t.Fatalf("replicas never reached applied index %d", want)
-	}
+	// wg.Wait() only means the callers returned: a MaybeApplied proposal can
+	// still commit, and a new leader can still be applying earlier entries.
+	// Commit a barrier entry through the current leader: once it applies,
+	// every entry that will ever commit before it has committed, and no
+	// workload proposal is left in flight. Then wait for every replica to
+	// settle at one common index at or past the barrier with equal hashes.
+	barrierKey, barriers, want := concurrentProposeBarrier(ctx, t, hosts)
+	at, hashes := concurrentProposeConverge(ctx, t, hosts, want)
 
 	smMu.Lock()
 	defer smMu.Unlock()
@@ -305,8 +287,17 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 				t.Errorf("replica %d applied acknowledged key %s %d times, want 1", id, key, n)
 			}
 		}
+		if n := applied[barrierKey]; n != 1 {
+			t.Errorf("replica %d applied barrier key %s %d times, want 1", id, barrierKey, n)
+		}
 		for key, n := range applied {
 			if _, ok := acked[key]; ok {
+				continue
+			}
+			if _, ok := barriers[key]; ok {
+				if n > 1 {
+					t.Errorf("replica %d applied barrier attempt %s %d times, want at most 1", id, key, n)
+				}
 				continue
 			}
 			if _, ok := refused[key]; ok {
@@ -323,18 +314,81 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 		}
 	}
 
-	var hashes []uint64
-	for i, n := range hosts {
-		hash, idx, ok, err := n.StateMachineHash(concurrentProposeShard)
-		if err != nil || !ok {
-			t.Fatalf("replica %d StateMachineHash: ok=%v err=%v", i+1, ok, err)
-		}
-		if idx != want {
-			t.Fatalf("replica %d at applied index %d, want %d", i+1, idx, want)
-		}
-		hashes = append(hashes, hash)
-	}
 	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
-		t.Fatalf("replica state hashes differ at index %d: %v", want, hashes)
+		t.Fatalf("replica state hashes differ at index %d: %v", at, hashes)
 	}
+}
+
+// concurrentProposeBarrier commits a barrier entry through the current
+// leader, retrying with a fresh key on a not-leader refusal or a
+// MaybeApplied failure, and returns the key that was acknowledged, every
+// barrier key attempted (each applied at most once), and the barrier's
+// applied index.
+func concurrentProposeBarrier(ctx context.Context, t *testing.T, hosts []*Host) (string, map[string]struct{}, uint64) {
+	t.Helper()
+	attempted := make(map[string]struct{})
+	for attempt := 0; ; attempt++ {
+		if ctx.Err() != nil {
+			t.Fatalf("barrier never committed: %v", ctx.Err())
+		}
+		var current *Host
+		if !waitUntil(20*time.Second, func() bool {
+			current = concurrentProposeLeader(hosts)
+			return current != nil
+		}) {
+			t.Fatal("no leader after the run")
+		}
+		key := fmt.Sprintf("barrier-%02d", attempt)
+		attempted[key] = struct{}{}
+		res, err := current.SyncPropose(ctx, concurrentProposeShard, []byte(key))
+		switch {
+		case err == nil:
+			return key, attempted, res.Value
+		case MaybeApplied(err), errors.Is(err, ErrNotLeader):
+			t.Logf("barrier %s: %v; retrying", key, err)
+		default:
+			t.Fatalf("barrier SyncPropose(%s): %v", key, err)
+		}
+	}
+}
+
+// concurrentProposeConverge waits until every replica reports one common
+// applied index at or past want with equal state hashes in the same sample,
+// and returns that index and the hashes.
+func concurrentProposeConverge(ctx context.Context, t *testing.T, hosts []*Host, want uint64) (uint64, []uint64) {
+	t.Helper()
+	var (
+		at      uint64
+		hashes  []uint64
+		indexes []uint64
+		lastErr error
+	)
+	ok := waitUntil(30*time.Second, func() bool {
+		if ctx.Err() != nil {
+			lastErr = ctx.Err()
+			return false
+		}
+		hashes, indexes = hashes[:0], indexes[:0]
+		for i, n := range hosts {
+			hash, idx, ok, err := n.StateMachineHash(concurrentProposeShard)
+			if err != nil || !ok {
+				lastErr = fmt.Errorf("replica %d StateMachineHash: ok=%v err=%v", i+1, ok, err)
+				return false
+			}
+			hashes = append(hashes, hash)
+			indexes = append(indexes, idx)
+		}
+		at = indexes[0]
+		for i := range indexes {
+			if indexes[i] < want || indexes[i] != at || hashes[i] != hashes[0] {
+				return false
+			}
+		}
+		return true
+	})
+	if !ok {
+		t.Fatalf("replicas never settled at one index >= %d with equal hashes: indexes=%v hashes=%v last error=%v",
+			want, indexes, hashes, lastErr)
+	}
+	return at, append([]uint64(nil), hashes...)
 }
