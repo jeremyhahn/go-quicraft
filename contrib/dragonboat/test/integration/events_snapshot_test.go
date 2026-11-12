@@ -187,6 +187,7 @@ func proposeSnapshotEventKeys(ctx context.Context, t *testing.T, nh *dragonboat.
 	session := dbClient.NewNoOPSession(1, nil)
 	for i := range n {
 		pctx, cancel := context.WithTimeout(ctx, defaultTimeout)
+		//quicraft:direct-propose single-replica shard: every caller passes the startListenedSingleNode NodeHost, the shard's only member and so its leader
 		_, err := nh.SyncPropose(pctx, session, encodeKVPut(fmt.Sprintf("%s-%d", prefix, i), "v"))
 		cancel()
 		if err != nil {
