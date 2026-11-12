@@ -344,3 +344,40 @@ func TestSyncRemoveData_RemovesSnapshotDirUnderDataDir(t *testing.T) {
 		t.Fatalf("the removed replica's snapshot directory remains (stat err %v): %s", err, snapDir)
 	}
 }
+
+// A replica started with join=true and a custom DataDir roots its snapshot
+// tree under that DataDir; RemoveData must find it there, not under
+// NodeHostDir, so the joined replica's snapshots do not outlive its removal.
+func TestSyncRemoveData_RemovesJoinedReplicaSnapshotsUnderDataDir(t *testing.T) {
+	c := newRemoveDataCluster(t)
+	const f = 2
+	fid := uint64(f + 1)
+	dataDir := t.TempDir()
+	for i, h := range c.hosts {
+		scfg := c.shardConfig(uint64(i + 1))
+		members, join := c.members(), false
+		if i == f {
+			scfg.DataDir = dataDir
+			members, join = nil, true
+		}
+		if err := h.StartShard(members, join, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d] (join=%v): %v", i, join, err)
+		}
+	}
+	fh := c.hosts[f]
+	snapDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(c.cfgs[f].NodeHostDir, dataDir, removeDataShard), removeDataShard, fid)
+	if _, err := os.Stat(snapDir); err != nil {
+		t.Fatalf("joined replica's snapshot directory missing before removal: %v", err)
+	}
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+	if err := fh.SyncRemoveData(context.Background(), removeDataShard, fid); err != nil {
+		t.Fatalf("SyncRemoveData on a stopped joined replica: %v", err)
+	}
+	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the removed joined replica's snapshot directory remains under its "+
+			"DataDir (stat err %v): %s", err, snapDir)
+	}
+}
