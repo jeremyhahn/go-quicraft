@@ -9989,12 +9989,25 @@ func TestHostEngineCallback_OnCommitted_NotifiesPendingProposal(t *testing.T) {
 }
 
 // TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal verifies the
-// recycle guard: a pendingProposal whose RequestState holds NO outstanding
-// reference is one that a claiming path (OnApplied/OnProposalFailed/
-// failPendingRequests/sweep) has already released — its object may already
-// be recycled into a new request. OnCommitted must skip it rather than
-// deliver a notification it holds no reference for.
+// recycle guard: a pendingProposal whose RequestState has zero holders (its
+// caller has released and a claiming path such as OnApplied, OnProposalFailed,
+// failPendingRequests or the sweep has dropped the map's reference) has been
+// recycled and may already belong to a new request. OnCommitted must refuse
+// to pin it with tryAcquireRef and skip it. Without the guard its trailing
+// releaseRef would take holders 1 -> 0 again and recycle the object twice,
+// which the testHookTryRecycle counter observes.
 func TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal(t *testing.T) {
+	// The hook runs on engine goroutines too, so the watched object is
+	// published through an atomic pointer.
+	var watched atomic.Pointer[RequestState]
+	var recycleEntries atomic.Int64
+	testHookTryRecycle = func(r *RequestState, stage int) {
+		if stage == recycleStageEnter && r == watched.Load() {
+			recycleEntries.Add(1)
+		}
+	}
+	defer func() { testHookTryRecycle = nil }()
+
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -10010,25 +10023,38 @@ func TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal(t *testing.T) 
 	ns := testLoadNode(h, 1)
 
 	// Simulate the hazard window: the map still holds the entry, but the
-	// RequestState's reference count has already dropped to zero (as it
-	// would mid-race once a claiming path ran releaseRef).
-	pool := NewRequestStatePool()
-	rs := newRequestState(pool, 88, time.Time{}, true)
+	// RequestState has reached zero holders through the real release path
+	// and been recycled.
+	rs := newRequestState(NewRequestStatePool(), 88, time.Time{}, true)
+	watched.Store(rs)
+	rs.acquireRef()
 	ns.pendingProposals.Store(uint64(88), &pendingProposal{rs: rs})
+	rs.Release()
+	rs.releaseRef()
+	if got := recycleEntries.Load(); got != 1 {
+		t.Fatalf("tryRecycle entries after reaching zero holders = %d, want 1", got)
+	}
 
 	cb := &hostEngineCallback{h: h}
 	cb.OnCommitted(1, []proto.Entry{{Index: 10, Key: 88}})
 
+	if got := recycleEntries.Load(); got != 1 {
+		t.Fatalf("tryRecycle entries after OnCommitted = %d, want 1 (OnCommitted pinned a zero-holder RequestState)", got)
+	}
+	if got := rs.holders.Load(); got != 0 {
+		t.Fatalf("holders = %d after OnCommitted, want 0", got)
+	}
+	if got := rs.outstanding.Load(); got != 0 {
+		t.Fatalf("outstanding = %d after OnCommitted, want 0", got)
+	}
 	select {
-	case <-rs.CommittedC():
-		t.Fatal("OnCommitted notified a RequestState with no outstanding reference")
+	case <-rs.committedC:
+		t.Fatal("OnCommitted notified a RequestState with zero holders")
 	default:
 		// Correct: skipped.
 	}
 
 	ns.pendingProposals.Delete(uint64(88))
-	rs.complete(RequestResult{Value: 1})
-	rs.Release()
 }
 
 // TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress hammers
