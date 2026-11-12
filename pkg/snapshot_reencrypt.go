@@ -203,7 +203,6 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	}()
 
 	srcLive := srcBarrier != nil
-	dstLive := dstBarrier != nil
 
 	// Pin every epoch the source frames reference so a concurrent
 	// PurgeEpochsBefore cannot remove a DEK mid-migration. The scan is
@@ -235,36 +234,8 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 			dstBarrier.DeregisterInFlightEpoch(e)
 		}
 	}()
-	switch {
-	case srcLive && dstLive:
-		// Framed -> framed. Decrypt in one goroutine, feeding plaintext through
-		// an in-memory pipe into the encrypt side, so no plaintext is ever
-		// written to disk.
-		pr, pw := io.Pipe()
-		decDone := make(chan struct{})
-		go func() {
-			defer close(decDone)
-			_, decErr := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, pw)
-			_ = pw.CloseWithError(decErr)
-		}()
-		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, pr, tmp)
-		// Unblock the decrypt goroutine if the encrypt side stopped early, then
-		// JOIN it: it reads from src and holds srcBarrier epoch pins, both of
-		// which this function's deferred cleanup tears down on return. Returning
-		// while it still runs would close src and deregister the pins underneath
-		// a live decrypt.
-		_ = pr.CloseWithError(err)
-		<-decDone
-	case srcLive && !dstLive:
-		// Framed -> plaintext.
-		_, err = decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, tmp)
-	case !srcLive && dstLive:
-		// Plaintext -> framed.
-		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, src, tmp)
-	default:
-		// Plaintext -> plaintext.
-		_, err = io.Copy(tmp, src)
-	}
+	epoch, dstPins, err = copySnapshotAcrossBarriers(src, tmp, shardID, replicaID, index,
+		srcBarrier, dstBarrier)
 	if err != nil {
 		return 0, err
 	}
@@ -320,6 +291,51 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 		}
 	}
 	return epoch, nil
+}
+
+// copySnapshotAcrossBarriers streams the snapshot data in src into dst,
+// decrypting it under srcBarrier and sealing it under dstBarrier, where a
+// nil barrier means that side is plaintext. It returns the at-rest epoch and
+// the destination epochs encryptSnapshotFrames pinned, which the caller
+// deregisters once its durable write is done; both are zero when dstBarrier
+// is nil.
+func copySnapshotAcrossBarriers(src io.Reader, dst io.Writer, shardID, replicaID, index uint64,
+	srcBarrier, dstBarrier Barrier) (uint64, []uint64, error) {
+	srcLive := srcBarrier != nil
+	dstLive := dstBarrier != nil
+	switch {
+	case srcLive && dstLive:
+		// Framed -> framed. Decrypt in one goroutine, feeding plaintext through
+		// an in-memory pipe into the encrypt side, so no plaintext is ever
+		// written to disk.
+		pr, pw := io.Pipe()
+		decDone := make(chan struct{})
+		go func() {
+			defer close(decDone)
+			_, decErr := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, pw)
+			_ = pw.CloseWithError(decErr)
+		}()
+		epoch, pins, err := encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, pr, dst)
+		// Unblock the decrypt goroutine if the encrypt side stopped early, then
+		// JOIN it: it reads from src and holds srcBarrier epoch pins, both of
+		// which the caller's deferred cleanup tears down on return. Returning
+		// while it still runs would close src and deregister the pins underneath
+		// a live decrypt.
+		_ = pr.CloseWithError(err)
+		<-decDone
+		return epoch, pins, err
+	case srcLive && !dstLive:
+		// Framed -> plaintext.
+		_, err := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, dst)
+		return 0, nil, err
+	case !srcLive && dstLive:
+		// Plaintext -> framed.
+		return encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, src, dst)
+	default:
+		// Plaintext -> plaintext.
+		_, err := io.Copy(dst, src)
+		return 0, nil, err
+	}
 }
 
 // reencryptMetaReadLimit bounds the snapshot.meta read in
