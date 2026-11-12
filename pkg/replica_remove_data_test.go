@@ -15,6 +15,8 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -33,6 +35,13 @@ const removeDataShard = 1
 
 func newRemoveDataCluster(t *testing.T, opts ...HostOption) *removeDataCluster {
 	t.Helper()
+	return newRemoveDataClusterWith(t, nil, opts...)
+}
+
+// newRemoveDataClusterWith is newRemoveDataCluster with perHost, when not nil,
+// adding host i's own options (a LogDB wrapper, say) after opts.
+func newRemoveDataClusterWith(t *testing.T, perHost func(i int, cfg config.HostConfig) []HostOption, opts ...HostOption) *removeDataCluster {
+	t.Helper()
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, 3)
 	c := &removeDataCluster{t: t, ca: ca}
@@ -43,7 +52,11 @@ func newRemoveDataCluster(t *testing.T, opts ...HostOption) *removeDataCluster {
 		cfg.ListenAddress = addr
 		cfg.TransportConfig.MTLSConfig = leaves[i]
 		cfg.ShutdownTimeout = 2 * time.Second
-		h, err := NewHost(cfg, append([]HostOption{WithoutEncryption()}, opts...)...)
+		hopts := append([]HostOption{WithoutEncryption()}, opts...)
+		if perHost != nil {
+			hopts = append(hopts, perHost(i, cfg)...)
+		}
+		h, err := NewHost(cfg, hopts...)
 		if err != nil {
 			t.Fatalf("NewHost[%d]: %v", i, err)
 		}
@@ -447,17 +460,25 @@ func TestSyncRemoveData_RetriesAfterSnapshotRemovalFails(t *testing.T) {
 		t.Fatalf("RemoveData with a failing snapshot removal: err = %v, want %v",
 			err, errInjectedRemoveAll)
 	}
+	// The replica is retired before its snapshots are touched, and the
+	// durable intent names the directory the retry must still remove.
 	removed, err := fh.logdb.NodeRemoved(removeDataShard, fid)
 	if err != nil {
 		t.Fatalf("NodeRemoved: %v", err)
 	}
-	if removed {
-		t.Fatal("a RemoveData that failed to remove the snapshot directory retired the " +
-			"replica: a retry no longer finds the record that locates its snapshots")
+	if !removed {
+		t.Fatal("RemoveData reached the snapshot removal without retiring the replica first")
+	}
+	intent := removeDataIntentFile(c.cfgs[f].NodeHostDir, removeDataShard, fid)
+	if _, err := os.Stat(intent); err != nil {
+		t.Fatalf("the failed snapshot removal left no removal intent at %s: %v", intent, err)
 	}
 
 	if err := fh.RemoveData(removeDataShard, fid); err != nil {
 		t.Fatalf("RemoveData retry: %v", err)
+	}
+	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the retried removal left its intent (stat err %v): %s", err, intent)
 	}
 	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the retried removal left the snapshot directory under the DataDir "+
@@ -466,5 +487,130 @@ func TestSyncRemoveData_RetriesAfterSnapshotRemovalFails(t *testing.T) {
 	removed, err = fh.logdb.NodeRemoved(removeDataShard, fid)
 	if err != nil || !removed {
 		t.Fatalf("after the retry NodeRemoved = %v (err %v), want true", removed, err)
+	}
+}
+
+// removeDataIntentFile is where RemoveData records its removal intent for
+// the replica, as the test expects it (NodeHostDir/remove-data).
+func removeDataIntentFile(nodeHostDir string, shardID, replicaID uint64) string {
+	return filepath.Join(nodeHostDir, "remove-data",
+		fmt.Sprintf("shard-%d-replica-%d", shardID, replicaID))
+}
+
+// errInjectedRetire is the RemoveNodeData failure removeDataLogDB injects.
+var errInjectedRetire = errors.New("injected RemoveNodeData failure")
+
+// removeDataLogDB wraps the LogDB a host uses: RemoveNodeData fails
+// failRetire times, and GetBootstrap reports no record while hideBootstrap
+// is set (a replica joined, or imported into, before joins were recorded).
+type removeDataLogDB struct {
+	logdb.LogDB
+	mu            sync.Mutex
+	failRetire    int
+	hideBootstrap bool
+}
+
+func (w *removeDataLogDB) RemoveNodeData(shardID, replicaID uint64) error {
+	w.mu.Lock()
+	if w.failRetire > 0 {
+		w.failRetire--
+		w.mu.Unlock()
+		return errInjectedRetire
+	}
+	w.mu.Unlock()
+	return w.LogDB.RemoveNodeData(shardID, replicaID)
+}
+
+func (w *removeDataLogDB) GetBootstrap(shardID, replicaID uint64) (logdb.Bootstrap, bool, error) {
+	w.mu.Lock()
+	hide := w.hideBootstrap
+	w.mu.Unlock()
+	if hide {
+		return logdb.Bootstrap{}, false, nil
+	}
+	return w.LogDB.GetBootstrap(shardID, replicaID)
+}
+
+func (w *removeDataLogDB) set(failRetire int, hideBootstrap bool) {
+	w.mu.Lock()
+	w.failRetire, w.hideBootstrap = failRetire, hideBootstrap
+	w.mu.Unlock()
+}
+
+// walWrapperFor returns a perHost option set giving host f a removeDataLogDB
+// over its own WAL (opened where NewHost would open it) and storing the
+// wrapper in *out.
+func walWrapperFor(t *testing.T, f int, out **removeDataLogDB) func(int, config.HostConfig) []HostOption {
+	return func(i int, cfg config.HostConfig) []HostOption {
+		if i != f {
+			return nil
+		}
+		wal, err := waldb.Open(cfg.WALDir)
+		if err != nil {
+			t.Fatalf("waldb.Open: %v", err)
+		}
+		*out = &removeDataLogDB{LogDB: wal}
+		return []HostOption{WithLogDB(*out)}
+	}
+}
+
+// TestSyncRemoveData_FailedRetirementKeepsCompactedSnapshot: a RemoveData
+// whose retirement fails leaves the replica unretired, so it must also leave
+// the snapshot its compacted log depends on; the replica then restarts.
+func TestSyncRemoveData_FailedRetirementKeepsCompactedSnapshot(t *testing.T) {
+	const f = 1
+	fid := uint64(f + 1)
+	var w *removeDataLogDB
+	c := newRemoveDataClusterWith(t, walWrapperFor(t, f, &w))
+	for i, h := range c.hosts {
+		scfg := c.shardConfig(uint64(i + 1))
+		scfg.CompactionOverhead = 10
+		if err := h.StartShard(c.members(), false, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	all := []int{0, 1, 2}
+	c.propose(all, "before", 60)
+	c.waitHashMatch(f, all)
+	fh := c.hosts[f]
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	snapIndex, err := fh.SyncRequestSnapshot(ctx, removeDataShard, SnapshotOption{})
+	if err != nil {
+		t.Fatalf("SyncRequestSnapshot on the follower: %v", err)
+	}
+	if lr, err := fh.LogRange(removeDataShard); err != nil || lr.FirstIndex <= 1 {
+		t.Fatalf("follower log after the snapshot at %d = %+v (err %v), want it compacted",
+			snapIndex, lr, err)
+	}
+	snapDir := c.replicaSnapshotDir(f, fid)
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+
+	w.set(1, false)
+	if err := fh.RemoveData(removeDataShard, fid); !errors.Is(err, errInjectedRetire) {
+		t.Fatalf("RemoveData with a failing retirement: err = %v, want %v", err, errInjectedRetire)
+	}
+	if removed, err := fh.logdb.NodeRemoved(removeDataShard, fid); err != nil || removed {
+		t.Fatalf("after the failed retirement NodeRemoved = %v (err %v), want false", removed, err)
+	}
+	if _, err := os.Stat(snapDir); err != nil {
+		t.Fatalf("a RemoveData that did not retire the replica deleted its snapshot "+
+			"directory %s (stat err %v): its compacted log can no longer start", snapDir, err)
+	}
+
+	if err := fh.StartShard(c.members(), false, hashingCreateFunc, c.shardConfig(fid)); err != nil {
+		t.Fatalf("StartShard of the unretired replica: %v", err)
+	}
+	c.waitHashMatch(f, all)
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica (second): %v", err)
+	}
+	if err := fh.RemoveData(removeDataShard, fid); err != nil {
+		t.Fatalf("RemoveData retry: %v", err)
+	}
+	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the second RemoveData left the snapshot directory (stat err %v): %s", err, snapDir)
 	}
 }
