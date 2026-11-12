@@ -282,3 +282,37 @@ func TestSyncRemoveData_RefusesRunningRemovesStoppedReplica(t *testing.T) {
 	c.propose(live, "rejoined", 5)
 	c.waitHashMatch(f, live)
 }
+
+// TestSyncRemoveData_RemovesSnapshotDirUnderDataDir: a replica whose shard
+// roots its snapshot tree off Config.DataDir has that tree's replica
+// directory removed, resolved from the bootstrap record after the replica
+// has been stopped and unloaded.
+func TestSyncRemoveData_RemovesSnapshotDirUnderDataDir(t *testing.T) {
+	c := newRemoveDataCluster(t)
+	dataDirs := make([]string, len(c.hosts))
+	for i, h := range c.hosts {
+		dataDirs[i] = t.TempDir()
+		scfg := c.shardConfig(uint64(i + 1))
+		scfg.DataDir = dataDirs[i]
+		if err := h.StartShard(c.members(), false, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	const f = 1
+	fid := uint64(f + 1)
+	fh := c.hosts[f]
+	snapDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(c.cfgs[f].NodeHostDir, dataDirs[f], removeDataShard), removeDataShard, fid)
+	if _, err := os.Stat(snapDir); err != nil {
+		t.Fatalf("snapshot directory missing before removal: %v", err)
+	}
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+	if err := fh.SyncRemoveData(context.Background(), removeDataShard, fid); err != nil {
+		t.Fatalf("SyncRemoveData on a stopped replica: %v", err)
+	}
+	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the removed replica's snapshot directory remains (stat err %v): %s", err, snapDir)
+	}
+}
