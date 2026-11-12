@@ -34,7 +34,7 @@ type asyncWitnessPolicyRun struct {
 // waits for the RequestState's Result. Every RequestState the call returns
 // is released exactly once: it is checked to be unreleased before the
 // test's single Release and released after it.
-func (r *asyncWitnessPolicyRun) requestPolicy(t *testing.T, ctx context.Context, h *Host, max int, rfrm bool, ccid uint64) error {
+func (r *asyncWitnessPolicyRun) requestPolicy(ctx context.Context, t *testing.T, h *Host, max int, rfrm bool, ccid uint64) error {
 	t.Helper()
 	rs, err := h.RequestUpdateWitnessPolicy(ctx, witnessPolicyShard, config.WitnessConfig{
 		MaxWitnesses:               max,
@@ -82,7 +82,7 @@ func TestWitnessPolicy_AsyncRequestCompletesAndRefusesAViolatedPolicyOrAStaleInd
 	// replica adopts it.
 	var a asyncWitnessPolicyRun
 	if err := c.change(func(ctx context.Context, h *Host, ccid uint64) error {
-		return a.requestPolicy(t, ctx, h, 2, false, ccid)
+		return a.requestPolicy(ctx, t, h, 2, false, ccid)
 	}); err != nil {
 		t.Fatalf("(a) RequestUpdateWitnessPolicy(MaxWitnesses=2, RequireFullReplicaMajority=false): %v", err)
 	}
@@ -104,7 +104,7 @@ func TestWitnessPolicy_AsyncRequestCompletesAndRefusesAViolatedPolicyOrAStaleInd
 	// call or from the result, and every replica keeps the old policy.
 	var b asyncWitnessPolicyRun
 	err := c.change(func(ctx context.Context, h *Host, ccid uint64) error {
-		return b.requestPolicy(t, ctx, h, 1, false, ccid)
+		return b.requestPolicy(ctx, t, h, 1, false, ccid)
 	})
 	if !errors.Is(err, ErrTooManyWitnesses) && !errors.Is(err, ErrBreaksFullReplicaMajority) {
 		t.Fatalf("(b) tightening to MaxWitnesses=1 with two witnesses: got %v, want ErrTooManyWitnesses or ErrBreaksFullReplicaMajority", err)
@@ -124,12 +124,12 @@ func TestWitnessPolicy_AsyncRequestCompletesAndRefusesAViolatedPolicyOrAStaleInd
 	err = c.change(func(ctx context.Context, h *Host, ccid uint64) error {
 		if stale == 0 {
 			stale = ccid
-			if err := cr.requestPolicy(t, ctx, h, 3, false, ccid); err != nil {
+			if err := cr.requestPolicy(ctx, t, h, 3, false, ccid); err != nil {
 				stale = 0
 				return err
 			}
 		}
-		return cr.requestPolicy(t, ctx, h, 2, true, stale)
+		return cr.requestPolicy(ctx, t, h, 2, true, stale)
 	})
 	if stale == 0 {
 		t.Fatalf("(c) the update that moves the index: %v", err)
