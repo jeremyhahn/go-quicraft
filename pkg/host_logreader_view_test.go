@@ -233,3 +233,44 @@ func TestLogReaderViewTermAdvancesWithoutAppend(t *testing.T) {
 		t.Fatalf("NodeState() = (%d, %d), want (2, 3)", lastIndex, term)
 	}
 }
+
+// TestLogReaderViewHostTermAdvancesWithoutAppend drives the Host.LogReader
+// wiring end to end: a higher-term Heartbeat makes the replica a follower at
+// that term without appending, so only the live Raft term (not the log tail)
+// can report it.
+func TestLogReaderViewHostTermAdvancesWithoutAppend(t *testing.T) {
+	h := startLogReaderViewShard(t)
+	r, err := h.LogReader(1)
+	if err != nil {
+		t.Fatalf("LogReader: %v", err)
+	}
+	idx0, term0 := r.NodeState()
+	if !h.engine.DeliverMessage(1, proto.Message{
+		ShardID: 1,
+		From:    2,
+		To:      1,
+		Type:    proto.Heartbeat,
+		Term:    term0 + 1,
+	}) {
+		t.Fatalf("DeliverMessage refused the heartbeat")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		lastIndex, term := r.NodeState()
+		if term == term0+1 {
+			if lastIndex != idx0 {
+				t.Fatalf("NodeState() = (%d, %d), want (%d, %d): the term moved without an append",
+					lastIndex, term, idx0, term0+1)
+			}
+			return
+		}
+		if term > term0+1 {
+			t.Fatalf("NodeState() term %d passed %d before it was observed: observation window missed",
+				term, term0+1)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("NodeState() = (%d, %d), never reported term %d", lastIndex, term, term0+1)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
