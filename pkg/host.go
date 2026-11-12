@@ -11684,6 +11684,15 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 	// combination that never held would tell a caller this replica led in a
 	// term it never led.
 	leaderID, term, isLeader := ns.leaderAndTerm()
+	// A paused replica steps nothing, so the published leader is frozen at
+	// its pre-pause value. It neither campaigns nor heartbeats and discards
+	// every inbound message: it leads nothing and knows no leader, and the
+	// other voters may already have elected one. Report that, not the frozen
+	// claim, which would show two replicas leading the shard.
+	paused := ns.paused.Load()
+	if paused {
+		leaderID, isLeader = 0, false
+	}
 	lastApplied := ns.lastApplied.Load()
 
 	return &ShardInfo{
@@ -11701,7 +11710,7 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		Health:               h.shardHealth(ns, leaderID, lastApplied),
 		LastApplied:          lastApplied,
 		ConfigChangeIndex:    ns.configChangeIndex.Load(),
-		Paused:               ns.paused.Load(),
+		Paused:               paused,
 		Replicas:             h.replicaProgress(ns.shardID),
 	}
 }
