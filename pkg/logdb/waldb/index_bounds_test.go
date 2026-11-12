@@ -17,7 +17,9 @@ package waldb
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // requireIndexBounds fails t unless idx.Bounds reports first.Index,
@@ -109,28 +111,56 @@ func TestIndexBoundsConcurrentAppendCompact(t *testing.T) {
 	idx := newIndex()
 	idx.Append(indexEntry{Index: 1, Term: 1})
 
-	var wg sync.WaitGroup
+	// started is a start barrier: sampling begins only once both workers
+	// run. appends and compactions count each mutation that changed the
+	// index, so the test can prove both happened while it sampled.
+	var started, wg sync.WaitGroup
+	var appends, compactions atomic.Uint64
+	started.Add(2)
 	wg.Add(2)
 	go func() { // appender
 		defer wg.Done()
+		started.Done()
 		for i := uint64(2); ctx.Err() == nil; i++ {
 			idx.Append(indexEntry{Index: i, Term: 1})
+			appends.Add(1)
 		}
 	}()
 	go func() { // compactor, always below the tail
 		defer wg.Done()
+		started.Done()
 		for ctx.Err() == nil {
-			if last, ok := idx.Last(); ok && last.Index > 1 {
+			last, ok := idx.Last()
+			if !ok || last.Index <= 1 {
+				continue
+			}
+			// Only the compactor moves First, so an upTo at or above it
+			// removes at least one entry.
+			if first, ok := idx.First(); ok && first.Index <= last.Index-1 {
 				idx.Compact(last.Index - 1)
+				compactions.Add(1)
 			}
 		}
 	}()
+	started.Wait()
 
-	const reads = 10000
-	var bad, nonEmpty int
+	const (
+		minReads    = 10000
+		minProgress = 100
+		maxSampling = 10 * time.Second
+	)
+	appendsBefore, compactionsBefore := appends.Load(), compactions.Load()
+	deadline := time.Now().Add(maxSampling)
+	var reads, bad, nonEmpty int
 	var badFirst, badLast uint64
 	var badCount int
-	for range reads {
+	enough := func() bool {
+		return reads >= minReads &&
+			appends.Load()-appendsBefore >= minProgress &&
+			compactions.Load()-compactionsBefore >= minProgress
+	}
+	for !enough() && time.Now().Before(deadline) {
+		reads++
 		first, last, count := idx.Bounds()
 		if count == 0 {
 			continue
@@ -143,6 +173,8 @@ func TestIndexBoundsConcurrentAppendCompact(t *testing.T) {
 			bad++
 		}
 	}
+	appendsDuring := appends.Load() - appendsBefore
+	compactionsDuring := compactions.Load() - compactionsBefore
 	cancel()
 	wg.Wait()
 
@@ -152,5 +184,9 @@ func TestIndexBoundsConcurrentAppendCompact(t *testing.T) {
 	}
 	if nonEmpty == 0 {
 		t.Fatal("every Bounds result was empty; the index should never empty under append and compact-below-tail")
+	}
+	if appendsDuring < minProgress || compactionsDuring < minProgress {
+		t.Fatalf("mutations during %d Bounds reads: %d appends, %d compactions; want at least %d of each",
+			reads, appendsDuring, compactionsDuring, minProgress)
 	}
 }
