@@ -6,6 +6,7 @@ package quicraft
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -253,8 +254,20 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 	// Stop two voters. One voter and one observer are no quorum: no proposal
 	// commits, through the surviving voter or the observer, and the observer
 	// never takes leadership.
-	survivor := uint64(3)
-	for id := uint64(1); id <= 2; id++ {
+	// The survivor is the current leader, so the lone voter keeps its role and
+	// only the commit rule can stop a proposal: if the observer's
+	// acknowledgements counted, leader plus observer would commit.
+	var survivor uint64
+	if !waitUntil(20*time.Second, func() bool {
+		survivor = c.leader()
+		return survivor != 0
+	}) {
+		t.Fatal("no leader before stopping two voters")
+	}
+	for id := uint64(1); id <= 3; id++ {
+		if id == survivor {
+			continue
+		}
 		if err := c.nodes[id-1].host.Close(); err != nil {
 			t.Fatalf("Close[%d]: %v", id, err)
 		}
@@ -282,5 +295,9 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 	rcancel()
 	if err == nil {
 		t.Fatalf("observer StaleRead(\"after\") = %#v, want key not found", got)
+	}
+	var nf *kv.KeyNotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("observer StaleRead(\"after\") error = %v, want *kv.KeyNotFoundError", err)
 	}
 }
