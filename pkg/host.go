@@ -11342,6 +11342,35 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 	return nil
 }
 
+// removeDataLayoutUnknownError is returned by RemoveData when the replica
+// has no bootstrap record and no pending removal intent, and its LogDB
+// snapshot record names a Filepath that lies in no replica snapshot layout
+// this host creates. RemoveData refuses before anything is retired or
+// deleted, rather than report a success that leaves the snapshots behind.
+// It matches ErrInvalidOperation under errors.Is.
+type removeDataLayoutUnknownError struct {
+	// shardID is the shard whose data was to be removed.
+	shardID uint64
+	// replicaID is the replica whose data was to be removed.
+	replicaID uint64
+	// filepath is the snapshot record's path that matched no layout.
+	filepath string
+}
+
+// Error returns a human-readable description of the error.
+func (e *removeDataLayoutUnknownError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: RemoveData of shard %d replica %d: snapshot record path %q lies in no replica snapshot layout",
+		e.shardID, e.replicaID, e.filepath,
+	)
+}
+
+// Is reports whether target is ErrInvalidOperation, so callers classify the
+// refusal with errors.Is(err, ErrInvalidOperation).
+func (e *removeDataLayoutUnknownError) Is(target error) bool {
+	return target == ErrInvalidOperation
+}
+
 // removeDataSnapshotDir resolves the snapshot directory RemoveData removes
 // for the replica, and reports whether it came from a pending removal intent
 // (which then need not be written again). In order: the bootstrap record's
@@ -11352,8 +11381,8 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 // WithImportDataDir, or joined before joins were recorded, under a custom
 // DataDir); else, with no snapshot record, the NodeHostDir layout StartShard
 // uses for an empty DataDir. A snapshot record whose Filepath lies in no
-// replica layout is a *RemoveDataLayoutUnknownError, returned before
-// anything is retired or deleted.
+// replica layout is a *removeDataLayoutUnknownError (errors.Is
+// ErrInvalidOperation), returned before anything is retired or deleted.
 func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, error) {
 	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
 	if err != nil {
@@ -11375,10 +11404,10 @@ func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, e
 	if err == nil && ss.Filepath != "" {
 		dir, ok := replicaSnapshotDirFromRecord(ss.Filepath, shardID, replicaID)
 		if !ok {
-			return "", false, &RemoveDataLayoutUnknownError{
-				ShardID:   shardID,
-				ReplicaID: replicaID,
-				Filepath:  ss.Filepath,
+			return "", false, &removeDataLayoutUnknownError{
+				shardID:   shardID,
+				replicaID: replicaID,
+				filepath:  ss.Filepath,
 			}
 		}
 		return dir, false, nil
