@@ -971,8 +971,17 @@ func (f *intentSyncFS) Open(name string) (snapshotFile, error) {
 // durable only once the intent directory and NodeHostDir are synced, so a
 // failed sync of the intent directory returns the error with the replica
 // unretired and its snapshots kept; a retry from the pending intent syncs
-// both directories before it retires the replica.
+// both directories before it retires the replica. "rewrite" retries with
+// the bootstrap record still present, so the retry writes the intent again;
+// "pending" hides the record, as after a crash past the retirement or for a
+// replica joined before joins were recorded, so the retry reads the pending
+// intent and skips the write.
 func TestSyncRemoveData_IntentDirSyncFailureDoesNotRetire(t *testing.T) {
+	t.Run("rewrite", func(t *testing.T) { testIntentDirSyncFailure(t, false) })
+	t.Run("pending", func(t *testing.T) { testIntentDirSyncFailure(t, true) })
+}
+
+func testIntentDirSyncFailure(t *testing.T, pendingOnRetry bool) {
 	const f = 1
 	fid := uint64(f + 1)
 	fsys := &intentSyncFS{}
@@ -1013,6 +1022,12 @@ func TestSyncRemoveData_IntentDirSyncFailureDoesNotRetire(t *testing.T) {
 	}
 	fsys.take()
 
+	if pendingOnRetry {
+		w.set(0, true)
+		if _, pending, err := fh.readRemoveDataIntent(removeDataShard, fid); err != nil || !pending {
+			t.Fatalf("after the failed intent sync pending = %v (err %v), want a pending intent", pending, err)
+		}
+	}
 	if err := fh.RemoveData(removeDataShard, fid); err != nil {
 		t.Fatalf("RemoveData retry: %v", err)
 	}
