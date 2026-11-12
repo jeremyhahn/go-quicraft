@@ -224,6 +224,52 @@ func undocumentedDecls(fset *token.FileSet, rel string, file *ast.File) []docGap
 	return gaps
 }
 
+// TestUndocumentedDeclsGroupedTypes proves a doc comment on a grouped type
+// block does not document the types inside it, while a doc comment on a
+// const or var group, or on a standalone type, still covers its names.
+func TestUndocumentedDeclsGroupedTypes(t *testing.T) {
+	const src = `// Package fixture is a doc comment gate fixture.
+package fixture
+
+// Public types.
+type (
+	Foo struct{}
+	Bar struct{}
+
+	// Baz is documented.
+	Baz struct{}
+)
+
+// Single is a standalone type.
+type Single struct{}
+
+// Limits of the fixture.
+const (
+	MaxA = 1
+	MaxB = 2
+)
+
+// Defaults of the fixture.
+var (
+	DefA = 1
+	DefB = 2
+)
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parsing fixture: %v", err)
+	}
+	var got []string
+	for _, g := range undocumentedDecls(fset, "fixture.go", file) {
+		got = append(got, g.what)
+	}
+	want := []string{"type Foo", "type Bar"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("undocumentedDecls reported %q, want %q", got, want)
+	}
+}
+
 // receiverTypeName returns the base type name of a method receiver, looking
 // through pointers and type parameters.
 func receiverTypeName(recv *ast.FieldList) string {
