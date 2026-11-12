@@ -161,6 +161,36 @@ func TestValidateFrameHeaderAcceptsLengthBounds(t *testing.T) {
 	}
 }
 
+// TestReadFrameHeaderLengthBoundsIntConversion pins the bound that makes the
+// receive path's int(length) (handleMessageFrame's getRecvBuf, recv.go) and
+// the snapshot chunk allocation exact on every platform: the wire length is a
+// uint32 read from peer bytes, and ValidateFrameHeaderWindow rejects anything
+// above MaxFrameSize before either conversion runs. MaxFrameSize must stay
+// within int32, or int(length) could wrap negative on a 32-bit build.
+func TestReadFrameHeaderLengthBoundsIntConversion(t *testing.T) {
+	const maxInt32 = 1<<31 - 1
+	if uint64(MaxFrameSize) > maxInt32 {
+		t.Fatalf("MaxFrameSize %d exceeds int32; int(length) is no longer exact on 32-bit", MaxFrameSize)
+	}
+	for _, length := range []uint32{MaxFrameSize + 1, 1 << 31, ^uint32(0)} {
+		header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion, 0x00}
+		binary.BigEndian.PutUint32(header[4:8], length)
+		got, _, err := ReadFrameHeader(bytes.NewReader(header[:]))
+		if !errors.Is(err, ErrFrameTooLarge) {
+			t.Fatalf("length %d: expected ErrFrameTooLarge, got %v", length, err)
+		}
+		if got != 0 {
+			t.Fatalf("length %d: rejected header returned length %d, want 0", length, got)
+		}
+	}
+	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion, 0x00}
+	binary.BigEndian.PutUint32(header[4:8], MaxFrameSize)
+	got, _, err := ReadFrameHeader(bytes.NewReader(header[:]))
+	if err != nil || got != MaxFrameSize {
+		t.Fatalf("MaxFrameSize header: got length %d err %v", got, err)
+	}
+}
+
 // TestValidateFrameHeaderWrongMagic verifies detection of bad magic bytes.
 func TestValidateFrameHeaderWrongMagic(t *testing.T) {
 	tests := []struct {
