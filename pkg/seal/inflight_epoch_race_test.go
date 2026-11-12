@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -147,10 +148,24 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 		started.Wait()
 		close(startedCh)
 	}()
+	// firstRotated closes after the first successful Rotate, or when the
+	// rotator stops without one, so no goroutine waits on it forever. The
+	// purger and the second half of every worker's seals wait on it, so
+	// purges run, and seals and pins continue, after an old epoch exists.
+	firstRotated := make(chan struct{})
+	var firstRotatedOnce sync.Once
+	closeFirstRotated := func() { firstRotatedOnce.Do(func() { close(firstRotated) }) }
+	// initialEpoch is the epoch every worker's first-half pins are sealed
+	// under: no rotation runs before every worker has sealed them.
+	initialEpoch := b.CurrentEpoch()
+	// overlapPurges counts background purges that ran with the current
+	// epoch past initialEpoch while the old-epoch pins were held.
+	var overlapPurges atomic.Int64
 
 	racing.Add(2)
 	go func() {
 		defer racing.Done()
+		defer closeFirstRotated()
 		// Rotate only once every worker keeps a pin sealed under the
 		// initial epoch, so each encryption mode holds an old-epoch pin
 		// across the purges.
@@ -165,15 +180,37 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 				report(fmt.Errorf("Rotate %d: %w", i, err))
 				return
 			}
+			if i == 0 {
+				closeFirstRotated()
+			}
 			runtime.Gosched()
 		}
 	}()
 	go func() {
 		defer racing.Done()
+		select {
+		case <-firstRotated:
+		case <-ctx.Done():
+			report(fmt.Errorf("purger waiting for the first rotation: %w", ctx.Err()))
+			return
+		}
 		for i := 0; i < inFlightEpochRacePurges; i++ {
-			if _, err := b.PurgeEpochsBefore(ctx, b.CurrentEpoch()); err != nil {
+			current := b.CurrentEpoch()
+			if _, err := b.PurgeEpochsBefore(ctx, current); err != nil {
 				report(fmt.Errorf("PurgeEpochsBefore %d: %w", i, err))
 				return
+			}
+			if current > initialEpoch {
+				// The workers hold pins on initialEpoch until raceDone,
+				// which follows racing.Wait: this purge had an old,
+				// pinned epoch to skip, and must have kept it.
+				b.mu.RLock()
+				_, kept := b.deks[initialEpoch]
+				b.mu.RUnlock()
+				if !kept {
+					report(fmt.Errorf("PurgeEpochsBefore %d (current %d) removed pinned epoch %d", i, current, initialEpoch))
+				}
+				overlapPurges.Add(1)
 			}
 			runtime.Gosched()
 		}
@@ -195,6 +232,17 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 				}
 			}
 			for i := 0; i < inFlightEpochRaceFrames; i++ {
+				if i == inFlightEpochRaceFrames/2 {
+					// The first half holds pins under initialEpoch; the
+					// second half seals after a rotation, while the
+					// purger runs.
+					signalStarted()
+					select {
+					case <-firstRotated:
+					case <-ctx.Done():
+						report(fmt.Errorf("worker %d waiting for the first rotation: %w", w, ctx.Err()))
+					}
+				}
 				pt := []byte(fmt.Sprintf("worker %d frame %d", w, i))
 				f, err := seal(ctx, b, pt)
 				if err != nil {
@@ -213,9 +261,6 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 					f.pinned = false
 				}
 				frames[w] = append(frames[w], f)
-				if f.pinned {
-					signalStarted()
-				}
 			}
 			// On an early seal error the worker still signals, so the
 			// rotator and the main goroutine never wait on it.
@@ -237,6 +282,14 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 	}
 
 	racing.Wait()
+	if overlapPurges.Load() == 0 {
+		errMu.Lock()
+		for _, err := range errs {
+			t.Error(err)
+		}
+		errMu.Unlock()
+		t.Fatalf("no background purge ran after a rotation with the epoch-%d pins held", initialEpoch)
+	}
 	// sealed.Wait orders every worker's appends to frames before the reads
 	// below.
 	sealed.Wait()
