@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,7 +31,7 @@ type removeDataCluster struct {
 
 const removeDataShard = 1
 
-func newRemoveDataCluster(t *testing.T) *removeDataCluster {
+func newRemoveDataCluster(t *testing.T, opts ...HostOption) *removeDataCluster {
 	t.Helper()
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, 3)
@@ -41,7 +43,7 @@ func newRemoveDataCluster(t *testing.T) *removeDataCluster {
 		cfg.ListenAddress = addr
 		cfg.TransportConfig.MTLSConfig = leaves[i]
 		cfg.ShutdownTimeout = 2 * time.Second
-		h, err := NewHost(cfg, WithoutEncryption())
+		h, err := NewHost(cfg, append([]HostOption{WithoutEncryption()}, opts...)...)
 		if err != nil {
 			t.Fatalf("NewHost[%d]: %v", i, err)
 		}
@@ -379,5 +381,90 @@ func TestSyncRemoveData_RemovesJoinedReplicaSnapshotsUnderDataDir(t *testing.T) 
 	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the removed joined replica's snapshot directory remains under its "+
 			"DataDir (stat err %v): %s", err, snapDir)
+	}
+}
+
+// failRemoveAllFS is the OS snapshot filesystem whose first RemoveAll of the
+// armed path fails with errInjectedRemoveAll and has no effect.
+type failRemoveAllFS struct {
+	osSnapshotFS
+	mu     sync.Mutex
+	target string
+	fired  bool
+}
+
+var errInjectedRemoveAll = errors.New("injected RemoveAll failure")
+
+func (f *failRemoveAllFS) arm(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.target = filepath.Clean(path)
+}
+
+func (f *failRemoveAllFS) RemoveAll(path string) error {
+	f.mu.Lock()
+	fail := !f.fired && f.target != "" && filepath.Clean(path) == f.target
+	if fail {
+		f.fired = true
+	}
+	f.mu.Unlock()
+	if fail {
+		return errInjectedRemoveAll
+	}
+	return f.osSnapshotFS.RemoveAll(path)
+}
+
+// A RemoveData whose snapshot removal fails must leave the replica
+// retryable: it reports the error, does not retire the replica, and keeps
+// the record that locates the snapshot tree, so a second RemoveData removes
+// the directory under the shard's DataDir.
+func TestSyncRemoveData_RetriesAfterSnapshotRemovalFails(t *testing.T) {
+	fsys := &failRemoveAllFS{}
+	c := newRemoveDataCluster(t, withSnapshotFS(fsys))
+	dataDirs := make([]string, len(c.hosts))
+	for i, h := range c.hosts {
+		dataDirs[i] = t.TempDir()
+		scfg := c.shardConfig(uint64(i + 1))
+		scfg.DataDir = dataDirs[i]
+		if err := h.StartShard(c.members(), false, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	const f = 1
+	fid := uint64(f + 1)
+	fh := c.hosts[f]
+	snapDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(c.cfgs[f].NodeHostDir, dataDirs[f], removeDataShard), removeDataShard, fid)
+	if _, err := os.Stat(snapDir); err != nil {
+		t.Fatalf("snapshot directory missing before removal: %v", err)
+	}
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+
+	fsys.arm(snapDir)
+	if err := fh.RemoveData(removeDataShard, fid); !errors.Is(err, errInjectedRemoveAll) {
+		t.Fatalf("RemoveData with a failing snapshot removal: err = %v, want %v",
+			err, errInjectedRemoveAll)
+	}
+	removed, err := fh.logdb.NodeRemoved(removeDataShard, fid)
+	if err != nil {
+		t.Fatalf("NodeRemoved: %v", err)
+	}
+	if removed {
+		t.Fatal("a RemoveData that failed to remove the snapshot directory retired the " +
+			"replica: a retry no longer finds the record that locates its snapshots")
+	}
+
+	if err := fh.RemoveData(removeDataShard, fid); err != nil {
+		t.Fatalf("RemoveData retry: %v", err)
+	}
+	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the retried removal left the snapshot directory under the DataDir "+
+			"(stat err %v): %s", err, snapDir)
+	}
+	removed, err = fh.logdb.NodeRemoved(removeDataShard, fid)
+	if err != nil || !removed {
+		t.Fatalf("after the retry NodeRemoved = %v (err %v), want true", removed, err)
 	}
 }
