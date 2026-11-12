@@ -234,10 +234,38 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 			dstBarrier.DeregisterInFlightEpoch(e)
 		}
 	}()
-	epoch, dstPins, err = copySnapshotAcrossBarriers(src, tmp, shardID, replicaID, index,
+	// When a snapshot.meta will be restamped beside the destination, check
+	// the source against the record it already has FIRST. The restamp hashes
+	// the destination as written, so a source damaged after it was recorded
+	// (a same-length bit flip, invisible to the FileSize check) would come
+	// out carrying a checksum that vouches for the damage, and recovery would
+	// accept state VerifySnapshotArtifact refused. Every byte the copy reads
+	// is teed into the verifier, the rest of the file is drained through it,
+	// and a mismatch fails here, before anything is committed.
+	var srcReader io.Reader = src
+	var srcVerifier *engine.SnapshotDataVerifier
+	if filepath.Base(dstPath) == "snapshot.dat" {
+		srcDir := filepath.Dir(srcPath)
+		if _, err := fsys.Stat(filepath.Join(srcDir, "snapshot.meta")); err == nil {
+			srcVerifier = engine.NewSnapshotDataVerifier(srcDir)
+			srcReader = io.TeeReader(src, srcVerifier)
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return 0, err
+		}
+	}
+
+	epoch, dstPins, err = copySnapshotAcrossBarriers(srcReader, tmp, shardID, replicaID, index,
 		srcBarrier, dstBarrier)
 	if err != nil {
 		return 0, err
+	}
+	if srcVerifier != nil {
+		if _, err := io.Copy(io.Discard, srcReader); err != nil {
+			return 0, err
+		}
+		if err := srcVerifier.Verify(); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := tmp.Sync(); err != nil {
