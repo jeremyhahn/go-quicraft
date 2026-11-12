@@ -8,6 +8,8 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // TestReencryptSnapshotFile_DirFsyncFailureReturnsEpoch pins the
@@ -103,4 +105,69 @@ func epochFromDroppedReturn(cfs *crashFS, srcPath, dstPath string,
 		return notDurable.Epoch
 	}
 	return 0
+}
+
+// TestReencryptSnapshotFile_CrashFSSourceMetaRestamped re-encrypts a source
+// snapshot whose snapshot.data AND snapshot.meta live only in the injected
+// snapshotFS. The source check must read the record through that filesystem:
+// read through os it is missing, the check fails closed, and no fault test can
+// reach the restamp the commit path performs.
+func TestReencryptSnapshotFile_CrashFSSourceMetaRestamped(t *testing.T) {
+	srcBarrier := createTestBarrier(t)
+	dstBarrier := createTestBarrier(t)
+	migrated := bytes.Repeat([]byte("restamped-snapshot-content"), 200)
+
+	root := "/vol"
+	cfs := newCrashFS(root)
+	srcPath := filepath.Join(root, "src", "snapshot.dat")
+	dstPath := filepath.Join(root, "dst", "snapshot.dat")
+	srcData := encryptToBytes(t, srcBarrier, migrated)
+	writeDurableFile(t, cfs, srcPath, srcData)
+	writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
+		reencryptTestSourceMeta(srcData))
+
+	epoch, err := reencryptSnapshotFile(cfs, srcPath, dstPath,
+		testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	if err != nil {
+		t.Fatalf("re-encrypting a valid crashFS-held snapshot failed: %v", err)
+	}
+	stored, ok := cfs.liveBytes(dstPath)
+	if !ok {
+		t.Fatalf("%s is missing after a successful re-encryption", dstPath)
+	}
+	metaBytes, ok := cfs.liveBytes(filepath.Join(root, "dst", "snapshot.meta"))
+	if !ok {
+		t.Fatal("the destination snapshot.meta was not restamped")
+	}
+	meta, err := engine.ParseSnapshotMeta(metaBytes)
+	if err != nil {
+		t.Fatalf("restamped snapshot.meta does not parse: %v", err)
+	}
+	sum, size, _ := engine.HashSnapshotReader(bytes.NewReader(stored))
+	if meta.Epoch != epoch || meta.DataLen != size || meta.DataHash != sum {
+		t.Fatalf("restamped meta = epoch %d len %d hash %x, want epoch %d len %d hash %x",
+			meta.Epoch, meta.DataLen, meta.DataHash, epoch, size, sum)
+	}
+	if meta.Index != testSnapIndex || meta.ShardID != testSnapShardID ||
+		meta.ReplicaID != testSnapReplicaID || meta.Term != reencryptTestTerm {
+		t.Fatalf("restamped meta lost the source identity: %+v", meta)
+	}
+}
+
+// reencryptTestTerm is the term the source snapshot.meta records.
+const reencryptTestTerm = 7
+
+// reencryptTestSourceMeta returns a snapshot.meta record that vouches for
+// srcData as stored.
+func reencryptTestSourceMeta(srcData []byte) []byte {
+	sum, size, _ := engine.HashSnapshotReader(bytes.NewReader(srcData))
+	return engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index:     testSnapIndex,
+		Term:      reencryptTestTerm,
+		ShardID:   testSnapShardID,
+		ReplicaID: testSnapReplicaID,
+		Epoch:     1,
+		DataLen:   size,
+		DataHash:  sum,
+	})
 }
