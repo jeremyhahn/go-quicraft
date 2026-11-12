@@ -30,12 +30,7 @@ import (
 // to wire or remove before v1.0.0. The test fails when an entry becomes
 // live or is no longer declared, so the list cannot go stale.
 var unreferencedExportedErrors = map[string]string{
-	"ErrShardNotStarted":       "listed in temporaryErrors, but no code path in pkg returns it",
-	"ErrSessionLimitExceeded":  "distinct from session.ErrSessionLimitExceeded, which internal/session returns and nothing translates to this value",
-	"ErrTooManySessions":       "legacy alias of ErrSessionLimitExceeded, which is itself never returned",
-	"ErrSessionNotFound":       "distinct from session.ErrSessionNotFound, which internal/session returns and nothing translates to this value",
-	"ErrSessionAlreadyExists":  "distinct from session.ErrSessionAlreadyExists, which internal/session returns and nothing translates to this value",
-	"ErrResponseLimitExceeded": "distinct from session.ErrResponseLimitExceeded, which internal/session returns and nothing translates to this value",
+	"ErrShardNotStarted": "listed in temporaryErrors, but every registered-but-not-started path returns ErrShardNotReady; returning this from one of them would split one state over two errors",
 }
 
 // exportedErrorDecl is one exported Err* value declared in errors.go.
