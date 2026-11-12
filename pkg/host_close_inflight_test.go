@@ -46,9 +46,11 @@ func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
-	closed := false
+	// closeStarted is set before the test's own Close begins, so this
+	// cleanup never calls Close again on a shutdown that has not finished.
+	closeStarted := false
 	defer func() {
-		if !closed {
+		if !closeStarted {
 			_ = h.Close()
 		}
 	}()
@@ -122,11 +124,18 @@ func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	start := time.Now()
-	closeErr := h.Close()
-	closed = true
-	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("Close took %v, want <= 5s", elapsed)
+	// Close runs in a goroutine bounded by a timer, so a shutdown deadlock
+	// fails the test within 5s instead of hanging it until the suite timeout.
+	closeStarted = true
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- h.Close() }()
+	closeTimer := time.NewTimer(5 * time.Second)
+	defer closeTimer.Stop()
+	var closeErr error
+	select {
+	case closeErr = <-closeResult:
+	case <-closeTimer.C:
+		t.Fatal("Close did not return within 5s")
 	}
 	// Drain cannot finish while requests wait on a lost quorum, so
 	// ErrShutdownTimeout is the documented outcome; any other error fails.
