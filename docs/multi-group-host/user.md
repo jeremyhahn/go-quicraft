@@ -266,13 +266,21 @@ decisions most deployments need to make:
 | `MaxTotalSessions` / `MaxSessionsPerOwner` | 16384 / 128 | session caps. Fixed when the shard is created |
 | `NoSyncWAL` | false | never in production: it gives up Raft's durability guarantee |
 
-Witness policy and the four session limits are copied into the shard when it is
-created and then live in the shard itself. Changing them in a node's `Config`
-afterwards has no effect (a differing session limit is logged as a warning when
-the node starts); read what a shard is actually using with
-`ShardMembership`. Witness policy can be changed with
-`SyncRequestUpdateWitnessPolicy`; the session limits cannot be changed after
-creation, so size `MaxTotalSessions` up front.
+Witness policy and the four session settings (`SessionExpiryEntries`,
+`MaxTotalSessions`, `MaxResponsesPerSession` and `MaxSessionsPerOwner`) are
+committed into the shard when it is bootstrapped and then live in the shard
+itself; read what a shard is actually using with `ShardMembership`. Witness
+policy can be changed with `SyncRequestUpdateWitnessPolicy`. The session
+settings cannot be changed after creation, so size `MaxTotalSessions` up front,
+and every replica's `Config` must carry the shard's committed values. A
+restarting replica whose session settings disagree is refused: `StartShard`
+returns `ErrSessionPolicyMismatch`, wrapped with the first disagreeing
+setting's name and both values. A joining replica learns the policy from the
+log or an installed snapshot, so a mismatch there fails the shard with
+`ErrSessionPolicyMismatch` (`ShardFailedInfo.Err`, through `OnShardFailed`).
+To recover, set the node's `Config` back to the shard's committed values and
+start the shard again. A shard bootstrapped before the policy was recorded has
+none to compare against, and each replica applies its own `Config`.
 
 `MaxResponsesPerSession` limits cached responses per session, not the number of
 sessions.
@@ -335,15 +343,23 @@ host, err := quicraft.NewHost(cfg, quicraft.WithBarrier(barrier))
   is returned, not logged, so it does not flood the log. Shards under other,
   unsealed barriers keep serving. Once the barrier is unsealed the same calls
   work again.
-- **The failure latch while sealed.** The refusal covers client calls only.
+- **Replicated writes while sealed.** The refusal covers client calls only.
   Raft keeps running: a follower still persists the entries its leader sends,
   and a leader still persists proposals other replicas forward to it. If such a
-  write lands while the barrier is sealed, its encryption fails and the shard's
-  failure latch trips: the shard halts with `ErrShardFailed`, and
-  `OnShardFailed` fires. **Unsealing does not bring a halted shard back.** Stop
-  and restart the shard (`StopShard`, then `StartShard`) after unsealing. A seal
-  on a shard that receives no replicated writes, for example an idle cluster,
-  does not trip the latch.
+  write reaches the log while the barrier is sealed, the barrier refuses it and
+  the commit worker holds the shard instead of failing it: the write waits,
+  leaving the log as it was before the batch, and is retried when the shard's
+  barrier is unsealed. The shard then carries on by itself; `OnShardFailed`
+  does not fire and nothing needs a restart. Only the sealed refusal is held:
+  a write that also hits a disk fault (a failed fsync, a poisoned log, a
+  rollback that did not complete) still fails the shard.
+- **Planned seal.** To seal a running shard with no log, apply or snapshot work
+  in flight, call `host.PauseShard(ctx, shardID)`, seal the barrier once it
+  returns, unseal it, then call `host.ResumeShard(ctx, shardID)`. A paused
+  replica refuses client calls with `ErrShardPaused` (`Temporary`), hands off
+  leadership if it is the leader, and neither votes nor replicates; after
+  `ResumeShard` it rejoins as a follower and applies what was committed
+  meanwhile. A pause is not persisted: a restarted replica starts unpaused.
 - **Per-tenant keys.** `WithShardBarriers` gives each shard its own barrier. The
   default WAL is still encrypted under the host-wide barrier, so for per-tenant
   log keys you need a LogDB that supports them, such as a multiplexing LogDB
@@ -600,7 +616,8 @@ limit, so a state machine that blocks in `Update` blocks shutdown.
 | `StartShard` returns `ErrShardBarrierLogDBMismatch` | the LogDB holds this shard under a different barrier than your resolver returned; return the same pointer the LogDB was given |
 | `StartShard` returns `ErrBarrierSealed` | the shard's resolved barrier is sealed; unseal it before starting the shard |
 | `Propose`, a read or another client call returns `ErrBarrierSealed` | the shard's barrier is sealed; unseal it and retry |
-| `ErrShardFailed` after an unseal, log shows `WAL record encryption failed: ... barrier is sealed` | a replicated write reached the log while sealed and tripped the failure latch; restart the shard |
+| A shard stops making progress while its barrier is sealed | a replicated write reached the log while sealed and is held; unseal the barrier and the shard resumes by itself |
+| `StartShard` returns `ErrSessionPolicyMismatch` | this node's session settings differ from the shard's committed policy (the error names the setting and both values); set the `Config` back to the committed values |
 | `NewHost` fails validation on `MTLSConfig` | the transport needs a CA, certificate and key |
 | `StartShard` or a membership add returns `ErrSharedPeerCertificate` | a node's certificate also covers another member's host; issue one certificate per node |
 | `StartShard` returns `*InvalidMemberError` about identities | `MemberIdentities` is missing a member, binds one identity twice, names no other replica on a join, or contradicts the shard's recorded identities |
