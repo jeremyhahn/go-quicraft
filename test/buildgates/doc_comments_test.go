@@ -199,7 +199,13 @@ func undocumentedDecls(fset *token.FileSet, rel string, file *ast.File) []docGap
 			}
 			add(d.Pos(), "method "+recv+"."+d.Name.Name)
 		case *ast.GenDecl:
-			if d.Tok == token.IMPORT || d.Doc != nil {
+			if d.Tok == token.IMPORT {
+				continue
+			}
+			// A group doc covers a const or var group and a standalone
+			// type; each type in a grouped type block needs its own.
+			grouped := d.Tok == token.TYPE && d.Lparen.IsValid()
+			if d.Doc != nil && !grouped {
 				continue
 			}
 			for _, spec := range d.Specs {
