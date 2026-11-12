@@ -11269,13 +11269,18 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 		return err
 	}
 
-	// Record the removal intent BEFORE anything is retired or deleted: once
-	// RemoveNodeData drops the bootstrap record, the intent is what still
-	// locates the snapshot directory for a retry after a failure or crash.
+	// Record the removal intent, durably, BEFORE anything is retired or
+	// deleted: once RemoveNodeData drops the bootstrap record, the intent is
+	// what still locates the snapshot directory for a retry after a failure
+	// or crash. A pending intent was published by an earlier call whose
+	// directory sync may have failed, so it is synced again here; a failed
+	// sync returns with the replica unretired.
 	if !intentPending {
 		if err := h.writeRemoveDataIntent(shardID, replicaID, snapDir); err != nil {
 			return err
 		}
+	} else if err := syncRemoveDataIntentDir(h.snapshotFsys(), h.cfg.NodeHostDir); err != nil {
+		return err
 	}
 
 	// Retire the replica BEFORE its snapshots are deleted. An unretired
@@ -11492,14 +11497,11 @@ func (h *Host) readRemoveDataIntent(shardID, replicaID uint64) (string, bool, er
 
 // writeRemoveDataIntent durably records that the replica's snapshot
 // directory snapDir is being removed: a temporary file in the intent
-// directory, written and synced, renamed into place, and the directory synced.
+// directory, written and synced, renamed into place, and then the intent
+// directory and NodeHostDir synced (syncRemoveDataIntentDir).
 func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) error {
 	fsys := h.snapshotFsys()
 	dir := filepath.Join(h.cfg.NodeHostDir, removeDataIntentDir)
-	// The deepest existing ancestor before MkdirAll bounds the directory
-	// chain synced after the rename: every directory MkdirAll creates must
-	// be durable in its parent, or a power loss loses the intent with it.
-	stop := fsutil.DeepestExistingAncestorWith(fsys.Stat, dir)
 	if err := fsys.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create removal intent directory %s: %w", dir, err)
 	}
@@ -11527,8 +11529,22 @@ func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) 
 		_ = fsys.Remove(tmpPath)
 		return fmt.Errorf("publish removal intent %s: %w", p, err)
 	}
-	if err := syncDirChain(fsys, dir, stop); err != nil {
+	return syncRemoveDataIntentDir(fsys, h.cfg.NodeHostDir)
+}
+
+// syncRemoveDataIntentDir makes the removal intents under nodeHostDir
+// durable: it syncs the intent directory, which holds each intent's entry,
+// and then nodeHostDir, which holds the intent directory's entry. Both are
+// synced on every call, whichever of them existed before, so neither a
+// rewrite after the directory was created nor a retry from a pending intent
+// relies on an earlier sync that may have failed.
+func syncRemoveDataIntentDir(fsys snapshotFS, nodeHostDir string) error {
+	dir := filepath.Join(nodeHostDir, removeDataIntentDir)
+	if err := syncDir(fsys, dir); err != nil {
 		return fmt.Errorf("sync removal intent directory %s: %w", dir, err)
+	}
+	if err := syncDir(fsys, nodeHostDir); err != nil {
+		return fmt.Errorf("sync removal intent parent directory %s: %w", nodeHostDir, err)
 	}
 	return nil
 }
