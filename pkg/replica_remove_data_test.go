@@ -21,6 +21,7 @@ import (
 // own on-disk WAL, running one shard.
 type removeDataCluster struct {
 	t     *testing.T
+	ca    *testpki.CA
 	hosts []*Host
 	cfgs  []config.HostConfig
 	addrs []string
@@ -32,7 +33,7 @@ func newRemoveDataCluster(t *testing.T) *removeDataCluster {
 	t.Helper()
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, 3)
-	c := &removeDataCluster{t: t}
+	c := &removeDataCluster{t: t, ca: ca}
 	for i := range 3 {
 		addr := netport.MustReserveUDP(t.Fatalf)
 		cfg := testHostConfig(t)
@@ -260,16 +261,43 @@ func TestSyncRemoveData_RefusesRunningRemovesStoppedReplica(t *testing.T) {
 		t.Fatalf("restart of a removed replica under its old ID = %v, want ErrReplicaRetired", err)
 	}
 
-	// It rejoins under a new ID on the same host and catches up.
+	// It rejoins under a new ID from the same address and data directory and
+	// catches up. The removed replica's key is tombstoned by the shard
+	// (raft.ErrRemovedMemberIdentity), so the host restarts with a new one.
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := c.hosts[c.leader(live)].SyncRequestRemoveNode(ctx, removeDataShard, fid, 0); err != nil {
 		t.Fatalf("SyncRequestRemoveNode(%d): %v", fid, err)
 	}
+	if err := fh.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	rcfg := c.cfgs[f]
+	rcfg.TransportConfig.MTLSConfig = c.ca.Leaves(t, 1)[0]
+	fh, err = NewHost(rcfg, WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost(rejoin): %v", err)
+	}
+	t.Cleanup(func() { _ = fh.Close() })
+	c.hosts[f] = fh
 	newID := uint64(4)
-	if err := c.hosts[c.leader(live)].SyncRequestAddNodeWithIdentity(ctx, removeDataShard, newID,
-		c.addrs[f], fh.NodeIdentity(), 0); err != nil {
-		t.Fatalf("SyncRequestAddNodeWithIdentity(%d): %v", newID, err)
+	// The removal can move leadership while the add is in flight; a
+	// not-leader refusal may still commit, so retry until it is a member.
+	for {
+		lh := c.hosts[c.leader(live)]
+		err := lh.SyncRequestAddNodeWithIdentity(ctx, removeDataShard, newID, c.addrs[f], fh.NodeIdentity(), 0)
+		if err == nil {
+			break
+		}
+		if m, mErr := lh.SyncGetShardMembership(ctx, removeDataShard); mErr == nil {
+			if _, ok := m.Nodes[newID]; ok {
+				break
+			}
+		}
+		if !errors.Is(err, ErrNotLeader) || ctx.Err() != nil {
+			t.Fatalf("SyncRequestAddNodeWithIdentity(%d): %v", newID, err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	rejoin := testShardConfig(removeDataShard, newID)
 	rejoin.MemberIdentities = map[uint64]string{newID: fh.NodeIdentity()}
