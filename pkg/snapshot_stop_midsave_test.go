@@ -49,6 +49,7 @@ type midSaveGate struct {
 	enterOnce     sync.Once
 	returnOnce    sync.Once
 	stopperOnce   sync.Once
+	releaseOnce   sync.Once
 }
 
 func newMidSaveGate() *midSaveGate {
@@ -58,6 +59,12 @@ func newMidSaveGate() *midSaveGate {
 		returned:      make(chan struct{}),
 		stopperClosed: make(chan struct{}),
 	}
+}
+
+// releaseSave unblocks the gated save. It is idempotent, so every cleanup
+// path may call it.
+func (g *midSaveGate) releaseSave() {
+	g.releaseOnce.Do(func() { close(g.release) })
 }
 
 // midSaveState is the state machine's whole state: how many entries it has
@@ -152,7 +159,29 @@ type midSaveFixture struct {
 func newMidSaveFixture(t *testing.T) *midSaveFixture {
 	t.Helper()
 	cfg := testHostConfig(t)
-	return &midSaveFixture{cfg: cfg, gate: newMidSaveGate()}
+	f := &midSaveFixture{cfg: cfg, gate: newMidSaveGate()}
+	// A failed step must never leave the save blocked: engine.Stop joins
+	// the snapshot worker, so an unreleased save would hang Close.
+	t.Cleanup(f.gate.releaseSave)
+	return f
+}
+
+// closeHost releases the gated save and closes h, failing the test if Close
+// does not return within midSaveStep. It releases the save itself, so the
+// order of cleanups does not matter.
+func (f *midSaveFixture) closeHost(t *testing.T, h *Host) {
+	t.Helper()
+	f.gate.releaseSave()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = h.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(midSaveStep):
+		t.Errorf("Host.Close did not return within %v", midSaveStep)
+	}
 }
 
 func (f *midSaveFixture) openHost(t *testing.T) *Host {
@@ -239,7 +268,7 @@ func (f *midSaveFixture) stopDuringSave(t *testing.T, what string, stop func() e
 	case <-time.After(midSaveStep):
 		t.Fatalf("%s did not close the blocked save's stopper within %v", what, midSaveStep)
 	}
-	close(f.gate.release)
+	f.gate.releaseSave()
 	var stopErr error
 	select {
 	case stopErr = <-done:
@@ -368,7 +397,7 @@ func (f *midSaveFixture) assertRestartedCleanly(t *testing.T, h *Host) {
 func TestMidSave_StopShardLeavesNoPartialSnapshot(t *testing.T) {
 	f := newMidSaveFixture(t)
 	h := f.openHost(t)
-	defer func() { _ = h.Close() }()
+	defer f.closeHost(t, h)
 	f.startShard(t, h)
 	f.readState(t, h)
 	f.propose(t, h, 5)
@@ -390,6 +419,9 @@ func TestMidSave_StopShardLeavesNoPartialSnapshot(t *testing.T) {
 func TestMidSave_HostCloseLeavesNoPartialSnapshot(t *testing.T) {
 	f := newMidSaveFixture(t)
 	h := f.openHost(t)
+	// Bounds h's cleanup if a step fails before or during the Close under
+	// test; on success this second Close returns at once.
+	defer f.closeHost(t, h)
 	f.startShard(t, h)
 	f.readState(t, h)
 	f.propose(t, h, 5)
@@ -404,7 +436,7 @@ func TestMidSave_HostCloseLeavesNoPartialSnapshot(t *testing.T) {
 	assertNoPartialSnapshot(t, f.cfg.NodeHostDir)
 
 	h2 := f.openHost(t)
-	defer func() { _ = h2.Close() }()
+	defer f.closeHost(t, h2)
 	f.startShard(t, h2)
 	f.assertRestartedCleanly(t, h2)
 }
