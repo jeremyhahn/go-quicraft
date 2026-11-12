@@ -120,12 +120,39 @@ func (c *removeReaddCluster) propose(tag string) {
 	c.t.Fatalf("proposal %q never committed: %v", tag, lastErr)
 }
 
-func (c *removeReaddCluster) lastApplied(replicaID uint64) uint64 {
+func (c *removeReaddCluster) lastApplied(replicaID uint64) (uint64, error) {
 	info, err := c.hosts[replicaID-1].ShardInfo(removeReaddShard)
 	if err != nil {
-		return 0
+		return 0, err
 	}
-	return info.LastApplied
+	return info.LastApplied, nil
+}
+
+// mustLastApplied returns replicaID's LastApplied and fails the test on any
+// ShardInfo error.
+func (c *removeReaddCluster) mustLastApplied(replicaID uint64) uint64 {
+	c.t.Helper()
+	got, err := c.lastApplied(replicaID)
+	if err != nil {
+		c.t.Fatalf("ShardInfo(replica %d): %v", replicaID, err)
+	}
+	return got
+}
+
+// checkRemovedNotPast fails the test unless the removed replica reports a
+// LastApplied at or below removalApplied, or ErrShardNotFound because its
+// node has stopped.
+func (c *removeReaddCluster) checkRemovedNotPast(removed, removalApplied uint64, when string) {
+	c.t.Helper()
+	got, err := c.lastApplied(removed)
+	switch {
+	case errors.Is(err, ErrShardNotFound):
+	case err != nil:
+		c.t.Fatalf("ShardInfo(removed replica %d) %s: %v", removed, when, err)
+	case got > removalApplied:
+		c.t.Fatalf("removed replica %d applied index %d %s, past the removal at %d",
+			removed, got, when, removalApplied)
+	}
 }
 
 func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *testing.T) {
@@ -136,6 +163,20 @@ func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *test
 
 	leaderID, lh := c.leader()
 	removed := leaderID%3 + 1 // a follower
+
+	// The initial proposals commit on two of three replicas, so the chosen
+	// follower may not have applied anything yet: wait until it has caught up
+	// with the leader, so a stalled follower cannot pass the later
+	// upper-bound checks at LastApplied 0.
+	beforeRemoval := c.mustLastApplied(leaderID)
+	if beforeRemoval == 0 {
+		t.Fatalf("leader %d has applied nothing after the initial proposals", leaderID)
+	}
+	if !waitUntil(10*time.Second, func() bool {
+		return c.mustLastApplied(removed) >= beforeRemoval
+	}) {
+		t.Fatalf("follower %d did not apply up to %d before its removal", removed, beforeRemoval)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -158,7 +199,7 @@ func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *test
 	}
 	// The linearizable read applied everything up to the removal on the
 	// leader; the removed replica may apply at most that far.
-	removalApplied := c.lastApplied(leaderID)
+	removalApplied := c.mustLastApplied(leaderID)
 
 	for i := range 3 {
 		c.propose(fmt.Sprintf("between-%d", i))
@@ -171,7 +212,7 @@ func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *test
 	}
 	if !waitUntil(10*time.Second, func() bool {
 		for _, id := range survivors {
-			if c.lastApplied(id) <= removalApplied {
+			if c.mustLastApplied(id) <= removalApplied {
 				return false
 			}
 		}
@@ -179,9 +220,7 @@ func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *test
 	}) {
 		t.Fatalf("the remaining replicas did not apply past the removal at %d", removalApplied)
 	}
-	if got := c.lastApplied(removed); got > removalApplied {
-		t.Fatalf("removed replica %d applied index %d, past the removal at %d", removed, got, removalApplied)
-	}
+	c.checkRemovedNotPast(removed, removalApplied, "while the survivors advanced")
 
 	_, lh = c.leader()
 	err = lh.SyncRequestAddNode(ctx, removeReaddShard, removed, c.addrs[removed], 0)
@@ -199,8 +238,5 @@ func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *test
 	for i := range 3 {
 		c.propose(fmt.Sprintf("after-%d", i))
 	}
-	if got := c.lastApplied(removed); got > removalApplied {
-		t.Fatalf("removed replica %d applied index %d after the refused add, past the removal at %d",
-			removed, got, removalApplied)
-	}
+	c.checkRemovedNotPast(removed, removalApplied, "after the refused add")
 }
