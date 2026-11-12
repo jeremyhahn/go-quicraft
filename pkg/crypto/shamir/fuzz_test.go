@@ -137,7 +137,7 @@ func FuzzUnmarshalShareSet(f *testing.F) {
 }
 
 // FuzzUnmarshalShareSetWith decodes through a real enclave allocator whose
-// budget, one to eight pages, comes from the fuzz input, so budgets too small
+// budget, zero to eight pages, comes from the fuzz input, so budgets too small
 // for the set are fuzzed alongside ones that fit. On every input: no panic; a
 // refusal returns no shares and leaves no reservation behind; an accepted set
 // stays within the budget and round-trips; destroying it releases every
@@ -150,12 +150,19 @@ func FuzzUnmarshalShareSetWith(f *testing.F) {
 		}
 	}
 	f.Fuzz(func(t *testing.T, data []byte, pages uint8) {
-		limit := (int64(pages%8) + 1) * pageBytes()
-		a, err := enclave.NewAllocator(limit)
+		a, err := enclave.NewAllocator(8 * pageBytes())
 		if err != nil {
-			t.Fatalf("NewAllocator(%d): %v", limit, err)
+			t.Fatalf("NewAllocator(%d): %v", 8*pageBytes(), err)
+		}
+		limit := int64(pages%9) * pageBytes()
+		if err := a.SetLimit(limit); err != nil {
+			t.Fatalf("SetLimit(%d): %v", limit, err)
 		}
 		shares, err := UnmarshalShareSetWith(a, data)
+		if limit == 0 && err == nil {
+			destroyAll(shares)
+			t.Fatalf("decode with no admission headroom accepted %d shares", len(shares))
+		}
 		if err != nil {
 			if shares != nil {
 				destroyAll(shares)
