@@ -18,7 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -40,7 +40,8 @@ import (
 // case, the three client calls and the error class.
 func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 	const callers = 64
-	baseline := runtime.NumGoroutine()
+	self := currentGoroutineID()
+	before := goroutineStacks()
 
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -171,13 +172,8 @@ func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 	// No goroutine outlives the host.
 	cancel()
 	addCancel()
-	leakDeadline := time.Now().Add(5 * time.Second)
-	for runtime.NumGoroutine() > baseline {
-		if time.Now().After(leakDeadline) {
-			buf := make([]byte, 1<<16)
-			n := runtime.Stack(buf, true)
-			t.Fatalf("goroutines = %d after Close, baseline %d:\n%s", runtime.NumGoroutine(), baseline, buf[:n])
-		}
-		time.Sleep(10 * time.Millisecond)
+	if leaked := leakedModuleGoroutines(before, self, goroutineLeakWait); len(leaked) != 0 {
+		t.Fatalf("%d goroutine(s) started during the test still running %v after Close:\n\n%s",
+			len(leaked), goroutineLeakWait, strings.Join(leaked, "\n\n"))
 	}
 }
