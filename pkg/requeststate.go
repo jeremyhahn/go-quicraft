@@ -38,6 +38,19 @@ var timerPool = sync.Pool{
 
 // acquireTimer gets a timer from the pool and resets it to fire after d.
 // The returned timer must be returned via releaseTimer after use.
+// Stages at which tryRecycle calls testHookTryRecycle: on entry, and once
+// it has decided the request may be recycled, just before it claims the
+// return to the pool.
+const (
+	recycleStageEnter = iota
+	recycleStageDecide
+)
+
+// testHookTryRecycle, when set by a test, is called by tryRecycle at each
+// recycleStage. Tests use it to interleave a Release and a reuse of the
+// object with a recycle in progress. Nil outside tests.
+var testHookTryRecycle func(rs *RequestState, stage int)
+
 func acquireTimer(d time.Duration) *time.Timer {
 	t := timerPool.Get().(*time.Timer)
 	// Drain any stale tick that may have fired before the previous Stop.
@@ -424,8 +437,14 @@ func (rs *RequestState) tryAcquireRef() bool {
 // recycled CAS ensures a single pool.Put even when Release and the final
 // releaseRef race.
 func (rs *RequestState) tryRecycle() {
+	if h := testHookTryRecycle; h != nil {
+		h(rs, recycleStageEnter)
+	}
 	if !rs.released.Load() {
 		return
+	}
+	if h := testHookTryRecycle; h != nil {
+		h(rs, recycleStageDecide)
 	}
 	if rs.outstanding.Load() != 0 {
 		return
