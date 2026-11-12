@@ -129,53 +129,67 @@ func TestForwardedRead_RefusedUnderCommitPending_IsAnswered(t *testing.T) {
 		return l == leader
 	})
 
-	// Hold the leader in commitPending. A hand-off in flight when the flag is
-	// raised clears it on completion, so raise it until it stays up; once it
-	// does, processReady skips the leader and nothing else lowers it.
+	// Hold the leader in commitPending and deliver the read under the hold.
+	// The flag is the step worker's hand-off ownership: a hand-off in flight
+	// lowers it when it completes (with nothing committed, commitBatchItem's
+	// no-piggyback path), and the step worker may have passed processReady's
+	// check just before the flag was raised here, so the hand-off it is about
+	// to make lowers it later — under -race and coverage, well past any fixed
+	// window. No signal reports that no hand-off is in flight, so each attempt
+	// claims the flag only from an unowned state and holds it until the
+	// refusal is answered; an attempt whose flag was lowered by someone else
+	// proves nothing about the path its read took and is retried with a fresh
+	// read. Once the flag stays raised, processReady skips the leader and
+	// nothing else lowers it.
 	t.Cleanup(func() {
 		lnode.commitPending.Store(false)
 		c.replicas[leader].engine.NotifyWork(shardID)
 	})
-	held := false
-	for range 100 {
-		lnode.commitPending.Store(true)
-		// Kept: the window is the check; the flag must stay raised through it, which no signal reports.
+	const baseKey = 0x376
+	answered := false
+	for attempt := range uint64(20) {
+		waitFor(t, 10*time.Second, time.Millisecond, "fixture: the leader's hand-offs never left commitPending unowned", func() bool {
+			return lnode.commitPending.CompareAndSwap(false, true)
+		})
+		// Kept: a window in which an in-flight hand-off usually completes, so
+		// most attempts that do not own the flag are discarded before a read.
 		time.Sleep(50 * time.Millisecond)
+		if !lnode.commitPending.Load() {
+			continue
+		}
+		if got := lnode.CommittedIndex(); got != 0 {
+			t.Fatalf("fixture: the leader committed index %d with every Replicate dropped", got)
+		}
+
+		// Delivered to the leader as the transport would: a follower that has
+		// not seen the term commit refuses its own reads locally, so the
+		// leader's refusal is reached by a read relayed across a leader change.
+		_, term := lnode.LeaderAndTerm()
+		key := baseKey + attempt
+		if !c.replicas[leader].engine.DeliverMessage(shardID, proto.Message{
+			Type:    proto.ReadIndex,
+			ShardID: shardID,
+			From:    follower,
+			To:      leader,
+			Term:    term,
+			Hint:    key,
+		}) {
+			t.Fatal("DeliverMessage(ReadIndex) refused")
+		}
+		c.replicas[leader].engine.NotifyWork(shardID)
+
+		if err := awaitReadFailure(t, cbs[follower], key); !errors.Is(err, raft.ErrReadIndexNotReady) {
+			t.Fatalf("read failed with %v, want ErrReadIndexNotReady", err)
+		}
 		if lnode.commitPending.Load() {
-			held = true
+			answered = true
 			break
 		}
+		// The flag was lowered by a hand-off this attempt did not own; the
+		// reject may have gone out through processReady. Try again.
 	}
-	if !held {
-		t.Fatal("fixture: the leader's commitPending would not stay raised")
-	}
-	if got := lnode.CommittedIndex(); got != 0 {
-		t.Fatalf("fixture: the leader committed index %d with every Replicate dropped", got)
-	}
-
-	// Delivered to the leader as the transport would: a follower that has not
-	// seen the term commit refuses its own reads locally, so the leader's
-	// refusal is reached by a read relayed across a leader change.
-	_, term := lnode.LeaderAndTerm()
-	const key = 0x376
-	if !c.replicas[leader].engine.DeliverMessage(shardID, proto.Message{
-		Type:    proto.ReadIndex,
-		ShardID: shardID,
-		From:    follower,
-		To:      leader,
-		Term:    term,
-		Hint:    key,
-	}) {
-		t.Fatal("DeliverMessage(ReadIndex) refused")
-	}
-	c.replicas[leader].engine.NotifyWork(shardID)
-
-	if err := awaitReadFailure(t, cbs[follower], key); !errors.Is(err, raft.ErrReadIndexNotReady) {
-		t.Fatalf("read failed with %v, want ErrReadIndexNotReady", err)
-	}
-	if !lnode.commitPending.Load() {
-		t.Fatal("fixture: the leader left commitPending before the refusal arrived; " +
-			"the reject may have gone out through processReady instead")
+	if !answered {
+		t.Fatal("fixture: no attempt held the leader in commitPending until the refusal arrived")
 	}
 	if got := lnode.CommittedIndex(); got != 0 {
 		t.Fatalf("the leader committed index %d while held; the refusal proves nothing", got)
