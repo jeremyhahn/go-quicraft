@@ -11191,11 +11191,16 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	snapDir := engine.ReplicaSnapshotDir(
 		shardSnapshotBaseDir(h.cfg.NodeHostDir, dataDir, shardID), shardID, replicaID)
 
-	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
-		return err
-	}
+	// Remove the snapshot directory BEFORE RemoveNodeData retires the
+	// replica and drops its bootstrap record: a RemoveAll error or a crash
+	// between the two then leaves the record in place, so a retry resolves
+	// the same directory. RemoveAll of a missing directory is nil, so the
+	// retry is idempotent.
 	if err := h.snapshotFsys().RemoveAll(snapDir); err != nil {
 		return fmt.Errorf("remove snapshot directory %s: %w", snapDir, err)
+	}
+	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
+		return err
 	}
 
 	// Fire OnNodeDeleted after successfully removing node data.
