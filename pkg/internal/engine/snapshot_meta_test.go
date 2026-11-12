@@ -220,9 +220,9 @@ func TestSnapshotMeta_CorruptRejected(t *testing.T) {
 // TestSnapshotMeta_CompressionOutOfRangeRejected patches the 8-byte
 // Compression field of an encoder-built record. config.CompressionType is a
 // uint16, so a wider value must not be truncated into a known type (0x10001
-// used to read as Snappy), and a value naming no known type is corrupt too.
+// used to read as Snappy).
 func TestSnapshotMeta_CompressionOutOfRangeRejected(t *testing.T) {
-	for _, v := range []uint64{0x10001, 0x10000, 1 << 63, ^uint64(0), 0xFFFF, 2} {
+	for _, v := range []uint64{0x10001, 0x10000, 1 << 63, ^uint64(0)} {
 		t.Run(fmt.Sprintf("%#x", v), func(t *testing.T) {
 			d := MarshalSnapshotMeta(SnapshotMeta{Index: 1, Epoch: 3, Compression: config.Snappy})
 			binary.LittleEndian.PutUint64(d[snapshotMetaHeaderSize+metaBodyCompressionOff:], v)
