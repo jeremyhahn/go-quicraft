@@ -154,11 +154,15 @@ func TestInstallVerdict_StopOrFailAnswersEveryWaitOnce(t *testing.T) {
 				chans[i] = node.AwaitInstallVerdict(index)
 			}
 			tt.end(node)
+			// The first termination path alone answers every wait, before
+			// any other path runs that could supply a missing verdict.
+			for _, ch := range chans {
+				requireInstallOutcome(ctx, t, ch, InstallAbandoned, "wait")
+			}
 			// A second stop or fail must not answer anything again.
 			node.Stop()
 			node.markFailed()
 			for i, ch := range chans {
-				requireInstallOutcome(ctx, t, ch, InstallAbandoned, "wait")
 				requireNoInstallVerdict(ctx, t, ch, "wait after abandon")
 				// A late signal for the index reaches no one.
 				node.signalInstallVerdict(indexes[i], InstallVerdict{Outcome: InstallAdopted})
