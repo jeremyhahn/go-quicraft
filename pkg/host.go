@@ -9779,6 +9779,9 @@ func (h *Host) NodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 // Used for debugging pipeline stalls. The snapshot gates that can also stall
 // a shard are reported by DiagShardGates.
 func (h *Host) DiagPipelineState(shardID uint64) (PipelineDiag, error) {
+	if h.closed.Load() {
+		return PipelineDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return PipelineDiag{}, ErrShardNotReady
@@ -9817,6 +9820,9 @@ func (h *Host) DiagPipelineState(shardID uint64) (PipelineDiag, error) {
 // See ShardGatesDiag for what each gate means. Both states are also surfaced
 // through ShardInfo.Health as ShardRecovering and ShardSnapshotting.
 func (h *Host) DiagShardGates(shardID uint64) (ShardGatesDiag, error) {
+	if h.closed.Load() {
+		return ShardGatesDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return ShardGatesDiag{}, ErrShardNotReady
@@ -9832,6 +9838,9 @@ func (h *Host) DiagShardGates(shardID uint64) (ShardGatesDiag, error) {
 // DiagRaftState returns diagnostic raft state for the given shard.
 // Used for debugging pipeline stalls.
 func (h *Host) DiagRaftState(shardID uint64) (RaftStateDiag, error) {
+	if h.closed.Load() {
+		return RaftStateDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return RaftStateDiag{}, ErrShardNotReady
@@ -9849,6 +9858,9 @@ func (h *Host) DiagRaftState(shardID uint64) (RaftStateDiag, error) {
 
 // DiagRemotes returns diagnostic remote state for debugging commit stalls.
 func (h *Host) DiagRemotes(shardID uint64) (RemotesDiag, error) {
+	if h.closed.Load() {
+		return RemotesDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return RemotesDiag{}, ErrShardNotReady
