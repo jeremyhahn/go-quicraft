@@ -17,6 +17,7 @@ package supervise
 import (
 	"context"
 	"log/slog"
+	"math"
 	"runtime"
 	"testing"
 	"time"
@@ -73,6 +74,39 @@ func awaitIdle(t *testing.T, want int) {
 // are dropped and counted, no goroutine is started per record, and the worker
 // drains its queue and exits once the handler is released.
 func TestLogContained_BlockingHandlerIsBounded(t *testing.T) {
+	assertBlockingHandlerBounded(t)
+}
+
+// TestLogContained_BoundHoldsWithDiagnosticsInFlight starts the bound check
+// while an earlier test's diagnostics are still on the worker: one held in a
+// slow handler and one queued, as RunEach and RunResilient leave them. The
+// check must not count them against the bound (seen at -count=20).
+func TestLogContained_BoundHoldsWithDiagnosticsInFlight(t *testing.T) {
+	prev := slog.Default()
+	inHandler := make(chan struct{}, 1)
+	slog.SetDefault(slog.New(hostileHandler{act: func() {
+		select {
+		case inHandler <- struct{}{}:
+		default:
+		}
+		time.Sleep(200 * time.Millisecond)
+	}}))
+	LogContained(func() { slog.Error("in flight") })
+	await(t, inHandler, "the in-flight diagnostic never reached its handler")
+	LogContained(func() { slog.Error("queued") })
+	slog.SetDefault(prev)
+	assertBlockingHandlerBounded(t)
+}
+
+// assertBlockingHandlerBounded checks that a blocked slog handler neither
+// blocks LogContained's callers nor grows goroutines, and drops exactly the
+// records the queue cannot hold.
+func assertBlockingHandlerBounded(t *testing.T) {
+	t.Helper()
+	// The bound is counted from an empty queue and an idle worker: records
+	// an earlier test left on the shared worker would take queue slots and
+	// show as drops of this check's own records.
+	awaitIdle(t, math.MaxInt)
 	baseline := runtime.NumGoroutine()
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)

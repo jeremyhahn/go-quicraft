@@ -1788,7 +1788,7 @@ func (p *Peer) RequestLeaderTransfer(target uint64) error {
 //
 // Checks are ordered cheapest-first: slice length and field comparisons
 // before entriesToSave() which requires arithmetic on inmem indices.
-func (p *Peer) HasUpdate(_ uint64) bool {
+func (p *Peer) HasUpdate(lastApplied uint64) bool {
 	if len(p.r.msgs) > 0 {
 		return true
 	}
@@ -1807,7 +1807,26 @@ func (p *Peer) HasUpdate(_ uint64) bool {
 	if len(p.r.log.entriesToSave()) > 0 {
 		return true
 	}
-	return false
+	// Applied entries still held in memory: without an update nothing
+	// carries lastApplied to appliedLogTo, the last applied batch would stay
+	// counted against MaxInMemLogSize, and an idle shard past its limit
+	// would refuse proposals forever.
+	return p.appliedReleasePending(lastApplied)
+}
+
+// appliedReleasePending reports whether the in-memory log still holds
+// entries at or below lastApplied that appliedLogTo would release.
+func (p *Peer) appliedReleasePending(lastApplied uint64) bool {
+	l := p.r.log
+	if lastApplied == 0 || lastApplied > l.committed || lastApplied > l.processed {
+		return false
+	}
+	// The same bounds appliedLogTo checks before it releases anything.
+	im := &l.inmem
+	if len(im.entries) == 0 || lastApplied < im.markerIndex {
+		return false
+	}
+	return lastApplied <= im.entries[len(im.entries)-1].Index
 }
 
 // GetUpdate collects the current state changes into an Update for the
@@ -1890,6 +1909,12 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 		len(update.EntriesToSave) == 0 &&
 		len(update.CommittedEntries) == 0 &&
 		update.Snapshot.Index == 0
+	// A ReadOnly update is never committed, so Commit never releases the
+	// applied entries it reports; release them here or HasUpdate would keep
+	// returning true for them.
+	if update.ReadOnly && p.appliedReleasePending(lastApplied) {
+		p.r.log.inmem.appliedLogTo(lastApplied)
+	}
 
 	// Update previous state for next diff and sync the atomic leaderID. The
 	// re-persist demand is satisfied by THIS update: it is not ReadOnly, so it

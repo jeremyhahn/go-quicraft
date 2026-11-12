@@ -196,3 +196,62 @@ func TestHostGoroutineLeak_DetectsPlantedLeak(t *testing.T) {
 			len(leaked), strings.Join(leaked, "\n\n"))
 	}
 }
+
+// baselineExitBlock is a module goroutine present when the baseline is
+// taken: it reports its goroutine ID, then blocks until release is closed.
+func baselineExitBlock(id chan<- string, release <-chan struct{}) {
+	id <- currentGoroutineID()
+	<-release
+}
+
+// TestHostGoroutineLeak_DetectsPlantedLeakWhileBaselineExits shows the
+// identity check catches a leak that a goroutine count would miss: one
+// baseline goroutine exits while one new goroutine leaks, so the count is
+// unchanged, but the check reports exactly the planted goroutine.
+func TestHostGoroutineLeak_DetectsPlantedLeakWhileBaselineExits(t *testing.T) {
+	self := currentGoroutineID()
+
+	idCh := make(chan string, 1)
+	releaseBaseline := make(chan struct{})
+	baselineReleased := false
+	defer func() {
+		if !baselineReleased {
+			close(releaseBaseline)
+		}
+	}()
+	go baselineExitBlock(idCh, releaseBaseline)
+	baselineID := <-idCh
+
+	before := goroutineStacks()
+	if _, ok := before[baselineID]; !ok {
+		t.Fatalf("baseline goroutine %q missing from the baseline stacks", baselineID)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	go plantedLeakBlock(started, release)
+	<-started
+
+	baselineReleased = true
+	close(releaseBaseline)
+	deadline := time.Now().Add(goroutineLeakWait)
+	for {
+		if _, ok := goroutineStacks()[baselineID]; !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("baseline goroutine %q still running %v after release", baselineID, goroutineLeakWait)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	leaked := leakedModuleGoroutines(before, self, 100*time.Millisecond)
+	if len(leaked) != 1 {
+		t.Fatalf("leak check reported %d goroutine(s), want exactly the planted one:\n\n%s",
+			len(leaked), strings.Join(leaked, "\n\n"))
+	}
+	if !strings.Contains(leaked[0], "plantedLeakBlock") {
+		t.Fatalf("leak check reported a goroutine that is not the planted one:\n\n%s", leaked[0])
+	}
+}
