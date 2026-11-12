@@ -1,7 +1,7 @@
 # Write Batching — Architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-13
+> Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
