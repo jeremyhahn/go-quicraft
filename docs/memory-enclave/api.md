@@ -1,6 +1,6 @@
 # Memory enclave: API
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-13
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 ## Transport coverage
@@ -22,7 +22,7 @@ feature exists to prevent.
 
 ## Go API
 
-Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.9.0-alpha).
+Import: `github.com/jeremyhahn/go-enclave` (go-quicraft requires v0.11.1-alpha).
 
 All of the surface belongs to go-enclave. go-quicraft declares no
 protected-memory type, alias or wrapper, and re-exports nothing: consumers
