@@ -54,12 +54,21 @@ func (l *connLog) sawEstablished(addr string) bool {
 	return false
 }
 
-// sawFailed reports whether OnConnectionFailed fired for addr.
-func (l *connLog) sawFailed(addr string) bool {
+// failedLen returns the length of the failure log, taken under the mutex.
+func (l *connLog) failedLen() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	for _, info := range l.failed {
-		if info.Address == addr {
+	return len(l.failed)
+}
+
+// sawFailedSince reports whether OnConnectionFailed fired for addr at or
+// after position from in the failure log, so events recorded before a
+// failedLen snapshot (startup dials, election) do not count.
+func (l *connLog) sawFailedSince(addr string, from int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for i := from; i < len(l.failed); i++ {
+		if l.failed[i].Address == addr {
 			return true
 		}
 	}
@@ -153,11 +162,12 @@ func TestConnectionEvents_PeerAddress(t *testing.T) {
 
 	// (b) Close host 1; the survivor reports its address failed.
 	const gone, survivor = 1, 0
+	failedBefore := logs[survivor].failedLen()
 	hosts[gone].Close()
 	closed[gone] = true
 	waitForConditionDiag(t, connEventLostTimeout,
-		fmt.Sprintf("survivor sees OnConnectionFailed for %s", addrs[gone]),
-		func() bool { return logs[survivor].sawFailed(addrs[gone]) },
+		fmt.Sprintf("survivor sees OnConnectionFailed for %s after Close", addrs[gone]),
+		func() bool { return logs[survivor].sawFailedSince(addrs[gone], failedBefore) },
 		func() string { return logs[survivor].String() })
 
 	// (c) No callback on either host named that host's own address.
