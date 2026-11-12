@@ -10720,8 +10720,12 @@ func (h *Host) RaftAddress() string {
 // EmergencySeal immediately seals the barrier without waiting for in-flight
 // operations to complete. All in-flight operations will fail with
 // ErrBarrierSealed. This is for security incident response where speed
-// matters more than graceful shutdown.
+// matters more than graceful shutdown. On a closed host it returns
+// ErrClosed: Close has already sealed the barrier.
 func (h *Host) EmergencySeal() error {
+	if h.closed.Load() {
+		return ErrClosed
+	}
 	if h.barrier == nil {
 		return ErrBarrierNotInit
 	}
