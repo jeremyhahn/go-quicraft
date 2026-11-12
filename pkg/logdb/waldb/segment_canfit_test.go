@@ -155,3 +155,32 @@ func TestSegmentCanFitMatchesWrite_Closed(t *testing.T) {
 		}
 	}
 }
+
+// ErrRecordTooLarge is documented as the verdict for a record whose framed
+// size could not fit in ANY segment, and callers treat it as permanent: they
+// do not rotate. So the largest record an empty segment accepts must never be
+// reported as ErrRecordTooLarge, whatever the current segment holds: a
+// non-empty segment refuses it with ErrSegmentFull (rotate and retry), the
+// same verdict from Write, and the fresh segment the caller rotates to takes
+// it.
+func TestSegmentCanFitMatchesWrite_FreshFitIsNeverTooLarge(t *testing.T) {
+	ctx := context.Background()
+	freshLargest := largestCanFit(ctx, t, newCanFitSegment(ctx, t, 0))
+
+	for prefix := 1; prefix <= 2*canFitBlockSize; prefix++ {
+		s := newCanFitSegment(ctx, t, prefix)
+		if err := s.CanFit(freshLargest); err != nil && !errors.Is(err, ErrSegmentFull) {
+			t.Fatalf("after a %d-byte record (block offset %d), CanFit(%d) = %v; a record an empty segment takes must be nil or ErrSegmentFull",
+				prefix, s.blockOffset, freshLargest, err)
+		}
+		if _, err := s.Write(make([]byte, freshLargest)); err != nil && !errors.Is(err, ErrSegmentFull) {
+			t.Fatalf("after a %d-byte record (block offset %d), Write(%d) = %v; want nil or ErrSegmentFull",
+				prefix, s.blockOffset, freshLargest, err)
+		}
+	}
+
+	rotated := newCanFitSegment(ctx, t, 0)
+	if _, err := rotated.Write(make([]byte, freshLargest)); err != nil {
+		t.Fatalf("Write(%d) on a fresh segment: %v", freshLargest, err)
+	}
+}
