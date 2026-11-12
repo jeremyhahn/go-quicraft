@@ -64,12 +64,14 @@ type File interface {
 type FileMetadataSyncer = fsutil.MetadataSyncer
 
 // FilePreAllocator is optionally implemented by File implementations that
-// support pre-allocating disk space without changing the visible file size.
-// On Linux this maps to fallocate(2); other platforms fall back to
-// ftruncate(2).
+// support pre-allocating disk space. Preallocation may change the visible
+// file size: on Linux this maps to fallocate(2) with mode 0, which extends a
+// file shorter than size; other platforms fall back to ftruncate(2), which
+// sets the size and may not reserve physical blocks.
 type FilePreAllocator interface {
-	// PreAllocate reserves disk space for size bytes without changing the
-	// visible file size.
+	// PreAllocate reserves disk space for size bytes. It may change the
+	// visible file size, and the non-Linux fallback may not reserve
+	// physical blocks.
 	PreAllocate(size int64) error
 }
 
