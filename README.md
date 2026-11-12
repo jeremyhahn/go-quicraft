@@ -2,7 +2,7 @@
 
 [![Go](https://img.shields.io/badge/Go-1.27.4-blue.svg)](https://go.dev/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.21.0--rc.2-orange.svg)](VERSION)
+[![Version](https://img.shields.io/badge/Version-0.24.2--alpha-orange.svg)](VERSION)
 
 QuicRaft is a multi-group Raft consensus library for Go. One process hosts
 many independent Raft groups (shards), replicas talk to each other over QUIC
@@ -33,7 +33,7 @@ client sessions for at-most-once proposals.
 
 ## Status
 
-The current version is **0.21.0-rc.2**, a release candidate. QuicRaft has not had a
+The current version is **0.24.2-alpha**, a pre-release. QuicRaft has not had a
 1.0 release, so:
 
 - The public API may still change between minor versions.
