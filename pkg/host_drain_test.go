@@ -34,6 +34,65 @@ import (
 // flag went up while it was being admitted); every call that starts after
 // Drain returns is refused with ErrDraining. A second Drain is safe, and
 // Close then returns within 5s and leaves no goroutine behind.
+// boundedCloser runs Host.Close at most once, in its own goroutine, and never
+// blocks a caller past its deadline. A second synchronous Close after a hung
+// one would join the stuck stopOnce and hang the test binary, so the test and
+// its cleanup share the single attempt, and the cleanup skips waiting once an
+// earlier wait has timed out.
+type boundedCloser struct {
+	h        *Host
+	mu       sync.Mutex
+	done     chan struct{}
+	err      error
+	timedOut bool
+}
+
+// newBoundedCloser returns a boundedCloser for h and registers a cleanup that
+// closes h within d unless an explicit close already timed out.
+func newBoundedCloser(t *testing.T, h *Host, d time.Duration) *boundedCloser {
+	t.Helper()
+	c := &boundedCloser{h: h}
+	t.Cleanup(func() {
+		c.mu.Lock()
+		skip := c.timedOut
+		c.mu.Unlock()
+		if skip {
+			return
+		}
+		if ok, _ := c.close(d); !ok {
+			t.Errorf("cleanup: Close did not return within %v", d)
+		}
+	})
+	return c
+}
+
+// close starts the single Close attempt if none is running and waits up to d
+// for it. ok is false when the attempt did not finish in time.
+func (c *boundedCloser) close(d time.Duration) (ok bool, err error) {
+	c.mu.Lock()
+	if c.done == nil {
+		c.done = make(chan struct{})
+		go func() {
+			c.err = c.h.Close()
+			close(c.done)
+		}()
+	}
+	done := c.done
+	c.mu.Unlock()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true, c.err
+	case <-timer.C:
+		c.mu.Lock()
+		c.timedOut = true
+		c.mu.Unlock()
+		return false, nil
+	}
+}
+
 func TestHost_Drain_InFlightSyncProposeThenClose(t *testing.T) {
 	const (
 		workers         = 16
@@ -49,7 +108,7 @@ func TestHost_Drain_InFlightSyncProposeThenClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
-	t.Cleanup(func() { _ = h.Close() })
+	closer := newBoundedCloser(t, h, closeDeadline)
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
@@ -156,15 +215,12 @@ func TestHost_Drain_InFlightSyncProposeThenClose(t *testing.T) {
 		t.Error("IsDraining = false after the second Drain")
 	}
 
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- h.Close() }()
-	select {
-	case err := <-closeDone:
-		if err != nil {
-			t.Errorf("Close after Drain = %v, want nil", err)
-		}
-	case <-time.After(closeDeadline):
+	ok, err := closer.close(closeDeadline)
+	if !ok {
 		t.Fatalf("Close did not return within %v", closeDeadline)
+	}
+	if err != nil {
+		t.Errorf("Close after Drain = %v, want nil", err)
 	}
 
 	// Every goroutine the host and the workers started must exit.
@@ -242,7 +298,7 @@ func TestHost_Drain_WaitsForHeldProposal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewHost failed: %v", err)
 	}
-	t.Cleanup(func() { _ = h.Close() })
+	newBoundedCloser(t, h, deadline)
 	// Cleanups run last-registered first: release a still-held Update
 	// before the host is closed.
 	var releaseOnce sync.Once
