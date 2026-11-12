@@ -108,6 +108,27 @@ func startLifecycleShard(t *testing.T, h *Host, shardID uint64) {
 	waitForLeader(t, h, shardID)
 }
 
+// waitForLifecycleCall polls rc's snapshot until it holds a call to method
+// for shardID, and returns that snapshot. It fails the test when ctx ends
+// first.
+func waitForLifecycleCall(ctx context.Context, t *testing.T, rc *lifecycleCollector, method string, shardID uint64) []lifecycleCall {
+	t.Helper()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		calls := rc.snapshot()
+		if len(lifecycleIndices(calls, method, shardID)) > 0 {
+			return calls
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("no %s(%d) recorded before deadline: %v", method, shardID, ctx.Err())
+			return nil
+		case <-tick.C:
+		}
+	}
+}
+
 // TestHostMetricsShardLifecycle_RecordingCollector checks that a Host calls
 // RegisterShard on StartShard before any per-shard sample, UnregisterShard on
 // StopShard for that shard only, and RegisterShard again on a restart.
@@ -134,7 +155,9 @@ func TestHostMetricsShardLifecycle_RecordingCollector(t *testing.T) {
 	if _, err := h.SyncPropose(ctx, 1, []byte("lifecycle")); err != nil {
 		t.Fatalf("SyncPropose: %v", err)
 	}
-	calls = rc.snapshot()
+	// SyncPropose returns once the result is delivered; the apply goroutine
+	// records the latency sample after that, so wait for it.
+	calls = waitForLifecycleCall(ctx, t, rc, "ObserveProposalLatency", 1)
 	props := lifecycleIndices(calls, "ObserveProposalLatency", 1)
 	if len(props) == 0 {
 		t.Fatal("(b) no ObserveProposalLatency(1) after SyncPropose")
