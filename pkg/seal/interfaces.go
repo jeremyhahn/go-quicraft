@@ -29,11 +29,18 @@ import (
 // nothing in this module implements it — which is also why the contract is
 // pinned by an executable conformance test rather than by prose alone.
 type StorageBackend interface {
+	// Get returns the data stored under key.
 	Get(ctx context.Context, key string) ([]byte, error)
+	// Put stores data under key, replacing any existing value.
 	Put(ctx context.Context, key string, data []byte) error
+	// Delete removes key and its data.
 	Delete(ctx context.Context, key string) error
+	// List returns the keys that start with prefix.
 	List(ctx context.Context, prefix string) ([]string, error)
+	// Exists reports whether key is stored.
 	Exists(ctx context.Context, key string) (bool, error)
+	// Scan calls fn with each key that starts with prefix and its value,
+	// stopping at the first error fn returns.
 	Scan(ctx context.Context, prefix string, fn func(key string, value []byte) error) error
 
 	// PutIfAbsent atomically stores data under key only if key does not
@@ -106,6 +113,7 @@ type StorageBackend interface {
 	// from that interface must not carry the assumption across.
 	CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
 
+	// Close releases the resources held by the backend.
 	Close() error
 }
 
@@ -172,6 +180,7 @@ type InvocationCounter interface {
 // The two produce identical frames for AES-GCM, which is why the wire format is
 // unversioned across the migration; see newAESGCM.
 type AEADProvider interface {
+	// NewAEAD returns an AEAD cipher for the algorithm keyed with key.
 	NewAEAD(alg SymmetricAlgorithm, key []byte) (cipher.AEAD, error)
 }
 
@@ -219,7 +228,10 @@ type NonceTrackerProvider interface {
 // this interface cannot authenticate the caller's positional context. Implement
 // AADSymmetricEncrypter as well to declare that capability.
 type SymmetricEncrypter interface {
+	// Encrypt returns the ciphertext of plaintext.
 	Encrypt(plaintext []byte) ([]byte, error)
+	// Decrypt returns the plaintext of ciphertext, or an error when it
+	// fails authentication.
 	Decrypt(ciphertext []byte) ([]byte, error)
 }
 

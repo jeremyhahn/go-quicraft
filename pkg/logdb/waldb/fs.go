@@ -27,14 +27,23 @@ import (
 // (fdatasync on Linux, fsync elsewhere). Test code can provide alternative
 // implementations for error injection.
 type File interface {
+	// Write writes p at the current offset, as io.Writer does.
 	Write(p []byte) (int, error)
+	// WriteAt writes p at offset off, as io.WriterAt does.
 	WriteAt(p []byte, off int64) (int, error)
+	// Read reads into p from the current offset, as io.Reader does.
 	Read(p []byte) (int, error)
+	// ReadAt reads into p from offset off, as io.ReaderAt does.
 	ReadAt(p []byte, off int64) (int, error)
+	// Stat returns the file info of the file.
 	Stat() (fs.FileInfo, error)
+	// Truncate changes the size of the file to size.
 	Truncate(size int64) error
+	// Seek sets the offset for the next Read or Write, as io.Seeker does.
 	Seek(offset int64, whence int) (int64, error)
+	// Sync flushes the file's data to stable storage.
 	Sync() error
+	// Close closes the file.
 	Close() error
 }
 
@@ -55,10 +64,14 @@ type File interface {
 type FileMetadataSyncer = fsutil.MetadataSyncer
 
 // FilePreAllocator is optionally implemented by File implementations that
-// support pre-allocating disk space without changing the visible file size.
-// On Linux this maps to fallocate(2); other platforms fall back to
-// ftruncate(2).
+// support pre-allocating disk space. Preallocation may change the visible
+// file size: on Linux this maps to fallocate(2) with mode 0, which extends a
+// file shorter than size; other platforms fall back to ftruncate(2), which
+// sets the size and may not reserve physical blocks.
 type FilePreAllocator interface {
+	// PreAllocate reserves disk space for size bytes. It may change the
+	// visible file size, and the non-Linux fallback may not reserve
+	// physical blocks.
 	PreAllocate(size int64) error
 }
 
@@ -92,12 +105,22 @@ type DirLocker interface {
 // fallback would reintroduce exactly the torn-write state the rename exists to
 // remove, so an FS that cannot rename cannot host a WAL. See writeWALFormat.
 type FS interface {
+	// OpenFile opens the named file with the given flags and permissions,
+	// as os.OpenFile does.
 	OpenFile(name string, flag int, perm fs.FileMode) (File, error)
+	// Open opens the named file for reading, as os.Open does.
 	Open(name string) (File, error)
+	// MkdirAll creates the directory path and any missing parents, as
+	// os.MkdirAll does.
 	MkdirAll(path string, perm fs.FileMode) error
+	// ReadDir returns the entries of the named directory, as os.ReadDir
+	// does.
 	ReadDir(name string) ([]fs.DirEntry, error)
+	// Stat returns the file info of the named file, as os.Stat does.
 	Stat(name string) (fs.FileInfo, error)
+	// Remove removes the named file or empty directory, as os.Remove does.
 	Remove(name string) error
+	// Rename atomically renames oldpath to newpath, as os.Rename does.
 	Rename(oldpath, newpath string) error
 }
 

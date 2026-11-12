@@ -35,6 +35,9 @@ func ExampleBarrier() {
 		fmt.Println("barrier:", err)
 		return
 	}
+	// Seal on every return path so the root key and epoch DEKs are erased
+	// before the deferred strategy.Close runs.
+	defer func() { _ = b.Seal() }()
 
 	// First boot: generate and seal the root key. Initialize does not call
 	// the persister; the embedder stores SealedRootKeyData itself. The
