@@ -1472,6 +1472,8 @@ jobs:
       CI_IMAGE_NAMESPACE: ci-images   # v1.30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0   # CUSTOMIZE (go-quicraft): the API check's base is `git describe --tags`
 
       # v1.21.1: mask the forge credentials before any other step (as above).
       - name: Mask the forge credentials
@@ -1544,7 +1546,7 @@ jobs:
       - name: make lint-gates
         if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' }}
         env:
-          IN_IMAGE_NETWORK: none   # CUSTOMIZE: bridge when a gate needs the module proxy or a network
+          IN_IMAGE_NETWORK: bridge   # CUSTOMIZE: bridge when a gate needs the module proxy or a network
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make lint-gates GO_BUILD_TAGS='$GO_BUILD_TAGS'"
 
       - name: Tear down
