@@ -4,6 +4,7 @@
 package quicraft
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,7 +17,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -612,5 +615,134 @@ func TestSyncRemoveData_FailedRetirementKeepsCompactedSnapshot(t *testing.T) {
 	}
 	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the second RemoveData left the snapshot directory (stat err %v): %s", err, snapDir)
+	}
+}
+
+// TestSyncRemoveData_RemovesImportedSnapshotUnderDataDir: a snapshot imported
+// with WithImportDataDir for a replica this host never started (no bootstrap
+// record) lives under that DataDir; RemoveData finds it from the LogDB
+// snapshot record, removes it and retires the replica.
+func TestSyncRemoveData_RemovesImportedSnapshotUnderDataDir(t *testing.T) {
+	const shardID, replicaID uint64 = 7, 3
+	const index uint64 = 900
+	cfg := testHostConfig(t)
+	real := memdb.New()
+	db := &removeDataLogDB{LogDB: real}
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+	// The replica's only trace on this host: LogDB data without a bootstrap
+	// record the host can read.
+	if err := real.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+		Addresses: map[uint64]string{replicaID: "127.0.0.1:5000"},
+	}); err != nil {
+		t.Fatalf("SaveBootstrap: %v", err)
+	}
+	db.set(0, true)
+
+	custom := t.TempDir()
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("IMPORTED-UNDER-DATADIR")))
+	if err := h.ImportSnapshot(context.Background(), shardID, bytes.NewReader(artifact),
+		WithImportDataDir(custom)); err != nil {
+		t.Fatalf("ImportSnapshot: %v", err)
+	}
+	replicaDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(cfg.NodeHostDir, custom, shardID), shardID, replicaID)
+	if _, err := os.Stat(replicaDir); err != nil {
+		t.Fatalf("imported replica directory missing: %v", err)
+	}
+
+	if err := h.SyncRemoveData(context.Background(), shardID, replicaID); err != nil {
+		t.Fatalf("SyncRemoveData: %v", err)
+	}
+	if _, err := os.Stat(replicaDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the imported snapshot under the DataDir survived the removal "+
+			"(stat err %v): %s", err, replicaDir)
+	}
+	if removed, err := h.logdb.NodeRemoved(shardID, replicaID); err != nil || !removed {
+		t.Fatalf("NodeRemoved = %v (err %v), want true", removed, err)
+	}
+}
+
+// TestSyncRemoveData_RemovesPreRecordJoinedReplicaSnapshots: a replica joined
+// with a custom DataDir before joins were recorded (no bootstrap record) took
+// a snapshot; RemoveData finds its directory from the snapshot record.
+func TestSyncRemoveData_RemovesPreRecordJoinedReplicaSnapshots(t *testing.T) {
+	const f = 2
+	fid := uint64(f + 1)
+	var w *removeDataLogDB
+	c := newRemoveDataClusterWith(t, walWrapperFor(t, f, &w))
+	dataDir := t.TempDir()
+	for i, h := range c.hosts {
+		scfg := c.shardConfig(uint64(i + 1))
+		members, join := c.members(), false
+		if i == f {
+			scfg.DataDir = dataDir
+			members, join = nil, true
+		}
+		if err := h.StartShard(members, join, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d] (join=%v): %v", i, join, err)
+		}
+	}
+	all := []int{0, 1, 2}
+	c.propose(all, "joined", 20)
+	c.waitHashMatch(f, all)
+	fh := c.hosts[f]
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := fh.SyncRequestSnapshot(ctx, removeDataShard, SnapshotOption{}); err != nil {
+		t.Fatalf("SyncRequestSnapshot on the joined replica: %v", err)
+	}
+	snapDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(c.cfgs[f].NodeHostDir, dataDir, removeDataShard), removeDataShard, fid)
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+
+	w.set(0, true)
+	if err := fh.SyncRemoveData(context.Background(), removeDataShard, fid); err != nil {
+		t.Fatalf("SyncRemoveData on a pre-record joined replica: %v", err)
+	}
+	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the pre-record joined replica's snapshots survived under its DataDir "+
+			"(stat err %v): %s", err, snapDir)
+	}
+}
+
+// TestReplicaSnapshotDirFromRecord: the helper finds the replica directory a
+// snapshot record's Filepath lies in only when it is the layout StartShard
+// creates for that shard and replica.
+func TestReplicaSnapshotDirFromRecord(t *testing.T) {
+	const shardID, replicaID uint64 = 5, 2
+	root := filepath.Join(t.TempDir(), "data")
+	dataDirLayout := engine.ReplicaSnapshotDir(shardSnapshotBaseDir("", root, shardID), shardID, replicaID)
+	nhLayout := engine.ReplicaSnapshotDir(shardSnapshotBaseDir(root, "", shardID), shardID, replicaID)
+	cases := []struct {
+		name string
+		path string
+		want string
+		ok   bool
+	}{
+		{"snapshot dir under a DataDir", filepath.Join(dataDirLayout, "snapshot-0000000384"), dataDirLayout, true},
+		{"data file under a DataDir", filepath.Join(dataDirLayout, "snapshot-0000000384", "snapshot.dat"), dataDirLayout, true},
+		{"the replica directory itself", dataDirLayout, dataDirLayout, true},
+		{"NodeHostDir layout", filepath.Join(nhLayout, "snapshot-0000000001"), nhLayout, true},
+		{"outside any replica layout", filepath.Join(root, "elsewhere", "snapshot.dat"), "", false},
+		{"another replica", filepath.Join(root, "shard-5", "shard-5", "replica-9", "snapshot-1"), "", false},
+		{"another shard", filepath.Join(root, "shard-6", "shard-6", "replica-2", "snapshot-1"), "", false},
+		{"no shard base directory", filepath.Join(root, "x", "shard-5", "replica-2", "snapshot-1"), "", false},
+		{"empty", "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := replicaSnapshotDirFromRecord(tc.path, shardID, replicaID)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("replicaSnapshotDirFromRecord(%q) = (%q, %v), want (%q, %v)",
+					tc.path, got, ok, tc.want, tc.ok)
+			}
+		})
 	}
 }
