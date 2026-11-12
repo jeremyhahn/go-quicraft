@@ -1149,17 +1149,39 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 	shardID := rs.ShardID()
 	// Dragonboat's ReadLocalNode calls sm.Lookup with no deadline at all,
 	// so the adapter imposes one only when SetQueryTimeout opted in.
-	ctx := context.Background()
-	if d := nh.QueryTimeout(); d > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, d)
-		defer cancel()
+	d := nh.QueryTimeout()
+	if d <= 0 {
+		val, err := nh.host.QueryLocalNode(context.Background(), shardID, query)
+		if err != nil {
+			return nil, translateError(err)
+		}
+		return val, nil
 	}
-	val, err := nh.host.QueryLocalNode(ctx, shardID, query)
-	if err != nil {
-		return nil, translateError(err)
+	// The dragonboat Lookup and NALookup take no context, so the deadline
+	// cannot reach the user's state machine: run the query in its own
+	// goroutine and stop waiting for it when the deadline passes. A lookup
+	// that outlives the deadline finishes in the background and its result
+	// is discarded.
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	type lookupResult struct {
+		val interface{}
+		err error
 	}
-	return val, nil
+	done := make(chan lookupResult, 1)
+	go func() {
+		val, err := nh.host.QueryLocalNode(ctx, shardID, query)
+		done <- lookupResult{val: val, err: err}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			return nil, translateError(r.err)
+		}
+		return r.val, nil
+	case <-ctx.Done():
+		return nil, translateError(ctx.Err())
+	}
 }
 
 // StaleRead reads local state machine state directly without any
