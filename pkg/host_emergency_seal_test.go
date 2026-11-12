@@ -6,10 +6,13 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // newEmergencySealHost starts a Host with a real seal.Barrier, one shard
@@ -132,8 +135,7 @@ func TestEmergencySeal_DuringSnapshotSave(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		name := d.Name()
-		if strings.HasPrefix(name, "snapshot-") || strings.HasSuffix(name, ".tmp") {
+		if isSaveArtifact(d.Name()) {
 			t.Errorf("partial snapshot left on disk after sealed save: %s", p)
 		}
 		return nil
@@ -141,4 +143,29 @@ func TestEmergencySeal_DuringSnapshotSave(t *testing.T) {
 	if walkErr != nil {
 		t.Fatalf("walk host dir: %v", walkErr)
 	}
+
+	// The replica's own snapshot directory is where a local save stages and
+	// publishes; it must hold no save artifact after the sealed failure.
+	replicaDir := engine.ReplicaSnapshotDir(shardSnapshotBaseDir(dir, testShardConfig(1, 1).DataDir, 1), 1, 1)
+	entries, err := os.ReadDir(replicaDir)
+	if err != nil {
+		t.Fatalf("read replica snapshot dir %s: %v", replicaDir, err)
+	}
+	for _, e := range entries {
+		if isSaveArtifact(e.Name()) {
+			t.Errorf("save artifact left in the replica snapshot dir after sealed save: %s",
+				filepath.Join(replicaDir, e.Name()))
+		}
+	}
+}
+
+// isSaveArtifact reports whether a directory entry name is anything a local
+// snapshot save writes before or at publication: a published snapshot-<index>
+// directory, a save staging directory (engine.IsSnapshotSaveStage), the staged
+// snapshot.dat, or a *.tmp file.
+func isSaveArtifact(name string) bool {
+	return strings.HasPrefix(name, "snapshot-") ||
+		strings.HasSuffix(name, ".tmp") ||
+		engine.IsSnapshotSaveStage(name) ||
+		name == "snapshot.dat"
 }
