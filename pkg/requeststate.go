@@ -133,17 +133,32 @@ type RequestState struct {
 
 	// outstanding counts the references held by pending maps. Registering
 	// the RequestState in a pending map is +1 (acquireRef); removing it is
-	// -1 (releaseRef). The object is only returned to the pool when the
-	// caller has released it AND no pending-map references remain. This
-	// closes the use-after-Release window where a Sync* caller times out
-	// and releases while the request is still registered in a pending map:
-	// the late OnApplied/sweep removes its reference and recycles the
-	// object then, never delivering into a recycled (foreign) request.
+	// -1 (releaseRef). It is bookkeeping only: the recycle decision is made
+	// on holders.
 	outstanding atomic.Int64
 
-	// recycled guards the single return-to-pool. Whichever of Release or
-	// releaseRef observes released==true && outstanding==0 wins the CAS and
-	// performs the pool.Put exactly once.
+	// holders counts every reference that keeps the object out of the pool:
+	// the caller's own, until its first Release, plus each pending-map
+	// reference. newRequestState sets it to 1; acquireRef and tryAcquireRef
+	// add 1; releaseRef and the first Release subtract 1. Exactly one
+	// goroutine takes it to zero — once zero it is never raised again in
+	// this use (tryAcquireRef refuses zero) — and that goroutine, holding the
+	// last reference, recycles the object. Nothing else reads it to decide.
+	// A decision made from separate loads of released and outstanding
+	// instead let a releaser that had seen the pending count reach zero
+	// before the caller released finish its check late, across the caller's
+	// recycle and the next newRequestState's reset, and return the live
+	// object to the pool a second time: a pending read then completed a
+	// RequestState another request was using (#831). The object is only
+	// returned to the pool when the caller has released it AND no pending-map
+	// references remain, so a Sync* caller that times out and releases while
+	// the request is still registered leaves it to the late
+	// OnApplied/sweep, which recycles it then, never delivering into a
+	// recycled (foreign) request.
+	holders atomic.Int64
+
+	// recycled records the return to the pool. The zero transition of
+	// holders already elects one recycler; the CAS is a second guard.
 	recycled atomic.Bool
 
 	// completed prevents double-complete. The first complete() wins;
@@ -212,6 +227,10 @@ func newRequestState(pool *sync.Pool, key uint64, deadline time.Time, trackLaten
 	rs.released.Store(false)
 	rs.recycled.Store(false)
 	rs.outstanding.Store(0)
+	// The caller's reference. Set after outstanding is reset: until it is
+	// nonzero no tryAcquireRef can succeed on this object, so no stale
+	// increment is lost to the reset.
+	rs.holders.Store(1)
 	rs.completed.Store(false)
 	rs.committedDone.Store(false)
 	rs.session.Store(nil)
@@ -336,8 +355,8 @@ func (rs *RequestState) ApplyResultC() <-chan RequestResult {
 // concurrently: once the first call has recycled the object and a new
 // request has been built on it, nothing can tell a stale second call from
 // that request's own, and a caller descheduled before its first instruction
-// is exactly that stale call. The pin below narrows the concurrent window
-// to that one interleaving — it cannot close it, and no pooled design can.
+// is exactly that stale call. A second call that finds released already set
+// touches nothing else.
 // After Release, Result returns ErrReleased and ResultC returns nil.
 //
 // The object is NOT returned to the pool until both the caller has
@@ -349,22 +368,15 @@ func (rs *RequestState) ApplyResultC() <-chan RequestResult {
 // it. The late OnApplied/sweep removes the final reference and recycles
 // the object then.
 func (rs *RequestState) Release() {
-	// Pin the object first, then elect the releaser. The pin is an extra
-	// outstanding reference taken while released is still false, so the
-	// object cannot be recycled under it: tryRecycle needs released set,
-	// which only the CAS below does, and the pin holds the count above zero
-	// until the releaser has finished — in particular across releaseSession,
-	// which the last pending-map releaseRef could otherwise recycle out from
-	// under. A second caller that has already pinned when the first one
-	// wins loses the CAS and touches nothing else; one that has not yet
-	// executed its pin is the use-after-free the contract above excludes.
-	rs.outstanding.Add(1)
+	// The released CAS elects the one Release that drops the caller's
+	// reference; any later Release touches nothing else. The caller's
+	// reference is still held across releaseSession, so the last
+	// pending-map releaseRef cannot recycle the object out from under it.
 	if !rs.released.CompareAndSwap(false, true) {
-		rs.releaseRef()
 		return
 	}
 	rs.releaseSession()
-	rs.releaseRef()
+	rs.dropHolder()
 }
 
 // bindSession records that this request holds series in flight on session.
@@ -389,6 +401,7 @@ func (rs *RequestState) releaseSession() {
 // RequestSnapshot) before the object is exposed to completion callbacks.
 func (rs *RequestState) acquireRef() {
 	rs.outstanding.Add(1)
+	rs.holders.Add(1)
 }
 
 // releaseRef records that a pending map no longer holds a reference to
@@ -398,7 +411,15 @@ func (rs *RequestState) acquireRef() {
 // When the caller has already released and this was the last reference,
 // the object is returned to the pool.
 func (rs *RequestState) releaseRef() {
-	if rs.outstanding.Add(-1) == 0 {
+	rs.outstanding.Add(-1)
+	rs.dropHolder()
+}
+
+// dropHolder drops one reference from holders and, if it was the last,
+// recycles the object. Only the goroutine that takes holders to zero
+// recycles, and it makes that decision from its own decrement alone.
+func (rs *RequestState) dropHolder() {
+	if rs.holders.Add(-1) == 0 {
 		rs.tryRecycle()
 	}
 }
@@ -408,8 +429,8 @@ func (rs *RequestState) releaseRef() {
 // acquireRef (which is only safe at registration time, before the object
 // is published to a pending map), tryAcquireRef is safe on an object that
 // may be racing recycling: it never increments from zero, and a nonzero
-// count means a pending-map reference — or Release's own pin, which holds
-// the count only until the releaser has finished — still pins the object, so it cannot
+// holders count means a pending-map reference or the caller's own still
+// pins the object, so it cannot
 // reach tryRecycle's pool.Put — or newRequestState's counter reset — while
 // the new reference is held. An unconditional Add(1) here could instead
 // land on an object already recycled into the pool; if newRequestState
@@ -422,20 +443,23 @@ func (rs *RequestState) releaseRef() {
 // verify fails and the balanced acquire/release pair is harmless.
 func (rs *RequestState) tryAcquireRef() bool {
 	for {
-		n := rs.outstanding.Load()
+		n := rs.holders.Load()
 		if n <= 0 {
 			return false
 		}
-		if rs.outstanding.CompareAndSwap(n, n+1) {
+		if rs.holders.CompareAndSwap(n, n+1) {
+			rs.outstanding.Add(1)
 			return true
 		}
 	}
 }
 
-// tryRecycle returns the object to its pool exactly once, but only when
-// the caller has released it and no pending-map references remain. The
-// recycled CAS ensures a single pool.Put even when Release and the final
-// releaseRef race.
+// tryRecycle returns the object to its pool. It is called only by
+// dropHolder, from the goroutine that took holders to zero and so holds the
+// last reference: no other goroutine can release, reset or reuse the object
+// while it runs, and every load below sees this use's state. The released
+// check only matters for an object not made by newRequestState (holders
+// starts at zero), which is never recycled before its caller's Release.
 func (rs *RequestState) tryRecycle() {
 	if h := testHookTryRecycle; h != nil {
 		h(rs, recycleStageEnter)
@@ -445,9 +469,6 @@ func (rs *RequestState) tryRecycle() {
 	}
 	if h := testHookTryRecycle; h != nil {
 		h(rs, recycleStageDecide)
-	}
-	if rs.outstanding.Load() != 0 {
-		return
 	}
 	if !rs.recycled.CompareAndSwap(false, true) {
 		return
