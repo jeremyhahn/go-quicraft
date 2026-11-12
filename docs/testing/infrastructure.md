@@ -149,18 +149,19 @@ times, or a short write that disturbs the delegate before returning an error.
 
 Two tiers:
 
-- 23 tests behind `quicraft_errfs` (`waldb_test.go`, 21; `durability_test.go`,
+- 15 tests behind `quicraft_errfs` (`waldb_test.go`, 13; `durability_test.go`,
   2) drive the WAL and LogDB through injected failures: torn tails and repair,
-  a failed fsync losing only unacknowledged data, mid-entry write failure, read
-  and `Stat` failure during replay, `OpenFile` and `MkdirAll` failure,
-  compaction remove and readdir failure, double faults across write and
-  rollback, and idempotent recovery.
-- 13 untagged tests in `errfs_unit_test.go` and `harness_test.go` test the
+  a failed fsync losing only unacknowledged data, sync failure, a state write
+  failure and a clean reopen after it, a partial batch across shards, typed
+  error wrappers through recovery, command payload integrity, `Stat` failure
+  during replay, `OpenFile` and `MkdirAll` failure, compaction remove and
+  readdir failure, `Reset` clearing state, and idempotent recovery.
+- 10 untagged tests in `errfs_unit_test.go` and `harness_test.go` test the
   injector: the `injectAt` argument to `New` fires on exactly the Nth operation, `OnlyOps` restricts
   and rejects unknown operations, `Times` bounds the budget, a short write
   disturbs the delegate, and every non-injecting operation delegates. They run
   in `make test`, because an injector that silently stopped injecting would
-  make the 23 tagged tests pass for the wrong reason.
+  make the 15 tagged tests pass for the wrong reason.
 
 `make errfs-waldb` runs the tagged suite with `-v`, which you want when one
 fails: the test name is the only way to tell which injection point produced the
@@ -181,8 +182,9 @@ recovery path shows up as a race rather than a wrong answer.
 | `pkg/seal` | 4 | AEAD encrypt/decrypt across epochs |
 | `pkg/internal/raft` | 2 | adversarial step sequences, log recovery |
 
-Every target has `f.Add` seeds. The committed corpus is 39 files under
-`pkg/proto/testdata/fuzz/<Target>/`; nightly fuzzing uploads crashers as
+Every target has `f.Add` seeds. The committed corpus is 310 files under
+`<pkg>/testdata/fuzz/<Target>/`: 169 in `pkg/internal/raft`, 86 in
+`pkg/proto` and 55 in `pkg/logdb/waldb`; nightly fuzzing uploads crashers as
 artifacts, and committing one makes it a permanent regression test.
 
 Three different things are called fuzzing here:
@@ -394,18 +396,20 @@ gate: it interleaves baseline and current binaries across many rounds at a fixed
 iteration count and compares the distributions with benchstat. See
 [Benchmark regression testing](benchmarking.md).
 
-## Numbers (2026-10-13)
+## Numbers (2026-11-12)
 
-- 7,088 top-level test functions across the 26 packages under `pkg/`; 8,208
-  across the module tree
-- 182 integration test functions: 175 under `integration`, 7 more under
+- 4,919 top-level test functions across the 26 packages under `pkg/`; 5,080
+  across the module tree (default build tags)
+- 123 integration test functions: 116 under `integration`, 7 more under
   `quicraft_netfault`
-- 37 fuzz targets in six packages, all seeded; 39 committed corpus files
-- 36 errfs tests: 23 injecting, 13 testing the injector
+- 37 fuzz targets in six packages, all seeded; 310 committed corpus files
+- 25 errfs tests: 15 injecting, 10 testing the injector
 - 27 linearizability tests; 7 netfault injector tests
 - Coverage floor 91% locally, 90% in CI, total and per package
 
-Counts drift. Regenerate with `git grep -cE '^func Test'`.
+Counts drift. Regenerate with `go test -list '^Test'` over the package, adding
+`-tags` for the tagged tiers (`integration`, `quicraft_netfault`,
+`quicraft_errfs`).
 
 ## Cross-references
 
