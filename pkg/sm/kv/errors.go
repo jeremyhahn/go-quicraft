@@ -31,6 +31,7 @@ type KeyNotFoundError struct {
 	Key string
 }
 
+// Error returns a message naming the key that was not found.
 func (e *KeyNotFoundError) Error() string {
 	return "kv: key not found: " + e.Key
 }
@@ -40,6 +41,7 @@ type InvalidCommandError struct {
 	Reason string
 }
 
+// Error returns a message carrying the reason the command was rejected.
 func (e *InvalidCommandError) Error() string {
 	return "kv: invalid command: " + e.Reason
 }
@@ -49,10 +51,12 @@ type HashWriteError struct {
 	Err error
 }
 
+// Error returns a message wrapping the underlying hash write failure.
 func (e *HashWriteError) Error() string {
 	return "kv: hash write failed: " + e.Err.Error()
 }
 
+// Unwrap returns the underlying hash write error for errors.Is and errors.As.
 func (e *HashWriteError) Unwrap() error {
 	return e.Err
 }
