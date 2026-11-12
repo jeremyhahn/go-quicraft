@@ -242,10 +242,11 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// accept state VerifySnapshotArtifact refused. Every byte the copy reads
 	// is teed into the verifier, the rest of the file is drained through it,
 	// and a mismatch fails here, before anything is committed.
-	srcReader, verifySrc, err := teeSourceVerifier(fsys, srcPath, dstPath, src)
+	srcMeta, err := readReencryptSourceMeta(fsys, srcPath, dstPath)
 	if err != nil {
 		return 0, err
 	}
+	srcReader, verifySrc := teeSourceVerifier(srcPath, srcMeta, src)
 
 	epoch, dstPins, err = copySnapshotAcrossBarriers(srcReader, tmp, shardID, replicaID, index,
 		srcBarrier, dstBarrier)
@@ -278,7 +279,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// corrupt. Restamp it beside the destination, before the directory
 	// fsync below makes both durable. A failure comes back like the fsync
 	// failure below, epoch included, for the reason given there.
-	if err := restampReencryptedSnapshotMeta(fsys, srcPath, dstPath, epoch); err != nil {
+	if err := restampReencryptedSnapshotMeta(fsys, dstPath, srcMeta, epoch); err != nil {
 		return epoch, &SnapshotCommittedNotDurableError{Path: dstPath, Epoch: epoch, Err: err}
 	}
 
@@ -315,26 +316,58 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 // teed into an engine.SnapshotDataVerifier, and the check drains the rest of
 // the source through it and verifies it against that record; otherwise the
 // reader is src and the check is a no-op.
-func teeSourceVerifier(fsys snapshotFS, srcPath, dstPath string, src io.Reader) (io.Reader, func() error, error) {
-	noop := func() error { return nil }
-	if filepath.Base(dstPath) != "snapshot.dat" {
-		return src, noop, nil
+func teeSourceVerifier(srcPath string, srcMeta reencryptSourceMeta, src io.Reader) (io.Reader, func() error) {
+	if !srcMeta.present {
+		return src, func() error { return nil }
 	}
-	srcDir := filepath.Dir(srcPath)
-	if _, err := fsys.Stat(filepath.Join(srcDir, "snapshot.meta")); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return src, noop, nil
-		}
-		return nil, nil, err
-	}
-	verifier := engine.NewSnapshotDataVerifier(srcDir)
+	verifier := engine.NewSnapshotDataVerifierForMeta(filepath.Dir(srcPath), srcMeta.meta, srcMeta.err)
 	tee := io.TeeReader(src, verifier)
 	return tee, func() error {
 		if _, err := io.Copy(io.Discard, tee); err != nil {
 			return err
 		}
 		return verifier.Verify()
-	}, nil
+	}
+}
+
+// reencryptSourceMeta is the source's snapshot.meta, read once through the
+// injected snapshotFS and used both to check the source and to restamp the
+// destination. present is false when the destination is not a snapshot.dat
+// or the source has no snapshot.meta; err is the read or parse failure of a
+// record that exists, which the source check reports before anything is
+// committed.
+type reencryptSourceMeta struct {
+	present bool
+	meta    engine.SnapshotMeta
+	err     error
+}
+
+// readReencryptSourceMeta reads and parses the snapshot.meta beside srcPath
+// through fsys, bounded like every other snapshot.meta read. Only a failure
+// to open an existing record is returned as an error; a read, size or parse
+// failure is carried in the result for the source check to report.
+func readReencryptSourceMeta(fsys snapshotFS, srcPath, dstPath string) (reencryptSourceMeta, error) {
+	if filepath.Base(dstPath) != "snapshot.dat" {
+		return reencryptSourceMeta{}, nil
+	}
+	f, err := fsys.Open(filepath.Join(filepath.Dir(srcPath), "snapshot.meta"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return reencryptSourceMeta{}, nil
+		}
+		return reencryptSourceMeta{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, reencryptMetaReadLimit+1))
+	// A read-only handle's Close error cannot indicate lost data.
+	_ = f.Close()
+	if err == nil && len(data) > reencryptMetaReadLimit {
+		err = engine.ErrSnapshotMetaTooLarge
+	}
+	var meta engine.SnapshotMeta
+	if err == nil {
+		meta, err = engine.ParseSnapshotMeta(data)
+	}
+	return reencryptSourceMeta{present: true, meta: meta, err: err}, nil
 }
 
 // copySnapshotAcrossBarriers streams the snapshot data in src into dst,
@@ -382,8 +415,8 @@ func copySnapshotAcrossBarriers(src io.Reader, dst io.Writer, shardID, replicaID
 	}
 }
 
-// reencryptMetaReadLimit bounds the snapshot.meta read in
-// restampReencryptedSnapshotMeta. A record is a fixed header plus a body
+// reencryptMetaReadLimit bounds the source snapshot.meta read in
+// readReencryptSourceMeta. A record is a fixed header plus a body
 // whose declared length engine bounds at 64 KiB; anything longer is not a
 // record and is refused rather than read into memory.
 const reencryptMetaReadLimit = 1<<16 + 4096
@@ -393,30 +426,16 @@ const reencryptMetaReadLimit = 1<<16 + 4096
 // shard, replica and compression with the new epoch, length and hash. It
 // does nothing when dstPath is not a snapshot.dat or no snapshot.meta sits
 // beside srcPath.
-func restampReencryptedSnapshotMeta(fsys snapshotFS, srcPath, dstPath string, epoch uint64) error {
-	if filepath.Base(dstPath) != "snapshot.dat" {
+func restampReencryptedSnapshotMeta(fsys snapshotFS, dstPath string, srcMeta reencryptSourceMeta, epoch uint64) error {
+	if !srcMeta.present {
 		return nil
 	}
-	f, err := fsys.Open(filepath.Join(filepath.Dir(srcPath), "snapshot.meta"))
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
+	if srcMeta.err != nil {
+		// The source check refuses such a record before the commit; this
+		// guards a caller that skipped it.
+		return srcMeta.err
 	}
-	data, err := io.ReadAll(io.LimitReader(f, reencryptMetaReadLimit+1))
-	// A read-only handle's Close error cannot indicate lost data.
-	_ = f.Close()
-	if err != nil {
-		return err
-	}
-	if len(data) > reencryptMetaReadLimit {
-		return fmt.Errorf("snapshot.meta beside %s exceeds %d bytes", srcPath, reencryptMetaReadLimit)
-	}
-	meta, err := engine.ParseSnapshotMeta(data)
-	if err != nil {
-		return err
-	}
+	meta := srcMeta.meta
 	return writeReceivedSnapshotMetadata(fsys, filepath.Dir(dstPath), meta.Index, meta.Term,
 		meta.ShardID, meta.ReplicaID, epoch, meta.Compression)
 }
