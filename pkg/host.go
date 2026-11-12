@@ -11294,7 +11294,22 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 		return fmt.Errorf("remove snapshot directory %s: %w", snapDir, err)
 	}
 
-	// Every step is done: drop the intent.
+	// Make the removal durable BEFORE the intent is dropped: sync the parent
+	// that held the snapshot directory's entry, or a power loss could bring
+	// the directory back with no intent and no record left to find it. A
+	// missing parent holds no entry to sync. A failed sync keeps the intent,
+	// so a retry finishes the removal.
+	if parent := filepath.Dir(snapDir); parent != snapDir {
+		if _, err := h.snapshotFsys().Stat(parent); err == nil {
+			if err := syncDir(h.snapshotFsys(), parent); err != nil {
+				return fmt.Errorf("sync snapshot parent directory %s: %w", parent, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat snapshot parent directory %s: %w", parent, err)
+		}
+	}
+
+	// Every step is done and durable: drop the intent.
 	if err := h.clearRemoveDataIntent(shardID, replicaID); err != nil {
 		return err
 	}
@@ -11452,6 +11467,10 @@ func (h *Host) readRemoveDataIntent(shardID, replicaID uint64) (string, bool, er
 func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) error {
 	fsys := h.snapshotFsys()
 	dir := filepath.Join(h.cfg.NodeHostDir, removeDataIntentDir)
+	// The deepest existing ancestor before MkdirAll bounds the directory
+	// chain synced after the rename: every directory MkdirAll creates must
+	// be durable in its parent, or a power loss loses the intent with it.
+	stop := fsutil.DeepestExistingAncestorWith(fsys.Stat, dir)
 	if err := fsys.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create removal intent directory %s: %w", dir, err)
 	}
@@ -11479,7 +11498,7 @@ func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) 
 		_ = fsys.Remove(tmpPath)
 		return fmt.Errorf("publish removal intent %s: %w", p, err)
 	}
-	if err := syncDir(fsys, dir); err != nil {
+	if err := syncDirChain(fsys, dir, stop); err != nil {
 		return fmt.Errorf("sync removal intent directory %s: %w", dir, err)
 	}
 	return nil
