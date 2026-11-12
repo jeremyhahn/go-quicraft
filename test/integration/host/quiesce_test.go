@@ -235,13 +235,8 @@ func TestQuiesce_IdleShardKeepsLeaderAndWakes(t *testing.T) {
 	snap = quiesceSnapshot(logs)
 	time.Sleep(quiesceIdle)
 	assertQuietSince(t, c, logs, snap, leaderID, "(c) idle")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*quiesceElectionTimeout)
 	start := time.Now()
-	got, err := c.hosts[leaderIdx].SyncRead(ctx, quiesceShard, "wake")
-	cancel()
-	if err != nil {
-		t.Fatalf("(c) SyncRead after idle: %v", err)
-	}
+	got := readFromLeader(t, c, quiesceShard, "wake", 5*quiesceElectionTimeout)
 	if got != "1" {
 		t.Fatalf("(c) SyncRead after idle = %v, want 1", got)
 	}
