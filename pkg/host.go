@@ -6178,7 +6178,7 @@ func (h *Host) Propose(ctx context.Context, shardID uint64, cmd []byte) (*Reques
 
 	// Reject proposals when the WAL disk is full to prevent unbounded
 	// log growth and potential data loss.
-	if h.diskFull != nil && h.diskFull.Load() {
+	if h.isDiskFull() {
 		return nil, ErrDiskFull
 	}
 
@@ -6287,7 +6287,7 @@ func (h *Host) ProposeWithSession(ctx context.Context, session *Session, cmd []b
 
 	// Reject proposals when the WAL disk is full to prevent unbounded
 	// log growth and potential data loss.
-	if h.diskFull != nil && h.diskFull.Load() {
+	if h.isDiskFull() {
 		return nil, ErrDiskFull
 	}
 
@@ -9313,7 +9313,7 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	// The import writes a full snapshot artifact to disk; starting one while
 	// the WAL disk monitor reports the volume full would only deepen the
 	// exhaustion and leave a truncated artifact behind.
-	if h.diskFull != nil && h.diskFull.Load() {
+	if h.isDiskFull() {
 		return 0, ErrDiskFull
 	}
 
@@ -10827,7 +10827,7 @@ func (h *Host) ShardCount() int {
 //   - "ok"        if all shards are healthy (HTTP 200)
 func (h *Host) HealthCheck() *HealthStatus {
 	sealed := h.barrier != nil && h.barrier.IsSealed()
-	diskOK := h.diskFull == nil || !h.diskFull.Load()
+	diskOK := !h.isDiskFull()
 
 	shards := make([]ShardInfo, 0, clampNonNegative(h.activeNodes.Load()))
 	h.nodes.Range(func(_, value any) bool {
@@ -12734,6 +12734,32 @@ func walDirUsage(dir string) (uint64, error) {
 		return 0, err
 	}
 	return used, nil
+}
+
+// isDiskFull reports whether the WAL disk is full. The WAL's DiskMonitor sets
+// the flag and clears it only from a WAL write, but a full Host refuses
+// proposals, so on an idle or single-replica shard no write would ever run to
+// see the space a snapshot's compaction freed. While the flag is set, the Host
+// re-measures the WAL directory itself and clears the flag once usage is
+// below the full threshold; the next WAL write then re-checks (the monitor
+// checks every write while full) and fires the recovery transition.
+func (h *Host) isDiskFull() bool {
+	if h.diskFull == nil || !h.diskFull.Load() {
+		return false
+	}
+	maxBytes := h.cfg.MaxWALDiskSize
+	if maxBytes == 0 || h.cfg.WALDir == "" {
+		return true
+	}
+	used, err := walDirUsage(h.cfg.WALDir)
+	if err != nil {
+		return true
+	}
+	if used >= uint64(float64(maxBytes)*waldb.DefaultFullPercent) {
+		return true
+	}
+	h.diskFull.Store(false)
+	return false
 }
 
 // diskShards calls shards when it is set, for DiskInfo.Shards.
