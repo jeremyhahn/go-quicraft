@@ -98,7 +98,7 @@ func (s *keepingCmdSM) GetHash() (uint64, error) {
 // zeroCopyCmdPayload returns the i-th distinct, deterministic payload.
 func zeroCopyCmdPayload(i int) []byte {
 	p := make([]byte, zeroCopyCmdPayloadSize)
-	var x uint64 = uint64(i)*0x9E3779B97F4A7C15 + 1
+	x := uint64(i)*0x9E3779B97F4A7C15 + 1
 	for off := 0; off < len(p); off += 8 {
 		x ^= x << 13
 		x ^= x >> 7
