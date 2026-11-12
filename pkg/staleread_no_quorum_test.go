@@ -20,6 +20,11 @@ import (
 
 const noQuorumShard uint64 = 1
 
+// noQuorumElectionRTT is the election timeout, in 5 ms ticks, of every
+// replica in TestStaleReadNoQuorum: long enough (2 s) that the isolated
+// leader cannot step down before phase 1 has submitted its SyncRead.
+const noQuorumElectionRTT uint64 = 400
+
 // noQuorumSM counts the entries it has applied; Lookup answers the count, so
 // a read shows exactly the replica's applied state.
 type noQuorumSM struct{ applied atomic.Uint64 }
@@ -89,6 +94,9 @@ func TestStaleReadNoQuorum(t *testing.T) {
 	for i, h := range hosts {
 		scfg := testShardConfig(noQuorumShard, uint64(i+1))
 		scfg.MemberIdentities = ids
+		// 400 ticks of 5 ms: CheckQuorum needs at least 2 s to step an
+		// isolated leader down, so phase 1 reads while it still leads.
+		scfg.ElectionRTT = noQuorumElectionRTT
 		create := func(_, _ uint64) interface{} { return sms[i] }
 		if err := h.StartShard(members, false, create, scfg); err != nil {
 			t.Fatalf("StartShard[%d]: %v", i, err)
@@ -129,16 +137,17 @@ func TestStaleReadNoQuorum(t *testing.T) {
 	}
 	h := hosts[survivor]
 
-	// Phase 1: the leader has not yet noticed it lost its quorum. Phase 2:
-	// it has stepped down and knows no leader. Neither may serve SyncRead.
-	assertNoQuorumReads(t, h, "leader without quorum", entries)
-	if !waitUntil(10*time.Second, func() bool {
+	// Phase 1: the leader has not yet noticed it lost its quorum (it must
+	// still lead before and after the SyncRead). Phase 2: it has stepped
+	// down and knows no leader. Neither may serve SyncRead.
+	assertNoQuorumReads(t, h, "leader without quorum", entries, false)
+	if !waitUntil(20*time.Second, func() bool {
 		info, err := h.ShardInfo(noQuorumShard)
 		return err == nil && !info.IsLeader
 	}) {
 		t.Fatal("the leader never stepped down after losing its quorum")
 	}
-	assertNoQuorumReads(t, h, "stepped-down replica", entries)
+	assertNoQuorumReads(t, h, "stepped-down replica", entries, true)
 
 	closeAll()
 	if !waitUntil(10*time.Second, func() bool { return runtime.NumGoroutine() <= baseline }) {
@@ -154,7 +163,7 @@ func TestStaleReadNoQuorum(t *testing.T) {
 // 500ms deadline refuses: with ErrTimeout or ErrCanceled when the wait for a
 // quorum runs out, or with ErrNotLeader when the replica steps down during
 // the read or already knows no leader. It never answers a value.
-func assertNoQuorumReads(t *testing.T, h *Host, phase string, want uint64) {
+func assertNoQuorumReads(t *testing.T, h *Host, phase string, want uint64, allowNotLeader bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	start := time.Now()
@@ -170,18 +179,44 @@ func assertNoQuorumReads(t *testing.T, h *Host, phase string, want uint64) {
 		t.Fatalf("%s: StaleRead took %v, want under 1s", phase, d)
 	}
 
+	// While the replica must still lead, the SyncRead below reaches the
+	// leader's read path: a refusal by ErrNotLeader would prove nothing.
+	if !allowNotLeader {
+		assertStillLeads(t, h, phase+": before SyncRead")
+	}
 	ctx, cancel = context.WithTimeout(context.Background(), 500*time.Millisecond)
 	start = time.Now()
 	v, err = h.SyncRead(ctx, noQuorumShard, nil)
 	cancel()
+	if !allowNotLeader {
+		assertStillLeads(t, h, phase+": after SyncRead")
+	}
 	if err == nil {
 		t.Fatalf("%s: SyncRead answered %v, want an error", phase, v)
 	}
-	if !errors.Is(err, ErrTimeout) && !errors.Is(err, ErrCanceled) && !errors.Is(err, ErrNotLeader) {
+	switch {
+	case errors.Is(err, ErrTimeout), errors.Is(err, ErrCanceled):
+	case allowNotLeader && errors.Is(err, ErrNotLeader):
+	case allowNotLeader:
 		t.Fatalf("%s: SyncRead: %v, want ErrTimeout, ErrCanceled or ErrNotLeader", phase, err)
+	default:
+		t.Fatalf("%s: SyncRead: %v, want ErrTimeout or ErrCanceled from the leader", phase, err)
 	}
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("%s: SyncRead took %v past its 500ms deadline", phase, d)
+	}
+}
+
+// assertStillLeads fails the test unless h reports itself the leader of
+// noQuorumShard.
+func assertStillLeads(t *testing.T, h *Host, what string) {
+	t.Helper()
+	info, err := h.ShardInfo(noQuorumShard)
+	if err != nil {
+		t.Fatalf("%s: ShardInfo: %v", what, err)
+	}
+	if !info.IsLeader {
+		t.Fatalf("%s: the replica no longer leads", what)
 	}
 }
 
