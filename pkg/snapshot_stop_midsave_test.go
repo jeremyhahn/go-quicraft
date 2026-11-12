@@ -264,6 +264,40 @@ func awaitRequestEnd(t *testing.T, rs *RequestState) {
 // its data or metadata file.
 func assertNoPartialSnapshot(t *testing.T, nodeHostDir string) {
 	t.Helper()
+	for _, p := range partialSnapshotArtifacts(t, nodeHostDir) {
+		t.Error(p)
+	}
+}
+
+// awaitNoPartialSnapshot polls until no partial snapshot artifact remains
+// under nodeHostDir, failing with the last listing after the deadline. A
+// stopped shard's request completes before its pool worker's save returns,
+// and the worker's deferred stage removal runs only then, so the check that
+// follows StopShard must wait for that worker rather than race it.
+func awaitNoPartialSnapshot(t *testing.T, nodeHostDir string, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		problems := partialSnapshotArtifacts(t, nodeHostDir)
+		if len(problems) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			for _, p := range problems {
+				t.Errorf("after %v: %s", within, p)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// partialSnapshotArtifacts lists every staging, receive, import or scratch
+// artifact, every .tmp file and every snapshot directory missing its data or
+// metadata file under nodeHostDir's snapshot root.
+func partialSnapshotArtifacts(t *testing.T, nodeHostDir string) []string {
+	t.Helper()
+	var problems []string
 	root := filepath.Join(nodeHostDir, "snapshots")
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -276,13 +310,16 @@ func assertNoPartialSnapshot(t *testing.T, nodeHostDir string) {
 		if engine.IsSnapshotSaveStage(name) || engine.IsSnapshotRecvStage(name) ||
 			engine.IsSnapshotImportStage(name) || engine.IsSnapshotScratchTemp(name) ||
 			strings.HasSuffix(name, ".tmp") {
-			t.Errorf("partial snapshot artifact left behind: %s", path)
+			problems = append(problems, "partial snapshot artifact left behind: "+path)
+			if d.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		if d.IsDir() && strings.HasPrefix(name, "snapshot-") {
 			for _, f := range []string{"snapshot.dat", "snapshot.meta"} {
 				if _, statErr := os.Stat(filepath.Join(path, f)); statErr != nil {
-					t.Errorf("snapshot directory %s has no %s: %v", path, f, statErr)
+					problems = append(problems, fmt.Sprintf("snapshot directory %s has no %s: %v", path, f, statErr))
 				}
 			}
 		}
@@ -291,6 +328,7 @@ func assertNoPartialSnapshot(t *testing.T, nodeHostDir string) {
 	if err != nil {
 		t.Fatalf("walk %s: %v", root, err)
 	}
+	return problems
 }
 
 // assertRestartedCleanly checks the restarted shard: no partial snapshot,
@@ -331,7 +369,7 @@ func TestMidSave_StopShardLeavesNoPartialSnapshot(t *testing.T) {
 		t.Fatalf("StopShard during a save: %v", err)
 	}
 	awaitRequestEnd(t, rs)
-	assertNoPartialSnapshot(t, f.cfg.NodeHostDir)
+	awaitNoPartialSnapshot(t, f.cfg.NodeHostDir, 5*time.Second)
 
 	f.startShard(t, h)
 	f.assertRestartedCleanly(t, h)
