@@ -97,6 +97,14 @@ func FuzzSnapshotHeaderUnmarshalCrash(f *testing.F) {
 	f.Add(append(append([]byte{}, valid...), 0xAA, 0xBB))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
+		// The header is fixed-size: decoding it, valid or not, allocates
+		// nothing.
+		if allocs := testing.AllocsPerRun(1, func() {
+			var h SnapshotHeader
+			_, _ = h.UnmarshalFrom(data)
+		}); allocs != 0 {
+			t.Fatalf("UnmarshalFrom of %d bytes allocated %v times, want 0", len(data), allocs)
+		}
 		var h SnapshotHeader
 		n, err := h.UnmarshalFrom(data)
 		if len(data) < SnapshotHeaderSize {
@@ -204,24 +212,32 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 		h.ChunkCount = uint64(chunkCount % 8)
 		stopC := make(chan struct{})
 
-		// allocBound is the most receiveChunks may allocate for one stream.
-		// A frame buffer is allocated only after reserveChunkMemory admits
-		// its length (snapshot_recv.go), so the frame buffers of one stream
-		// total at most the budget, fuzzSnapshotMemory; a decoded chunk
-		// copies at most its own frame, which doubles that to
-		// 2*fuzzSnapshotMemory. Neither can exceed the bytes the stream
-		// actually carried either, hence the 2*len(data) term for streams
-		// whose buffers are filled from data. 1 MiB covers the chunk slice,
-		// timers, errors and log records. An allocation made before the
-		// budget check (a MaxFrameSize buffer is 16 MiB) or an oversized one
-		// followed by a decode error lands past it.
-		allocBound := uint64(2*fuzzSnapshotMemory + 2*len(data) + 1<<20)
+		// admitted is the sum of the frame lengths receiveChunks reserves
+		// against the budget, computed by walking a copy of the stream with
+		// the receiver's own functions. A frame buffer is allocated only
+		// after reserveChunkMemory admits its length (snapshot_recv.go), so
+		// a buffer allocated before that check, or for a frame the budget
+		// refuses, lands past allocBound.
+		admitted := fuzzAdmittedFrameBytes(sr, &h, data)
+		// k is 1: SnapshotChunk.UnmarshalFromWindow aliases Data into the
+		// frame buffer (pkg/proto getBytes returns a sub-slice) rather than
+		// copying it, so the frame buffers are the only per-frame
+		// allocation that scales with the frame. allocSlack covers the
+		// chunk slice, the timer, errors and log records, and stays below
+		// every rejected seed frame's length.
+		const k, allocSlack = 1, 64 << 10
+		allocBound := uint64(k*admitted + allocSlack)
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
 		sr.receiveChunks(&testChunkReader{data: data}, &h, fuzzSnapshotPeer, PeerAuth{}, stopC)
 		runtime.ReadMemStats(&after)
 		if delta := after.TotalAlloc - before.TotalAlloc; delta > allocBound {
-			t.Fatalf("receiveChunks allocated %d bytes from a %d byte stream, bound %d", delta, len(data), allocBound)
+			if admitted == 0 {
+				t.Fatalf("receiveChunks allocated %d bytes from a %d byte stream refused before any frame buffer was admitted, bound %d",
+					delta, len(data), allocBound)
+			}
+			t.Fatalf("receiveChunks allocated %d bytes from a %d byte stream with %d frame bytes admitted, bound %d",
+				delta, len(data), admitted, allocBound)
 		}
 
 		if got := sr.memoryBudget.Load(); got != fuzzSnapshotMemory {
@@ -260,6 +276,46 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 			t.Fatalf("delivered %d data bytes from a %d byte stream", total, len(data))
 		}
 	})
+}
+
+// fuzzAdmittedFrameBytes returns the sum of the frame lengths receiveChunks
+// reserves against its memory budget for data, walking a copy of the stream
+// with the receiver's own header, budget, decode and validation steps. A
+// frame the budget refuses is refused before its buffer exists, so it is not
+// counted; a frame that is admitted and then fails to read, decode or
+// validate is counted and ends the walk.
+func fuzzAdmittedFrameBytes(sr *snapshotReceiver, h *SnapshotHeader, data []byte) int {
+	r := bytes.NewReader(data)
+	var admitted int
+	var charged int64
+	for i := uint64(0); i < h.ChunkCount; i++ {
+		length, _, err := readFrameHeaderWindow(r, sr.wire)
+		if err != nil {
+			break
+		}
+		if length == 0 {
+			continue
+		}
+		charge := int64(length) + snapshotChunkStructBytes
+		if charged+charge > sr.maxPerPeerMemory || charged+charge > fuzzSnapshotMemory {
+			break
+		}
+		charged += charge
+		admitted += int(length)
+		if r.Len() < int(length) {
+			break
+		}
+		body := make([]byte, length)
+		_, _ = r.Read(body)
+		var chunk proto.SnapshotChunk
+		if _, err := chunk.UnmarshalFromWindow(body, sr.wire.Proto); err != nil {
+			break
+		}
+		if err := sr.validateChunk(&chunk, h); err != nil {
+			break
+		}
+	}
+	return admitted
 }
 
 // FuzzSnapshotChunkRoundTrip builds a chunk from fuzzed fields, frames it with
