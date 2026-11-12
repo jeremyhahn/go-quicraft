@@ -1011,6 +1011,75 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 
 }
 
+// TestUnmarshalFrom_Uint32CountsAtMaxRejectedUntruncated pins the bounded
+// behaviour of every uint32 count the snapshot decoder reads (#760): at the
+// top of the uint32 range each is widened to uint64 before it is compared,
+// rejected with a BoundsError carrying the full value, and the rejection
+// leaves the manager empty. A narrowing (to int or a smaller type) before
+// the comparison would show up here as a truncated Value or an allocation.
+func TestUnmarshalFrom_Uint32CountsAtMaxRejectedUntruncated(t *testing.T) {
+	const maxU32 = ^uint32(0)
+	u32 := func(buf *bytes.Buffer, v uint32) {
+		var b [4]byte
+		binary.LittleEndian.PutUint32(b[:], v)
+		buf.Write(b[:])
+	}
+	u64 := func(buf *bytes.Buffer, v uint64) {
+		var b [8]byte
+		binary.LittleEndian.PutUint64(b[:], v)
+		buf.Write(b[:])
+	}
+	// header writes one session's fixed fields up to numResponses.
+	header := func(buf *bytes.Buffer, numResponses uint32) {
+		u32(buf, 1) // numSessions
+		u64(buf, 1) // clientID
+		u64(buf, 0) // ownerID
+		u64(buf, 0) // registeredIndex
+		u64(buf, 0) // respondedTo
+		u32(buf, numResponses)
+	}
+
+	tests := []struct {
+		name  string
+		field string
+		build func(buf *bytes.Buffer)
+	}{
+		{"numSessions", "numSessions", func(buf *bytes.Buffer) { u32(buf, maxU32) }},
+		{"numResponses", "numResponses", func(buf *bytes.Buffer) { header(buf, maxU32) }},
+		{"dataLen", "responseDataLen", func(buf *bytes.Buffer) {
+			header(buf, 1)
+			u64(buf, 1)  // seriesID
+			u64(buf, 42) // value
+			u32(buf, maxU32)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(10, 10, 0)
+			var buf bytes.Buffer
+			tc.build(&buf)
+
+			err := m.UnmarshalFrom(&buf)
+			var boundsErr *BoundsError
+			if !errors.As(err, &boundsErr) {
+				t.Fatalf("UnmarshalFrom = %T %v, want *BoundsError", err, err)
+			}
+			if !errors.Is(err, ErrSnapshotCorrupted) {
+				t.Errorf("error %v does not match ErrSnapshotCorrupted", err)
+			}
+			if boundsErr.Field != tc.field {
+				t.Errorf("Field = %q, want %q", boundsErr.Field, tc.field)
+			}
+			if boundsErr.Value != uint64(maxU32) {
+				t.Errorf("Value = %d, want %d (untruncated)", boundsErr.Value, uint64(maxU32))
+			}
+			if n := m.Count(); n != 0 {
+				t.Errorf("Count() = %d after rejected snapshot, want 0", n)
+			}
+		})
+	}
+}
+
 func TestBoundsError(t *testing.T) {
 	t.Run("error message", func(t *testing.T) {
 		err := &BoundsError{Field: "numSessions", Value: 100, Limit: 50}
