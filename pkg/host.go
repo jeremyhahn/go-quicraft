@@ -3476,11 +3476,15 @@ type Host struct {
 	dirLock     *fsutil.DirLock
 	nodes       sync.Map     // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
 	activeNodes atomic.Int64 // tracks the number of loaded shards (replaces len(h.nodes))
-	closed      atomic.Bool
-	draining    atomic.Bool
-	diskFull    *atomic.Bool // set by disk full callback in buildWALOptions
-	id          string
-	stopOnce    sync.Once
+	closed      atomic.Bool  // shutdown admitted: set at the start of Close
+	// closeDone is set once Close's shutdown work has completed. EmergencySeal
+	// keeps sealing while closed is set but closeDone is not, because Close
+	// seals the barrier only after it has drained and stopped the engine.
+	closeDone atomic.Bool
+	draining  atomic.Bool
+	diskFull  *atomic.Bool // set by disk full callback in buildWALOptions
+	id        string
+	stopOnce  sync.Once
 	// closeErr is the shutdown outcome the FIRST Close computed. Every other
 	// Close returns it too, which is only safe because stopOnce.Do publishes
 	// the write to every caller that blocked on it.
@@ -10068,6 +10072,7 @@ func (h *Host) Close() error {
 
 		h.logger.Info("host closed", "id", h.id)
 		h.closeErr = closeErr
+		h.closeDone.Store(true)
 	})
 
 	return h.closeErr
@@ -10720,10 +10725,12 @@ func (h *Host) RaftAddress() string {
 // EmergencySeal immediately seals the barrier without waiting for in-flight
 // operations to complete. All in-flight operations will fail with
 // ErrBarrierSealed. This is for security incident response where speed
-// matters more than graceful shutdown. On a closed host it returns
-// ErrClosed: Close has already sealed the barrier.
+// matters more than graceful shutdown. While Close is still running it
+// seals the barrier: Close seals it only after draining and stopping the
+// engine, which can take arbitrarily long. Once Close has completed it
+// returns ErrClosed: Close has already sealed the barrier.
 func (h *Host) EmergencySeal() error {
-	if h.closed.Load() {
+	if h.closeDone.Load() {
 		return ErrClosed
 	}
 	if h.barrier == nil {
