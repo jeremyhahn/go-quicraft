@@ -17,11 +17,13 @@ package quicraft
 import (
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,6 +151,17 @@ func newConcurrentProposeHosts(t *testing.T) ([]*Host, map[uint64]string, map[ui
 	return hosts, members, ids
 }
 
+// concurrentProposeLeader returns the host that reports itself leader of the
+// shard, or nil when none does.
+func concurrentProposeLeader(hosts []*Host) *Host {
+	for _, n := range hosts {
+		if info, err := n.ShardInfo(concurrentProposeShard); err == nil && info.IsLeader {
+			return n
+		}
+	}
+	return nil
+}
+
 func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T) {
 	if testing.Short() {
 		t.Skip("three-host cluster over loopback QUIC")
@@ -176,13 +189,11 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 		}
 	}
 
-	var leader *Host
+	var leader atomic.Pointer[Host]
 	if !waitUntil(20*time.Second, func() bool {
-		for _, n := range hosts {
-			if info, err := n.ShardInfo(concurrentProposeShard); err == nil && info.IsLeader {
-				leader = n
-				return true
-			}
+		if l := concurrentProposeLeader(hosts); l != nil {
+			leader.Store(l)
+			return true
 		}
 		return false
 	}) {
@@ -192,11 +203,22 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// Each SyncPropose outcome falls in one class, and each class bounds how
+	// many times a replica may apply the key:
+	//   - acked: acknowledged, applied exactly once;
+	//   - maybe: already submitted to raft when it failed (MaybeApplied),
+	//     applied at most once;
+	//   - refused: a not-leader refusal before submission, applied zero times;
+	//   - failed: any other error, which fails the test.
+	// A leader change during the run is legitimate; a refused proposer
+	// re-resolves the leader and carries on with its next key.
 	var (
-		ackMu  sync.Mutex
-		acked  = make(map[string]struct{}, goroutines*perG)
-		failed = make(map[string]error)
-		wg     sync.WaitGroup
+		ackMu   sync.Mutex
+		acked   = make(map[string]struct{}, goroutines*perG)
+		maybe   = make(map[string]error)
+		refused = make(map[string]error)
+		failed  = make(map[string]error)
+		wg      sync.WaitGroup
 	)
 	for g := range goroutines {
 		wg.Add(1)
@@ -204,14 +226,30 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 			defer wg.Done()
 			for i := range perG {
 				key := fmt.Sprintf("g%02d-k%02d", g, i)
-				_, err := leader.SyncPropose(ctx, concurrentProposeShard, []byte(key))
+				_, err := leader.Load().SyncPropose(ctx, concurrentProposeShard, []byte(key))
+				moved := false
 				ackMu.Lock()
-				if err != nil {
-					failed[key] = err
-				} else {
+				switch {
+				case err == nil:
 					acked[key] = struct{}{}
+				case MaybeApplied(err):
+					maybe[key] = err
+				case errors.Is(err, ErrNotLeader):
+					refused[key] = err
+					moved = true
+				default:
+					failed[key] = err
 				}
 				ackMu.Unlock()
+				if moved {
+					waitUntil(5*time.Second, func() bool {
+						if l := concurrentProposeLeader(hosts); l != nil {
+							leader.Store(l)
+							return true
+						}
+						return false
+					})
+				}
 			}
 		}()
 	}
@@ -223,10 +261,23 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 	if len(acked) == 0 {
 		t.Fatal("no proposal was acknowledged")
 	}
+	if len(maybe)+len(refused) > 0 {
+		t.Logf("leadership moved during the run: %d proposals may still commit, %d refused before submission",
+			len(maybe), len(refused))
+	}
+
+	// The leader may have moved; read the applied index from the current one.
+	var current *Host
+	if !waitUntil(20*time.Second, func() bool {
+		current = concurrentProposeLeader(hosts)
+		return current != nil
+	}) {
+		t.Fatal("no leader after the run")
+	}
 
 	// Every replica must reach the leader's applied index before its record
 	// is read; a follower may trail the acknowledgements.
-	_, want, _, err := leader.StateMachineHash(concurrentProposeShard)
+	_, want, _, err := current.StateMachineHash(concurrentProposeShard)
 	if err != nil {
 		t.Fatalf("leader StateMachineHash: %v", err)
 	}
@@ -255,9 +306,20 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 			}
 		}
 		for key, n := range applied {
-			if _, ok := acked[key]; !ok {
-				t.Errorf("replica %d applied unacknowledged key %s (%d times)", id, key, n)
+			if _, ok := acked[key]; ok {
+				continue
 			}
+			if _, ok := refused[key]; ok {
+				t.Errorf("replica %d applied key %s refused before submission (%d times), want 0", id, key, n)
+				continue
+			}
+			if _, ok := maybe[key]; ok {
+				if n > 1 {
+					t.Errorf("replica %d applied may-still-commit key %s %d times, want at most 1", id, key, n)
+				}
+				continue
+			}
+			t.Errorf("replica %d applied unacknowledged key %s (%d times)", id, key, n)
 		}
 	}
 
