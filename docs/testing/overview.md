@@ -160,25 +160,28 @@ start gets the larger budget because it pays for connection handshakes first.
 
 ### E2E test files
 
-`test/integration/e2e/` holds 68 scenario tests plus one budget pin test.
-Three files also need `quicraft_netfault`.
+`test/integration/e2e/` holds 48 scenario tests plus two harness pins in
+`helpers_test.go` (the election budget pin and the host config that skips WAL
+sync). Three files also need `quicraft_netfault`.
 
 | File | Tests | Covers |
 |---|---|---|
-| `replication_test.go` | 10 | single entry, sequential, concurrent proposals, stale read, large values, 3N and 5N |
-| `failover_test.go` | 9 | leader kill and re-election, data survival, proposals after failover, exact-quorum cases |
-| `cluster_test.go` | 6 | 3N/5N election, leader agreement, multiple shards on one cluster |
-| `asymmetric_partition_test.go` | 6 | leader isolated from a minority or majority, follower isolated, snapshot catch-up after |
-| `membership_test.go` | 5 | add, remove, round-trip, proposal after removal |
-| `membership_election_test.go` | 4 | elections across a membership change |
-| `barrier_test.go` | 4 | propose and read through an encrypted barrier, replication, snapshot restore, 5N |
-| `replacement_test.go` | 4 | replace a follower in 3N and 5N, data integrity, continued writes |
+| `paused_replica_test.go` | 8 | a paused follower or leader, idle, under load and across a seal cycle; snapshot recovery after resume; a paused shard leaves its shared worker unaffected |
+| `replication_test.go` | 5 | sequential and concurrent proposals, stale read from a follower, 3N and 5N |
+| `asymmetric_partition_test.go` | 4 | leader isolated from a minority or majority, follower isolated, snapshot catch-up after |
+| `membership_election_test.go` | 4 | membership change during an election and alongside proposals, multi-shard failover under load, leader transfer during concurrent writes |
 | `sealed_replica_test.go` | 4 | a sealed follower or leader, on an idle cluster and under load |
+| `cluster_test.go` | 3 | 3N election, 5N leader agreement, multiple shards on one cluster |
 | `barrier_replacement_test.go` | 3 | replacement and snapshot catch-up with a barrier, key rotation mid-replacement |
-| `snapshot_catchup_test.go` | 3 | new node catch-up via snapshot, data integrity, 5N |
-| `partition_test.go` | 3 | minority cannot elect, majority commits, heal and reconverge |
 | `netpartition_test.go` | 3 | `quicraft_netfault`: deposed live leader, asymmetric leader, 2-of-4 cannot elect |
+| `failover_test.go` | 2 | proposals after failover, 3N and 5N |
+| `membership_test.go` | 2 | add/remove round-trip, proposal after removal |
+| `barrier_test.go` | 2 | propose and read through an encrypted barrier, 5N |
 | `quorum_loss_test.go` | 2 | writes rejected without quorum, recovery |
+| `replacement_test.go` | 1 | replace a follower in 3N |
+| `snapshot_catchup_test.go` | 1 | new node catch-up via snapshot |
+| `partition_test.go` | 1 | heal and reconverge after a partition |
+| `quorum_loss_runbook_test.go` | 1 | the quorum-loss recovery runbook end to end |
 | `election_safety_netfault_test.go` | 1 | `quicraft_netfault`: a spent term cannot be won twice |
 | `propose_to_leader_netfault_test.go` | 1 | `quicraft_netfault`: a proposal resolves past an isolated incumbent leader |
 
