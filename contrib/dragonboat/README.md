@@ -28,26 +28,8 @@ depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
   `quicraft.HostOption` values; they must state the at-rest encryption
   (`quicraft.WithBarrier` or `quicraft.WithoutEncryption`), and the
   constructor fails with a `NodeHostConstructionError` if they state neither.
-- The `NodeHost` surface:
-  - lifecycle: `StartReplica`, `StartConcurrentReplica`, `StartOnDiskReplica`,
-    `StopReplica`, `StopShard`, `Close`;
-  - proposals and reads: `SyncPropose`, `Propose`, `ProposeSession`,
-    `SyncRead`, `ReadIndex`, `ReadLocalNode`, `NAReadLocalNode`, `StaleRead`;
-  - sessions: `GetNoOPSession`, `SyncGetSession`, `SyncCloseSession`;
-  - membership: `SyncGetShardMembership`, `GetShardMembership`, `GetLeaderID`,
-    and `RequestAddReplica`, `RequestAddNonVoting`, `RequestAddWitness`, each
-    with a `Sync…` form and a `…WithIdentity` form, plus
-    `RequestDeleteReplica` / `SyncRequestDeleteReplica` and
-    `RequestLeaderTransfer`;
-  - snapshots and storage: `RequestSnapshot`, `SyncRequestSnapshot`,
-    `ExportSnapshot`, `ImportSnapshot`, `RequestCompaction`, `RemoveData`,
-    `SyncRemoveData`, `QueryRaftLog`, `GetLogReader`;
-  - introspection: `ID`, `RaftAddress`, `GetNodeHostInfo`, `GetShardInfo`,
-    `HasNodeInfo`, `GetNodeHostRegistry`, `GetNodeUser`, `NodeHostConfig`,
-    `NodeIdentity`;
-  - QuicRaft extensions: `SetQueryTimeout` and `QueryTimeout` bound the
-    state machine `Lookup` behind `ReadLocalNode`. The default is 0, no
-    deadline, as in Dragonboat.
+- The `NodeHost` surface, method by method, is in
+  [NodeHost methods](#nodehost-methods) below.
 - `NAReadLocalNode` behaves as in Dragonboat v4: after a completed
   `ReadIndex` it passes the byte-slice query to the state machine's
   `statemachine.IExtended.NALookup` and returns `statemachine.ErrNotImplemented`
@@ -84,6 +66,78 @@ depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
   `GetNoOPSession`, …) keep Dragonboat's names; the `quicraft.Host` methods
   behind them carry no prefix (`LeaderID`, `ShardMembership`, `NoOPSession`).
   See [docs/multi-group-host/api.md](../../docs/multi-group-host/api.md).
+
+## NodeHost methods
+
+Every exported method of this package's `NodeHost`, against the `NodeHost` of
+Dragonboat v4 (v4.0.1). "Dragonboat" says whether Dragonboat has the method;
+"Difference" is empty when the method behaves as Dragonboat's does. Every
+method takes the same arguments as Dragonboat's; `Target` is an alias of
+`string`. `readme_table_test.go` fails when an exported method is missing from
+this table or the table names one the package does not export.
+
+| Method | Dragonboat | Difference |
+| --- | --- | --- |
+| `Close` | yes | Logs a warning when the QuicRaft host's close returns an error. |
+| `ExportSnapshot` | no | QuicRaft extension: streams the shard's latest snapshot to an `io.Writer`; the shard needs at least one snapshot. |
+| `GetLeaderID` | yes | |
+| `GetLogReader` | yes | |
+| `GetNoOPSession` | yes | |
+| `GetNodeHostInfo` | yes | |
+| `GetNodeHostRegistry` | yes | Always `nil, false`: QuicRaft has no gossip registry. |
+| `GetNodeUser` | yes | The shard must be running on this host. |
+| `GetShardInfo` | no | QuicRaft extension: the shard's `ShardInfo`, and false when it is not loaded here. |
+| `GetShardMembership` | no | QuicRaft extension: the committed membership from the local replica, without the `ReadIndex` of `SyncGetShardMembership`. |
+| `HasNodeInfo` | yes | |
+| `ID` | yes | |
+| `ImportSnapshot` | no | QuicRaft extension, in place of Dragonboat's `tools.ImportSnapshot`: imports a snapshot from an `io.Reader` into a stopped shard, which recovers from it at its next start. |
+| `NAReadLocalNode` | yes | Also bounded by `QueryTimeout`. |
+| `NodeHostConfig` | yes | |
+| `NodeIdentity` | no | QuicRaft extension: the identity peers must commit for this host before they count its messages; empty without a transport. |
+| `Propose` | yes | |
+| `ProposeSession` | yes | Registration runs in its own goroutine, since QuicRaft registers synchronously; the result comes through the `RequestState`. |
+| `QueryRaftLog` | yes | Runs synchronously; the returned `RequestState` is already resolved. |
+| `QueryTimeout` | no | QuicRaft extension: the deadline `ReadLocalNode` and `NAReadLocalNode` put on `Lookup`; 0, no deadline, by default. |
+| `RaftAddress` | yes | |
+| `ReadIndex` | yes | |
+| `ReadLocalNode` | yes | Before the `ReadIndex` completes it returns `ErrInvalidOperation`; after a failed one, that failure. Bounded by `QueryTimeout`. |
+| `ReloadMutualTLS` | no | QuicRaft extension: re-reads the configured CA, certificate and key and uses them for new handshakes; the node identity must not change. |
+| `RemoveData` | yes | Persists a removal marker, so the replica cannot restart on this host; a marker failure returns `RemovalMarkerError`. |
+| `RequestAddNonVoting` | yes | Refused on a host with a transport, which needs `RequestAddNonVotingWithIdentity`. |
+| `RequestAddNonVotingWithIdentity` | no | QuicRaft extension: `RequestAddNonVoting` with the identity the shard commits for the member. |
+| `RequestAddReplica` | yes | A change invalid against the current membership fails at once, with a nil `RequestState`. Refused on a host with a transport (`quicraft.ErrMemberIdentityRequired`), which needs `RequestAddReplicaWithIdentity`. |
+| `RequestAddReplicaWithIdentity` | no | QuicRaft extension: `RequestAddReplica` with the identity the shard commits for the member. |
+| `RequestAddWitness` | yes | A change invalid against the current membership fails at once, with a nil `RequestState`. Refused on a host with a transport, which needs `RequestAddWitnessWithIdentity`. |
+| `RequestAddWitnessWithIdentity` | no | QuicRaft extension: `RequestAddWitness` with the identity the shard commits for the member. |
+| `RequestCompaction` | yes | Runs synchronously; the `SysOpState` is already complete. A shard that is not loaded is not compacted to `MaxUint64`: segment GC follows the existing compaction markers. |
+| `RequestDeleteReplica` | yes | A change invalid against the current membership fails at once, with a nil `RequestState`. |
+| `RequestLeaderTransfer` | yes | |
+| `RequestSnapshot` | yes | |
+| `SetQueryTimeout` | no | QuicRaft extension: sets `QueryTimeout`; zero or negative restores no deadline. |
+| `StaleRead` | yes | |
+| `StartConcurrentReplica` | yes | On a host with a transport, `config.Config.MemberIdentities` names the founding members' identities. |
+| `StartOnDiskReplica` | yes | As `StartConcurrentReplica`. |
+| `StartReplica` | yes | As `StartConcurrentReplica`. |
+| `StopReplica` | yes | |
+| `StopShard` | yes | |
+| `SyncCloseSession` | yes | |
+| `SyncGetSession` | yes | |
+| `SyncGetShardMembership` | yes | |
+| `SyncPropose` | yes | |
+| `SyncRead` | yes | |
+| `SyncRemoveData` | yes | As `RemoveData`. |
+| `SyncRequestAddNonVoting` | yes | Refused on a host with a transport, which needs `SyncRequestAddNonVotingWithIdentity`. |
+| `SyncRequestAddNonVotingWithIdentity` | no | QuicRaft extension: `SyncRequestAddNonVoting` with the member's identity. |
+| `SyncRequestAddReplica` | yes | Refused on a host with a transport, which needs `SyncRequestAddReplicaWithIdentity`. |
+| `SyncRequestAddReplicaWithIdentity` | no | QuicRaft extension: `SyncRequestAddReplica` with the member's identity. |
+| `SyncRequestAddWitness` | yes | Refused on a host with a transport, which needs `SyncRequestAddWitnessWithIdentity`. |
+| `SyncRequestAddWitnessWithIdentity` | no | QuicRaft extension: `SyncRequestAddWitness` with the member's identity. |
+| `SyncRequestDeleteReplica` | yes | |
+| `SyncRequestSnapshot` | yes | |
+
+Dragonboat v4 `NodeHost` methods this package does not provide: none. The
+package-level `WriteHealthMetrics` exists but writes nothing (see "Not
+supported" above).
 
 The performance comparison in `test/performance/dragonboat` does not use this
 shim. It benchmarks a Dragonboat fork directly; see
