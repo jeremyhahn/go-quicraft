@@ -371,6 +371,51 @@ func TestHostClosedEmergencySealDuringClose(t *testing.T) {
 	}
 }
 
+// flakySealBarrier is a mockBarrier whose first Seal fails without sealing;
+// every later Seal behaves as mockBarrier's.
+type flakySealBarrier struct {
+	mockBarrier
+	failOnce sync.Once
+	failErr  error
+}
+
+func (b *flakySealBarrier) Seal() error {
+	failed := false
+	b.failOnce.Do(func() { failed = true })
+	if failed {
+		return b.failErr
+	}
+	return b.mockBarrier.Seal()
+}
+
+// TestHostClosedEmergencySealRetriesFailedCloseSeal checks that a Close whose
+// barrier seal failed does not turn EmergencySeal into a no-op: the operator's
+// key-destruction path must still seal the barrier, and only once it has
+// does EmergencySeal report ErrClosed.
+func TestHostClosedEmergencySealRetriesFailedCloseSeal(t *testing.T) {
+	sealFailure := errors.New("seal failure")
+	b := &flakySealBarrier{failErr: sealFailure}
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	if err := h.Close(); !errors.Is(err, sealFailure) {
+		t.Fatalf("Close: got %v, want the seal failure", err)
+	}
+	if b.IsSealed() {
+		t.Fatal("barrier sealed although Close's seal failed")
+	}
+	if err := h.EmergencySeal(); err != nil {
+		t.Fatalf("EmergencySeal after a failed Close seal: got %v, want nil", err)
+	}
+	if !b.IsSealed() {
+		t.Fatal("EmergencySeal after a failed Close seal left the barrier unsealed")
+	}
+	if err := h.EmergencySeal(); !errors.Is(err, ErrClosed) {
+		t.Errorf("EmergencySeal after a successful retry: got %v, want ErrClosed", err)
+	}
+}
+
 // closeDeadline bounds every Close call in the closed-host tests.
 const closeDeadline = 30 * time.Second
 
