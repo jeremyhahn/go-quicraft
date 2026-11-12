@@ -38,9 +38,6 @@ const (
 	// closedGetter: the method has no error to return and is documented
 	// as safe after Close; it must only return without panicking.
 	closedGetter
-	// closedExempt: documented to keep its own behaviour after Close; it
-	// must only return without panicking or blocking. Each entry says why.
-	closedExempt
 	// closedSelf: Close itself, covered by TestHostClosedCloseIdempotent.
 	closedSelf
 )
