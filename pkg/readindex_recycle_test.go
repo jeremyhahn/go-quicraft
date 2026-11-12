@@ -105,6 +105,9 @@ func TestPendingReadRecycleUnderContention(t *testing.T) {
 	var nextKey atomic.Uint64
 	var failures atomic.Int64
 	var wg sync.WaitGroup
+	// completers tracks every completer goroutine so the test returns
+	// only after the last releaseRef (and its tryRecycle) has run.
+	var completers sync.WaitGroup
 	wg.Add(workers)
 	for w := 0; w < workers; w++ {
 		go func() {
@@ -113,7 +116,9 @@ func TestPendingReadRecycleUnderContention(t *testing.T) {
 				key := nextKey.Add(1)
 				rs := newRequestState(pool, key, time.Time{}, true)
 				rs.acquireRef()
+				completers.Add(1)
 				go func() {
+					defer completers.Done()
 					rs.complete(RequestResult{Value: key})
 					rs.releaseRef()
 				}()
@@ -126,6 +131,7 @@ func TestPendingReadRecycleUnderContention(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	completers.Wait()
 	if n := failures.Load(); n != 0 {
 		t.Fatalf("%d requests found their RequestState in use by another request", n)
 	}
