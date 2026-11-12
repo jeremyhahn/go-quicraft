@@ -111,22 +111,30 @@ func (c *sessionRetryCluster) leader() int {
 	c.t.Helper()
 	idx := -1
 	if !waitUntil(20*time.Second, func() bool {
-		idx = -1
-		for i, n := range c.nodes {
-			info, err := n.host.ShardInfo(retryShard)
-			if err != nil {
-				return false
-			}
-			if info.IsLeader {
-				if idx >= 0 {
-					return false
-				}
-				idx = i
-			}
-		}
+		idx = c.leaderNow()
 		return idx >= 0
 	}) {
 		c.t.Fatal("no single leader elected")
+	}
+	return idx
+}
+
+// leaderNow probes every node once and returns the index of the single
+// node that reports itself leader, or -1 when there is none or more than
+// one. It never blocks, so a caller can bound the wait by its own deadline.
+func (c *sessionRetryCluster) leaderNow() int {
+	idx := -1
+	for i, n := range c.nodes {
+		info, err := n.host.ShardInfo(retryShard)
+		if err != nil {
+			return -1
+		}
+		if info.IsLeader {
+			if idx >= 0 {
+				return -1
+			}
+			idx = i
+		}
 	}
 	return idx
 }
@@ -209,10 +217,12 @@ func proposeOnce(t *testing.T, h *Host, session *Session, cmd []byte) RequestRes
 
 func newRetrySession(t *testing.T, c *sessionRetryCluster) (*Session, int) {
 	t.Helper()
+	// Resolve the initial leader before the registration deadline starts:
+	// a slow first election must not eat NewSession's budget.
+	idx := c.leader()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for {
-		idx := c.leader()
 		session, err := c.nodes[idx].host.NewSession(ctx, retryShard)
 		if err == nil {
 			return session, idx
@@ -221,11 +231,16 @@ func newRetrySession(t *testing.T, c *sessionRetryCluster) (*Session, int) {
 			t.Fatalf("NewSession on node %d: %v", idx, err)
 		}
 		// Leadership moved, or this node's view is not settled yet:
-		// re-resolve the leader and try again within the deadline.
-		select {
-		case <-ctx.Done():
-			t.Fatalf("NewSession on node %d: %v (deadline: %v)", idx, err, ctx.Err())
-		case <-time.After(50 * time.Millisecond):
+		// re-resolve the leader within the remaining deadline.
+		prev := idx
+		idx = -1
+		for idx < 0 {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("NewSession on node %d: %v (deadline: %v)", prev, err, ctx.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
+			idx = c.leaderNow()
 		}
 	}
 }
