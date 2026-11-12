@@ -246,3 +246,110 @@ func TestMetricsDocumented_EveryMentionedNameIsRegistered(t *testing.T) {
 		}
 	}
 }
+
+// multiGroupHostAPIDoc is the multi-group-host API reference, relative to this
+// package. Its §Metrics table is a second list of metric names.
+const multiGroupHostAPIDoc = "../docs/multi-group-host/api.md"
+
+// perShardOnlyMarker suffixes a label in the multi-group-host table that is
+// present only when PerShardMetrics is on.
+const perShardOnlyMarker = "*"
+
+// readMultiGroupHostMetricList parses the Subsystem | Metric | Type | Labels
+// table in the multi-group-host API reference and returns its rows by name.
+func readMultiGroupHostMetricList(t *testing.T) map[string]documentedMetric {
+	t.Helper()
+	f, err := os.Open(multiGroupHostAPIDoc)
+	if err != nil {
+		t.Fatalf("open %s: %v", multiGroupHostAPIDoc, err)
+	}
+	defer f.Close()
+
+	rows := make(map[string]documentedMetric)
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "|") {
+			continue
+		}
+		cells := strings.Split(strings.Trim(line, "|"), "|")
+		if len(cells) != 4 || !strings.HasPrefix(strings.TrimSpace(cells[1]), "`quicraft_") {
+			continue
+		}
+		name := strings.Trim(strings.TrimSpace(cells[1]), "`")
+		if _, dup := rows[name]; dup {
+			t.Errorf("%s: metric %s listed twice", multiGroupHostAPIDoc, name)
+		}
+		rows[name] = documentedMetric{
+			typ:    strings.ToLower(strings.TrimSpace(cells[2])),
+			labels: strings.TrimSpace(cells[3]),
+		}
+	}
+	if err := sc.Err(); err != nil {
+		t.Fatalf("read %s: %v", multiGroupHostAPIDoc, err)
+	}
+	if len(rows) == 0 {
+		t.Fatalf("%s: no metric table found", multiGroupHostAPIDoc)
+	}
+	return rows
+}
+
+// multiGroupHostLabels returns the sorted label names a multi-group-host row
+// documents for the given label mode: "none" is no labels, and a label marked
+// with perShardOnlyMarker is present only in per-shard mode.
+func multiGroupHostLabels(cell string, perShard bool) []string {
+	if cell == "none" {
+		return nil
+	}
+	var out []string
+	for _, l := range strings.Split(cell, ",") {
+		l = strings.Trim(strings.TrimSpace(l), "`")
+		if strings.HasSuffix(l, perShardOnlyMarker) {
+			if !perShard {
+				continue
+			}
+			l = strings.TrimSuffix(l, perShardOnlyMarker)
+		}
+		out = append(out, l)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestMetricsDocumented_MultiGroupHostListMatchesRegistry checks the metric
+// table in the multi-group-host API reference against the collector in both
+// label modes: every row is a registered family with the stated type and
+// labels, and every registered family is listed.
+func TestMetricsDocumented_MultiGroupHostListMatchesRegistry(t *testing.T) {
+	rows := readMultiGroupHostMetricList(t)
+	for _, perShard := range []bool{false, true} {
+		name := "aggregated"
+		if perShard {
+			name = "per_shard"
+		}
+		t.Run(name, func(t *testing.T) {
+			registered := make(map[string]bool)
+			for _, mf := range exercisedFamilies(t, perShard) {
+				registered[mf.GetName()] = true
+				row, ok := rows[mf.GetName()]
+				if !ok {
+					t.Errorf("%s is registered but not in %s", mf.GetName(), multiGroupHostAPIDoc)
+					continue
+				}
+				if got := promTypeName(mf.GetType()); got != row.typ {
+					t.Errorf("%s: registered type %s, %s says %s", mf.GetName(), got, multiGroupHostAPIDoc, row.typ)
+				}
+				got := strings.Join(familyLabels(mf), ",")
+				want := strings.Join(multiGroupHostLabels(row.labels, perShard), ",")
+				if got != want {
+					t.Errorf("%s: registered labels [%s], %s says [%s] (cell %q)", mf.GetName(), got, multiGroupHostAPIDoc, want, row.labels)
+				}
+			}
+			for n := range rows {
+				if !registered[n] {
+					t.Errorf("%s lists %s, which the collector does not register", multiGroupHostAPIDoc, n)
+				}
+			}
+		})
+	}
+}
