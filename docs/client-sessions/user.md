@@ -129,8 +129,14 @@ session, err := host.RegisterSession(ctx, quicraft.NewSession(shardID, savedClie
 ```
 
 Registration fails with a `*SessionError` while the shard still holds that
-client ID. Entries left over from an earlier session under the same ID are
-answered as expired, never applied a second time.
+client ID. Re-registering never re-applies what an earlier session under the
+same ID committed, and while no session holds the ID, any entry sent under it
+is answered as expired. Once the ID is registered again, an entry is a
+proposal of the new session: the log records no session generation, so an
+old session's proposal resent then is applied as a new one. Before you
+re-register an ID, drop every unacknowledged proposal from its earlier session
+and treat its outcome as unknown; resend the command only on the new session,
+where it is applied as a new command.
 
 ## Size the limits
 
