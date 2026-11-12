@@ -51,16 +51,24 @@ func putExampleKeys(ctx context.Context, h *quicraft.Host, kvs ...string) error 
 // hasRegularFile reports whether the tree under root holds a non-empty file.
 func hasRegularFile(root string) bool {
 	found := false
-	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	err := filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
 			return nil
 		}
-		if info, err := d.Info(); err == nil && info.Size() > 0 {
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.Size() > 0 {
 			found = true
+			return fs.SkipAll
 		}
 		return nil
 	})
-	return found
+	return err == nil && found
 }
 
 // ExampleHost_SyncRequestSnapshot takes a snapshot on demand, as the guide's
