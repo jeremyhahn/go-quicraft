@@ -1450,6 +1450,37 @@ func (e *ImportLayoutUnknownError) Is(target error) bool {
 	return target == ErrImportLayoutUnknown
 }
 
+// ErrRemoveDataLayoutUnknown is the sentinel for
+// *RemoveDataLayoutUnknownError.
+var ErrRemoveDataLayoutUnknown = errors.New("quicraft: RemoveData cannot determine the replica's snapshot directory")
+
+// RemoveDataLayoutUnknownError is returned by RemoveData when the replica has
+// no bootstrap record and no pending removal intent, and its LogDB snapshot
+// record names a Filepath that lies in no replica snapshot layout this host
+// creates. RemoveData refuses before anything is retired or deleted, rather
+// than report a success that leaves the snapshots behind.
+type RemoveDataLayoutUnknownError struct {
+	// ShardID is the shard whose data was to be removed.
+	ShardID uint64
+	// ReplicaID is the replica whose data was to be removed.
+	ReplicaID uint64
+	// Filepath is the snapshot record's path that matched no layout.
+	Filepath string
+}
+
+// Error returns a human-readable description of the error.
+func (e *RemoveDataLayoutUnknownError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: RemoveData of shard %d replica %d: snapshot record path %q lies in no replica snapshot layout",
+		e.ShardID, e.ReplicaID, e.Filepath,
+	)
+}
+
+// Is reports whether target matches the sentinel ErrRemoveDataLayoutUnknown.
+func (e *RemoveDataLayoutUnknownError) Is(target error) bool {
+	return target == ErrRemoveDataLayoutUnknown
+}
+
 // ErrImportMembershipInvalid is the sentinel for *ImportMembershipInvalidError.
 var ErrImportMembershipInvalid = errors.New("quicraft: snapshot import membership override is not usable")
 

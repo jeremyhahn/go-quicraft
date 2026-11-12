@@ -11332,8 +11332,13 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 // (which then need not be written again). In order: the bootstrap record's
 // DataDir (StartShard records one for every start, a join included); else
 // a pending intent's path (a removal that retired the replica, dropping the
-// record, and then failed or crashed); else the NodeHostDir layout
-// StartShard uses for an empty DataDir.
+// record, and then failed or crashed); else the replica directory the LogDB
+// snapshot record's Filepath lies in (a replica imported with
+// WithImportDataDir, or joined before joins were recorded, under a custom
+// DataDir); else, with no snapshot record, the NodeHostDir layout StartShard
+// uses for an empty DataDir. A snapshot record whose Filepath lies in no
+// replica layout is a *RemoveDataLayoutUnknownError, returned before
+// anything is retired or deleted.
 func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, error) {
 	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
 	if err != nil {
@@ -11348,8 +11353,54 @@ func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, e
 	} else if pending {
 		return p, true, nil
 	}
+	ss, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil && !errors.Is(err, logdb.ErrNoSnapshot) {
+		return "", false, err
+	}
+	if err == nil && ss.Filepath != "" {
+		dir, ok := replicaSnapshotDirFromRecord(ss.Filepath, shardID, replicaID)
+		if !ok {
+			return "", false, &RemoveDataLayoutUnknownError{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				Filepath:  ss.Filepath,
+			}
+		}
+		return dir, false, nil
+	}
 	return engine.ReplicaSnapshotDir(
 		shardSnapshotBaseDir(h.cfg.NodeHostDir, "", shardID), shardID, replicaID), false, nil
+}
+
+// replicaSnapshotDirFromRecord returns the replica snapshot directory a
+// snapshot record's path lies in. It walks up from path to the ancestor
+// named replica-<replicaID> whose parent is shard-<shardID>, derives the
+// DataDir that layout implies (shardSnapshotBaseDir puts one more
+// shard-<shardID> level between the DataDir and that parent), and accepts
+// the ancestor only when it is exactly the directory StartShard creates for
+// that DataDir. The NodeHostDir layout is the DataDir NodeHostDir/snapshots.
+func replicaSnapshotDirFromRecord(path string, shardID, replicaID uint64) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	replicaBase := fmt.Sprintf("replica-%d", replicaID)
+	shardBase := fmt.Sprintf("shard-%d", shardID)
+	dir := filepath.Clean(path)
+	for {
+		parent := filepath.Dir(dir)
+		if filepath.Base(dir) == replicaBase && filepath.Base(parent) == shardBase {
+			dataDir := filepath.Dir(filepath.Dir(parent))
+			want := engine.ReplicaSnapshotDir(shardSnapshotBaseDir("", dataDir, shardID), shardID, replicaID)
+			if dir == want {
+				return dir, true
+			}
+			return "", false
+		}
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
 }
 
 // removeDataIntentDir is the directory under NodeHostDir holding RemoveData's
