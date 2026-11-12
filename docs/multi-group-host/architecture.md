@@ -2,8 +2,10 @@
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — the `Host`, its options,
 > `RequestState`, `Membership`, `ShardInfo`, the error and metrics vocabulary,
-> and `pkg/config` · Last verified: 2026-10-13
+> and `pkg/config` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are excerpts: abridged from the source they describe, they do not
+> compile on their own.
 
 The `Host` is the library's single entry point: one per process, managing shard
 lifecycle, proposal routing, reads, sessions and membership. This document is

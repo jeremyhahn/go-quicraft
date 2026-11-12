@@ -313,8 +313,8 @@ defer release()
 ```
 
 Calling `release` twice is safe. Not calling it leaks a pooled buffer; using
-`result` afterwards reads someone else's bytes. Without `NALookupInto` the
-`*Buf` reads still work, through `BytesLookup` or `Lookup`, with an ordinary
+`result` afterwards reads someone else's bytes. Without `NALookupInto`
+`SyncReadBuf` and `StaleReadBuf` still work, through `BytesLookup` or `Lookup`, with an ordinary
 allocation and a no-op `release`.
 
 ## `CachedDiskStateMachine`
@@ -478,19 +478,24 @@ process `slog` default is used.
 
 `local` is this node's configuration, used only while the shard has no
 replicated policy (a `join=true` replica that has not yet received the shard's
-configuration). `replicated` returns the shard's committed policy and always
-wins, even when it is looser: a replica enforcing a stricter local limit would
-refuse registrations its peers admit and then answer `ResultSessionExpired` for
-entries the rest of the shard applies. The policy is one struct rather than
-adjacent `uint64` parameters so the limits cannot be transposed.
+configuration). `replicated` returns the shard's committed policy, and once it
+is set `local` must equal it: the state machine compares the two when it is
+built (every restart and every bootstrap, so `StartShard` returns the error)
+and when a joining replica first learns the policy in `Apply` or
+`RecoverFromSnapshot` (the shard fails), refusing a disagreement with
+`ErrSessionPolicyMismatch`. Silently adopting either side would be unsafe: a
+replica enforcing a different limit would refuse registrations its peers admit
+and then answer `ResultSessionExpired` for entries the rest of the shard
+applies. `replicated` may be `nil`, which pins the state machine to `local`;
+tests use that shape, a live shard never does. The policy is one struct rather
+than adjacent `uint64` parameters so the limits cannot be transposed.
 
 The replicated policy is re-read at the start of every `Apply` and before
-snapshot recovery, so a replica that learns it late converges without a
+snapshot recovery, so a replica that learns it late checks it without a
 restart. That is safe only because the policy is fixed at bootstrap. A config
 change that alters it would have to be adopted from the committed entry at the
 exact index it applies, or replicas with lagging apply paths would switch
-policies at different log positions. A disagreement with local configuration is
-logged at WARN.
+policies at different log positions.
 
 ### The wrapper interface
 
