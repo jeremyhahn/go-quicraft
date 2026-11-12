@@ -276,6 +276,54 @@ var (
 	}
 }
 
+// TestUndocumentedDeclsInterfaceMethods pins the interface method rule: each
+// exported method of an exported interface needs its own doc comment, whether
+// the interface is standalone or in a grouped type block, while embedded
+// interfaces, unexported methods and unexported interfaces are not checked.
+func TestUndocumentedDeclsInterfaceMethods(t *testing.T) {
+	const src = `// Package fixture is a doc comment gate fixture.
+package fixture
+
+// Store is a documented standalone interface.
+type Store interface {
+	Get() int
+
+	// Put is documented.
+	Put(int)
+
+	reset()
+
+	Embedded
+}
+
+// Grouped types.
+type (
+	// Reader is documented.
+	Reader interface {
+		Read() int
+	}
+)
+
+// hidden is unexported.
+type hidden interface {
+	Close() error
+}
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parsing fixture: %v", err)
+	}
+	var got []string
+	for _, g := range undocumentedDecls(fset, "fixture.go", file) {
+		got = append(got, g.what)
+	}
+	want := []string{"method Store.Get", "method Reader.Read"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("undocumentedDecls reported %q, want %q", got, want)
+	}
+}
+
 // receiverTypeName returns the base type name of a method receiver, looking
 // through pointers and type parameters.
 func receiverTypeName(recv *ast.FieldList) string {
