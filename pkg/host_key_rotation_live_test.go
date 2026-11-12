@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
 )
@@ -19,7 +21,18 @@ const (
 	// keyRotationLiveAdvances is how many scheduled rotations the test waits
 	// for beyond the epoch the barrier starts in.
 	keyRotationLiveAdvances = 3
+	// keyRotationLiveSegmentSize is the WAL segment size: small enough that
+	// keyRotationLivePadding-sized values roll a segment within each epoch.
+	keyRotationLiveSegmentSize int64 = 64 << 10
+	// keyRotationLivePadding pads each value to about one WAL block.
+	keyRotationLivePadding = 4096
 )
+
+// liveValueText is a value of about keyRotationLivePadding bytes named by
+// prefix and i, so a few dozen proposals roll a WAL segment.
+func liveValueText(prefix string, i int, epoch uint64) string {
+	return fmt.Sprintf("%s-%04d-epoch-%d-", prefix, i, epoch) + strings.Repeat("x", keyRotationLivePadding)
+}
 
 // liveSealedStore is the StatePersister a real embedder supplies: it keeps the
 // latest persisted SealedRootKey so a restarted process can load it.
@@ -94,8 +107,19 @@ func startLiveRotationHost(t *testing.T, walDir, nodeDir string, b *seal.Barrier
 	cfg.WALDir, cfg.NodeHostDir = walDir, nodeDir
 	cfg.KeyRotationInterval = time.Second
 	cfg.MaxRetainedEpochs = 2
-	h, err := NewHost(cfg, WithoutTransport(), WithBarrier(b))
+	// Small segments so the WAL rolls several times within each epoch: segment
+	// GC after a snapshot then removes whole old-epoch segments, the WAL's
+	// MinLiveEpoch rises, and the next rotation really purges an old DEK. With
+	// the default 64 MiB segment nothing ever rolls and the purge floor stays at
+	// the first epoch. Host.Close closes the injected LogDB.
+	db, err := waldb.Open(walDir, waldb.WithBarrier(b), waldb.WithBlockSize(4096),
+		waldb.WithMaxFileSize(keyRotationLiveSegmentSize), waldb.WithNoSync(true))
 	if err != nil {
+		t.Fatalf("waldb.Open: %v", err)
+	}
+	h, err := NewHost(cfg, WithoutTransport(), WithBarrier(b), WithLogDB(db))
+	if err != nil {
+		_ = db.Close()
 		t.Fatalf("NewHost: %v", err)
 	}
 	members := map[uint64]string{keyRotationLiveReplicaID: "127.0.0.1:5000"}
@@ -177,7 +201,7 @@ func TestKeyRotationLive_EntriesAndSnapshotSurviveRestart(t *testing.T) {
 	deadline := time.Now().Add(20 * time.Second)
 	for i := 0; ; i++ {
 		before := b.CurrentEpoch()
-		v := liveValue{key: fmt.Sprintf("pre-%04d", i), value: fmt.Sprintf("value-%04d-epoch-%d", i, before)}
+		v := liveValue{key: fmt.Sprintf("pre-%04d", i), value: liveValueText("value", i, before)}
 		proposeLiveValue(ctx, t, h, v.key, v.value)
 		if after := b.CurrentEpoch(); after == before {
 			v.epoch = before
@@ -200,34 +224,65 @@ func TestKeyRotationLive_EntriesAndSnapshotSurviveRestart(t *testing.T) {
 		}
 	}
 
-	// (c): snapshot, more proposals, close.
+	// (c): snapshot with no compaction overhead, so the log is compacted up to
+	// the snapshot index and segment GC drops the whole old-epoch segments
+	// below it. Then keep proposing across more rotations until the schedule
+	// purges an epoch older than the snapshot, and close.
+	preEpochs := sortedKeys(epochs)
+	oldest := preEpochs[0]
 	snapEpochBefore := b.CurrentEpoch()
-	if _, err := h.SyncRequestSnapshot(ctx, keyRotationLiveShardID, SnapshotOption{}); err != nil {
+	if _, err := h.SyncRequestSnapshot(ctx, keyRotationLiveShardID,
+		SnapshotOption{OverrideCompactionOverhead: true, CompactionOverhead: 0}); err != nil {
 		t.Fatalf("SyncRequestSnapshot: %v", err)
 	}
 	snapEpochAfter := b.CurrentEpoch()
-	for i := 0; i < 20; i++ {
-		v := liveValue{key: fmt.Sprintf("post-%04d", i), value: fmt.Sprintf("post-value-%04d", i), epoch: b.CurrentEpoch()}
+	if oldest >= snapEpochBefore {
+		t.Fatalf("fixture: oldest value epoch %d is not older than the snapshot epoch %d", oldest, snapEpochBefore)
+	}
+	postEpochs := map[uint64]bool{}
+	purged := func() bool {
+		p := store.load()
+		return p != nil && !slices.Contains(p.KnownEpochs, oldest)
+	}
+	deadline = time.Now().Add(20 * time.Second)
+	for i := 0; ; i++ {
+		before := b.CurrentEpoch()
+		v := liveValue{key: fmt.Sprintf("post-%04d", i), value: liveValueText("post-value", i, before)}
 		proposeLiveValue(ctx, t, h, v.key, v.value)
-		epochs[v.epoch] = true
+		if after := b.CurrentEpoch(); after == before {
+			v.epoch = before
+			postEpochs[before] = true
+		}
 		values = append(values, v)
+		if b.CurrentEpoch() > snapEpochAfter+h.cfg.MaxRetainedEpochs && purged() {
+			break
+		}
+		if time.Now().After(deadline) {
+			p := store.load()
+			t.Fatalf("(d) epoch %d -> %d after a compacting snapshot at epoch %d, MaxRetainedEpochs %d: "+
+				"oldest value epoch %d never purged (persisted %+v)",
+				snapEpochAfter, b.CurrentEpoch(), snapEpochBefore, h.cfg.MaxRetainedEpochs, oldest, p)
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	mustCloseHost(t, h)
 	closed = true
 
-	// (d): no purge removed an epoch a live WAL record or the retained
-	// snapshot is sealed under. Nothing was compacted here, so every epoch a
-	// value was written under is still needed, as is the snapshot's.
+	// (d): the schedule really purged an epoch older than the snapshot (the
+	// one the first values were written under), and kept every epoch a live
+	// WAL record or the retained snapshot is still sealed under: the
+	// snapshot's epoch and every post-snapshot value's.
 	persisted := store.load()
 	if persisted == nil {
 		t.Fatal("(d) the barrier never persisted its state")
 	}
-	needed := sortedKeys(epochs)
-	for _, ep := range []uint64{snapEpochBefore, snapEpochAfter} {
-		if !slices.Contains(needed, ep) {
-			needed = append(needed, ep)
-		}
+	if slices.Contains(persisted.KnownEpochs, oldest) {
+		t.Fatalf("(d) persisted KnownEpochs %v still holds epoch %d, older than the snapshot epoch %d: nothing was purged",
+			persisted.KnownEpochs, oldest, snapEpochBefore)
+	}
+	needed := sortedKeys(postEpochs)
+	if !slices.Contains(needed, snapEpochAfter) {
+		needed = append(needed, snapEpochAfter)
 	}
 	for _, ep := range needed {
 		if ep == 0 {
@@ -238,7 +293,8 @@ func TestKeyRotationLive_EntriesAndSnapshotSurviveRestart(t *testing.T) {
 				persisted.KnownEpochs, persisted.Epoch, ep)
 		}
 	}
-	t.Logf("(d) persisted epoch %d, KnownEpochs %v, %d state writes", persisted.Epoch, persisted.KnownEpochs, store.writes)
+	t.Logf("(d) purged epoch %d; persisted epoch %d, KnownEpochs %v, %d state writes",
+		oldest, persisted.Epoch, persisted.KnownEpochs, store.writes)
 
 	// (c) continued: a new Host on the same directories with the persisted
 	// barrier state, unsealed, reads every value back.
