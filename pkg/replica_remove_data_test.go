@@ -511,6 +511,24 @@ type removeDataLogDB struct {
 	mu            sync.Mutex
 	failRetire    int
 	hideBootstrap bool
+	// snapshotPath, when set, is the Filepath GetSnapshot reports.
+	snapshotPath string
+}
+
+func (w *removeDataLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.Snapshot, error) {
+	w.mu.Lock()
+	p := w.snapshotPath
+	w.mu.Unlock()
+	if p != "" {
+		return logdb.Snapshot{Index: 1, Term: 1, Filepath: p}, nil
+	}
+	return w.LogDB.GetSnapshot(shardID, replicaID)
+}
+
+func (w *removeDataLogDB) setSnapshotPath(p string) {
+	w.mu.Lock()
+	w.snapshotPath = p
+	w.mu.Unlock()
 }
 
 func (w *removeDataLogDB) RemoveNodeData(shardID, replicaID uint64) error {
@@ -734,6 +752,7 @@ func TestReplicaSnapshotDirFromRecord(t *testing.T) {
 		{"another replica", filepath.Join(root, "shard-5", "shard-5", "replica-9", "snapshot-1"), "", false},
 		{"another shard", filepath.Join(root, "shard-6", "shard-6", "replica-2", "snapshot-1"), "", false},
 		{"no shard base directory", filepath.Join(root, "x", "shard-5", "replica-2", "snapshot-1"), "", false},
+		{"right replica, DataDir layout differs", filepath.Join(root, "shard-5", "x", "shard-5", "replica-2", "snapshot-1"), "", false},
 		{"empty", "", "", false},
 	}
 	for _, tc := range cases {
@@ -744,5 +763,143 @@ func TestReplicaSnapshotDirFromRecord(t *testing.T) {
 					tc.path, got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+// TestSyncRemoveData_RefusesUnknownSnapshotLayout: with no bootstrap record,
+// no intent and a snapshot record whose Filepath lies outside any replica
+// layout, RemoveData cannot locate the snapshot directory. It refuses before
+// anything is retired or recorded, rather than reporting a success that
+// leaves the snapshots behind.
+func TestSyncRemoveData_RefusesUnknownSnapshotLayout(t *testing.T) {
+	const f = 1
+	fid := uint64(f + 1)
+	var w *removeDataLogDB
+	c := newRemoveDataClusterWith(t, walWrapperFor(t, f, &w))
+	for i, h := range c.hosts {
+		scfg := c.shardConfig(uint64(i + 1))
+		if i == f {
+			scfg.DataDir = t.TempDir()
+		}
+		if err := h.StartShard(c.members(), false, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	fh := c.hosts[f]
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+
+	stray := filepath.Join(t.TempDir(), "elsewhere", "snapshot.dat")
+	w.set(0, true)
+	w.setSnapshotPath(stray)
+	err := fh.RemoveData(removeDataShard, fid)
+	if !errors.Is(err, ErrRemoveDataLayoutUnknown) {
+		t.Fatalf("RemoveData with an unknown snapshot layout: err = %v, want %v",
+			err, ErrRemoveDataLayoutUnknown)
+	}
+	var le *RemoveDataLayoutUnknownError
+	if !errors.As(err, &le) {
+		t.Fatalf("RemoveData error %v is not a *RemoveDataLayoutUnknownError", err)
+	}
+	if le.ShardID != removeDataShard || le.ReplicaID != fid || le.Filepath != stray {
+		t.Fatalf("RemoveDataLayoutUnknownError = %+v, want shard %d replica %d filepath %q",
+			*le, removeDataShard, fid, stray)
+	}
+	if removed, err := fh.logdb.NodeRemoved(removeDataShard, fid); err != nil || removed {
+		t.Fatalf("after the refusal NodeRemoved = %v (err %v), want false", removed, err)
+	}
+	intent := removeDataIntentFile(c.cfgs[f].NodeHostDir, removeDataShard, fid)
+	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the refused removal recorded an intent (stat err %v): %s", err, intent)
+	}
+}
+
+// failParentSyncFS removes the armed directory for real, then fails the
+// next Open of its parent once: the directory sync that makes the removal
+// durable.
+type failParentSyncFS struct {
+	osSnapshotFS
+	mu     sync.Mutex
+	target string
+	parent string
+	fired  bool
+}
+
+var errInjectedParentSync = errors.New("injected parent directory sync failure")
+
+func (f *failParentSyncFS) arm(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.target = filepath.Clean(path)
+}
+
+func (f *failParentSyncFS) RemoveAll(path string) error {
+	if err := f.osSnapshotFS.RemoveAll(path); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	if !f.fired && f.target != "" && filepath.Clean(path) == f.target {
+		f.parent = filepath.Dir(f.target)
+	}
+	f.mu.Unlock()
+	return nil
+}
+
+func (f *failParentSyncFS) Open(name string) (snapshotFile, error) {
+	f.mu.Lock()
+	fail := !f.fired && f.parent != "" && filepath.Clean(name) == f.parent
+	if fail {
+		f.fired = true
+	}
+	f.mu.Unlock()
+	if fail {
+		return nil, errInjectedParentSync
+	}
+	return f.osSnapshotFS.Open(name)
+}
+
+// TestSyncRemoveData_SyncFailureKeepsIntent: the snapshot removal is durable
+// only once its parent directory is synced, so a failed sync returns the
+// error and keeps the intent; a retry finishes and drops it.
+func TestSyncRemoveData_SyncFailureKeepsIntent(t *testing.T) {
+	fsys := &failParentSyncFS{}
+	c := newRemoveDataCluster(t, withSnapshotFS(fsys))
+	dataDirs := make([]string, len(c.hosts))
+	for i, h := range c.hosts {
+		dataDirs[i] = t.TempDir()
+		scfg := c.shardConfig(uint64(i + 1))
+		scfg.DataDir = dataDirs[i]
+		if err := h.StartShard(c.members(), false, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	const f = 1
+	fid := uint64(f + 1)
+	fh := c.hosts[f]
+	snapDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(c.cfgs[f].NodeHostDir, dataDirs[f], removeDataShard), removeDataShard, fid)
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+
+	fsys.arm(snapDir)
+	if err := fh.RemoveData(removeDataShard, fid); !errors.Is(err, errInjectedParentSync) {
+		t.Fatalf("RemoveData with a failing parent sync: err = %v, want %v",
+			err, errInjectedParentSync)
+	}
+	intent := removeDataIntentFile(c.cfgs[f].NodeHostDir, removeDataShard, fid)
+	if _, err := os.Stat(intent); err != nil {
+		t.Fatalf("the unsynced snapshot removal dropped its intent %s: %v", intent, err)
+	}
+
+	if err := fh.RemoveData(removeDataShard, fid); err != nil {
+		t.Fatalf("RemoveData retry: %v", err)
+	}
+	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the retried removal left its intent (stat err %v): %s", err, intent)
+	}
+	if _, err := os.Stat(snapDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the retried removal left the snapshot directory (stat err %v): %s", err, snapDir)
 	}
 }
