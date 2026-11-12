@@ -65,9 +65,9 @@ var hostClosedContract = map[string]closedKind{
 	"ShardCount":              closedGetter,
 	"UnregisterLeaderHandler": closedGetter,
 
-	// Drain is idempotent and returns its one recorded result to every
-	// caller; Close itself calls it after setting the closed flag.
-	"Drain": closedExempt,
+	// Drain returns ErrClosed once Close has completed; Close's own call to
+	// Drain, made while shutdown runs, is unaffected.
+	"Drain": closedErr,
 
 	// Everything else returns ErrClosed.
 	"CloseSession":                       closedErr,
