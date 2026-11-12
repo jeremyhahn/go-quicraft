@@ -43,11 +43,12 @@ make test
 | `make test-<pkg>` | One package, e.g. `test-raft`, `test-waldb`, `test-seal` |
 | `make fmt` | Fails if `gofmt -l` reports any file |
 | `make vet` | `go vet ./...` |
-| `make lint` | `fmt` and `go vet`, golangci-lint in every module, actionlint over the workflows, then `api-check` |
+| `make lint` | gofmt, `go vet`, then golangci-lint in every module |
+| `make lint-gates` | The repository's own gates: actionlint over the workflows, then the API check against the last release tag |
 | `make security` | gosec, govulncheck, `go mod verify`, Trivy |
 | `make coverage` | Coverage over `./...`, enforced against `COVER_MIN` (91%) |
 | `make coverage-<pkg>` / `make coverage-packages` | One package, or every package under `pkg/`, against the same floor |
-| `make ci` | `fmt`, `no-mutants`, `check-tool-versions`, `vet`, `lint`, `security`, `build`, `test` |
+| `make ci` | `fmt`, `no-mutants`, `check-tool-versions`, `vet`, `lint`, `lint-gates`, `security`, `build`, `test` |
 | `make ci-full` | `ci` plus every nested module, built and vetted natively and for five other platforms, the integration, netfault, errfs, fuzz-seed and fuzz-mutation suites, and the FIPS checks |
 | `make integration-test` | Multi-node integration suite in Docker |
 | `make ci-integration` | The same suite on the host, as CI runs it |

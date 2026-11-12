@@ -1070,7 +1070,7 @@ verify-fips-exempt:
 .PHONY: ci
 # nancy is not included: it needs OSS Index credentials, and govulncheck and
 # trivy cover the same ground. Run `make nancy` where credentials exist.
-ci: fmt no-mutants check-tool-versions vet lint security build test
+ci: fmt no-mutants check-tool-versions vet lint lint-gates security build test
 	@echo "CI pipeline passed"
 
 # ============================================================================
@@ -1341,9 +1341,9 @@ ci-cross:
 # modules share the root's .golangci.yml, and -tags=benchmark brings in the
 # harness entry points under test/performance (the tag selects nothing in the
 # root), without which their helpers read as unused. Every module is attempted
-# even after a failure. gofmt and go vet run first, and actionlint over the
-# workflows last, each also after an earlier failure: this is CI's lint stage
-# (ci-template v1.21).
+# even after a failure. gofmt and go vet run first, each also after an earlier
+# failure: this is CI's lint stage (ci-template v1.21). actionlint and
+# api-check run in lint-gates.
 .PHONY: lint
 lint: check-lint-toolchain
 	@rc=0; \
@@ -1354,6 +1354,15 @@ lint: check-lint-toolchain
 		( cd "$$dir" && '$(GOLANGCI_BIN)' run --timeout=5m --config '$(CURDIR)/.golangci.yml' \
 			--build-tags benchmark$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) ./... ) || rc=1; \
 	done; \
+	exit $$rc
+
+# The repository's own gates: actionlint over the workflows and the API check
+# against the last release tag. CI runs this in the Lint Gates job beside the
+# image job's make lint (ci-template v1.27), so each gate runs once. Both are
+# attempted even after a failure, as in lint.
+.PHONY: lint-gates
+lint-gates:
+	@rc=0; \
 	$(MAKE) --no-print-directory actionlint || rc=1; \
 	$(MAKE) --no-print-directory api-check || rc=1; \
 	exit $$rc
