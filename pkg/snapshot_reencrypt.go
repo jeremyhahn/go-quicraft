@@ -242,16 +242,9 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// accept state VerifySnapshotArtifact refused. Every byte the copy reads
 	// is teed into the verifier, the rest of the file is drained through it,
 	// and a mismatch fails here, before anything is committed.
-	var srcReader io.Reader = src
-	var srcVerifier *engine.SnapshotDataVerifier
-	if filepath.Base(dstPath) == "snapshot.dat" {
-		srcDir := filepath.Dir(srcPath)
-		if _, err := fsys.Stat(filepath.Join(srcDir, "snapshot.meta")); err == nil {
-			srcVerifier = engine.NewSnapshotDataVerifier(srcDir)
-			srcReader = io.TeeReader(src, srcVerifier)
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return 0, err
-		}
+	srcReader, verifySrc, err := teeSourceVerifier(fsys, srcPath, dstPath, src)
+	if err != nil {
+		return 0, err
 	}
 
 	epoch, dstPins, err = copySnapshotAcrossBarriers(srcReader, tmp, shardID, replicaID, index,
@@ -259,13 +252,8 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	if err != nil {
 		return 0, err
 	}
-	if srcVerifier != nil {
-		if _, err := io.Copy(io.Discard, srcReader); err != nil {
-			return 0, err
-		}
-		if err := srcVerifier.Verify(); err != nil {
-			return 0, err
-		}
+	if err := verifySrc(); err != nil {
+		return 0, err
 	}
 
 	if err := tmp.Sync(); err != nil {
@@ -319,6 +307,34 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 		}
 	}
 	return epoch, nil
+}
+
+// teeSourceVerifier returns the reader the copy consumes the source through
+// and a check to run once the copy is done. When a snapshot.meta will be
+// restamped beside dstPath and one sits beside srcPath, every byte read is
+// teed into an engine.SnapshotDataVerifier, and the check drains the rest of
+// the source through it and verifies it against that record; otherwise the
+// reader is src and the check is a no-op.
+func teeSourceVerifier(fsys snapshotFS, srcPath, dstPath string, src io.Reader) (io.Reader, func() error, error) {
+	noop := func() error { return nil }
+	if filepath.Base(dstPath) != "snapshot.dat" {
+		return src, noop, nil
+	}
+	srcDir := filepath.Dir(srcPath)
+	if _, err := fsys.Stat(filepath.Join(srcDir, "snapshot.meta")); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return src, noop, nil
+		}
+		return nil, nil, err
+	}
+	verifier := engine.NewSnapshotDataVerifier(srcDir)
+	tee := io.TeeReader(src, verifier)
+	return tee, func() error {
+		if _, err := io.Copy(io.Discard, tee); err != nil {
+			return err
+		}
+		return verifier.Verify()
+	}, nil
 }
 
 // copySnapshotAcrossBarriers streams the snapshot data in src into dst,
