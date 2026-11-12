@@ -243,6 +243,11 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 	}
 	f.Logf("dense membership seed: n=%d, %d wire bytes", denseMembershipEntries, len(dense))
 	f.Add(uint8(1), dense)
+	// The same frame cut 8 bytes short, its length field to match: admitted,
+	// then the decode fails past Membership, after the maps are built.
+	denseShort := append([]byte{}, dense[:len(dense)-8]...)
+	binary.BigEndian.PutUint32(denseShort[4:8], binary.BigEndian.Uint32(dense[4:8])-8)
+	f.Add(uint8(1), denseShort)
 
 	f.Fuzz(func(t *testing.T, chunkCount uint8, data []byte) {
 		handler := newTestHandler()
