@@ -19,6 +19,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -308,7 +309,14 @@ func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 		m.EpochRecorded = true
 	}
 	if bodyLen >= metaBodyCompressionOff+8 {
-		m.Compression = config.CompressionType(binary.LittleEndian.Uint64(body[metaBodyCompressionOff:]))
+		raw := binary.LittleEndian.Uint64(body[metaBodyCompressionOff:])
+		// CompressionType is a uint16 and the encoder writes one widened:
+		// a wider value is not a record it wrote, and converting it would
+		// truncate it into a different (possibly known) type.
+		if raw > math.MaxUint16 {
+			return SnapshotMeta{}, ErrSnapshotMetaCorrupt
+		}
+		m.Compression = config.CompressionType(raw)
 		m.CompressionRecorded = true
 	}
 	// Both integrity fields are read together or not at all: a hash without
