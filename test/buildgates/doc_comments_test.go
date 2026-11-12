@@ -635,6 +635,139 @@ var (
 	}
 }
 
+// TestUndocumentedDeclsCoreDecls pins the gaps for undocumented exported
+// funcs, methods on pointer, value and generic receivers, and standalone and
+// grouped consts and vars; documented and unexported counterparts are not
+// reported. The repository scan sees a documented tree, so without this
+// fixture a disabled check would still pass.
+func TestUndocumentedDeclsCoreDecls(t *testing.T) {
+	const src = `// Package fixture is a doc comment gate fixture.
+package fixture
+
+// T is documented.
+type T struct{}
+
+// G is a documented generic type.
+type G[K any] struct{}
+
+func F() {}
+
+// Documented is documented.
+func Documented() {}
+
+func unexported() {}
+
+func (*T) M() {}
+
+func (T) W() {}
+
+func (g *G[K]) N() {}
+
+// D is documented.
+func (*T) D() {}
+
+func (*T) m() {}
+
+type u struct{}
+
+func (u) X() {}
+
+const C = 1
+
+// DC is documented.
+const DC = 1
+
+const c = 1
+
+var V = 1
+
+// DV is documented.
+var DV = 1
+
+var v = 1
+
+const (
+	GC = 1
+	// GD is documented.
+	GD = 2
+	gc = 3
+)
+
+var (
+	GV = 1
+	// GW is documented.
+	GW = 2
+	gv = 3
+)
+`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("parsing fixture: %v", err)
+	}
+	var got []string
+	for _, g := range undocumentedDecls(fset, "fixture.go", file) {
+		got = append(got, fmt.Sprintf("%s:%d: %s", g.file, g.line, g.what))
+	}
+	want := []string{
+		"fixture.go:10: func F",
+		"fixture.go:17: method T.M",
+		"fixture.go:19: method T.W",
+		"fixture.go:21: method G.N",
+		"fixture.go:32: const C",
+		"fixture.go:39: var V",
+		"fixture.go:47: const GC",
+		"fixture.go:54: var GV",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("undocumentedDecls reported\n%s\nwant\n%s",
+			strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestPackageDocGaps pins the package comment check: a package none of whose
+// files carries a package comment is reported once, at the first file's
+// package line; a comment in any file of the package satisfies it.
+func TestPackageDocGaps(t *testing.T) {
+	const bare = "\n\npackage a\n"
+	const doc = "// Package a is documented.\npackage a\n"
+	parse := func(rel, src string) parsedFile {
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, rel, src, parser.ParseComments)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", rel, err)
+		}
+		return parsedFile{rel: rel, fset: fset, file: file}
+	}
+	cases := []struct {
+		name  string
+		files [][2]string
+		want  []string
+	}{
+		{"no comment in either file", [][2]string{{"pkg/a/x.go", bare}, {"pkg/a/y.go", bare}},
+			[]string{"pkg/a/x.go:3: package pkg/a"}},
+		{"comment in first file", [][2]string{{"pkg/a/x.go", doc}, {"pkg/a/y.go", bare}}, nil},
+		{"comment in second file", [][2]string{{"pkg/a/x.go", bare}, {"pkg/a/y.go", doc}}, nil},
+		{"one of two packages documented", [][2]string{{"pkg/a/x.go", doc}, {"pkg/b/x.go", bare}},
+			[]string{"pkg/b/x.go:3: package pkg/b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var files []parsedFile
+			for _, f := range tc.files {
+				files = append(files, parse(f[0], f[1]))
+			}
+			var got []string
+			for _, g := range packageDocGaps(files) {
+				got = append(got, fmt.Sprintf("%s:%d: %s", g.file, g.line, g.what))
+			}
+			if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+				t.Fatalf("packageDocGaps reported %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestUndocumentedDeclsInterfaceMethods pins the interface method rule: each
 // exported method of an exported interface needs its own doc comment, whether
 // the interface is standalone or in a grouped type block, while embedded
