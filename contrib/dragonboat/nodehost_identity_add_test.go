@@ -15,7 +15,7 @@ import (
 // identityAddMembership reads the shard's membership through the adapter's
 // SyncGetShardMembership and the underlying host's, so a test checks both the
 // dragonboat role and the identity the shard committed for each member.
-func identityAddMembership(t *testing.T, ctx context.Context, nh *NodeHost, shardID uint64) (*Membership, *quicraft.Membership) {
+func identityAddMembership(ctx context.Context, t *testing.T, nh *NodeHost, shardID uint64) (*Membership, *quicraft.Membership) {
 	t.Helper()
 	m, err := nh.SyncGetShardMembership(ctx, shardID)
 	if err != nil {
@@ -81,7 +81,7 @@ func TestNodeHost_IdentityAdd(t *testing.T) {
 	defer cancel()
 
 	t.Run("invalid address refused", func(t *testing.T) {
-		before, _ := identityAddMembership(t, ctx, nh, shardID)
+		before, _ := identityAddMembership(ctx, t, nh, shardID)
 		const bad = "not a valid address"
 		calls := map[string]func() error{
 			"replica": func() error {
@@ -99,7 +99,7 @@ func TestNodeHost_IdentityAdd(t *testing.T) {
 				t.Errorf("%s: err = %v, want ErrInvalidAddress", name, err)
 			}
 		}
-		after, qm := identityAddMembership(t, ctx, nh, shardID)
+		after, qm := identityAddMembership(ctx, t, nh, shardID)
 		if identityAddMembers(after) != identityAddMembers(before) || after.ConfigChangeID != before.ConfigChangeID {
 			t.Fatalf("membership changed by refused adds: before %+v, after %+v", before, after)
 		}
@@ -112,7 +112,7 @@ func TestNodeHost_IdentityAdd(t *testing.T) {
 		if err := nh.SyncRequestAddNonVotingWithIdentity(ctx, shardID, 2, "localhost:63002", id2, 0); err != nil {
 			t.Fatalf("SyncRequestAddNonVotingWithIdentity: %v", err)
 		}
-		m, qm := identityAddMembership(t, ctx, nh, shardID)
+		m, qm := identityAddMembership(ctx, t, nh, shardID)
 		if _, ok := m.NonVotings[2]; !ok {
 			t.Fatalf("replica 2 not in NonVotings: %+v", m)
 		}
@@ -122,12 +122,12 @@ func TestNodeHost_IdentityAdd(t *testing.T) {
 	})
 
 	t.Run("duplicate identity refused", func(t *testing.T) {
-		before, _ := identityAddMembership(t, ctx, nh, shardID)
+		before, _ := identityAddMembership(ctx, t, nh, shardID)
 		err := nh.SyncRequestAddNonVotingWithIdentity(ctx, shardID, 4, "localhost:63004", id2, 0)
 		if !errors.Is(err, quicraft.ErrDuplicateMemberIdentity) {
 			t.Fatalf("err = %v, want quicraft.ErrDuplicateMemberIdentity", err)
 		}
-		after, _ := identityAddMembership(t, ctx, nh, shardID)
+		after, _ := identityAddMembership(ctx, t, nh, shardID)
 		if _, ok := after.NonVotings[4]; ok {
 			t.Fatalf("replica 4 added despite a duplicate identity: %+v", after)
 		}
