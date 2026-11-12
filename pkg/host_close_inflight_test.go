@@ -78,6 +78,16 @@ func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 		t.Fatal("RequestAddNode did not complete")
 	}
 	rs.Release()
+	// deliverProposal completes the result before it decrements pendingOps,
+	// so wait for the membership operation's count to drain before the
+	// callers start.
+	drainDeadline := time.Now().Add(10 * time.Second)
+	for h.pendingOps.Load() != 0 {
+		if time.Now().After(drainDeadline) {
+			t.Fatalf("pending ops = %d after RequestAddNode, want 0", h.pendingOps.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
 	before := h.pendingOps.Load()
 
 	// The callers' deadline is far beyond the test's bounds, so only Close
