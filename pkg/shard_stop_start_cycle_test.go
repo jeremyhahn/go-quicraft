@@ -69,11 +69,33 @@ func cycleCreateFunc(shardID, replicaID uint64) interface{} {
 // /proc/self/fd does not exist.
 func openFDs(t *testing.T) int {
 	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
+	if runtime.GOOS != "linux" {
 		return -1
 	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("read /proc/self/fd: %v", err)
+	}
 	return len(entries)
+}
+
+// settledGoroutines returns runtime.NumGoroutine once it stops changing
+// across a short settle (GC between reads), so a baseline is not taken while
+// start-up goroutines are still exiting.
+func settledGoroutines() int {
+	deadline := time.Now().Add(2 * time.Second)
+	runtime.GC()
+	prev := runtime.NumGoroutine()
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		runtime.GC()
+		n := runtime.NumGoroutine()
+		if n == prev {
+			return n
+		}
+		prev = n
+	}
+	return prev
 }
 
 // settle polls until read() is at most limit, returning the last reading. Shard
@@ -100,8 +122,10 @@ func TestStopStartCycle_RecoversStateAndLeaksNothing(t *testing.T) {
 		shardID, replicaID uint64 = 794, 1
 		cycles                    = 10
 		perCycle                  = 5
-		goroutineMargin           = 10
-		fdMargin                  = 0
+		// The margin is below the number of measured cycles, so one leaked
+		// goroutine per stopped incarnation fails the check.
+		goroutineMargin = 3
+		fdMargin        = 0
 	)
 
 	h, err := NewHost(testHostConfig(t), WithoutTransport(), WithoutEncryption())
@@ -119,7 +143,10 @@ func TestStopStartCycle_RecoversStateAndLeaksNothing(t *testing.T) {
 
 	var want uint64
 	seq := 0
-	baseGoroutines, baseFDs := -1, -1
+	// Baseline before cycle 0, with one incarnation running as after the last
+	// cycle, so every one of the cycles is measured.
+	baseGoroutines := settledGoroutines()
+	baseFDs := openFDs(t)
 	for cycle := 0; cycle < cycles; cycle++ {
 		for i := 0; i < perCycle; i++ {
 			cmd := []byte(fmt.Sprintf("cycle-%d-entry-%d", cycle, seq))
@@ -163,26 +190,21 @@ func TestStopStartCycle_RecoversStateAndLeaksNothing(t *testing.T) {
 				cycle, got, want, seq)
 		}
 
-		if cycle == 0 {
-			runtime.GC()
-			baseGoroutines = runtime.NumGoroutine()
-			baseFDs = openFDs(t)
-		}
 	}
 
 	if n := settle(runtime.NumGoroutine, baseGoroutines+goroutineMargin); n > baseGoroutines+goroutineMargin {
 		buf := make([]byte, 1<<20)
 		buf = buf[:runtime.Stack(buf, true)]
-		t.Fatalf("goroutines grew from %d after the first cycle to %d after the "+
-			"last (margin %d):\n%s", baseGoroutines, n, goroutineMargin, buf)
+		t.Fatalf("goroutines grew from %d before the first cycle to %d after the "+
+			"last %d cycles (margin %d):\n%s", baseGoroutines, n, cycles, goroutineMargin, buf)
 	}
 
-	if baseFDs < 0 {
-		t.Log("no /proc/self/fd on this platform; skipping the descriptor check")
+	if runtime.GOOS != "linux" {
+		t.Log("not Linux: no /proc/self/fd; skipping the descriptor check")
 		return
 	}
 	if n := settle(func() int { return openFDs(t) }, baseFDs+fdMargin); n > baseFDs+fdMargin {
-		t.Fatalf("open file descriptors grew from %d after the first cycle to %d "+
+		t.Fatalf("open file descriptors grew from %d before the first cycle to %d "+
 			"after the last (margin %d)", baseFDs, n, fdMargin)
 	}
 }
