@@ -186,6 +186,25 @@ func TestWitnessReplica_KeepsQuorumWithoutApplyingAndTheWitnessLimitHolds(t *tes
 		t.Fatalf("the surviving full replica applied %d user entries, want at least 11", got)
 	}
 
+	// SyncPropose waits only for the proposing full replica to apply, and a
+	// witness acks replication apart from its apply worker: wait until the
+	// witness has reached the leader's applied index before the zero check.
+	leaderInfo, err := nodes[survivor].host.ShardInfo(witnessReplicaShard)
+	if err != nil {
+		t.Fatalf("ShardInfo (leader): %v", err)
+	}
+	var witnessApplied uint64
+	if !waitUntil(20*time.Second, func() bool {
+		wi, werr := nodes[2].host.ShardInfo(witnessReplicaShard)
+		if werr != nil {
+			return false
+		}
+		witnessApplied = wi.LastApplied
+		return witnessApplied >= leaderInfo.LastApplied
+	}) {
+		t.Fatalf("the witness applied index %d never reached the leader's %d", witnessApplied, leaderInfo.LastApplied)
+	}
+
 	info, err := nodes[2].host.ShardInfo(witnessReplicaShard)
 	if err != nil {
 		t.Fatalf("ShardInfo (witness): %v", err)
