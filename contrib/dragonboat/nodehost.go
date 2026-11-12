@@ -1214,6 +1214,12 @@ func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
 func (nh *NodeHost) GetShardMembership(shardID uint64) (*Membership, error) {
 	m, err := nh.host.ShardMembership(shardID)
 	if err != nil {
+		// quicraft answers a shard with no engine node as not ready;
+		// dragonboat reports a shard this host does not run as
+		// ErrShardNotFound.
+		if _, infoErr := nh.host.ShardInfo(shardID); errors.Is(infoErr, quicraft.ErrShardNotFound) {
+			return nil, ErrShardNotFound
+		}
 		return nil, translateError(err)
 	}
 	return fromQuicraftMembership(m), nil
