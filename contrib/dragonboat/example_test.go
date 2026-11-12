@@ -105,6 +105,13 @@ func ExampleNewNodeHost() {
 		RaftAddress:    "localhost:63001",
 		ListenAddress:  "localhost:63001",
 		RTTMillisecond: 200,
+		// The transport requires mutual TLS. The CA bundle, this host's
+		// certificate and its private key are PEM files the caller
+		// provides; the certificate's public key is the host's identity.
+		MutualTLS: true,
+		CAFile:    "/etc/myapp/tls/ca.pem",
+		CertFile:  "/etc/myapp/tls/host.pem",
+		KeyFile:   "/etc/myapp/tls/host-key.pem",
 	})
 	if err != nil {
 		log.Fatal(err)
