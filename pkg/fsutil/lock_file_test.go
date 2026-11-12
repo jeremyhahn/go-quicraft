@@ -47,7 +47,10 @@ func TestLockFile_RelockSameFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first LockDir: %v", err)
 	}
-	fi1, err := os.Stat(first.Path())
+	// Take identity from the lock handle, not the path: on Windows a
+	// path-based FileInfo resolves identity lazily, so comparing two
+	// os.Stat results after Close would check the second file against itself.
+	fi1, err := first.f.Stat()
 	if err != nil {
 		t.Fatalf("stat while first lock held: %v", err)
 	}
@@ -60,7 +63,7 @@ func TestLockFile_RelockSameFile(t *testing.T) {
 		t.Fatalf("relock after Close: %v, want nil", err)
 	}
 	defer second.Close()
-	fi2, err := os.Stat(second.Path())
+	fi2, err := second.f.Stat()
 	if err != nil {
 		t.Fatalf("stat while second lock held: %v", err)
 	}
