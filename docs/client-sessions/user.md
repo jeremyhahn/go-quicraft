@@ -62,6 +62,8 @@ if r.Err != nil {
 session.ProposalCompleted() // advance to the next series
 ```
 
+Checked by `ExampleHost_ProposeWithSession` in `pkg/example_session_test.go`.
+
 `SyncProposeWithSession` calls `ProposalCompleted` for you. With the async form
 you must call it after each successful result, or the next proposal reuses the
 same series and gets the previous command's cached result.
@@ -110,6 +112,8 @@ rejects it with `ErrInvalidSession`.
 session, err := host.NewSessionWithOwner(ctx, shardID, tenantID)
 ```
 
+Checked by `ExampleHost_NewSessionWithOwner` in `pkg/example_session_test.go`.
+
 The owner groups sessions by your principal (tenant, account or authenticated
 subject) so `MaxSessionsPerOwner` (default 128) stops one of them exhausting
 the shard's `MaxTotalSessions` (default 16384).
@@ -127,6 +131,10 @@ register it explicitly:
 ```go
 session, err := host.RegisterSession(ctx, quicraft.NewSession(shardID, savedClientID))
 ```
+
+Checked by `ExampleHost_RegisterSession` in `pkg/example_session_test.go`,
+which also shows the duplicate registration refused and the saved ID
+registered again after `CloseSession`.
 
 Registration fails with a `*SessionError` while the shard still holds that
 client ID. Entries left over from an earlier session under the same ID are
