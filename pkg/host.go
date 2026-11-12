@@ -10117,7 +10117,13 @@ func sealOnClose(b Barrier) error {
 // The implementation is event-driven: instead of polling at fixed intervals,
 // it uses an atomic counter (pendingOps) decremented by operation completion
 // callbacks. When the counter reaches 0, a notification channel is closed.
+//
+// After Close has completed, Drain returns ErrClosed. Close's own call to
+// Drain, made while its shutdown work runs, is unaffected.
 func (h *Host) Drain() error {
+	if h.closeDone.Load() {
+		return ErrClosed
+	}
 	// The flag goes up before the Once so that new work is refused from the
 	// instant ANY caller asks for a drain, not from when the elected attempt
 	// gets scheduled. It is never cleared: see the irreversibility note.
