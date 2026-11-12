@@ -387,8 +387,13 @@ type HostConfig struct {
 	// The shards still applying at shutdown are logged before the wait begins.
 	ShutdownTimeout time.Duration
 
-	// MaxWALDiskSize is the maximum WAL directory size in bytes. 0 means
-	// unlimited.
+	// MaxWALDiskSize is a disk ceiling in bytes for the filesystem holding
+	// WALDir. The WAL compares it with the used space of that whole
+	// filesystem (statfs on Linux, sampled every 100 writes), not with the
+	// WAL's own size, so other files on the volume count against it. At 85%
+	// OnLogDBDiskWarning fires; at 95% OnLogDBDiskFull fires, new proposals
+	// fail with ErrDiskFull and HealthCheck reports DiskOK false until usage
+	// drops. 0 means unlimited.
 	MaxWALDiskSize uint64
 
 	// NoSyncWAL disables fdatasync on Raft WAL segment writes. When true,
