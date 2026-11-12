@@ -40,20 +40,67 @@ const concurrentProposeShard = uint64(797)
 type recordingStateMachine struct {
 	mu      sync.Mutex
 	applied map[string]int
+
+	// replicaID and gate, when gate is set, let a test hold this replica's
+	// apply of one key (see applyGate).
+	replicaID uint64
+	gate      *applyGate
 }
 
 func newRecordingStateMachine() *recordingStateMachine {
 	return &recordingStateMachine{applied: make(map[string]int)}
 }
 
-func (r *recordingStateMachine) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *recordingStateMachine) Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error {
 	for i := range entries {
+		if r.gate != nil {
+			r.gate.wait(ctx, r.replicaID, string(entries[i].Cmd))
+		}
+		r.mu.Lock()
 		r.applied[string(entries[i].Cmd)]++
+		r.mu.Unlock()
 		results[i] = sm.Result{Value: entries[i].Index}
 	}
 	return nil
+}
+
+// concurrentProposeGateKey is the command an armed applyGate holds.
+const concurrentProposeGateKey = "gate"
+
+// applyGate blocks one replica's apply of concurrentProposeGateKey until it
+// is opened. Held at the leader, it keeps every later proposal on that
+// leader committed but not completed, which is the window a leadership
+// change turns into MaybeApplied failures.
+type applyGate struct {
+	replica     atomic.Uint64
+	reached     chan struct{}
+	release     chan struct{}
+	reachedOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newApplyGate() *applyGate {
+	return &applyGate{reached: make(chan struct{}), release: make(chan struct{})}
+}
+
+// arm makes replicaID's apply of the gate key block until open.
+func (g *applyGate) arm(replicaID uint64) { g.replica.Store(replicaID) }
+
+// open releases a held apply and disarms the gate.
+func (g *applyGate) open() {
+	g.replica.Store(0)
+	g.releaseOnce.Do(func() { close(g.release) })
+}
+
+func (g *applyGate) wait(ctx context.Context, replicaID uint64, key string) {
+	if key != concurrentProposeGateKey || g.replica.Load() != replicaID {
+		return
+	}
+	g.reachedOnce.Do(func() { close(g.reached) })
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+	}
 }
 
 func (r *recordingStateMachine) Lookup(_ context.Context, query interface{}) (interface{}, error) {
@@ -107,28 +154,39 @@ func (r *recordingStateMachine) snapshot() map[string]int {
 	return out
 }
 
-// TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce drives 64
-// goroutines of 50 SyncPropose calls each, with unique keys, at the leader of
-// a three-replica shard on loopback QUIC. Every acknowledged key must be
-// applied exactly once on every replica, no other key may be applied, and the
-// replicas' state hashes must agree.
-//
-// TestMultipleConcurrentProposals_Complete (host_test.go) covers only ten
-// concurrent proposals on one replica and checks that each returns.
-// newConcurrentProposeHosts starts three hosts on loopback QUIC with leaves
-// from one CA and returns them with the shard's members and identities.
-func newConcurrentProposeHosts(t *testing.T) ([]*Host, map[uint64]string, map[uint64]string) {
+// concurrentProposeCluster is three hosts on loopback QUIC, with leaves from
+// one CA, running one shard of recordingStateMachines. Its hosts can be
+// closed and restarted from their own logs at the same addresses.
+type concurrentProposeCluster struct {
+	cfgs    []config.HostConfig
+	hosts   []*Host
+	members map[uint64]string
+	ids     map[uint64]string
+	gate    *applyGate
+
+	mu       sync.Mutex
+	machines map[uint64]*recordingStateMachine
+}
+
+// newConcurrentProposeCluster creates the three hosts; no shard is started.
+func newConcurrentProposeCluster(t *testing.T) *concurrentProposeCluster {
 	t.Helper()
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, 3)
-	hosts := make([]*Host, 0, 3)
-	members := make(map[uint64]string, 3)
-	ids := make(map[uint64]string, 3)
+	c := &concurrentProposeCluster{
+		members:  make(map[uint64]string, 3),
+		ids:      make(map[uint64]string, 3),
+		gate:     newApplyGate(),
+		machines: make(map[uint64]*recordingStateMachine, 3),
+	}
 	t.Cleanup(func() {
-		for _, h := range hosts {
+		for _, h := range c.hosts {
 			h.Close()
 		}
 	})
+	// Registered after the hosts' cleanup, so it runs first: a held apply
+	// must not block Close.
+	t.Cleanup(c.gate.open)
 	for i := range 3 {
 		cfg := config.HostConfig{
 			WALDir:          t.TempDir(),
@@ -144,11 +202,77 @@ func newConcurrentProposeHosts(t *testing.T) ([]*Host, map[uint64]string, map[ui
 		if err != nil {
 			t.Fatalf("NewHost[%d]: %v", i, err)
 		}
-		hosts = append(hosts, h)
-		members[uint64(i+1)] = h.RaftAddress()
-		ids[uint64(i+1)] = h.NodeIdentity()
+		// A restart binds the address the committed membership names.
+		cfg.RaftAddress, cfg.ListenAddress = h.RaftAddress(), h.RaftAddress()
+		c.cfgs = append(c.cfgs, cfg)
+		c.hosts = append(c.hosts, h)
+		c.members[uint64(i+1)] = h.RaftAddress()
+		c.ids[uint64(i+1)] = h.NodeIdentity()
 	}
-	return hosts, members, ids
+	return c
+}
+
+func (c *concurrentProposeCluster) create(_, replicaID uint64) interface{} {
+	r := newRecordingStateMachine()
+	r.replicaID, r.gate = replicaID, c.gate
+	c.mu.Lock()
+	c.machines[replicaID] = r
+	c.mu.Unlock()
+	return r
+}
+
+// startShard starts the shard on host i (replica i+1).
+func (c *concurrentProposeCluster) startShard(t *testing.T, i int) {
+	t.Helper()
+	scfg := testShardConfig(concurrentProposeShard, uint64(i+1))
+	scfg.MemberIdentities = c.ids
+	if err := c.hosts[i].StartShard(c.members, false, c.create, scfg); err != nil {
+		t.Fatalf("StartShard[%d]: %v", i, err)
+	}
+}
+
+// machine returns replica replicaID's current state machine.
+func (c *concurrentProposeCluster) machine(replicaID uint64) *recordingStateMachine {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.machines[replicaID]
+}
+
+// waitLeader waits for a leader and returns its host.
+func (c *concurrentProposeCluster) waitLeader(t *testing.T) *Host {
+	t.Helper()
+	var l *Host
+	if !waitUntil(20*time.Second, func() bool {
+		l = concurrentProposeLeader(c.hosts)
+		return l != nil
+	}) {
+		t.Fatal("no leader elected")
+	}
+	return l
+}
+
+// restart closes every host, then brings each back from its own WALDir and
+// NodeHostDir at the same address with a fresh state machine, which replays
+// what the replica's snapshot and log hold. No caller may be proposing.
+func (c *concurrentProposeCluster) restart(t *testing.T) {
+	t.Helper()
+	c.gate.open()
+	for i, h := range c.hosts {
+		if err := h.Close(); err != nil {
+			t.Fatalf("Close[%d]: %v", i, err)
+		}
+	}
+	c.mu.Lock()
+	clear(c.machines)
+	c.mu.Unlock()
+	for i, cfg := range c.cfgs {
+		h, err := NewHost(cfg, WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost[%d] (restart): %v", i, err)
+		}
+		c.hosts[i] = h
+		c.startShard(t, i)
+	}
 }
 
 // concurrentProposeLeader returns the host that reports itself leader of the
@@ -162,6 +286,59 @@ func concurrentProposeLeader(hosts []*Host) *Host {
 	return nil
 }
 
+// proposeOutcomes classifies SyncPropose outcomes. Each class bounds how many
+// times a replica may apply the key:
+//   - acked: acknowledged, applied exactly once;
+//   - maybe: already submitted to raft when it failed (MaybeApplied),
+//     applied at most once;
+//   - refused: a definite refusal before submission (a not-leader refusal,
+//     or ErrTransferInProgress from a leader mid-transfer), applied zero
+//     times;
+//   - failed: any other error, which fails the test.
+type proposeOutcomes struct {
+	mu      sync.Mutex
+	acked   map[string]struct{}
+	maybe   map[string]error
+	refused map[string]error
+	failed  map[string]error
+}
+
+func newProposeOutcomes() *proposeOutcomes {
+	return &proposeOutcomes{
+		acked:   make(map[string]struct{}),
+		maybe:   make(map[string]error),
+		refused: make(map[string]error),
+		failed:  make(map[string]error),
+	}
+}
+
+// record files key's outcome under its class and reports whether it was a
+// refusal, after which the proposer re-resolves the leader.
+func (o *proposeOutcomes) record(key string, err error) (moved bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	switch {
+	case err == nil:
+		o.acked[key] = struct{}{}
+	case MaybeApplied(err):
+		o.maybe[key] = err
+	case errors.Is(err, ErrNotLeader), errors.Is(err, ErrTransferInProgress):
+		o.refused[key] = err
+		moved = true
+	default:
+		o.failed[key] = err
+	}
+	return moved
+}
+
+// TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce drives 64
+// goroutines of 50 SyncPropose calls each, with unique keys, at the leader of
+// a three-replica shard on loopback QUIC. Every acknowledged key must be
+// applied exactly once on every replica, no other key may be applied, and the
+// replicas' state hashes must agree.
+//
+// TestMultipleConcurrentProposals_Complete (host_test.go) covers only ten
+// concurrent proposals on one replica and checks that each returns.
 func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T) {
 	if testing.Short() {
 		t.Skip("three-host cluster over loopback QUIC")
@@ -171,55 +348,20 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 		perG       = 50
 	)
 
-	hosts, members, ids := newConcurrentProposeHosts(t)
-	var smMu sync.Mutex
-	machines := make(map[uint64]*recordingStateMachine, 3)
-	create := func(_, replicaID uint64) interface{} {
-		r := newRecordingStateMachine()
-		smMu.Lock()
-		machines[replicaID] = r
-		smMu.Unlock()
-		return r
+	c := newConcurrentProposeCluster(t)
+	for i := range c.hosts {
+		c.startShard(t, i)
 	}
-	for i, h := range hosts {
-		scfg := testShardConfig(concurrentProposeShard, uint64(i+1))
-		scfg.MemberIdentities = ids
-		if err := h.StartShard(members, false, create, scfg); err != nil {
-			t.Fatalf("StartShard[%d]: %v", i, err)
-		}
-	}
-
 	var leader atomic.Pointer[Host]
-	if !waitUntil(20*time.Second, func() bool {
-		if l := concurrentProposeLeader(hosts); l != nil {
-			leader.Store(l)
-			return true
-		}
-		return false
-	}) {
-		t.Fatal("no leader elected")
-	}
+	leader.Store(c.waitLeader(t))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Each SyncPropose outcome falls in one class, and each class bounds how
-	// many times a replica may apply the key:
-	//   - acked: acknowledged, applied exactly once;
-	//   - maybe: already submitted to raft when it failed (MaybeApplied),
-	//     applied at most once;
-	//   - refused: a not-leader refusal before submission, applied zero times;
-	//   - failed: any other error, which fails the test.
 	// A leader change during the run is legitimate; a refused proposer
 	// re-resolves the leader and carries on with its next key.
-	var (
-		ackMu   sync.Mutex
-		acked   = make(map[string]struct{}, goroutines*perG)
-		maybe   = make(map[string]error)
-		refused = make(map[string]error)
-		failed  = make(map[string]error)
-		wg      sync.WaitGroup
-	)
+	out := newProposeOutcomes()
+	var wg sync.WaitGroup
 	for g := range goroutines {
 		wg.Add(1)
 		go func() {
@@ -227,23 +369,9 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 			for i := range perG {
 				key := fmt.Sprintf("g%02d-k%02d", g, i)
 				_, err := leader.Load().SyncPropose(ctx, concurrentProposeShard, []byte(key))
-				moved := false
-				ackMu.Lock()
-				switch {
-				case err == nil:
-					acked[key] = struct{}{}
-				case MaybeApplied(err):
-					maybe[key] = err
-				case errors.Is(err, ErrNotLeader):
-					refused[key] = err
-					moved = true
-				default:
-					failed[key] = err
-				}
-				ackMu.Unlock()
-				if moved {
+				if out.record(key, err) {
 					waitUntil(5*time.Second, func() bool {
-						if l := concurrentProposeLeader(hosts); l != nil {
+						if l := concurrentProposeLeader(c.hosts); l != nil {
 							leader.Store(l)
 							return true
 						}
@@ -255,41 +383,59 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 	}
 	wg.Wait()
 
-	for key, err := range failed {
+	for key, err := range out.failed {
 		t.Errorf("SyncPropose(%s): %v", key, err)
 	}
-	if len(acked) == 0 {
+	if len(out.acked) == 0 {
 		t.Fatal("no proposal was acknowledged")
 	}
-	if len(maybe)+len(refused) > 0 {
+	if len(out.maybe)+len(out.refused) > 0 {
 		t.Logf("leadership moved during the run: %d proposals may still commit, %d refused before submission",
-			len(maybe), len(refused))
+			len(out.maybe), len(out.refused))
 	}
 
-	// wg.Wait() only means the callers returned: a MaybeApplied proposal can
-	// still commit, and a new leader can still be applying earlier entries.
-	// Commit a barrier entry through the current leader: once it applies,
-	// every entry that will ever commit before it has committed, and no
-	// workload proposal is left in flight. Then wait for every replica to
-	// settle at one common index at or past the barrier with equal hashes.
-	// A barrier on the leader alone does not fence a proposal another host
-	// is still forwarding: fence every host through its own forward path
-	// first, then converge at or past the highest index of either.
-	barrierKey, barriers, want := concurrentProposeBarrier(ctx, t, hosts)
-	fences, fenceAt := concurrentProposeFence(ctx, t, hosts)
-	for key := range fences {
-		barriers[key] = struct{}{}
+	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
+	concurrentProposeCheck(t, c, out, barrierKey, barriers)
+	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
+		t.Fatalf("replica state hashes differ at index %d: %v", at, hashes)
 	}
-	at, hashes := concurrentProposeConverge(ctx, t, hosts, max(want, fenceAt))
+}
 
-	smMu.Lock()
-	defer smMu.Unlock()
-	if len(machines) != 3 {
-		t.Fatalf("%d state machines were created, want 3", len(machines))
+// concurrentProposeDrain settles every outstanding workload proposal before
+// the counts are read, and returns what concurrentProposeBarrier returns.
+//
+// wg.Wait() only means the callers returned. A MaybeApplied proposal can
+// still commit, and a proposal forwarded to a former leader is out of reach
+// of any barrier through the current one: a follower forwards a Propose to
+// whatever leader it knows at that moment (raft.go stepFollower, msg.To =
+// r.leaderID), on its stream to THAT target, and a stale-term Propose is
+// accepted and re-forwarded by its receiver once it is a follower, so a
+// message delayed on the stream to the former leader can commit after every
+// fence through the current leader. Closing every host drops every message
+// still in flight with its transport. Each host then restarts from its own
+// log with no caller proposing, so the only workload entries that can ever
+// commit are those already in a replica's log, and a barrier through the
+// restarted leader commits after every one of them that will.
+func concurrentProposeDrain(ctx context.Context, t *testing.T, c *concurrentProposeCluster) (string, map[string]struct{}, uint64) {
+	t.Helper()
+	c.restart(t)
+	return concurrentProposeBarrier(ctx, t, c.hosts)
+}
+
+// concurrentProposeCheck asserts each replica applied every key within its
+// class's bound (see proposeOutcomes), the acknowledged barrier exactly once,
+// every other barrier attempt at most once, and nothing else.
+func concurrentProposeCheck(t *testing.T, c *concurrentProposeCluster, out *proposeOutcomes, barrierKey string, barriers map[string]struct{}) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.machines) != 3 {
+		t.Fatalf("%d state machines were created, want 3", len(c.machines))
 	}
-	for id, m := range machines {
+	for id, m := range c.machines {
 		applied := m.snapshot()
-		for key := range acked {
+		for key := range out.acked {
 			if n := applied[key]; n != 1 {
 				t.Errorf("replica %d applied acknowledged key %s %d times, want 1", id, key, n)
 			}
@@ -298,7 +444,7 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 			t.Errorf("replica %d applied barrier key %s %d times, want 1", id, barrierKey, n)
 		}
 		for key, n := range applied {
-			if _, ok := acked[key]; ok {
+			if _, ok := out.acked[key]; ok {
 				continue
 			}
 			if _, ok := barriers[key]; ok {
@@ -307,11 +453,11 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 				}
 				continue
 			}
-			if _, ok := refused[key]; ok {
+			if _, ok := out.refused[key]; ok {
 				t.Errorf("replica %d applied key %s refused before submission (%d times), want 0", id, key, n)
 				continue
 			}
-			if _, ok := maybe[key]; ok {
+			if _, ok := out.maybe[key]; ok {
 				if n > 1 {
 					t.Errorf("replica %d applied may-still-commit key %s %d times, want at most 1", id, key, n)
 				}
@@ -319,10 +465,6 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 			}
 			t.Errorf("replica %d applied unacknowledged key %s (%d times)", id, key, n)
 		}
-	}
-
-	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
-		t.Fatalf("replica state hashes differ at index %d: %v", at, hashes)
 	}
 }
 
@@ -356,58 +498,6 @@ func concurrentProposeBarrier(ctx context.Context, t *testing.T, hosts []*Host) 
 		default:
 			t.Fatalf("barrier SyncPropose(%s): %v", key, err)
 		}
-	}
-}
-
-// concurrentProposeFence submits one fence entry through EVERY host's own
-// propose path and waits until each is acknowledged. A host that is not the
-// leader forwards its fence as an ordered Propose (raft.go stepFollower,
-// proto.Propose) on the same per-(target, shard) QUIC stream as any workload
-// proposal it forwarded earlier (transport getStream), so once that host's
-// fence commits, its earlier forwarded proposals to the same leader have
-// arrived. A round only counts when the leader is the same host before and
-// after it: a leader change mid-round sends fences to a different target,
-// which orders nothing, so the round is repeated. It returns every fence key
-// attempted and the highest acknowledged fence index.
-func concurrentProposeFence(ctx context.Context, t *testing.T, hosts []*Host) (map[string]struct{}, uint64) {
-	t.Helper()
-	attempted := make(map[string]struct{})
-	leaderNow := func() *Host {
-		var l *Host
-		if !waitUntil(20*time.Second, func() bool {
-			l = concurrentProposeLeader(hosts)
-			return l != nil
-		}) {
-			t.Fatal("no leader while fencing")
-		}
-		return l
-	}
-	for round := 0; ; round++ {
-		before := leaderNow()
-		var high uint64
-		for i, h := range hosts {
-			for attempt := 0; ; attempt++ {
-				if ctx.Err() != nil {
-					t.Fatalf("fence on host %d never committed: %v", i+1, ctx.Err())
-				}
-				key := fmt.Sprintf("fence-r%02d-h%d-%02d", round, i+1, attempt)
-				attempted[key] = struct{}{}
-				res, err := h.SyncPropose(ctx, concurrentProposeShard, []byte(key))
-				if err == nil {
-					high = max(high, res.Value)
-					break
-				}
-				if !MaybeApplied(err) && !errors.Is(err, ErrNotLeader) {
-					t.Fatalf("fence SyncPropose(%s) on host %d: %v", key, i+1, err)
-				}
-				t.Logf("fence %s on host %d: %v; retrying", key, i+1, err)
-				leaderNow()
-			}
-		}
-		if leaderNow() == before {
-			return attempted, high
-		}
-		t.Logf("leader moved during fence round %d; fencing again", round)
 	}
 }
 
