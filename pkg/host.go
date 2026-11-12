@@ -3476,11 +3476,15 @@ type Host struct {
 	dirLock     *fsutil.DirLock
 	nodes       sync.Map     // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
 	activeNodes atomic.Int64 // tracks the number of loaded shards (replaces len(h.nodes))
-	closed      atomic.Bool
-	draining    atomic.Bool
-	diskFull    *atomic.Bool // set by disk full callback in buildWALOptions
-	id          string
-	stopOnce    sync.Once
+	closed      atomic.Bool  // shutdown admitted: set at the start of Close
+	// closeDone is set once Close's shutdown work has completed. EmergencySeal
+	// keeps sealing while closed is set but closeDone is not, because Close
+	// seals the barrier only after it has drained and stopped the engine.
+	closeDone atomic.Bool
+	draining  atomic.Bool
+	diskFull  *atomic.Bool // set by disk full callback in buildWALOptions
+	id        string
+	stopOnce  sync.Once
 	// closeErr is the shutdown outcome the FIRST Close computed. Every other
 	// Close returns it too, which is only safe because stopOnce.Do publishes
 	// the write to every caller that blocked on it.
@@ -9779,6 +9783,9 @@ func (h *Host) NodeHostInfo(opt NodeHostInfoOption) *NodeHostInfo {
 // Used for debugging pipeline stalls. The snapshot gates that can also stall
 // a shard are reported by DiagShardGates.
 func (h *Host) DiagPipelineState(shardID uint64) (PipelineDiag, error) {
+	if h.closed.Load() {
+		return PipelineDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return PipelineDiag{}, ErrShardNotReady
@@ -9817,6 +9824,9 @@ func (h *Host) DiagPipelineState(shardID uint64) (PipelineDiag, error) {
 // See ShardGatesDiag for what each gate means. Both states are also surfaced
 // through ShardInfo.Health as ShardRecovering and ShardSnapshotting.
 func (h *Host) DiagShardGates(shardID uint64) (ShardGatesDiag, error) {
+	if h.closed.Load() {
+		return ShardGatesDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return ShardGatesDiag{}, ErrShardNotReady
@@ -9832,6 +9842,9 @@ func (h *Host) DiagShardGates(shardID uint64) (ShardGatesDiag, error) {
 // DiagRaftState returns diagnostic raft state for the given shard.
 // Used for debugging pipeline stalls.
 func (h *Host) DiagRaftState(shardID uint64) (RaftStateDiag, error) {
+	if h.closed.Load() {
+		return RaftStateDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return RaftStateDiag{}, ErrShardNotReady
@@ -9849,6 +9862,9 @@ func (h *Host) DiagRaftState(shardID uint64) (RaftStateDiag, error) {
 
 // DiagRemotes returns diagnostic remote state for debugging commit stalls.
 func (h *Host) DiagRemotes(shardID uint64) (RemotesDiag, error) {
+	if h.closed.Load() {
+		return RemotesDiag{}, ErrClosed
+	}
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		return RemotesDiag{}, ErrShardNotReady
@@ -10056,6 +10072,7 @@ func (h *Host) Close() error {
 
 		h.logger.Info("host closed", "id", h.id)
 		h.closeErr = closeErr
+		h.closeDone.Store(true)
 	})
 
 	return h.closeErr
@@ -10100,7 +10117,13 @@ func sealOnClose(b Barrier) error {
 // The implementation is event-driven: instead of polling at fixed intervals,
 // it uses an atomic counter (pendingOps) decremented by operation completion
 // callbacks. When the counter reaches 0, a notification channel is closed.
+//
+// After Close has completed, Drain returns ErrClosed. Close's own call to
+// Drain, made while its shutdown work runs, is unaffected.
 func (h *Host) Drain() error {
+	if h.closeDone.Load() {
+		return ErrClosed
+	}
 	// The flag goes up before the Once so that new work is refused from the
 	// instant ANY caller asks for a drain, not from when the elected attempt
 	// gets scheduled. It is never cleared: see the irreversibility note.
@@ -10708,8 +10731,14 @@ func (h *Host) RaftAddress() string {
 // EmergencySeal immediately seals the barrier without waiting for in-flight
 // operations to complete. All in-flight operations will fail with
 // ErrBarrierSealed. This is for security incident response where speed
-// matters more than graceful shutdown.
+// matters more than graceful shutdown. While Close is still running it
+// seals the barrier: Close seals it only after draining and stopping the
+// engine, which can take arbitrarily long. Once Close has completed it
+// returns ErrClosed: Close has already sealed the barrier.
 func (h *Host) EmergencySeal() error {
+	if h.closeDone.Load() {
+		return ErrClosed
+	}
 	if h.barrier == nil {
 		return ErrBarrierNotInit
 	}
@@ -11684,6 +11713,15 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 	// combination that never held would tell a caller this replica led in a
 	// term it never led.
 	leaderID, term, isLeader := ns.leaderAndTerm()
+	// A paused replica steps nothing, so the published leader is frozen at
+	// its pre-pause value. It neither campaigns nor heartbeats and discards
+	// every inbound message: it leads nothing and knows no leader, and the
+	// other voters may already have elected one. Report that, not the frozen
+	// claim, which would show two replicas leading the shard.
+	paused := ns.paused.Load()
+	if paused {
+		leaderID, isLeader = 0, false
+	}
 	lastApplied := ns.lastApplied.Load()
 
 	return &ShardInfo{
@@ -11701,7 +11739,7 @@ func (h *Host) buildShardInfo(ns *nodeState) *ShardInfo {
 		Health:               h.shardHealth(ns, leaderID, lastApplied),
 		LastApplied:          lastApplied,
 		ConfigChangeIndex:    ns.configChangeIndex.Load(),
-		Paused:               ns.paused.Load(),
+		Paused:               paused,
 		Replicas:             h.replicaProgress(ns.shardID),
 	}
 }

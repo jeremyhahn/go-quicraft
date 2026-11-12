@@ -1,6 +1,6 @@
 # Memory enclave: architecture
 
-> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-10-13
+> **Status: NORMATIVE** · Scope: go-quicraft's use of go-enclave protected memory · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
@@ -218,8 +218,7 @@ kernel zeroes them before reuse. The two are disjoint. A third,
 `ErrEnclaveCorrupted`, means the canary or guard pages were overwritten; the
 pages are still wiped and released.
 
-`Sealed.Destroy` returns an error too, always `nil` in go-enclave
-v0.9.0-alpha. `pkg/seal` logs a non-nil one at WARN through its own helper
+`Sealed.Destroy` returns an error too. `pkg/seal` logs a non-nil one at WARN through its own helper
 (`releaseSealed`), and `SoftwareStrategy.Close` returns it.
 
 Every `ByteAccess` this repository destroys is a cleanup step whose operation

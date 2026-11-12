@@ -1,7 +1,7 @@
 # Write Batching — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-13
+> Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 Use the aggregator when you have many small writes and the fixed cost of each
@@ -136,7 +136,8 @@ so a crash loses them; a short `FlushInterval` limits how many.
 ## Carry a durability mode in configuration
 
 ```go
-m, err := writemode.FromString(cfg.DurabilityMode) // "sync", "wal_durable", "batched", ...
+// name is your application's own setting: "sync", "wal_durable", "batched", ...
+m, err := writemode.FromString(name)
 if err != nil {
 	return err
 }

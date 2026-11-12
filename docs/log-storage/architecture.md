@@ -1,7 +1,7 @@
 # Log Storage — Architecture
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-11
+> `pkg/logdb/memdb` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 ## The problem
