@@ -12648,7 +12648,11 @@ func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards fu
 			return opts
 		}
 
-		var monOpts []waldb.DiskMonitorOption
+		// MaxWALDiskSize bounds the WAL directory, so the monitor measures
+		// the files under it, not the used bytes of the whole filesystem
+		// holding it (the monitor's default), which trips the full state on
+		// the first check whenever the limit is below the volume's usage.
+		monOpts := []waldb.DiskMonitorOption{waldb.WithDiskUsageFunc(walDirUsage)}
 
 		// Always wire a recovery callback to clear diskFullFlag when
 		// disk usage drops below the full threshold.
@@ -12699,6 +12703,37 @@ func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards fu
 	}
 
 	return opts
+}
+
+// walDirUsage returns the total size in bytes of the regular files under
+// dir: the WAL directory usage that HostConfig.MaxWALDiskSize bounds. A file
+// removed during the walk (a segment the WAL dropped) is skipped.
+func walDirUsage(dir string) (uint64, error) {
+	var used uint64
+	err := filepath.WalkDir(dir, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		used += uint64(max(info.Size(), 0))
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return used, nil
 }
 
 // diskShards calls shards when it is set, for DiskInfo.Shards.
