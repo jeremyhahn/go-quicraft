@@ -9292,9 +9292,9 @@ func TestSyncRemoveData_ContextCanceled_NotRawContextError(t *testing.T) {
 	cancel()
 
 	err := h.SyncRemoveData(ctx, 1, 1)
-	// Verify the error is NOT raw context.Canceled.
-	if errors.Is(err, context.Canceled) {
-		t.Error("SyncRemoveData should return ErrCanceled, not context.Canceled")
+	// The error is ErrCanceled, which also matches context.Canceled.
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("SyncRemoveData error = %v, want it to match context.Canceled", err)
 	}
 	if !errors.Is(err, ErrCanceled) {
 		t.Errorf("SyncRemoveData error = %v, want ErrCanceled", err)

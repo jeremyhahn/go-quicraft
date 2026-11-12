@@ -1280,10 +1280,9 @@ func TestExecuteOnLeader_CallerCancellationIsTheCallersError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	want := mapContextError(context.Canceled)
 	settleAttempts(ctx, t, c, 64, func(_ leaderExecOutcome, err error) {
-		if !errors.Is(err, want) {
-			t.Fatalf("err = %v, want %v", err, want)
+		if !errors.Is(err, ErrCanceled) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want ErrCanceled and context.Canceled", err)
 		}
 	})
 }

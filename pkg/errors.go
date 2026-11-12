@@ -59,10 +59,14 @@ var (
 	ErrClosed = errors.New("quicraft: host closed")
 
 	// ErrCanceled is returned when a request is canceled by the caller
-	// via context cancellation.
+	// via context cancellation. The returned error wraps the context
+	// error as well, so errors.Is(err, context.Canceled) also holds.
 	ErrCanceled = errors.New("quicraft: request canceled")
 
-	// ErrTimeout is returned when a request exceeds its deadline.
+	// ErrTimeout is returned when a request exceeds its deadline. When the
+	// deadline is the caller's context, the returned error wraps the
+	// context error as well, so errors.Is(err, context.DeadlineExceeded)
+	// also holds.
 	ErrTimeout = errors.New("quicraft: timeout")
 
 	// ErrRejected is returned when a proposal is rejected, for example

@@ -5946,10 +5946,7 @@ func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) 
 			return nil, result.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 lookup:
 
@@ -6015,10 +6012,7 @@ func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (res
 			return nil, nopHostRelease, r.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, nopHostRelease, ErrTimeout
-		}
-		return nil, nopHostRelease, ErrCanceled
+		return nil, nopHostRelease, mapContextError(ctx.Err())
 	}
 lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -7301,10 +7295,7 @@ func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Mem
 			return nil, result.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 
 	// Step 3: Read membership from the Raft peer. GetMembership returns a
@@ -7666,7 +7657,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 		if errors.Is(err, engine.ErrStopped) {
 			return ErrClosed
 		}
-		return err
+		return mapContextError(err)
 	}
 	return nil
 }
@@ -7769,7 +7760,7 @@ func pauseTransferTarget(progress []raft.RemoteProgress, self uint64) uint64 {
 // ResumeShard returns ctx.Err() and changes nothing.
 func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return mapContextError(err)
 	}
 	if h.closed.Load() {
 		return ErrClosed
@@ -7784,7 +7775,7 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	}
 	// A pause in its leadership transfer holds the gate; ctx bounds the wait.
 	if !ns.pauseGate.lock(ctx.Done()) {
-		return ctx.Err()
+		return mapContextError(ctx.Err())
 	}
 	h.engine.ResumeNode(engNode)
 	ns.paused.Store(false)
@@ -11118,10 +11109,7 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 		}
 		return result.Value, nil
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return 0, ErrTimeout
-		}
-		return 0, ErrCanceled
+		return 0, mapContextError(ctx.Err())
 	}
 }
 
@@ -11204,10 +11192,7 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 func (h *Host) SyncRemoveData(ctx context.Context, shardID, replicaID uint64) error {
 	select {
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
+		return mapContextError(ctx.Err())
 	default:
 	}
 	return h.RemoveData(shardID, replicaID)
@@ -12629,14 +12614,15 @@ func walShardIDs(db logdb.LogDB) []uint64 {
 }
 
 // mapContextError translates a context error into the corresponding
-// quicraft sentinel error. This ensures callers always see ErrCanceled
-// or ErrTimeout rather than raw context.Canceled / context.DeadlineExceeded.
+// quicraft sentinel error that wraps it, so errors.Is holds for both
+// ErrCanceled and context.Canceled, or for both ErrTimeout and
+// context.DeadlineExceeded.
 func mapContextError(err error) error {
-	if err == context.DeadlineExceeded {
-		return ErrTimeout
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrTimeout, err)
 	}
-	if err == context.Canceled {
-		return ErrCanceled
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%w: %w", ErrCanceled, err)
 	}
 	return err
 }
