@@ -167,7 +167,9 @@ type ShardInfo struct {
 
 	// Paused is true while the replica is paused by Host.PauseShard and
 	// not yet resumed by Host.ResumeShard. A pause is not persisted: a
-	// restarted replica reports false.
+	// restarted replica reports false. A paused replica neither leads nor
+	// follows, so it reports LeaderID 0, IsLeader false and Health
+	// ShardNoLeader until ResumeShard; Term keeps its last published value.
 	Paused bool `json:"paused"`
 
 	// Replicas reports how far each remote member has replicated, as this
