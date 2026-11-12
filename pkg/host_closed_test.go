@@ -66,13 +66,11 @@ var hostClosedContract = map[string]closedKind{
 	// Drain is idempotent and returns its one recorded result to every
 	// caller; Close itself calls it after setting the closed flag.
 	"Drain": closedExempt,
-	// EmergencySeal is incident response: Close does not seal the
-	// barrier, so sealing must stay possible on a closed host.
-	"EmergencySeal": closedExempt,
 
 	// Everything else returns ErrClosed.
 	"CloseSession":                       closedErr,
 	"DiagPipelineState":                  closedErr,
+	"EmergencySeal":                      closedErr,
 	"DiagRaftState":                      closedErr,
 	"DiagRemotes":                        closedErr,
 	"DiagShardGates":                     closedErr,
