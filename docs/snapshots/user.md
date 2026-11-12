@@ -1,7 +1,7 @@
 # Snapshots — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-10-13
+> import/export and re-encryption · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 Snapshots happen on their own. You deal with them when you tune how often they

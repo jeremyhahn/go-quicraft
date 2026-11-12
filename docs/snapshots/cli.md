@@ -1,7 +1,7 @@
 # Snapshots — CLI
 
 > **Status: NORMATIVE** · Scope: go-quicraft snapshot creation, streaming,
-> import/export and re-encryption · Last verified: 2026-10-13
+> import/export and re-encryption · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 **No CLI surface.** go-quicraft is a library and ships no binaries: there is no
