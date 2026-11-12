@@ -29,10 +29,11 @@ import (
 // retryCountingSM counts every entry the state machine is handed and answers
 // each with retryResultBase plus that count, so a result names the apply that
 // produced it and a second apply of one command would show in both the count
-// and the result.
+// and the result. last holds the log index of the latest entry it applied.
 type retryCountingSM struct {
 	mockStateMachine
 	applied *atomic.Uint64
+	last    *atomic.Uint64
 }
 
 const retryResultBase = 1000
@@ -40,6 +41,7 @@ const retryResultBase = 1000
 func (s *retryCountingSM) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
 	for i := range entries {
 		results[i] = sm.Result{Value: retryResultBase + s.applied.Add(1)}
+		s.last.Store(entries[i].Index)
 	}
 	return nil
 }
@@ -56,6 +58,7 @@ type sessionRetryCluster struct {
 	t       *testing.T
 	nodes   []*retryNode
 	applied [3]atomic.Uint64
+	last    [3]atomic.Uint64
 }
 
 func newSessionRetryCluster(t *testing.T) *sessionRetryCluster {
@@ -90,8 +93,9 @@ func newSessionRetryCluster(t *testing.T) *sessionRetryCluster {
 	}
 	for i, n := range c.nodes {
 		counter := &c.applied[i]
+		last := &c.last[i]
 		create := func(_, _ uint64) interface{} {
-			return &retryCountingSM{applied: counter}
+			return &retryCountingSM{applied: counter, last: last}
 		}
 		scfg := testShardConfig(retryShard, uint64(i+1))
 		scfg.MemberIdentities = ids
@@ -153,18 +157,28 @@ func (c *sessionRetryCluster) transfer(from int) int {
 	return to
 }
 
-// awaitApplied waits until every replica has applied want entries, then
-// checks none applied more.
-func (c *sessionRetryCluster) awaitApplied(want uint64) {
+// awaitApplied takes the log index of the latest entry the state machine on
+// replica leader applied (the final proposal, which leader answered), waits
+// until every replica's applied index reaches it, and only then checks every
+// replica applied exactly want entries. Waiting on the index rather than the
+// count keeps a duplicate apply on a follower from passing as the final one.
+func (c *sessionRetryCluster) awaitApplied(leader int, want uint64) {
 	c.t.Helper()
-	waitUntil(10*time.Second, func() bool {
-		for i := range c.applied {
-			if c.applied[i].Load() < want {
+	final := c.last[leader].Load()
+	if final == 0 {
+		c.t.Fatalf("replica %d has applied no entry", leader+1)
+	}
+	if !waitUntil(10*time.Second, func() bool {
+		for _, n := range c.nodes {
+			info, err := n.host.ShardInfo(retryShard)
+			if err != nil || info.LastApplied < final {
 				return false
 			}
 		}
 		return true
-	})
+	}) {
+		c.t.Fatalf("not every replica applied through index %d", final)
+	}
 	for i := range c.applied {
 		if got := c.applied[i].Load(); got != want {
 			c.t.Fatalf("replica %d applied %d entries, want %d", i+1, got, want)
@@ -220,7 +234,7 @@ func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 	if first.Value != retryResultBase+1 {
 		t.Fatalf("first result = %d, want %d", first.Value, retryResultBase+1)
 	}
-	c.awaitApplied(1)
+	c.awaitApplied(old, 1)
 
 	next := c.transfer(old)
 	if session.SeriesID() != series {
@@ -246,7 +260,7 @@ func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 	if r.Value != retryResultBase+2 {
 		t.Fatalf("next series result = %d, want %d", r.Value, retryResultBase+2)
 	}
-	c.awaitApplied(2)
+	c.awaitApplied(next, 2)
 }
 
 // A retry whose series is at or below the session's responded-to watermark,
@@ -270,7 +284,7 @@ func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 	if session.RespondedTo() < SeriesIDFirstProposal+1 {
 		t.Fatalf("RespondedTo = %d, want at least %d", session.RespondedTo(), SeriesIDFirstProposal+1)
 	}
-	c.awaitApplied(2)
+	c.awaitApplied(old, 2)
 
 	next := c.transfer(old)
 
@@ -296,5 +310,5 @@ func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 	if r2.Value != retryResultBase+3 {
 		t.Fatalf("series 3 result = %d, want %d", r2.Value, retryResultBase+3)
 	}
-	c.awaitApplied(3)
+	c.awaitApplied(next, 3)
 }
