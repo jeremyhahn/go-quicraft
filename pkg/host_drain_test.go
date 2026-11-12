@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -101,7 +102,8 @@ func TestHost_Drain_InFlightSyncProposeThenClose(t *testing.T) {
 		perCallDeadline = 5 * time.Second
 	)
 
-	baseline := runtime.NumGoroutine()
+	self := currentGoroutineID()
+	before := goroutineStacks()
 
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -224,15 +226,9 @@ func TestHost_Drain_InFlightSyncProposeThenClose(t *testing.T) {
 	}
 
 	// Every goroutine the host and the workers started must exit.
-	leakDeadline := time.Now().Add(closeDeadline)
-	for runtime.NumGoroutine() > baseline {
-		if time.Now().After(leakDeadline) {
-			buf := make([]byte, 64<<10)
-			buf = buf[:runtime.Stack(buf, true)]
-			t.Fatalf("goroutines after Close = %d, baseline %d:\n%s",
-				runtime.NumGoroutine(), baseline, buf)
-		}
-		time.Sleep(10 * time.Millisecond)
+	if leaked := leakedModuleGoroutines(before, self, goroutineLeakWait); len(leaked) != 0 {
+		t.Fatalf("%d goroutine(s) started during the test still running %v after Close:\n\n%s",
+			len(leaked), goroutineLeakWait, strings.Join(leaked, "\n\n"))
 	}
 
 	t.Logf("before Drain returned: %d committed, %d refused with ErrDraining",
