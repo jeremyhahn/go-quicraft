@@ -108,8 +108,8 @@ Follow *Effective Go*, and run `gofmt`. Local conventions:
 - Every error a caller might branch on is a package-level sentinel or a typed
   error. `fmt.Errorf` is only used to wrap one with `%w`.
 - Getters have no `Get` prefix: field `owner` gets `Owner()` and `SetOwner()`.
-  The ten `Get`-prefixed methods on `Host` are a documented exception (see
-  [docs/multi-group-host/api.md](docs/multi-group-host/api.md)).
+  `Host` follows the rule too (`ShardMembership`, `LeaderID`, `NoOPSession`);
+  only `contrib/dragonboat` keeps Dragonboat's `Get`-prefixed names.
 - Keep interfaces small and name them for what they do.
 - Make the zero value useful. Where zero must mean "unset" rather than "off",
   use a pointer and say so in the doc comment (`BarrierConfig.NonceTracking`
