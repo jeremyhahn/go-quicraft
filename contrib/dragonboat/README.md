@@ -77,11 +77,13 @@ depend on Dragonboat or on [Pebble](https://github.com/cockroachdb/pebble).
   leadership was lost, so it may still commit". Errors with no Dragonboat
   equivalent are wrapped in `AdapterError`. `IsTempError` reports the
   retryable set: `ErrSystemBusy`, `ErrShardNotReady`, `ErrTimeout`,
-  `ErrShardClosed`, `ErrShardNotInitialized`, `ErrClosed`, `ErrAborted` and
-  `ErrNotLeader`.
-- The `Get`-prefixed methods on `quicraft.Host` that this shim calls are a
-  documented naming exception; see
-  [docs/multi-group-host/api.md](../../docs/multi-group-host/api.md).
+  `ErrShardClosed`, `ErrShardNotInitialized`, `ErrClosed`, `ErrAborted`,
+  `ErrNotLeader` and `quicraft.ErrShardPaused` (a paused shard, which reaches
+  the caller wrapped in `AdapterError`).
+- The shim's `Get`-prefixed methods (`GetLeaderID`, `GetShardMembership`,
+  `GetNoOPSession`, …) keep Dragonboat's names; the `quicraft.Host` methods
+  behind them carry no prefix (`LeaderID`, `ShardMembership`, `NoOPSession`).
+  See [docs/multi-group-host/api.md](../../docs/multi-group-host/api.md).
 
 The performance comparison in `test/performance/dragonboat` does not use this
 shim. It benchmarks a Dragonboat fork directly; see
