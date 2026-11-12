@@ -11125,8 +11125,8 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 	}
 }
 
-// RemoveData removes all LogDB data for the given shard/replica pair and
-// retires the replica ID on this host: StartShard refuses it from then on
+// RemoveData removes all LogDB data for the given shard/replica pair, removes
+// the replica's snapshot directory, and retires the replica ID on this host: StartShard refuses it from then on
 // (ReplicaRetiredError), across restarts. The shard must be
 // stopped on this host before calling RemoveData. This is used to clean up
 // persistent state after a node has been permanently removed from a shard; a
@@ -11166,8 +11166,25 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 		}
 	}
 
+	// Resolve the replica's snapshot directory before the LogDB removal
+	// drops the bootstrap record that states the shard's DataDir (the
+	// nodeState holding the Config is gone once the replica is unloaded).
+	// Without a record (a joining replica records none) the tree is rooted
+	// under NodeHostDir, the layout StartShard uses for an empty DataDir.
+	var dataDir string
+	if bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID); err != nil {
+		return err
+	} else if ok {
+		dataDir = bs.DataDir
+	}
+	snapDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, dataDir, shardID), shardID, replicaID)
+
 	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
 		return err
+	}
+	if err := h.snapshotFsys().RemoveAll(snapDir); err != nil {
+		return fmt.Errorf("remove snapshot directory %s: %w", snapDir, err)
 	}
 
 	// Fire OnNodeDeleted after successfully removing node data.
