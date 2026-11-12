@@ -42,6 +42,41 @@ var docCommentRoots = []struct {
 // has anything missing fails the gate, so the list only shrinks.
 var docCommentAllowlist = map[string]bool{}
 
+// docFieldBaseline holds, per repo-relative file, the number of exported
+// struct fields that had neither a doc nor a trailing line comment when the
+// gate began checking fields. It only shrinks: a file over its count gained
+// an undocumented field and fails; a file under it fails until its count is
+// lowered. A file missing from the map has a baseline of 0.
+var docFieldBaseline = map[string]int{
+	"contrib/dragonboat/config/errors.go":          4,
+	"contrib/dragonboat/config/nodehost_config.go": 4,
+	"contrib/dragonboat/errors.go":                 5,
+	"contrib/dragonboat/nodehost.go":               4,
+	"contrib/dragonboat/raftio/events.go":          14,
+	"contrib/dragonboat/statemachine/errors.go":    7,
+	"pkg/batch/errors.go":                          5,
+	"pkg/config/errors.go":                         17,
+	"pkg/config/hostconfig.go":                     20,
+	"pkg/crypto/shamir/errors.go":                  4,
+	"pkg/errors.go":                                74,
+	"pkg/host.go":                                  6,
+	"pkg/logdb/errors.go":                          1,
+	"pkg/logdb/waldb/compaction.go":                4,
+	"pkg/logdb/waldb/db.go":                        6,
+	"pkg/logdb/waldb/errors.go":                    13,
+	"pkg/logdb/waldb/format.go":                    6,
+	"pkg/logdb/waldb/reencrypt.go":                 2,
+	"pkg/logdb/waldb/repair.go":                    4,
+	"pkg/proto/constants.go":                       2,
+	"pkg/seal/errors.go":                           7,
+	"pkg/sm/errors.go":                             2,
+	"pkg/sm/kv/errors.go":                          4,
+	"pkg/sm/kv/protocol.go":                        4,
+	"pkg/sm/types.go":                              2,
+	"pkg/snapshot_option.go":                       2,
+	"pkg/writemode/errors.go":                      1,
+}
+
 // docGap is one exported identifier or package with no doc comment.
 type docGap struct {
 	pkgDir string
@@ -54,7 +89,9 @@ type docGap struct {
 // function, method on an exported type, method declared in an exported
 // interface, constant and variable in a public package under pkg/ or
 // contrib/dragonboat/ that carries no doc comment, and for each such package
-// with no package comment.
+// with no package comment. Exported, named fields of an exported struct need
+// a doc or a trailing line comment too; their gaps are held to the
+// shrink-only per-file docFieldBaseline, never to docCommentAllowlist.
 //
 // Public means not under an internal/ directory and not a _test.go file. A
 // grouped const or var block's doc comment counts for its members; each type
@@ -134,7 +171,13 @@ func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 
 	var failing []docGap
 	allowedHit := map[string]int{}
+	fieldGaps := map[string][]docGap{}
 	for _, g := range gaps {
+		// Struct field gaps count against docFieldBaseline only.
+		if strings.HasPrefix(g.what, "field ") {
+			fieldGaps[g.file] = append(fieldGaps[g.file], g)
+			continue
+		}
 		if docCommentAllowlist[g.pkgDir] {
 			allowedHit[g.pkgDir]++
 			continue
@@ -151,6 +194,39 @@ func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 	sort.Strings(stale)
 	for _, dir := range stale {
 		t.Errorf("docCommentAllowlist entry %s has nothing undocumented; remove it", dir)
+	}
+
+	// The field baseline only shrinks: a file over its count gained an
+	// undocumented field, a file under it must lower its count.
+	fieldFiles := map[string]bool{}
+	for file := range fieldGaps {
+		fieldFiles[file] = true
+	}
+	for file := range docFieldBaseline {
+		fieldFiles[file] = true
+	}
+	var fieldFileList []string
+	for file := range fieldFiles {
+		fieldFileList = append(fieldFileList, file)
+	}
+	sort.Strings(fieldFileList)
+	fieldTotal := 0
+	for _, file := range fieldFileList {
+		got, base := len(fieldGaps[file]), docFieldBaseline[file]
+		fieldTotal += got
+		switch {
+		case got > base:
+			var b strings.Builder
+			for _, g := range fieldGaps[file] {
+				fmt.Fprintf(&b, "\t%s:%d: %s\n", g.file, g.line, g.what)
+			}
+			t.Errorf("%s has %d undocumented exported struct fields, docFieldBaseline allows %d; "+
+				"document the new field (a comment above it or a trailing line comment):\n%s",
+				file, got, base, b.String())
+		case got < base:
+			t.Errorf("%s has %d undocumented exported struct fields, below its docFieldBaseline of %d; "+
+				"lower the baseline to %d", file, got, base, got)
+		}
 	}
 
 	if len(failing) > 0 {
@@ -174,8 +250,9 @@ func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 	for _, n := range allowedHit {
 		skipped += n
 	}
-	t.Logf("checked %d files; %d gaps in %d allowlisted packages not enforced",
-		scanned, skipped, len(allowedHit))
+	t.Logf("checked %d files; %d gaps in %d allowlisted packages not enforced; "+
+		"%d undocumented struct fields in the baseline",
+		scanned, skipped, len(allowedHit), fieldTotal)
 }
 
 // undocumentedDecls returns the exported top-level declarations in file
@@ -210,6 +287,24 @@ func undocumentedDecls(fset *token.FileSet, rel string, file *ast.File) []docGap
 				for _, spec := range d.Specs {
 					s, ok := spec.(*ast.TypeSpec)
 					if !ok || !s.Name.IsExported() {
+						continue
+					}
+					// Each exported, named field of an exported struct
+					// needs a doc or a trailing line comment, as godoc
+					// renders either. Embedded fields are skipped, and
+					// fields of a nested anonymous struct type inside a
+					// field are out of scope.
+					if st, ok := s.Type.(*ast.StructType); ok && st.Fields != nil {
+						for _, field := range st.Fields.List {
+							if field.Doc != nil || field.Comment != nil {
+								continue
+							}
+							for _, n := range field.Names {
+								if n.IsExported() {
+									add(n.Pos(), "field "+s.Name.Name+"."+n.Name)
+								}
+							}
+						}
 						continue
 					}
 					it, ok := s.Type.(*ast.InterfaceType)
