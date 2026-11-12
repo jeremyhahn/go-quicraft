@@ -310,6 +310,19 @@ succeed after the election (clean at `-count=20` and under `-race`), and
 runs under `-race`. Removing the point is a change to the CI template, not to
 this repository's Makefile.
 
+The skip covered quic-go's `Conn.peerParams` race (a write from the
+connection's run goroutine against a read from the goroutine that opens an
+early-data stream). It was re-checked on quic-go v0.64.1 (#442, clean over 120
+race-detector runs) and again on quic-go v0.65.0 (#745), with Go 1.27:
+
+| Command | rc | Time |
+|---|---|---|
+| `go test -race -count=120 -run '^TestSnapshotOver0RTTRejected$' ./pkg/internal/transport/` | 0 | 37 s |
+| `go test -race -count=1 ./pkg/internal/transport/...` | 0 | 68 s |
+
+Neither run printed a `DATA RACE` report, so the test keeps running under
+`-race` with no skip. Repeat both commands after each quic-go bump.
+
 `check-coverage` fails on a missing or empty profile and on any value that is
 not a number before it compares. Without those guards an empty percentage made
 `bc` print nothing, the shell test degenerated to `[ -eq 1 ]`, and the gate
