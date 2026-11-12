@@ -697,14 +697,16 @@ func TestEncodeBatch_RejectsOverMaxInt32(t *testing.T) {
 	}
 }
 
-// TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotWrapBound pins the bound check
+// TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotOverflowBound pins the bound check
 // that follows the uint32-to-int narrowing of a length prefix. A prefix of
 // exactly MaxInt32 passes the MaxInt32 guard, and on a 32-bit build the sum
 // off+cmdLen then overflows int to a negative value that slips past an
 // off+cmdLen > len(data) comparison and panics the slice expression. Both
 // decode paths must refuse it with a DecodeError on every platform; EncodeBatch
-// never writes a prefix larger than the bytes that follow it.
-func TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotWrapBound(t *testing.T) {
+// never writes a prefix larger than the bytes that follow it. These inputs can
+// only overflow a 32-bit int; TestFits_NoOverflowNearMaxInt drives the shared
+// bound helper past a 64-bit int too.
+func TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotOverflowBound(t *testing.T) {
 	inputs := map[string][]byte{
 		"first prefix":  {0x7f, 0xff, 0xff, 0xff},
 		"second prefix": {0x00, 0x00, 0x00, 0x01, 0xaa, 0x7f, 0xff, 0xff, 0xff, 0xbb},
