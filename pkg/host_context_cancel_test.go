@@ -337,28 +337,15 @@ var contextCancelImmediate = map[string]string{
 	"ResumeShard": "the shard is not paused",
 }
 
-// contextCancelUncancellable names methods that block on the blocked shard
-// and ignore their context: the in-flight case is skipped with the reason.
-// The local reads call the state machine's Lookup, which waits behind the
-// Update the fixture holds without selecting on the context.
-var contextCancelUncancellable = map[string]string{
-	"StaleRead":      "Lookup waits behind a running Update without its context",
-	"StaleReadBuf":   "Lookup waits behind a running Update without its context",
-	"QueryLocalNode": "Lookup waits behind a running Update without its context",
-	"FollowerRead":   "Lookup waits behind a running Update without its context",
-}
-
 func TestHostContextCancel(t *testing.T) {
 	methods := contextCancelMethods(t)
 	known := make(map[string]bool, len(methods))
 	for _, m := range methods {
 		known[m.Name] = true
 	}
-	for _, table := range []map[string]string{contextCancelImmediate, contextCancelUncancellable} {
-		for name := range table {
-			if !known[name] {
-				t.Fatalf("%s is listed but is not a context-taking *Host method", name)
-			}
+	for name := range contextCancelImmediate {
+		if !known[name] {
+			t.Fatalf("%s is listed but is not a context-taking *Host method", name)
 		}
 	}
 
@@ -409,9 +396,6 @@ func TestHostContextCancel(t *testing.T) {
 			}
 		})
 		t.Run(m.Name+"/inflight", func(t *testing.T) {
-			if reason, ok := contextCancelUncancellable[m.Name]; ok {
-				t.Skipf("%s does not honour a cancel in flight: %s", m.Name, reason)
-			}
 			base := runtime.NumGoroutine()
 			h, block, release := startBlockedShard(t)
 			args := contextCancelCallArgs(h, m)
