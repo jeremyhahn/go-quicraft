@@ -109,6 +109,16 @@ func TestLifecycleEvents_SystemCallbacksFireOnceWithShardAndReplica(t *testing.T
 	// OnMembershipChanged{ShardID 1} than before it.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	// OnApplied publishes lastApplied before it fires OnMembershipChanged,
+	// so the bootstrap callback may still be pending after waitForLeader.
+	// Wait for it, so it cannot stand in for the observer's callback.
+	bootDeadline := time.Now().Add(5 * time.Second)
+	for rec.count("OnMembershipChanged", 1, 0, false) < 1 && time.Now().Before(bootDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if rec.count("OnMembershipChanged", 1, 0, false) < 1 {
+		t.Fatalf("bootstrap OnMembershipChanged{ShardID 1} never fired: %+v", rec.snapshot())
+	}
 	before := rec.count("OnMembershipChanged", 1, 0, false)
 	if err := h.SyncRequestAddObserver(ctx, 1, 2, "127.0.0.1:6000", 0); err != nil {
 		t.Fatalf("SyncRequestAddObserver: %v", err)
@@ -123,8 +133,19 @@ func TestLifecycleEvents_SystemCallbacksFireOnceWithShardAndReplica(t *testing.T
 		t.Fatalf("OnMembershipChanged{ShardID 1} count %d after adding an observer, want > %d: %+v",
 			got, before, rec.snapshot())
 	}
-	if got := rec.count("OnMembershipChanged", 1, 1, true); got != rec.count("OnMembershipChanged", 1, 0, false) {
-		t.Fatalf("OnMembershipChanged on shard 1 carried a replica other than 1: %+v", rec.snapshot())
+	membership := rec.snapshot()
+	onShard, onReplica := 0, 0
+	for _, e := range membership {
+		if e.name != "OnMembershipChanged" || e.shardID != 1 {
+			continue
+		}
+		onShard++
+		if e.replicaID == 1 {
+			onReplica++
+		}
+	}
+	if onReplica != onShard {
+		t.Fatalf("OnMembershipChanged on shard 1 carried a replica other than 1: %+v", membership)
 	}
 
 	// StopShard: exactly one OnNodeUnloaded{1,1}.
