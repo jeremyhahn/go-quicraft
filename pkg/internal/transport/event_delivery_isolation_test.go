@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,12 +24,19 @@ type snapshotSentRecorder struct {
 	noopTransportMetrics
 	mu    sync.Mutex
 	sends []snapshotSentSample
+	// exit, when set, runs after the sample is recorded, so a test can
+	// make the collector panic or call runtime.Goexit.
+	exit func()
 }
 
 func (r *snapshotSentRecorder) IncSnapshotsSent(shardID uint64, bytes int64, d time.Duration) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.sends = append(r.sends, snapshotSentSample{shardID: shardID, bytes: bytes, elapsed: d})
+	exit := r.exit
+	r.mu.Unlock()
+	if exit != nil {
+		exit()
+	}
 }
 
 func (r *snapshotSentRecorder) samples() []snapshotSentSample {
@@ -149,5 +157,53 @@ func TestEventDeliveryIsolation_ReportSnapshotSentMetricSurvivesExits(t *testing
 				t.Fatalf("IncSnapshotsSent recorded %+v, want %+v once despite OnSnapshotSent %s", got, want, exitName)
 			}
 		})
+	}
+}
+
+// TestEventDeliveryIsolation_ReportSnapshotSentContainsMetricExits makes the
+// IncSnapshotsSent collector itself panic or call runtime.Goexit after it
+// records its sample, with a listener that returns normally and with one
+// that also exits: reportSnapshotSent must still return normally, the
+// sample must be recorded exactly once, and OnSnapshotSent must still run.
+func TestEventDeliveryIsolation_ReportSnapshotSentContainsMetricExits(t *testing.T) {
+	for metricExitName, metricExit := range hostileLogExits {
+		for _, listenerExits := range []bool{false, true} {
+			name := metricExitName + "/listener-returns"
+			if listenerExits {
+				name = metricExitName + "/listener-also-exits"
+			}
+			t.Run(name, func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				requireSnapshotSentContained(ctx, t, metricExit, listenerExits)
+			})
+		}
+	}
+}
+
+func requireSnapshotSentContained(ctx context.Context, t *testing.T, metricExit func(), listenerExits bool) {
+	t.Helper()
+	rec := &snapshotSentRecorder{exit: metricExit}
+	var listenerCalls atomic.Int32
+	tr := &QUICTransport{
+		eventListener: &config.EventListener{
+			OnSnapshotSent: func(config.SnapshotInfo) {
+				listenerCalls.Add(1)
+				if listenerExits {
+					metricExit()
+				}
+			},
+		},
+		metrics: rec,
+	}
+	requireReturnsNormally(ctx, t, "reportSnapshotSent", func() {
+		tr.reportSnapshotSent(config.SnapshotInfo{ShardID: 9}, 2, 11, 3*time.Millisecond)
+	})
+	want := []snapshotSentSample{{shardID: 9, bytes: 11, elapsed: 3 * time.Millisecond}}
+	if got := rec.samples(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("IncSnapshotsSent recorded %+v, want %+v exactly once", got, want)
+	}
+	if got := listenerCalls.Load(); got != 1 {
+		t.Fatalf("OnSnapshotSent ran %d times, want 1", got)
 	}
 }
