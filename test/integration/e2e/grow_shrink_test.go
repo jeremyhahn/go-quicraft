@@ -50,22 +50,22 @@ func TestE2E_GrowShrink_OneToFiveToOne(t *testing.T) {
 	cluster := newTestCluster(t, 1)
 	defer cluster.close()
 	cluster.startShard(shardID)
-	waitForSingleLeader(t, cluster, shardID, leaderElectionTimeout)
+	waitForSingleLeader(t, cluster, shardID, growShrinkLeft(ctx, t, leaderElectionTimeout))
 
 	acked := make(map[string]string)
-	growShrinkWrite(t, cluster, shardID, "grow-1", 5, acked)
+	growShrinkWrite(ctx, t, cluster, shardID, "grow-1", 5, acked)
 
 	// (a) Grow: one host to five, one replica at a time.
 	for rid := uint64(2); rid <= maxReplicas; rid++ {
-		tracker := growShrinkAdd(t, cluster, shardID, rid)
-		waitForNodeData(t, tracker, shardID, rid, acked, membershipTimeout)
-		waitForSingleLeader(t, cluster, shardID, failoverTimeout)
+		tracker := growShrinkAdd(ctx, t, cluster, shardID, rid)
+		waitForNodeData(t, tracker, shardID, rid, acked, growShrinkLeft(ctx, t, membershipTimeout))
+		waitForSingleLeader(t, cluster, shardID, growShrinkLeft(ctx, t, failoverTimeout))
 		want := make([]uint64, 0, rid)
 		for id := uint64(1); id <= rid; id++ {
 			want = append(want, id)
 		}
-		waitForMembershipConverged(t, cluster, shardID, want, nil, membershipTimeout)
-		growShrinkWrite(t, cluster, shardID, fmt.Sprintf("grow-%d", rid), 5, acked)
+		waitForMembershipConverged(t, cluster, shardID, want, nil, growShrinkLeft(ctx, t, membershipTimeout))
+		growShrinkWrite(ctx, t, cluster, shardID, fmt.Sprintf("grow-%d", rid), 5, acked)
 		t.Logf("grew to %d voters; %d acknowledged writes", rid, len(acked))
 	}
 
@@ -82,7 +82,7 @@ func TestE2E_GrowShrink_OneToFiveToOne(t *testing.T) {
 		cluster.stopNode(idx)
 		removed = append(removed, rid)
 
-		leaderIdx := waitForSingleLeader(t, cluster, shardID, failoverTimeout)
+		leaderIdx := waitForSingleLeader(t, cluster, shardID, growShrinkLeft(ctx, t, failoverTimeout))
 		if leaderIdx == idx {
 			t.Fatalf("removed replica %d still leads shard %d", rid, shardID)
 		}
@@ -90,14 +90,14 @@ func TestE2E_GrowShrink_OneToFiveToOne(t *testing.T) {
 		for id := uint64(1); id < rid; id++ {
 			want = append(want, id)
 		}
-		waitForMembershipConverged(t, cluster, shardID, want, removed, membershipTimeout)
-		growShrinkWrite(t, cluster, shardID, fmt.Sprintf("shrink-%d", rid), 3, acked)
+		waitForMembershipConverged(t, cluster, shardID, want, removed, growShrinkLeft(ctx, t, membershipTimeout))
+		growShrinkWrite(ctx, t, cluster, shardID, fmt.Sprintf("shrink-%d", rid), 3, acked)
 		t.Logf("shrank to %d voters; %d acknowledged writes", rid-1, len(acked))
 	}
 
 	// (c) The last host holds every acknowledged write and only itself.
 	for key, want := range acked {
-		got := proposer.Read(t, cluster.leaderHost, shardID, key, growShrinkCallTimeout)
+		got := proposer.Read(t, cluster.leaderHost, shardID, key, growShrinkLeft(ctx, t, growShrinkCallTimeout))
 		if got != want {
 			t.Fatalf("Read(%q) through the last host = %v, want %q", key, got, want)
 		}
@@ -124,19 +124,22 @@ func TestE2E_GrowShrink_OneToFiveToOne(t *testing.T) {
 	if len(m.Removed) != len(removed) {
 		t.Fatalf("Removed = %v, want exactly %v", m.Removed, removed)
 	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("grow/shrink exceeded its %v budget: %v", growShrinkBudget, err)
+	}
 	t.Logf("1 -> 5 -> 1 complete with all %d acknowledged writes intact", len(acked))
 }
 
 // growShrinkWrite proposes n puts with keys prefix-000.. through the current
 // leader, retrying a leadership change, and records each acknowledged put in
 // acked.
-func growShrinkWrite(t *testing.T, c *testCluster, shardID uint64,
+func growShrinkWrite(ctx context.Context, t *testing.T, c *testCluster, shardID uint64,
 	prefix string, n int, acked map[string]string) {
 	t.Helper()
 	for i := range n {
 		key := fmt.Sprintf("%s-%03d", prefix, i)
 		value := "val-" + key
-		proposeToLeader(t, c, shardID, encodeKVPut(key, value), failoverTimeout)
+		proposeToLeader(t, c, shardID, encodeKVPut(key, value), growShrinkLeft(ctx, t, failoverTimeout))
 		acked[key] = value
 	}
 }
@@ -144,7 +147,7 @@ func growShrinkWrite(t *testing.T, c *testCluster, shardID uint64,
 // growShrinkAdd builds a host for replicaID, adds it as a voter with its node
 // identity and the leader's current ConfigChangeID, starts the shard on it in
 // join mode, and appends it to c. It returns the new replica's tracker.
-func growShrinkAdd(t *testing.T, c *testCluster, shardID, replicaID uint64) *smTracker {
+func growShrinkAdd(ctx context.Context, t *testing.T, c *testCluster, shardID, replicaID uint64) *smTracker {
 	t.Helper()
 	leaf := c.ca.Leaf(t)
 	hostCfg := testHostConfig(t, kernelAddr, leaf)
@@ -160,11 +163,15 @@ func growShrinkAdd(t *testing.T, c *testCluster, shardID, replicaID uint64) *smT
 	}()
 	addr, id := h.RaftAddress(), h.NodeIdentity()
 
-	syncAddNode(t, c, shardID, replicaID, addr, id, membershipTimeout)
-	m, err := c.leaderHost(shardID).ShardMembership(shardID)
-	if err != nil {
-		t.Fatalf("ShardMembership after adding replica %d: %v", replicaID, err)
-	}
+	m := growShrinkConfigChange(ctx, t, c, shardID,
+		fmt.Sprintf("SyncRequestAddNodeWithIdentity(replica=%d, addr=%s)", replicaID, addr),
+		func(cctx context.Context, lh *quicraft.Host, ccid uint64) error {
+			return lh.SyncRequestAddNodeWithIdentity(cctx, shardID, replicaID, addr, id, ccid) //quicraft:direct-config-change carries the leader's ConfigChangeID; growShrinkConfigChange confirms the outcome
+		},
+		func(lm *quicraft.Membership) bool {
+			_, ok := lm.Nodes[replicaID]
+			return ok
+		})
 	if _, ok := m.Nodes[replicaID]; !ok {
 		t.Fatalf("replica %d is not a voter after its add: %v", replicaID, m.Nodes)
 	}
@@ -200,7 +207,7 @@ func growShrinkAdd(t *testing.T, c *testCluster, shardID, replicaID uint64) *smT
 func growShrinkTransferLeader(ctx context.Context, t *testing.T, c *testCluster, shardID, target uint64) {
 	t.Helper()
 	for {
-		leaderIdx := waitForSingleLeader(t, c, shardID, failoverTimeout)
+		leaderIdx := waitForSingleLeader(t, c, shardID, growShrinkLeft(ctx, t, failoverTimeout))
 		if uint64(leaderIdx+1) == target {
 			return
 		}
@@ -219,7 +226,15 @@ func growShrinkTransferLeader(ctx context.Context, t *testing.T, c *testCluster,
 // the removed one has applied the removal.
 func growShrinkRemove(ctx context.Context, t *testing.T, c *testCluster, shardID, replicaID uint64, idx int) {
 	t.Helper()
-	syncDeleteNode(t, c, shardID, replicaID, membershipTimeout)
+	growShrinkConfigChange(ctx, t, c, shardID,
+		fmt.Sprintf("SyncRequestRemoveNode(replica=%d)", replicaID),
+		func(cctx context.Context, h *quicraft.Host, ccid uint64) error {
+			return h.SyncRequestRemoveNode(cctx, shardID, replicaID, ccid) //quicraft:direct-config-change carries the leader's ConfigChangeID; growShrinkConfigChange confirms the outcome
+		},
+		func(m *quicraft.Membership) bool {
+			_, ok := m.Removed[replicaID]
+			return ok
+		})
 	for {
 		for i, h := range c.hosts {
 			if i == idx || c.stopped[i].Load() {
@@ -233,6 +248,68 @@ func growShrinkRemove(ctx context.Context, t *testing.T, c *testCluster, shardID
 		}
 		growShrinkPause(ctx, t, fmt.Sprintf("removal of replica %d to apply", replicaID))
 	}
+}
+
+// growShrinkConfigChange drives one membership change through the current
+// leader, passing that leader's Membership.ConfigChangeID on every attempt
+// so the version round trip is exercised rather than skipped (0 skips it).
+// It retries only on leadership churn, and only until ctx expires. landed
+// reports whether a membership holds the change: after an attempt whose
+// outcome is unknown (a timeout or a cancelled proposal may still commit),
+// the change is accepted once it is visible instead of being resubmitted
+// under a ConfigChangeID that has gone stale. Any other refusal of a first
+// or definite attempt, a stale ConfigChangeID included, fails the test. It
+// returns the leader's membership in which the change landed.
+func growShrinkConfigChange(ctx context.Context, t *testing.T, c *testCluster, shardID uint64, what string,
+	submit func(ctx context.Context, h *quicraft.Host, ccid uint64) error,
+	landed func(m *quicraft.Membership) bool) *quicraft.Membership {
+	t.Helper()
+	committed, ambiguous := false, false
+	var lastErr error
+	for {
+		if h := c.leaderHost(shardID); h != nil {
+			m, err := h.ShardMembership(shardID)
+			switch {
+			case err != nil:
+				lastErr = err
+			case (committed || ambiguous) && landed(m):
+				return m
+			case !committed:
+				ccid := m.ConfigChangeID
+				cctx, cancel := context.WithTimeout(ctx, growShrinkLeft(ctx, t, growShrinkCallTimeout))
+				err = submit(cctx, h, ccid)
+				cancel()
+				switch {
+				case err == nil:
+					committed = true
+				case isTransientLeadershipError(err):
+					ambiguous, lastErr = true, err
+				case !ambiguous:
+					t.Fatalf("%s with ConfigChangeID %d: %v", what, ccid, err)
+				default:
+					// An earlier attempt may have committed; wait for it
+					// to become visible, failing at ctx expiry otherwise.
+					lastErr = err
+				}
+			}
+		}
+		growShrinkPause(ctx, t, fmt.Sprintf("%s (last error: %v)", what, lastErr))
+	}
+}
+
+// growShrinkLeft returns limit, or the time left on ctx when that is
+// shorter, so no shared helper outlives the test's overall budget.
+func growShrinkLeft(ctx context.Context, t *testing.T, limit time.Duration) time.Duration {
+	t.Helper()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return limit
+	}
+	left := time.Until(deadline)
+	if left <= 0 || ctx.Err() != nil {
+		t.Fatalf("grow/shrink budget %v exhausted", growShrinkBudget)
+	}
+	return min(left, limit)
 }
 
 // growShrinkPause waits briefly before a retry, failing the test with what
