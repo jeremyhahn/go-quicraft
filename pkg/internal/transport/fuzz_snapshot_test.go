@@ -16,7 +16,9 @@ package transport
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"runtime"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -172,6 +174,28 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 	oversize[4], oversize[5], oversize[6], oversize[7] = 0x7F, 0xFF, 0xFF, 0xFF
 	f.Add(uint8(1), oversize)
 
+	// Frames rejected before delivery. Each declares its length in a frame
+	// header copied from a valid frame, with no body or a short one.
+	frameWithLength := func(length uint32, body []byte) []byte {
+		fr := make([]byte, FrameHeaderSize, FrameHeaderSize+len(body))
+		copy(fr, valid[:FrameHeaderSize])
+		binary.BigEndian.PutUint32(fr[4:8], length)
+		return append(fr, body...)
+	}
+	// Past the per-frame cap: refused by the frame header check.
+	f.Add(uint8(1), frameWithLength(MaxFrameSize+1, nil))
+	// Within the per-frame cap but past the per-peer budget
+	// (fuzzSnapshotMemory/2): refused by reserveChunkMemory before the frame
+	// buffer exists. The MaxFrameSize one is what an allocation made ahead
+	// of the budget check would trip on.
+	f.Add(uint8(1), frameWithLength(MaxFrameSize, []byte{1, 2, 3}))
+	f.Add(uint8(2), frameWithLength(fuzzSnapshotMemory/2+1, nil))
+	// A valid frame followed by a truncated one.
+	firstLen := FrameHeaderSize + int(binary.BigEndian.Uint32(valid[4:8]))
+	truncated := append([]byte{}, valid[:firstLen]...)
+	truncated = append(truncated, valid[firstLen:firstLen+FrameHeaderSize+1]...)
+	f.Add(uint8(2), truncated)
+
 	f.Fuzz(func(t *testing.T, chunkCount uint8, data []byte) {
 		handler := newTestHandler()
 		sr := newSnapshotReceiver(4, fuzzSnapshotMemory, 0, 0, handler)
@@ -180,7 +204,25 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 		h.ChunkCount = uint64(chunkCount % 8)
 		stopC := make(chan struct{})
 
+		// allocBound is the most receiveChunks may allocate for one stream.
+		// A frame buffer is allocated only after reserveChunkMemory admits
+		// its length (snapshot_recv.go), so the frame buffers of one stream
+		// total at most the budget, fuzzSnapshotMemory; a decoded chunk
+		// copies at most its own frame, which doubles that to
+		// 2*fuzzSnapshotMemory. Neither can exceed the bytes the stream
+		// actually carried either, hence the 2*len(data) term for streams
+		// whose buffers are filled from data. 1 MiB covers the chunk slice,
+		// timers, errors and log records. An allocation made before the
+		// budget check (a MaxFrameSize buffer is 16 MiB) or an oversized one
+		// followed by a decode error lands past it.
+		allocBound := uint64(2*fuzzSnapshotMemory + 2*len(data) + 1<<20)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
 		sr.receiveChunks(&testChunkReader{data: data}, &h, fuzzSnapshotPeer, PeerAuth{}, stopC)
+		runtime.ReadMemStats(&after)
+		if delta := after.TotalAlloc - before.TotalAlloc; delta > allocBound {
+			t.Fatalf("receiveChunks allocated %d bytes from a %d byte stream, bound %d", delta, len(data), allocBound)
+		}
 
 		if got := sr.memoryBudget.Load(); got != fuzzSnapshotMemory {
 			t.Fatalf("memory budget not restored: %d, want %d", got, fuzzSnapshotMemory)
