@@ -1,6 +1,6 @@
 # go-quicraft roadmap
 
-> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-10-17
+> **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-11-12
 > Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 Every line names the [SPEC](docs/SPEC.md) feature it belongs to. The features
@@ -13,7 +13,8 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 
 ## Milestones
 
-- [`Dev complete`](../../milestone/11): release-candidate milestone; no due date set; 1 open ([#400](../../issues/400)), 75 closed.
+- `v1.0.0 bar`: the one open milestone; 1 open ([#427](../../issues/427), which waits on a go-enclave public release), 31 closed.
+- [`Dev complete`](../../milestone/11): closed.
 - [`Working fundamentally`](../../milestone/26): closed.
 
 ## Complete
@@ -32,29 +33,22 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 - **client-sessions** — client sessions for at-most-once delivery — [0.1.0-alpha](CHANGELOG.md) — done
 - **write-batching** — `pkg/batch`, `pkg/writemode` — [#268](../../issues/268) ([#271](../../pulls/271)) — done
 - **execute-on-leader** — `Host.ExecuteOnLeader` — [0.21.0-rc.1](../../releases/tag/v0.21.0-rc.1), [#257](../../issues/257) ([#261](../../pulls/261)) — done
-- **seal-barrier** — at-rest encryption, epoch rotation — [0.1.0-alpha](CHANGELOG.md), [#284](../../issues/284) ([#297](../../pulls/297)) — done
-- **seal-barrier** — Working fundamentally C4: sealed proposals return `ErrBarrierSealed` — [#296](../../issues/296), [0.21.0-rc.2](../../releases/tag/v0.21.0-rc.2) — done
+- **seal-barrier** — at-rest encryption, epoch rotation; Working fundamentally C4: sealed proposals return `ErrBarrierSealed` — [0.1.0-alpha](CHANGELOG.md), [#284](../../issues/284) ([#297](../../pulls/297)), [#296](../../issues/296), [0.21.0-rc.2](../../releases/tag/v0.21.0-rc.2) — done
 - **shamir-primitive** — Shamir `Combine`; share values in protected memory in 0.7.0-alpha — [0.4.0-alpha](../../releases/tag/v0.4.0-alpha), [0.7.0-alpha](../../releases/tag/v0.7.0-alpha) — done
 - **memory-enclave** — locked memory provided by go-enclave; `pkg/enclave` deleted — [0.11.0-alpha](../../releases/tag/v0.11.0-alpha) — done
 - **observability** — Prometheus metrics — [0.1.0-alpha](CHANGELOG.md), [#277](../../issues/277) ([#295](../../pulls/295), [#301](../../pulls/301)), [#279](../../issues/279) ([#295](../../pulls/295)) — done
 - **compatibility** — re-verified — [#274](../../issues/274) ([#287](../../pulls/287)) — done
 - **contrib-dragonboat** — `contrib/dragonboat` builds standalone — [0.2.0-alpha](CHANGELOG.md) — done
-- **testing** — Porcupine linearizability suite; Working fundamentally C3 (#275 fixed) — [0.1.0-alpha](CHANGELOG.md), [#275](../../issues/275) ([#295](../../pulls/295)), [#251](../../issues/251) ([#254](../../pulls/254)) — done
-- **testing** — Working fundamentally C1: the PR tier is green on main — [milestone](../../milestone/26) — done
-- **testing** — Working fundamentally C2: the full tier is green on the same SHA — [milestone](../../milestone/26) — done
-- **testing** — Working fundamentally C6: the nightly dependency-freshness check (`make deps-check`) is green — [milestone](../../milestone/26) — done
-- **release** — public-releasability gate — [0.16.0-alpha](../../releases/tag/v0.16.0-alpha), [#262](../../issues/262), [#269](../../issues/269) ([#270](../../pulls/270)), [#250](../../issues/250) ([#256](../../pulls/256)), [#282](../../issues/282) ([#287](../../pulls/287)) — done
-- **release** — Working fundamentally C7: v0.21.0-rc.2 is cut and go-qrdb adopts it — [0.21.0-rc.2](../../releases/tag/v0.21.0-rc.2) — done
-- **testing** — `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably ([#320](../../pulls/320), [#322](../../pulls/322), [#347](../../pulls/347)) — [#309](../../issues/309) — done
-- **release** — spec-review scrub of every `docs/<feature>/` for the release candidate — [#283](../../issues/283) — done
+- **testing** — Porcupine linearizability suite; Working fundamentally C3 (#275 fixed); C1: the PR tier is green on main; C2: the full tier is green on the same SHA; C6: the nightly dependency-freshness check (`make deps-check`) is green; `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably ([#320](../../pulls/320), [#322](../../pulls/322), [#347](../../pulls/347)) — [0.1.0-alpha](CHANGELOG.md), [#275](../../issues/275) ([#295](../../pulls/295)), [#251](../../issues/251) ([#254](../../pulls/254)), [milestone](../../milestone/26), [#309](../../issues/309) — done
+- **release** — public-releasability gate; Working fundamentally C7: v0.21.0-rc.2 is cut and go-qrdb adopts it; spec-review scrub of every `docs/<feature>/` for the release candidate — [0.16.0-alpha](../../releases/tag/v0.16.0-alpha), [#262](../../issues/262), [#269](../../issues/269) ([#270](../../pulls/270)), [#250](../../issues/250) ([#256](../../pulls/256)), [#282](../../issues/282) ([#287](../../pulls/287)), [0.21.0-rc.2](../../releases/tag/v0.21.0-rc.2), [#283](../../issues/283) — done
 - **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting, on the leader and on a follower that forwarded it — [go-qrdb#668](../../../go-qrdb/issues/668) — done
 - **shard-pause** — `Host.PauseShard`/`ResumeShard`: a paused shard accepts no proposals, reads or applies, keeps its state and resumes after unseal, so go-qrdb can seal a node at runtime without the shard failing — [0.22.0-alpha](../../releases/tag/v0.22.0-alpha) — done
-- **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state and log unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index — [Unreleased](CHANGELOG.md), [#390](../../issues/390) — done
-- **pq-key-exchange** — the handshake offers a post-quantum hybrid first: X25519MLKEM768 then SecP256r1MLKEM768 in the non-FIPS build, SecP256r1MLKEM768 in the FIPS build (the fips140 module accepts it under `only`); P-256 stays the shared classical group (owner ruling 2026-10-17, queue 49 option A) — [Unreleased](CHANGELOG.md), [#412](../../issues/412) — done
+- **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state and log unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index — [0.24.0-alpha](../../releases/tag/v0.24.0-alpha), [#390](../../issues/390) — done
+- **pq-key-exchange** — the handshake offers a post-quantum hybrid first: X25519MLKEM768 then SecP256r1MLKEM768 in the non-FIPS build, SecP256r1MLKEM768 in the FIPS build (the fips140 module accepts it under `only`); P-256 stays the shared classical group (owner ruling 2026-10-17, queue 49 option A) — [0.24.0-alpha](../../releases/tag/v0.24.0-alpha), [#412](../../issues/412) — done
 
 ## Now
 
-No feature in progress. Open in the milestone: [#400](../../issues/400) (ROADMAP and SPEC describe main); [#363](../../issues/363), [#369](../../issues/369), [#370](../../issues/370) and [#390](../../issues/390) are closed.
+No feature in progress. Open: [#427](../../issues/427) only, in the `v1.0.0 bar` milestone; it pins the next go-enclave release once go-enclave publishes it.
 
 ## Next
 
