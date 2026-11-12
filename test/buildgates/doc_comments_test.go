@@ -51,12 +51,14 @@ type docGap struct {
 }
 
 // TestExportedIdentifiersHaveDocComments fails for each exported type,
-// function, method on an exported type, constant and variable in a public
-// package under pkg/ or contrib/dragonboat/ that carries no doc comment, and
-// for each such package with no package comment.
+// function, method on an exported type, method declared in an exported
+// interface, constant and variable in a public package under pkg/ or
+// contrib/dragonboat/ that carries no doc comment, and for each such package
+// with no package comment.
 //
 // Public means not under an internal/ directory and not a _test.go file. A
-// grouped const, var or type block's doc comment counts for its members.
+// grouped const or var block's doc comment counts for its members; each type
+// in a grouped type block and each interface method needs its own.
 // Build tags are not evaluated: every file is parsed, so a declaration behind
 // a tag is held to the same rule.
 func TestExportedIdentifiersHaveDocComments(t *testing.T) {
@@ -201,6 +203,30 @@ func undocumentedDecls(fset *token.FileSet, rel string, file *ast.File) []docGap
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
 				continue
+			}
+			// Each exported method of an exported interface needs its
+			// own doc, whatever the type's or the group's doc.
+			if d.Tok == token.TYPE {
+				for _, spec := range d.Specs {
+					s, ok := spec.(*ast.TypeSpec)
+					if !ok || !s.Name.IsExported() {
+						continue
+					}
+					it, ok := s.Type.(*ast.InterfaceType)
+					if !ok || it.Methods == nil {
+						continue
+					}
+					for _, field := range it.Methods.List {
+						if field.Doc != nil {
+							continue
+						}
+						for _, n := range field.Names {
+							if n.IsExported() {
+								add(n.Pos(), "method "+s.Name.Name+"."+n.Name)
+							}
+						}
+					}
+				}
 			}
 			// A group doc covers a const or var group and a standalone
 			// type; each type in a grouped type block needs its own.
