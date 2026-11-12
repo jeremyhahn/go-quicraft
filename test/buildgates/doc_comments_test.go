@@ -300,10 +300,7 @@ type docGap struct {
 func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 	var gaps []docGap
 	scanned := 0
-	// pkgDoc records, per package directory, whether any file carries a
-	// package comment; pkgFirst keeps a position to report against.
-	pkgDoc := map[string]bool{}
-	pkgFirst := map[string]docGap{}
+	var parsed []parsedFile
 
 	for _, root := range docCommentRoots {
 		rootScanned := 0
@@ -335,13 +332,7 @@ func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 			rootScanned++
 
 			dir := filepath.ToSlash(filepath.Dir(rel))
-			if _, seen := pkgDoc[dir]; !seen {
-				pkgDoc[dir] = false
-				pkgFirst[dir] = docGap{file: rel, line: fset.Position(file.Package).Line}
-			}
-			if file.Doc != nil {
-				pkgDoc[dir] = true
-			}
+			parsed = append(parsed, parsedFile{rel: rel, fset: fset, file: file})
 			for _, g := range undocumentedDecls(fset, rel, file) {
 				g.pkgDir = dir
 				gaps = append(gaps, g)
@@ -361,12 +352,7 @@ func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 		scanned += rootScanned
 	}
 
-	for dir, has := range pkgDoc {
-		if !has {
-			first := pkgFirst[dir]
-			gaps = append(gaps, docGap{pkgDir: dir, file: first.file, line: first.line, what: "package " + dir})
-		}
-	}
+	gaps = append(gaps, packageDocGaps(parsed)...)
 
 	var failing []docGap
 	allowedHit := map[string]int{}
@@ -438,6 +424,44 @@ func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 	t.Logf("checked %d files; %d gaps in %d allowlisted packages not enforced; "+
 		"%d grandfathered struct fields in docFieldBaseline",
 		scanned, skipped, len(allowedHit), len(docFieldBaseline))
+}
+
+// parsedFile is one parsed source file: its repository-relative path, the
+// file set its positions resolve against, and its syntax tree.
+type parsedFile struct {
+	rel  string
+	fset *token.FileSet
+	file *ast.File
+}
+
+// packageDocGaps reports, once per package directory, a package none of
+// whose files carries a package comment, at the package line of the first
+// file seen in that directory.
+func packageDocGaps(files []parsedFile) []docGap {
+	// pkgDoc records, per package directory, whether any file carries a
+	// package comment; pkgFirst keeps a position to report against.
+	pkgDoc := map[string]bool{}
+	pkgFirst := map[string]docGap{}
+	var dirs []string
+	for _, f := range files {
+		dir := filepath.ToSlash(filepath.Dir(f.rel))
+		if _, seen := pkgDoc[dir]; !seen {
+			pkgDoc[dir] = false
+			pkgFirst[dir] = docGap{file: f.rel, line: f.fset.Position(f.file.Package).Line}
+			dirs = append(dirs, dir)
+		}
+		if f.file.Doc != nil {
+			pkgDoc[dir] = true
+		}
+	}
+	var gaps []docGap
+	for _, dir := range dirs {
+		if !pkgDoc[dir] {
+			first := pkgFirst[dir]
+			gaps = append(gaps, docGap{pkgDir: dir, file: first.file, line: first.line, what: "package " + dir})
+		}
+	}
+	return gaps
 }
 
 // fieldBaselineKey returns the docFieldBaseline key of a struct field gap:
