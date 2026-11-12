@@ -826,6 +826,144 @@ func TestPeer_HasUpdate_NoChanges(t *testing.T) {
 	}
 }
 
+// newSettledLeaderWithApplied builds a single-node leader from cfg, proposes
+// count entries and runs update cycles (reporting LastApplied 0) until the
+// peer settles, so the in-memory log holds committed, processed entries
+// that no update has yet released. It returns the peer and the last index.
+func newSettledLeaderWithApplied(t *testing.T, cfg config.Config, count int) (*Peer, uint64) {
+	t.Helper()
+	p := newTestPeer(t, cfg, proto.State{}, singleNodeMembership())
+	electSingleNodeLeader(t, p)
+	runUpdateCycles(t, p)
+	entries := make([]proto.Entry, count)
+	for i := range entries {
+		entries[i] = proto.Entry{Cmd: []byte("applied")}
+	}
+	if _, err := p.Propose(entries); err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	runUpdateCycles(t, p)
+	l := p.r.log
+	n := l.lastIndex()
+	if l.committed != n || l.processed != n {
+		t.Fatalf("precondition: committed=%d processed=%d, want both %d", l.committed, l.processed, n)
+	}
+	if !inMemHolds(p, n) {
+		t.Fatalf("precondition: in-memory log does not hold applied index %d", n)
+	}
+	return p, n
+}
+
+// inMemHolds reports whether the peer's in-memory log still holds index.
+func inMemHolds(p *Peer, index uint64) bool {
+	for _, e := range p.r.log.inmem.entries {
+		if e.Index == index {
+			return true
+		}
+	}
+	return false
+}
+
+// TestPeer_HasUpdate_AppliedReleasePending pins that HasUpdate reports
+// applied entries still held in memory for the applied index the caller
+// passes, and only for an index that is committed and processed.
+func TestPeer_HasUpdate_AppliedReleasePending(t *testing.T) {
+	p, n := newSettledLeaderWithApplied(t, testConfig(), 3)
+	if !p.HasUpdate(n) {
+		t.Fatalf("HasUpdate(%d) = false, want true: applied entries are held in memory", n)
+	}
+	if p.HasUpdate(0) {
+		t.Fatal("HasUpdate(0) = true, want false: nothing reported applied")
+	}
+	if p.HasUpdate(n + 1) {
+		t.Fatalf("HasUpdate(%d) = true, want false: index is past committed %d", n+1, p.r.log.committed)
+	}
+}
+
+// TestPeer_GetUpdate_ReadOnlyReleasesApplied pins that a ReadOnly update
+// releases the applied in-memory entries it reports, so an idle shard stops
+// producing updates after one release.
+func TestPeer_GetUpdate_ReadOnlyReleasesApplied(t *testing.T) {
+	p, n := newSettledLeaderWithApplied(t, testConfig(), 3)
+	update, err := p.GetUpdate(false, n)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if !update.ReadOnly {
+		t.Fatal("expected a ReadOnly update from an idle peer")
+	}
+	for _, e := range p.r.log.inmem.entries {
+		if e.Index <= n {
+			t.Fatalf("in-memory log still holds index %d <= applied %d", e.Index, n)
+		}
+	}
+	if p.HasUpdate(n) {
+		t.Fatalf("HasUpdate(%d) = true after the release, want false", n)
+	}
+}
+
+// TestPeer_HasUpdate_NoLimitIdleQuiesces pins that a shard with no
+// MaxInMemLogSize reaches HasUpdate false after one release, so the release
+// path never keeps an unlimited idle shard busy.
+func TestPeer_HasUpdate_NoLimitIdleQuiesces(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxInMemLogSize = 0
+	p, n := newSettledLeaderWithApplied(t, cfg, 3)
+	if !p.HasUpdate(n) {
+		t.Fatalf("HasUpdate(%d) = false, want true before the release", n)
+	}
+	update, err := p.GetUpdate(false, n)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if !update.ReadOnly {
+		t.Fatal("expected a ReadOnly update from an idle peer")
+	}
+	if p.HasUpdate(n) {
+		t.Fatalf("HasUpdate(%d) = true after one release, want false", n)
+	}
+	if inMemHolds(p, n) {
+		t.Fatalf("in-memory log still holds applied index %d", n)
+	}
+}
+
+// TestPeer_GetUpdate_NonReadOnlyReleasesNothingExtra pins that an update
+// carrying entries to save releases nothing in GetUpdate, and that its
+// Commit releases only entries at or below lastApplied.
+func TestPeer_GetUpdate_NonReadOnlyReleasesNothingExtra(t *testing.T) {
+	p, n := newSettledLeaderWithApplied(t, testConfig(), 3)
+	if _, err := p.Propose([]proto.Entry{{Cmd: []byte("a")}, {Cmd: []byte("b")}}); err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	last := p.r.log.lastIndex()
+	if last <= n {
+		t.Fatalf("precondition: lastIndex %d not above applied %d", last, n)
+	}
+	update, err := p.GetUpdate(true, n)
+	if err != nil {
+		t.Fatalf("GetUpdate: %v", err)
+	}
+	if update.ReadOnly {
+		t.Fatal("expected a non-ReadOnly update: it carries entries to save")
+	}
+	if len(update.EntriesToSave) == 0 {
+		t.Fatal("expected entries to save")
+	}
+	// GetUpdate itself releases nothing on a non-ReadOnly update.
+	for idx := n; idx <= last; idx++ {
+		if !inMemHolds(p, idx) {
+			t.Fatalf("GetUpdate released index %d from a non-ReadOnly update", idx)
+		}
+	}
+	mustCommit(t, p, update)
+	// Commit releases at or below lastApplied only.
+	for idx := n + 1; idx <= last; idx++ {
+		if !inMemHolds(p, idx) {
+			t.Fatalf("Commit released index %d above lastApplied %d", idx, n)
+		}
+	}
+}
+
 func TestPeer_HasUpdate_PendingMessages(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
 	p.r.msgs = append(p.r.msgs, proto.Message{Type: proto.Heartbeat})
