@@ -11963,8 +11963,16 @@ func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, 
 				return id, nil
 			}
 		}
-		// Invalid format: regenerate.
+		// Invalid format: regenerate. os.WriteFile applies its mode only
+		// when it creates the file, so the malformed file is removed first:
+		// otherwise the new ID would inherit its mode instead of
+		// hostIDFilePerms. Only this branch removes, where ReadFile proved
+		// the path is a readable file; anything else at the path (such as
+		// a directory) still fails the write below.
 		logger.Warn("host ID file has invalid format, regenerating", "path", idPath)
+		if err := os.Remove(idPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", &HostInitError{Field: "host_id", Err: err}
+		}
 	}
 
 	// Generate new ID.
@@ -11974,12 +11982,6 @@ func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, 
 	}
 	id := hex.EncodeToString(buf)
 
-	// os.WriteFile applies its mode only when it creates the file, so a
-	// malformed file being replaced is removed first: otherwise the new ID
-	// would inherit that file's mode instead of hostIDFilePerms.
-	if err := os.Remove(idPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", &HostInitError{Field: "host_id", Err: err}
-	}
 	if err := os.WriteFile(idPath, []byte(id), hostIDFilePerms); err != nil {
 		return "", &HostInitError{Field: "host_id", Err: err}
 	}
