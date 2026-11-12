@@ -10,8 +10,13 @@ import (
 	"io"
 	"reflect"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
 // contextCancelBound is how long a Host method may take to return once its
@@ -44,6 +49,37 @@ var contextCancelArgs = map[string]func(h *Host) []any{
 			s = NewSession(1, 42)
 		}
 		return []any{uint64(1), s}
+	},
+	// ProposeWithSession refuses a NoOP session, so it needs a registered one.
+	"ProposeWithSession": func(h *Host) []any {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s, err := h.NewSession(ctx, 1)
+		if err != nil {
+			s = NewSession(1, 43)
+		}
+		return []any{s, []byte("k")}
+	},
+	"SyncProposeWithSession": func(h *Host) []any {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		s, err := h.NewSession(ctx, 1)
+		if err != nil {
+			s = NewSession(1, 43)
+		}
+		return []any{s, []byte("k")}
+	},
+	// SyncRequestRemoveNode needs a member other than the sole voter:
+	// replica 4 joins as an observer first.
+	"SyncRequestRemoveNode": func(h *Host) []any {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = h.SyncRequestAddObserver(ctx, 1, 4, "127.0.0.1:5004", 0)
+		return []any{uint64(1), uint64(4), uint64(0)}
+	},
+	// A zero policy with no ConfigChangeID check.
+	"SyncRequestUpdateWitnessPolicy": func(*Host) []any {
+		return []any{uint64(1), nil, uint64(0)}
 	},
 	"SyncRemoveData": func(*Host) []any {
 		// Data removal needs the replica to be stopped first; replica 2 is
@@ -164,16 +200,80 @@ func isContextDeadlineErr(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) && errors.Is(err, ErrTimeout)
 }
 
-// startNoQuorumShard starts shard 1 as replica 1 of three on a host without a
-// transport, so no leader is ever elected and every call that needs one waits.
-func startNoQuorumShard(t *testing.T) *Host {
+// startBlockedShard starts shard 1 as the elected single replica, with a state
+// machine whose Update blocks once armed. The returned block func arms it and
+// proposes one entry, returning once Update holds that entry: from then on any
+// admitted work that needs an apply stays pending until the test ends.
+func startBlockedShard(t *testing.T) (*Host, func(), func()) {
 	t.Helper()
+	gate := &contextCancelGate{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
 	h := newTestHost(t)
-	members := map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001", 3: "127.0.0.1:5002"}
-	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
+	scfg := testShardConfig(1, 1)
+	scfg.CheckQuorum = config.BoolPtr(false)
+	// Lets a witness join the single full replica, so witness adds are
+	// admitted and wait on the apply.
+	scfg.Witness.RequireFullReplicaMajority = config.BoolPtr(false)
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	create := func(uint64, uint64) interface{} {
+		return &contextCancelBlockingSM{gate: gate}
+	}
+	if err := h.StartShard(members, false, create, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
-	return h
+	waitForLeader(t, h, 1)
+	t.Cleanup(gate.open)
+	block := func() {
+		t.Helper()
+		gate.armed.Store(true)
+		ctx, cancel := context.WithTimeout(context.Background(), contextCancelBound)
+		defer cancel()
+		rs, err := h.Propose(ctx, 1, []byte("block"))
+		if err != nil {
+			t.Fatalf("blocking Propose failed: %v", err)
+		}
+		rs.Release()
+		select {
+		case <-gate.entered:
+		case <-time.After(contextCancelBound):
+			t.Fatalf("state machine Update was not entered within %v", contextCancelBound)
+		}
+	}
+	return h, block, gate.open
+}
+
+// contextCancelGate holds the state machine's Update once armed, so admitted
+// work behind it cannot complete until the gate opens.
+type contextCancelGate struct {
+	armed       atomic.Bool
+	entered     chan struct{}
+	enteredOnce sync.Once
+	release     chan struct{}
+	releaseOnce sync.Once
+}
+
+func (g *contextCancelGate) open() {
+	g.releaseOnce.Do(func() { close(g.release) })
+}
+
+// contextCancelBlockingSM is a mockStateMachine whose Update blocks on its
+// gate once the gate is armed.
+type contextCancelBlockingSM struct {
+	mockStateMachine
+	gate *contextCancelGate
+}
+
+func (s *contextCancelBlockingSM) Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error {
+	if s.gate.armed.Load() {
+		s.gate.enteredOnce.Do(func() { close(s.gate.entered) })
+		select {
+		case <-s.gate.release:
+		case <-ctx.Done():
+		}
+	}
+	return s.mockStateMachine.Update(ctx, entries, results)
 }
 
 // contextCancelSettle waits until the goroutine count falls to base, and
@@ -194,8 +294,63 @@ func contextCancelSettle(base int) (int, bool) {
 // with no quorum. Each call must return within contextCancelBound with the
 // caller's cancellation (or, in the second case, any error it returned
 // before the cancel), and leave no goroutine behind once its Host closes.
+// contextCancelImmediate names the context-taking Host methods that cannot
+// block on the blocked shard, with the reason. Every other method must still
+// be pending 50ms into the call and return the cancellation error once its
+// context is cancelled.
+var contextCancelImmediate = map[string]string{
+	// Asynchronous: each returns a RequestState once the work is queued; the
+	// wait belongs to the caller.
+	"Propose":                        "returns a RequestState once queued",
+	"ProposeWithSession":             "returns a RequestState once queued",
+	"ReadIndex":                      "returns a RequestState once queued",
+	"CloseSession":                   "returns a RequestState once queued",
+	"RequestSnapshot":                "returns a RequestState once queued",
+	"RequestAddNode":                 "returns a RequestState once queued",
+	"RequestAddNodeWithIdentity":     "returns a RequestState once queued",
+	"RequestAddObserver":             "returns a RequestState once queued",
+	"RequestAddObserverWithIdentity": "returns a RequestState once queued",
+	"RequestAddWitness":              "returns a RequestState once queued",
+	"RequestAddWitnessWithIdentity":  "returns a RequestState once queued",
+	"RequestRemoveNode":              "returns a RequestState once queued",
+	"RequestUpdateWitnessPolicy":     "returns a RequestState once queued",
+	// RequestLeaderTransfer only hands the transfer to Raft; a single-replica
+	// shard has no target, so it is refused before any wait.
+	"RequestLeaderTransfer": "queues the transfer without waiting for it",
+	// Local reads of on-disk state that never wait on the shard's apply.
+	"QueryRaftLog":   "reads the local Raft log",
+	"ExportSnapshot": "copies the saved snapshot; this shard has none",
+	// Both act only on a stopped replica and refuse a running one at once.
+	"ImportSnapshot": "refuses a running shard",
+	"SyncRemoveData": "removes a stopped replica's data; replica 2 never ran here",
+	// ResumeShard on a shard that is not paused has nothing to wait for.
+	"ResumeShard": "the shard is not paused",
+}
+
+// contextCancelUncancellable names methods that block on the blocked shard
+// and ignore their context: the in-flight case is skipped with the reason.
+// The local reads call the state machine's Lookup, which waits behind the
+// Update the fixture holds without selecting on the context.
+var contextCancelUncancellable = map[string]string{
+	"StaleRead":      "Lookup waits behind a running Update without its context",
+	"StaleReadBuf":   "Lookup waits behind a running Update without its context",
+	"QueryLocalNode": "Lookup waits behind a running Update without its context",
+	"FollowerRead":   "Lookup waits behind a running Update without its context",
+}
+
 func TestHostContextCancel(t *testing.T) {
 	methods := contextCancelMethods(t)
+	known := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		known[m.Name] = true
+	}
+	for _, table := range []map[string]string{contextCancelImmediate, contextCancelUncancellable} {
+		for name := range table {
+			if !known[name] {
+				t.Fatalf("%s is listed but is not a context-taking *Host method", name)
+			}
+		}
+	}
 
 	// Warm up package-level goroutines (pools, timers) before any baseline.
 	newTestHost(t).Close()
@@ -244,28 +399,43 @@ func TestHostContextCancel(t *testing.T) {
 			}
 		})
 		t.Run(m.Name+"/inflight", func(t *testing.T) {
+			if reason, ok := contextCancelUncancellable[m.Name]; ok {
+				t.Skipf("%s does not honour a cancel in flight: %s", m.Name, reason)
+			}
 			base := runtime.NumGoroutine()
-			h := startNoQuorumShard(t)
+			h, block, release := startBlockedShard(t)
 			args := contextCancelCallArgs(h, m)
+			block()
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			done := make(chan error, 1)
 			go func() { done <- contextCancelCall(ctx, h, m, args) }()
-			select {
-			case <-done:
-				// Returned before the cancel: the call does not wait on a
-				// shard without quorum, which is fine.
-			case <-time.After(50 * time.Millisecond):
+			if reason, ok := contextCancelImmediate[m.Name]; ok {
+				// Cannot block: it must return without a cancel.
+				select {
+				case <-done:
+				case <-time.After(contextCancelBound):
+					t.Fatalf("%s (%s) did not return within %v", m.Name, reason, contextCancelBound)
+				}
+			} else {
+				select {
+				case err := <-done:
+					t.Fatalf("%s returned %v before its context was cancelled, want it pending on the blocked shard", m.Name, err)
+				case <-time.After(50 * time.Millisecond):
+				}
 				cancel()
 				select {
 				case err := <-done:
-					if !isContextCancelErr(err) {
-						t.Errorf("%s cancelled in flight returned %v, want ErrCanceled and context.Canceled", m.Name, err)
+					// A request already handed to Raft returns ErrCanceled
+					// inside a MaybeAppliedError, without the context error.
+					if !errors.Is(err, ErrCanceled) {
+						t.Errorf("%s cancelled in flight returned %v, want ErrCanceled", m.Name, err)
 					}
 				case <-time.After(contextCancelBound):
 					t.Fatalf("%s cancelled in flight did not return within %v", m.Name, contextCancelBound)
 				}
 			}
+			release()
 			h.Close()
 			if n, ok := contextCancelSettle(base); !ok {
 				t.Errorf("%s left goroutines behind: %d, want <= %d", m.Name, n, base)
