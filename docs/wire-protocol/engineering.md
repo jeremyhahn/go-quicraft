@@ -641,8 +641,8 @@ prefix, an inline Membership, and variable-length trailing fields.
 
 `UnmarshalFrom` requires 32 bytes before reading the four leading fields, and
 re-checks the remaining length before `FileSize` and again before the
-trailing 24-byte block. The smallest complete encoding is **149 bytes**: 32
-leading + 81 for an empty `Membership` + 4 for an empty `Filepath` + 8 for
+trailing 24-byte block. The smallest complete encoding is **157 bytes**: 32
+leading + 89 for an empty `Membership` + 4 for an empty `Filepath` + 8 for
 `FileSize` + 24 for the trailing block.
 
 `IsEmpty()` returns true when both `Index` and `Term` are zero. That is the
@@ -1145,9 +1145,9 @@ Membership and optional FileInfo.
 ```
 
 Minimum header: 72 bytes (9 fixed uint64 fields before the first
-variable-length Filepath). Smallest complete encoding: **217 bytes** --
+variable-length Filepath). Smallest complete encoding: **225 bytes** --
 72 + 4 (empty `Filepath`) + 24 (`FileChunkID`, `FileChunkCount`,
-`HasFileInfo`) + 81 (empty `Membership`) + 32 (`OnDiskIndex`,
+`HasFileInfo`) + 89 (empty `Membership`) + 32 (`OnDiskIndex`,
 `DeploymentID`, `BinVer`, `Epoch`) + 4 (empty `Data`).
 
 `Data` is returned by `getBytes` and **aliases the source buffer** after
@@ -1229,7 +1229,7 @@ Producers MUST bound themselves by these values.
 ### MaxDecodeMemoryFactor
 
 A wire-byte budget is not a memory budget. The decoded form of a frame is
-materially larger than the frame: a 100-byte heartbeat becomes a 304-byte
+materially larger than the frame: a 100-byte heartbeat becomes a 312-byte
 `Message` in a slice, and a membership map entry costs 12 bytes on the wire
 and roughly 57 in a Go map. The transport therefore reserves the frame
 length times this factor against `MaxMessageReceiveMemory` before reading the
@@ -1240,7 +1240,7 @@ that charge, 512 MB, which admits at most 64 MB of frames in flight.
 
 The bound is measured rather than derived. `TestDecodeMemoryAmplification`
 builds the densest frames the format admits and fails if any exceeds it; the
-measured worst case is 5.1x, on a batch of small messages each carrying a
+measured worst case is 5.2x, on a batch of small messages each carrying a
 snapshot whose membership maps hold a single entry (a one-entry Go map owns a
 whole 8-slot group). The headroom above that covers the Go runtime's map
 layout, which this package neither controls nor can assert at compile time.
@@ -1665,7 +1665,7 @@ Targets: `make test-proto`, `make bench-proto`, `make ci-fuzz-seeds`,
 |---|---|
 | `encoding_test.go` | the scalar, string, bytes and map primitives, including the `math.MaxInt32` guard |
 | `allocbounds_test.go` | that limits are checked **before** allocation |
-| `amplification_test.go` | `TestDecodeMemoryAmplification` builds the densest frames the format admits and fails if any exceeds `MaxDecodeMemoryFactor`. The measured worst case is 5.1x; the bound has already been exceeded once at 9.8x by a decoder that clamped its map size hint. |
+| `amplification_test.go` | `TestDecodeMemoryAmplification` builds the densest frames the format admits and fails if any exceeds `MaxDecodeMemoryFactor`. The measured worst case is 5.2x; the bound has already been exceeded once at 9.8x by a decoder that clamped its map size hint. |
 | `partial_decode_test.go` | truncated buffers at every field boundary |
 | `session_owner_layout_test.go` | the 68-byte `Entry` header offsets, `OwnerID` included |
 | `hardening_regression_test.go` | the hardening findings, kept as regressions |
@@ -1680,7 +1680,7 @@ Targets: `make test-proto`, `make bench-proto`, `make ci-fuzz-seeds`,
 `FuzzSnapshotUnmarshalCrash`, `FuzzMembershipRoundTrip`,
 `FuzzConfigChangeRoundTrip`, `FuzzStateRoundTrip` (`fuzz_test.go`), and
 `FuzzSnapshotChunkRoundTrip`, `FuzzSnapshotChunkUnmarshalCrash`
-(`fuzz_chunk_test.go`). The first eleven have checked-in corpora under
+(`fuzz_chunk_test.go`). All thirteen have checked-in corpora under
 `pkg/proto/testdata/fuzz/`.
 
 The split is deliberate. The `*RoundTrip` targets assert

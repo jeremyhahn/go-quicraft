@@ -1,7 +1,7 @@
 # Write Batching — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/batch`, `pkg/writemode` ·
-> Last verified: 2026-10-13
+> Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 Rationale and the scope fence are in [`architecture.md`](architecture.md); the
@@ -26,7 +26,7 @@ the state machine rejected is reported to its submitter as successful.
 
 **Flush triggers**, whichever comes first:
 
-| Trigger | `flush_reason` |
+| Trigger | `reason` label of `quicraft_batch_flush_reason_total` |
 |---|---|
 | `len(currentBatch) >= MaxBatchSize` after an add | `size` |
 | the next proposal would push the encoded size past `MaxBatchBytes` | `bytes` |

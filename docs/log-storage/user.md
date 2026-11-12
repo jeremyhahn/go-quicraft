@@ -1,7 +1,7 @@
 # Log Storage — Usage
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg/logdb`, `pkg/logdb/waldb`,
-> `pkg/logdb/memdb` · Last verified: 2026-10-13
+> `pkg/logdb/memdb` · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
 
 You deal with log storage in three ways: choosing a store when you build a
@@ -17,6 +17,10 @@ damaged.
   cannot be changed later.
 
 ## Choose a store
+
+The Go blocks on this page are excerpts: `cfg`, `barrier`, `store`, `walDir`
+and `blockSize` are your own values, and the first block shows three
+alternatives, not one program.
 
 ```go
 // Durable, the default. The log lives in cfg.WALDir; the barrier encrypts it.

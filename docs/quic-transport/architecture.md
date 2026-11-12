@@ -372,7 +372,7 @@ general `cipher.NewGCM`, which `fips140=only` declines, so a process panicked
 constructing the initial AEAD before any handshake.
 
 From v0.60.0, `quic-go` builds packet-protection AEADs through Go's TLS 1.3
-AES-GCM implementation instead. In v0.63.0 that is
+AES-GCM implementation instead. In v0.65.0 that is
 `internal/handshake/cipher_suite.go`, whose `aeadAESGCMTLS13` dispatches to
 `aeadAESGCMTLS13FIPS140` when `crypto/fips140.Enabled()`: the same approved
 path `crypto/tls` uses for its own records, for the same construction. The wire
@@ -386,7 +386,7 @@ unexported `crypto/tls.aeadAESGCMTLS13`. Three consequences:
 - The primitive executing is `crypto/tls`'s own AES-GCM, inside the Go
   Cryptographic Module. The linkname changes who can call it, not what it is.
 - It depends on a Go toolchain that has that symbol, not only on a `quic-go`
-  version. `quic-go` v0.63.0 declares `go 1.26.0`; this repository requires
+  version. `quic-go` v0.65.0 declares `go 1.26.0`; this repository requires
   Go 1.27.4.
 - It is a stopgap. `quic-go`'s own comment cites
   [golang/go#79219](https://github.com/golang/go/issues/79219) and the pending
@@ -394,7 +394,7 @@ unexported `crypto/tls.aeadAESGCMTLS13`. Three consequences:
   linkname goes away. A toolchain bump is something to re-measure this gate
   against, which `make verify-fips` does on every nightly run.
 
-go-quicraft requires `quic-go` v0.63.0, and the dispatch, the linkname and the
+go-quicraft requires `quic-go` v0.65.0, and the dispatch, the linkname and the
 `go` directive above were re-read from that version's source. Measured
 with real QUIC handshakes over loopback:
 
@@ -458,7 +458,7 @@ reaches the same call, so it skips when `crypto/fips140.Enforced()` reports
 
 Four things, all checkable:
 
-1. `quic-go` at v0.60.0 or later. go-quicraft requires v0.63.0.
+1. `quic-go` at v0.60.0 or later. go-quicraft requires v0.65.0.
 2. Build with `-tags fips`. This is not for the curve list: Go filters X25519
    out of the offer under `fips140` mode by itself, and
    `TestHandshakeCurves_InteroperateAcrossBuilds` passes untagged under `only`. The tag is for the seal layer: Argon2id and

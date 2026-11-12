@@ -1,8 +1,10 @@
 # Multi-Group Host — Engineering Contract
 
 > **Status: NORMATIVE** · Scope: go-quicraft `pkg` — host lifecycle, startup,
-> crash recovery, shutdown, and the performance contract · Last verified: 2026-10-13
+> crash recovery, shutdown, and the performance contract · Last verified: 2026-11-12
 > Conflicts with this document are defects. Fix them here first.
+> Go blocks are excerpts: abridged from the source they describe, they do not
+> compile on their own.
 
 Import path: `github.com/jeremyhahn/go-quicraft/pkg`
 
@@ -847,7 +849,8 @@ not be deleted in a refactor: `host_hardening_regression_test.go`,
 `host_api_regression_test.go`, `host_config_fault_regression_test.go`,
 `messagehandler_hardening_test.go`.
 
-**Coverage.** The Makefile floor is `COVER_MIN = 91`: `make coverage` checks the
+**Coverage.** The Makefile floor is `COVER_MIN`, taken from
+`COVERAGE_THRESHOLD ?= 91`: `make coverage` checks the
 module total and `make coverage-packages` holds every package under `pkg/` to the
 same floor. CI gates both the total and every package at its
 `COVERAGE_THRESHOLD` (90). Coverage runs without build tags, so the integration
