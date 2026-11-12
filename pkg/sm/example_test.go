@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
@@ -152,10 +153,14 @@ func ExampleConcurrentStateMachine() {
 	create := sm.NewConcurrentCreateFunc(func(_, _ uint64) sm.ConcurrentStateMachine { return &register{} })
 	machine := create(1, 1).(sm.ConcurrentStateMachine)
 
-	put := func(index, v uint64) {
-		cmd := binary.LittleEndian.AppendUint64(nil, v)
-		results := make([]sm.Result, 1)
-		_ = machine.Update(ctx, []sm.Entry{{Index: index, Cmd: cmd}}, results)
+	// put applies one batch: values[i] at index first+i.
+	put := func(first uint64, values ...uint64) {
+		entries := make([]sm.Entry, len(values))
+		for i, v := range values {
+			entries[i] = sm.Entry{Index: first + uint64(i), Cmd: binary.LittleEndian.AppendUint64(nil, v)}
+		}
+		results := make([]sm.Result, len(entries))
+		_ = machine.Update(ctx, entries, results)
 	}
 	put(1, 7)
 	snapCtx, err := machine.PrepareSnapshot()
@@ -163,7 +168,7 @@ func ExampleConcurrentStateMachine() {
 		fmt.Println("prepare:", err)
 		return
 	}
-	put(2, 9)
+	put(2, 8, 9)
 
 	var snap bytes.Buffer
 	if err := machine.SaveSnapshot(ctx, snapCtx, &snap, nil); err != nil {
@@ -180,6 +185,44 @@ func ExampleConcurrentStateMachine() {
 	fmt.Println("current:", current, "restored:", restored)
 	// Output:
 	// current: 9 restored: 7
+}
+
+// TestRegister_BatchPublishesOnce applies the batch [7, 9] while a reader
+// spins on Lookup: the reader must see 0 or 9, never the intermediate 7.
+func TestRegister_BatchPublishesOnce(t *testing.T) {
+	ctx := context.Background()
+	batch := []sm.Entry{
+		{Index: 1, Cmd: binary.LittleEndian.AppendUint64(nil, 7)},
+		{Index: 2, Cmd: binary.LittleEndian.AppendUint64(nil, 9)},
+	}
+	for i := 0; i < 10000; i++ {
+		r := &register{}
+		var (
+			sawIntermediate atomic.Bool
+			stop            atomic.Bool
+			wg              sync.WaitGroup
+			started         = make(chan struct{})
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			close(started)
+			for !stop.Load() {
+				if v, _ := r.Lookup(ctx, nil); v.(uint64) == 7 {
+					sawIntermediate.Store(true)
+				}
+			}
+		}()
+		<-started
+		if err := r.Update(ctx, batch, make([]sm.Result, len(batch))); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		stop.Store(true)
+		wg.Wait()
+		if sawIntermediate.Load() {
+			t.Fatalf("iteration %d: Lookup returned 7, an intermediate value of the batch [7, 9]", i)
+		}
+	}
 }
 
 // fileStore is a sm.DiskStateMachine skeleton: it keeps the last applied
