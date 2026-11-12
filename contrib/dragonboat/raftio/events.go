@@ -70,27 +70,55 @@ func GetNodeInfo(shardID, replicaID uint64) NodeInfo {
 // IRaftEventListener receives Raft protocol event notifications such as
 // leader changes.
 type IRaftEventListener interface {
+	// LeaderUpdated is called when the known leader or term of a shard
+	// replica changes.
 	LeaderUpdated(info LeaderInfo)
 }
 
 // ISystemEventListener receives system-level event notifications such as
 // node lifecycle changes, connection events, and snapshot operations.
 type ISystemEventListener interface {
+	// NodeHostShuttingDown is called when the NodeHost starts to shut down.
 	NodeHostShuttingDown()
+	// NodeUnloaded is called when a replica is unloaded from the NodeHost.
 	NodeUnloaded(info NodeInfo)
+	// NodeDeleted is called when a replica is deleted from the NodeHost.
 	NodeDeleted(info NodeInfo)
+	// NodeReady is called when a replica is ready to serve requests.
 	NodeReady(info NodeInfo)
+	// MembershipChanged is called when the membership of a shard changes.
 	MembershipChanged(info NodeInfo)
+	// ConnectionEstablished is called when a connection to a remote
+	// NodeHost is established.
 	ConnectionEstablished(info ConnectionInfo)
+	// ConnectionFailed is called when a connection to a remote NodeHost
+	// fails.
 	ConnectionFailed(info ConnectionInfo)
+	// SendSnapshotStarted is called when sending a snapshot to a remote
+	// replica starts.
 	SendSnapshotStarted(info SnapshotInfo)
+	// SendSnapshotCompleted is called when a snapshot has been sent to a
+	// remote replica.
 	SendSnapshotCompleted(info SnapshotInfo)
+	// SendSnapshotAborted is called when sending a snapshot to a remote
+	// replica is aborted.
 	SendSnapshotAborted(info SnapshotInfo)
+	// SnapshotReceived is called when a snapshot from a remote replica
+	// has been received.
 	SnapshotReceived(info SnapshotInfo)
+	// SnapshotRecovered is called when a replica has been recovered from
+	// a snapshot.
 	SnapshotRecovered(info SnapshotInfo)
+	// SnapshotCreated is called when a replica has created a snapshot.
 	SnapshotCreated(info SnapshotInfo)
+	// SnapshotCompacted is called when old snapshots of a replica have
+	// been removed.
 	SnapshotCompacted(info SnapshotInfo)
+	// LogCompacted is called when log entries of a replica have been
+	// compacted.
 	LogCompacted(info EntryInfo)
+	// LogDBCompacted is called when the LogDB has compacted the storage
+	// of a replica's removed entries.
 	LogDBCompacted(info EntryInfo)
 }
 

@@ -208,7 +208,10 @@ type LogDBInfo struct {
 
 // LogDBFactory creates LogDB instances for NodeHost.
 type LogDBFactory interface {
+	// Create opens a LogDB for the NodeHost config, using the given
+	// callback, data directories and low-latency directories.
 	Create(NodeHostConfig, LogDBCallback, []string, []string) (raftio.ILogDB, error)
+	// Name returns the name of the LogDB type the factory creates.
 	Name() string
 }
 
@@ -222,12 +225,17 @@ type RaftRPCFactoryFunc func(NodeHostConfig, raftio.MessageHandler, raftio.Chunk
 
 // TransportFactory creates transport instances for NodeHost.
 type TransportFactory interface {
+	// Create returns a transport for the NodeHost config that delivers
+	// received messages and snapshot chunks to the given handlers.
 	Create(NodeHostConfig, raftio.MessageHandler, raftio.ChunkHandler) raftio.ITransport
+	// Validate reports whether the address is valid for the transport.
 	Validate(string) bool
 }
 
 // NodeRegistryFactory creates node registry instances for NodeHost.
 type NodeRegistryFactory interface {
+	// Create returns a node registry for the NodeHost ID, with the given
+	// number of stream connections and target address validator.
 	Create(nhid string, streamConnections uint64, v TargetValidator) (raftio.INodeRegistry, error)
 }
 
