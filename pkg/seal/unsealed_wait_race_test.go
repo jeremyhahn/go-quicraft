@@ -2,6 +2,7 @@ package seal
 
 import (
 	"context"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -197,6 +198,175 @@ func TestBarrier_UnsealedCRace_SealUnsealCycles(t *testing.T) {
 		if n != cycles {
 			t.Fatalf("waiter %d woke from an open UnsealedC channel in %d of %d sealed periods", w, n, cycles)
 		}
+	}
+	requireUnsealedNoWaiter(ctx, t, b)
+}
+
+// unsealedCAcquire is an open UnsealedC channel a reader took, and the
+// number of unseal transitions that must complete before it is closed.
+type unsealedCAcquire struct {
+	c        <-chan struct{}
+	deadline int64
+}
+
+// unsealedCReaders is the result of startConcurrentUnsealedCReaders.
+type unsealedCReaders struct {
+	wg       sync.WaitGroup
+	mu       sync.Mutex
+	acquired []unsealedCAcquire
+	// stale counts channels still open after the transition that had to
+	// close them had completed.
+	stale atomic.Int64
+	// openAt[g] counts open channels taken while g transitions to unsealed
+	// had completed.
+	openAt []atomic.Int64
+}
+
+// startConcurrentUnsealedCReaders starts n goroutines that, from start until
+// stop, call b.UnsealedC in a loop with no handshake against the transitions
+// that run meanwhile. gen is the number of completed transitions to unsealed
+// (Unseal or Initialize), stored by the transition goroutine once each one
+// returns. A channel taken open while gen read g after the call must be
+// closed once gen reaches g+1: the call ended before transition g+1
+// completed, so that transition's wake-up follows the call or the call saw
+// the barrier unsealed. Readers check this as they loop and record every open
+// channel they took.
+func startConcurrentUnsealedCReaders(ctx context.Context, t *testing.T, b *Barrier, n int, start, stop <-chan struct{}, gen *atomic.Int64, transitions int) *unsealedCReaders {
+	t.Helper()
+	r := &unsealedCReaders{openAt: make([]atomic.Int64, transitions+1)}
+	r.wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func() {
+			defer r.wg.Done()
+			select {
+			case <-start:
+			case <-ctx.Done():
+				return
+			}
+			var mine, pending []unsealedCAcquire
+			var last <-chan struct{}
+			for {
+				select {
+				case <-stop:
+					r.mu.Lock()
+					r.acquired = append(r.acquired, mine...)
+					r.mu.Unlock()
+					return
+				case <-ctx.Done():
+					r.mu.Lock()
+					r.acquired = append(r.acquired, mine...)
+					r.mu.Unlock()
+					return
+				default:
+				}
+				c := b.UnsealedC()
+				g := gen.Load()
+				if !isClosedUnsealedC(c) {
+					r.openAt[g].Add(1)
+					if c != last {
+						a := unsealedCAcquire{c: c, deadline: g + 1}
+						mine = append(mine, a)
+						pending = append(pending, a)
+						last = c
+					}
+				}
+				kept := pending[:0]
+				for _, a := range pending {
+					switch {
+					case a.deadline > g:
+						kept = append(kept, a)
+					case !isClosedUnsealedC(a.c):
+						r.stale.Add(1)
+					}
+				}
+				pending = kept
+				runtime.Gosched()
+			}
+		}()
+	}
+	return r
+}
+
+// (e) Readers take UnsealedC continuously while Seal, Unseal, Reset and
+// Initialize run, with no handshake ordering the calls against the
+// transitions. Every open channel a reader took is closed by the first
+// transition to unsealed that completes after the take, and all of them are
+// closed after the final Unseal.
+func TestBarrier_UnsealedCRace_ConcurrentAcquireDuringTransitions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), unsealedWaitBound)
+	defer cancel()
+	b, s := testInitializedBarrier(t)
+	defer s.Close()
+
+	const (
+		// Each Unseal derives the key, about 150ms under -race.
+		cycles  = 4
+		readers = 8
+		// cycles Unseals, one Initialize after Reset, and the final Unseal.
+		transitions = cycles + 2
+	)
+	start := make(chan struct{})
+	stop := make(chan struct{})
+	var gen atomic.Int64
+	r := startConcurrentUnsealedCReaders(ctx, t, b, readers, start, stop, &gen, transitions)
+
+	cycle := func() error {
+		close(start)
+		for p := 0; p < cycles; p++ {
+			if err := b.Seal(); err != nil {
+				return err
+			}
+			if err := b.Unseal(ctx, s, Credentials{}); err != nil {
+				return err
+			}
+			gen.Add(1)
+		}
+		if err := b.Seal(); err != nil {
+			return err
+		}
+		if err := b.Reset(); err != nil {
+			return err
+		}
+		if err := b.Initialize(ctx, s, Credentials{}); err != nil {
+			return err
+		}
+		gen.Add(1)
+		if err := b.Seal(); err != nil {
+			return err
+		}
+		if err := b.Unseal(ctx, s, Credentials{}); err != nil {
+			return err
+		}
+		gen.Add(1)
+		return nil
+	}
+	err := cycle()
+	close(stop)
+	r.wg.Wait()
+	if err != nil {
+		t.Fatalf("Seal/Unseal/Reset/Initialize cycle failed: %v", err)
+	}
+
+	missed := 0
+	for _, a := range r.acquired {
+		if !waitUnsealedC(ctx, a.c) {
+			missed++
+		}
+	}
+	if missed != 0 {
+		t.Fatalf("%d of %d UnsealedC channels taken during transitions still open %v after the final Unseal", missed, len(r.acquired), unsealedWaitBound)
+	}
+	if n := r.stale.Load(); n != 0 {
+		t.Fatalf("%d UnsealedC channels still open after the transition to unsealed that followed their take", n)
+	}
+	periods := 0
+	for g := range r.openAt {
+		if r.openAt[g].Load() > 0 {
+			periods++
+		}
+	}
+	if periods < 2 {
+		t.Fatalf("readers took an open UnsealedC channel in %d sealed periods, want at least 2: the race had no reach", periods)
 	}
 	requireUnsealedNoWaiter(ctx, t, b)
 }
