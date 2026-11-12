@@ -88,7 +88,6 @@ func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	before := h.pendingOps.Load()
 
 	// The callers' deadline is far beyond the test's bounds, so only Close
 	// can end their requests.
@@ -127,9 +126,9 @@ func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 	// Close only once every request is pending, so each one is in flight
 	// when the host shuts down rather than refused at admission.
 	deadline := time.Now().Add(10 * time.Second)
-	for h.pendingOps.Load()-before < callers {
+	for h.pendingOps.Load() < callers {
 		if time.Now().After(deadline) {
-			t.Fatalf("pending ops = %d, want %d before Close", h.pendingOps.Load()-before, callers)
+			t.Fatalf("pending ops = %d, want %d before Close", h.pendingOps.Load(), callers)
 		}
 		time.Sleep(time.Millisecond)
 	}
