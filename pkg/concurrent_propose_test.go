@@ -272,8 +272,15 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 	// every entry that will ever commit before it has committed, and no
 	// workload proposal is left in flight. Then wait for every replica to
 	// settle at one common index at or past the barrier with equal hashes.
+	// A barrier on the leader alone does not fence a proposal another host
+	// is still forwarding: fence every host through its own forward path
+	// first, then converge at or past the highest index of either.
 	barrierKey, barriers, want := concurrentProposeBarrier(ctx, t, hosts)
-	at, hashes := concurrentProposeConverge(ctx, t, hosts, want)
+	fences, fenceAt := concurrentProposeFence(ctx, t, hosts)
+	for key := range fences {
+		barriers[key] = struct{}{}
+	}
+	at, hashes := concurrentProposeConverge(ctx, t, hosts, max(want, fenceAt))
 
 	smMu.Lock()
 	defer smMu.Unlock()
@@ -349,6 +356,58 @@ func concurrentProposeBarrier(ctx context.Context, t *testing.T, hosts []*Host) 
 		default:
 			t.Fatalf("barrier SyncPropose(%s): %v", key, err)
 		}
+	}
+}
+
+// concurrentProposeFence submits one fence entry through EVERY host's own
+// propose path and waits until each is acknowledged. A host that is not the
+// leader forwards its fence as an ordered Propose (raft.go stepFollower,
+// proto.Propose) on the same per-(target, shard) QUIC stream as any workload
+// proposal it forwarded earlier (transport getStream), so once that host's
+// fence commits, its earlier forwarded proposals to the same leader have
+// arrived. A round only counts when the leader is the same host before and
+// after it: a leader change mid-round sends fences to a different target,
+// which orders nothing, so the round is repeated. It returns every fence key
+// attempted and the highest acknowledged fence index.
+func concurrentProposeFence(ctx context.Context, t *testing.T, hosts []*Host) (map[string]struct{}, uint64) {
+	t.Helper()
+	attempted := make(map[string]struct{})
+	leaderNow := func() *Host {
+		var l *Host
+		if !waitUntil(20*time.Second, func() bool {
+			l = concurrentProposeLeader(hosts)
+			return l != nil
+		}) {
+			t.Fatal("no leader while fencing")
+		}
+		return l
+	}
+	for round := 0; ; round++ {
+		before := leaderNow()
+		var high uint64
+		for i, h := range hosts {
+			for attempt := 0; ; attempt++ {
+				if ctx.Err() != nil {
+					t.Fatalf("fence on host %d never committed: %v", i+1, ctx.Err())
+				}
+				key := fmt.Sprintf("fence-r%02d-h%d-%02d", round, i+1, attempt)
+				attempted[key] = struct{}{}
+				res, err := h.SyncPropose(ctx, concurrentProposeShard, []byte(key))
+				if err == nil {
+					high = max(high, res.Value)
+					break
+				}
+				if !MaybeApplied(err) && !errors.Is(err, ErrNotLeader) {
+					t.Fatalf("fence SyncPropose(%s) on host %d: %v", key, i+1, err)
+				}
+				t.Logf("fence %s on host %d: %v; retrying", key, i+1, err)
+				leaderNow()
+			}
+		}
+		if leaderNow() == before {
+			return attempted, high
+		}
+		t.Logf("leader moved during fence round %d; fencing again", round)
 	}
 }
 
