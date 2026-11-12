@@ -11395,7 +11395,15 @@ func (h *Host) LogReader(shardID uint64) (ReadonlyLogReader, error) {
 		return nil, ErrShardNotFound
 	}
 
-	return &logReaderAdapter{reader: engNode.LogReader()}, nil
+	return &logReaderAdapter{
+		reader: engNode.LogReader(),
+		currentTerm: func() uint64 {
+			if p := engNode.Peer(); p != nil {
+				return p.Term()
+			}
+			return 0
+		},
+	}, nil
 }
 
 // LogRange represents the valid index range of a shard's Raft log.
