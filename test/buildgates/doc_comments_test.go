@@ -495,6 +495,60 @@ type hidden struct {
 	}
 }
 
+// TestFieldBaselineByIdentifier checks that the field baseline is matched by
+// file and field name, so swapping one grandfathered field for a new
+// undocumented one in the same file fails, and so does a stale entry.
+func TestFieldBaselineByIdentifier(t *testing.T) {
+	gap := func(file, field string) docGap {
+		return docGap{file: file, line: 1, what: "field " + field}
+	}
+	cases := []struct {
+		name         string
+		baseline     map[string]bool
+		gaps         []docGap
+		wantUnlisted []string
+		wantStale    []string
+	}{
+		{
+			name:         "same count, different field",
+			baseline:     map[string]bool{"a.go: T.X": true},
+			gaps:         []docGap{gap("a.go", "T.Y")},
+			wantUnlisted: []string{"a.go: T.Y"},
+			wantStale:    []string{"a.go: T.X"},
+		},
+		{
+			name:     "listed field",
+			baseline: map[string]bool{"a.go: T.X": true},
+			gaps:     []docGap{gap("a.go", "T.X")},
+		},
+		{
+			name:         "same field in another file",
+			baseline:     map[string]bool{"a.go: T.X": true},
+			gaps:         []docGap{gap("a.go", "T.X"), gap("b.go", "T.X")},
+			wantUnlisted: []string{"b.go: T.X"},
+		},
+		{
+			name:     "empty baseline, no gaps",
+			baseline: map[string]bool{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unlisted, stale := fieldBaselineViolations(tc.gaps, tc.baseline)
+			var got []string
+			for _, g := range unlisted {
+				got = append(got, fieldBaselineKey(g))
+			}
+			if strings.Join(got, ",") != strings.Join(tc.wantUnlisted, ",") {
+				t.Errorf("unlisted = %q, want %q", got, tc.wantUnlisted)
+			}
+			if strings.Join(stale, ",") != strings.Join(tc.wantStale, ",") {
+				t.Errorf("stale = %q, want %q", stale, tc.wantStale)
+			}
+		})
+	}
+}
+
 // receiverTypeName returns the base type name of a method receiver, looking
 // through pointers and type parameters.
 func receiverTypeName(recv *ast.FieldList) string {
