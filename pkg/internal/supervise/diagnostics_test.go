@@ -17,6 +17,7 @@ package supervise
 import (
 	"context"
 	"log/slog"
+	"math"
 	"runtime"
 	"testing"
 	"time"
@@ -102,6 +103,10 @@ func TestLogContained_BoundHoldsWithDiagnosticsInFlight(t *testing.T) {
 // records the queue cannot hold.
 func assertBlockingHandlerBounded(t *testing.T) {
 	t.Helper()
+	// The bound is counted from an empty queue and an idle worker: records
+	// an earlier test left on the shared worker would take queue slots and
+	// show as drops of this check's own records.
+	awaitIdle(t, math.MaxInt)
 	baseline := runtime.NumGoroutine()
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)
