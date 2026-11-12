@@ -6086,16 +6086,16 @@ func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (re
 	if ns.barrierSealed() {
 		return nil, nopHostRelease, ErrBarrierSealed
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
 	}
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
@@ -6807,7 +6807,8 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 		return nil, ErrBarrierSealed
 	}
 
-	return ns.rsm.Lookup(ctx, query)
+	v, lookupErr := ns.rsm.Lookup(ctx, query)
+	return v, mapLocalReadError(lookupErr)
 }
 
 // StaleRead reads this replica's state machine directly, without any
@@ -6897,7 +6898,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 
 	// Fast path: SM has already applied up to the committed index.
 	if ns.lastApplied.Load() >= committed {
-		return ns.rsm.Lookup(ctx, query)
+		v, lookupErr := ns.rsm.Lookup(ctx, query)
+		return v, mapLocalReadError(lookupErr)
 	}
 
 	// Slow path: poll until lastApplied catches up, the shard or host shuts
@@ -6918,7 +6920,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 		select {
 		case <-ticker.C:
 			if ns.lastApplied.Load() >= committed {
-				return ns.rsm.Lookup(ctx, query)
+				v, lookupErr := ns.rsm.Lookup(ctx, query)
+				return v, mapLocalReadError(lookupErr)
 			}
 			if ns.stopped.Load() || h.closed.Load() {
 				return nil, ErrClosed
@@ -12667,6 +12670,17 @@ func mapContextError(err error) error {
 		return fmt.Errorf("%w: %w", ErrCanceled, err)
 	}
 	return err
+}
+
+// mapLocalReadError maps a context error returned by a local state machine
+// read (a read abandoned while an Update held the state machine) to
+// ErrCanceled or ErrTimeout, as the read's own context checks do. An error
+// that already carries ErrCanceled or ErrTimeout is returned unchanged.
+func mapLocalReadError(err error) error {
+	if err == nil || errors.Is(err, ErrCanceled) || errors.Is(err, ErrTimeout) {
+		return err
+	}
+	return mapContextError(err)
 }
 
 // effectiveMaxPayload returns the effective maximum proposal payload size
