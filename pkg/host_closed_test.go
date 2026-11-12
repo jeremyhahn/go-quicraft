@@ -24,6 +24,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
 // closedKind says what an exported *Host method owes its caller once
@@ -298,6 +300,77 @@ func TestHostClosedCloseIdempotent(t *testing.T) {
 		if !closeH(fmt.Sprintf("repeat Close %d", i)) {
 			return
 		}
+	}
+}
+
+// TestHostClosedEmergencySealDuringClose holds Close open after it has
+// admitted shutdown (h.closed is set) but before it has sealed the barrier,
+// and calls EmergencySeal in that window. An operator asking for immediate
+// key destruction must get it while shutdown is still draining: the barrier
+// is sealed at once and the call does not wait for Close.
+func TestHostClosedEmergencySealDuringClose(t *testing.T) {
+	cfg := testHostConfig(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	cfg.EventListener = &config.EventListener{
+		OnNodeHostShuttingDown: func() {
+			close(entered)
+			<-release
+		},
+	}
+	b := &mockBarrier{}
+	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(b), WithoutTransport())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- h.Close() }()
+	defer func() {
+		unblock()
+		select {
+		case <-closeErr:
+		case <-time.After(closeDeadline):
+			t.Errorf("Close blocked past %v after release", closeDeadline)
+		}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(closeDeadline):
+		t.Fatalf("Close did not reach shutdown within %v", closeDeadline)
+	}
+	if b.IsSealed() {
+		t.Fatal("barrier sealed before EmergencySeal")
+	}
+
+	sealErr := make(chan error, 1)
+	go func() { sealErr <- h.EmergencySeal() }()
+	select {
+	case err := <-sealErr:
+		if err != nil {
+			t.Errorf("EmergencySeal during Close: got %v, want nil", err)
+		}
+	case <-time.After(closedCallDeadline):
+		t.Fatalf("EmergencySeal blocked past %v while Close was running", closedCallDeadline)
+	}
+	if !b.IsSealed() {
+		t.Error("EmergencySeal during Close left the barrier unsealed")
+	}
+
+	unblock()
+	select {
+	case err := <-closeErr:
+		if err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	case <-time.After(closeDeadline):
+		t.Fatalf("Close blocked past %v after release", closeDeadline)
+	}
+	closeErr <- nil // the deferred wait reads it
+	if err := h.EmergencySeal(); !errors.Is(err, ErrClosed) {
+		t.Errorf("EmergencySeal after Close: got %v, want ErrClosed", err)
 	}
 }
 
