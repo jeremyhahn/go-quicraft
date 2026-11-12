@@ -336,3 +336,81 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 		t.Fatalf("observer StaleRead(\"after\") error = %v, want *kv.KeyNotFoundError", err)
 	}
 }
+
+// TestObserverReplica_TwoVotersCommitWithObserverDown stops the observer and
+// one non-leader voter. The two remaining voters are a quorum of three, so a
+// proposal through the leader commits; were the observer counted as a voter,
+// quorum would be 3 of 4 and the proposal could not commit.
+func TestObserverReplica_TwoVotersCommitWithObserverDown(t *testing.T) {
+	c := newObserverCluster(t)
+	c.startVoters()
+	c.admitObserver(t)
+	c.put("k", "v")
+
+	// The observer catches up: its state machine hash reaches the leader's at
+	// the same applied index.
+	obs := c.host(observerID)
+	if !waitUntil(20*time.Second, func() bool {
+		id := c.leader()
+		if id == 0 {
+			return false
+		}
+		lh, li, lok, lerr := c.host(id).StateMachineHash(observerShard)
+		oh, oi, ook, oerr := obs.StateMachineHash(observerShard)
+		return lerr == nil && oerr == nil && lok && ook && li == oi && lh == oh
+	}) {
+		t.Fatal("observer never caught up with the leader")
+	}
+
+	var leaderID uint64
+	if !waitUntil(20*time.Second, func() bool {
+		leaderID = c.leader()
+		return leaderID != 0
+	}) {
+		t.Fatal("no leader before the stop")
+	}
+	var stopped, other uint64
+	for id := uint64(1); id <= 3; id++ {
+		if id == leaderID {
+			continue
+		}
+		if stopped == 0 {
+			stopped = id
+		} else {
+			other = id
+		}
+	}
+	for _, id := range []uint64{observerID, stopped} {
+		if err := c.nodes[id-1].host.Close(); err != nil {
+			t.Fatalf("Close[%d]: %v", id, err)
+		}
+		c.nodes[id-1].host = nil
+	}
+
+	cmd, err := kv.EncodePut([]byte("after"), []byte("two-voters"))
+	if err != nil {
+		t.Fatalf("EncodePut: %v", err)
+	}
+	var lastErr error
+	if !waitUntil(20*time.Second, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, lastErr = c.host(leaderID).SyncPropose(ctx, observerShard, cmd)
+		return lastErr == nil
+	}) {
+		t.Fatalf("proposal through leader %d with voters %d and %d up never committed: %v",
+			leaderID, leaderID, other, lastErr)
+	}
+
+	// The other surviving voter applies the committed value.
+	var got any
+	if !waitUntil(20*time.Second, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		got, lastErr = c.host(other).StaleRead(ctx, observerShard, []byte("after"))
+		b, ok := got.([]byte)
+		return lastErr == nil && ok && bytes.Equal(b, []byte("two-voters"))
+	}) {
+		t.Fatalf("voter %d StaleRead(\"after\") = %#v, %v; want \"two-voters\"", other, got, lastErr)
+	}
+}
