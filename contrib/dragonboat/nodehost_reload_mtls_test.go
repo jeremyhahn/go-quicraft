@@ -15,10 +15,13 @@
 package dragonboat_test
 
 import (
+	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	dragonboat "github.com/jeremyhahn/go-quicraft/contrib/dragonboat"
 	"github.com/jeremyhahn/go-quicraft/contrib/dragonboat/config"
@@ -38,18 +41,32 @@ type reloadFixture struct {
 	identity string
 }
 
-func newReloadFixture(t *testing.T) *reloadFixture {
+// freeUDPAddr reserves a loopback UDP port and releases it, so a NodeHost
+// can bind an address its peers can dial (127.0.0.1:0 is not dialable).
+func freeUDPAddr(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve UDP port: %v", err)
+	}
+	addr := pc.LocalAddr().String()
+	if err := pc.Close(); err != nil {
+		t.Fatalf("release UDP port: %v", err)
+	}
+	return addr
+}
+
+// newMTLSNodeHost starts a NodeHost serving mutual TLS from files on addr.
+func newMTLSNodeHost(t *testing.T, files testpki.Files, addr string) *dragonboat.NodeHost {
 	t.Helper()
 	dir := t.TempDir()
-	ca := testpki.NewCA(t)
-	files := ca.LeafFiles(t, t.TempDir())
 	nh, err := dragonboat.NewNodeHost(config.NodeHostConfig{
 		DeploymentID:   1,
 		WALDir:         filepath.Join(dir, "wal"),
 		NodeHostDir:    filepath.Join(dir, "data"),
-		RaftAddress:    "127.0.0.1:0",
-		ListenAddress:  "127.0.0.1:0",
-		RTTMillisecond: 200,
+		RaftAddress:    addr,
+		ListenAddress:  addr,
+		RTTMillisecond: 20,
 		MutualTLS:      true,
 		CAFile:         files.CAFile,
 		CertFile:       files.CertFile,
@@ -59,6 +76,14 @@ func newReloadFixture(t *testing.T) *reloadFixture {
 		t.Fatalf("NewNodeHost: %v", err)
 	}
 	t.Cleanup(nh.Close)
+	return nh
+}
+
+func newReloadFixture(t *testing.T) *reloadFixture {
+	t.Helper()
+	ca := testpki.NewCA(t)
+	files := ca.LeafFiles(t, t.TempDir())
+	nh := newMTLSNodeHost(t, files, freeUDPAddr(t))
 	f := &reloadFixture{
 		nh:       nh,
 		ca:       ca,
@@ -99,6 +124,49 @@ func (f *reloadFixture) requireIdentity(t *testing.T) {
 	t.Helper()
 	if got := f.nh.NodeIdentity(); got != f.identity {
 		t.Fatalf("NodeIdentity = %q, want %q", got, f.identity)
+	}
+}
+
+// requireServes proves the fixture's listener still accepts authenticated
+// connections: a second NodeHost with a fresh leaf from the same CA forms a
+// two-member shard with the fixture and a proposal commits, which needs
+// both hosts to complete new mutual-TLS handshakes with each other.
+func (f *reloadFixture) requireServes(ctx context.Context, t *testing.T) {
+	t.Helper()
+	peer := newMTLSNodeHost(t, f.ca.LeafFiles(t, t.TempDir()), freeUDPAddr(t))
+	const shardID = 1
+	members := map[uint64]dragonboat.Target{
+		1: f.nh.RaftAddress(),
+		2: peer.RaftAddress(),
+	}
+	identities := map[uint64]string{
+		1: f.nh.NodeIdentity(),
+		2: peer.NodeIdentity(),
+	}
+	for replicaID, nh := range map[uint64]*dragonboat.NodeHost{1: f.nh, 2: peer} {
+		if err := nh.StartReplica(members, false, newKVStore, config.Config{
+			ShardID:          shardID,
+			ReplicaID:        replicaID,
+			MemberIdentities: identities,
+			ElectionRTT:      10,
+			HeartbeatRTT:     1,
+			CheckQuorum:      true,
+		}); err != nil {
+			t.Fatalf("StartReplica %d: %v", replicaID, err)
+		}
+	}
+	session := f.nh.GetNoOPSession(shardID)
+	for {
+		attempt, cancel := context.WithTimeout(ctx, time.Second)
+		_, err := f.nh.SyncPropose(attempt, session, []byte("k=v"))
+		cancel()
+		if err == nil {
+			return
+		}
+		if !dragonboat.IsTempError(err) || ctx.Err() != nil {
+			t.Fatalf("SyncPropose on a shard with a same-CA peer: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -160,6 +228,9 @@ func TestNodeHost_ReloadMutualTLS_NotPEMRefused(t *testing.T) {
 	if f.nh.RaftAddress() == "" {
 		t.Error("RaftAddress is empty after a refused reload")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	f.requireServes(ctx, t)
 
 	f.restore(t)
 	if err := f.nh.ReloadMutualTLS(); err != nil {
