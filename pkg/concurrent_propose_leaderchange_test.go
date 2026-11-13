@@ -16,7 +16,9 @@ package quicraft
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"testing"
 	"time"
 )
@@ -111,17 +113,31 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	}) {
 		t.Fatalf("replica %d never stepped down after losing its quorum", leaderID)
 	}
-	cancelHeld()
+	// The held calls are collected under the live test ctx, not a cancelled
+	// one: a cancel would make every held call return a MaybeApplied
+	// ErrCanceled whatever the leader-loss path does. OnLeaderUpdated must
+	// fail each of them with a MaybeApplied *NotLeaderError on its own.
+	// cancelHeld stays only as the deferred cleanup.
+	pending := make(map[string]bool, len(heldKeys))
+	for _, key := range heldKeys {
+		pending[key] = true
+	}
 	for range heldKeys {
 		select {
 		case r := <-results:
+			delete(pending, r.key)
 			if out.record(r.key, r.err) {
 				t.Errorf("held proposal %s refused before submission (%v), want MaybeApplied", r.key, r.err)
-			} else if !MaybeApplied(r.err) {
-				t.Errorf("held proposal %s = %v, want MaybeApplied", r.key, r.err)
+			} else if !MaybeApplied(r.err) || !errors.Is(r.err, ErrNotLeader) {
+				t.Errorf("held proposal %s = %v, want a MaybeApplied ErrNotLeader from the leader-loss path", r.key, r.err)
 			}
 		case <-ctx.Done():
-			t.Fatal("a proposal held at the gate never returned after the leader transfer")
+			stuck := make([]string, 0, len(pending))
+			for key := range pending {
+				stuck = append(stuck, key)
+			}
+			sort.Strings(stuck)
+			t.Fatalf("held proposals %v never returned after replica %d stepped down: the leader-loss path did not fail them", stuck, leaderID)
 		}
 	}
 	c.gate.open()
