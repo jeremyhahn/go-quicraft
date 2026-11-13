@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -44,6 +46,83 @@ const followerReadShard uint64 = 1
 
 type followerReadCluster struct {
 	hosts []*Host
+	// gates[i] can hold replica i's apply of one chosen entry.
+	gates []*followerApplyGate
+}
+
+// followerApplyGate holds a replica's apply of one armed command until
+// released, so a test can keep that replica's applied index behind the
+// commit index it already knows. Disarmed, it never blocks.
+type followerApplyGate struct {
+	mu       sync.Mutex
+	target   []byte
+	reached  chan struct{}
+	release  chan struct{}
+	released bool
+}
+
+// arm makes the next Update holding an entry whose command equals cmd
+// signal reached and block until release is called. release is idempotent.
+func (g *followerApplyGate) arm(cmd []byte) (reached <-chan struct{}, release func()) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.target = cmd
+	g.reached = make(chan struct{})
+	g.release = make(chan struct{})
+	g.released = false
+	rel := g.release
+	return g.reached, func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if g.release == rel && !g.released {
+			g.released = true
+			close(rel)
+		}
+	}
+}
+
+// hold blocks while entries contain the armed command, until released or
+// ctx is done. It fires once per arm.
+func (g *followerApplyGate) hold(ctx context.Context, entries []sm.Entry) {
+	g.mu.Lock()
+	if g.target == nil {
+		g.mu.Unlock()
+		return
+	}
+	hit := false
+	for _, e := range entries {
+		if bytes.Equal(e.Cmd, g.target) {
+			hit = true
+			break
+		}
+	}
+	if !hit {
+		g.mu.Unlock()
+		return
+	}
+	g.target = nil
+	close(g.reached)
+	release := g.release
+	g.mu.Unlock()
+	select {
+	case <-release:
+	case <-ctx.Done():
+	}
+}
+
+// gatedKVStore is the kv concurrent in-memory store with an apply gate in
+// front of Update. The concurrent form is used because a regular state
+// machine's Lookup is serialized with Update: a read issued while the gate
+// holds an apply would block behind it whatever FollowerRead does, and the
+// test could not tell a read that waited for apply from one that did not.
+type gatedKVStore struct {
+	*kv.ConcurrentStore
+	gate *followerApplyGate
+}
+
+func (s *gatedKVStore) Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error {
+	s.gate.hold(ctx, entries)
+	return s.ConcurrentStore.Update(ctx, entries, results)
 }
 
 func newFollowerReadCluster(t *testing.T) *followerReadCluster {
@@ -79,7 +158,12 @@ func newFollowerReadCluster(t *testing.T) *followerReadCluster {
 	for i, h := range c.hosts {
 		scfg := testShardConfig(followerReadShard, uint64(i+1))
 		scfg.MemberIdentities = ids
-		if err := h.StartShard(addrs, false, kv.NewMemoryCreateFunc(), scfg); err != nil {
+		gate := &followerApplyGate{}
+		c.gates = append(c.gates, gate)
+		create := sm.NewConcurrentCreateFunc(func(_, _ uint64) sm.ConcurrentStateMachine {
+			return &gatedKVStore{ConcurrentStore: kv.NewConcurrentStore(), gate: gate}
+		})
+		if err := h.StartShard(addrs, false, create, scfg); err != nil {
 			t.Fatalf("StartShard[%d]: %v", i, err)
 		}
 	}
@@ -310,6 +394,77 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 			t.Errorf("the writer acknowledged only %d writes in 30s", snapshot().value)
 		}
 		t.Logf("%d writes acknowledged; checked reads per follower %v", snapshot().value, reads)
+	})
+
+	t.Run("a read on a follower whose apply lags its known commit waits and returns the new value", func(t *testing.T) {
+		const key = "lag"
+		li, index := c.put(t, key, "old")
+		fi := (li + 1) % len(c.hosts)
+		if !c.awaitCommitted(fi, index) {
+			t.Fatalf("replica %d never learned commit index %d", fi+1, index)
+		}
+		var (
+			cmd []byte
+			err error
+		)
+		// Precondition, not the property under test: the follower has applied
+		// "old" before its apply is gated.
+		var got string
+		if !waitUntil(10*time.Second, func() bool {
+			got, err = c.read(fi, key)
+			return err == nil && got == "old"
+		}) {
+			t.Fatalf("FollowerRead on replica %d before the gate = (%q, %v), want old", fi+1, got, err)
+		}
+
+		cmd, err = kv.EncodePut([]byte(key), []byte("new"))
+		if err != nil {
+			t.Fatalf("EncodePut: %v", err)
+		}
+		reached, release := c.gates[fi].arm(cmd)
+		t.Cleanup(release)
+
+		_, index = c.put(t, key, "new")
+		select {
+		case <-reached:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("replica %d never reached the apply of the write at commit index %d", fi+1, index)
+		}
+		// Apply runs only on committed entries, so the follower already knows
+		// the write is committed; its apply is held before the write lands.
+		if !c.awaitCommitted(fi, index) {
+			t.Fatalf("replica %d never learned commit index %d", fi+1, index)
+		}
+
+		type result struct {
+			value string
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			v, err := c.hosts[fi].FollowerRead(ctx, followerReadShard, []byte(key))
+			b, _ := v.([]byte)
+			done <- result{value: string(b), err: err}
+		}()
+
+		select {
+		case r := <-done:
+			t.Fatalf("FollowerRead on replica %d returned (%q, %v) while its apply of commit index %d was held, want it to wait",
+				fi+1, r.value, r.err, index)
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		release()
+		select {
+		case r := <-done:
+			if r.err != nil || r.value != "new" {
+				t.Fatalf("FollowerRead on replica %d after release = (%q, %v), want new", fi+1, r.value, r.err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("FollowerRead on replica %d did not return within 10s of the apply being released", fi+1)
+		}
 	})
 
 	t.Run("FollowerRead on the leader returns the latest value", func(t *testing.T) {
