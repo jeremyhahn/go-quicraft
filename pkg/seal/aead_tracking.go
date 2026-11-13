@@ -208,7 +208,10 @@ func (ic *InMemoryInvocationCounter) GetUsagePercentage() float64 {
 	if !ic.enabled || ic.limit == 0 {
 		return 0.0
 	}
-	return (float64(ic.count.Load()) / float64(ic.limit)) * 100.0
+	// Seed stores a restored count without a limit check, so the count can
+	// exceed the limit; clamp to keep the documented range.
+	pct := (float64(ic.count.Load()) / float64(ic.limit)) * 100.0
+	return min(max(pct, 0.0), 100.0)
 }
 
 // Reset sets the invocation counter back to zero. This must only be called
