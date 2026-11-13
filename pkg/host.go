@@ -12630,12 +12630,14 @@ func (ns *nodeState) signalLeaderChange() {
 	}
 }
 
-// buildWALOptions constructs waldb.Option values from the HostConfig.
-// When MaxWALDiskSize is set and/or EventListener disk callbacks are
-// configured, a DiskMonitor is attached to the WAL database. The
-// diskFullFlag is atomically set to true when disk full is detected
+// buildWALOptions constructs waldb.Option values from the HostConfig, with
+// the WAL monitor of hostDiskMonitorOptions and no proposal gate.
+// When MaxWALDiskSize is set, a DiskMonitor is attached to the WAL
+// database. The diskFullFlag is set to true when disk full is detected
 // and cleared when usage drops below the full threshold. shards reports
 // DiskInfo.Shards when a disk callback fires; nil leaves it empty.
+//
+//nolint:unparam // shards kept: same inputs as hostDiskMonitorOptions; NewHost wires both monitors through it
 func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) []waldb.Option {
 	_, walMon := hostDiskMonitorOptions(cfg, diskFullFlag, shards)
 	return walDBOptions(cfg, walMon)
@@ -12663,16 +12665,15 @@ func walDBOptions(cfg config.HostConfig, monOpts []waldb.DiskMonitorOption) []wa
 // into diskFullFlag and share the OnLogDBDiskFull listener; the WAL monitor
 // also carries the OnLogDBDiskWarning listener.
 func hostDiskMonitorOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) (gate, wal []waldb.DiskMonitorOption) {
-	clearFlag := waldb.WithOnRecovery(func(_, _ uint64) {
-		diskFullFlag.Store(false)
-	})
+	state := newDiskFullState(cfg, diskFullFlag, shards)
+	clock := waldb.WithSampleClock(&state.clock)
 	gate = []waldb.DiskMonitorOption{
 		waldb.WithFullPercent(proposalDiskFullPercent),
 		waldb.WithCheckEvery(proposalDiskCheckEvery),
-		waldb.WithOnFullNotify(diskFullCallback(cfg, diskFullFlag, shards)),
-		clearFlag,
+		clock,
+		waldb.WithOnSample(state.publisher(true)),
 	}
-	wal = []waldb.DiskMonitorOption{clearFlag}
+	wal = []waldb.DiskMonitorOption{clock, waldb.WithOnSample(state.publisher(false))}
 	if cfg.EventListener != nil && cfg.EventListener.OnLogDBDiskWarning != nil {
 		walDir := cfg.WALDir
 		warningCb := cfg.EventListener.OnLogDBDiskWarning
@@ -12685,7 +12686,6 @@ func hostDiskMonitorOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, sh
 			})
 		}))
 	}
-	wal = append(wal, waldb.WithOnFullNotify(diskFullCallback(cfg, diskFullFlag, shards)))
 	return gate, wal
 }
 
@@ -12705,40 +12705,85 @@ const proposalDiskFullPercent = 0.90
 // the WAL's under a proposal-driven workload.
 const proposalDiskCheckEvery = waldb.DefaultCheckEvery / 10
 
-// diskFullCallback returns the full-threshold callback shared by the WAL's
-// disk monitor and the proposal gate. It sets diskFullFlag and calls
-// EventListener.OnLogDBDiskFull once per transition into the full state,
-// whichever monitor sees it first; a recovery clears the flag and re-arms it.
-func diskFullCallback(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) func(used, maxBytes uint64) func() {
-	var fullCb func(config.DiskInfo)
+// diskFullState is the one publisher of the host's disk-full flag, shared by
+// the WAL's disk monitor and the proposal gate. Each monitor publishes every
+// sample (waldb.WithOnSample) under its own mutex; the flag is derived from
+// both monitors' latest samples under mu, so a stalled publication from one
+// monitor cannot overwrite a newer one from the other.
+// EventListener.OnLogDBDiskFull fires once per rise of the flag, whichever
+// monitor causes it; a fall re-arms it.
+type diskFullState struct {
+	flag *atomic.Bool
+	// clock is the sample clock both monitors share (waldb.WithSampleClock).
+	clock atomic.Uint64
+
+	mu   sync.Mutex
+	gate waldb.DiskSample // latest proposal gate sample
+	wal  waldb.DiskSample // latest WAL monitor sample
+
+	fullCb func(config.DiskInfo)
+	walDir string
+	shards func() []uint64
+}
+
+func newDiskFullState(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) *diskFullState {
+	s := &diskFullState{flag: diskFullFlag, walDir: cfg.WALDir, shards: shards}
 	if cfg.EventListener != nil {
-		fullCb = cfg.EventListener.OnLogDBDiskFull
+		s.fullCb = cfg.EventListener.OnLogDBDiskFull
 	}
-	walDir := cfg.WALDir
-	// The flag is published under the monitor's mutex (in sample order with
-	// the recovery callback that clears it); the listener runs from the
-	// returned function after the mutex is released, because a listener
-	// that proposes samples the proposal gate again.
-	return func(used, maxBytes uint64) func() {
-		if diskFullFlag.Swap(true) || fullCb == nil {
-			return nil
-		}
-		return func() {
-			fullCb(config.DiskInfo{
-				WALDir:    walDir,
-				UsedBytes: used,
-				MaxBytes:  maxBytes,
-				Shards:    diskShards(shards),
-			})
-		}
+	return s
+}
+
+// publisher returns the waldb.WithOnSample hook of the gate (fromGate) or of
+// the WAL monitor.
+func (s *diskFullState) publisher(fromGate bool) func(waldb.DiskSample) func() {
+	return func(sample waldb.DiskSample) func() {
+		return s.publish(fromGate, sample)
+	}
+}
+
+// publish records sample as its monitor's latest and recomputes the flag
+// under s.mu. The flag is set while the gate's latest sample is full, or
+// while the WAL's latest sample is full and newer than the gate's: the gate's
+// threshold (90%) is below the WAL's (95%), so a newer gate sample below it
+// shows that an older WAL full sample is stale. A sample older than the one
+// already recorded for its monitor is ignored. It returns the
+// OnLogDBDiskFull notification when the flag rises, to run after the
+// monitor's mutex is released (a listener that proposes samples the gate).
+func (s *diskFullState) publish(fromGate bool, sample waldb.DiskSample) func() {
+	s.mu.Lock()
+	latest := &s.wal
+	if fromGate {
+		latest = &s.gate
+	}
+	if sample.Seq < latest.Seq {
+		s.mu.Unlock()
+		return nil
+	}
+	*latest = sample
+	full := s.gate.Full || (s.wal.Full && s.wal.Seq > s.gate.Seq)
+	rose := !s.flag.Swap(full) && full
+	s.mu.Unlock()
+	if !rose || s.fullCb == nil {
+		return nil
+	}
+	fullCb, walDir, shards := s.fullCb, s.walDir, s.shards
+	return func() {
+		fullCb(config.DiskInfo{
+			WALDir:    walDir,
+			UsedBytes: sample.Used,
+			MaxBytes:  sample.MaxBytes,
+			Shards:    diskShards(shards),
+		})
 	}
 }
 
 // newProposalDiskGate builds the disk monitor the proposal path samples
 // before admitting a proposal, or nil when HostConfig.MaxWALDiskSize is zero.
 // It watches the WAL's volume at proposalDiskFullPercent, every
-// proposalDiskCheckEvery proposals, and shares diskFullFlag and the full and
-// recovery callbacks with the WAL's own monitor (buildWALOptions).
+// proposalDiskCheckEvery proposals, with the gate options of
+// hostDiskMonitorOptions, which publish into the flag the WAL's own monitor
+// shares.
 func newProposalDiskGate(cfg config.HostConfig, gateOpts []waldb.DiskMonitorOption) *waldb.DiskMonitor {
 	if cfg.MaxWALDiskSize == 0 {
 		return nil
