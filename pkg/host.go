@@ -1822,17 +1822,11 @@ func (pp *pendingProposal) owns(entry proto.Entry) bool {
 	return entry.Index > pp.floor
 }
 
-// completeProposal delivers an applied entry's result to the caller waiting
+// deliverProposal delivers an applied entry's result to the caller waiting
 // on pp.rs, translating the reserved ResultSessionExpired value into an
 // error so clients can distinguish expired sessions from legitimate
-// zero-value results (PhD Figure 6.1, step 3). Shared by both branches of
-// OnApplied's proposal completion so they cannot drift apart.
-func completeProposal(h *Host, shardID uint64, entry proto.Entry, pp *pendingProposal, result sm.Result) {
-	createdAt := deliverProposal(h, shardID, entry, pp, result)
-	observeProposalLatency(h, shardID, createdAt)
-}
-
-// deliverProposal is completeProposal without the latency observation: it
+// zero-value results (PhD Figure 6.1, step 3), without the latency
+// observation: it
 // completes and releases pp's caller, runs no user code, and returns the
 // request's creation time for observeProposalLatency. A caller that tracks
 // which proposals it has completed records the completion between the two,
@@ -1937,7 +1931,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// reads, a metrics call per one), and until claiming happens the
 	// config-change proposal is just as exposed to the sweeper. Claiming
 	// first, before any other work at all, closes both. Only the actual
-	// completion (rs.complete, inside completeProposal) is deferred until
+	// completion (rs.complete, inside deliverProposal) is deferred until
 	// after routing, so ns.configChangeIndex reflects this batch before a
 	// woken caller can round-trip its ConfigChangeID (see below).
 	//
@@ -2008,7 +2002,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// in here calls at least one user-supplied callback that can panic:
 	// c.h.metrics.ObserveReadIndexLatency in the reads scan, c.h.logger in
 	// applyMembershipRouting's per-entry log call, c.h.metrics.
-	// ObserveProposalLatency in completeProposal. A narrower recover placed
+	// ObserveProposalLatency in deliverProposal. A narrower recover placed
 	// around just one of them protects claimed only from THAT one — the
 	// reads scan's own metrics call is exactly as capable of leaving
 	// claimed's proposals unclaimed-from-the-map-but-never-completed as
@@ -2023,7 +2017,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// apply worker's own recover and fails the shard.
 	func() {
 		// completedClaims counts how many of claimed[0:] the normal
-		// completeProposal loop below has already finished — see the
+		// deliverProposal loop below has already finished — see the
 		// recover for why a panic handler needs this rather than ranging
 		// over all of claimed unconditionally.
 		completedClaims := 0
@@ -2055,7 +2049,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 				// exactly the stranding this recovery exists to prevent.
 				//
 				// Only the NOT-yet-completed tail: a panic reaching here
-				// after the completeProposal loop below has already
+				// after the deliverProposal loop below has already
 				// finished some of claimed would otherwise complete/
 				// release those a second time. RequestState.complete is
 				// idempotent (CAS-guarded) but releaseRef is not — it
@@ -2156,7 +2150,7 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			// Update the Host routing table (ns.nodes + registry, and —
 			// critically — ns.configChangeIndex) BEFORE completing any
 			// claimed proposal in this batch, not after. rs.complete
-			// (inside completeProposal) is a cross-goroutine handoff: it
+			// (inside deliverProposal) is a cross-goroutine handoff: it
 			// can wake a caller blocked on RequestState.ResultC() while
 			// this function is still executing on the apply worker's
 			// goroutine. A caller unblocked by a config-change proposal's
