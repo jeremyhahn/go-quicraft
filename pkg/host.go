@@ -6012,7 +6012,11 @@ lookup:
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
 	}
-	return ns.rsm.Lookup(ctx, query)
+	result, lookupErr := ns.rsm.Lookup(ctx, query)
+	if lookupErr != nil {
+		return nil, mapLocalReadError(lookupErr)
+	}
+	return result, nil
 }
 
 // SyncReadBuf is the pooled-buffer variant of SyncRead for []byte key queries.
@@ -6071,9 +6075,9 @@ lookup:
 	if ns.rsm == nil {
 		return nil, nopHostRelease, ErrShardNotReady
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
@@ -6081,7 +6085,7 @@ lookup:
 	// Fall back to the generic Lookup path (result is []byte or interface{}).
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
