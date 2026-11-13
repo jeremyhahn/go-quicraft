@@ -209,6 +209,11 @@ func TestPeer_RejoinAfterPause_PersistsNothing(t *testing.T) {
 	for _, c := range rejoinCases() {
 		t.Run(c.name, func(t *testing.T) {
 			p, before := rejoinSubject(ctx, t, c)
+			// The engine persists the pre-rejoin update and commits it, so the
+			// rejoin is measured against a durable baseline.
+			if err := p.Commit(before); err != nil {
+				t.Fatalf("Commit: %v", err)
+			}
 
 			p.RejoinAfterPause()
 
@@ -223,6 +228,13 @@ func TestPeer_RejoinAfterPause_PersistsNothing(t *testing.T) {
 			if len(after.EntriesToSave) != 0 {
 				t.Fatalf("rejoin produced %d entries to save", len(after.EntriesToSave))
 			}
+			// GetUpdate always carries the hard state; the engine skips
+			// SaveState only when the update is ReadOnly.
+			if !after.ReadOnly {
+				t.Fatalf("rejoin update is not ReadOnly, the engine would persist it: "+
+					"%d committed entries, snapshot index %d",
+					len(after.CommittedEntries), after.Snapshot.Index)
+			}
 		})
 	}
 }
@@ -234,21 +246,38 @@ func TestPeer_RejoinAfterPause_ElectionTimeoutCampaigns(t *testing.T) {
 	for _, c := range rejoinCases() {
 		t.Run(c.name, func(t *testing.T) {
 			p, _ := rejoinSubject(ctx, t, c)
+			// Seed a timer one tick short of expiry. Set directly: ticking a
+			// leader or candidate there would change its role first.
+			p.r.electionTick = p.r.randomizedElectionTimeout - 1
+
 			p.RejoinAfterPause()
 			_ = takeUpdate(ctx, t, p)
 			if p.r.electionTick != 0 {
 				t.Fatalf("electionTick = %d after rejoin, want 0", p.r.electionTick)
 			}
 
-			campaigned := false
-			for range 3 * p.r.electionTimeout {
-				p.Tick()
+			campaignSent := func() bool {
 				for _, m := range p.r.msgs {
 					if m.Type == proto.RequestPreVote || m.Type == proto.RequestVote {
-						campaigned = true
+						return true
 					}
 				}
-				if campaigned {
+				return false
+			}
+			armed := p.r.randomizedElectionTimeout
+			for i := range armed - 1 {
+				p.Tick()
+				if campaignSent() {
+					t.Fatalf("campaign at tick %d after rejoin, before the armed timeout %d",
+						i+1, armed)
+				}
+			}
+
+			campaigned := false
+			for range 3*p.r.electionTimeout - (armed - 1) {
+				p.Tick()
+				if campaignSent() {
+					campaigned = true
 					break
 				}
 			}
