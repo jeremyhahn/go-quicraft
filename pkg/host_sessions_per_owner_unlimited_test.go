@@ -27,34 +27,45 @@ import (
 // turns the per-owner cap off without a special case: one owner may fill
 // the shard, and MaxTotalSessions is what stops it.
 //
+// The shard holds DefaultMaxSessionsPerOwner+2 sessions, so the owner's
+// registrations run past the default cap: a runtime that lost the
+// unlimited choice between Config and the session manager (mapping it to
+// DefaultMaxSessionsPerOwner) refuses registration #DefaultMaxSessionsPerOwner+1.
+//
 // The refusal shape is the one the code produces: session.Manager.Register
 // returns ErrSessionLimitExceeded for the shard-wide total, the state
 // machine answers the register with a value other than the client ID, and
 // Host.NewSessionWithOwner reports that as a *SessionError from "register"
 // wrapping ErrInvalidOperation.
 func TestHostSessionsPerOwnerUnlimited(t *testing.T) {
-	const (
-		owner = uint64(0x744)
-		total = 3
-	)
+	const owner = uint64(0x744)
+	perOwnerDefault := int(config.DefaultMaxSessionsPerOwner)
+	total := perOwnerDefault + 2
 	h := newTestHost(t)
 	scfg := testShardConfig(1, 1)
 	scfg.MaxSessionsPerOwner = config.SessionsPerOwnerUnlimited
-	scfg.MaxTotalSessions = total
+	scfg.MaxTotalSessions = uint64(total)
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
 		testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 	waitForLeader(t, h, 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// One owner holds every slot the shard has.
+	// One owner holds every slot the shard has, past the default per-owner
+	// cap.
 	var held []*Session
 	for i := 0; i < total; i++ {
 		s, err := h.NewSessionWithOwner(ctx, 1, owner)
 		if err != nil {
+			if i >= perOwnerDefault {
+				t.Fatalf("NewSessionWithOwner #%d: %v, want success: the owner is past "+
+					"DefaultMaxSessionsPerOwner (%d), but MaxSessionsPerOwner is "+
+					"SessionsPerOwnerUnlimited and the shard holds %d",
+					i+1, err, perOwnerDefault, total)
+			}
 			t.Fatalf("NewSessionWithOwner #%d: %v, want success: the per-owner "+
 				"cap is SessionsPerOwnerUnlimited and the shard holds %d", i+1, err, total)
 		}
