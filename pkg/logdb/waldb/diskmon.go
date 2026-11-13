@@ -166,8 +166,11 @@ type DiskSample struct {
 	// monitor's own) when the sample starts, before usage is read.
 	Seq uint64
 	// Full reports whether the sample is at or above the full threshold.
-	Full     bool
-	Used     uint64
+	Full bool
+	// Used is the disk usage the sample read, in bytes.
+	Used uint64
+	// MaxBytes is the configured ceiling the sample compared Used against,
+	// in bytes.
 	MaxBytes uint64
 }
 
