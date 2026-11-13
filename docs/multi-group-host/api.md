@@ -245,7 +245,7 @@ an election (the ReadIndex warmup of Raft PhD §6.4).
 | `ErrDraining` | Host in drain mode |
 | `ErrShardNotFound` | Shard not loaded |
 | `ErrInvalidOperation` | This replica is a witness; witnesses store no log data |
-| `ErrDiskFull` | WAL usage reached the full threshold (95% of `MaxWALDiskSize`) |
+| `ErrDiskFull` | usage of the WAL's filesystem reached the proposal threshold (90% of `MaxWALDiskSize`, sampled every 10 proposals); the WAL itself refuses writes at 95% |
 | `*EntryTooLargeError` | `len(cmd)` exceeds `min(MaxProposalPayloadSize, MaxEntrySize)` |
 | `*NotLeaderError` | No leader is known. `LeaderID` is 0 and `LeaderAddress` empty |
 | `ErrSystemBusy` | Global rate limit (`MaxTotalInMemLogSize`) exceeded |
@@ -2498,7 +2498,7 @@ Failure events:
 |---|---|---|
 | `OnShardFailed` | `ShardFailedInfo` | the shard's failure latch tripped, once per shard incarnation, reporting the failure that tripped it; failures that race it are not reported again. Causes: SM error or panic, commit or save-state failure, a step-worker `GetUpdate` error, a snapshot recovery that failed or panicked once the state machine's `RecoverFromSnapshot` was invoked, a recovery whose every re-driven attempt was rejected before the restore (`*SnapshotRecoveryExhaustedError`), a corrupt committed config entry. The shard is offline until reloaded. Not fired for a failed snapshot save, which leaves the shard running (it is logged and returned to the `RequestSnapshot` caller), for a recovery that failed before `RecoverFromSnapshot` was invoked while attempts remain (rejected through `OnSnapshotRejected` and re-driven), nor when the engine declines a stale snapshot recovery, since the shard is already past that snapshot |
 | `OnLogDBDiskWarning` | `DiskInfo` | WAL usage crossed 85% of `HostConfig.MaxWALDiskSize`; requires `MaxWALDiskSize > 0` |
-| `OnLogDBDiskFull` | `DiskInfo` | WAL usage reached 95% of `MaxWALDiskSize`; new proposals are refused with `ErrDiskFull` until usage drops. Requires `MaxWALDiskSize > 0` |
+| `OnLogDBDiskFull` | `DiskInfo` | usage of the WAL's filesystem reached 90% of `MaxWALDiskSize` (the proposal gate, sampled every 10 proposals) or 95% (the WAL, sampled every 100 writes), whichever comes first; fires once per crossing. From 90% new proposals are refused with `ErrDiskFull` and `HealthCheck` reports `DiskOK` false until a sample sees usage below 90%; at 95% the WAL refuses writes. Requires `MaxWALDiskSize > 0` |
 
 Payload types:
 

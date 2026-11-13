@@ -251,10 +251,13 @@ type EventListener struct {
 	// OnLogDBDiskWarning fires when WAL disk usage crosses the warning
 	// threshold of HostConfig.MaxWALDiskSize. It requires MaxWALDiskSize > 0.
 	OnLogDBDiskWarning func(info DiskInfo)
-	// OnLogDBDiskFull fires when WAL disk usage reaches the full threshold
-	// (95% of MaxWALDiskSize; the warning fires at 85%); new proposals are
-	// refused with ErrDiskFull until usage drops. It requires
-	// MaxWALDiskSize > 0.
+	// OnLogDBDiskFull fires once when disk usage reaches a full threshold of
+	// HostConfig.MaxWALDiskSize, whichever is reached first: 90%, where the
+	// host's proposal gate (sampled every 10 proposals) starts refusing new
+	// proposals with ErrDiskFull, or 95%, where the WAL (sampled every 100
+	// writes) refuses writes. It fires again only after usage has dropped
+	// below the threshold and crossed it once more. The warning fires at
+	// 85%. It requires MaxWALDiskSize > 0.
 	OnLogDBDiskFull func(info DiskInfo)
 }
 
@@ -388,12 +391,15 @@ type HostConfig struct {
 	ShutdownTimeout time.Duration
 
 	// MaxWALDiskSize is a disk ceiling in bytes for the filesystem holding
-	// WALDir. The WAL compares it with the used space of that whole
-	// filesystem (statfs on Linux, sampled every 100 writes), not with the
-	// WAL's own size, so other files on the volume count against it. At 85%
-	// OnLogDBDiskWarning fires; at 95% OnLogDBDiskFull fires, new proposals
-	// fail with ErrDiskFull and HealthCheck reports DiskOK false until usage
-	// drops. 0 means unlimited.
+	// WALDir. It is compared with the used space of that whole filesystem
+	// (statfs on Linux), not with the WAL's own size, so other files on the
+	// volume count against it. Three thresholds apply: at 85% (sampled
+	// every 100 WAL writes) OnLogDBDiskWarning fires; at 90% (sampled every
+	// 10 proposals) new proposals and snapshot imports fail with
+	// ErrDiskFull, OnLogDBDiskFull fires and HealthCheck reports DiskOK false
+	// until a sample sees usage below 90%; at 95% (sampled every 100 WAL
+	// writes) the WAL refuses writes, which fails the shard that issued
+	// the write. 0 means unlimited.
 	MaxWALDiskSize uint64
 
 	// NoSyncWAL disables fdatasync on Raft WAL segment writes. When true,

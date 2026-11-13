@@ -511,11 +511,19 @@ are in [api.md](api.md#leader-executed-requests).
 
 ## Manage disk
 
-Set `MaxWALDiskSize`. At 85% of it the host fires `OnLogDBDiskWarning`; at 95% it
-fires `OnLogDBDiskFull`, refuses proposals with `ErrDiskFull` and reports
-`DiskOK: false`. Callbacks fire on crossing a threshold, not on every check.
-Proposals are accepted again once usage falls back below the full threshold, for
-example after compaction or cleanup.
+Set `MaxWALDiskSize`. Usage is that of the whole filesystem holding the WAL,
+and three thresholds apply:
+
+- at 85% (sampled every 100 WAL writes) the host fires `OnLogDBDiskWarning`;
+- at 90% (sampled every 10 proposals) it refuses proposals with `ErrDiskFull`,
+  fires `OnLogDBDiskFull` and reports `DiskOK: false`;
+- at 95% (sampled every 100 WAL writes) the WAL refuses writes, and the shard
+  that issued the write fails.
+
+Callbacks fire on crossing a threshold, not on every check. Proposals are
+accepted again once a sample sees usage below 90%, for example after
+compaction or cleanup. [Log storage](../log-storage/user.md) describes when
+the 95% limit is reached first.
 
 Snapshots drive log compaction. Every `SnapshotEntries` applied entries a shard
 takes a snapshot and drops log entries older than the snapshot minus
@@ -630,7 +638,7 @@ limit, so a state machine that blocks in `Update` blocks shutdown.
 | new replica never catches up, `unknown_member` drops on it | its `MemberIdentities` anchor does not name the replica sending to it; name the leader |
 | `ErrSystemBusy` or `*BusyError` from `Propose` | memory limits reached; back off and retry |
 | `ErrDropped` from `Propose` | the shard's proposal queue is full; back off and retry |
-| `ErrDiskFull` | WAL usage reached 95% of `MaxWALDiskSize`; free space or raise the limit |
+| `ErrDiskFull` | usage of the WAL's filesystem reached 90% of `MaxWALDiskSize` (the WAL itself refuses writes at 95%); free space or raise the limit |
 | `ErrShardFailed` | the state machine returned an error or panicked; the shard is offline until restarted or recovered from a snapshot |
 | `Close` does not return | a state machine `Update` is blocked |
 | `ShardHealth` JSON fails to decode | an unknown value is rejected, not read as `healthy` |
