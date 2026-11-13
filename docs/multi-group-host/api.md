@@ -569,8 +569,10 @@ An add also checks certificate exclusivity for the address it introduces. That
 is the only point where a grow-by-join deployment can be checked, since
 `StartShard` sees only the initial members map.
 
-With `OrderedConfigChange` on (the default), one membership change is in flight
-per shard at a time.
+One membership change is always in flight per shard at a time: a second one
+while the first is uncommitted returns `ErrRejected`. `OrderedConfigChange` does
+not change this; `config.BoolPtr(false)` is accepted, logs a warning and has no
+effect.
 
 #### Config changes with node identity
 
@@ -2067,7 +2069,7 @@ Source: `pkg/config/config.go`.
 | `RequireMemberIdentities` | `bool` | set by the Host | true on every shard behind a transport: admission refuses an identity-less member. Validate-only; a committed entry is never refused on apply |
 | `CheckQuorum` | `*bool` | nil = on | leader steps down on quorum loss. Disabling is unsafe and logged |
 | `PreVote` | `*bool` | nil = on | pre-vote extension. Disabling is unsafe and logged |
-| `OrderedConfigChange` | `*bool` | nil = on | one membership change at a time. Disabling is unsafe and logged |
+| `OrderedConfigChange` | `*bool` | nil = on | no effect: membership changes are always serialised (one at a time). `false` is accepted and logged |
 | `ElectionRTT` | `uint64` | `10` | election timeout in `RTTMillisecond` multiples; at least 5 and at least `2 * HeartbeatRTT` |
 | `HeartbeatRTT` | `uint64` | `1` | heartbeat interval in `RTTMillisecond` multiples |
 | `SnapshotEntries` | `uint64` | `100000` | applied entries between automatic snapshots. `config.SnapshotsDisabled` turns them off |
