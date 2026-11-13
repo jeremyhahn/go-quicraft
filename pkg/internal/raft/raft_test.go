@@ -335,6 +335,41 @@ func electLeader(r *raft) {
 	r.drainMessages()
 }
 
+// TestRaft_CheckQuorum_NewWitnessGetsOneWindowOfGrace reproduces #1103: a
+// one-replica leader that commits an AddWitness must not step down at the
+// very next CheckQuorum boundary merely because the witness has not had a
+// chance to answer yet. The new remote starts inactive, so without a grace
+// window the boundary right after the membership change sees 1 of 2 voters
+// active and the leader abdicates, failing the still-pending AddWitness with
+// ErrNotLeader. Worst case: the change lands one tick before the boundary.
+// The leader must still step down one full window later if the witness
+// never answers: the grace only defers CheckQuorum, it never disables it.
+func TestRaft_CheckQuorum_NewWitnessGetsOneWindowOfGrace(t *testing.T) {
+	r := newTestRaftWithMembers(1, map[uint64]string{1: "a"})
+	r.checkQuorum = true
+	electLeader(r)
+
+	// Put the next CheckQuorum evaluation one tick away, then apply the
+	// membership change the way Peer.syncRaftRemotes does on a leader.
+	r.electionTick = r.electionTimeout - 1
+	r.witnesses[10] = newRemote(r.log.lastIndex()+1, maxInflightMsgs)
+	if err := r.rebuildReplicaToBit(); err != nil {
+		t.Fatalf("rebuildReplicaToBit: %v", err)
+	}
+
+	r.tickFunc(r)
+	if r.state != leader {
+		t.Fatalf("leader stepped down at the CheckQuorum boundary right after adding a witness: state=%s", r.state)
+	}
+
+	for i := 0; i < r.electionTimeout && r.state == leader; i++ {
+		r.tickFunc(r)
+	}
+	if r.state == leader {
+		t.Fatal("leader kept leadership a full CheckQuorum window after its witness never answered")
+	}
+}
+
 // setReadIndexAck sets the ack bit for replicaID on the given readIndexStatus
 // using the raft's replicaToBit mapping. Panics if the replicaID is unknown.
 func setReadIndexAck(r *raft, status *readIndexStatus, replicaID uint64) {
