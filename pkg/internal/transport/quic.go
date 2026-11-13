@@ -318,6 +318,11 @@ type QUICTransport struct {
 	// a seam.
 	inboundRefusalForTest func(conn *quic.Conn) error
 
+	// queuedCloseForTest, when set, runs before closeQueuedOnShutdown closes
+	// each connection it drained from the accept queue, so tests can make
+	// the drain outlast a deadline.
+	queuedCloseForTest func()
+
 	shutdownCtx     context.Context
 	shutdownCancel  context.CancelFunc
 	wg              sync.WaitGroup
@@ -981,6 +986,9 @@ func (t *QUICTransport) closeQueuedOnShutdown() int {
 		conn, err := t.listener.Accept(ctx)
 		if err != nil {
 			return closed
+		}
+		if t.queuedCloseForTest != nil {
+			t.queuedCloseForTest()
 		}
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
 			remote := conn.RemoteAddr().String()
