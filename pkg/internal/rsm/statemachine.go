@@ -26,6 +26,7 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/session"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -1032,6 +1033,54 @@ func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) er
 	return nil
 }
 
+// rlockContext backoff bounds: the first retry waits rlockMinBackoff, each
+// later one twice as long, capped at rlockMaxBackoff.
+const (
+	rlockMinBackoff = 10 * time.Microsecond
+	rlockMaxBackoff = time.Millisecond
+)
+
+// rlockContext takes the read guard, or returns ctx.Err() if ctx is done
+// first. Update holds the guard's write side for the whole user SM Update
+// call, so a plain RLock would keep a cancelled read waiting for as long as
+// that Update runs.
+//
+// When the guard is not free at once the caller retries TryRLock on a capped
+// backoff timer, on its own goroutine: nothing is left blocked in RLock
+// behind an abandoned read, so repeated cancelled reads against a stalled
+// Update cost no goroutines. TryRLock fails while a writer is waiting, so
+// the retries cannot starve Update.
+func (s *StateMachine) rlockContext(ctx context.Context) error {
+	if s.readGuard.TryRLock() {
+		return nil
+	}
+	done := ctx.Done()
+	if done == nil {
+		s.readGuard.RLock()
+		return nil
+	}
+	backoff := rlockMinBackoff
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	for {
+		select {
+		case <-done:
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if s.readGuard.TryRLock() {
+			return nil
+		}
+		if backoff < rlockMaxBackoff {
+			backoff *= 2
+			if backoff > rlockMaxBackoff {
+				backoff = rlockMaxBackoff
+			}
+		}
+		timer.Reset(backoff)
+	}
+}
+
 // Lookup forwards the query to the user state machine.
 //
 // On a basic sm.StateMachine the read guard serializes this against Apply,
@@ -1048,55 +1097,6 @@ func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) er
 // the test for absence on both paths. A key that exists holding an empty value
 // comes back as a non-nil interface wrapping a zero-length slice, and stays
 // distinguishable from absence.
-// rlockContext takes the read guard, or returns ctx.Err() if ctx is done
-// first. Update holds the guard's write side for the whole user SM Update
-// call, so a plain RLock would keep a cancelled read waiting for as long as
-// that Update runs.
-//
-// When the guard is not free at once a helper goroutine waits for it. The
-// caller and the helper race to settle a shared state exactly once: if the
-// helper wins it hands the held guard to the caller; if the caller gives up
-// first, the helper releases the guard as soon as it gets it and exits, so
-// no lock and no goroutine outlive the abandoned read.
-func (s *StateMachine) rlockContext(ctx context.Context) error {
-	if s.readGuard.TryRLock() {
-		return nil
-	}
-	done := ctx.Done()
-	if done == nil {
-		s.readGuard.RLock()
-		return nil
-	}
-	const (
-		pending int32 = iota
-		handed
-		abandoned
-	)
-	var state atomic.Int32
-	acquired := make(chan struct{})
-	go func() {
-		s.readGuard.RLock()
-		if !state.CompareAndSwap(pending, handed) {
-			s.readGuard.RUnlock()
-			return
-		}
-		close(acquired)
-	}()
-	select {
-	case <-acquired:
-		return nil
-	case <-done:
-		if state.CompareAndSwap(pending, abandoned) {
-			return ctx.Err()
-		}
-		// The helper got the guard first and handed it over; the read is
-		// still refused, since its caller has gone.
-		<-acquired
-		s.readGuard.RUnlock()
-		return ctx.Err()
-	}
-}
-
 func (s *StateMachine) Lookup(ctx context.Context, query interface{}) (interface{}, error) {
 	if err := s.rlockContext(ctx); err != nil {
 		return nil, err
