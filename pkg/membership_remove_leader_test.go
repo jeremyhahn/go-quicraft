@@ -219,7 +219,11 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 		t.Fatalf("new leader %d was not read-ready within %v", newID, bound)
 	}
 
-	m, err := newHost.SyncGetShardMembership(ctx, removeLeaderShard)
+	// The removal's ctx may already have expired (a MaybeApplied timeout is
+	// an accepted outcome), so the membership read gets its own timeout.
+	mctx, mcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	m, err := newHost.SyncGetShardMembership(mctx, removeLeaderShard)
+	mcancel()
 	if err != nil {
 		t.Fatalf("SyncGetShardMembership on survivor %d: %v", newID, err)
 	}
