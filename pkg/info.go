@@ -315,9 +315,10 @@ type RaftStateDiag struct {
 type RemotesDiag struct {
 	// Text renders each remote as
 	// "r<id>[role= match= next= state= paused= active= inflights=]",
-	// space-separated in replica-ID order. It is "not leader" on a replica
-	// that tracks no remotes and "(diagnostics warming up)" before the first
-	// publication. It is for humans; ShardInfo.Replicas carries the same
+	// space-separated in replica-ID order. The leader does not list itself,
+	// so it is "" on a leader with no remotes (a single-replica shard). It is
+	// "not leader" on a replica that is not the leader and
+	// "(diagnostics warming up)" before the first publication. It is for humans; ShardInfo.Replicas carries the same
 	// state structured.
 	Text string `json:"text"`
 }
