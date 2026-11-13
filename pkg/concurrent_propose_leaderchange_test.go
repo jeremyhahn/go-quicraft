@@ -207,25 +207,45 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	for i := range 3 {
 		c.startShard(t, i)
 	}
-	leader := c.waitLeader(t)
-	info, err := leader.ShardInfo(concurrentProposeShard)
-	if err != nil {
-		t.Fatalf("ShardInfo: %v", err)
+	// A proposal through a follower proves it forwards to the leader. The
+	// first leader can still lose its term just after the election; such
+	// a forward fails with a classified error (recorded, a may-commit key
+	// is checked later like any other), and the warm-up re-resolves the
+	// leader and tries again with a fresh key.
+	var (
+		leader   *Host
+		leaderID uint64
+		proposer *Host
+	)
+	for attempt := 0; ; attempt++ {
+		if attempt == 5 {
+			t.Fatal("no proposal through a follower was acknowledged in 5 attempts")
+		}
+		leader = c.waitLeader(t)
+		info, err := leader.ShardInfo(concurrentProposeShard)
+		if err != nil {
+			t.Fatalf("ShardInfo: %v", err)
+		}
+		leaderID = info.ReplicaID
+		follower := leaderID%3 + 1
+		proposer = c.hosts[follower-1]
+		if !waitUntil(10*time.Second, func() bool {
+			info, err := proposer.ShardInfo(concurrentProposeShard)
+			return err == nil && info.LeaderID == leaderID
+		}) {
+			t.Fatalf("replica %d never learned leader %d", follower, leaderID)
+		}
+		key := fmt.Sprintf("acked-%02d", attempt)
+		_, err = proposer.SyncPropose(ctx, concurrentProposeShard, []byte(key))
+		out.record(key, err)
+		if err == nil {
+			break
+		}
+		if !MaybeApplied(err) && !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("SyncPropose(%s) through a follower: %v", key, err)
+		}
+		t.Logf("SyncPropose(%s) through a follower raced a leader change: %v", key, err)
 	}
-	leaderID := info.ReplicaID
-	follower := leaderID%3 + 1
-	proposer := c.hosts[follower-1]
-	if !waitUntil(10*time.Second, func() bool {
-		info, err := proposer.ShardInfo(concurrentProposeShard)
-		return err == nil && info.LeaderID == leaderID
-	}) {
-		t.Fatalf("replica %d never learned leader %d", follower, leaderID)
-	}
-	// A proposal through the follower proves it forwards to the leader.
-	if _, err := proposer.SyncPropose(ctx, concurrentProposeShard, []byte("acked-00")); err != nil {
-		t.Fatalf("SyncPropose(acked-00) through a follower: %v", err)
-	}
-	out.record("acked-00", nil)
 
 	c.closeHost(t, leader)
 	const orphans = 8
