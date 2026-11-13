@@ -316,8 +316,10 @@ func (c *concurrentProposeCluster) restart(t *testing.T) {
 	t.Helper()
 	c.gate.open()
 	// Let the live replicas finish applying what is committed, so a
-	// follower that is merely behind is not read as divergent. A real
-	// divergence never settles and the pre-restart check reports it.
+	// follower that is merely behind holds as much of the workload as it
+	// can before its host closes. This is best effort: a proposal still in
+	// flight can apply on the remaining quorum while the hosts close one at
+	// a time, so replicas are compared only after the restart.
 	waitUntil(10*time.Second, func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -501,14 +503,18 @@ func concurrentProposeDrain(ctx context.Context, t *testing.T, c *concurrentProp
 
 // concurrentProposeCheck asserts each replica applied every key within its
 // class's bound (see proposeOutcomes), the acknowledged barrier exactly once,
-// every other barrier attempt at most once, and nothing else.
+// every other barrier attempt at most once, and nothing else, and that
+// every replica holds the same count for every key.
 // concurrentProposeCheckPreRestart asserts on the counts the workload's own
-// state machines held when restart closed the hosts: every acknowledged key
-// applied exactly once (on a replica closed mid-workload, at most once), no
-// key more than once, no refused key at all, the same count per key on every
-// live replica, and a down replica's counts a subset of theirs. Replay after the restart applies
-// each persisted entry once, so only these counts can show a duplicate apply
-// or a divergence during the concurrent workload.
+// state machines held when restart closed the hosts: no key applied more
+// than once and no refused or unsubmitted key at all. Replay after the
+// restart applies each persisted entry once, so only these counts can show a
+// duplicate apply during the concurrent workload. It does not compare the
+// replicas with each other: restart closes the hosts one at a time, and a
+// MaybeApplied proposal still in flight can commit and apply on the
+// remaining quorum after the first host has stopped, so the saved prefixes
+// may legitimately differ. Whole-state equality is asserted by
+// concurrentProposeCheck, after the restart fence and the final barrier.
 func concurrentProposeCheckPreRestart(t *testing.T, c *concurrentProposeCluster, out *proposeOutcomes) {
 	t.Helper()
 	c.mu.Lock()
@@ -516,23 +522,11 @@ func concurrentProposeCheckPreRestart(t *testing.T, c *concurrentProposeCluster,
 	if len(c.preRestart) != 3 {
 		t.Fatalf("%d replicas' counts were saved before the restart, want 3", len(c.preRestart))
 	}
-	var ref map[string]int
-	var refID uint64
 	for id, applied := range c.preRestart {
 		down := c.preRestartDown[id]
-		if !down && ref == nil {
-			ref, refID = applied, id
-		}
-		for key := range out.acked {
-			// A replica closed mid-workload may stop short of the
-			// entries acknowledged after it; a live one may not.
-			if n := applied[key]; n != 1 && (!down || n > 1) {
-				t.Errorf("before restart replica %d (down=%v) applied acknowledged key %s %d times, want 1", id, down, key, n)
-			}
-		}
 		for key, n := range applied {
 			if n > 1 {
-				t.Errorf("before restart replica %d applied key %s %d times, want at most 1", id, key, n)
+				t.Errorf("before restart replica %d (down=%v) applied key %s %d times, want at most 1", id, down, key, n)
 			}
 			_, acked := out.acked[key]
 			_, maybe := out.maybe[key]
@@ -540,28 +534,6 @@ func concurrentProposeCheckPreRestart(t *testing.T, c *concurrentProposeCluster,
 				t.Errorf("before restart replica %d applied key %s refused before submission (%d times), want 0", id, key, n)
 			} else if !acked && !maybe {
 				t.Errorf("before restart replica %d applied unacknowledged key %s (%d times)", id, key, n)
-			}
-		}
-	}
-	if ref == nil {
-		t.Fatal("no replica was live at the restart")
-	}
-	for id, applied := range c.preRestart {
-		if id == refID {
-			continue
-		}
-		down := c.preRestartDown[id]
-		for key, n := range applied {
-			if ref[key] != n {
-				t.Errorf("before restart replica %d applied key %s %d times, replica %d %d times", id, key, n, refID, ref[key])
-			}
-		}
-		if down {
-			continue
-		}
-		for key, n := range ref {
-			if applied[key] != n {
-				t.Errorf("before restart replica %d applied key %s %d times, replica %d %d times", id, key, applied[key], refID, n)
 			}
 		}
 	}
@@ -605,6 +577,28 @@ func concurrentProposeCheck(t *testing.T, c *concurrentProposeCluster, out *prop
 				continue
 			}
 			t.Errorf("replica %d applied unacknowledged key %s (%d times)", id, key, n)
+		}
+	}
+	// The final barrier is the common applied prefix: after the restart
+	// fence no workload proposal is in flight, and concurrentProposeConverge
+	// has every replica settled at one applied index, so each must hold the
+	// same count for every key.
+	const refID uint64 = 1
+	ref := c.machines[refID].snapshot()
+	for id, m := range c.machines {
+		if id == refID {
+			continue
+		}
+		applied := m.snapshot()
+		for key, n := range applied {
+			if ref[key] != n {
+				t.Errorf("replica %d applied key %s %d times, replica %d %d times", id, key, n, refID, ref[key])
+			}
+		}
+		for key, n := range ref {
+			if _, ok := applied[key]; !ok {
+				t.Errorf("replica %d applied key %s 0 times, replica %d %d times", id, key, refID, n)
+			}
 		}
 	}
 }
