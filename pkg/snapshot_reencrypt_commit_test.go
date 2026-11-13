@@ -191,6 +191,16 @@ func (c closeFailFS) OpenFile(name string, flag int, perm fs.FileMode) (snapshot
 	return closeFailFile{snapshotFile: f, err: c.err}, nil
 }
 
+// CreateTemp fails the Close of a temp file whose name matches, which is how
+// the restamp writes the record it renames over snapshot.meta.
+func (c closeFailFS) CreateTemp(dir, pattern string) (snapshotFile, error) {
+	f, err := c.crashFS.CreateTemp(dir, pattern)
+	if err != nil || !strings.Contains(f.Name(), c.match) {
+		return f, err
+	}
+	return closeFailFile{snapshotFile: f, err: c.err}, nil
+}
+
 type closeFailFile struct {
 	snapshotFile
 	err error

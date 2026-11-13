@@ -246,6 +246,18 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	if err != nil {
 		return 0, err
 	}
+	// A destination that already holds a snapshot.dat is a published pair
+	// (or half of one). Replacing it would rename new data over the old
+	// entry and restamp snapshot.meta beside it in two separate durable
+	// steps, and a crash between them could bring the old snapshot.dat back
+	// with the new record: recovery would then refuse a snapshot that was
+	// valid. Refuse before anything is copied; the deferred cleanup removes
+	// the temp.
+	if srcMeta.present {
+		if _, statErr := fsys.Stat(dstPath); statErr == nil {
+			return 0, fmt.Errorf("re-encrypt snapshot: destination %s already exists: %w", dstPath, fs.ErrExist)
+		}
+	}
 	srcReader, verifySrc := teeSourceVerifier(srcPath, srcMeta, src)
 
 	epoch, dstPins, err = copySnapshotAcrossBarriers(srcReader, tmp, shardID, replicaID, index,
@@ -435,7 +447,57 @@ func restampReencryptedSnapshotMeta(fsys snapshotFS, dstPath string, srcMeta ree
 		// guards a caller that skipped it.
 		return srcMeta.err
 	}
+	// Hash the destination AS STORED, so the record describes the bytes
+	// every later consumer reads.
+	dataFile, err := fsys.Open(dstPath)
+	if err != nil {
+		return err
+	}
+	dataHash, dataLen, hashErr := engine.HashSnapshotReader(dataFile)
+	// A read-only handle's Close error cannot indicate lost data.
+	_ = dataFile.Close()
+	if hashErr != nil {
+		return hashErr
+	}
 	meta := srcMeta.meta
-	return writeReceivedSnapshotMetadata(fsys, filepath.Dir(dstPath), meta.Index, meta.Term,
-		meta.ShardID, meta.ReplicaID, epoch, meta.Compression)
+	buf := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index:       meta.Index,
+		Term:        meta.Term,
+		ShardID:     meta.ShardID,
+		ReplicaID:   meta.ReplicaID,
+		Epoch:       epoch,
+		Compression: meta.Compression,
+		DataLen:     dataLen,
+		DataHash:    dataHash,
+	})
+
+	// The destination directory is not an unpublished staging directory: a
+	// snapshot.meta may already sit beside dstPath (the runbook copies the
+	// source's). Truncating it in place would leave a torn or empty record
+	// after a crash mid-write, so the new record goes to a temp file in the
+	// same directory and is renamed over snapshot.meta: a crash leaves the
+	// old record or the new one, whole. The caller's directory fsync makes
+	// the rename durable.
+	dir := filepath.Dir(dstPath)
+	tmp, err := fsys.CreateTemp(dir, "snapshot.meta.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	_, writeErr := tmp.Write(buf)
+	if writeErr == nil {
+		writeErr = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr == nil {
+		writeErr = fsys.Rename(tmpPath, filepath.Join(dir, "snapshot.meta"))
+	}
+	if writeErr != nil {
+		_ = fsys.Remove(tmpPath)
+		return writeErr
+	}
+	return nil
 }

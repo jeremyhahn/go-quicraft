@@ -130,6 +130,13 @@ epoch, err := quicraft.ReencryptSnapshotFile(srcPath, dstPath,
 Both barriers must be unsealed. A nil barrier means that side is plaintext; a
 sealed one is not plaintext and fails the call.
 
+When the source has a `snapshot.meta` beside it, `dstPath` must not exist yet.
+A destination that already holds a `snapshot.dat` is refused with an error that
+names it and matches `fs.ErrExist`, before anything is written: re-key into a
+fresh directory. A `snapshot.meta` already in that directory (a copy of the
+source's) is fine; it is replaced whole, by rename, with one that describes the
+re-encrypted data.
+
 `shardID`, `replicaID` and `index` must be the identity the snapshot was sealed
 under. They are part of what each frame authenticates, and there is no weaker
 fallback.
