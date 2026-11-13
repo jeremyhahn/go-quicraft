@@ -1921,22 +1921,6 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		matched = entries[:len(results)]
 	}
 
-	// Publish the applied index before the ordinary path below completes
-	// any proposal (#1104). A caller whose SyncPropose has returned must
-	// find its entry covered by this replica's applied index: a
-	// FollowerRead or a ReadIndex issued right after the acknowledgement
-	// waits for lastApplied to reach the index it learned, and an
-	// acknowledgement that outruns the store lets a read observe the
-	// pre-write state. The entries are already in the state machine, so
-	// the early store is never ahead of it. completeAppliedReads stores
-	// the same value again under pendingReadsMu before its scan, which
-	// keeps that scan's ordering with OnReadyToRead intact. A
-	// membership-changing batch completes its proposals after that call,
-	// so it needs no early store.
-	if !hasMembershipChange && len(entries) > 0 {
-		ns.lastApplied.Store(entries[len(entries)-1].Index)
-	}
-
 	// Claim every pending proposal in this batch — LoadAndDelete it out of
 	// ns.pendingProposals — before anything else in this function, including
 	// the pending-reads scan below and (for a membership-changing batch)
@@ -1955,18 +1939,30 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// first, before any other work at all, closes both. Only the actual
 	// completion (rs.complete, inside completeProposal) is deferred until
 	// after routing, so ns.configChangeIndex reflects this batch before a
-	// woken caller can round-trip its ConfigChangeID (see below) — and only for a
-	// membership-changing batch, which is the only case that has routing to
-	// defer it past.
+	// woken caller can round-trip its ConfigChangeID (see below).
+	//
+	// Every batch, not only a membership-changing one, also defers
+	// completion until after the pending-reads scan has stored
+	// ns.lastApplied (#1104). A caller whose proposal has completed must
+	// find its entry covered by this replica's applied index: a
+	// FollowerRead or ReadIndex issued right after the acknowledgement
+	// waits for lastApplied to reach the index it learned, and an
+	// acknowledgement that outruns the store lets that read observe the
+	// pre-write state. The store stays inside the scan, under
+	// pendingReadsMu, rather than ahead of the claim: a reader that sees
+	// the new lastApplied may then take pendingReadsMu itself, and an
+	// early store would let it do so before this batch's scan, stalling
+	// the apply worker behind it.
+	//
+	// claimed records an index into matched, not a copy of the entry, and
+	// starts on a stack buffer, so the ordinary path stays allocation-free
+	// for the common small batch.
 	type claimedProposal struct {
-		entry  proto.Entry
-		result sm.Result
-		pp     *pendingProposal
+		i  int
+		pp *pendingProposal
 	}
-	var claimed []claimedProposal
-	if hasMembershipChange {
-		claimed = make([]claimedProposal, 0, len(matched))
-	}
+	var claimedBuf [32]claimedProposal
+	claimed := claimedBuf[:0]
 	for i, entry := range matched {
 		// Match by entry.Key (the proposal tracking key set by
 		// Host.Propose) rather than entry.Index (assigned by the raft
@@ -1999,19 +1995,10 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			// here; that site completed the caller.
 			continue
 		}
-		if hasMembershipChange {
-			// Staged for completion after routing below — see the
-			// claiming comment above for why. Confined to this branch so
-			// the ordinary path (the ELSE below) never pays for the
-			// staging allocation.
-			claimed = append(claimed, claimedProposal{entry: entry, result: results[i], pp: pp})
-		} else {
-			// Ordinary path (no config change in this batch, the
-			// overwhelming majority of apply traffic — regular client
-			// proposals and follower replication): there is no routing
-			// work to order around, so complete immediately.
-			completeProposal(c.h, shardID, entry, pp, results[i])
-		}
+		// Staged for completion after the reads scan (and, for a
+		// membership-changing batch, routing) below — see the claiming
+		// comment above for why.
+		claimed = append(claimed, claimedProposal{i: i, pp: pp})
 	}
 
 	// Everything below — the pending-reads scan, applyMembershipRouting, and
@@ -2030,11 +2017,10 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 	// whole region means the next user-callback panic this function grows
 	// is covered without a bespoke guard of its own.
 	//
-	// This is harmless for a batch with no membership change: claimed is
-	// nil there (proposals were already claimed AND completed together, in
-	// the loop above, before this closure even starts), so the recover
-	// handler's range over claimed is a no-op and a panic in the reads
-	// scan reaches the apply worker's own recover and fails the shard.
+	// This covers a batch with no membership change too: its proposals are
+	// claimed above but completed only after the reads scan, so a panic in
+	// that scan completes them here, as maybe-applied, before it reaches the
+	// apply worker's own recover and fails the shard.
 	func() {
 		// completedClaims counts how many of claimed[0:] the normal
 		// completeProposal loop below has already finished — see the
@@ -2200,12 +2186,12 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 			// this batch has already been claimed, so that recovery path
 			// finds nothing left in pendingProposals to fail.
 			c.applyMembershipRouting(ns, shardID, entries)
+		}
 
-			for i, cp := range claimed {
-				createdAt := deliverProposal(c.h, shardID, cp.entry, cp.pp, cp.result)
-				completedClaims = i + 1
-				observeProposalLatency(c.h, shardID, createdAt)
-			}
+		for i, cp := range claimed {
+			createdAt := deliverProposal(c.h, shardID, matched[cp.i], cp.pp, results[cp.i])
+			completedClaims = i + 1
+			observeProposalLatency(c.h, shardID, createdAt)
 		}
 		normalReturn = true
 	}()
