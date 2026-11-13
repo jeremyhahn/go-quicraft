@@ -18,6 +18,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
@@ -525,6 +526,76 @@ func TestDiskMonitorRecoveryCallback(t *testing.T) {
 	}
 	if recoveryMax != 1000 {
 		t.Errorf("recovery maxBytes = %d, want 1000", recoveryMax)
+	}
+}
+
+// TestDiskMonitorConcurrentRecoveryAfterStaleFullSample pins that a full
+// sample taken before a recovery cannot publish its state after it: caller A
+// samples full and stalls inside onFull, caller B samples below the threshold,
+// and once both return the monitor and the flag its callbacks drive both say
+// not full.
+func TestDiskMonitorConcurrentRecoveryAfterStaleFullSample(t *testing.T) {
+	var calls atomic.Uint64
+	usage := func(string) (uint64, error) {
+		if calls.Add(1) == 1 {
+			return 950, nil
+		}
+		return 100, nil
+	}
+
+	var full atomic.Bool
+	inFull := make(chan struct{})
+	release := make(chan struct{})
+	dm := NewDiskMonitor("/tmp/test-wal", 1000,
+		WithCheckEvery(1),
+		WithFullPercent(0.90),
+		WithOnFull(func(_, _ uint64) {
+			close(inFull)
+			<-release
+			full.Store(true)
+		}),
+		WithOnRecovery(func(_, _ uint64) {
+			full.Store(false)
+		}),
+		WithDiskUsageFunc(usage),
+	)
+
+	aErr := make(chan error, 1)
+	go func() { aErr <- dm.MaybeCheck() }()
+	select {
+	case <-inFull:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("caller A never reached onFull")
+	}
+
+	bErr := make(chan error, 1)
+	go func() { bErr <- dm.MaybeCheck() }()
+	// B may finish now (no serialization) or block behind A (serialized);
+	// either way give it a bounded window before releasing A.
+	var bDone bool
+	var errB error
+	select {
+	case errB = <-bErr:
+		bDone = true
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+
+	if errA := <-aErr; !errors.Is(errA, ErrDiskFull) {
+		t.Fatalf("caller A: got %v, want ErrDiskFull", errA)
+	}
+	if !bDone {
+		errB = <-bErr
+	}
+	if errB != nil {
+		t.Fatalf("caller B: got %v, want nil", errB)
+	}
+	if dm.lastFull.Load() {
+		t.Error("monitor still full after a later sample below the threshold")
+	}
+	if full.Load() {
+		t.Error("flag driven by onFull/onRecovery still full after a later recovery")
 	}
 }
 
