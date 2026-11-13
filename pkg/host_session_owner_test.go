@@ -35,6 +35,9 @@ func requireOwnerCapRefusal(t *testing.T, what string, s *Session, err error) {
 	if !errors.As(err, &se) {
 		t.Fatalf("%s: err = %v (%T), want a *SessionError", what, err, err)
 	}
+	if se.Op != "register" {
+		t.Fatalf("%s: SessionError.Op = %q, want \"register\"", what, se.Op)
+	}
 	if !errors.Is(err, ErrInvalidOperation) {
 		t.Fatalf("%s: err = %v, want it to wrap ErrInvalidOperation", what, err)
 	}
