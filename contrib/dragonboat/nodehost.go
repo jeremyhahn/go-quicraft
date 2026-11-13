@@ -138,6 +138,13 @@ type removedKey struct {
 // quicraft extension that opts into a bound.
 const defaultQueryTimeout time.Duration = 0
 
+// maxDetachedLookups bounds the timed local lookups (see SetQueryTimeout)
+// in flight on one NodeHost. A lookup holds its slot until the state
+// machine's Lookup or NALookup actually returns, so lookups that outlive
+// their deadline cannot accumulate without limit; a timed read that finds
+// every slot taken is refused with ErrSystemBusy.
+const maxDetachedLookups = 64
+
 // defaultWaitReadyTimeout bounds the Start*Replica readiness wait used
 // when Config.WaitReady is set. Dragonboat blocks on the node's
 // initializedC until the node is initialized or stopped; the adapter

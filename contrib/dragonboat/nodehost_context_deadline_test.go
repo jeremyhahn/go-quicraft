@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 )
 
 // deadlineCall is one NodeHost Sync call that takes a context, run
@@ -116,5 +118,145 @@ func TestNodeHost_SyncCallsContextDeadline(t *testing.T) {
 	defer cancel()
 	if _, err := nh.SyncPropose(ctx, nh.GetNoOPSession(1), []byte("after")); err != nil {
 		t.Errorf("SyncPropose with a valid deadline = %v, want nil", err)
+	}
+}
+
+// detachedLookupSM is a state machine whose Lookup and NALookup panic with
+// panicWith when it is set, and otherwise wait for release to close and
+// then record the query bytes they see on seen (without blocking).
+type detachedLookupSM struct {
+	testStateMachine
+	panicWith interface{}
+	release   chan struct{}
+	seen      chan string
+}
+
+func (sm *detachedLookupSM) record(b []byte) {
+	select {
+	case sm.seen <- string(b):
+	default:
+	}
+}
+
+func (sm *detachedLookupSM) Lookup(query interface{}) (interface{}, error) {
+	if sm.panicWith != nil {
+		panic(sm.panicWith)
+	}
+	<-sm.release
+	b, _ := query.([]byte)
+	sm.record(b)
+	return nil, nil
+}
+
+func (sm *detachedLookupSM) NALookup(key []byte) ([]byte, error) {
+	if sm.panicWith != nil {
+		panic(sm.panicWith)
+	}
+	<-sm.release
+	sm.record(key)
+	return nil, nil
+}
+
+func startDetachedLookupShard(t *testing.T, sm *detachedLookupSM, timeout time.Duration) *NodeHost {
+	t.Helper()
+	nh := newTestNodeHost(t)
+	startTestShardWith(t, nh, 1, 1, func(_, _ uint64) dbSM.IStateMachine { return sm })
+	nh.SetQueryTimeout(timeout)
+	return nh
+}
+
+// A Lookup panic under a positive QueryTimeout reaches the caller's
+// goroutine, where the caller's recover can contain it, instead of
+// terminating the process from the worker goroutine.
+func TestNodeHost_SyncCallsContextDeadline_LookupPanicReachesCaller(t *testing.T) {
+	for _, na := range []bool{false, true} {
+		t.Run(fmt.Sprintf("na=%v", na), func(t *testing.T) {
+			sm := &detachedLookupSM{panicWith: "lookup boom"}
+			nh := startDetachedLookupShard(t, sm, 5*time.Second)
+			rs := completedReadIndex(t, nh, 1)
+			got := func() (p interface{}) {
+				defer func() { p = recover() }()
+				if na {
+					_, _ = nh.NAReadLocalNode(rs, []byte("k"))
+				} else {
+					_, _ = nh.ReadLocalNode(rs, []byte("k"))
+				}
+				return nil
+			}()
+			if got != "lookup boom" {
+				t.Fatalf("recovered %v, want the Lookup panic value", got)
+			}
+		})
+	}
+}
+
+// After ErrTimeout the caller may reuse its query buffer: the lookup that
+// outlives the deadline still sees the bytes the caller passed.
+func TestNodeHost_SyncCallsContextDeadline_TimedOutQueryOwnsItsBuffer(t *testing.T) {
+	for _, na := range []bool{false, true} {
+		t.Run(fmt.Sprintf("na=%v", na), func(t *testing.T) {
+			sm := &detachedLookupSM{release: make(chan struct{}), seen: make(chan string, 1)}
+			nh := startDetachedLookupShard(t, sm, 50*time.Millisecond)
+			rs := completedReadIndex(t, nh, 1)
+			buf := []byte("original")
+			var err error
+			if na {
+				_, err = nh.NAReadLocalNode(rs, buf)
+			} else {
+				_, err = nh.ReadLocalNode(rs, buf)
+			}
+			if !errors.Is(err, ErrTimeout) {
+				close(sm.release)
+				t.Fatalf("blocked lookup: err = %v, want ErrTimeout", err)
+			}
+			copy(buf, "reused!!")
+			close(sm.release)
+			select {
+			case s := <-sm.seen:
+				if s != "original" {
+					t.Fatalf("delayed lookup saw %q, want %q", s, "original")
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("delayed lookup did not finish within 5s")
+			}
+		})
+	}
+}
+
+// Lookups that outlive their deadline hold capacity until they return:
+// once maxDetachedLookups are in flight a timed read is refused with
+// ErrSystemBusy, and capacity comes back when the lookups exit.
+func TestNodeHost_SyncCallsContextDeadline_DetachedLookupsAreBounded(t *testing.T) {
+	sm := &detachedLookupSM{release: make(chan struct{})}
+	nh := startDetachedLookupShard(t, sm, 10*time.Millisecond)
+	released := false
+	defer func() {
+		if !released {
+			close(sm.release)
+		}
+	}()
+	for i := 0; i < maxDetachedLookups; i++ {
+		if _, err := nh.ReadLocalNode(completedReadIndex(t, nh, 1), nil); !errors.Is(err, ErrTimeout) {
+			t.Fatalf("lookup %d: err = %v, want ErrTimeout", i, err)
+		}
+	}
+	if _, err := nh.ReadLocalNode(completedReadIndex(t, nh, 1), nil); !errors.Is(err, ErrSystemBusy) {
+		t.Fatalf("lookup past the bound: err = %v, want ErrSystemBusy", err)
+	}
+	close(sm.release)
+	released = true
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := nh.ReadLocalNode(completedReadIndex(t, nh, 1), nil)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrSystemBusy) && !errors.Is(err, ErrTimeout) {
+			t.Fatalf("lookup after release: err = %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("capacity not returned within 5s: err = %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
