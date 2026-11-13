@@ -591,7 +591,7 @@ func TestDiskMonitorConcurrentRecoveryAfterStaleFullSample(t *testing.T) {
 	if errB != nil {
 		t.Fatalf("caller B: got %v, want nil", errB)
 	}
-	if dm.lastFull.Load() {
+	if dm.Full() {
 		t.Error("monitor still full after a later sample below the threshold")
 	}
 	if full.Load() {
