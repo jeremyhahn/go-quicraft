@@ -16,6 +16,7 @@ package quicraft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -58,7 +59,13 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 		t.Fatalf("ShardInfo: %v", err)
 	}
 	leaderID := info.ReplicaID
-	target := leaderID%3 + 1
+	// The gate sits on a FOLLOWER, which also proposes the held keys, and
+	// leadership moves between the other two replicas. A leader whose apply
+	// is held never gets its TimeoutNow to the target: the transfer times out
+	// and the held calls only return at the test's deadline.
+	follower := leaderID%3 + 1
+	target := follower%3 + 1
+	proposer := c.hosts[follower-1]
 
 	for i := range 4 {
 		key := fmt.Sprintf("acked-%02d", i)
@@ -68,24 +75,22 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 		}
 	}
 
-	type outcome struct {
-		key string
-		err error
-	}
 	const held = 8
-	results := make(chan outcome, held+1)
+	heldCtx, cancelHeld := context.WithCancel(ctx)
+	defer cancelHeld()
+	results := make(chan concurrentProposeResult, held+1)
 	propose := func(key string) {
 		go func() {
-			_, err := leader.SyncPropose(ctx, concurrentProposeShard, []byte(key))
-			results <- outcome{key, err}
+			_, err := proposer.SyncPropose(heldCtx, concurrentProposeShard, []byte(key))
+			results <- concurrentProposeResult{key, err}
 		}()
 	}
-	c.gate.arm(leaderID)
+	c.gate.arm(follower)
 	propose(concurrentProposeGateKey)
 	select {
 	case <-c.gate.reached:
 	case <-ctx.Done():
-		t.Fatal("the leader never reached the gated apply")
+		t.Fatalf("replica %d never reached the gated apply", follower)
 	}
 	heldKeys := []string{concurrentProposeGateKey}
 	for i := range held {
@@ -94,24 +99,29 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 		propose(key)
 	}
 	if !waitUntil(20*time.Second, func() bool {
-		applied := c.machine(target).snapshot()
-		for _, key := range heldKeys {
-			if applied[key] != 1 {
-				return false
+		for _, id := range []uint64{leaderID, target} {
+			applied := c.machine(id).snapshot()
+			for _, key := range heldKeys {
+				if applied[key] != 1 {
+					return false
+				}
 			}
 		}
 		return true
 	}) {
-		t.Fatalf("replica %d never applied the proposals held at leader %d", target, leaderID)
+		t.Fatalf("replicas %d and %d never applied the proposals held at replica %d", leaderID, target, follower)
 	}
-	if err := leader.RequestLeaderTransfer(ctx, concurrentProposeShard, target); err != nil {
-		t.Fatalf("RequestLeaderTransfer(%d -> %d): %v", leaderID, target, err)
-	}
+	concurrentProposeTransfer(ctx, t, leader, c.hosts[target-1], target)
+	// Every held key is committed, but the proposer's apply is still held:
+	// its callers can only learn that the outcome is unknown.
+	cancelHeld()
 	for range heldKeys {
 		select {
 		case r := <-results:
 			if out.record(r.key, r.err) {
 				t.Errorf("held proposal %s refused before submission (%v), want MaybeApplied", r.key, r.err)
+			} else if !MaybeApplied(r.err) {
+				t.Errorf("held proposal %s = %v, want MaybeApplied", r.key, r.err)
 			}
 		case <-ctx.Done():
 			t.Fatal("a proposal held at the gate never returned after the leader transfer")
@@ -140,5 +150,32 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	}
 	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
 		t.Fatalf("replica state hashes differ at index %d: %v", at, hashes)
+	}
+}
+
+// concurrentProposeResult is one SyncPropose call's key and outcome.
+type concurrentProposeResult struct {
+	key string
+	err error
+}
+
+// concurrentProposeTransfer moves leadership from `from` to replica target
+// (hosted by to), retrying a transfer that times out, until ctx ends.
+func concurrentProposeTransfer(ctx context.Context, t *testing.T, from, to *Host, target uint64) {
+	t.Helper()
+	for {
+		err := from.RequestLeaderTransfer(ctx, concurrentProposeShard, target)
+		if err != nil && !errors.Is(err, ErrTransferInProgress) {
+			t.Fatalf("RequestLeaderTransfer(-> %d): %v", target, err)
+		}
+		if waitUntil(5*time.Second, func() bool {
+			info, err := to.ShardInfo(concurrentProposeShard)
+			return err == nil && info.IsLeader
+		}) {
+			return
+		}
+		if ctx.Err() != nil {
+			t.Fatalf("replica %d never took leadership: %v", target, ctx.Err())
+		}
 	}
 }
