@@ -161,6 +161,9 @@ type concurrentAdapter struct {
 // Update converts quicraft entries to dragonboat entries, delegates to
 // the inner IConcurrentStateMachine.Update, then copies the in-place
 // Entry.Result values back to the pre-allocated quicraft results slice.
+// The inner Update reports one error for the whole batch without naming
+// the entry that failed, so its AdapterUpdateError carries Index 0, not
+// a Raft log index.
 func (a *concurrentAdapter) Update(_ context.Context, entries []qcSM.Entry, results []qcSM.Result) error {
 	dbEntries := make([]Entry, len(entries))
 	for i := range entries {
@@ -270,7 +273,9 @@ func (a *diskAdapter) Open(_ context.Context, _ string, stopper <-chan struct{})
 
 // Update converts quicraft entries to dragonboat entries, delegates to
 // the inner IOnDiskStateMachine.Update, then copies Entry.Result values
-// back to the quicraft results slice.
+// back to the quicraft results slice. The inner Update reports one error
+// for the whole batch without naming the entry that failed, so its
+// AdapterUpdateError carries Index 0, not a Raft log index.
 func (a *diskAdapter) Update(_ context.Context, entries []qcSM.Entry, results []qcSM.Result) error {
 	dbEntries := make([]Entry, len(entries))
 	for i := range entries {
