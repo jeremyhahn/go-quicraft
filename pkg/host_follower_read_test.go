@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -247,6 +248,32 @@ func (c *followerReadCluster) read(i int, key string) (string, error) {
 	return string(b), nil
 }
 
+// diag describes the replicas' commit and apply state after a failed read on
+// replica i of a put acknowledged by replica li at index, and retries the
+// read once after 100ms. Temporary diagnostic for #1104.
+func (c *followerReadCluster) diag(i, li int, index uint64, key string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "ack leader %d index %d;", li+1, index)
+	for j, h := range c.hosts {
+		var applied uint64
+		if ns, err := h.getNode(followerReadShard); err == nil {
+			applied = ns.lastApplied.Load()
+		}
+		lead := false
+		if info, err := h.ShardInfo(followerReadShard); err == nil {
+			lead = info.IsLeader
+		}
+		fmt.Fprintf(&b, " r%d commit=%d applied=%d leader=%v;", j+1, c.committed(j), applied, lead)
+	}
+	time.Sleep(100 * time.Millisecond)
+	got, err := c.read(i, key)
+	fmt.Fprintf(&b, " retry after 100ms = (%q, %v);", got, err)
+	for j := range c.hosts {
+		fmt.Fprintf(&b, " r%d commit=%d;", j+1, c.committed(j))
+	}
+	return b.String()
+}
+
 // TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead
 // checks the documented FollowerRead contract on a running three-replica
 // shard: on a follower and on the leader the result reflects every write
@@ -269,7 +296,7 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 				}
 				got, err := c.read(i, key)
 				if err != nil {
-					t.Fatalf("put %d: FollowerRead on replica %d: %v", n, i+1, err)
+					t.Fatalf("put %d: FollowerRead on replica %d: %v [%s]", n, i+1, err, c.diag(i, li, index, key))
 				}
 				if got != want {
 					t.Fatalf("put %d: FollowerRead on replica %d = %q, want %q (commit index %d known)",
@@ -288,11 +315,20 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 		var (
 			mu   sync.Mutex
 			last acked
+			// unresolved holds the values of writes whose SyncPropose
+			// failed, keyed to the error.
+			unresolved = make(map[int]error)
 		)
 		snapshot := func() acked {
 			mu.Lock()
 			defer mu.Unlock()
 			return last
+		}
+		isUnresolved := func(v int) (error, bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			err, ok := unresolved[v]
+			return err, ok
 		}
 
 		li, _ := c.put(t, "followers", "1")
@@ -317,12 +353,20 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 					return
 				default:
 				}
-				if _, index, err := c.tryPut(key, strconv.Itoa(v)); err == nil {
-					mu.Lock()
+				// Every attempt writes a fresh value. A failed attempt has an
+				// unknown outcome: its entry may still commit, after later
+				// acknowledged writes, so its value is recorded as one a
+				// read may legitimately return out of order.
+				_, index, err := c.tryPut(key, strconv.Itoa(v))
+				mu.Lock()
+				if err == nil {
 					last = acked{value: v, index: index}
-					mu.Unlock()
-					v++
 				} else {
+					unresolved[v] = err
+				}
+				mu.Unlock()
+				v++
+				if err != nil {
 					time.Sleep(time.Millisecond)
 				}
 			}
@@ -363,6 +407,12 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 						fail("FollowerRead = %q, not a written value", got)
 						continue
 					}
+					if _, late := isUnresolved(v); late {
+						// A failed write landing after later ones; its
+						// order against them is not defined.
+						reads[r]++
+						continue
+					}
 					if v < snap.value {
 						fail("FollowerRead = %d, older than %d acknowledged at commit index %d before the read",
 							v, snap.value, snap.index)
@@ -393,7 +443,10 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 		if !enough {
 			t.Errorf("the writer acknowledged only %d writes in 30s", snapshot().value)
 		}
-		t.Logf("%d writes acknowledged; checked reads per follower %v", snapshot().value, reads)
+		mu.Lock()
+		t.Logf("%d writes acknowledged; checked reads per follower %v; failed writes %v",
+			last.value, reads, unresolved)
+		mu.Unlock()
 	})
 
 	t.Run("a read on a follower whose apply lags its known commit waits and returns the new value", func(t *testing.T) {
