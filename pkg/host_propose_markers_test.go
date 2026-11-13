@@ -160,6 +160,23 @@ func TestSyncPropose_AcknowledgedEntryIsCoveredByLeaderMarkers(t *testing.T) {
 		t.Fatalf("only %d of %d writes acknowledged in 60s", acked, writes)
 	}
 
+	// The probe runs after the caller is completed (observeProposalLatency
+	// follows deliverProposal), so the last acknowledgement can return to
+	// SyncPropose before its probe has recorded it: wait for every
+	// acknowledgement to be observed before counting.
+	observedTotal := func() int {
+		n := 0
+		for _, p := range probes {
+			p.mu.Lock()
+			n += p.observed
+			p.mu.Unlock()
+		}
+		return n
+	}
+	for wait := time.Now().Add(5 * time.Second); observedTotal() < writes && time.Now().Before(wait); {
+		time.Sleep(time.Millisecond)
+	}
+
 	observed := 0
 	for i, p := range probes {
 		p.mu.Lock()
