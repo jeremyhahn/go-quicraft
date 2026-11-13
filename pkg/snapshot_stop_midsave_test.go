@@ -193,12 +193,41 @@ func (f *midSaveFixture) openHost(t *testing.T) *Host {
 	return h
 }
 
-func (f *midSaveFixture) startShard(t *testing.T, h *Host) {
+func (f *midSaveFixture) startShard(ctx context.Context, t *testing.T, h *Host) {
 	t.Helper()
 	create := func(_, _ uint64) interface{} { return &midSaveSM{gate: f.gate} }
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
 		create, testShardConfig(1, 1)); err != nil {
 		t.Fatalf("StartShard: %v", err)
+	}
+	f.awaitLeader(ctx, t, h)
+}
+
+// awaitLeader waits, bounded by midSaveStep and ctx, until the host's
+// leadership view reports this replica as leader of shard 1. The view is
+// updated asynchronously by the engine's event dispatcher, so the raft peer
+// may already serve a ReadIndex while Propose's pre-flight check still sees
+// no leader; waiting on ShardInfo makes the first proposal admissible.
+func (f *midSaveFixture) awaitLeader(ctx context.Context, t *testing.T, h *Host) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(ctx, midSaveStep)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		info, err := h.ShardInfo(1)
+		if err == nil && info.IsLeader {
+			return
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			t.Fatalf("shard 1 did not report a local leader within %v (last ShardInfo error: %v)",
+				midSaveStep, lastErr)
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -226,17 +255,34 @@ func (f *midSaveFixture) readState(t *testing.T, h *Host) midSaveState {
 	return midSaveState{}
 }
 
-func (f *midSaveFixture) propose(t *testing.T, h *Host, n int) {
+func (f *midSaveFixture) propose(ctx context.Context, t *testing.T, h *Host, n int) {
 	t.Helper()
 	for i := range n {
 		cmd := []byte(fmt.Sprintf("entry-%d", f.expected.count))
-		ctx, cancel := context.WithTimeout(context.Background(), midSaveStep)
-		_, err := h.SyncPropose(ctx, 1, cmd)
-		cancel()
-		if err != nil {
+		if err := f.proposeOne(ctx, h, cmd); err != nil {
 			t.Fatalf("SyncPropose #%d: %v", i, err)
 		}
 		f.expected = f.expected.apply(cmd)
+	}
+}
+
+// proposeOne submits cmd, retrying only a NotLeaderError that is not
+// MaybeApplied until midSaveStep elapses. That error is a refusal before
+// admission, so a retry cannot apply the command twice. Any other error, including a timeout (the proposal may
+// have committed), is returned at once; on the deadline the last error is.
+func (f *midSaveFixture) proposeOne(ctx context.Context, h *Host, cmd []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, midSaveStep)
+	defer cancel()
+	for {
+		_, err := h.SyncPropose(ctx, 1, cmd)
+		if err == nil || !errors.Is(err, ErrNotLeader) || MaybeApplied(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
@@ -378,7 +424,7 @@ func (f *midSaveFixture) assertRestartedCleanly(t *testing.T, h *Host) {
 		t.Fatalf("restarted state = (count %d, hash %x), want (count %d, hash %x)",
 			got.count, got.sum, f.expected.count, f.expected.sum)
 	}
-	f.propose(t, h, 2)
+	f.propose(context.Background(), t, h, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), midSaveStep)
 	defer cancel()
 	if _, err := h.SyncRequestSnapshot(ctx, 1, SnapshotOption{}); err != nil {
@@ -398,9 +444,9 @@ func TestMidSave_StopShardLeavesNoPartialSnapshot(t *testing.T) {
 	f := newMidSaveFixture(t)
 	h := f.openHost(t)
 	defer f.closeHost(t, h)
-	f.startShard(t, h)
+	f.startShard(context.Background(), t, h)
 	f.readState(t, h)
-	f.propose(t, h, 5)
+	f.propose(context.Background(), t, h, 5)
 
 	rs := f.beginBlockedSave(t, h)
 	if err := f.stopDuringSave(t, "StopShard", func() error { return h.StopShard(1) }); err != nil {
@@ -409,7 +455,7 @@ func TestMidSave_StopShardLeavesNoPartialSnapshot(t *testing.T) {
 	awaitRequestEnd(t, rs)
 	awaitNoPartialSnapshot(t, f.cfg.NodeHostDir, 5*time.Second)
 
-	f.startShard(t, h)
+	f.startShard(context.Background(), t, h)
 	f.assertRestartedCleanly(t, h)
 }
 
@@ -422,9 +468,9 @@ func TestMidSave_HostCloseLeavesNoPartialSnapshot(t *testing.T) {
 	// Bounds h's cleanup if a step fails before or during the Close under
 	// test; on success this second Close returns at once.
 	defer f.closeHost(t, h)
-	f.startShard(t, h)
+	f.startShard(context.Background(), t, h)
 	f.readState(t, h)
-	f.propose(t, h, 5)
+	f.propose(context.Background(), t, h, 5)
 
 	rs := f.beginBlockedSave(t, h)
 	if err := f.stopDuringSave(t, "Host.Close", h.Close); err != nil {
@@ -437,6 +483,6 @@ func TestMidSave_HostCloseLeavesNoPartialSnapshot(t *testing.T) {
 
 	h2 := f.openHost(t)
 	defer f.closeHost(t, h2)
-	f.startShard(t, h2)
+	f.startShard(context.Background(), t, h2)
 	f.assertRestartedCleanly(t, h2)
 }
