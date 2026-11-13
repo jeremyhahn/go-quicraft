@@ -16,6 +16,7 @@ package waldb
 
 import (
 	"errors"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -596,6 +597,53 @@ func TestDiskMonitorConcurrentRecoveryAfterStaleFullSample(t *testing.T) {
 	}
 	if full.Load() {
 		t.Error("flag driven by onFull/onRecovery still full after a later recovery")
+	}
+}
+
+// TestDiskMonitorOnFullCallbackMayForceCheck pins finding 2 of the #911
+// round 2 review: a WithOnFull callback that frees space and calls
+// ForceCheck to verify recovery must not deadlock on the monitor's mutex,
+// and the recovery it causes is delivered after the full callback returns.
+func TestDiskMonitorOnFullCallbackMayForceCheck(t *testing.T) {
+	var usage atomic.Uint64
+	usage.Store(950)
+	var events []string
+	var dm *DiskMonitor
+	innerErr := make(chan error, 1)
+	dm = NewDiskMonitor("/tmp/test-wal", 1000,
+		WithCheckEvery(1),
+		WithFullPercent(0.90),
+		WithOnFull(func(_, _ uint64) {
+			events = append(events, "full")
+			usage.Store(100)
+			innerErr <- dm.ForceCheck()
+			events = append(events, "full-returned")
+		}),
+		WithOnRecovery(func(_, _ uint64) {
+			events = append(events, "recovery")
+		}),
+		WithDiskUsageFunc(func(string) (uint64, error) { return usage.Load(), nil }),
+	)
+
+	outerErr := make(chan error, 1)
+	go func() { outerErr <- dm.ForceCheck() }()
+	select {
+	case err := <-outerErr:
+		if !errors.Is(err, ErrDiskFull) {
+			t.Fatalf("outer ForceCheck: got %v, want ErrDiskFull", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ForceCheck from inside WithOnFull deadlocked on the monitor mutex")
+	}
+	if err := <-innerErr; err != nil {
+		t.Fatalf("inner ForceCheck: got %v, want nil", err)
+	}
+	if dm.Full() {
+		t.Error("monitor still full after the callback freed space")
+	}
+	want := []string{"full", "full-returned", "recovery"}
+	if !slices.Equal(events, want) {
+		t.Errorf("callback order = %v, want %v", events, want)
 	}
 }
 

@@ -273,13 +273,10 @@ func TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth(t *testing.T) {
 		},
 	}
 	var flag atomic.Bool
-	gate := waldb.NewDiskMonitor(cfg.WALDir, maxBytes,
-		waldb.WithFullPercent(proposalDiskFullPercent),
-		waldb.WithCheckEvery(proposalDiskCheckEvery),
-		waldb.WithOnFullNotify(diskFullCallback(cfg, &flag, nil)),
-		waldb.WithOnRecovery(func(_, _ uint64) { flag.Store(false) }),
+	gateOpts, _ := hostDiskMonitorOptions(cfg, &flag, nil)
+	gate := waldb.NewDiskMonitor(cfg.WALDir, maxBytes, append(gateOpts,
 		waldb.WithDiskUsageFunc(func(string) (uint64, error) { return usage.Load(), nil }),
-	)
+	)...)
 	h := &Host{diskFull: &flag, diskGate: gate}
 
 	for r := 0; r < rounds; r++ {
@@ -317,5 +314,65 @@ func TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth(t *testing.T) {
 	}
 	if got := fired.Load(); got != rounds {
 		t.Errorf("OnLogDBDiskFull fired %d times over %d trips, want %d", got, rounds, rounds)
+	}
+}
+
+// TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery pins finding 1 of
+// the #911 round 2 review: the proposal gate and the WAL monitor publish into
+// one flag. A WAL sample at 96% that pauses before it publishes must not set
+// the flag after a newer proposal-gate sample below 90% has cleared it.
+func TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery(t *testing.T) {
+	const maxBytes = uint64(1000)
+	cfg := config.HostConfig{WALDir: t.TempDir(), MaxWALDiskSize: maxBytes}
+	var flag atomic.Bool
+	gateOpts, walOpts := hostDiskMonitorOptions(cfg, &flag, nil)
+
+	var gateUsage atomic.Uint64
+	gate := waldb.NewDiskMonitor(cfg.WALDir, maxBytes, append(gateOpts,
+		waldb.WithDiskUsageFunc(func(string) (uint64, error) { return gateUsage.Load(), nil }),
+	)...)
+	sampled := make(chan struct{})
+	release := make(chan struct{})
+	wal := waldb.NewDiskMonitor(cfg.WALDir, maxBytes, append(walOpts,
+		waldb.WithDiskUsageFunc(func(string) (uint64, error) {
+			close(sampled)
+			<-release
+			return maxBytes * 96 / 100, nil
+		}),
+	)...)
+
+	gateUsage.Store(maxBytes * 92 / 100)
+	if err := gate.ForceCheck(); !errors.Is(err, waldb.ErrDiskFull) {
+		t.Fatalf("gate at 92%%: got %v, want ErrDiskFull", err)
+	}
+	if !flag.Load() {
+		t.Fatal("flag not set with the gate full")
+	}
+
+	walDone := make(chan error, 1)
+	go func() { walDone <- wal.ForceCheck() }()
+	select {
+	case <-sampled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the WAL monitor never sampled")
+	}
+
+	gateUsage.Store(maxBytes * 50 / 100)
+	if err := gate.ForceCheck(); err != nil {
+		close(release)
+		t.Fatalf("gate at 50%%: got %v, want nil", err)
+	}
+	close(release)
+	if err := <-walDone; !errors.Is(err, waldb.ErrDiskFull) {
+		t.Fatalf("WAL at 96%%: got %v, want ErrDiskFull", err)
+	}
+	if flag.Load() {
+		t.Error("a WAL full sample older than the gate's recovery set the flag")
+	}
+	if err := gate.ForceCheck(); err != nil {
+		t.Fatalf("gate at 50%%: got %v, want nil", err)
+	}
+	if flag.Load() {
+		t.Error("a newer low gate sample did not clear the flag")
 	}
 }

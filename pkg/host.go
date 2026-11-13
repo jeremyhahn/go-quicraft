@@ -4067,8 +4067,9 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 			}
 			return nil
 		}
-		walOpts := buildWALOptions(cfg, &diskFullFlag, walShards)
-		diskGate = newProposalDiskGate(cfg, &diskFullFlag, walShards)
+		gateMon, walMon := hostDiskMonitorOptions(cfg, &diskFullFlag, walShards)
+		walOpts := walDBOptions(cfg, walMon)
+		diskGate = newProposalDiskGate(cfg, gateMon)
 		// Wire barrier encryption into the WAL when a barrier is configured.
 		if options.barrier != nil {
 			walOpts = append(walOpts, waldb.WithBarrier(options.barrier))
@@ -12636,53 +12637,56 @@ func (ns *nodeState) signalLeaderChange() {
 // and cleared when usage drops below the full threshold. shards reports
 // DiskInfo.Shards when a disk callback fires; nil leaves it empty.
 func buildWALOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) []waldb.Option {
+	_, walMon := hostDiskMonitorOptions(cfg, diskFullFlag, shards)
+	return walDBOptions(cfg, walMon)
+}
+
+// walDBOptions returns the WAL database options for cfg, attaching a WAL disk
+// monitor built from monOpts when HostConfig.MaxWALDiskSize is set. Without a
+// size limit there are no thresholds to compute, so no monitor is attached
+// even when disk listeners are configured.
+func walDBOptions(cfg config.HostConfig, monOpts []waldb.DiskMonitorOption) []waldb.Option {
 	var opts []waldb.Option
 
 	// Disable fsync when NoSyncWAL is set (testing only — never production).
 	if cfg.NoSyncWAL {
 		opts = append(opts, waldb.WithNoSync(true))
 	}
-
-	// Only configure disk monitoring if there is a size limit or
-	// listener callbacks that need disk usage events.
-	hasCallbacks := cfg.EventListener != nil &&
-		(cfg.EventListener.OnLogDBDiskWarning != nil || cfg.EventListener.OnLogDBDiskFull != nil)
-
-	if cfg.MaxWALDiskSize > 0 || hasCallbacks {
-		maxBytes := cfg.MaxWALDiskSize
-		// If callbacks are set but no size limit, we still need a
-		// maxBytes to compute thresholds. Default to 0 which
-		// effectively disables the monitor in NewDiskMonitor.
-		if maxBytes == 0 {
-			return opts
-		}
-
-		var monOpts []waldb.DiskMonitorOption
-
-		// Always wire a recovery callback to clear diskFullFlag when
-		// disk usage drops below the full threshold.
-		monOpts = append(monOpts, waldb.WithOnRecovery(func(_, _ uint64) {
-			diskFullFlag.Store(false)
-		}))
-
-		if cfg.EventListener != nil && cfg.EventListener.OnLogDBDiskWarning != nil {
-			walDir := cfg.WALDir
-			warningCb := cfg.EventListener.OnLogDBDiskWarning
-			monOpts = append(monOpts, waldb.WithOnWarning(func(used, maxBytes uint64) {
-				warningCb(config.DiskInfo{
-					WALDir:    walDir,
-					UsedBytes: used,
-					MaxBytes:  maxBytes,
-					Shards:    diskShards(shards),
-				})
-			}))
-		}
-		monOpts = append(monOpts, waldb.WithOnFullNotify(diskFullCallback(cfg, diskFullFlag, shards)))
-
-		opts = append(opts, waldb.WithDiskMonitorOpts(maxBytes, monOpts...))
+	if cfg.MaxWALDiskSize > 0 {
+		opts = append(opts, waldb.WithDiskMonitorOpts(cfg.MaxWALDiskSize, monOpts...))
 	}
-
 	return opts
+}
+
+// hostDiskMonitorOptions returns the options of the host's two disk monitors:
+// the proposal gate (gate) and the WAL database's monitor (wal). Both publish
+// into diskFullFlag and share the OnLogDBDiskFull listener; the WAL monitor
+// also carries the OnLogDBDiskWarning listener.
+func hostDiskMonitorOptions(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) (gate, wal []waldb.DiskMonitorOption) {
+	clearFlag := waldb.WithOnRecovery(func(_, _ uint64) {
+		diskFullFlag.Store(false)
+	})
+	gate = []waldb.DiskMonitorOption{
+		waldb.WithFullPercent(proposalDiskFullPercent),
+		waldb.WithCheckEvery(proposalDiskCheckEvery),
+		waldb.WithOnFullNotify(diskFullCallback(cfg, diskFullFlag, shards)),
+		clearFlag,
+	}
+	wal = []waldb.DiskMonitorOption{clearFlag}
+	if cfg.EventListener != nil && cfg.EventListener.OnLogDBDiskWarning != nil {
+		walDir := cfg.WALDir
+		warningCb := cfg.EventListener.OnLogDBDiskWarning
+		wal = append(wal, waldb.WithOnWarning(func(used, maxBytes uint64) {
+			warningCb(config.DiskInfo{
+				WALDir:    walDir,
+				UsedBytes: used,
+				MaxBytes:  maxBytes,
+				Shards:    diskShards(shards),
+			})
+		}))
+	}
+	wal = append(wal, waldb.WithOnFullNotify(diskFullCallback(cfg, diskFullFlag, shards)))
+	return gate, wal
 }
 
 // proposalDiskFullPercent is the share of HostConfig.MaxWALDiskSize at which
@@ -12735,18 +12739,11 @@ func diskFullCallback(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards f
 // It watches the WAL's volume at proposalDiskFullPercent, every
 // proposalDiskCheckEvery proposals, and shares diskFullFlag and the full and
 // recovery callbacks with the WAL's own monitor (buildWALOptions).
-func newProposalDiskGate(cfg config.HostConfig, diskFullFlag *atomic.Bool, shards func() []uint64) *waldb.DiskMonitor {
+func newProposalDiskGate(cfg config.HostConfig, gateOpts []waldb.DiskMonitorOption) *waldb.DiskMonitor {
 	if cfg.MaxWALDiskSize == 0 {
 		return nil
 	}
-	return waldb.NewDiskMonitor(cfg.WALDir, cfg.MaxWALDiskSize,
-		waldb.WithFullPercent(proposalDiskFullPercent),
-		waldb.WithCheckEvery(proposalDiskCheckEvery),
-		waldb.WithOnFullNotify(diskFullCallback(cfg, diskFullFlag, shards)),
-		waldb.WithOnRecovery(func(_, _ uint64) {
-			diskFullFlag.Store(false)
-		}),
-	)
+	return waldb.NewDiskMonitor(cfg.WALDir, cfg.MaxWALDiskSize, gateOpts...)
 }
 
 // proposalDiskFull reports whether a new proposal (or a snapshot import) must
