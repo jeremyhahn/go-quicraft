@@ -973,14 +973,19 @@ func (t *QUICTransport) stop() {
 // shutdown at once instead of after MaxIdleTimeout. It must run after the
 // listener close (a closed listener's Accept returns the queued connections and
 // then ErrServerClosed, never blocking) and after the accept loop has returned
-// (so nothing else takes from the queue), and before quicTr.Close. The timeout
-// is only a guard against a listener that did not close.
+// (so nothing else takes from the queue), and before quicTr.Close.
+//
+// Accept runs on an uncancelled context, and the drain ends only on the
+// listener's close error (ErrServerClosed). A deadline would cover every
+// synchronous CloseWithError below: once it expired, quic-go's Accept could
+// pick ctx.Done() over a nonempty queue, and quicTr.Close would destroy the
+// rest of the queue unannounced. The closed listener cannot block Accept once
+// the queue is empty, so no deadline is needed.
 func (t *QUICTransport) closeQueuedOnShutdown() int {
 	if t.listener == nil {
 		return 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
+	ctx := context.Background()
 	closed := 0
 	for {
 		conn, err := t.listener.Accept(ctx)
