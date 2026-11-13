@@ -299,18 +299,17 @@ func (rs *RequestState) lostWait(err error) error {
 }
 
 // awaitResult waits for rs to complete or ctx to end, whichever is first. A
-// context that ends first is reported as ErrTimeout (deadline) or ErrCanceled,
-// classified by lostWait. It is the one wait every synchronous proposal path
+// context that ends first is reported as ErrTimeout (deadline) or ErrCanceled
+// wrapping ctx.Err(), classified by lostWait. It is the one wait every synchronous proposal path
 // uses.
 func awaitResult(ctx context.Context, rs *RequestState) (RequestResult, error) {
 	select {
 	case result := <-rs.ResultC():
 		return result, result.Err
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return RequestResult{}, rs.lostWait(ErrTimeout)
-		}
-		return RequestResult{}, rs.lostWait(ErrCanceled)
+		// mapContextError keeps ctx.Err() under the ErrTimeout/ErrCanceled
+		// sentinel, so the error matches both inside a MaybeAppliedError.
+		return RequestResult{}, rs.lostWait(mapContextError(ctx.Err()))
 	}
 }
 

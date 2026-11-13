@@ -5926,6 +5926,19 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 	return sm.Result{Value: result.Value, Data: result.Data}, nil
 }
 
+// syncReadLookupHook, when set, runs after SyncRead or SyncReadBuf has its
+// read index applied and before it takes the state machine's read guard.
+// Tests set it to hold an Update across the lookup stage; it is nil in
+// production, costing one atomic load per read.
+var syncReadLookupHook atomic.Pointer[func()]
+
+// runSyncReadLookupHook runs syncReadLookupHook if one is set.
+func runSyncReadLookupHook() {
+	if hook := syncReadLookupHook.Load(); hook != nil {
+		(*hook)()
+	}
+}
+
 // SyncRead performs a linearizable read in a single call. It confirms
 // leadership via ReadIndex, waits for the local SM to catch up, then
 // executes the query. This provides the strongest consistency guarantee:
@@ -5979,10 +5992,7 @@ func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) 
 			return nil, result.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 lookup:
 
@@ -5992,6 +6002,7 @@ lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 
 	// Step 3: Execute the query on the caught-up state machine.
 	ns, err := h.getNode(shardID)
@@ -6007,7 +6018,11 @@ lookup:
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
 	}
-	return ns.rsm.Lookup(ctx, query)
+	result, lookupErr := ns.rsm.Lookup(ctx, query)
+	if lookupErr != nil {
+		return nil, mapLocalReadError(lookupErr)
+	}
+	return result, nil
 }
 
 // SyncReadBuf is the pooled-buffer variant of SyncRead for []byte key queries.
@@ -6048,15 +6063,13 @@ func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (res
 			return nil, nopHostRelease, r.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, nopHostRelease, ErrTimeout
-		}
-		return nil, nopHostRelease, ErrCanceled
+		return nil, nopHostRelease, mapContextError(ctx.Err())
 	}
 lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, nopHostRelease, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 	ns, nsErr := h.getNode(shardID)
 	if nsErr != nil {
 		return nil, nopHostRelease, nsErr
@@ -6068,9 +6081,9 @@ lookup:
 	if ns.rsm == nil {
 		return nil, nopHostRelease, ErrShardNotReady
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
@@ -6078,7 +6091,7 @@ lookup:
 	// Fall back to the generic Lookup path (result is []byte or interface{}).
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
@@ -6121,16 +6134,16 @@ func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (re
 	if ns.barrierSealed() {
 		return nil, nopHostRelease, ErrBarrierSealed
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
 	}
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
@@ -6853,7 +6866,8 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 		return nil, ErrBarrierSealed
 	}
 
-	return ns.rsm.Lookup(ctx, query)
+	v, lookupErr := ns.rsm.Lookup(ctx, query)
+	return v, mapLocalReadError(lookupErr)
 }
 
 // StaleRead reads this replica's state machine directly, without any
@@ -6946,7 +6960,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 
 	// Fast path: SM has already applied up to the committed index.
 	if ns.lastApplied.Load() >= committed {
-		return ns.rsm.Lookup(ctx, query)
+		v, lookupErr := ns.rsm.Lookup(ctx, query)
+		return v, mapLocalReadError(lookupErr)
 	}
 
 	// Slow path: poll until lastApplied catches up, the shard or host shuts
@@ -6967,7 +6982,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 		select {
 		case <-ticker.C:
 			if ns.lastApplied.Load() >= committed {
-				return ns.rsm.Lookup(ctx, query)
+				v, lookupErr := ns.rsm.Lookup(ctx, query)
+				return v, mapLocalReadError(lookupErr)
 			}
 			if ns.stopped.Load() || h.closed.Load() {
 				return nil, ErrClosed
@@ -7348,10 +7364,7 @@ func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Mem
 			return nil, result.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 
 	// Step 3: Read membership from the Raft peer. GetMembership returns a
@@ -7713,7 +7726,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 		if errors.Is(err, engine.ErrStopped) {
 			return ErrClosed
 		}
-		return err
+		return mapContextError(err)
 	}
 	return nil
 }
@@ -7816,7 +7829,7 @@ func pauseTransferTarget(progress []raft.RemoteProgress, self uint64) uint64 {
 // ResumeShard returns ctx.Err() and changes nothing.
 func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return mapContextError(err)
 	}
 	if h.closed.Load() {
 		return ErrClosed
@@ -7831,7 +7844,7 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	}
 	// A pause in its leadership transfer holds the gate; ctx bounds the wait.
 	if !ns.pauseGate.lock(ctx.Done()) {
-		return ctx.Err()
+		return mapContextError(ctx.Err())
 	}
 	h.engine.ResumeNode(engNode)
 	ns.paused.Store(false)
@@ -8260,6 +8273,9 @@ func (e *SnapshotArtifactError) Unwrap() error { return e.Err }
 // never be imported, even by a caller that ignored the error. It is still not
 // an artifact and should be discarded.
 func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return mapContextError(err)
+	}
 	if h.closed.Load() {
 		return ErrClosed
 	}
@@ -8314,6 +8330,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
 		return ErrSnapshotEncryptedBarrierUnavailable
 	}
+	// Checked again: the lookups above may outlast the caller's context.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
 	}
@@ -11262,10 +11279,7 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 		}
 		return result.Value, nil
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return 0, ErrTimeout
-		}
-		return 0, ErrCanceled
+		return 0, mapContextError(ctx.Err())
 	}
 }
 
@@ -11348,10 +11362,7 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 func (h *Host) SyncRemoveData(ctx context.Context, shardID, replicaID uint64) error {
 	select {
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
+		return mapContextError(ctx.Err())
 	default:
 	}
 	return h.RemoveData(shardID, replicaID)
@@ -12909,16 +12920,28 @@ func walShardIDs(db logdb.LogDB) []uint64 {
 }
 
 // mapContextError translates a context error into the corresponding
-// quicraft sentinel error. This ensures callers always see ErrCanceled
-// or ErrTimeout rather than raw context.Canceled / context.DeadlineExceeded.
+// quicraft sentinel error that wraps it, so errors.Is holds for both
+// ErrCanceled and context.Canceled, or for both ErrTimeout and
+// context.DeadlineExceeded.
 func mapContextError(err error) error {
-	if err == context.DeadlineExceeded {
-		return ErrTimeout
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrTimeout, err)
 	}
-	if err == context.Canceled {
-		return ErrCanceled
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%w: %w", ErrCanceled, err)
 	}
 	return err
+}
+
+// mapLocalReadError maps a context error returned by a local state machine
+// read (a read abandoned while an Update held the state machine) to
+// ErrCanceled or ErrTimeout, as the read's own context checks do. An error
+// that already carries ErrCanceled or ErrTimeout is returned unchanged.
+func mapLocalReadError(err error) error {
+	if err == nil || errors.Is(err, ErrCanceled) || errors.Is(err, ErrTimeout) {
+		return err
+	}
+	return mapContextError(err)
 }
 
 // effectiveMaxPayload returns the effective maximum proposal payload size
