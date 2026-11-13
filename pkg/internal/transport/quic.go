@@ -869,6 +869,17 @@ func (t *QUICTransport) stop() {
 	// shutdownCancel above are enough to end it.
 	t.acceptWG.Wait()
 
+	// The join covers what the loop ADMITTED, not what the listener QUEUED.
+	// The loop exits as soon as it sees stopped, and its Accept runs on
+	// shutdownCtx, cancelled above, which can win over a queued connection;
+	// a connection whose handshake completed but which the loop never took is
+	// still in the listener's queue, unpublished, so the inbound sweep below
+	// cannot reach it and quicTr.Close would destroy it unannounced. Drain the
+	// queue and announce on each one here.
+	if n := t.closeQueuedOnShutdown(); n > 0 {
+		supervise.LogContained(func() { slog.Debug("announced shutdown on queued inbound connections", "connections", n) })
+	}
+
 	t.connMu.Lock()
 	for addr, conn := range t.conns {
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
@@ -949,6 +960,35 @@ func (t *QUICTransport) stop() {
 		if err := t.udpConn.Close(); err != nil {
 			supervise.LogContained(func() { slog.Debug("UDP listener close failed", "error", err) })
 		}
+	}
+}
+
+// closeQueuedOnShutdown takes every connection left in the closed listener's
+// accept queue and closes it with QUICErrShutdown, so its dialer learns of the
+// shutdown at once instead of after MaxIdleTimeout. It must run after the
+// listener close (a closed listener's Accept returns the queued connections and
+// then ErrServerClosed, never blocking) and after the accept loop has returned
+// (so nothing else takes from the queue), and before quicTr.Close. The timeout
+// is only a guard against a listener that did not close.
+func (t *QUICTransport) closeQueuedOnShutdown() int {
+	if t.listener == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	closed := 0
+	for {
+		conn, err := t.listener.Accept(ctx)
+		if err != nil {
+			return closed
+		}
+		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
+			remote := conn.RemoteAddr().String()
+			supervise.LogContained(func() {
+				slog.Debug("QUIC queued inbound connection close failed", "remote", remote, "error", err)
+			})
+		}
+		closed++
 	}
 }
 
