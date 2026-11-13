@@ -16,6 +16,7 @@ package waldb
 
 import (
 	"log/slog"
+	"sync"
 	"sync/atomic"
 )
 
@@ -61,9 +62,27 @@ type DiskMonitor struct {
 	lastWarning atomic.Bool
 	lastFull    atomic.Bool
 
-	onWarning func(used, maxBytes uint64)
-	onFull    func(used, maxBytes uint64)
+	// mu serializes check: the sample, the lastFull/lastWarning transition,
+	// the onSample publication and the queueing of the sample's callbacks,
+	// so the state last published is the one from the latest sample.
+	// MaybeCheck reads lastFull without it.
+	mu sync.Mutex
 
+	// notifyMu guards pending and draining. The callbacks of each sample
+	// are queued under mu, in sample order, and run by one draining caller
+	// at a time with neither lock held, so a callback may sample this
+	// monitor again: its own callbacks are queued and run after it returns.
+	notifyMu sync.Mutex
+	pending  []func()
+	draining bool
+
+	// sampleClock is the source of DiskSample.Seq; ownClock when not set.
+	sampleClock *atomic.Uint64
+	ownClock    atomic.Uint64
+
+	onWarning  func(used, maxBytes uint64)
+	onFull     func(used, maxBytes uint64)
+	onSample   func(s DiskSample) func()
 	onRecovery func(used, maxBytes uint64)
 
 	// diskUsage is the function used to query disk usage. Defaults to
@@ -119,7 +138,11 @@ func WithOnWarning(fn func(used, maxBytes uint64)) DiskMonitorOption {
 }
 
 // WithOnFull sets the callback invoked when usage crosses the full
-// threshold. The callback receives the current used and maxBytes bytes.
+// threshold. The callback receives the current used and maxBytes bytes. It
+// runs after the monitor's mutex is released, in sample order with the
+// warning and recovery callbacks, so it may call back into this monitor
+// (free space, then ForceCheck to verify recovery); the callbacks of a sample
+// taken from inside it run after it returns.
 func WithOnFull(fn func(used, maxBytes uint64)) DiskMonitorOption {
 	return func(dm *DiskMonitor) {
 		dm.onFull = fn
@@ -129,10 +152,44 @@ func WithOnFull(fn func(used, maxBytes uint64)) DiskMonitorOption {
 // WithOnRecovery sets the callback invoked when usage drops below the full
 // threshold after being in the full state. This enables clearing external
 // disk-full flags when disk space is freed. The callback receives the
-// current used and maxBytes bytes.
+// current used and maxBytes bytes. It runs like WithOnFull's callback: after
+// the mutex is released, in sample order.
 func WithOnRecovery(fn func(used, maxBytes uint64)) DiskMonitorOption {
 	return func(dm *DiskMonitor) {
 		dm.onRecovery = fn
+	}
+}
+
+// DiskSample is one successful disk usage sample, as WithOnSample sees it.
+type DiskSample struct {
+	// Seq orders samples: it is drawn from the WithSampleClock clock (or the
+	// monitor's own) when the sample starts, before usage is read.
+	Seq uint64
+	// Full reports whether the sample is at or above the full threshold.
+	Full bool
+	// Used is the disk usage the sample read, in bytes.
+	Used uint64
+	// MaxBytes is the configured ceiling the sample compared Used against,
+	// in bytes.
+	MaxBytes uint64
+}
+
+// WithOnSample sets a hook for internal state publication. fn runs under the
+// monitor's mutex after every successful sample, so the state it publishes
+// is that of the monitor's latest sample; it must not call back into this
+// monitor. The function it returns, if not nil, runs after the mutex is
+// released, in sample order after the sample's other callbacks.
+func WithOnSample(fn func(s DiskSample) func()) DiskMonitorOption {
+	return func(dm *DiskMonitor) {
+		dm.onSample = fn
+	}
+}
+
+// WithSampleClock makes the monitor draw DiskSample.Seq from clock, so the
+// samples of several monitors that share it are ordered against each other.
+func WithSampleClock(clock *atomic.Uint64) DiskMonitorOption {
+	return func(dm *DiskMonitor) {
+		dm.sampleClock = clock
 	}
 }
 
@@ -165,6 +222,9 @@ func NewDiskMonitor(dir string, maxBytes uint64, opts ...DiskMonitorOption) *Dis
 	// monitored write into a division by zero on the commit worker.
 	if dm.checkEvery == 0 {
 		dm.checkEvery = DefaultCheckEvery
+	}
+	if dm.sampleClock == nil {
+		dm.sampleClock = &dm.ownClock
 	}
 	return dm
 }
@@ -212,6 +272,73 @@ func (dm *DiskMonitor) ForceCheck() error {
 // check performs the actual disk usage query and fires callbacks as
 // needed based on threshold crossings.
 func (dm *DiskMonitor) check() error {
+	// The callbacks run after mu is released: they may reach user code that
+	// samples this monitor again, which would deadlock on mu.
+	err := dm.checkLocked()
+	dm.drain()
+	return err
+}
+
+// drain runs the queued callbacks in order. One caller drains at a time; a
+// caller that finds a drain in progress (another goroutine's, or its own
+// further up the stack when a callback sampled this monitor) leaves its
+// callbacks to that drain.
+func (dm *DiskMonitor) drain() {
+	dm.notifyMu.Lock()
+	if dm.draining {
+		dm.notifyMu.Unlock()
+		return
+	}
+	dm.draining = true
+	for len(dm.pending) > 0 {
+		fn := dm.pending[0]
+		dm.pending[0] = nil
+		dm.pending = dm.pending[1:]
+		dm.notifyMu.Unlock()
+		dm.runCallback(fn)
+		dm.notifyMu.Lock()
+	}
+	dm.pending = nil
+	dm.draining = false
+	dm.notifyMu.Unlock()
+}
+
+// runCallback runs fn and, should it panic, clears the draining mark so the
+// monitor's later callbacks are not silently dropped.
+func (dm *DiskMonitor) runCallback(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			dm.notifyMu.Lock()
+			dm.draining = false
+			dm.notifyMu.Unlock()
+			panic(r)
+		}
+	}()
+	fn()
+}
+
+// enqueue queues the callbacks of one sample. It is called under mu, so the
+// queue is in sample order.
+func (dm *DiskMonitor) enqueue(fns ...func()) {
+	dm.notifyMu.Lock()
+	for _, fn := range fns {
+		if fn != nil {
+			dm.pending = append(dm.pending, fn)
+		}
+	}
+	dm.notifyMu.Unlock()
+}
+
+// checkLocked samples usage and applies the transition under mu. It returns
+// the notification to run once mu is released, or nil.
+func (dm *DiskMonitor) checkLocked() error {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
+	// The sample's position is taken when it starts, so a sample that stalls
+	// between reading usage and publishing it is older than one that starts
+	// during the stall.
+	seq := dm.sampleClock.Add(1)
 	used, err := dm.diskUsage(dm.dir)
 	if err != nil {
 		// If we cannot determine disk usage, do not block writes.
@@ -222,45 +349,52 @@ func (dm *DiskMonitor) check() error {
 		return nil
 	}
 
-	warningThreshold := uint64(float64(dm.maxBytes) * dm.warningPct)
-	fullThreshold := uint64(float64(dm.maxBytes) * dm.fullPct)
+	maxBytes := dm.maxBytes
+	warningThreshold := uint64(float64(maxBytes) * dm.warningPct)
+	fullThreshold := uint64(float64(maxBytes) * dm.fullPct)
+	full := used >= fullThreshold
 
-	// Evaluate full threshold first (superset of warning).
-	if used >= fullThreshold {
-		// Transition to full state.
-		if !dm.lastFull.Swap(true) {
-			// State change: fire callback once.
-			if dm.onFull != nil {
-				dm.onFull(used, dm.maxBytes)
-			}
+	var onFull, onRecovery, onWarning func()
+	if full {
+		// Transition to full state: fire the callback once. Full is a
+		// superset of warning.
+		if !dm.lastFull.Swap(true) && dm.onFull != nil {
+			onFull = func() { dm.onFull(used, maxBytes) }
 		}
-		// Also ensure warning is set when full.
 		dm.lastWarning.Store(true)
+	} else {
+		// Fire the recovery callback on the transition from full to
+		// non-full.
+		if dm.lastFull.Swap(false) && dm.onRecovery != nil {
+			onRecovery = func() { dm.onRecovery(used, maxBytes) }
+		}
+		if used >= warningThreshold {
+			// Transition to warning state: fire the callback once.
+			if !dm.lastWarning.Swap(true) && dm.onWarning != nil {
+				onWarning = func() { dm.onWarning(used, maxBytes) }
+			}
+		} else {
+			// Below both thresholds: clear warning state.
+			dm.lastWarning.Store(false)
+		}
+	}
+
+	var published func()
+	if dm.onSample != nil {
+		published = dm.onSample(DiskSample{Seq: seq, Full: full, Used: used, MaxBytes: maxBytes})
+	}
+	dm.enqueue(onFull, onRecovery, onWarning, published)
+	if full {
 		return ErrDiskFull
 	}
-
-	// Clear full state if we dropped below the full threshold.
-	// Fire the recovery callback on the transition from full to non-full.
-	if dm.lastFull.Swap(false) {
-		if dm.onRecovery != nil {
-			dm.onRecovery(used, dm.maxBytes)
-		}
-	}
-
-	if used >= warningThreshold {
-		// Transition to warning state.
-		if !dm.lastWarning.Swap(true) {
-			// State change: fire callback once.
-			if dm.onWarning != nil {
-				dm.onWarning(used, dm.maxBytes)
-			}
-		}
-		return nil
-	}
-
-	// Below both thresholds: clear warning state.
-	dm.lastWarning.Store(false)
 	return nil
+}
+
+// Full reports whether the latest sample was at or above the full
+// threshold, that is whether MaybeCheck is refusing. It is false for a nil
+// or disabled monitor.
+func (dm *DiskMonitor) Full() bool {
+	return dm != nil && dm.lastFull.Load()
 }
 
 // WriteCount returns the current write count. Useful for testing.
