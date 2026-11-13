@@ -2475,7 +2475,7 @@ func TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine(t *testing.T
 	errs := make(chan error, readers)
 	for i := 0; i < readers; i++ {
 		go func() {
-			_, lookupErr := rsm.Lookup(ctx, []byte("key"))
+			_, lookupErr := rsm.Lookup(ctx, "key")
 			errs <- lookupErr
 		}()
 	}
@@ -2503,7 +2503,7 @@ func TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine(t *testing.T
 
 	rsm.readGuard.Unlock()
 	locked = false
-	if _, lookupErr := rsm.Lookup(context.Background(), []byte("key")); lookupErr != nil {
+	if _, lookupErr := rsm.Lookup(context.Background(), "key"); lookupErr != nil {
 		t.Fatalf("Lookup after release = %v", lookupErr)
 	}
 }
