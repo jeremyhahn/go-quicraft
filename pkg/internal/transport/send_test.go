@@ -998,7 +998,12 @@ func TestSendBatch_DirectWriteErrorViaConnectionClose(t *testing.T) {
 	deadConn, ok := t1.conns[t2Addr]
 	t1.connMu.Unlock()
 	if ok {
-		waitForChan(t, deadConn.Context().Done(), 10*time.Second, "the connection did not close after the peer stopped")
+		// Close it locally rather than wait for the peer's CONNECTION_CLOSE:
+		// the announce is TestStop_AnnouncesConnectionStillInAcceptQueue's
+		// subject, and a frame lost on a loaded runner would otherwise leave
+		// this test waiting for MaxIdleTimeout.
+		_ = deadConn.CloseWithError(QUICErrShutdown, "test: peer stopped")
+		waitForChan(t, deadConn.Context().Done(), 10*time.Second, "the connection did not close")
 	}
 
 	// Remove the connection from conns but keep the cached stream.
