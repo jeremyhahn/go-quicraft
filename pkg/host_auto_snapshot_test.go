@@ -152,6 +152,44 @@ func waitAutoSnap(ctx context.Context, t *testing.T, what string, cond func() bo
 	}
 }
 
+// settleAutoSnap waits until at least minSaves saves have been taken and the
+// latest one has completed: the node's last snapshot index has reached the
+// index the save captured, and the node's in-flight snapshotting flag has
+// been released (the pool clears it only after persistence, compaction and
+// the completion report). It returns every save so far, none still pending.
+//
+// SaveSnapshot records its index before the snapshot is persisted, and while
+// the flag is held the apply path skips the automatic trigger, so a test that
+// drives the next threshold, or compares a save with LogRange, before this
+// returns can race the save still in flight.
+//
+// The flag is probed by claiming it and clearing it at once. Callers settle
+// only while no proposal is in flight and the applied index is below the next
+// threshold, so no automatic trigger can be refused during the probe.
+func settleAutoSnap(ctx context.Context, t *testing.T, h *Host, s *autoSnapSM, minSaves int) []uint64 {
+	t.Helper()
+	node := h.engine.GetNode(autoSnapShardID)
+	if node == nil {
+		t.Fatalf("shard %d has no engine node", autoSnapShardID)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		saves := s.saveIndices()
+		if len(saves) >= minSaves &&
+			(len(saves) == 0 || node.LastSnapshotIndex() >= saves[len(saves)-1]) &&
+			node.TryStartSnapshot() {
+			node.ClearSnapshotting()
+			return saves
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			t.Fatalf("timed out waiting for %d completed snapshots: saves %v, last "+
+				"snapshot index %d, applied %d", minSaves, saves,
+				node.LastSnapshotIndex(), s.lastApplied())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestAutoSnapshot_TriggersAtSnapshotEntries checks (a): fewer than
 // SnapshotEntries applied entries take no snapshot; SnapshotEntries more take
 // one on their own, with no RequestSnapshot call.
@@ -184,27 +222,24 @@ func TestAutoSnapshot_TriggersAtSnapshotEntries(t *testing.T) {
 	// its own, with no RequestSnapshot call.
 	proposeAutoSnap(ctx, t, h, n, n+1)
 	n++
-	waitAutoSnap(ctx, t, "an automatic snapshot at SnapshotEntries", func() bool {
-		return len(s.saveIndices()) >= 1
-	})
-	if saves := s.saveIndices(); saves[0] != autoSnapEntries {
+	// Wait for the save to complete and release the in-flight flag before
+	// driving the next threshold: while it is held the apply path skips the
+	// trigger, and no later batch would retry it.
+	if saves := settleAutoSnap(ctx, t, h, s, 1); saves[0] != autoSnapEntries {
 		t.Fatalf("first automatic snapshot at applied index %d, want SnapshotEntries %d",
 			saves[0], autoSnapEntries)
 	}
 
 	// SnapshotEntries more applied entries take the next one.
 	proposeAutoSnap(ctx, t, h, n, n+int(autoSnapEntries))
-	waitAutoSnap(ctx, t, "a second automatic snapshot", func() bool {
-		return len(s.saveIndices()) >= 2
-	})
-	saves := s.saveIndices()
+	saves := settleAutoSnap(ctx, t, h, s, 2)
 	t.Logf("%d proposals reached applied index %d; automatic snapshots at %v",
 		n-1, autoSnapEntries-1, saves)
-	// >= rather than ==: a trigger that lands while the previous save is still
-	// running is deferred to the next applied batch.
-	if saves[1] < 2*autoSnapEntries {
-		t.Fatalf("second automatic snapshot at applied index %d, want >= %d",
-			saves[1], 2*autoSnapEntries)
+	// The first save was settled before these proposals, so nothing defers
+	// the trigger: the second save lands exactly SnapshotEntries later.
+	if len(saves) != 2 || saves[1] != 2*autoSnapEntries {
+		t.Fatalf("automatic snapshots at %v, want a second one at applied index %d",
+			saves, 2*autoSnapEntries)
 	}
 }
 
@@ -220,24 +255,38 @@ func TestAutoSnapshot_CadenceCompactionAndRecovery(t *testing.T) {
 	s := &autoSnapSM{}
 	h := startAutoSnapHost(t, walDir, nodeDir, s, autoSnapEntries)
 
-	proposeAutoSnap(ctx, t, h, 0, proposals)
+	// Propose one key at a time, and whenever an applied entry reaches the
+	// next threshold, settle that save (persisted, compacted, in-flight flag
+	// released) before driving the next one. A threshold reached while a save
+	// is still in flight is skipped by the apply path and retried only by a
+	// later batch, so without settling the cadence depends on save latency.
+	node := h.engine.GetNode(autoSnapShardID)
+	if node == nil {
+		mustCloseHost(t, h)
+		t.Fatalf("shard %d has no engine node", autoSnapShardID)
+	}
+	var saves []uint64
+	for i := 0; i < proposals; i++ {
+		proposeAutoSnap(ctx, t, h, i, i+1)
+		if s.lastApplied()-node.LastSnapshotIndex() >= autoSnapEntries {
+			saves = settleAutoSnap(ctx, t, h, s, len(saves)+1)
+		}
+	}
+	// Settle every save before reading the indices: a save still in flight
+	// has recorded its index but not yet compacted the log, and the latest
+	// index below is compared with LogRange.
+	saves = settleAutoSnap(ctx, t, h, s, len(saves))
 	applied := s.lastApplied()
 	want := int(applied / autoSnapEntries)
-	// A save that is still running when the next threshold is reached defers
-	// that trigger to a later batch, so one fewer is allowed; more is a bug.
-	waitAutoSnap(ctx, t, fmt.Sprintf("at least %d snapshots", want-1), func() bool {
-		return len(s.saveIndices()) >= want-1
-	})
-	saves := s.saveIndices()
-	if len(saves) < want-1 || len(saves) > want {
+	if len(saves) != want {
 		mustCloseHost(t, h)
-		t.Fatalf("applied index %d with SnapshotEntries %d took %d snapshots %v, want %d (or %d)",
-			applied, autoSnapEntries, len(saves), saves, want, want-1)
+		t.Fatalf("applied index %d with SnapshotEntries %d took %d snapshots %v, want %d",
+			applied, autoSnapEntries, len(saves), saves, want)
 	}
 	for i := 1; i < len(saves); i++ {
-		if saves[i]-saves[i-1] < autoSnapEntries {
+		if saves[i]-saves[i-1] != autoSnapEntries {
 			mustCloseHost(t, h)
-			t.Fatalf("snapshots %v are %d applied entries apart, want >= SnapshotEntries %d",
+			t.Fatalf("snapshots %v are %d applied entries apart, want SnapshotEntries %d",
 				saves, saves[i]-saves[i-1], autoSnapEntries)
 		}
 	}
