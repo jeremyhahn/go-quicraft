@@ -338,3 +338,127 @@ func TestReencryptSnapshotFile_RestampFaults(t *testing.T) {
 		})
 	}
 }
+
+// assertReencryptPairVerifies fails the test unless dir holds a snapshot.dat
+// and a snapshot.meta whose DataLen and DataHash describe it, the check
+// recovery applies before it accepts the artifact.
+func assertReencryptPairVerifies(t *testing.T, cfs *crashFS, dir string) {
+	t.Helper()
+	stored, ok := cfs.liveBytes(filepath.Join(dir, "snapshot.dat"))
+	if !ok {
+		t.Fatalf("%s/snapshot.dat is missing", dir)
+	}
+	metaBytes, ok := cfs.liveBytes(filepath.Join(dir, "snapshot.meta"))
+	if !ok {
+		t.Fatalf("%s/snapshot.meta is missing", dir)
+	}
+	meta, err := engine.ParseSnapshotMeta(metaBytes)
+	if err != nil {
+		t.Fatalf("%s/snapshot.meta does not parse: %v", dir, err)
+	}
+	sum, size, _ := engine.HashSnapshotReader(bytes.NewReader(stored))
+	if meta.DataLen != size || meta.DataHash != sum {
+		t.Fatalf("%s/snapshot.meta records len %d hash %x, snapshot.dat has len %d hash %x",
+			dir, meta.DataLen, meta.DataHash, size, sum)
+	}
+}
+
+// TestReencryptSnapshotFile_CrashFSExistingDestinationKept: a destination
+// that already holds a published snapshot.dat/snapshot.meta pair is refused
+// before anything is written. Restamping snapshot.meta in place beside it
+// would leave a crash window in which the old snapshot.dat entry comes back
+// with the new record, and recovery would refuse a snapshot that was valid.
+func TestReencryptSnapshotFile_CrashFSExistingDestinationKept(t *testing.T) {
+	srcBarrier := createTestBarrier(t)
+	dstBarrier := createTestBarrier(t)
+
+	root := "/vol"
+	cfs := newCrashFS(root)
+	srcPath := filepath.Join(root, "src", "snapshot.dat")
+	dstDir := filepath.Join(root, "dst")
+	dstPath := filepath.Join(dstDir, "snapshot.dat")
+	dstMetaPath := filepath.Join(dstDir, "snapshot.meta")
+	srcData := encryptToBytes(t, srcBarrier, bytes.Repeat([]byte("new-source-content"), 200))
+	writeDurableFile(t, cfs, srcPath, srcData)
+	writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
+		reencryptTestSourceMeta(srcData))
+	oldData := encryptToBytes(t, dstBarrier, bytes.Repeat([]byte("published-destination"), 150))
+	oldMeta := reencryptTestSourceMeta(oldData)
+	writeDurableFile(t, cfs, dstPath, oldData)
+	writeDurableFile(t, cfs, dstMetaPath, oldMeta)
+
+	_, err := reencryptSnapshotFile(cfs, srcPath, dstPath,
+		testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	if !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("err = %v, want fs.ErrExist for a destination that already holds a pair", err)
+	}
+	if !strings.Contains(err.Error(), dstPath) {
+		t.Fatalf("err = %v does not name %s", err, dstPath)
+	}
+	if got, _ := cfs.liveBytes(dstPath); !bytes.Equal(got, oldData) {
+		t.Fatal("the published snapshot.dat was changed")
+	}
+	if got, _ := cfs.liveBytes(dstMetaPath); !bytes.Equal(got, oldMeta) {
+		t.Fatal("the published snapshot.meta was changed")
+	}
+	if names := cfs.entries(dstDir); len(names) != 2 {
+		t.Fatalf("%s holds %v, want only the published pair", dstDir, names)
+	}
+
+	cfs.Crash()
+	assertReencryptPairVerifies(t, cfs, dstDir)
+}
+
+// TestReencryptSnapshotFile_CrashFSMetaReplacedWhole: the restamp replaces a
+// snapshot.meta already beside the destination (the runbook copies the
+// source's) by rename, so a crash at any point of the write leaves the old
+// record or the new one whole, never a torn or truncated one.
+func TestReencryptSnapshotFile_CrashFSMetaReplacedWhole(t *testing.T) {
+	cases := []struct {
+		name string
+		op   crashOp
+	}{
+		{name: "crash on the meta write", op: opWrite},
+		{name: "crash on the meta sync", op: opSync},
+		{name: "crash on the meta rename", op: opRename},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srcBarrier := createTestBarrier(t)
+			dstBarrier := createTestBarrier(t)
+
+			root := "/vol"
+			cfs := newCrashFS(root)
+			srcPath := filepath.Join(root, "src", "snapshot.dat")
+			dstDir := filepath.Join(root, "dst")
+			dstPath := filepath.Join(dstDir, "snapshot.dat")
+			dstMetaPath := filepath.Join(dstDir, "snapshot.meta")
+			srcData := encryptToBytes(t, srcBarrier, bytes.Repeat([]byte("meta-whole-content"), 200))
+			srcMeta := reencryptTestSourceMeta(srcData)
+			writeDurableFile(t, cfs, srcPath, srcData)
+			writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"), srcMeta)
+			writeDurableFile(t, cfs, dstMetaPath, srcMeta)
+
+			cfs.crashOn(tc.op, "dst/snapshot.meta")
+			_, err := reencryptSnapshotFile(cfs, srcPath, dstPath,
+				testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+			if !errors.Is(err, errCrashed) {
+				t.Fatalf("err = %v, want the injected crash", err)
+			}
+			cfs.setHook(nil)
+
+			metaBytes, ok := cfs.liveBytes(dstMetaPath)
+			if !ok {
+				t.Fatalf("%s was lost by a crash during its restamp", dstMetaPath)
+			}
+			meta, err := engine.ParseSnapshotMeta(metaBytes)
+			if err != nil {
+				t.Fatalf("%s is torn after a crash during its restamp: %v", dstMetaPath, err)
+			}
+			if meta.Index != testSnapIndex || meta.ShardID != testSnapShardID ||
+				meta.ReplicaID != testSnapReplicaID || meta.Term != reencryptTestTerm {
+				t.Fatalf("the surviving record lost the source identity: %+v", meta)
+			}
+		})
+	}
+}
