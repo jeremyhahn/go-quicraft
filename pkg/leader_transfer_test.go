@@ -216,18 +216,40 @@ func (c *transferCluster) transferNext() uint64 {
 	deadline := 10 * c.electionTimeout()
 	leaderID, fromTerm := c.agreedLeader(deadline)
 	target := leaderID%uint64(len(c.hosts)) + 1
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
-	err := c.hosts[leaderID-1].RequestLeaderTransfer(ctx, transferShard, target)
-	cancel()
-	if err != nil {
-		c.t.Fatalf("transfer to %d: request to leader %d at term %d: %v", target, leaderID, fromTerm, err)
-	}
+	// Under -race load a heartbeat can arrive late enough that a replica
+	// times out while the transfer is in flight: the election it starts
+	// supersedes the transfer and can re-elect the old leader in a newer
+	// term. That is Raft working as specified, not a transfer bug, so a
+	// transfer overtaken by an election is requested again of whichever
+	// replica leads now, toward the same target.
+	const attempts = 5
 	var id, term uint64
-	if waitUntil(deadline, func() bool {
-		id, term = c.leader(int(target - 1))
-		return id == target && term > fromTerm
-	}) {
-		return term
+	for attempt := range attempts {
+		if attempt > 0 {
+			leaderID, fromTerm = c.agreedLeader(deadline)
+			if leaderID == target {
+				return fromTerm
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), deadline)
+		err := c.hosts[leaderID-1].RequestLeaderTransfer(ctx, transferShard, target)
+		cancel()
+		if err != nil {
+			c.t.Fatalf("transfer to %d: request to leader %d at term %d: %v", target, leaderID, fromTerm, err)
+		}
+		superseded := false
+		if waitUntil(deadline, func() bool {
+			id, term = c.leader(int(target - 1))
+			superseded = id != 0 && id != target && term > fromTerm
+			return (id == target && term > fromTerm) || superseded
+		}) && !superseded {
+			return term
+		}
+		if !superseded {
+			break
+		}
+		c.t.Logf("transfer to %d: an election superseded the request to leader %d at term %d (now leader %d term %d); retrying",
+			target, leaderID, fromTerm, id, term)
 	}
 	c.t.Fatalf("transfer to %d: after %v replica %d reports leader %d term %d (requested of leader %d at term %d)",
 		target, deadline, target, id, term, leaderID, fromTerm)
