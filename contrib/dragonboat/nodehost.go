@@ -15,6 +15,7 @@
 package dragonboat
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -510,6 +511,12 @@ func (nh *NodeHost) checkTimeout(timeout time.Duration) error {
 // bound and calls the state machine's Lookup with no deadline, which is
 // also this adapter's default. A zero or negative duration restores that
 // default. This method is safe for concurrent use.
+//
+// Under a positive deadline a lookup that outlives it keeps running in the
+// background: a []byte query is copied first, so its buffer may be reused
+// after ErrTimeout, but a query of another type must not be mutated after
+// one. At most maxDetachedLookups such lookups run at once; a timed read
+// beyond that is refused with ErrSystemBusy.
 func (nh *NodeHost) SetQueryTimeout(d time.Duration) {
 	if d < 0 {
 		d = 0
@@ -1169,6 +1176,13 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 	// goroutine and stop waiting for it when the deadline passes. A lookup
 	// that outlives the deadline finishes in the background and its result
 	// is discarded.
+	//
+	// That lookup may still read the query after ErrTimeout returns, so
+	// it gets its own copy of a []byte query (and of the NAReadLocalNode
+	// key) and the caller may reuse its buffer at once. A query of any
+	// other type is passed as is: the caller must not mutate it after a
+	// timeout.
+	query = detachedQuery(query)
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	type lookupResult struct {
@@ -1204,6 +1218,20 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 		return r.val, nil
 	case <-ctx.Done():
 		return nil, translateError(ctx.Err())
+	}
+}
+
+// detachedQuery returns a copy of query that a lookup outliving its
+// caller's deadline can own: []byte and nalookup.Query keys are cloned,
+// any other value is returned unchanged.
+func detachedQuery(query interface{}) interface{} {
+	switch q := query.(type) {
+	case []byte:
+		return bytes.Clone(q)
+	case nalookup.Query:
+		return nalookup.Query{Key: bytes.Clone(q.Key)}
+	default:
+		return query
 	}
 }
 
