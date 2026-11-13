@@ -189,6 +189,10 @@ type NodeHost struct {
 	// SetQueryTimeout to opt into a bound.
 	queryTimeout atomic.Int64
 
+	// detachedLookups counts the timed local lookups whose state machine
+	// call has not returned yet, bounded by maxDetachedLookups.
+	detachedLookups atomic.Int64
+
 	// shardConfigs retains the dragonboat Config each shard was started
 	// with, keyed by shardID. OrderedConfigChange is only expressible in
 	// the dragonboat Config, and quicraft's host-level staleness check
@@ -1183,6 +1187,11 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 	// other type is passed as is: the caller must not mutate it after a
 	// timeout.
 	query = detachedQuery(query)
+	// Each lookup holds a slot until it actually returns, not until its
+	// caller stops waiting, so stuck lookups cannot pile up.
+	if !nh.acquireDetachedLookup() {
+		return nil, ErrSystemBusy
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	type lookupResult struct {
@@ -1193,6 +1202,7 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 	}
 	done := make(chan lookupResult, 1)
 	go func() {
+		defer nh.detachedLookups.Add(-1)
 		var r lookupResult
 		// A Lookup panic must not end the process from this goroutine,
 		// which no caller can recover: carry it back to the caller,
@@ -1232,6 +1242,21 @@ func detachedQuery(query interface{}) interface{} {
 		return nalookup.Query{Key: bytes.Clone(q.Key)}
 	default:
 		return query
+	}
+}
+
+// acquireDetachedLookup takes one of the maxDetachedLookups slots for a
+// timed local lookup, reporting false when all are taken. The lookup's
+// goroutine releases the slot when the state machine call returns.
+func (nh *NodeHost) acquireDetachedLookup() bool {
+	for {
+		n := nh.detachedLookups.Load()
+		if n >= maxDetachedLookups {
+			return false
+		}
+		if nh.detachedLookups.CompareAndSwap(n, n+1) {
+			return true
+		}
 	}
 }
 
