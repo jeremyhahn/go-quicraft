@@ -1920,6 +1920,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 					return snapshotIndex, compaction, nil
 				}
 			}
+			p.carryBootstrapForward(req.shardID, req.replicaID)
 			removeErr := p.logdb.RemoveEntriesTo(req.shardID, req.replicaID, compactIndex)
 			if removeErr != nil {
 				slog.Warn("log compaction remove failed",
@@ -3145,6 +3146,35 @@ func (p *snapshotPool) shardUsesBarrier(shardID uint64, target SnapshotBarrier) 
 // keep purging normally. In single-barrier mode every shard shares one keyring,
 // so there is no smaller scope to fall back to — suppression is host-wide by
 // construction, not by conservatism.
+// carryBootstrapForward rewrites the shard's bootstrap record, unchanged,
+// just before a snapshot's log removal when an encryption barrier is
+// configured. The bootstrap is written once, at the shard's first start, so
+// the WAL segment holding it (and every record sealed in that segment) is
+// otherwise retained forever: segment GC keeps it live, the WAL epoch floor
+// stays at the shard's first epoch, and no DEK is ever purged however many
+// times the key rotates. Rewriting it seals it under the current epoch in the
+// active segment, so the removal that follows can reclaim the old segment and
+// the floor can advance past epochs no retained record still uses.
+//
+// The rewrite is discretionary, like the compaction it precedes: an error is
+// logged and the bootstrap stays where it was, which only keeps the old floor.
+func (p *snapshotPool) carryBootstrapForward(shardID, replicaID uint64) {
+	if p.logdb == nil || (p.barrier == nil && p.shardBarriers == nil) {
+		return
+	}
+	bootstrap, ok, err := p.logdb.GetBootstrap(shardID, replicaID)
+	if err == nil && ok {
+		err = p.logdb.SaveBootstrap(shardID, replicaID, bootstrap)
+	}
+	if err != nil {
+		slog.Warn("bootstrap carry-forward failed; the WAL epoch floor stays put",
+			"shard_id", shardID,
+			"replica_id", replicaID,
+			"error", err,
+		)
+	}
+}
+
 func (p *snapshotPool) purgeOldEpochs(_ string, shardID, replicaID uint64) {
 	if p.shardBarriers == nil {
 		// Original global single-barrier path, unchanged.
