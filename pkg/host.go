@@ -5920,6 +5920,19 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 	return sm.Result{Value: result.Value, Data: result.Data}, nil
 }
 
+// syncReadLookupHook, when set, runs after SyncRead or SyncReadBuf has its
+// read index applied and before it takes the state machine's read guard.
+// Tests set it to hold an Update across the lookup stage; it is nil in
+// production, costing one atomic load per read.
+var syncReadLookupHook atomic.Pointer[func()]
+
+// runSyncReadLookupHook runs syncReadLookupHook if one is set.
+func runSyncReadLookupHook() {
+	if hook := syncReadLookupHook.Load(); hook != nil {
+		(*hook)()
+	}
+}
+
 // SyncRead performs a linearizable read in a single call. It confirms
 // leadership via ReadIndex, waits for the local SM to catch up, then
 // executes the query. This provides the strongest consistency guarantee:
@@ -5983,6 +5996,7 @@ lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 
 	// Step 3: Execute the query on the caught-up state machine.
 	ns, err := h.getNode(shardID)
@@ -6045,6 +6059,7 @@ lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, nopHostRelease, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 	ns, nsErr := h.getNode(shardID)
 	if nsErr != nil {
 		return nil, nopHostRelease, nsErr

@@ -437,3 +437,75 @@ func TestHostContextCancel(t *testing.T) {
 		})
 	}
 }
+
+// TestHostContextCancel_LookupStage cancels SyncRead and SyncReadBuf after
+// their read index has been applied, while an Update holds the state
+// machine's read guard, so they wait in the lookup itself rather than in
+// ReadIndex. syncReadLookupHook starts the blocking Update between the two
+// stages, which makes the ordering deterministic.
+func TestHostContextCancel_LookupStage(t *testing.T) {
+	newTestHost(t).Close()
+	calls := map[string]func(ctx context.Context, h *Host) error{
+		"SyncRead": func(ctx context.Context, h *Host) error {
+			_, err := h.SyncRead(ctx, 1, []byte("k"))
+			return err
+		},
+		"SyncReadBuf": func(ctx context.Context, h *Host) error {
+			_, release, err := h.SyncReadBuf(ctx, 1, []byte("k"))
+			release()
+			return err
+		},
+	}
+	for name, call := range calls {
+		t.Run(name, func(t *testing.T) {
+			base := runtime.NumGoroutine()
+			h, block, release := startBlockedShard(t)
+			var once sync.Once
+			var held atomic.Int64
+			hook := func() {
+				once.Do(func() {
+					block()
+					held.Store(int64(runtime.NumGoroutine()))
+				})
+			}
+			syncReadLookupHook.Store(&hook)
+			t.Cleanup(func() { syncReadLookupHook.Store(nil) })
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- call(ctx, h) }()
+			deadline := time.Now().Add(contextCancelBound)
+			for held.Load() == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if held.Load() == 0 {
+				t.Fatalf("%s did not reach the lookup stage within %v", name, contextCancelBound)
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("%s returned %v with the read guard held, want it pending in the lookup", name, err)
+			case <-time.After(50 * time.Millisecond):
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !isContextCancelErr(err) {
+					t.Errorf("%s cancelled in the lookup returned %v, want ErrCanceled and context.Canceled", name, err)
+				}
+			case <-time.After(contextCancelBound):
+				t.Fatalf("%s cancelled in the lookup did not return within %v", name, contextCancelBound)
+			}
+			// The call's own goroutine has exited; nothing it started may
+			// still wait on the guard the Update holds.
+			if n, ok := contextCancelSettle(int(held.Load()) - 1); !ok {
+				t.Errorf("%s left goroutines behind the held Update: %d, want <= %d", name, n, held.Load()-1)
+			}
+			release()
+			h.Close()
+			if n, ok := contextCancelSettle(base); !ok {
+				t.Errorf("%s left goroutines behind: %d, want <= %d", name, n, base)
+			}
+		})
+	}
+}
