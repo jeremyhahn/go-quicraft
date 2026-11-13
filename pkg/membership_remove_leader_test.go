@@ -123,6 +123,43 @@ func (c *removeLeaderCluster) put(h *Host, key, value string) {
 	}
 }
 
+// putOnLeader proposes a put through whichever of ids currently leads,
+// retrying on ErrNotLeader until ctx ends. A freshly elected leader can lose
+// quorum while the transport settles; a retried put of the same value is
+// idempotent, so an attempt that committed despite the error is harmless.
+func (c *removeLeaderCluster) putOnLeader(ctx context.Context, ids []uint64, key, value string) {
+	c.t.Helper()
+	cmd, err := kv.EncodePut([]byte(key), []byte(value))
+	if err != nil {
+		c.t.Fatalf("EncodePut(%q): %v", key, err)
+	}
+	for {
+		_, h, ok := c.leaderAmong(ids, time.Until(deadlineOf(ctx)))
+		if !ok {
+			c.t.Fatalf("SyncPropose(%q): no leader among %v before the deadline", key, ids)
+		}
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err := h.SyncPropose(pctx, removeLeaderShard, cmd)
+		cancel()
+		switch {
+		case err == nil:
+			return
+		case errors.Is(err, ErrNotLeader) && ctx.Err() == nil:
+			continue
+		default:
+			c.t.Fatalf("SyncPropose(%q): %v", key, err)
+		}
+	}
+}
+
+// deadlineOf returns ctx's deadline, or a point 20 s away when it has none.
+func deadlineOf(ctx context.Context) time.Time {
+	if d, ok := ctx.Deadline(); ok {
+		return d
+	}
+	return time.Now().Add(20 * time.Second)
+}
+
 // checkRead reads key through a linearizable SyncRead on h and fails the
 // test unless it returns value.
 func (c *removeLeaderCluster) checkRead(h *Host, key, value string) {
@@ -142,15 +179,17 @@ func (c *removeLeaderCluster) checkRead(h *Host, key, value string) {
 func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	c := newRemoveLeaderCluster(t)
 	all := []uint64{1, 2, 3}
+	// 30 acknowledged puts through the current leader. Leadership may move
+	// while the transport settles; the leader to remove is chosen after.
+	const before = 30
+	pctx0, pcancel0 := context.WithTimeout(context.Background(), 20*time.Second)
+	for i := range before {
+		c.putOnLeader(pctx0, all, fmt.Sprintf("key-%02d", i), fmt.Sprintf("before-%02d", i))
+	}
+	pcancel0()
 	oldID, oldHost, ok := c.leaderAmong(all, 20*time.Second)
 	if !ok {
-		t.Fatal("the shard never elected a leader")
-	}
-
-	// 30 acknowledged puts through the leader.
-	const before = 30
-	for i := range before {
-		c.put(oldHost, fmt.Sprintf("key-%02d", i), fmt.Sprintf("before-%02d", i))
+		t.Fatal("the shard has no leader after the initial puts")
 	}
 
 	// (a) The leader removes its own replica.
@@ -162,7 +201,49 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	}
 	removedAt := time.Now()
 
-	// (d) From here on, the removed host must never report itself leader.
+	survivors := make([]uint64, 0, 2)
+	for _, id := range all {
+		if id != oldID {
+			survivors = append(survivors, id)
+		}
+	}
+	// A randomized election timeout lies in [T, 2T); the bound allows the
+	// step-down, one split vote and scheduling under -race on top of that.
+	bound := 20 * c.electionTimeout()
+
+	// Neither a nil return nor a MaybeApplied timeout from
+	// SyncRequestRemoveNode synchronizes with the removal's commit, so
+	// confirm it: a survivor's committed membership records the old leader
+	// as removed. Survivors may learn the commit index only from the next
+	// leader, so the bound covers an election.
+	if !waitUntil(bound, func() bool {
+		for _, rid := range survivors {
+			m, err := c.hosts[rid-1].ShardMembership(removeLeaderShard)
+			if err != nil {
+				continue
+			}
+			if _, removed := m.Removed[oldID]; removed {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no survivor of %v recorded leader %d as removed within %v", survivors, oldID, bound)
+	}
+
+	// Peer.Commit steps the leader down, but the Host's cached IsLeader flag
+	// is updated later by the step worker's listener dispatch. Wait, with a
+	// bound, for the old host to publish that initial step-down before
+	// watching for renewed leadership.
+	const stepDownBound = 5 * time.Second
+	if !waitUntil(stepDownBound, func() bool {
+		info, err := oldHost.ShardInfo(removeLeaderShard)
+		return err != nil || !info.IsLeader
+	}) {
+		t.Fatalf("removed leader %d still reported itself leader %v after its removal committed", oldID, stepDownBound)
+	}
+
+	// (d) From here on, the removed host must never report itself leader again.
 	var sawLeader atomic.Bool
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -192,17 +273,7 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	}
 	defer stopWatch()
 
-	survivors := make([]uint64, 0, 2)
-	for _, id := range all {
-		if id != oldID {
-			survivors = append(survivors, id)
-		}
-	}
-
 	// (b) The survivors elect a new leader within the election-timeout bound.
-	// A randomized election timeout lies in [T, 2T); the bound allows the
-	// step-down, one split vote and scheduling under -race on top of that.
-	bound := 20 * c.electionTimeout()
 	newID, newHost, ok := c.leaderAmong(survivors, bound)
 	if !ok {
 		t.Fatalf("the survivors %v elected no leader within %v of the removal", survivors, bound)
