@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -166,6 +167,62 @@ type concurrentProposeCluster struct {
 
 	mu       sync.Mutex
 	machines map[uint64]*recordingStateMachine
+	// preRestart is each replica's counts as the workload left them,
+	// saved by restart after every host closed and before log replay
+	// rebuilds the machines.
+	preRestart map[uint64]map[string]int
+	// down marks hosts closed by closeHost; restart saves it in
+	// preRestartDown and clears it.
+	down           map[int]bool
+	preRestartDown map[uint64]bool
+}
+
+// closeHost closes h before the drain restart and marks it down: its
+// replica's counts stay where the close left them.
+func (c *concurrentProposeCluster) closeHost(t *testing.T, h *Host) {
+	t.Helper()
+	for i, x := range c.hosts {
+		if x != h {
+			continue
+		}
+		if err := h.Close(); err != nil {
+			t.Fatalf("Close host %d: %v", i, err)
+		}
+		c.mu.Lock()
+		c.down[i] = true
+		c.mu.Unlock()
+		return
+	}
+	t.Fatal("closeHost: host is not in the cluster")
+}
+
+// agreedLocked reports whether every live replica holds the same counts
+// and every down replica's counts are a subset of them, which is what a
+// replica that stopped early can hold. c.mu must be held.
+func (c *concurrentProposeCluster) agreedLocked() bool {
+	var ref map[string]int
+	for id, m := range c.machines {
+		if c.down[int(id-1)] {
+			continue
+		}
+		s := m.snapshot()
+		if ref == nil {
+			ref = s
+		} else if !maps.Equal(ref, s) {
+			return false
+		}
+	}
+	for id, m := range c.machines {
+		if !c.down[int(id-1)] {
+			continue
+		}
+		for k, n := range m.snapshot() {
+			if ref[k] != n {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // newConcurrentProposeCluster creates the three hosts; no shard is started.
@@ -178,6 +235,7 @@ func newConcurrentProposeCluster(t *testing.T) *concurrentProposeCluster {
 		ids:      make(map[uint64]string, 3),
 		gate:     newApplyGate(),
 		machines: make(map[uint64]*recordingStateMachine, 3),
+		down:     make(map[int]bool, 3),
 	}
 	t.Cleanup(func() {
 		for _, h := range c.hosts {
@@ -257,13 +315,30 @@ func (c *concurrentProposeCluster) waitLeader(t *testing.T) *Host {
 func (c *concurrentProposeCluster) restart(t *testing.T) {
 	t.Helper()
 	c.gate.open()
+	// Let the live replicas finish applying what is committed, so a
+	// follower that is merely behind is not read as divergent. A real
+	// divergence never settles and the pre-restart check reports it.
+	waitUntil(10*time.Second, func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.agreedLocked()
+	})
 	for i, h := range c.hosts {
 		if err := h.Close(); err != nil {
 			t.Fatalf("Close[%d]: %v", i, err)
 		}
 	}
+	// Every host is closed, so no apply can still run: these are the
+	// counts the workload itself produced, before replay replaces them.
 	c.mu.Lock()
+	c.preRestart = make(map[uint64]map[string]int, len(c.machines))
+	c.preRestartDown = make(map[uint64]bool, len(c.machines))
+	for id, m := range c.machines {
+		c.preRestart[id] = m.snapshot()
+		c.preRestartDown[id] = c.down[int(id-1)]
+	}
 	clear(c.machines)
+	clear(c.down)
 	c.mu.Unlock()
 	for i, cfg := range c.cfgs {
 		h, err := NewHost(cfg, WithoutEncryption())
@@ -395,6 +470,7 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 	}
 
 	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	concurrentProposeCheckPreRestart(t, c, out)
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
 	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
@@ -426,6 +502,71 @@ func concurrentProposeDrain(ctx context.Context, t *testing.T, c *concurrentProp
 // concurrentProposeCheck asserts each replica applied every key within its
 // class's bound (see proposeOutcomes), the acknowledged barrier exactly once,
 // every other barrier attempt at most once, and nothing else.
+// concurrentProposeCheckPreRestart asserts on the counts the workload's own
+// state machines held when restart closed the hosts: every acknowledged key
+// applied exactly once (on a replica closed mid-workload, at most once), no
+// key more than once, no refused key at all, the same count per key on every
+// live replica, and a down replica's counts a subset of theirs. Replay after the restart applies
+// each persisted entry once, so only these counts can show a duplicate apply
+// or a divergence during the concurrent workload.
+func concurrentProposeCheckPreRestart(t *testing.T, c *concurrentProposeCluster, out *proposeOutcomes) {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.preRestart) != 3 {
+		t.Fatalf("%d replicas' counts were saved before the restart, want 3", len(c.preRestart))
+	}
+	var ref map[string]int
+	var refID uint64
+	for id, applied := range c.preRestart {
+		down := c.preRestartDown[id]
+		if !down && ref == nil {
+			ref, refID = applied, id
+		}
+		for key := range out.acked {
+			// A replica closed mid-workload may stop short of the
+			// entries acknowledged after it; a live one may not.
+			if n := applied[key]; n != 1 && (!down || n > 1) {
+				t.Errorf("before restart replica %d (down=%v) applied acknowledged key %s %d times, want 1", id, down, key, n)
+			}
+		}
+		for key, n := range applied {
+			if n > 1 {
+				t.Errorf("before restart replica %d applied key %s %d times, want at most 1", id, key, n)
+			}
+			_, acked := out.acked[key]
+			_, maybe := out.maybe[key]
+			if _, ok := out.refused[key]; ok {
+				t.Errorf("before restart replica %d applied key %s refused before submission (%d times), want 0", id, key, n)
+			} else if !acked && !maybe {
+				t.Errorf("before restart replica %d applied unacknowledged key %s (%d times)", id, key, n)
+			}
+		}
+	}
+	if ref == nil {
+		t.Fatal("no replica was live at the restart")
+	}
+	for id, applied := range c.preRestart {
+		if id == refID {
+			continue
+		}
+		down := c.preRestartDown[id]
+		for key, n := range applied {
+			if ref[key] != n {
+				t.Errorf("before restart replica %d applied key %s %d times, replica %d %d times", id, key, n, refID, ref[key])
+			}
+		}
+		if down {
+			continue
+		}
+		for key, n := range ref {
+			if applied[key] != n {
+				t.Errorf("before restart replica %d applied key %s %d times, replica %d %d times", id, key, applied[key], refID, n)
+			}
+		}
+	}
+}
+
 func concurrentProposeCheck(t *testing.T, c *concurrentProposeCluster, out *proposeOutcomes, barrierKey string, barriers map[string]struct{}) {
 	t.Helper()
 	c.mu.Lock()

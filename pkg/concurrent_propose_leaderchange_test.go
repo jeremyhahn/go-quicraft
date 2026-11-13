@@ -103,9 +103,7 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 		if id == leaderID {
 			continue
 		}
-		if err := c.hosts[id-1].Close(); err != nil {
-			t.Fatalf("Close follower host %d: %v", id, err)
-		}
+		c.closeHost(t, c.hosts[id-1])
 	}
 	if !waitUntil(30*time.Second, func() bool {
 		info, err := leader.ShardInfo(concurrentProposeShard)
@@ -137,6 +135,7 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	}
 
 	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	concurrentProposeCheckPreRestart(t, c, out)
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
 	concurrentProposeSameCount(t, c, heldKeys)
@@ -212,9 +211,7 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	}
 	out.record("acked-00", nil)
 
-	if err := leader.Close(); err != nil {
-		t.Fatalf("Close leader host %d: %v", leaderID, err)
-	}
+	c.closeHost(t, leader)
 	const orphans = 8
 	orphanCtx, cancelOrphans := context.WithCancel(ctx)
 	defer cancelOrphans()
@@ -256,6 +253,7 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	}
 
 	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	concurrentProposeCheckPreRestart(t, c, out)
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
 	concurrentProposeSameCount(t, c, keys)
