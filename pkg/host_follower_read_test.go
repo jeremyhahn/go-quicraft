@@ -288,11 +288,20 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 		var (
 			mu   sync.Mutex
 			last acked
+			// unresolved holds the values of writes whose SyncPropose
+			// failed, keyed to the error.
+			unresolved = make(map[int]error)
 		)
 		snapshot := func() acked {
 			mu.Lock()
 			defer mu.Unlock()
 			return last
+		}
+		isUnresolved := func(v int) (error, bool) {
+			mu.Lock()
+			defer mu.Unlock()
+			err, ok := unresolved[v]
+			return err, ok
 		}
 
 		li, _ := c.put(t, "followers", "1")
@@ -317,12 +326,20 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 					return
 				default:
 				}
-				if _, index, err := c.tryPut(key, strconv.Itoa(v)); err == nil {
-					mu.Lock()
+				// Every attempt writes a fresh value. A failed attempt has an
+				// unknown outcome: its entry may still commit, after later
+				// acknowledged writes, so its value is recorded as one a
+				// read may legitimately return out of order.
+				_, index, err := c.tryPut(key, strconv.Itoa(v))
+				mu.Lock()
+				if err == nil {
 					last = acked{value: v, index: index}
-					mu.Unlock()
-					v++
 				} else {
+					unresolved[v] = err
+				}
+				mu.Unlock()
+				v++
+				if err != nil {
 					time.Sleep(time.Millisecond)
 				}
 			}
@@ -363,6 +380,12 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 						fail("FollowerRead = %q, not a written value", got)
 						continue
 					}
+					if _, late := isUnresolved(v); late {
+						// A failed write landing after later ones; its
+						// order against them is not defined.
+						reads[r]++
+						continue
+					}
 					if v < snap.value {
 						fail("FollowerRead = %d, older than %d acknowledged at commit index %d before the read",
 							v, snap.value, snap.index)
@@ -393,7 +416,10 @@ func TestFollowerRead_RealFollowerReturnsEveryWriteCommittedBeforeTheRead(t *tes
 		if !enough {
 			t.Errorf("the writer acknowledged only %d writes in 30s", snapshot().value)
 		}
-		t.Logf("%d writes acknowledged; checked reads per follower %v", snapshot().value, reads)
+		mu.Lock()
+		t.Logf("%d writes acknowledged; checked reads per follower %v; failed writes %v",
+			last.value, reads, unresolved)
+		mu.Unlock()
 	})
 
 	t.Run("a read on a follower whose apply lags its known commit waits and returns the new value", func(t *testing.T) {
