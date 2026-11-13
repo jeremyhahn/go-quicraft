@@ -829,6 +829,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			ShardID:   hdr.ShardID,
 			ReplicaID: hdr.ReplicaID,
 			Index:     hdr.Index,
+			From:      hdr.From,
 		})
 		received := len(chunks)
 		supervise.LogContained(func() {
@@ -859,7 +860,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 				slog.Info("snapshot received",
 					"shard", hdr.ShardID, "replica", hdr.ReplicaID, "index", hdr.Index, "chunks", n)
 			})
-			info := config.SnapshotInfo{ShardID: hdr.ShardID, ReplicaID: hdr.ReplicaID, Index: hdr.Index}
+			info := config.SnapshotInfo{ShardID: hdr.ShardID, ReplicaID: hdr.ReplicaID, Index: hdr.Index, From: hdr.From}
 			var notify, observe func()
 			if l := sr.listener; l != nil && l.OnSnapshotReceived != nil {
 				cb := l.OnSnapshotReceived
@@ -889,6 +890,7 @@ func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason snapshotR
 		ShardID:   hdr.ShardID,
 		ReplicaID: hdr.ReplicaID,
 		Index:     hdr.Index,
+		From:      hdr.From,
 		Err:       err,
 	})
 	shardID, replicaID, index, chunkCount := hdr.ShardID, hdr.ReplicaID, hdr.Index, hdr.ChunkCount
@@ -938,7 +940,7 @@ func (sr *snapshotReceiver) rejectAuthorizedStream(reason snapshotRejectReason, 
 func (sr *snapshotReceiver) rejectStream(reason snapshotRejectReason, detail string, hdr *SnapshotHeader, countedShard uint64, err error, level slog.Level) {
 	info := config.SnapshotInfo{Err: err}
 	if hdr != nil {
-		info.ShardID, info.ReplicaID, info.Index = hdr.ShardID, hdr.ReplicaID, hdr.Index
+		info.ShardID, info.ReplicaID, info.Index, info.From = hdr.ShardID, hdr.ReplicaID, hdr.Index, hdr.From
 	}
 	// Reported first, then the diagnostic (contained) and the metric: see
 	// rejectSnapshot.
