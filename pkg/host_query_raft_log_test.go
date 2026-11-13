@@ -111,13 +111,21 @@ func TestQueryRaftLogMaxSize_ReturnsContiguousPrefixWithinBudget(t *testing.T) {
 		t.Fatalf("QueryRaftLog with maxSize %d returned all %d entries of %d bytes: the size limit was ignored",
 			maxSize, len(entries), queryRaftLogCmdSize)
 	}
+	// The budget charges logdb.EntryOverheadBytes plus len(Cmd) per entry
+	// (the IterateEntries contract), so 4,096 bytes holds three 1,024-byte
+	// commands (3,324 charged bytes) and not a fourth (4,432).
 	var total int
 	for i := range entries {
-		total += len(entries[i].Cmd)
+		total += logdb.EntryOverheadBytes + len(entries[i].Cmd)
 	}
 	if total > maxSize && len(entries) > 1 {
-		t.Fatalf("QueryRaftLog returned %d entries totalling %d Cmd bytes, want at most %d (or a single entry)",
-			len(entries), total, maxSize)
+		t.Fatalf("QueryRaftLog returned %d entries charging %d bytes (%d overhead + Cmd each), want at most %d (or a single entry)",
+			len(entries), total, logdb.EntryOverheadBytes, maxSize)
+	}
+	const wantEntries = maxSize / (logdb.EntryOverheadBytes + queryRaftLogCmdSize)
+	if len(entries) != wantEntries {
+		t.Fatalf("QueryRaftLog with maxSize %d returned %d entries of %d+%d charged bytes, want exactly %d",
+			maxSize, len(entries), logdb.EntryOverheadBytes, queryRaftLogCmdSize, wantEntries)
 	}
 
 	// A budget smaller than one entry still returns that one entry.
