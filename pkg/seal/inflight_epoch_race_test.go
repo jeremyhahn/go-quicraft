@@ -111,10 +111,34 @@ func inFlightEpochRaceWaitGoroutines(ctx context.Context, t *testing.T, baseline
 	}
 }
 
-func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+// inFlightEpochRaceSealFunc seals one frame and holds an in-flight pin on
+// the epoch it was sealed under.
+type inFlightEpochRaceSealFunc func(ctx context.Context, b *Barrier, plaintext []byte) (inFlightEpochRaceFrame, error)
 
+// TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge runs the race once
+// per pinning API, each on its own barrier with only that API's workers, so
+// neither API's pins can protect the other's ciphertexts.
+func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seal inFlightEpochRaceSealFunc
+	}{
+		{name: "EncryptWithEpochPinned", seal: inFlightEpochRaceSealPinned},
+		{name: "RegisterInFlightEpoch", seal: inFlightEpochRaceSealRegistered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			inFlightEpochRaceRun(ctx, t, tc.seal)
+		})
+	}
+}
+
+// inFlightEpochRaceRun races workers sealing with seal against a rotator and
+// a background purger on a fresh barrier, then checks that the pins seal
+// holds, and only those, kept the old epoch across a completed purge.
+func inFlightEpochRaceRun(ctx context.Context, t *testing.T, seal inFlightEpochRaceSealFunc) {
+	t.Helper()
 	b, _ := testInitializedBarrier(t)
 	defer func() { _ = b.Seal() }()
 
@@ -167,7 +191,7 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 		defer racing.Done()
 		defer closeFirstRotated()
 		// Rotate only once every worker keeps a pin sealed under the
-		// initial epoch, so each encryption mode holds an old-epoch pin
+		// initial epoch, so the API under test holds old-epoch pins
 		// across the purges.
 		select {
 		case <-startedCh:
@@ -220,10 +244,6 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 		workers.Add(1)
 		go func(w int) {
 			defer workers.Done()
-			seal := inFlightEpochRaceSealPinned
-			if w%2 == 1 {
-				seal = inFlightEpochRaceSealRegistered
-			}
 			signalled := false
 			signalStarted := func() {
 				if !signalled {
@@ -281,50 +301,78 @@ func TestBarrier_InFlightEpochRace_PinsSurviveRotateAndPurge(t *testing.T) {
 		}(w)
 	}
 
-	racing.Wait()
-	if overlapPurges.Load() == 0 {
+	flushErrs := func() {
 		errMu.Lock()
 		for _, err := range errs {
 			t.Error(err)
 		}
+		errs = nil
 		errMu.Unlock()
+	}
+
+	racing.Wait()
+	if overlapPurges.Load() == 0 {
+		flushErrs()
 		t.Fatalf("no background purge ran after a rotation with the epoch-%d pins held", initialEpoch)
 	}
 	// sealed.Wait orders every worker's appends to frames before the reads
 	// below.
 	sealed.Wait()
 	// One more purge with the remaining pins still held: pinned epochs stay.
-	if _, err := b.PurgeEpochsBefore(ctx, b.CurrentEpoch()); err != nil {
+	afterPurge := b.CurrentEpoch()
+	if afterPurge <= initialEpoch {
+		flushErrs()
+		t.Fatalf("CurrentEpoch = %d, want past the pinned epoch %d before the purge", afterPurge, initialEpoch)
+	}
+	if _, err := b.PurgeEpochsBefore(ctx, afterPurge); err != nil {
 		t.Fatalf("PurgeEpochsBefore with pins held: %v", err)
 	}
-	// (a) each encryption mode still holds a pin on an epoch older than the
-	// current one across the completed purges, and every such frame still
-	// decrypts: reference protection, not currency, kept those epochs.
-	afterPurge := b.CurrentEpoch()
-	var retainedPinned, retainedRegistered int
+	// (a) the in-flight table holds exactly the references these workers
+	// still hold, at least one of them on the old initial epoch, and every
+	// frame on an old epoch still decrypts: reference protection by this
+	// API alone, not currency, kept those epochs.
+	held := make(map[uint64]int)
 	for w := range frames {
 		for i, f := range frames[w] {
-			if !f.pinned || f.epoch >= afterPurge {
+			if !f.pinned {
 				continue
 			}
-			if w%2 == 1 {
-				retainedRegistered++
-			} else {
-				retainedPinned++
+			held[f.epoch]++
+			if f.epoch >= afterPurge {
+				continue
 			}
 			if err := inFlightEpochRaceCheckDecrypt(ctx, b, f); err != nil {
 				t.Errorf("worker %d frame %d pinned on old epoch %d after purge: %v", w, i, f.epoch, err)
 			}
 		}
 	}
-	if retainedPinned == 0 || retainedRegistered == 0 {
-		errMu.Lock()
-		for _, err := range errs {
-			t.Error(err)
+	inFlight := inFlightEpochRaceInFlightLen(ctx, t, b)
+	if held[initialEpoch] == 0 {
+		flushErrs()
+		t.Fatalf("no pin held on old epoch %d across the purge (current epoch %d)", initialEpoch, afterPurge)
+	}
+	if inFlight[initialEpoch] != held[initialEpoch] {
+		t.Errorf("in-flight references on old epoch %d = %d, want %d held pins", initialEpoch, inFlight[initialEpoch], held[initialEpoch])
+	}
+	for e, n := range held {
+		if inFlight[e] != n {
+			t.Errorf("in-flight references on epoch %d = %d, want %d held pins", e, inFlight[e], n)
 		}
-		errMu.Unlock()
-		t.Fatalf("old-epoch pins held across the purge (current epoch %d): EncryptWithEpochPinned %d, RegisterInFlightEpoch %d; want both > 0",
-			afterPurge, retainedPinned, retainedRegistered)
+	}
+	for e, n := range inFlight {
+		if held[e] == 0 {
+			t.Errorf("in-flight references on epoch %d = %d, want none held", e, n)
+		}
+	}
+	b.mu.RLock()
+	_, kept := b.deks[initialEpoch]
+	b.mu.RUnlock()
+	if !kept {
+		t.Errorf("purge at current epoch %d removed the pinned epoch %d", afterPurge, initialEpoch)
+	}
+	if t.Failed() {
+		flushErrs()
+		t.FailNow()
 	}
 	releaseWorkers()
 	workers.Wait()

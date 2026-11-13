@@ -25,5 +25,15 @@ pin is the only thing keeping it: once every pin is released with
    fails with `ErrDecryptionFailed`.
 5. The in-flight table is empty and no test goroutine is left running.
 
+The race runs as two subtests, one per pinning API (`EncryptWithEpochPinned`
+and `RegisterInFlightEpoch`), each on its own fresh barrier with only that
+API's workers. Sharing one barrier let either API's pins on the initial epoch
+protect the other's ciphertexts, so an API that stopped pinning would still
+pass. Before the pins are released, each subtest asserts that a purge
+completed with the current epoch past the initial one, that the in-flight
+table's reference count on every epoch equals the pins the workers still hold
+(more than zero on the initial epoch), and that every frame on an old epoch
+still decrypts.
+
 A divergence between the code and its documentation is a bug: a failing test
 commit, then a fix commit in pkg/seal/barrier.go.
