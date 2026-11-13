@@ -498,7 +498,9 @@ func (m *MemDB) ReadState(shardID uint64, replicaID uint64) (logdb.State, logdb.
 		return logdb.State{}, logdb.Membership{}, logdb.ErrNoState
 	}
 
-	return nd.state, nd.membership, nil
+	// A copy, as in GetSnapshot: the stored membership is shared with the
+	// stored snapshot, so an edit through it would rewrite both.
+	return nd.state, copyMembership(nd.membership), nil
 }
 
 // EntryRange returns the first index and the contiguous span of available
@@ -664,7 +666,12 @@ func (m *MemDB) GetSnapshot(shardID uint64, replicaID uint64) (logdb.Snapshot, e
 		return logdb.Snapshot{}, logdb.ErrNoSnapshot
 	}
 
-	return nd.snapshot, nil
+	// The maps are copied on the way out for the same reason they are copied
+	// on the way in: what the caller gets is the caller's to change, and an
+	// edit must never reach the stored record (as in waldb).
+	snap := nd.snapshot
+	snap.Membership = copyMembership(nd.snapshot.Membership)
+	return snap, nil
 }
 
 // RemoveNodeData removes all data for the given node and retires its replica
@@ -771,7 +778,10 @@ func (m *MemDB) GetBootstrap(shardID uint64, replicaID uint64) (logdb.Bootstrap,
 		return logdb.Bootstrap{}, false, nil
 	}
 
-	return nd.bootstrap, true, nil
+	// A copy, as in GetSnapshot: the caller owns the returned Addresses.
+	boot := nd.bootstrap
+	boot.Addresses = copyAddrMap(nd.bootstrap.Addresses)
+	return boot, true, nil
 }
 
 // getNode returns the nodeData for the given key, or nil if it does not exist.
