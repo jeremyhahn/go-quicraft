@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
-	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -196,33 +195,24 @@ func (c *concurrentProposeCluster) closeHost(t *testing.T, h *Host) {
 	t.Fatal("closeHost: host is not in the cluster")
 }
 
-// agreedLocked reports whether every live replica holds the same counts
-// and every down replica's counts are a subset of them, which is what a
-// replica that stopped early can hold. c.mu must be held.
-func (c *concurrentProposeCluster) agreedLocked() bool {
-	var ref map[string]int
+// ackedFenceLocked returns "" once every live replica's own state machine
+// has applied every acknowledged key, and otherwise names one replica and
+// key still missing. An acknowledged entry is committed, so every replica
+// that stays up applies it; one that never does skipped a committed entry.
+// c.mu must be held.
+func (c *concurrentProposeCluster) ackedFenceLocked(acked map[string]struct{}) string {
 	for id, m := range c.machines {
 		if c.down[int(id-1)] {
 			continue
 		}
-		s := m.snapshot()
-		if ref == nil {
-			ref = s
-		} else if !maps.Equal(ref, s) {
-			return false
-		}
-	}
-	for id, m := range c.machines {
-		if !c.down[int(id-1)] {
-			continue
-		}
-		for k, n := range m.snapshot() {
-			if ref[k] != n {
-				return false
+		applied := m.snapshot()
+		for key := range acked {
+			if applied[key] == 0 {
+				return fmt.Sprintf("replica %d has not applied acknowledged key %s", id, key)
 			}
 		}
 	}
-	return true
+	return ""
 }
 
 // newConcurrentProposeCluster creates the three hosts; no shard is started.
@@ -312,19 +302,24 @@ func (c *concurrentProposeCluster) waitLeader(t *testing.T) *Host {
 // restart closes every host, then brings each back from its own WALDir and
 // NodeHostDir at the same address with a fresh state machine, which replays
 // what the replica's snapshot and log hold. No caller may be proposing.
-func (c *concurrentProposeCluster) restart(t *testing.T) {
+func (c *concurrentProposeCluster) restart(t *testing.T, acked map[string]struct{}) {
 	t.Helper()
 	c.gate.open()
-	// Let the live replicas finish applying what is committed, so a
-	// follower that is merely behind holds as much of the workload as it
-	// can before its host closes. This is best effort: a proposal still in
-	// flight can apply on the remaining quorum while the hosts close one at
-	// a time, so replicas are compared only after the restart.
-	waitUntil(10*time.Second, func() bool {
+	// Fence the live replicas at the acknowledged prefix before any host
+	// closes: each workload state machine must itself have applied every
+	// acknowledged key, so concurrentProposeCheckPreRestart checks the
+	// pipeline's own applies and not what replay later repairs. Proposals
+	// still in flight (MaybeApplied) may apply on some replicas and not
+	// others while the hosts close one at a time; they are not fenced.
+	var missing string
+	if !waitUntil(30*time.Second, func() bool {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		return c.agreedLocked()
-	})
+		missing = c.ackedFenceLocked(acked)
+		return missing == ""
+	}) {
+		t.Fatalf("live replicas never reached the acknowledged prefix before the restart: %s", missing)
+	}
 	for i, h := range c.hosts {
 		if err := h.Close(); err != nil {
 			t.Fatalf("Close[%d]: %v", i, err)
@@ -471,7 +466,7 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 			len(out.maybe), len(out.refused))
 	}
 
-	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c, out)
 	concurrentProposeCheckPreRestart(t, c, out)
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
@@ -495,9 +490,9 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 // log with no caller proposing, so the only workload entries that can ever
 // commit are those already in a replica's log, and a barrier through the
 // restarted leader commits after every one of them that will.
-func concurrentProposeDrain(ctx context.Context, t *testing.T, c *concurrentProposeCluster) (string, map[string]struct{}, uint64) {
+func concurrentProposeDrain(ctx context.Context, t *testing.T, c *concurrentProposeCluster, out *proposeOutcomes) (string, map[string]struct{}, uint64) {
 	t.Helper()
-	c.restart(t)
+	c.restart(t, out.acked)
 	return concurrentProposeBarrier(ctx, t, c.hosts)
 }
 
@@ -506,10 +501,12 @@ func concurrentProposeDrain(ctx context.Context, t *testing.T, c *concurrentProp
 // every other barrier attempt at most once, and nothing else, and that
 // every replica holds the same count for every key.
 // concurrentProposeCheckPreRestart asserts on the counts the workload's own
-// state machines held when restart closed the hosts: no key applied more
-// than once and no refused or unsubmitted key at all. Replay after the
-// restart applies each persisted entry once, so only these counts can show a
-// duplicate apply during the concurrent workload. It does not compare the
+// state machines held when restart closed the hosts: every acknowledged key
+// applied exactly once on each live replica (on a replica closed
+// mid-workload, at most once), no key more than once, and no refused or
+// unsubmitted key at all. Replay after the restart applies each persisted
+// entry once and would repair a skipped apply, so only these counts can show
+// a lost or duplicate apply during the concurrent workload. It does not compare the
 // replicas with each other: restart closes the hosts one at a time, and a
 // MaybeApplied proposal still in flight can commit and apply on the
 // remaining quorum after the first host has stopped, so the saved prefixes
@@ -524,6 +521,14 @@ func concurrentProposeCheckPreRestart(t *testing.T, c *concurrentProposeCluster,
 	}
 	for id, applied := range c.preRestart {
 		down := c.preRestartDown[id]
+		for key := range out.acked {
+			// restart fenced every live replica at the acknowledged
+			// prefix; a replica closed mid-workload may stop short of the
+			// entries acknowledged after it.
+			if n := applied[key]; n != 1 && (!down || n > 1) {
+				t.Errorf("before restart replica %d (down=%v) applied acknowledged key %s %d times, want 1", id, down, key, n)
+			}
+		}
 		for key, n := range applied {
 			if n > 1 {
 				t.Errorf("before restart replica %d (down=%v) applied key %s %d times, want at most 1", id, down, key, n)

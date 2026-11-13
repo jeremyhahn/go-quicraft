@@ -150,7 +150,7 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 			len(out.acked), len(out.maybe), len(out.refused))
 	}
 
-	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c, out)
 	concurrentProposeCheckPreRestart(t, c, out)
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
@@ -268,7 +268,7 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 		t.Errorf("SyncPropose(%s): %v", key, err)
 	}
 
-	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c, out)
 	concurrentProposeCheckPreRestart(t, c, out)
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
