@@ -164,5 +164,5 @@ func landingOverflowActiveSegment(db *DB) uint64 {
 	s := db.shards[1%DefaultShardCount]
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return uint64(s.activeSegmentID)
+	return s.activeSegmentID
 }
