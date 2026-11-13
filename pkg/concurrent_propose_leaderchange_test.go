@@ -16,7 +16,6 @@ package quicraft
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -29,14 +28,15 @@ import (
 //   - refused: replica 1 runs the shard alone, so no leader can be elected
 //     and Host.Propose refuses before submission;
 //   - acked: proposals at the elected leader;
-//   - maybe: the leader's apply is held at a gate, proposals behind it
-//     commit (a follower applies them) but cannot complete, and a
-//     RequestLeaderTransfer moves leadership away, which fails every
-//     handed-off pending proposal MaybeApplied.
+//   - maybe: the leader's apply is held at a gate and proposals queue
+//     behind it (a host whose apply is held replicates no new entries);
+//     both followers are stopped, the leader steps down on CheckQuorum,
+//     and cancelling the held calls fails them MaybeApplied.
 //
 // The cluster is then drained and checked with the same bounds as the
-// workload test, and every held proposal, whose commit was observed, must be
-// applied exactly once on every replica.
+// workload test: the gate key, whose apply was reached, is applied exactly
+// once on every replica, and every other held proposal at most once, the
+// same number of times on every replica.
 func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	if testing.Short() {
 		t.Skip("three-host cluster over loopback QUIC")
@@ -59,13 +59,12 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 		t.Fatalf("ShardInfo: %v", err)
 	}
 	leaderID := info.ReplicaID
-	// The gate sits on a FOLLOWER, which also proposes the held keys, and
-	// leadership moves between the other two replicas. A leader whose apply
-	// is held never gets its TimeoutNow to the target: the transfer times out
-	// and the held calls only return at the test's deadline.
-	follower := leaderID%3 + 1
-	target := follower%3 + 1
-	proposer := c.hosts[follower-1]
+	// The gate holds the LEADER's apply. A host whose apply is held keeps
+	// heartbeating but replicates no new entry and never gets a TimeoutNow
+	// out, so neither an election nor a transfer moves leadership; losing
+	// the quorum does. The held calls wait at the old leader and can only
+	// learn that their outcome is unknown.
+	proposer := leader
 
 	for i := range 4 {
 		key := fmt.Sprintf("acked-%02d", i)
@@ -85,12 +84,12 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 			results <- concurrentProposeResult{key, err}
 		}()
 	}
-	c.gate.arm(follower)
+	c.gate.arm(leaderID)
 	propose(concurrentProposeGateKey)
 	select {
 	case <-c.gate.reached:
 	case <-ctx.Done():
-		t.Fatalf("replica %d never reached the gated apply", follower)
+		t.Fatalf("replica %d never reached the gated apply", leaderID)
 	}
 	heldKeys := []string{concurrentProposeGateKey}
 	for i := range held {
@@ -98,22 +97,22 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 		heldKeys = append(heldKeys, key)
 		propose(key)
 	}
-	if !waitUntil(20*time.Second, func() bool {
-		for _, id := range []uint64{leaderID, target} {
-			applied := c.machine(id).snapshot()
-			for _, key := range heldKeys {
-				if applied[key] != 1 {
-					return false
-				}
-			}
+	// Stop both followers: the leader's heartbeats go unanswered and
+	// CheckQuorum makes it step down with the held proposals still pending.
+	for id := uint64(1); id <= 3; id++ {
+		if id == leaderID {
+			continue
 		}
-		return true
-	}) {
-		t.Fatalf("replicas %d and %d never applied the proposals held at replica %d", leaderID, target, follower)
+		if err := c.hosts[id-1].Close(); err != nil {
+			t.Fatalf("Close follower host %d: %v", id, err)
+		}
 	}
-	concurrentProposeTransfer(ctx, t, leader, c.hosts[target-1], target)
-	// Every held key is committed, but the proposer's apply is still held:
-	// its callers can only learn that the outcome is unknown.
+	if !waitUntil(30*time.Second, func() bool {
+		info, err := leader.ShardInfo(concurrentProposeShard)
+		return err == nil && !info.IsLeader
+	}) {
+		t.Fatalf("replica %d never stepped down after losing its quorum", leaderID)
+	}
 	cancelHeld()
 	for range heldKeys {
 		select {
@@ -140,12 +139,11 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
+	concurrentProposeSameCount(t, c, heldKeys)
+	// The gate key reached the old leader's apply, so it was committed.
 	for id := uint64(1); id <= 3; id++ {
-		applied := c.machine(id).snapshot()
-		for _, key := range heldKeys {
-			if n := applied[key]; n != 1 {
-				t.Errorf("replica %d applied committed held key %s %d times, want 1", id, key, n)
-			}
+		if n := c.machine(id).snapshot()[concurrentProposeGateKey]; n != 1 {
+			t.Errorf("replica %d applied committed gate key %d times, want 1", id, n)
 		}
 	}
 	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
@@ -159,23 +157,109 @@ type concurrentProposeResult struct {
 	err error
 }
 
-// concurrentProposeTransfer moves leadership from `from` to replica target
-// (hosted by to), retrying a transfer that times out, until ctx ends.
-func concurrentProposeTransfer(ctx context.Context, t *testing.T, from, to *Host, target uint64) {
+// concurrentProposeSameCount fails the test unless each key is applied at
+// most once, the same number of times on every replica.
+func concurrentProposeSameCount(t *testing.T, c *concurrentProposeCluster, keys []string) {
 	t.Helper()
-	for {
-		err := from.RequestLeaderTransfer(ctx, concurrentProposeShard, target)
-		if err != nil && !errors.Is(err, ErrTransferInProgress) {
-			t.Fatalf("RequestLeaderTransfer(-> %d): %v", target, err)
+	for _, key := range keys {
+		var counts [3]int
+		for id := uint64(1); id <= 3; id++ {
+			counts[id-1] = c.machine(id).snapshot()[key]
 		}
-		if waitUntil(5*time.Second, func() bool {
-			info, err := to.ShardInfo(concurrentProposeShard)
-			return err == nil && info.IsLeader
-		}) {
-			return
+		if counts[0] > 1 || counts[0] != counts[1] || counts[0] != counts[2] {
+			t.Errorf("key %s applied %v times on replicas 1-3, want the same count, at most 1, on every replica", key, counts)
 		}
-		if ctx.Err() != nil {
-			t.Fatalf("replica %d never took leadership: %v", target, ctx.Err())
+	}
+}
+
+// TestConcurrentPropose_ProposalToStoppedFormerLeader is the regression for
+// a proposal forwarded to a leader that is gone by the time the replicas are
+// compared (#928 review, finding 1). No test hook delays a single forwarded
+// message (the only hook is testHookTryRecycle, pkg/requeststate.go; HostOptions
+// inject no transport), so the leader's host is stopped instead: a follower
+// that still names it forwards the proposals to it, the survivors elect a new
+// leader, and the drain's restart brings the stopped host back from its WAL.
+// Each orphaned proposal is then applied at most once, the same number of
+// times on every replica.
+func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
+	if testing.Short() {
+		t.Skip("three-host cluster over loopback QUIC")
+	}
+	c := newConcurrentProposeCluster(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	out := newProposeOutcomes()
+	for i := range 3 {
+		c.startShard(t, i)
+	}
+	leader := c.waitLeader(t)
+	info, err := leader.ShardInfo(concurrentProposeShard)
+	if err != nil {
+		t.Fatalf("ShardInfo: %v", err)
+	}
+	leaderID := info.ReplicaID
+	follower := leaderID%3 + 1
+	proposer := c.hosts[follower-1]
+	if !waitUntil(10*time.Second, func() bool {
+		info, err := proposer.ShardInfo(concurrentProposeShard)
+		return err == nil && info.LeaderID == leaderID
+	}) {
+		t.Fatalf("replica %d never learned leader %d", follower, leaderID)
+	}
+	// A proposal through the follower proves it forwards to the leader.
+	if _, err := proposer.SyncPropose(ctx, concurrentProposeShard, []byte("acked-00")); err != nil {
+		t.Fatalf("SyncPropose(acked-00) through a follower: %v", err)
+	}
+	out.record("acked-00", nil)
+
+	if err := leader.Close(); err != nil {
+		t.Fatalf("Close leader host %d: %v", leaderID, err)
+	}
+	const orphans = 8
+	orphanCtx, cancelOrphans := context.WithCancel(ctx)
+	defer cancelOrphans()
+	results := make(chan concurrentProposeResult, orphans)
+	keys := make([]string, 0, orphans)
+	for i := range orphans {
+		key := fmt.Sprintf("orphan-%02d", i)
+		keys = append(keys, key)
+		go func() {
+			_, err := proposer.SyncPropose(orphanCtx, concurrentProposeShard, []byte(key))
+			results <- concurrentProposeResult{key, err}
+		}()
+	}
+	if !waitUntil(30*time.Second, func() bool {
+		for id := uint64(1); id <= 3; id++ {
+			if id == leaderID {
+				continue
+			}
+			info, err := c.hosts[id-1].ShardInfo(concurrentProposeShard)
+			if err == nil && info.IsLeader {
+				return true
+			}
 		}
+		return false
+	}) {
+		t.Fatalf("the survivors never elected a leader after replica %d stopped", leaderID)
+	}
+	cancelOrphans()
+	for range keys {
+		select {
+		case r := <-results:
+			out.record(r.key, r.err)
+		case <-ctx.Done():
+			t.Fatal("a proposal forwarded to the stopped leader never returned")
+		}
+	}
+	for key, err := range out.failed {
+		t.Errorf("SyncPropose(%s): %v", key, err)
+	}
+
+	barrierKey, barriers, want := concurrentProposeDrain(ctx, t, c)
+	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
+	concurrentProposeCheck(t, c, out, barrierKey, barriers)
+	concurrentProposeSameCount(t, c, keys)
+	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
+		t.Fatalf("replica state hashes differ at index %d: %v", at, hashes)
 	}
 }
