@@ -1172,16 +1172,32 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	type lookupResult struct {
-		val interface{}
-		err error
+		val      interface{}
+		err      error
+		panicked bool
+		panicVal interface{}
 	}
 	done := make(chan lookupResult, 1)
 	go func() {
-		val, err := nh.host.QueryLocalNode(ctx, shardID, query)
-		done <- lookupResult{val: val, err: err}
+		var r lookupResult
+		// A Lookup panic must not end the process from this goroutine,
+		// which no caller can recover: carry it back to the caller,
+		// which re-raises it inside its own panic-handling boundary,
+		// as the synchronous call did. A panic after the caller stopped
+		// waiting has no caller left and is dropped.
+		defer func() {
+			if p := recover(); p != nil {
+				r = lookupResult{panicked: true, panicVal: p}
+			}
+			done <- r
+		}()
+		r.val, r.err = nh.host.QueryLocalNode(ctx, shardID, query)
 	}()
 	select {
 	case r := <-done:
+		if r.panicked {
+			panic(r.panicVal)
+		}
 		if r.err != nil {
 			return nil, translateError(r.err)
 		}
