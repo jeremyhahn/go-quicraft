@@ -177,6 +177,11 @@ func TestSegmentCanFitMatchesWrite_FreshFitIsNeverTooLarge(t *testing.T) {
 			t.Fatalf("after a %d-byte record (block offset %d), Write(%d) = %v; want nil or ErrSegmentFull",
 				prefix, s.blockOffset, freshLargest, err)
 		}
+		// Close now: t.Cleanup runs only when the test ends, and the sweep
+		// would otherwise hold one descriptor per prefix (EMFILE at 1,024).
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close after prefix %d: %v", prefix, err)
+		}
 	}
 
 	rotated := newCanFitSegment(ctx, t, 0)
