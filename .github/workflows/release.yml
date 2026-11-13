@@ -116,6 +116,7 @@ jobs:
   # are time-sensitive, so one published since the last branch build is caught
   # here.
   lint:
+    timeout-minutes: 60
     name: Gate - lint
     needs: validate
     runs-on: ubuntu-latest
@@ -183,6 +184,7 @@ jobs:
         run: golangci-lint run --timeout=5m ./...
 
   security:
+    timeout-minutes: 60
     name: Gate - security
     needs: validate
     runs-on: ubuntu-latest
@@ -251,6 +253,7 @@ jobs:
         run: govulncheck ./...
 
   trivy:
+    timeout-minutes: 60
     name: Gate - trivy
     needs: validate
     runs-on: ubuntu-latest
