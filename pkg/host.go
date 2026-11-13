@@ -1921,6 +1921,22 @@ func (c *hostEngineCallback) OnApplied(shardID uint64, entries []proto.Entry, re
 		matched = entries[:len(results)]
 	}
 
+	// Publish the applied index before the ordinary path below completes
+	// any proposal (#1104). A caller whose SyncPropose has returned must
+	// find its entry covered by this replica's applied index: a
+	// FollowerRead or a ReadIndex issued right after the acknowledgement
+	// waits for lastApplied to reach the index it learned, and an
+	// acknowledgement that outruns the store lets a read observe the
+	// pre-write state. The entries are already in the state machine, so
+	// the early store is never ahead of it. completeAppliedReads stores
+	// the same value again under pendingReadsMu before its scan, which
+	// keeps that scan's ordering with OnReadyToRead intact. A
+	// membership-changing batch completes its proposals after that call,
+	// so it needs no early store.
+	if !hasMembershipChange && len(entries) > 0 {
+		ns.lastApplied.Store(entries[len(entries)-1].Index)
+	}
+
 	// Claim every pending proposal in this batch — LoadAndDelete it out of
 	// ns.pendingProposals — before anything else in this function, including
 	// the pending-reads scan below and (for a membership-changing batch)

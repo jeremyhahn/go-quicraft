@@ -787,6 +787,15 @@ func commitUpdateLocked(node *Node, u *proto.Update, piggyback *proto.Update) (c
 		// commit index after handling follower ReplicateResp).
 		pb, err := node.peer.GetPiggybackUpdate(node.lastApplied.Load())
 		*piggyback = pb
+		if err == nil && len(pb.CommittedEntries) > 0 {
+			// The piggyback hands entries to apply that the step
+			// worker's own publish never saw: the commit index moved
+			// in the commitPending window. Publish the markers before
+			// the entries reach apply so a proposal acknowledged from
+			// this batch is covered by the published commit index
+			// (#1104), as on the step worker's path.
+			node.publishLogMarkers()
+		}
 		return commitPiggyback, err
 	}
 
