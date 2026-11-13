@@ -10837,7 +10837,10 @@ func (h *Host) ShardCount() int {
 //   - "ok"        if all shards are healthy (HTTP 200)
 func (h *Host) HealthCheck() *HealthStatus {
 	sealed := h.barrier != nil && h.barrier.IsSealed()
-	diskOK := (h.diskFull == nil || !h.diskFull.Load()) && !h.diskGate.Full()
+	// The flag is the reconciled state of both monitors (diskFullState), so
+	// DiskOK recovers on a newer healthy WAL sample even while the gate's
+	// own latch waits for the next proposal to re-sample.
+	diskOK := h.diskFull == nil || !h.diskFull.Load()
 
 	shards := make([]ShardInfo, 0, clampNonNegative(h.activeNodes.Load()))
 	h.nodes.Range(func(_, value any) bool {
@@ -12742,11 +12745,26 @@ func (s *diskFullState) publisher(fromGate bool) func(waldb.DiskSample) func() {
 	}
 }
 
+// full derives the flag from the newest sample; s.mu must be held. When the
+// WAL's sample is newer than the gate's, it decides: the flag is set when it
+// is full (95%) or at or above the gate's threshold (90%) while the gate's
+// sample was full, so a newer WAL sample below the gate's threshold clears a
+// stale gate full state without another proposal. Otherwise the gate's
+// sample decides: its threshold is below the WAL's, so a newer gate sample
+// below it shows that an older WAL full sample is stale.
+func (s *diskFullState) full() bool {
+	if s.wal.Seq <= s.gate.Seq {
+		return s.gate.Full
+	}
+	if s.wal.Full {
+		return true
+	}
+	gateThreshold := uint64(float64(s.wal.MaxBytes) * proposalDiskFullPercent)
+	return s.gate.Full && s.wal.Used >= gateThreshold
+}
+
 // publish records sample as its monitor's latest and recomputes the flag
-// under s.mu. The flag is set while the gate's latest sample is full, or
-// while the WAL's latest sample is full and newer than the gate's: the gate's
-// threshold (90%) is below the WAL's (95%), so a newer gate sample below it
-// shows that an older WAL full sample is stale. A sample older than the one
+// (full) under s.mu. A sample older than the one
 // already recorded for its monitor is ignored. It returns the
 // OnLogDBDiskFull notification when the flag rises, to run after the
 // monitor's mutex is released (a listener that proposes samples the gate).
@@ -12761,7 +12779,7 @@ func (s *diskFullState) publish(fromGate bool, sample waldb.DiskSample) func() {
 		return nil
 	}
 	*latest = sample
-	full := s.gate.Full || (s.wal.Full && s.wal.Seq > s.gate.Seq)
+	full := s.full()
 	rose := !s.flag.Swap(full) && full
 	s.mu.Unlock()
 	if !rose || s.fullCb == nil {
