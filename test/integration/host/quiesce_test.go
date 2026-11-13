@@ -123,60 +123,85 @@ func quiesceSnapshot(logs []*quiesceLog) [][2]int {
 	return out
 }
 
-// quiesceMetrics counts, for quiesceShard on one host, the Heartbeat and
-// Quiesce messages its transport sent and the Quiesce messages it received.
+// quiesceMetrics counts, for quiesceShard on one host, the Quiesce messages
+// its transport sent and the Heartbeat and Quiesce messages it received.
 // They are the observable signals of quiesce: a leader entering quiesce
-// broadcasts Quiesce, and while quiesced it sends a heartbeat only once per
-// liveness interval instead of every heartbeat RTT.
+// broadcasts Quiesce, and while quiesced it heartbeats only once per
+// liveness interval instead of every heartbeat RTT. Heartbeats are counted
+// on receipt: the transport's heartbeat fast path (sendHeartbeatBatch) does
+// not report its sends to IncMessagesSent, while the receive path reports
+// every request of every frame.
 type quiesceMetrics struct {
 	quicraft.NoOpMetricsCollector
-	heartbeatsSent  atomic.Uint64
-	quiesceSent     atomic.Uint64
-	quiesceReceived atomic.Uint64
+	heartbeatsReceived atomic.Uint64
+	quiesceSent        atomic.Uint64
+	quiesceReceived    atomic.Uint64
 }
 
-// IncMessagesSent counts the shard's Heartbeat and Quiesce sends.
+// IncMessagesSent counts the shard's Quiesce sends.
 func (m *quiesceMetrics) IncMessagesSent(shardID, _ uint64, msgType uint64) {
+	if shardID == quiesceShard && msgType == proto.Quiesce {
+		m.quiesceSent.Add(1)
+	}
+}
+
+// IncMessagesReceived counts the shard's Heartbeat and Quiesce receipts.
+func (m *quiesceMetrics) IncMessagesReceived(shardID, _ uint64, msgType uint64) {
 	if shardID != quiesceShard {
 		return
 	}
 	switch msgType {
 	case proto.Heartbeat:
-		m.heartbeatsSent.Add(1)
+		m.heartbeatsReceived.Add(1)
 	case proto.Quiesce:
-		m.quiesceSent.Add(1)
-	}
-}
-
-// IncMessagesReceived counts the shard's Quiesce receipts.
-func (m *quiesceMetrics) IncMessagesReceived(shardID, _ uint64, msgType uint64) {
-	if shardID == quiesceShard && msgType == proto.Quiesce {
 		m.quiesceReceived.Add(1)
 	}
 }
 
 // quiesceCounts is a point-in-time copy of every host's quiesceMetrics.
 type quiesceCounts struct {
-	heartbeatsSent, quiesceSent, quiesceReceived []uint64
+	heartbeatsReceived, quiesceSent, quiesceReceived []uint64
 }
 
 func quiesceMetricsSnapshot(ms []*quiesceMetrics) quiesceCounts {
 	out := quiesceCounts{
-		heartbeatsSent:  make([]uint64, len(ms)),
-		quiesceSent:     make([]uint64, len(ms)),
-		quiesceReceived: make([]uint64, len(ms)),
+		heartbeatsReceived: make([]uint64, len(ms)),
+		quiesceSent:        make([]uint64, len(ms)),
+		quiesceReceived:    make([]uint64, len(ms)),
 	}
 	for i, m := range ms {
-		out.heartbeatsSent[i] = m.heartbeatsSent.Load()
+		out.heartbeatsReceived[i] = m.heartbeatsReceived.Load()
 		out.quiesceSent[i] = m.quiesceSent.Load()
 		out.quiesceReceived[i] = m.quiesceReceived.Load()
 	}
 	return out
 }
 
-// quiesceCadenceWindow is how long assertQuiesced watches the leader's
-// heartbeats once it has broadcast Quiesce. An active leader heartbeats each
-// follower every heartbeat RTT (one tick), so it sends about
+// assertActiveCadence checks the heartbeat counter sees an active leader's
+// heartbeats: over one election timeout each live follower receives at
+// least half of the testElectionRTT heartbeats due (one per tick). It makes
+// the suppressed-cadence checks below meaningful: a counter that never saw
+// heartbeats would pass them vacuously.
+func assertActiveCadence(t *testing.T, c *testCluster, ms []*quiesceMetrics, leaderIdx int) {
+	t.Helper()
+	before := quiesceMetricsSnapshot(ms)
+	time.Sleep(quiesceElectionTimeout)
+	after := quiesceMetricsSnapshot(ms)
+	want := uint64(testElectionRTT / 2)
+	for _, i := range c.liveNodeIndexes() {
+		if i == leaderIdx {
+			continue
+		}
+		if got := after.heartbeatsReceived[i] - before.heartbeatsReceived[i]; got < want {
+			t.Fatalf("active: follower host[%d] received %d heartbeats in %v, want at least %d",
+				i, got, quiesceElectionTimeout, want)
+		}
+	}
+}
+
+// quiesceCadenceWindow is how long assertQuiesced watches the followers'
+// heartbeats once the leader has broadcast Quiesce. An active leader
+// heartbeats each follower every heartbeat RTT (one tick), about
 // 3*testElectionRTT heartbeats per follower in the window; a quiesced leader
 // sends one liveness probe per follower per quiesceLivenessInterval, which is
 // longer than the window, so at most one per follower falls inside it.
@@ -185,8 +210,8 @@ const quiesceCadenceWindow = 3 * quiesceElectionTimeout
 // assertQuiesced waits until the shard has entered quiesce since snap and
 // then checks the heartbeat cadence is suppressed. Entry is observed as the
 // leader sending a Quiesce message to every live follower and every live
-// follower receiving one; suppression as the leader sending at most one
-// heartbeat per live follower over quiesceCadenceWindow. With Quiesce off,
+// follower receiving one; suppression as every live follower receiving at
+// most one heartbeat over quiesceCadenceWindow. With Quiesce off,
 // or its configuration not reaching the raft layer, no Quiesce message is
 // ever sent and the wait fails.
 func assertQuiesced(t *testing.T, c *testCluster, ms []*quiesceMetrics, snap quiesceCounts, leaderIdx int, phase string) {
@@ -216,14 +241,19 @@ func assertQuiesced(t *testing.T, c *testCluster, ms []*quiesceMetrics, snap qui
 				quiesceMetricsSnapshot(ms), snap, shardStateDump(c, quiesceShard))
 		},
 	)
-	before := ms[leaderIdx].heartbeatsSent.Load()
+	before := quiesceMetricsSnapshot(ms)
 	time.Sleep(quiesceCadenceWindow)
-	sent := ms[leaderIdx].heartbeatsSent.Load() - before
-	if sent > uint64(followers) {
-		t.Fatalf("%s: quiesced leader host[%d] sent %d heartbeats in %v, want at most %d (one liveness probe per follower)",
-			phase, leaderIdx, sent, quiesceCadenceWindow, followers)
+	after := quiesceMetricsSnapshot(ms)
+	for _, i := range live {
+		if i == leaderIdx {
+			continue
+		}
+		if got := after.heartbeatsReceived[i] - before.heartbeatsReceived[i]; got > 1 {
+			t.Fatalf("%s: follower host[%d] received %d heartbeats from the quiesced leader in %v, want at most 1 (one liveness probe)",
+				phase, i, got, quiesceCadenceWindow)
+		}
 	}
-	t.Logf("%s: quiesce entered; leader host[%d] sent %d heartbeats in %v", phase, leaderIdx, sent, quiesceCadenceWindow)
+	t.Logf("%s: quiesce entered; heartbeat cadence suppressed over %v", phase, quiesceCadenceWindow)
 }
 
 // idleQuiesced keeps the shard idle for at least quiesceIdle from start and
@@ -235,6 +265,43 @@ func idleQuiesced(t *testing.T, c *testCluster, ms []*quiesceMetrics, leaderIdx 
 	if rest := quiesceIdle - time.Since(start); rest > 0 {
 		time.Sleep(rest)
 	}
+}
+
+// quiesceFollowerElectionTimeout is the election timeout a quiesced
+// follower runs on: three liveness intervals (quiesceElectionTimeout in
+// pkg/internal/raft). A follower that hears nothing for this long campaigns.
+const quiesceFollowerElectionTimeout = 3 * quiesceLivenessInterval
+
+// quiesceProbeSpan is how long assertProbed keeps the quiesced shard idle:
+// past the followers' extended election timeout, so only the leader's
+// liveness probes keep them from campaigning.
+const quiesceProbeSpan = quiesceFollowerElectionTimeout + 2*quiesceElectionTimeout
+
+// assertProbed keeps the already-quiesced shard idle for quiesceProbeSpan
+// and asserts the leader keeps it alive with liveness probes: it sends a
+// heartbeat to every live follower at least once per liveness interval
+// (and no more than about that), and every live follower receives them.
+// Leadership stability over the span is left to assertQuietSince on a
+// snapshot taken before it. A leader that never sends quiesced liveness
+// probes fails here, and its followers campaign before the span ends.
+func assertProbed(t *testing.T, c *testCluster, ms []*quiesceMetrics, leaderIdx int, phase string) {
+	t.Helper()
+	snap := quiesceMetricsSnapshot(ms)
+	time.Sleep(quiesceProbeSpan)
+	now := quiesceMetricsSnapshot(ms)
+	// The span holds at least floor(span/interval) whole liveness
+	// intervals, and at most one more probe round than that.
+	rounds := uint64(quiesceProbeSpan / quiesceLivenessInterval)
+	for _, i := range c.liveNodeIndexes() {
+		if i == leaderIdx {
+			continue
+		}
+		if got := now.heartbeatsReceived[i] - snap.heartbeatsReceived[i]; got < rounds || got > rounds+1 {
+			t.Fatalf("%s: follower host[%d] received %d heartbeats from the quiesced leader in %v, want %d..%d (one liveness probe per %v)",
+				phase, i, got, quiesceProbeSpan, rounds, rounds+1, quiesceLivenessInterval)
+		}
+	}
+	t.Logf("%s: every follower received the quiesced leader's liveness probes over %v", phase, quiesceProbeSpan)
 }
 
 // assertQuietSince fails if any live Host launched a campaign or saw a
@@ -335,12 +402,18 @@ func TestQuiesce_IdleShardKeepsLeaderAndWakes(t *testing.T) {
 		return true
 	})
 
-	// (a) Idle for 12 election timeouts: the shard enters quiesce, no
-	// campaign, same leader.
+	// While active, every follower receives a heartbeat per tick.
+	assertActiveCadence(t, c, ms, leaderIdx)
+
+	// (a) Idle for 12 election timeouts: the shard enters quiesce. It then
+	// stays idle past the followers' extended election timeout, kept alive
+	// only by the leader's liveness probes: no campaign, same leader
+	// throughout.
 	snap := quiesceSnapshot(logs)
 	idleQuiesced(t, c, ms, leaderIdx, "(a) idle")
+	assertProbed(t, c, ms, leaderIdx, "(a) idle")
 	assertQuietSince(t, c, logs, snap, leaderID, "(a) idle")
-	t.Logf("(a) idle %v: no campaign, leader %d on every host", quiesceIdle, leaderID)
+	t.Logf("(a) idle %v: no campaign, leader %d on every host", quiesceIdle+quiesceProbeSpan, leaderID)
 
 	// (b) A proposal after the idle period applies everywhere within 5
 	// election timeouts.
