@@ -10,10 +10,12 @@ import (
 	"io"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
@@ -185,6 +187,13 @@ func TestDiskCeiling_RefusesProposalsFiresOnceAndKeepsAcknowledgedEntries(t *tes
 	}
 
 	// (c) The ceiling refuses proposals; it does not fail the shard.
+	// OnShardFailed runs through the engine's listener dispatcher, so the
+	// count may lag the failure; the engine's latch is checked directly,
+	// and the count again after Close has drained the dispatcher.
+	if n := h.engine.GetNode(shardID); n == nil || n.IsFailed() {
+		t.Errorf("(c) shard %d failure latch set after the refusal (node present: %v)",
+			shardID, n != nil)
+	}
 	if failed != 0 {
 		t.Errorf("(c) OnShardFailed fired %d times, want 0", failed)
 	}
@@ -199,6 +208,15 @@ func TestDiskCeiling_RefusesProposalsFiresOnceAndKeepsAcknowledgedEntries(t *tes
 		t.Fatalf("Close: %v", err)
 	}
 	closed = true
+
+	// (c) again: Close drained the listener dispatcher, so a queued
+	// OnShardFailed has run by now.
+	mu.Lock()
+	failed = failedCount
+	mu.Unlock()
+	if failed != 0 {
+		t.Errorf("(c) OnShardFailed fired %d times by Close, want 0", failed)
+	}
 
 	cfg.MaxWALDiskSize = 0
 	cfg.EventListener = nil
@@ -229,5 +247,75 @@ func TestDiskCeiling_RefusesProposalsFiresOnceAndKeepsAcknowledgedEntries(t *tes
 		if ok, _ := v.(bool); !ok {
 			t.Errorf("(e) acknowledged proposal %q is not applied after restart", cmd)
 		}
+	}
+}
+
+// TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth pins that once the
+// proposal gate has tripped and usage drops, proposals racing the recovery
+// cannot leave the Host refusing: a refusal sampled before the recovery must
+// not be republished after it. Each round trips the gate, starts concurrent
+// proposalDiskFull callers, drops usage while they run, and checks that the
+// Host then admits proposals and HealthCheck reports DiskOK true.
+func TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth(t *testing.T) {
+	const (
+		maxBytes = uint64(1000)
+		rounds   = 20
+		callers  = 16
+		calls    = 50
+	)
+	var usage atomic.Uint64
+	var fired atomic.Int64
+	cfg := config.HostConfig{
+		WALDir:         t.TempDir(),
+		MaxWALDiskSize: maxBytes,
+		EventListener: &config.EventListener{
+			OnLogDBDiskFull: func(config.DiskInfo) { fired.Add(1) },
+		},
+	}
+	var flag atomic.Bool
+	gate := waldb.NewDiskMonitor(cfg.WALDir, maxBytes,
+		waldb.WithFullPercent(proposalDiskFullPercent),
+		waldb.WithCheckEvery(proposalDiskCheckEvery),
+		waldb.WithOnFullNotify(diskFullCallback(cfg, &flag, nil)),
+		waldb.WithOnRecovery(func(_, _ uint64) { flag.Store(false) }),
+		waldb.WithDiskUsageFunc(func(string) (uint64, error) { return usage.Load(), nil }),
+	)
+	h := &Host{diskFull: &flag, diskGate: gate}
+
+	for r := 0; r < rounds; r++ {
+		usage.Store(maxBytes * 95 / 100)
+		tripped := false
+		for i := 0; i <= proposalDiskCheckEvery && !tripped; i++ {
+			tripped = h.proposalDiskFull()
+		}
+		if !tripped {
+			t.Fatalf("round %d: the gate never refused at 95%% usage", r)
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for c := 0; c < callers; c++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for i := 0; i < calls; i++ {
+					h.proposalDiskFull()
+				}
+			}()
+		}
+		close(start)
+		usage.Store(maxBytes / 10)
+		wg.Wait()
+
+		if h.proposalDiskFull() {
+			t.Fatalf("round %d: proposals still refused after usage dropped", r)
+		}
+		if hs := h.HealthCheck(); !hs.DiskOK {
+			t.Fatalf("round %d: HealthCheck DiskOK = false after usage dropped", r)
+		}
+	}
+	if got := fired.Load(); got != rounds {
+		t.Errorf("OnLogDBDiskFull fired %d times over %d trips, want %d", got, rounds, rounds)
 	}
 }
