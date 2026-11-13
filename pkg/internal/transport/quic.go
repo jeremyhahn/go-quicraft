@@ -1929,6 +1929,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		ShardID:   first.ShardID,
 		ReplicaID: first.ReplicaID,
 		Index:     first.Index,
+		From:      first.From,
 	}
 	sendOK := false
 	defer func() {
@@ -2141,6 +2142,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 		ShardID:   meta.ShardID,
 		ReplicaID: meta.ReplicaID,
 		Index:     meta.Index,
+		From:      meta.From,
 	}
 	sendOK := false
 	defer func() {

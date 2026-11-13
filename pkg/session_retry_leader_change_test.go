@@ -111,22 +111,30 @@ func (c *sessionRetryCluster) leader() int {
 	c.t.Helper()
 	idx := -1
 	if !waitUntil(20*time.Second, func() bool {
-		idx = -1
-		for i, n := range c.nodes {
-			info, err := n.host.ShardInfo(retryShard)
-			if err != nil {
-				return false
-			}
-			if info.IsLeader {
-				if idx >= 0 {
-					return false
-				}
-				idx = i
-			}
-		}
+		idx = c.leaderNow()
 		return idx >= 0
 	}) {
 		c.t.Fatal("no single leader elected")
+	}
+	return idx
+}
+
+// leaderNow probes every node once and returns the index of the single
+// node that reports itself leader, or -1 when there is none or more than
+// one. It never blocks, so a caller can bound the wait by its own deadline.
+func (c *sessionRetryCluster) leaderNow() int {
+	idx := -1
+	for i, n := range c.nodes {
+		info, err := n.host.ShardInfo(retryShard)
+		if err != nil {
+			return -1
+		}
+		if info.IsLeader {
+			if idx >= 0 {
+				return -1
+			}
+			idx = i
+		}
 	}
 	return idx
 }
@@ -207,15 +215,34 @@ func proposeOnce(t *testing.T, h *Host, session *Session, cmd []byte) RequestRes
 	}
 }
 
-func newRetrySession(t *testing.T, h *Host) *Session {
+func newRetrySession(t *testing.T, c *sessionRetryCluster) (*Session, int) {
 	t.Helper()
+	// Resolve the initial leader before the registration deadline starts:
+	// a slow first election must not eat NewSession's budget.
+	idx := c.leader()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	session, err := h.NewSession(ctx, retryShard)
-	if err != nil {
-		t.Fatalf("NewSession: %v", err)
+	for {
+		session, err := c.nodes[idx].host.NewSession(ctx, retryShard)
+		if err == nil {
+			return session, idx
+		}
+		if !errors.Is(err, ErrNotLeader) || ctx.Err() != nil {
+			t.Fatalf("NewSession on node %d: %v", idx, err)
+		}
+		// Leadership moved, or this node's view is not settled yet:
+		// re-resolve the leader within the remaining deadline.
+		prev := idx
+		idx = -1
+		for idx < 0 {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("NewSession on node %d: %v (deadline: %v)", prev, err, ctx.Err())
+			case <-time.After(50 * time.Millisecond):
+			}
+			idx = c.leaderNow()
+		}
 	}
-	return session
 }
 
 // A proposal answered by the old leader and retried with the same session and
@@ -223,8 +250,7 @@ func newRetrySession(t *testing.T, h *Host) *Session {
 // retry returns the first result.
 func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 	c := newSessionRetryCluster(t)
-	old := c.leader()
-	session := newRetrySession(t, c.nodes[old].host)
+	session, old := newRetrySession(t, c)
 	series := session.SeriesID()
 
 	first := proposeOnce(t, c.nodes[old].host, session, []byte("once"))
@@ -268,8 +294,7 @@ func TestSessionRetry_LeaderChangeAppliesOnce(t *testing.T) {
 // cached response was discarded, PhD Figure 6.1 step 3) and applied nowhere.
 func TestSessionRetry_BelowRespondedToIsSessionExpired(t *testing.T) {
 	c := newSessionRetryCluster(t)
-	old := c.leader()
-	session := newRetrySession(t, c.nodes[old].host)
+	session, old := newRetrySession(t, c)
 	h := c.nodes[old].host
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

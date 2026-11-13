@@ -207,9 +207,13 @@ const maxCiphertextExpansion = 8 + 1 + 24 + 16
 // all metric collection is skipped. The concrete implementation lives in
 // the public quicraft package to avoid an import cycle.
 type LogDBMetrics interface {
+	// ObserveWriteLatency records the duration of one write.
 	ObserveWriteLatency(d time.Duration)
+	// ObserveFsyncLatency records the duration of one fsync.
 	ObserveFsyncLatency(d time.Duration)
+	// ObserveCompactionLatency records the duration of one compaction.
 	ObserveCompactionLatency(d time.Duration)
+	// IncWriteBytes adds n to the count of bytes written.
 	IncWriteBytes(n int64)
 }
 

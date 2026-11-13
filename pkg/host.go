@@ -3477,14 +3477,21 @@ type Host struct {
 	nodes       sync.Map     // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
 	activeNodes atomic.Int64 // tracks the number of loaded shards (replaces len(h.nodes))
 	closed      atomic.Bool  // shutdown admitted: set at the start of Close
-	// closeDone is set once Close's shutdown work has completed. EmergencySeal
-	// keeps sealing while closed is set but closeDone is not, because Close
-	// seals the barrier only after it has drained and stopped the engine.
+	// closeDone is set once Close's shutdown work has completed, whether or
+	// not its barrier seals succeeded. EmergencySeal keeps sealing while
+	// closed is set but closeDone is not, because Close seals the barrier
+	// only after it has drained and stopped the engine.
 	closeDone atomic.Bool
-	draining  atomic.Bool
-	diskFull  *atomic.Bool // set by disk full callback in buildWALOptions
-	id        string
-	stopOnce  sync.Once
+	// barriersSealed is set once every barrier the host was given has been
+	// sealed: by Close when all of its seals succeeded, or by an
+	// EmergencySeal retry after Close. It is kept apart from closeDone so a
+	// Close whose seal failed does not turn EmergencySeal into a no-op;
+	// EmergencySeal after Close returns ErrClosed only when it is set.
+	barriersSealed atomic.Bool
+	draining       atomic.Bool
+	diskFull       *atomic.Bool // set by disk full callback in buildWALOptions
+	id             string
+	stopOnce       sync.Once
 	// closeErr is the shutdown outcome the FIRST Close computed. Every other
 	// Close returns it too, which is only safe because stopOnce.Do publishes
 	// the write to every caller that blocked on it.
@@ -3496,6 +3503,11 @@ type Host struct {
 	sweepDone   chan struct{} // closed when the sweeper goroutine exits
 	drainC      chan struct{} // closed when pendingOps reaches 0 during drain
 	drainCMu    sync.Mutex    // protects drainC creation
+	// admitMu orders admissions against Drain (#1084): admitPendingOp
+	// checks closed/draining and counts under RLock, and Drain raises the
+	// draining flag under Lock, so every admission either is counted before
+	// Drain loads pendingOps or sees the flag and is refused.
+	admitMu sync.RWMutex
 	// drainOnce elects the one Drain attempt and JOINS every other caller on
 	// it, exactly as stopOnce does for Close. drainErr is written inside the
 	// Once and published by it, so every caller reports the same outcome.
@@ -5923,6 +5935,17 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 // leader, a role that no longer permits the read) fails fast with
 // ErrReadIndexNotReady; see ReadIndex. A forwarded ReadIndex or response
 // lost in transit is bounded only by ctx, so callers must pass a deadline.
+//
+// With LeaseRead disabled, SyncRead never answers from a replica that
+// cannot reach a quorum. A leader that has lost its quorum cannot confirm
+// the read: the call fails with ErrTimeout (or ErrCanceled) when ctx ends,
+// or with a NotLeaderError (errors.Is ErrNotLeader) when the leader steps
+// down first. A replica that knows no leader fails with a NotLeaderError or
+// at ctx's end. The exception is LeaseRead enabled: a leader holding a valid
+// lease may answer SyncRead from its own state for the rest of that lease
+// after its peers become unreachable, and refuses as above once the lease
+// has expired. Use StaleRead to read a replica's applied state without a
+// quorum.
 func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) (interface{}, error) {
 	// Step 1: Get a confirmed read index via ReadIndex.
 	rs, err := h.ReadIndex(ctx, shardID)
@@ -6564,7 +6587,13 @@ func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, 
 // pins the RS until this map entry is removed, even if the caller releases
 // first (e.g. a Sync* timeout).
 func (h *Host) registerPendingProposal(ns *nodeState, engNode *engine.Node, key uint64, pp *pendingProposal) error {
-	h.addPendingOp()
+	// Count before registering: a Drain that already returned nil refuses
+	// the proposal here, with nothing registered to undo (#1084). The
+	// caller's own reference is dropped as on the rollback below.
+	if err := h.admitPendingOp(); err != nil {
+		pp.rs.Release()
+		return err
+	}
 	pp.node = engNode
 	pp.rs.acquireRef()
 	// From here a completion or the caller's own wait can fail it, and both
@@ -6676,8 +6705,13 @@ func (h *Host) ReadIndex(ctx context.Context, shardID uint64) (*RequestState, er
 	deadline := pendingDeadline(ctx)
 	rs := newRequestState(ns.requestPool, readKey, deadline, h.metrics != nil)
 
-	// Track this operation for drain notification.
-	h.addPendingOp()
+	// Track this operation for drain notification. Admission counts it, or
+	// refuses it once Drain has raised its flag (#1084), before anything is
+	// registered.
+	if err := h.admitPendingOp(); err != nil {
+		rs.Release()
+		return nil, err
+	}
 
 	// Register the pending read BEFORE delivering the message to avoid
 	// a race where OnReadyToRead fires before the map entry exists.
@@ -6822,6 +6856,9 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 // partitioned or lagging replica can serve data from an old term indefinitely,
 // and reads issued in sequence are not guaranteed to be monotonic. Use it only
 // where staleness is acceptable. For linearizable reads use SyncRead.
+//
+// Because it needs no quorum and no leader, StaleRead keeps answering from
+// the replica's applied state while the rest of the shard is down.
 //
 // StaleRead is the preferred name for this operation because it states the
 // guarantee (or lack of one) at the call site. It is exactly QueryLocalNode,
@@ -7807,6 +7844,14 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 // When SnapshotOption.OverrideCompactionOverhead is true, the provided
 // CompactionOverhead replaces the shard-level value for this snapshot's
 // log compaction.
+//
+// A request made when nothing has been applied since the last recorded
+// snapshot is a no-op: it is accepted, writes nothing, and resolves with
+// Value 0 and no error. An export request in that state fails instead,
+// because the export it asked for cannot be produced. Each shard runs one
+// snapshot at a time: a request made while another is still in flight
+// returns ErrSnapshotInProgress without being queued, so of two concurrent
+// requests over the same applied state at most one creates a snapshot.
 func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt SnapshotOption) (*RequestState, error) {
 	// Same already-cancelled guard as Propose. Without it a cancelled call
 	// would claim the shard's single-flight snapshot slot and enqueue disk
@@ -7860,8 +7905,14 @@ func (h *Host) RequestSnapshot(ctx context.Context, shardID uint64, opt Snapshot
 	deadline := pendingDeadlineWithin(ctx, defaultPendingSnapshotTimeout)
 	rs := newRequestState(ns.requestPool, snapshotKey, deadline, h.metrics != nil)
 
-	// Track this operation for drain notification.
-	h.addPendingOp()
+	// Track this operation for drain notification. Admission counts it, or
+	// refuses it once Drain has raised its flag (#1084), before anything is
+	// registered; the snapshotting flag set above is cleared on refusal.
+	if err := h.admitPendingOp(); err != nil {
+		rs.Release()
+		engNode.ClearSnapshotting()
+		return nil, err
+	}
 
 	// Register the pending snapshot before submitting to avoid a race
 	// where OnSnapshotRequestCompleted fires before the map entry exists.
@@ -10060,12 +10111,13 @@ func (h *Host) Close() error {
 		// stopped. A per-shard barrier that IS the host-wide barrier (pointer
 		// identity, logdb.SameBarrier) was sealed with it; one that cannot be
 		// identified is sealed again, and its ErrBarrierSealed is benign.
-		closeErr = errors.Join(closeErr, sealOnClose(h.barrier))
-		h.shardBarriersGiven.each(func(b Barrier) {
-			if !logdb.SameBarrier(b, h.barrier) {
-				closeErr = errors.Join(closeErr, sealOnClose(b))
-			}
-		})
+		// barriersSealed records whether all of them sealed, so EmergencySeal
+		// after this Close can retry a seal that failed here.
+		sealErr := h.sealGivenBarriers()
+		closeErr = errors.Join(closeErr, sealErr)
+		if sealErr == nil {
+			h.barriersSealed.Store(true)
+		}
 
 		// Release NodeHostDir last, once nothing the host owns writes under it.
 		closeErr = errors.Join(closeErr, h.dirLock.Close())
@@ -10076,6 +10128,21 @@ func (h *Host) Close() error {
 	})
 
 	return h.closeErr
+}
+
+// sealGivenBarriers seals the host-wide barrier and every per-shard barrier
+// the resolver returned, and joins their failures. A per-shard barrier that
+// IS the host-wide barrier (logdb.SameBarrier) is sealed with it; every seal
+// goes through sealOnClose, so a barrier already sealed is not a failure.
+// Every barrier is attempted even when an earlier one fails.
+func (h *Host) sealGivenBarriers() error {
+	err := sealOnClose(h.barrier)
+	h.shardBarriersGiven.each(func(b Barrier) {
+		if !logdb.SameBarrier(b, h.barrier) {
+			err = errors.Join(err, sealOnClose(b))
+		}
+	})
+	return err
 }
 
 // sealOnClose seals b during Host.Close and returns the failure Close must
@@ -10127,7 +10194,12 @@ func (h *Host) Drain() error {
 	// The flag goes up before the Once so that new work is refused from the
 	// instant ANY caller asks for a drain, not from when the elected attempt
 	// gets scheduled. It is never cleared: see the irreversibility note.
+	// Raising it under admitMu waits out every admission between its
+	// draining check and its count, so the pendingOps load below sees each
+	// one (see admitPendingOp).
+	h.admitMu.Lock()
 	h.draining.Store(true)
+	h.admitMu.Unlock()
 
 	// sync.Once.Do does not return until f has completed, for EVERY caller —
 	// the losers of the election wait here for the winner's attempt and then
@@ -10171,8 +10243,31 @@ func (h *Host) drainOnceLocked() error {
 	}
 }
 
-// addPendingOp increments the outstanding pending operations counter.
-// Called when a proposal, read, or snapshot operation is registered.
+// admitPendingOp is the admission step of every operation Drain waits for: it
+// counts the operation in pendingOps unless the host is closed or draining,
+// and refuses with ErrClosed or ErrDraining (counting nothing) otherwise.
+// The check and the count run under admitMu.RLock, and Drain raises the
+// draining flag under admitMu.Lock before it loads pendingOps, so an
+// operation is either counted before Drain looks or refused: once Drain has
+// returned nil nothing new is admitted (#1084). Callers keep their own
+// earlier draining checks as fast paths, and call admitPendingOp before they
+// register anything, so a refusal has only the caller's own state to undo.
+func (h *Host) admitPendingOp() error {
+	h.admitMu.RLock()
+	defer h.admitMu.RUnlock()
+	if h.closed.Load() {
+		return ErrClosed
+	}
+	if h.draining.Load() {
+		return ErrDraining
+	}
+	h.pendingOps.Add(1)
+	return nil
+}
+
+// addPendingOp increments the outstanding pending operations counter
+// unconditionally. Admission paths use admitPendingOp, which refuses once the
+// host is closed or draining; this is for tests that seed pendingOps.
 func (h *Host) addPendingOp() {
 	h.pendingOps.Add(1)
 }
@@ -10734,10 +10829,21 @@ func (h *Host) RaftAddress() string {
 // matters more than graceful shutdown. While Close is still running it
 // seals the barrier: Close seals it only after draining and stopping the
 // engine, which can take arbitrarily long. Once Close has completed it
-// returns ErrClosed: Close has already sealed the barrier.
+// returns ErrClosed only if every barrier the host was given is sealed. If
+// any of Close's seals failed, it seals again the host-wide barrier and every
+// per-shard barrier (one already sealed is not a failure), records them as
+// sealed when all succeed, and otherwise returns the joined seal errors, so
+// the key-destruction path survives a Close whose seal failed.
 func (h *Host) EmergencySeal() error {
 	if h.closeDone.Load() {
-		return ErrClosed
+		if h.barriersSealed.Load() {
+			return ErrClosed
+		}
+		if err := h.sealGivenBarriers(); err != nil {
+			return err
+		}
+		h.barriersSealed.Store(true)
+		return nil
 	}
 	if h.barrier == nil {
 		return ErrBarrierNotInit
@@ -11347,7 +11453,15 @@ func (h *Host) LogReader(shardID uint64) (ReadonlyLogReader, error) {
 		return nil, ErrShardNotFound
 	}
 
-	return &logReaderAdapter{reader: engNode.LogReader()}, nil
+	return &logReaderAdapter{
+		reader: engNode.LogReader(),
+		currentTerm: func() uint64 {
+			if p := engNode.Peer(); p != nil {
+				return p.Term()
+			}
+			return 0
+		},
+	}, nil
 }
 
 // LogRange represents the valid index range of a shard's Raft log.

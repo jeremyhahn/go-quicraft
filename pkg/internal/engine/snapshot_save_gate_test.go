@@ -77,12 +77,20 @@ func TestSavingGateQuiescesApplies(t *testing.T) {
 	}()
 
 	// Saver: run the save-gate sequence repeatedly. During the capture window no
-	// Apply may run.
+	// Apply may run. The saver keeps cycling until it has done at least saves
+	// cycles and at least saves applies have run, so a saver that finishes
+	// before the applier starts cannot end the test with no interleaving.
 	const saves = 250
+	deadline := time.Now().Add(10 * time.Second)
 	saverDone := make(chan struct{})
 	go func() {
 		defer close(saverDone)
-		for i := 0; i < saves; i++ {
+		for i := 0; i < saves || probe.applies.Load() < saves; i++ {
+			if time.Now().After(deadline) {
+				t.Errorf("deadline reached after %d save cycles with %d applies; want at least %d of each",
+					i, probe.applies.Load(), saves)
+				return
+			}
 			node.SetSaving(true)
 			if !node.WaitForApplyDrain(stopC) {
 				node.SetSaving(false)

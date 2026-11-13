@@ -384,17 +384,31 @@ func TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit(t *testing.T) {
 	}
 
 	// The markers adopt the CLAMPED index, and the term recorded beside it is
-	// that index's term.
+	// that index's term. The one-replica shard then elects itself and applies
+	// its no-op at index 51 in a new term, which may land before the reads
+	// below, so the markers are (50, 4) or the new leader's first entry
+	// (51, term > 4); anything else means the clamp is wrong.
+	//
+	// The apply path stores ns.lastApplied (in OnApplied) before the engine's
+	// lastAppliedTerm, so the term is read first: a term past 4 then
+	// guarantees ns.lastApplied already shows 51, and a term of 4 allows an
+	// index of 50, or 51 when the no-op's apply is between the two stores.
 	ns := testLoadNode(h, 1)
-	if got := ns.lastApplied.Load(); got != 50 {
-		t.Errorf("ns.lastApplied = %d, want 50 (clamped to the recovered commit index)", got)
-	}
 	engNode := h.engine.GetNode(1)
 	if engNode == nil {
 		t.Fatal("shard is not loaded in the engine")
 	}
-	if got := engNode.LastAppliedTerm(); got != 4 {
-		t.Errorf("engine lastAppliedTerm = %d, want 4 (the CLAMPED index's term)", got)
+	term := engNode.LastAppliedTerm()
+	applied := ns.lastApplied.Load()
+	switch {
+	case term == 4 && (applied == 50 || applied == 51):
+		// The clamped pair, or the no-op's apply is in flight.
+	case term > 4 && applied == 51:
+		// The new leader's first entry, applied on top of the clamped index.
+	default:
+		t.Errorf("markers = (lastApplied %d, lastAppliedTerm %d), want the "+
+			"clamped (50, 4) or the new leader's first entry (51, term > 4)",
+			applied, term)
 	}
 }
 
