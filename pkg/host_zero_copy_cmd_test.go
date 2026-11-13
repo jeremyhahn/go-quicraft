@@ -144,11 +144,23 @@ func runZeroCopyCmdWorkload(t *testing.T, zeroCopy bool) (*keepingCmdSM, map[uin
 	)
 	propose := func(i int) error {
 		payload := zeroCopyCmdPayload(i)
+		// want is kept apart from the proposed buffer: on this single-voter,
+		// uncompressed path the Raft log shares the proposed backing array,
+		// so a copy the engine or CopyCmd should have made but did not would
+		// still read back equal unless the source buffer changes.
+		want := bytes.Clone(payload)
 		ctx, cancel := context.WithTimeout(context.Background(), zeroCopyCmdProposeLimit)
 		defer cancel()
 		res, err := h.SyncPropose(ctx, zeroCopyCmdShard, payload)
 		if err != nil {
 			return fmt.Errorf("SyncPropose payload %d: %w", i, err)
+		}
+		// The entry is applied once SyncPropose returns, and the state
+		// machine hash was folded in at apply time. Overwriting the proposed
+		// buffer now makes a kept raw Cmd (default mode) or a CopyCmd result
+		// that aliases it differ from want.
+		for j := range payload {
+			payload[j] = 0xFF
 		}
 		mu.Lock()
 		defer mu.Unlock()
@@ -156,7 +168,7 @@ func runZeroCopyCmdWorkload(t *testing.T, zeroCopy bool) (*keepingCmdSM, map[uin
 			return fmt.Errorf("payload %d reported index %d already taken by payload %d",
 				i, res.Value, binary.LittleEndian.Uint64(prev))
 		}
-		byIdx[res.Value] = payload
+		byIdx[res.Value] = want
 		return nil
 	}
 
@@ -274,6 +286,11 @@ func TestZeroCopyCmd_ConcurrentKVStoreReadsBackEveryValue(t *testing.T) {
 		}
 		if _, err := h.SyncPropose(ctx, zeroCopyCmdShard, cmd); err != nil {
 			t.Fatalf("SyncPropose key %d: %v", i, err)
+		}
+		// The put is applied; overwrite the proposed buffer so a store that
+		// kept a slice of it instead of copying the value reads back wrong.
+		for j := range cmd {
+			cmd[j] = 0xFF
 		}
 	}
 	for i := 0; i < zeroCopyCmdKVKeys; i++ {
