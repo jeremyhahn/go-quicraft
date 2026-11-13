@@ -207,18 +207,25 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	// A randomized election timeout lies in [T, 2T); the bound allows the
 	// step-down, one split vote and scheduling under -race on top of that.
 	bound := 20 * c.electionTimeout()
-	// electionSchedulingSlack covers the watcher's polling interval and the
-	// ShardInfo/ShardMembership calls between its two observations.
+	// removalCommitBound is how long the removal may take, from submission,
+	// to commit and step the old leader down; it is generous for -race CI.
+	const removalCommitBound = 5 * time.Second
+	// electionSchedulingSlack covers the watcher's polling interval, the
+	// ShardInfo calls between its observations and the old host's lag in
+	// publishing its cached IsLeader flag after Peer.Commit steps it down.
 	const electionSchedulingSlack = 200 * time.Millisecond
 
-	// The election watcher runs concurrently with the removal request, so
-	// neither SyncRequestRemoveNode nor any later wait can hide a slow
-	// election. It records (a) the first time a survivor's membership
-	// records the old leader as removed and (b) the first time a survivor
-	// reports itself leader in a term above the removed leader's.
+	// The watcher starts before the removal is submitted and runs
+	// concurrently with it, so neither SyncRequestRemoveNode nor any later
+	// wait can hide a slow election. It records (a) the first time the old
+	// leader's own host stops reporting itself leader, which happens when
+	// the removal commits on it, and (b) the first time a survivor reports
+	// itself leader in a term above the removed leader's. Survivor
+	// membership discovery is not used: a survivor may learn the commit
+	// only from the new leader, after the election.
 	var (
-		commitAt, electedAt time.Time
-		electedID           uint64
+		stepDownAt, electedAt time.Time
+		electedID             uint64
 	)
 	electDone := make(chan struct{})
 	electStop := make(chan struct{})
@@ -226,24 +233,23 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 		defer close(electDone)
 		tick := time.NewTicker(time.Millisecond)
 		defer tick.Stop()
-		for commitAt.IsZero() || electedAt.IsZero() {
+		for stepDownAt.IsZero() || electedAt.IsZero() {
 			select {
 			case <-electStop:
 				return
 			case <-tick.C:
 			}
-			for _, rid := range survivors {
-				h := c.hosts[rid-1]
-				if commitAt.IsZero() {
-					if m, err := h.ShardMembership(removeLeaderShard); err == nil {
-						if _, removed := m.Removed[oldID]; removed {
-							commitAt = time.Now()
-						}
-					}
+			if stepDownAt.IsZero() {
+				if info, err := oldHost.ShardInfo(removeLeaderShard); err != nil || !info.IsLeader {
+					stepDownAt = time.Now()
 				}
-				if electedAt.IsZero() {
-					if info, err := h.ShardInfo(removeLeaderShard); err == nil && info.IsLeader && info.Term > oldTerm {
+			}
+			if electedAt.IsZero() {
+				for _, rid := range survivors {
+					info, err := c.hosts[rid-1].ShardInfo(removeLeaderShard)
+					if err == nil && info.IsLeader && info.Term > oldTerm {
 						electedAt, electedID = time.Now(), rid
+						break
 					}
 				}
 			}
@@ -253,6 +259,7 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	// (a) The leader removes its own replica.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	submitAt := time.Now()
 	err = oldHost.SyncRequestRemoveNode(ctx, removeLeaderShard, oldID, 0)
 	if err != nil && !MaybeApplied(err) {
 		close(electStop)
@@ -262,39 +269,36 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 
 	// Neither a nil return nor a MaybeApplied timeout from
 	// SyncRequestRemoveNode synchronizes with the removal's commit, so the
-	// watcher confirms it from a survivor's committed membership. Survivors
-	// may learn the commit index only from the next leader, so the wait
-	// covers an election; it is only a liveness limit, the timing
-	// assertion below is measured from the observed commit.
+	// liveness limit runs from submission, not from the call's return.
+	handoverBound := removalCommitBound + bound
 	select {
 	case <-electDone:
-	case <-time.After(bound):
+	case <-time.After(time.Until(submitAt.Add(handoverBound + electionSchedulingSlack))):
 		close(electStop)
 		<-electDone
-		t.Fatalf("within %v of the removal request returning, survivors %v: removal observed=%v, new leader observed=%v",
-			bound, survivors, !commitAt.IsZero(), !electedAt.IsZero())
+		t.Fatalf("within %v of submitting the removal of leader %d: old leader stepped down=%v, survivor of %v elected=%v",
+			handoverBound+electionSchedulingSlack, oldID, !stepDownAt.IsZero(), survivors, !electedAt.IsZero())
 	}
-	// (b) The survivors elect a new leader within the election-timeout
-	// bound of the observed removal commit. A survivor that learns the
-	// commit only from the new leader observes it after the election.
-	if d := electedAt.Sub(commitAt); d > bound+electionSchedulingSlack {
-		t.Fatalf("survivor %d led %v after the removal of leader %d was observed committed, want <= %v + %v",
+	// (b) The survivors elect a new leader within the commit and election
+	// bounds of the removal's submission, and within the election bound of
+	// the old leader's step-down. A new leader observed before the old one
+	// stepped down (beyond the slack) is a failure, never a negative
+	// duration that passes.
+	if d := electedAt.Sub(submitAt); d > handoverBound+electionSchedulingSlack {
+		t.Fatalf("survivor %d led %v after the removal of leader %d was submitted, want <= %v + %v + %v",
+			electedID, d, oldID, removalCommitBound, bound, electionSchedulingSlack)
+	}
+	d := electedAt.Sub(stepDownAt)
+	if d < -electionSchedulingSlack {
+		t.Fatalf("survivor %d led %v before removed leader %d stepped down, want the step-down first (slack %v)",
+			electedID, -d, oldID, electionSchedulingSlack)
+	}
+	if d > bound+electionSchedulingSlack {
+		t.Fatalf("survivor %d led %v after removed leader %d stepped down, want <= %v + %v",
 			electedID, d, oldID, bound, electionSchedulingSlack)
 	}
-	t.Logf("replica %d removed itself; replica %d leads term >%d, %v after the observed commit (election timeout %v)",
-		oldID, electedID, oldTerm, electedAt.Sub(commitAt), c.electionTimeout())
-
-	// Peer.Commit steps the leader down, but the Host's cached IsLeader flag
-	// is updated later by the step worker's listener dispatch. Wait, with a
-	// bound, for the old host to publish that initial step-down before
-	// watching for renewed leadership.
-	const stepDownBound = 5 * time.Second
-	if !waitUntil(stepDownBound, func() bool {
-		info, err := oldHost.ShardInfo(removeLeaderShard)
-		return err != nil || !info.IsLeader
-	}) {
-		t.Fatalf("removed leader %d still reported itself leader %v after its removal committed", oldID, stepDownBound)
-	}
+	t.Logf("replica %d removed itself; replica %d leads term >%d, %v after the step-down, %v after submission (election timeout %v)",
+		oldID, electedID, oldTerm, d, electedAt.Sub(submitAt), c.electionTimeout())
 
 	// (d) From here on, the removed host must never report itself leader again.
 	var sawLeader atomic.Bool
