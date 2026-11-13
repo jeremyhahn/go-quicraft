@@ -188,6 +188,20 @@ func NewSnapshotDataVerifier(dir string) *SnapshotDataVerifier {
 	return &SnapshotDataVerifier{dir: dir, meta: meta, metaErr: err, digest: xxhash.New()}
 }
 
+// NewSnapshotDataVerifierForMeta returns a verifier for the snapshot in dir
+// checked against meta, a record the caller has already read and parsed,
+// for callers that read snapshot.meta through a filesystem other than the
+// OS one. A non-nil metaErr is the read or parse failure of that record:
+// Verify reports it as a *SnapshotMetaInvalidError, exactly as
+// NewSnapshotDataVerifier does for a record it cannot read itself.
+func NewSnapshotDataVerifierForMeta(dir string, meta SnapshotMeta, metaErr error) *SnapshotDataVerifier {
+	if metaErr != nil {
+		meta = SnapshotMeta{}
+		metaErr = &SnapshotMetaInvalidError{Dir: dir, Err: metaErr}
+	}
+	return &SnapshotDataVerifier{dir: dir, meta: meta, metaErr: metaErr, digest: xxhash.New()}
+}
+
 // Write adds p to the running hash. It never fails, so it is safe as the sink
 // of an io.TeeReader.
 func (v *SnapshotDataVerifier) Write(p []byte) (int, error) {

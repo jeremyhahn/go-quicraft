@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // snapshotPlaintext returns a multi-chunk plaintext payload (>64KiB) so the
@@ -214,6 +216,61 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	}
 	if !bytes.Equal(dec.Bytes(), plain) {
 		t.Fatal("plaintext->keyed lost data")
+	}
+}
+
+// TestReencryptSnapshotFile_RefusesCorruptSource pins that a source
+// snapshot.dat whose bytes no longer match its snapshot.meta is refused before
+// a fresh snapshot.meta is stamped beside the destination. A same-length bit
+// flip in a serialized value is invisible to the FileSize check; restamping
+// would replace the original checksum with one that matches the damage, and
+// recovery would accept the corrupt state.
+func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
+	plain := snapshotPlaintext()
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	if err := os.MkdirAll(srcDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(srcDir, "snapshot.dat")
+	if err := os.WriteFile(srcPath, plain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("hash source: %v", err)
+	}
+	meta := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index: testSnapIndex, Term: 1, ShardID: testSnapShardID, ReplicaID: testSnapReplicaID,
+		DataLen: size, DataHash: sum,
+	})
+	if err := os.WriteFile(filepath.Join(srcDir, "snapshot.meta"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: the intact source migrates and gets a destination record.
+	okDst := filepath.Join(dir, "ok", "snapshot.dat")
+	if _, err := ReencryptSnapshotFile(srcPath, okDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil); err != nil {
+		t.Fatalf("intact source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ok", "snapshot.meta")); err != nil {
+		t.Fatalf("intact source: destination snapshot.meta: %v", err)
+	}
+
+	// Flip one byte of the last serialized value: same length, wrong bytes.
+	flipSnapshotByte(t, srcPath, int64(len(plain)-1))
+
+	dstDir := filepath.Join(dir, "dst")
+	dstPath := filepath.Join(dstDir, "snapshot.dat")
+	_, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	if !errors.Is(err, ErrSnapshotCorrupt) {
+		t.Fatalf("corrupt source: err = %v, want ErrSnapshotCorrupt", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "snapshot.meta")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt source: destination snapshot.meta stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(dstPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt source: destination snapshot.dat stat err = %v, want not exist", err)
 	}
 }
 

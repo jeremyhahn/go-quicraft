@@ -5,11 +5,14 @@ package quicraft
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // SnapshotCommittedNotDurableError reports a snapshot re-encryption whose
@@ -200,7 +203,6 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	}()
 
 	srcLive := srcBarrier != nil
-	dstLive := dstBarrier != nil
 
 	// Pin every epoch the source frames reference so a concurrent
 	// PurgeEpochsBefore cannot remove a DEK mid-migration. The scan is
@@ -232,37 +234,38 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 			dstBarrier.DeregisterInFlightEpoch(e)
 		}
 	}()
-	switch {
-	case srcLive && dstLive:
-		// Framed -> framed. Decrypt in one goroutine, feeding plaintext through
-		// an in-memory pipe into the encrypt side, so no plaintext is ever
-		// written to disk.
-		pr, pw := io.Pipe()
-		decDone := make(chan struct{})
-		go func() {
-			defer close(decDone)
-			_, decErr := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, pw)
-			_ = pw.CloseWithError(decErr)
-		}()
-		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, pr, tmp)
-		// Unblock the decrypt goroutine if the encrypt side stopped early, then
-		// JOIN it: it reads from src and holds srcBarrier epoch pins, both of
-		// which this function's deferred cleanup tears down on return. Returning
-		// while it still runs would close src and deregister the pins underneath
-		// a live decrypt.
-		_ = pr.CloseWithError(err)
-		<-decDone
-	case srcLive && !dstLive:
-		// Framed -> plaintext.
-		_, err = decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, tmp)
-	case !srcLive && dstLive:
-		// Plaintext -> framed.
-		epoch, dstPins, err = encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, src, tmp)
-	default:
-		// Plaintext -> plaintext.
-		_, err = io.Copy(tmp, src)
-	}
+	// When a snapshot.meta will be restamped beside the destination, check
+	// the source against the record it already has FIRST. The restamp hashes
+	// the destination as written, so a source damaged after it was recorded
+	// (a same-length bit flip, invisible to the FileSize check) would come
+	// out carrying a checksum that vouches for the damage, and recovery would
+	// accept state VerifySnapshotArtifact refused. Every byte the copy reads
+	// is teed into the verifier, the rest of the file is drained through it,
+	// and a mismatch fails here, before anything is committed.
+	srcMeta, err := readReencryptSourceMeta(fsys, srcPath, dstPath)
 	if err != nil {
+		return 0, err
+	}
+	// A destination that already holds a snapshot.dat is a published pair
+	// (or half of one). Replacing it would rename new data over the old
+	// entry and restamp snapshot.meta beside it in two separate durable
+	// steps, and a crash between them could bring the old snapshot.dat back
+	// with the new record: recovery would then refuse a snapshot that was
+	// valid. Refuse before anything is copied; the deferred cleanup removes
+	// the temp.
+	if srcMeta.present {
+		if _, statErr := fsys.Stat(dstPath); statErr == nil {
+			return 0, fmt.Errorf("re-encrypt snapshot: destination %s already exists: %w", dstPath, fs.ErrExist)
+		}
+	}
+	srcReader, verifySrc := teeSourceVerifier(srcPath, srcMeta, src)
+
+	epoch, dstPins, err = copySnapshotAcrossBarriers(srcReader, tmp, shardID, replicaID, index,
+		srcBarrier, dstBarrier)
+	if err != nil {
+		return 0, err
+	}
+	if err := verifySrc(); err != nil {
 		return 0, err
 	}
 
@@ -281,6 +284,16 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// never remove (a temp file that no longer exists at) a path that is now
 	// the destination.
 	committed = true
+
+	// snapshot.meta records the epoch, length and hash of snapshot.dat AS
+	// STORED, so the source's record no longer describes the re-encrypted
+	// bytes: recovery verifies the artifact against it and refuses it as
+	// corrupt. Restamp it beside the destination, before the directory
+	// fsync below makes both durable. A failure comes back like the fsync
+	// failure below, epoch included, for the reason given there.
+	if err := restampReencryptedSnapshotMeta(fsys, dstPath, srcMeta, epoch); err != nil {
+		return epoch, &SnapshotCommittedNotDurableError{Path: dstPath, Epoch: epoch, Err: err}
+	}
 
 	// Make the rename (and any directories MkdirAll created) durable before
 	// reporting success: without the directory fsync a crash could leave the
@@ -307,4 +320,184 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 		}
 	}
 	return epoch, nil
+}
+
+// teeSourceVerifier returns the reader the copy consumes the source through
+// and a check to run once the copy is done. When a snapshot.meta will be
+// restamped beside dstPath and one sits beside srcPath, every byte read is
+// teed into an engine.SnapshotDataVerifier, and the check drains the rest of
+// the source through it and verifies it against that record; otherwise the
+// reader is src and the check is a no-op.
+func teeSourceVerifier(srcPath string, srcMeta reencryptSourceMeta, src io.Reader) (io.Reader, func() error) {
+	if !srcMeta.present {
+		return src, func() error { return nil }
+	}
+	verifier := engine.NewSnapshotDataVerifierForMeta(filepath.Dir(srcPath), srcMeta.meta, srcMeta.err)
+	tee := io.TeeReader(src, verifier)
+	return tee, func() error {
+		if _, err := io.Copy(io.Discard, tee); err != nil {
+			return err
+		}
+		return verifier.Verify()
+	}
+}
+
+// reencryptSourceMeta is the source's snapshot.meta, read once through the
+// injected snapshotFS and used both to check the source and to restamp the
+// destination. present is false when the destination is not a snapshot.dat
+// or the source has no snapshot.meta; err is the read or parse failure of a
+// record that exists, which the source check reports before anything is
+// committed.
+type reencryptSourceMeta struct {
+	present bool
+	meta    engine.SnapshotMeta
+	err     error
+}
+
+// readReencryptSourceMeta reads and parses the snapshot.meta beside srcPath
+// through fsys, bounded like every other snapshot.meta read. Only a failure
+// to open an existing record is returned as an error; a read, size or parse
+// failure is carried in the result for the source check to report.
+func readReencryptSourceMeta(fsys snapshotFS, srcPath, dstPath string) (reencryptSourceMeta, error) {
+	if filepath.Base(dstPath) != "snapshot.dat" {
+		return reencryptSourceMeta{}, nil
+	}
+	f, err := fsys.Open(filepath.Join(filepath.Dir(srcPath), "snapshot.meta"))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return reencryptSourceMeta{}, nil
+		}
+		return reencryptSourceMeta{}, err
+	}
+	data, err := io.ReadAll(io.LimitReader(f, reencryptMetaReadLimit+1))
+	// A read-only handle's Close error cannot indicate lost data.
+	_ = f.Close()
+	if err == nil && len(data) > reencryptMetaReadLimit {
+		err = engine.ErrSnapshotMetaTooLarge
+	}
+	var meta engine.SnapshotMeta
+	if err == nil {
+		meta, err = engine.ParseSnapshotMeta(data)
+	}
+	return reencryptSourceMeta{present: true, meta: meta, err: err}, nil
+}
+
+// copySnapshotAcrossBarriers streams the snapshot data in src into dst,
+// decrypting it under srcBarrier and sealing it under dstBarrier, where a
+// nil barrier means that side is plaintext. It returns the at-rest epoch and
+// the destination epochs encryptSnapshotFrames pinned, which the caller
+// deregisters once its durable write is done; both are zero when dstBarrier
+// is nil.
+func copySnapshotAcrossBarriers(src io.Reader, dst io.Writer, shardID, replicaID, index uint64,
+	srcBarrier, dstBarrier Barrier) (uint64, []uint64, error) {
+	srcLive := srcBarrier != nil
+	dstLive := dstBarrier != nil
+	switch {
+	case srcLive && dstLive:
+		// Framed -> framed. Decrypt in one goroutine, feeding plaintext through
+		// an in-memory pipe into the encrypt side, so no plaintext is ever
+		// written to disk.
+		pr, pw := io.Pipe()
+		decDone := make(chan struct{})
+		go func() {
+			defer close(decDone)
+			_, decErr := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, pw)
+			_ = pw.CloseWithError(decErr)
+		}()
+		epoch, pins, err := encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, pr, dst)
+		// Unblock the decrypt goroutine if the encrypt side stopped early, then
+		// JOIN it: it reads from src and holds srcBarrier epoch pins, both of
+		// which the caller's deferred cleanup tears down on return. Returning
+		// while it still runs would close src and deregister the pins underneath
+		// a live decrypt.
+		_ = pr.CloseWithError(err)
+		<-decDone
+		return epoch, pins, err
+	case srcLive && !dstLive:
+		// Framed -> plaintext.
+		_, err := decryptSnapshotFrames(srcBarrier, shardID, replicaID, index, src, dst)
+		return 0, nil, err
+	case !srcLive && dstLive:
+		// Plaintext -> framed.
+		return encryptSnapshotFrames(dstBarrier, shardID, replicaID, index, src, dst)
+	default:
+		// Plaintext -> plaintext.
+		_, err := io.Copy(dst, src)
+		return 0, nil, err
+	}
+}
+
+// reencryptMetaReadLimit bounds the source snapshot.meta read in
+// readReencryptSourceMeta. A record is a fixed header plus a body
+// whose declared length engine bounds at 64 KiB; anything longer is not a
+// record and is refused rather than read into memory.
+const reencryptMetaReadLimit = 1<<16 + 4096
+
+// restampReencryptedSnapshotMeta writes a snapshot.meta beside dstPath for
+// the re-encrypted data file, carrying the source record's index, term,
+// shard, replica and compression with the new epoch, length and hash. It
+// does nothing when dstPath is not a snapshot.dat or no snapshot.meta sits
+// beside srcPath.
+func restampReencryptedSnapshotMeta(fsys snapshotFS, dstPath string, srcMeta reencryptSourceMeta, epoch uint64) error {
+	if !srcMeta.present {
+		return nil
+	}
+	if srcMeta.err != nil {
+		// The source check refuses such a record before the commit; this
+		// guards a caller that skipped it.
+		return srcMeta.err
+	}
+	// Hash the destination AS STORED, so the record describes the bytes
+	// every later consumer reads.
+	dataFile, err := fsys.Open(dstPath)
+	if err != nil {
+		return err
+	}
+	dataHash, dataLen, hashErr := engine.HashSnapshotReader(dataFile)
+	// A read-only handle's Close error cannot indicate lost data.
+	_ = dataFile.Close()
+	if hashErr != nil {
+		return hashErr
+	}
+	meta := srcMeta.meta
+	buf := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index:       meta.Index,
+		Term:        meta.Term,
+		ShardID:     meta.ShardID,
+		ReplicaID:   meta.ReplicaID,
+		Epoch:       epoch,
+		Compression: meta.Compression,
+		DataLen:     dataLen,
+		DataHash:    dataHash,
+	})
+
+	// The destination directory is not an unpublished staging directory: a
+	// snapshot.meta may already sit beside dstPath (the runbook copies the
+	// source's). Truncating it in place would leave a torn or empty record
+	// after a crash mid-write, so the new record goes to a temp file in the
+	// same directory and is renamed over snapshot.meta: a crash leaves the
+	// old record or the new one, whole. The caller's directory fsync makes
+	// the rename durable.
+	dir := filepath.Dir(dstPath)
+	tmp, err := fsys.CreateTemp(dir, "snapshot.meta.tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	_, writeErr := tmp.Write(buf)
+	if writeErr == nil {
+		writeErr = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if writeErr == nil {
+		writeErr = closeErr
+	}
+	if writeErr == nil {
+		writeErr = fsys.Rename(tmpPath, filepath.Join(dir, "snapshot.meta"))
+	}
+	if writeErr != nil {
+		_ = fsys.Remove(tmpPath)
+		return writeErr
+	}
+	return nil
 }
