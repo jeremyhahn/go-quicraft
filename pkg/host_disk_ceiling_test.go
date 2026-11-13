@@ -376,3 +376,51 @@ func TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery(t *testing.T) {
 		t.Error("a newer low gate sample did not clear the flag")
 	}
 }
+
+// TestDiskGate_NewerHealthyWALSampleClearsStaleGateFull checks that a WAL
+// sample below the proposal threshold, newer than the gate's full sample,
+// clears the flag and HealthCheck's DiskOK without another proposal.
+func TestDiskGate_NewerHealthyWALSampleClearsStaleGateFull(t *testing.T) {
+	const maxBytes = uint64(1000)
+	cfg := config.HostConfig{WALDir: t.TempDir(), MaxWALDiskSize: maxBytes}
+	var flag atomic.Bool
+	gateOpts, walOpts := hostDiskMonitorOptions(cfg, &flag, nil)
+
+	var usage atomic.Uint64
+	usageFn := waldb.WithDiskUsageFunc(func(string) (uint64, error) { return usage.Load(), nil })
+	gate := waldb.NewDiskMonitor(cfg.WALDir, maxBytes, append(gateOpts, usageFn)...)
+	wal := waldb.NewDiskMonitor(cfg.WALDir, maxBytes, append(walOpts, usageFn)...)
+	h := &Host{diskFull: &flag, diskGate: gate}
+
+	usage.Store(maxBytes * 92 / 100)
+	if err := gate.ForceCheck(); !errors.Is(err, waldb.ErrDiskFull) {
+		t.Fatalf("gate at 92%%: got %v, want ErrDiskFull", err)
+	}
+	if h.HealthCheck().DiskOK {
+		t.Fatal("DiskOK with the gate full")
+	}
+
+	// A WAL sample between the two thresholds proves nothing about recovery.
+	if err := wal.ForceCheck(); err != nil {
+		t.Fatalf("WAL at 92%%: got %v, want nil", err)
+	}
+	if !flag.Load() || h.HealthCheck().DiskOK {
+		t.Error("a WAL sample above the proposal threshold cleared the gate's full state")
+	}
+
+	usage.Store(maxBytes * 50 / 100)
+	if err := wal.ForceCheck(); err != nil {
+		t.Fatalf("WAL at 50%%: got %v, want nil", err)
+	}
+	if flag.Load() {
+		t.Error("a newer healthy WAL sample did not clear the flag")
+	}
+	if !h.HealthCheck().DiskOK {
+		t.Error("DiskOK false after a newer healthy WAL sample")
+	}
+
+	// The gate's own full state recovers on the next proposal's sample.
+	if h.proposalDiskFull() {
+		t.Error("proposal refused after recovery")
+	}
+}
