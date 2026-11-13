@@ -252,10 +252,16 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// steps, and a crash between them could bring the old snapshot.dat back
 	// with the new record: recovery would then refuse a snapshot that was
 	// valid. Refuse before anything is copied; the deferred cleanup removes
-	// the temp.
+	// the temp. Only fs.ErrNotExist establishes that the destination is
+	// absent; any other lookup failure (EIO, EACCES) is returned, since the
+	// destination may still hold a published pair.
 	if srcMeta.present {
-		if _, statErr := fsys.Stat(dstPath); statErr == nil {
+		_, statErr := fsys.Stat(dstPath)
+		switch {
+		case statErr == nil:
 			return 0, fmt.Errorf("re-encrypt snapshot: destination %s already exists: %w", dstPath, fs.ErrExist)
+		case !errors.Is(statErr, fs.ErrNotExist):
+			return 0, fmt.Errorf("re-encrypt snapshot: look up destination %s: %w", dstPath, statErr)
 		}
 	}
 	srcReader, verifySrc := teeSourceVerifier(srcPath, srcMeta, src)
