@@ -1224,7 +1224,10 @@ func (r *raft) becomeLeader() error {
 	// The guard at the top of this function already established that the set
 	// fits, and nothing between the two changes it, so this cannot fail; the
 	// error is propagated rather than dropped so the two stay coupled if one
-	// of them is ever moved.
+	// of them is ever moved. The previous tenure's map is dropped first so
+	// the rebuild grants no new-voter grace: a new term earns every active
+	// flag afresh (see the reset loop above).
+	r.replicaToBit = nil
 	if err := r.rebuildReplicaToBit(); err != nil {
 		return err
 	}
@@ -5310,17 +5313,34 @@ func (r *raft) rebuildReplicaToBit() error {
 			"witnesses", len(r.witnesses))
 		return ErrTooManyVotingMembers
 	}
+	// A non-nil previous map means this is a membership change during the
+	// current leadership tenure (becomeLeader clears it first). A voter
+	// that was not in it was just added: give it one CheckQuorum window of
+	// grace, as etcd/raft does (new Progress has RecentActive = true).
+	// Its remote starts inactive and has had no chance to answer, so the
+	// next boundary — possibly one tick away — would otherwise count it
+	// against quorum and step the leader down, failing the very config
+	// change that added it (#1103: a one-replica shard adding a witness).
+	// The flag is cleared at that boundary as usual, so a voter that never
+	// answers still costs the leader its leadership one window later.
+	prev := r.replicaToBit
 	r.replicaToBit = make(map[uint64]uint8, votingCount)
 	var bit uint8
 	r.replicaToBit[r.replicaID] = bit
 	bit++
-	for id := range r.remotes {
+	for id, rm := range r.remotes {
 		r.replicaToBit[id] = bit
 		bit++
+		if _, known := prev[id]; prev != nil && !known {
+			rm.setActive()
+		}
 	}
-	for id := range r.witnesses {
+	for id, wm := range r.witnesses {
 		r.replicaToBit[id] = bit
 		bit++
+		if _, known := prev[id]; prev != nil && !known {
+			wm.setActive()
+		}
 	}
 
 	// Re-base in-flight ReadIndex acks to self-only. Their ackBits were

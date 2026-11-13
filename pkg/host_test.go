@@ -11691,6 +11691,15 @@ func TestSyncRequestUpdateWitnessPolicy_EndToEnd(t *testing.T) {
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
+	// The witness this test adds (127.0.0.1:6000) never runs, so once it
+	// is a member the voting set {1, witness 10} has quorum 2 with only one
+	// voter answering: with CheckQuorum on, the leader correctly steps down
+	// one CheckQuorum window (a few ms at test ticks) after the add, and
+	// the policy-tightening step below would race that step-down and see
+	// ErrNotLeader instead of the policy rejection it asserts (#1103).
+	// This test is about the witness policy, not CheckQuorum, so turn it
+	// off; the raft package tests the new-voter grace window itself.
+	scfg.CheckQuorum = config.BoolPtr(false)
 	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
