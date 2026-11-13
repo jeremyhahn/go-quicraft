@@ -222,27 +222,39 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	// the removal commits on it, and (b) the first time a survivor reports
 	// itself leader in a term above the removed leader's. Survivor
 	// membership discovery is not used: a survivor may learn the commit
-	// only from the new leader, after the election.
+	// only from the new leader, after the election. Once both are seen it
+	// closes handover, and it keeps watching the old host until the end of
+	// the test: (d) any IsLeader observation on the removed host after its
+	// first step-down, including one during the handover itself, is
+	// latched in sawLeader.
 	var (
 		stepDownAt, electedAt time.Time
 		electedID             uint64
+		sawLeader             atomic.Bool
 	)
-	electDone := make(chan struct{})
-	electStop := make(chan struct{})
+	handover := make(chan struct{})
+	watchStop := make(chan struct{})
+	watchDone := make(chan struct{})
 	go func() {
-		defer close(electDone)
+		defer close(watchDone)
 		tick := time.NewTicker(time.Millisecond)
 		defer tick.Stop()
-		for stepDownAt.IsZero() || electedAt.IsZero() {
+		signalled := false
+		for {
 			select {
-			case <-electStop:
+			case <-watchStop:
 				return
 			case <-tick.C:
 			}
-			if stepDownAt.IsZero() {
-				if info, err := oldHost.ShardInfo(removeLeaderShard); err != nil || !info.IsLeader {
+			info, err := oldHost.ShardInfo(removeLeaderShard)
+			oldLeads := err == nil && info.IsLeader
+			switch {
+			case stepDownAt.IsZero():
+				if !oldLeads {
 					stepDownAt = time.Now()
 				}
+			case oldLeads:
+				sawLeader.Store(true)
 			}
 			if electedAt.IsZero() {
 				for _, rid := range survivors {
@@ -253,8 +265,19 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 					}
 				}
 			}
+			// stepDownAt and electedAt are not written after handover
+			// closes, so the test reads them once it has received on it.
+			if !signalled && !stepDownAt.IsZero() && !electedAt.IsZero() {
+				signalled = true
+				close(handover)
+			}
 		}
 	}()
+	stopWatch := sync.OnceFunc(func() {
+		close(watchStop)
+		<-watchDone
+	})
+	defer stopWatch()
 
 	// (a) The leader removes its own replica.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -262,8 +285,7 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	submitAt := time.Now()
 	err = oldHost.SyncRequestRemoveNode(ctx, removeLeaderShard, oldID, 0)
 	if err != nil && !MaybeApplied(err) {
-		close(electStop)
-		<-electDone
+		stopWatch()
 		t.Fatalf("SyncRequestRemoveNode(own replica %d) on the leader = %v, want nil or a MaybeApplied error", oldID, err)
 	}
 
@@ -272,10 +294,9 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	// liveness limit runs from submission, not from the call's return.
 	handoverBound := removalCommitBound + bound
 	select {
-	case <-electDone:
+	case <-handover:
 	case <-time.After(time.Until(submitAt.Add(handoverBound + electionSchedulingSlack))):
-		close(electStop)
-		<-electDone
+		stopWatch()
 		t.Fatalf("within %v of submitting the removal of leader %d: old leader stepped down=%v, survivor of %v elected=%v",
 			handoverBound+electionSchedulingSlack, oldID, !stepDownAt.IsZero(), survivors, !electedAt.IsZero())
 	}
@@ -299,36 +320,6 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	}
 	t.Logf("replica %d removed itself; replica %d leads term >%d, %v after the step-down, %v after submission (election timeout %v)",
 		oldID, electedID, oldTerm, d, electedAt.Sub(submitAt), c.electionTimeout())
-
-	// (d) From here on, the removed host must never report itself leader again.
-	var sawLeader atomic.Bool
-	stop := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		tick := time.NewTicker(time.Millisecond)
-		defer tick.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-tick.C:
-				if info, err := oldHost.ShardInfo(removeLeaderShard); err == nil && info.IsLeader {
-					sawLeader.Store(true)
-				}
-			}
-		}
-	}()
-	stopWatch := func() {
-		select {
-		case <-stop:
-		default:
-			close(stop)
-		}
-		wg.Wait()
-	}
-	defer stopWatch()
 
 	// The election was asserted above; leadership may have moved between
 	// survivors since, so the rest of the test uses the current leader.
@@ -398,7 +389,7 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	time.Sleep(4 * c.electionTimeout())
 	stopWatch()
 	if sawLeader.Load() {
-		t.Fatalf("removed replica %d reported itself leader after its removal", oldID)
+		t.Fatalf("removed replica %d reported itself leader after its first step-down", oldID)
 	}
 	if _, lh, ok := c.leaderAmong(survivors, bound); !ok || lh == oldHost {
 		t.Fatalf("no survivor leads after the removed host's proposal")
