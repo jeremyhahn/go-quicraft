@@ -57,6 +57,11 @@ jobs:
           - ./pkg/internal/raft
           - ./pkg/logdb/waldb
           - ./pkg/seal
+          - ./pkg/batch
+          - ./pkg/crypto/shamir
+          - ./pkg/internal/engine
+          - ./pkg/internal/transport/revocation
+          - ./pkg/sm/kv
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -98,6 +103,13 @@ jobs:
             # 4 targets, 11.6k–13.8k execs/min: every exec derives a key and
             # runs an AEAD seal or open.
             ./pkg/seal)               EXECS=2500 ;;
+            # Enrolled with their round-trip and decode targets; the same
+            # budgets as the Makefile's release-gate mutation run.
+            ./pkg/batch)              EXECS=700000 ;;
+            ./pkg/crypto/shamir)      EXECS=450000 ;;
+            ./pkg/internal/engine)    EXECS=480000 ;;
+            ./pkg/internal/transport/revocation) EXECS=380000 ;;
+            ./pkg/sm/kv)              EXECS=1500000 ;;
             *)
               echo "FAIL: no execution budget is calibrated for ${PACKAGE} — add one before adding the package to the matrix"
               exit 1
@@ -130,6 +142,8 @@ jobs:
               # twice, idle and under load, within 0.1% — this one is stable
               # and genuinely that expensive.
               FuzzFrameHeaderUnmarshalCrash) echo 4500 ;;
+              # Each exec splits and recombines a secret over GF(256).
+              FuzzSplitCombine) echo 25000 ;;
               # 44k–176k execs/min: each of these opens or replays real WAL
               # state rather than decoding a buffer.
               FuzzRecordRoundTrip|FuzzRecordDecodeCrash|FuzzSegmentReplayCrash|\

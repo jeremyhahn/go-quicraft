@@ -580,8 +580,29 @@ fuzz-session:
 fuzz-raft:
 	$(call fuzz-pkg,./pkg/internal/raft)
 
+.PHONY: fuzz-batch
+fuzz-batch:
+	$(call fuzz-pkg,./pkg/batch)
+
+.PHONY: fuzz-shamir
+fuzz-shamir:
+	$(call fuzz-pkg,./pkg/crypto/shamir)
+
+.PHONY: fuzz-engine
+fuzz-engine:
+	$(call fuzz-pkg,./pkg/internal/engine)
+
+.PHONY: fuzz-revocation
+fuzz-revocation:
+	$(call fuzz-pkg,./pkg/internal/transport/revocation)
+
+.PHONY: fuzz-kv
+fuzz-kv:
+	$(call fuzz-pkg,./pkg/sm/kv)
+
 .PHONY: fuzz-all
-fuzz-all: fuzz-proto fuzz-transport fuzz-waldb fuzz-seal fuzz-session fuzz-raft
+fuzz-all: fuzz-proto fuzz-transport fuzz-waldb fuzz-seal fuzz-session fuzz-raft \
+          fuzz-batch fuzz-shamir fuzz-engine fuzz-revocation fuzz-kv
 
 # CI parity: identical to the `fuzz-seeds` job in .github/workflows/ci.yml.
 # -run=Fuzz without -fuzz runs each target over its seeds and committed corpus
@@ -600,7 +621,9 @@ ci-fuzz-seeds:
 # ============================================================================
 
 FUZZ_MUT_PKGS ?= ./pkg/proto ./pkg/internal/transport ./pkg/internal/session \
-                 ./pkg/internal/raft ./pkg/logdb/waldb ./pkg/seal
+                 ./pkg/internal/raft ./pkg/logdb/waldb ./pkg/seal ./pkg/batch \
+                 ./pkg/crypto/shamir ./pkg/internal/engine \
+                 ./pkg/internal/transport/revocation ./pkg/sm/kv
 # Each budget is the nightly's depth divided by FUZZ_MUT_DIVISOR.
 FUZZ_MUT_DIVISOR ?= 6
 
@@ -615,11 +638,17 @@ ci-fuzz-mutation:
 		  ./pkg/internal/raft)      base=680000 ;; \
 		  ./pkg/logdb/waldb)        base=2000000 ;; \
 		  ./pkg/seal)               base=2500 ;; \
+		  ./pkg/batch)              base=700000 ;; \
+		  ./pkg/crypto/shamir)      base=450000 ;; \
+		  ./pkg/internal/engine)    base=480000 ;; \
+		  ./pkg/internal/transport/revocation) base=380000 ;; \
+		  ./pkg/sm/kv)              base=1500000 ;; \
 		  *) echo "FAIL: no execution budget is calibrated for $$1 -- add one before adding the package to FUZZ_MUT_PKGS" >&2; return 1 ;; \
 		esac; \
 		case "$$2" in \
 		  FuzzMessageFrameDecode) base=160000 ;; \
 		  FuzzFrameHeaderUnmarshalCrash) base=4500 ;; \
+		  FuzzSplitCombine) base=25000 ;; \
 		  FuzzRecordRoundTrip|FuzzRecordDecodeCrash|FuzzSegmentReplayCrash|\
 		  FuzzUnmarshalAddrMapCrash|FuzzUnmarshalRemovedMapCrash) base=20000 ;; \
 		esac; \
