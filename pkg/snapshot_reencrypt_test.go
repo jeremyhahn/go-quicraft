@@ -19,9 +19,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
@@ -517,6 +519,53 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 			t.Error("nil destination barrier did not write the plaintext through")
 		}
 	})
+}
+
+// TestReencryptSnapshotFile_DestinationStatFailurePropagates pins the
+// overwrite guard's lookup: a Stat of the destination that fails with
+// anything other than fs.ErrNotExist (here EIO) does not establish that the
+// destination is absent, so the call must return that error before copying,
+// and the published snapshot.dat/snapshot.meta pair must stay unchanged.
+func TestReencryptSnapshotFile_DestinationStatFailurePropagates(t *testing.T) {
+	srcBarrier := createTestBarrier(t)
+	dstBarrier := createTestBarrier(t)
+
+	root := "/vol"
+	cfs := newCrashFS(root)
+	srcPath := filepath.Join(root, "src", "snapshot.dat")
+	dstDir := filepath.Join(root, "dst")
+	dstPath := filepath.Join(dstDir, "snapshot.dat")
+	dstMetaPath := filepath.Join(dstDir, "snapshot.meta")
+	srcData := encryptToBytes(t, srcBarrier, bytes.Repeat([]byte("new-source-content"), 200))
+	writeDurableFile(t, cfs, srcPath, srcData)
+	writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
+		reencryptTestSourceMeta(srcData))
+	oldData := encryptToBytes(t, dstBarrier, bytes.Repeat([]byte("published-destination"), 150))
+	oldMeta := reencryptTestSourceMeta(oldData)
+	writeDurableFile(t, cfs, dstPath, oldData)
+	writeDurableFile(t, cfs, dstMetaPath, oldMeta)
+
+	cfs.setHook(func(op crashOp, path string) error {
+		if op == opStat && filepath.Clean(path) == dstPath {
+			return &fs.PathError{Op: "stat", Path: path, Err: syscall.EIO}
+		}
+		return nil
+	})
+	_, err := reencryptSnapshotFile(cfs, srcPath, dstPath,
+		testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	cfs.setHook(nil)
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("err = %v, want the destination lookup's EIO", err)
+	}
+	if got, _ := cfs.liveBytes(dstPath); !bytes.Equal(got, oldData) {
+		t.Fatal("the published snapshot.dat was changed")
+	}
+	if got, _ := cfs.liveBytes(dstMetaPath); !bytes.Equal(got, oldMeta) {
+		t.Fatal("the published snapshot.meta was changed")
+	}
+	if names := cfs.entries(dstDir); len(names) != 2 {
+		t.Fatalf("%s holds %v, want only the published pair", dstDir, names)
+	}
 }
 
 // EncryptWithEpochPinnedContext is the path every snapshot frame now takes:
