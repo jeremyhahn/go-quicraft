@@ -190,6 +190,10 @@ func (s *Session) PrepareForUnregister() {
 //   - RespondedTo must be below SeriesID: a series that has already been
 //     responded to (RespondedTo == SeriesID) is not proposed again until
 //     ProposalCompleted advances it
+//
+// NodeHost.SyncPropose and NodeHost.Propose call it on every tracked
+// session before submission and return ErrInvalidSession when it fails,
+// because the host's own validator admits RespondedTo == SeriesID.
 func (s *Session) ValidForProposal(shardID uint64) bool {
 	in := s.inner.Load()
 	if !in.ValidForProposal(shardID) {

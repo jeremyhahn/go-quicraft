@@ -822,6 +822,9 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 		}
 		return dbSM.Result{Value: result.Value, Data: result.Data}, nil
 	}
+	if !session.ValidForProposal(session.ShardID) {
+		return dbSM.Result{}, ErrInvalidSession
+	}
 
 	// Use ProposeWithSession (not SyncProposeWithSession) so that
 	// ProposalCompleted is NOT called automatically. Dragonboat's API
@@ -1000,6 +1003,10 @@ func (nh *NodeHost) Propose(session *dbClient.Session, cmd []byte, timeout time.
 			return nil, translateError(err)
 		}
 		return wrapRequestState(rs, session.ShardID, cancel, nh.config.NotifyCommit), nil
+	}
+	if !session.ValidForProposal(session.ShardID) {
+		cancel()
+		return nil, ErrInvalidSession
 	}
 
 	rs, err := nh.host.ProposeWithSession(ctx, session.Inner(), cmd)

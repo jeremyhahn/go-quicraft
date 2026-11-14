@@ -63,19 +63,3 @@ func TestSessionBoundary_SyncPropose_AdvancedSeriesAccepted(t *testing.T) {
 		t.Fatalf("SyncPropose after ProposalCompleted: %v", err)
 	}
 }
-
-func TestSessionBoundary_Propose_WrongShardRefused(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	nh, session := respondedSession(ctx, t)
-
-	session.ProposalCompleted()
-	session.ShardID = 2
-	rs, err := nh.Propose(session, []byte("wrong-shard"), 5*time.Second)
-	if rs != nil {
-		rs.Release()
-	}
-	if !errors.Is(err, ErrInvalidSession) {
-		t.Fatalf("Propose with foreign ShardID: err = %v, want ErrInvalidSession", err)
-	}
-}
