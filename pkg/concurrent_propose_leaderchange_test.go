@@ -194,6 +194,43 @@ func concurrentProposeSameCount(t *testing.T, c *concurrentProposeCluster, keys 
 	}
 }
 
+// concurrentProposeProbeReachedStoppedLeader fails the test unless at least
+// one orphan probe was forwarded to the stopped leader. The survivors can
+// elect a replacement before the orphan goroutines submit anything, and then
+// every probe goes to the new leader (and commits) or is refused in the
+// leaderless window (a definite refusal, never maybe-applied); neither
+// exercises the forward to a dead replica. A probe the proposer's step worker
+// handed to raft while it still followed the stopped leader is failed by the
+// proposer's leader-change path (failLeaderChangeRequests in host.go) as a
+// maybe-applied *NotLeaderError naming no leader, or, if the change comes
+// after cancelOrphans, ends as a maybe-applied cancellation; and it was never
+// appended, so no replica applied it after the drain and the convergence.
+func concurrentProposeProbeReachedStoppedLeader(t *testing.T, c *concurrentProposeCluster,
+	out *proposeOutcomes, keys []string, leaderID uint64) {
+	t.Helper()
+	seen := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out.mu.Lock()
+		err, maybe := out.maybe[key]
+		_, acked := out.acked[key]
+		out.mu.Unlock()
+		applied := 0
+		for id := uint64(1); id <= 3; id++ {
+			applied += c.machine(id).snapshot()[key]
+		}
+		seen = append(seen, fmt.Sprintf("%s acked=%v err=%v applied=%d", key, acked, err, applied))
+		var nl *NotLeaderError
+		orphaned := errors.As(err, &nl) && nl.LeaderID == 0
+		canceled := errors.Is(err, ErrCanceled) || errors.Is(err, context.Canceled)
+		if maybe && (orphaned || canceled) && applied == 0 {
+			return
+		}
+	}
+	t.Fatalf("no orphan probe was forwarded to the stopped leader %d: every probe "+
+		"committed or was refused outright, so the survivors elected a "+
+		"replacement before any probe reached raft: %v", leaderID, seen)
+}
+
 // TestConcurrentPropose_ProposalToStoppedFormerLeader is the regression for
 // a proposal forwarded to a leader that is gone by the time the replicas are
 // compared (#928 review, finding 1). No test hook delays a single forwarded
@@ -297,6 +334,7 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
 	concurrentProposeSameCount(t, c, keys)
+	concurrentProposeProbeReachedStoppedLeader(t, c, out, keys, leaderID)
 	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
 		t.Fatalf("replica state hashes differ at index %d: %v", at, hashes)
 	}
