@@ -43,6 +43,8 @@ if err != nil {
 // keyBytes is now zeroed, on the error path too. Do not read it again.
 ```
 
+Checked by `Example_enclaveNewSealed` in `pkg/seal/example_enclave_test.go`.
+
 `ctx` bounds the seal. go-enclave hands it to the process sealer's provider,
 which may be a device or a remote service that blocks; a context that has ended
 fails the call with an error matching both `enclave.ErrSealFailed` and
@@ -77,6 +79,9 @@ if err := buf.WithBytes(func(k []byte) error {
 	return err
 }
 ```
+
+Checked, as an AES-GCM seal and open round trip, by `Example_enclaveWithBytes`
+in `pkg/seal/example_enclave_test.go`.
 
 Three rules the compiler will not enforce:
 
@@ -114,7 +119,8 @@ unprotected.
 key.Destroy()
 ```
 
-After this, `Open` returns `ErrEnclaveDestroyed`. Calling `Destroy` twice is
+After this, `Open` returns `ErrEnclaveDestroyed` (checked by
+`Example_enclaveWithBytes`). Calling `Destroy` twice is
 fine, it is safe on a nil handle, and it is safe while another goroutine is in
 `Open`. It does not wait for that call: an open already in flight completes
 against the envelope it pinned, and the last open out wipes the ciphertext.
@@ -153,6 +159,11 @@ if err := f.Freeze(); err != nil {
 }
 ```
 
+Checked by `Example_enclaveNewMemorySized` in
+`pkg/seal/example_enclave_test.go`, which also shows `As` refusing a capability
+the handle lacks and the `*CapabilityError` matching
+`enclave.ErrCapabilityUnsupported`.
+
 A sized enclave stays writable until you freeze it. That is what makes filling it possible, and what lets a retained
 slice corrupt the material instead of faulting. `Freeze` is idempotent and
 irreversible. A refused freeze leaves the enclave alive and writable, so destroy
@@ -167,6 +178,8 @@ the process.
 ```go
 enclave.Wipe(transient)
 ```
+
+Checked by `Example_enclaveWipe` in `pkg/seal/example_enclave_test.go`.
 
 Use this for the copy a third-party API forced you to make. It does not replace
 a `ByteAccess` (the bytes were swappable and dumpable while they existed), but
@@ -184,6 +197,8 @@ if err != nil {
 }
 defer creds.Secret.Destroy() // the credential is yours; the seal layer never destroys it
 ```
+
+Checked by `Example_enclaveNewCredentials` in `pkg/seal/example_enclave_test.go`.
 
 One credential serves many calls. The seal layer opens it, derives from it and
 destroys the opened copy each time; it never touches the `Sealed` itself.

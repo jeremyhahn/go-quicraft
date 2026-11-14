@@ -44,6 +44,10 @@ if leaderID, ok := quicraft.NotLeader(err); ok {
 }
 ```
 
+`NotLeader` also matches the bare `ErrNotLeader` sentinel, with leader 0; the
+leader's address is in `*NotLeaderError.LeaderAddress` through `errors.As`.
+Checked by `ExampleNotLeader` in `pkg/example_raft_test.go`.
+
 ## Handle `MaybeApplied` correctly
 
 Getting this wrong duplicates writes.
@@ -55,6 +59,11 @@ if quicraft.MaybeApplied(err) {
     // command here applies it twice.
 }
 ```
+
+A failure after the proposal reached Raft, such as its wait timing out, is
+`MaybeApplied`; a definite rejection such as `ErrSystemBusy`, and any read
+failure, is not. Checked by `ExampleMaybeApplied` in
+`pkg/example_raft_test.go`.
 
 After some failures the only honest answer is "unknown". If your command is not
 idempotent, use a session
@@ -79,6 +88,9 @@ buf, release, err := host.SyncReadBuf(ctx, shardID, key)
 defer release()   // do not skip this
 ```
 
+`ExampleHost_SyncReadBuf` in `pkg/example_raft_test.go` runs this on a
+single-node shard.
+
 The `*Buf` forms skip the allocation when your state machine implements
 `sm.NALookupInto`, and fall back to an ordinary lookup when it does not.
 
@@ -94,9 +106,11 @@ cfg.ElectionRTT = 10         // must be >= 5
 ```
 
 Linearizable reads then resolve without a heartbeat round while the lease
-holds. Validation refuses `LeaseRead` with `config.ErrLeaseReadRequiresCheckQuorum` if
-`CheckQuorum` is off, and with a `*config.ValidationError` if
-`ElectionRTT < 5`.
+holds. Validation refuses `LeaseRead` with a
+`*config.LeaseReadRequiresCheckQuorumError` (matching
+`config.ErrLeaseReadRequiresCheckQuorum`) if `CheckQuorum` is off, and with a
+`*config.ValidationError` if `ElectionRTT < 5`. Checked by
+`ExampleHost_StartShard_leaseRead` in `pkg/example_raft_test.go`.
 
 The lease is measured on the leader's monotonic clock, so a leader that is
 paused or descheduled loses it and falls back to the heartbeat round. It

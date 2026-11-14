@@ -70,6 +70,9 @@ store, err := waldb.Open(walDir,
 )
 ```
 
+`ExampleOpen` in `pkg/logdb/waldb/example_test.go` compiles this open, saves
+one update, reopens and reads the state back, with checked output.
+
 Set a disk ceiling. Without one, the WAL fills the volume and the first sign is
 `fdatasync` returning ENOSPC, which stops the store until a restart:
 
@@ -173,6 +176,10 @@ if errors.As(openErr, &corrupt) {
     // res.RecordsKept, res.BytesDiscarded, res.SegmentsDeleted
 }
 ```
+
+`ExampleRepair` in `pkg/logdb/waldb/example_test.go` runs this end to end:
+it damages a segment, matches the `*SegmentCorruptionError` from `Open`,
+repairs, and reopens on the entries before the damage, with checked output.
 
 Pass the block size the directory was written with. `Repair` refuses a segment
 that is not damaged (`ErrRepairNoCorruption`), an offset other than the one the

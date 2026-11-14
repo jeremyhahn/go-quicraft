@@ -50,6 +50,9 @@ slightly-behind follower catch up from the log.
 index, err := host.SyncRequestSnapshot(ctx, shardID, quicraft.DefaultSnapshotOption)
 ```
 
+`ExampleHost_SyncRequestSnapshot` in `pkg/example_snapshot_test.go` runs this
+and checks that the returned index is non-zero.
+
 `RequestSnapshot` is the asynchronous form and returns a `*RequestState`. Only
 one snapshot per shard runs at a time; a second request gets
 `ErrSnapshotInProgress`. A request issued after the previous one has returned
@@ -75,7 +78,9 @@ index, err := host.SyncRequestSnapshot(ctx, shardID, opt)
 
 The directory is created if needed, and the snapshot is also written to the
 normal snapshot directory, so log compaction still happens. Leave `Exported`
-alone; it follows from `ExportPath`.
+alone; it follows from `ExportPath`. `ExampleSnapshotOption_exportPath` in
+`pkg/example_snapshot_test.go` runs this into a directory that does not exist
+yet and checks that the snapshot file is written there.
 
 To a stream, from the latest snapshot:
 
@@ -106,6 +111,14 @@ different set of replicas, and `WithImportMemberIdentities` to supply the node
 identity (what each node's `host.NodeIdentity()` reports) of any member the
 artifact has none for: on a host with a transport, every member needs one.
 
+The shard must be stopped on this host, and this host must hold the replica's
+record: start it once (and stop it) before importing into a fresh host. Then
+start the shard again; it recovers from the imported snapshot.
+`ExampleHost_ImportSnapshot` in `pkg/example_snapshot_test.go` runs the whole
+flow: `ExportSnapshot` to a buffer on one host, `ImportSnapshot` with
+`WithImportDataDir("")` (the shard has no `DataDir`) on a fresh host, and a
+read of the exported key after the restart.
+
 The refusals are the safety net:
 
 | Error | Means |
@@ -129,6 +142,13 @@ epoch, err := quicraft.ReencryptSnapshotFile(srcPath, dstPath,
 
 Both barriers must be unsealed. A nil barrier means that side is plaintext; a
 sealed one is not plaintext and fails the call.
+
+When the source has a `snapshot.meta` beside it, `dstPath` must not exist yet.
+A destination that already holds a `snapshot.dat` is refused with a `*SnapshotDestinationError` that
+names it and matches `fs.ErrExist`, before anything is written: re-key into a
+fresh directory. A `snapshot.meta` already in that directory (a copy of the
+source's) is fine; it is replaced whole, by rename, with one that describes the
+re-encrypted data.
 
 `shardID`, `replicaID` and `index` must be the identity the snapshot was sealed
 under. They are part of what each frame authenticates, and there is no weaker

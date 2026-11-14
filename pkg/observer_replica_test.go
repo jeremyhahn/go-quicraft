@@ -169,20 +169,44 @@ func (c *observerCluster) assertObserverNeverLeads(d time.Duration) {
 
 // admitObserver admits replica 4 through a committed config change, then
 // starts it as a joiner anchored on the voters' committed identities.
-func (c *observerCluster) admitObserver(t *testing.T) {
+func (c *observerCluster) admitObserver(ctx context.Context, t *testing.T) {
 	t.Helper()
 	obs := c.host(observerID)
-	if !waitUntil(20*time.Second, func() bool {
-		id := c.leader()
-		if id == 0 {
+	// The add is not idempotent: a call that commits but returns an error
+	// (its own deadline under load) leaves replica observerID a member, and
+	// every retry of the same add is then refused. So the leader's applied
+	// membership, not the call's result, decides whether the admission is
+	// done: it is checked before each attempt and again after a failed one.
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	admitted := func(id uint64) bool {
+		m, err := c.host(id).ShardMembership(observerShard)
+		if err != nil || m == nil {
 			return false
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return c.host(id).SyncRequestAddObserverWithIdentity(ctx, observerShard, observerID,
-			obs.RaftAddress(), c.ids[observerID], 0) == nil
-	}) {
-		t.Fatal("SyncRequestAddObserverWithIdentity never committed")
+		_, ok := m.Observers[observerID]
+		return ok
+	}
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		if id := c.leader(); id != 0 {
+			if admitted(id) {
+				break
+			}
+			callCtx, callCancel := context.WithTimeout(ctx, 5*time.Second)
+			lastErr = c.host(id).SyncRequestAddObserverWithIdentity(callCtx, observerShard, observerID,
+				obs.RaftAddress(), c.ids[observerID], 0)
+			callCancel()
+			if lastErr == nil || admitted(id) {
+				break
+			}
+			t.Logf("admitObserver attempt %d through leader %d: %v", attempt, id, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("SyncRequestAddObserverWithIdentity never committed: last error: %v", lastErr)
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
 	scfg := testShardConfig(observerShard, observerID)
 	scfg.IsObserver = true
@@ -199,7 +223,7 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 	c.startVoters()
 	c.put("before", "the-observer")
 
-	c.admitObserver(t)
+	c.admitObserver(t.Context(), t)
 	obs := c.host(observerID)
 
 	const entries = 20
@@ -344,7 +368,7 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 func TestObserverReplica_TwoVotersCommitWithObserverDown(t *testing.T) {
 	c := newObserverCluster(t)
 	c.startVoters()
-	c.admitObserver(t)
+	c.admitObserver(t.Context(), t)
 	c.put("k", "v")
 
 	// The observer catches up: its state machine hash reaches the leader's at
