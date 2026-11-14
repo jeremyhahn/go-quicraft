@@ -62,6 +62,7 @@ concurrency:
 
 jobs:
   revert:
+    timeout-minutes: 10
     name: Revert a merge that turned main red
     if: >-
       github.server_url != 'https://github.com' &&
