@@ -5227,9 +5227,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// published into the engine, so a failed StartShard does not leak the open
 	// store and brick subsequent retries on the same DataDir with "lock held by
 	// current process". Once published (smPublished=true, set after LoadNode),
-	// the node's lifecycle — including rsm.Close — is owned by StopShard/Close,
-	// and every error path between publication and LoadNode removes the
-	// nodeState first, so this never double-closes.
+	// the node's lifecycle — including rsm.Close — is owned by StopShard/Close.
+	// The error path between nodeState publication and LoadNode (a failed
+	// SaveBootstrap) claims ns.stopped first: it rolls back and keeps this
+	// close only when it wins the claim, and sets smPublished when a
+	// concurrent StopShard/Close won it, so this never double-closes.
 	smPublished := false
 	defer func() {
 		if !smPublished {
@@ -5581,16 +5583,26 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			bootstrap.Addresses = nodesCopy
 		}
 		if err := h.logdb.SaveBootstrap(cfg.ShardID, cfg.ReplicaID, bootstrap); err != nil {
-			// Mark the nodeState stopped BEFORE removing it from h.nodes
-			// (matching StopShard/Close ordering): a reader that resolved ns
-			// just before the Delete must fail its stopped check rather than
-			// call into the state machine the deferred rollback is about to
-			// close.
-			ns.stopped.Store(true)
-			h.nodes.Delete(cfg.ShardID)
-			h.clearShardJoining(cfg.ShardID)
-			h.anchors.Delete(cfg.ShardID)
-			h.activeNodes.Add(-1)
+			// Claim teardown before rolling back, as StopShard and Close do.
+			// The nodeState was published before the save, so a Close or
+			// StopShard that ran while the save was in flight may already
+			// own it: that claimant removes the node, decrements
+			// activeNodes and closes the state machine, and a second
+			// rollback here would drive activeNodes negative and close the
+			// user's state machine twice. Losing the claim hands the
+			// deferred close to the claimant as well. Winning it marks the
+			// nodeState stopped BEFORE removing it from h.nodes, so a reader
+			// that resolved ns just before the Delete fails its stopped
+			// check rather than call into the state machine the deferred
+			// rollback is about to close.
+			if ns.stopped.CompareAndSwap(false, true) {
+				h.nodes.Delete(cfg.ShardID)
+				h.clearShardJoining(cfg.ShardID)
+				h.anchors.Delete(cfg.ShardID)
+				h.activeNodes.Add(-1)
+			} else {
+				smPublished = true
+			}
 			// A start that lost a race with Close finds the LogDB closed:
 			// report the host closed, as the publish check below would.
 			if h.closed.Load() || errors.Is(err, logdb.ErrClosed) {
