@@ -170,6 +170,14 @@ func main() {
 
 `deploymentID`, `readPassphrase` and `hostCfg` are yours to supply.
 
+The persist and restart path of this block is compiled and run as
+`ExampleBarrier_SetSealedRootKey` in `pkg/seal/example_persist_test.go`: a
+barrier is initialized and its `SealedRootKeyData` written as JSON, a value is
+encrypted and the barrier sealed, then a new barrier reads the JSON back,
+calls `SetSealedRootKey` and `Unseal` with a strategy from the same passphrase,
+and decrypts the value. A strategy from a different passphrase makes `Unseal`
+return an `*UnsealError` and leaves the barrier sealed.
+
 To move the blob somewhere other than a file (a Raft-backed KV store, a database
 row, a KMS entry), replace the body of `persistSealedState` and the
 `os.ReadFile`. Nothing else changes.

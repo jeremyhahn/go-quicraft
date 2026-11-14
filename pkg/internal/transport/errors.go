@@ -116,9 +116,11 @@ var (
 	ErrCACertificateParse = errors.New("transport: CA certificate parse failed")
 
 	// ErrSnapshotChunkWriteTimeout is the sentinel for
-	// SnapshotChunkWriteTimeoutError. Returned when a snapshot chunk
-	// write exceeds the per-chunk write deadline, indicating a slow
-	// receiver or network stall.
+	// SnapshotChunkWriteTimeoutError. Returned when writing a snapshot
+	// chunk fails for any reason: the per-chunk write deadline expiring
+	// (a slow receiver or network stall) is one cause, the receiver
+	// closing the connection or resetting the stream mid-transfer is
+	// another. The wrapped stream error tells them apart.
 	ErrSnapshotChunkWriteTimeout = errors.New("transport: snapshot chunk write deadline exceeded")
 )
 
@@ -442,9 +444,14 @@ func (e *CACertificateParseError) Unwrap() error {
 }
 
 // SnapshotChunkWriteTimeoutError is returned when writing a snapshot chunk
-// to a QUIC stream exceeds the per-chunk write deadline. This indicates the
-// receiver is slow or the network is stalled. The snapshot send is aborted
-// and the snapshotTracker slot is released so Stop() can proceed.
+// to a QUIC stream fails. Despite its name it wraps every chunk write
+// failure, not only the per-chunk write deadline expiring: a receiver that
+// closes the connection or resets the stream mid-transfer is reported as
+// this type too. ShardID and ReplicaID name the target, ChunkID is the
+// zero-based position of the failed chunk in the transfer, and Err (returned
+// by Unwrap) is the stream error that says which failure it was. The
+// snapshot send is aborted and the snapshotTracker slot is released so
+// Stop() can proceed.
 type SnapshotChunkWriteTimeoutError struct {
 	ShardID   uint64
 	ReplicaID uint64
@@ -452,7 +459,9 @@ type SnapshotChunkWriteTimeoutError struct {
 	Err       error
 }
 
-// Error returns a human-readable description of the timeout.
+// Error returns a human-readable description of the failed chunk write.
+// The text keeps its historical "deadline exceeded" wording; the wrapped
+// error it ends with names the actual cause.
 func (e *SnapshotChunkWriteTimeoutError) Error() string {
 	return fmt.Sprintf(
 		"transport: snapshot chunk write deadline exceeded for shard %d replica %d chunk %d: %v",

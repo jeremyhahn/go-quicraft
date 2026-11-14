@@ -498,12 +498,15 @@ type Config struct {
 	// there are no pending proposals.
 	Quiesce bool
 
-	// OrderedConfigChange serializes configuration changes so that only
-	// one membership change is applied at a time. The Raft paper mandates
-	// single-membership-change-at-a-time for safety. Defaults to true
-	// when nil. Set to BoolPtr(false) to explicitly disable for
-	// benchmarking or compatibility testing. Disabling is UNSAFE for
-	// production.
+	// OrderedConfigChange has no effect. Membership changes are always
+	// serialised: while one config change is appended but not yet applied,
+	// the leader refuses every further one, and the Host API reports the
+	// refusal as ErrRejected (nothing entered the log, so a retry once the
+	// pending change commits succeeds). The Raft paper mandates
+	// single-membership-change-at-a-time for safety, so the gate is not
+	// configurable. Defaults to true when nil; an explicit BoolPtr(false)
+	// is accepted, logs a warning in Validate, and changes nothing. The
+	// field is kept for configuration compatibility.
 	OrderedConfigChange *bool
 
 	// ZeroCopyEntryCmd controls whether Entry.Cmd aliases the internal
@@ -648,11 +651,12 @@ type Config struct {
 //
 // CheckQuorum, PreVote, and OrderedConfigChange default to true when nil.
 // These are Raft safety invariants: disabling CheckQuorum permits a stale
-// leader to serve reads after a partition heals, disabling PreVote allows
-// disruptive elections from partitioned nodes, and disabling
-// OrderedConfigChange violates the single-membership-change-at-a-time
-// requirement from the Raft paper. Explicitly setting these to
-// BoolPtr(false) is respected but will emit a warning during Validate().
+// leader to serve reads after a partition heals, and disabling PreVote
+// allows disruptive elections from partitioned nodes. Explicitly setting
+// these to BoolPtr(false) is respected but will emit a warning during
+// Validate(). OrderedConfigChange is the exception: membership changes are
+// always serialised, so BoolPtr(false) is accepted and warned about but has
+// no effect (see the field).
 func (c *Config) SetDefaults() {
 	// Safety-critical defaults: only apply when user has not explicitly set.
 	if c.CheckQuorum == nil {
@@ -944,7 +948,7 @@ func (c *Config) warnDisabledSafetyFlags() {
 		slog.Warn("PreVote disabled: partitioned nodes may cause disruptive elections")
 	}
 	if c.OrderedConfigChange != nil && !*c.OrderedConfigChange {
-		slog.Warn("OrderedConfigChange disabled: concurrent membership changes violate Raft safety")
+		slog.Warn("OrderedConfigChange=false has no effect: membership changes are always serialised")
 	}
 }
 
@@ -967,7 +971,8 @@ func (c *Config) GetPreVote() bool {
 }
 
 // GetOrderedConfigChange returns the effective OrderedConfigChange value.
-// Returns true if OrderedConfigChange is nil (safe default).
+// Returns true if OrderedConfigChange is nil (safe default). The value
+// governs nothing: membership changes are always serialised.
 func (c *Config) GetOrderedConfigChange() bool {
 	if c.OrderedConfigChange == nil {
 		return true

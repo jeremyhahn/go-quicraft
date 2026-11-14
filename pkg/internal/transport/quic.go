@@ -318,6 +318,11 @@ type QUICTransport struct {
 	// a seam.
 	inboundRefusalForTest func(conn *quic.Conn) error
 
+	// queuedCloseForTest, when set, runs before closeQueuedOnShutdown closes
+	// each connection it drained from the accept queue, so tests can make
+	// the drain outlast a deadline.
+	queuedCloseForTest func()
+
 	shutdownCtx     context.Context
 	shutdownCancel  context.CancelFunc
 	wg              sync.WaitGroup
@@ -869,6 +874,17 @@ func (t *QUICTransport) stop() {
 	// shutdownCancel above are enough to end it.
 	t.acceptWG.Wait()
 
+	// The join covers what the loop ADMITTED, not what the listener QUEUED.
+	// The loop exits as soon as it sees stopped, and its Accept runs on
+	// shutdownCtx, cancelled above, which can win over a queued connection;
+	// a connection whose handshake completed but which the loop never took is
+	// still in the listener's queue, unpublished, so the inbound sweep below
+	// cannot reach it and quicTr.Close would destroy it unannounced. Drain the
+	// queue and announce on each one here.
+	if n := t.closeQueuedOnShutdown(); n > 0 {
+		supervise.LogContained(func() { slog.Debug("announced shutdown on queued inbound connections", "connections", n) })
+	}
+
 	t.connMu.Lock()
 	for addr, conn := range t.conns {
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
@@ -949,6 +965,43 @@ func (t *QUICTransport) stop() {
 		if err := t.udpConn.Close(); err != nil {
 			supervise.LogContained(func() { slog.Debug("UDP listener close failed", "error", err) })
 		}
+	}
+}
+
+// closeQueuedOnShutdown takes every connection left in the closed listener's
+// accept queue and closes it with QUICErrShutdown, so its dialer learns of the
+// shutdown at once instead of after MaxIdleTimeout. It must run after the
+// listener close (a closed listener's Accept returns the queued connections and
+// then ErrServerClosed, never blocking) and after the accept loop has returned
+// (so nothing else takes from the queue), and before quicTr.Close.
+//
+// Accept runs on an uncancelled context, and the drain ends only on the
+// listener's close error (ErrServerClosed). A deadline would cover every
+// synchronous CloseWithError below: once it expired, quic-go's Accept could
+// pick ctx.Done() over a nonempty queue, and quicTr.Close would destroy the
+// rest of the queue unannounced. The closed listener cannot block Accept once
+// the queue is empty, so no deadline is needed.
+func (t *QUICTransport) closeQueuedOnShutdown() int {
+	if t.listener == nil {
+		return 0
+	}
+	ctx := context.Background()
+	closed := 0
+	for {
+		conn, err := t.listener.Accept(ctx)
+		if err != nil {
+			return closed
+		}
+		if t.queuedCloseForTest != nil {
+			t.queuedCloseForTest()
+		}
+		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
+			remote := conn.RemoteAddr().String()
+			supervise.LogContained(func() {
+				slog.Debug("QUIC queued inbound connection close failed", "remote", remote, "error", err)
+			})
+		}
+		closed++
 	}
 }
 

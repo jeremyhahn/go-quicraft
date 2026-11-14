@@ -50,6 +50,8 @@ type CA struct {
 	key    *ecdsa.PrivateKey
 	certPE []byte
 	serial int64
+	// crlNumber is the CRL number of the last list CRL issued.
+	crlNumber int64
 }
 
 // NewCA generates a fresh CA. Every leaf it issues verifies against it and
@@ -161,6 +163,43 @@ func (ca *CA) Leaves(t testing.TB, n int) []*config.MTLSConfig {
 		out[i] = ca.Leaf(t)
 	}
 	return out
+}
+
+// CRL returns a PEM-encoded ("X509 CRL") certificate revocation list signed
+// by ca that revokes the leaf certificate of each of revoked. With no
+// arguments it is an empty, valid CRL. Every call carries a fresh, increasing
+// CRL number, and the list is valid from a minute ago for an hour, so a
+// checker that refuses a stale CRL accepts it.
+func (ca *CA) CRL(t testing.TB, revoked ...*config.MTLSConfig) []byte {
+	t.Helper()
+	now := time.Now()
+	entries := make([]x509.RevocationListEntry, 0, len(revoked))
+	for i, m := range revoked {
+		block, _ := pem.Decode(m.Cert)
+		if block == nil {
+			t.Fatalf("testpki: revoked[%d]: no PEM certificate", i)
+		}
+		leaf, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatalf("testpki: revoked[%d]: parse leaf: %v", i, err)
+		}
+		entries = append(entries, x509.RevocationListEntry{
+			SerialNumber:   leaf.SerialNumber,
+			RevocationTime: now.Add(-1 * time.Minute),
+		})
+	}
+	ca.crlNumber++
+	tmpl := &x509.RevocationList{
+		RevokedCertificateEntries: entries,
+		Number:                    big.NewInt(ca.crlNumber),
+		ThisUpdate:                now.Add(-1 * time.Minute),
+		NextUpdate:                now.Add(1 * time.Hour),
+	}
+	der, err := x509.CreateRevocationList(rand.Reader, tmpl, ca.cert, ca.key)
+	if err != nil {
+		t.Fatalf("testpki: create CRL: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})
 }
 
 // Files is a leaf written to disk, for adapters that take their mTLS

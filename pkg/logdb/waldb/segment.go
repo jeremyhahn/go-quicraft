@@ -320,7 +320,11 @@ func (s *segment) CanFit(dataLen int) error {
 	// The record itself must leave room for the sync mark the Sync that
 	// acknowledges it will append (syncMarkReserve), or the mark could land
 	// past maxFileSize. Both bounds include it.
-	if int64(needed)+syncMarkReserve > s.maxFileSize {
+	// The permanent bound is the framed size from an EMPTY segment, not from
+	// the current block offset: starting mid-block can split the record into
+	// one more chunk, and a record that fits a fresh segment must get
+	// ErrSegmentFull here so the caller rotates instead of failing for good.
+	if int64(s.bytesNeededFrom(0, dataLen))+syncMarkReserve > s.maxFileSize {
 		return ErrRecordTooLarge
 	}
 	if s.fileOffset+int64(s.blockOffset)+int64(needed)+syncMarkReserve > s.maxFileSize {
@@ -341,9 +345,15 @@ func (s *segment) RecordCount() uint64 {
 // including all chunk headers and any block padding needed for block
 // transitions.
 func (s *segment) bytesNeeded(dataLen int) int {
+	return s.bytesNeededFrom(s.blockOffset, dataLen)
+}
+
+// bytesNeededFrom is bytesNeeded for a record that starts at block offset
+// blockOff rather than at the segment's current one. From offset 0 it is the
+// framed size the record takes in an empty segment.
+func (s *segment) bytesNeededFrom(blockOff, dataLen int) int {
 	total := 0
 	remaining := dataLen
-	blockOff := s.blockOffset
 
 	for remaining > 0 {
 		avail := s.blockSize - blockOff
