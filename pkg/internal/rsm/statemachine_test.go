@@ -2508,6 +2508,71 @@ func TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine(t *testing.T
 	}
 }
 
+// TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate holds a
+// writer on the read guard at every instant (several goroutines loop on
+// lockApply/unlockApply, as a continuous Update stream does) and requires a
+// Lookup whose context can only be cancelled, never times out, to complete.
+// A TryRLock poll fails whenever a writer is pending, so it starves here; a
+// fair acquisition gets the read guard between two Updates.
+func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	const writerCount = 4
+	for i := 0; i < writerCount; i++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				rsm.lockApply()
+				time.Sleep(2 * time.Millisecond)
+				rsm.unlockApply()
+			}
+		}()
+	}
+	defer func() {
+		close(stop)
+		writers.Wait()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const reads = 200
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < reads; i++ {
+			if _, lookupErr := rsm.Lookup(ctx, "key"); lookupErr != nil {
+				done <- lookupErr
+				return
+			}
+		}
+		done <- nil
+	}()
+	select {
+	case lookupErr := <-done:
+		if lookupErr != nil {
+			t.Fatalf("Lookup under continuous Update = %v", lookupErr)
+		}
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-done
+		t.Fatalf("%d cancel-only Lookups did not complete within 5s under a continuous Update stream: read starvation", reads)
+	}
+}
+
 func TestStateMachine_NALookupBuf_ErrorPropagated(t *testing.T) {
 	// testNALookupIntoSMError returns an error from BytesLookupInto.
 	kv := &testNALookupIntoSMError{}
