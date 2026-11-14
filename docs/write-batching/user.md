@@ -60,6 +60,9 @@ func (s *MySM) Update(ctx context.Context, entries []sm.Entry, results []sm.Resu
 }
 ```
 
+`ExampleDecodeBatch` in [`pkg/batch/example_test.go`](../../pkg/batch/example_test.go)
+runs this decode and checks its output.
+
 - `DecodeBatch` returns `nil, nil` for an empty entry, so if a shard carries
   both batched and unbatched entries you need your own discriminator, such as a
   leading type byte or a shard reserved for batched writes.
@@ -104,6 +107,10 @@ default:
 	// definite failure: the command was not applied
 }
 ```
+
+`ExampleFlushError` in [`pkg/batch/example_test.go`](../../pkg/batch/example_test.go)
+runs this switch against a failing proposer: a plain rejection is definite, a
+propose timeout is indeterminate, and both carry the shard ID.
 
 An indeterminate failure is what you get when your own context ends while
 waiting, or the propose times out. Retry it only if the command is safe to apply
@@ -158,6 +165,10 @@ An unknown `Mode` reports false from `IsSynchronous`, `IsAsync` and
 
 `Batched` reports `RequiresQuorum() == true`: once its batch commits, a batched
 write has the same durability as `Sync`.
+
+`ExampleFromString` in [`pkg/writemode/example_test.go`](../../pkg/writemode/example_test.go)
+checks each name, its predicates, and the `*writemode.InvalidModeError` for an
+unknown name or `Mode`.
 
 ## Troubleshooting
 
