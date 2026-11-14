@@ -1136,7 +1136,9 @@ func (q *readWaitQueue) signal() {
 // read, so repeated cancelled reads against a stalled Update cost no
 // goroutines. lockApply yields to the registered readers, so a continuous
 // Update stream cannot starve the read either, and the readers it yields to
-// were registered before it, so reads cannot starve Update.
+// were registered before it, so reads cannot starve Update. A queued read
+// rechecks ctx after each acquisition and releases the guard when it was
+// cancelled, so a cancelled read never reaches the lookup.
 func (s *StateMachine) rlockContext(ctx context.Context) error {
 	if s.readGuard.TryRLock() {
 		return nil
@@ -1155,6 +1157,14 @@ func (s *StateMachine) rlockContext(ctx context.Context) error {
 		// after a failed TryRLock always closes the channel waited on.
 		wake := s.readWait.wakeChan()
 		if s.readGuard.TryRLock() {
+			// The context may have been cancelled while this reader was
+			// queued and the guard released before it resumed: the select
+			// below can then pick wake or the timer over done. A queued read
+			// that was cancelled must not run the lookup.
+			if err := ctx.Err(); err != nil {
+				s.readGuard.RUnlock()
+				return err
+			}
 			return nil
 		}
 		select {
