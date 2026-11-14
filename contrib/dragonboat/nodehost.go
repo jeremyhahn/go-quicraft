@@ -1209,13 +1209,22 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 		// which re-raises it inside its own panic-handling boundary,
 		// as the synchronous call did. A panic after the caller stopped
 		// waiting has no caller left and is dropped.
+		//
+		// A lookup that ends its goroutine with runtime.Goexit neither
+		// returns nor panics (recover() is nil): it never produced a
+		// result, so it is reported as ErrAborted, not as a successful
+		// (nil, nil) read.
+		returned := false
 		defer func() {
 			if p := recover(); p != nil {
 				r = lookupResult{panicked: true, panicVal: p}
+			} else if !returned {
+				r = lookupResult{err: ErrAborted}
 			}
 			done <- r
 		}()
 		r.val, r.err = nh.host.QueryLocalNode(ctx, shardID, query)
+		returned = true
 	}()
 	select {
 	case r := <-done:
