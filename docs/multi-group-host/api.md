@@ -340,11 +340,16 @@ A linearizable read in one call:
 The result reflects every write committed before the call.
 
 On a basic `sm.StateMachine`, step 3 waits for any in-flight `Apply`, which
-holds the RSM adapter's read guard for writing. `sync.RWMutex` has no
-context-aware acquire, so `ctx`'s deadline is not observed while the call waits
-on that lock. The same applies to `SyncReadBuf`, `FollowerRead`,
-`QueryLocalNode`, `StaleRead` and `StaleReadBuf`. `ConcurrentStateMachine` and
-`DiskStateMachine` lookups run alongside `Apply`. See
+holds the RSM adapter's read guard for writing. That wait observes `ctx`: the
+adapter acquires the guard with a context-aware retry, so a deadline or
+cancellation that fires while the read is queued behind `Apply` returns
+`ctx.Err()` without running `Lookup`. Once the guard is held, the call hands `ctx` to the
+embedder's `Lookup` and waits for it to return; whether a lookup that is already
+running stops on cancellation is up to that implementation (`NALookupInto`
+takes no context and always runs to completion). The
+same applies to `SyncReadBuf`, `FollowerRead`, `QueryLocalNode`, `StaleRead` and
+`StaleReadBuf`. `ConcurrentStateMachine` and `DiskStateMachine` lookups run
+alongside `Apply`, so they do not queue on the guard. See
 [Lookup concurrency](../state-machines/engineering.md#concurrency).
 
 #### SyncReadBuf
