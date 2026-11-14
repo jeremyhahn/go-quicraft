@@ -4808,6 +4808,14 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return err
 	}
 
+	// The bootstrap record's DataDir is where the replica's snapshots are,
+	// and what RemoveData and ImportSnapshot locate them by. A start under
+	// another DataDir would recover from the old tree while recording the
+	// new one, so it is refused before anything is recovered or overwritten.
+	if err := h.refuseDataDirChange(cfg.ShardID, cfg.ReplicaID, cfg.DataDir); err != nil {
+		return err
+	}
+
 	// Copy the members map to avoid aliasing.
 	nodesCopy := make(map[uint64]string, len(members))
 	for k, v := range members {
@@ -11427,6 +11435,49 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 	}
 	if retired {
 		return &ReplicaRetiredError{ShardID: shardID, ReplicaID: replicaID}
+	}
+	return nil
+}
+
+// DataDirChangedError is returned by StartShard when the replica's bootstrap
+// record states a different DataDir from the Config's. The replica's
+// snapshots, and the LogDB records naming them, are under the recorded
+// DataDir: a start under another one would recover them from the old tree
+// while recording the new one, and a later RemoveData or ImportSnapshot,
+// which locate the tree by the record, would act on the wrong directory.
+type DataDirChangedError struct {
+	ShardID   uint64
+	ReplicaID uint64
+	Recorded  string
+	Requested string
+}
+
+// Error implements the error interface.
+func (e *DataDirChangedError) Error() string {
+	return fmt.Sprintf("quicraft: shard %d replica %d was started with DataDir %q, refusing DataDir %q",
+		e.ShardID, e.ReplicaID, e.Recorded, e.Requested)
+}
+
+// refuseDataDirChange returns *DataDirChangedError when the replica's
+// bootstrap record states a DataDir other than dataDir, and a LogDB error
+// when that cannot be determined. It runs before StartShard recovers or
+// writes anything, so the bootstrap record keeps stating the tree the
+// replica's snapshots are in.
+func (h *Host) refuseDataDirChange(shardID, replicaID uint64, dataDir string) error {
+	if h.logdb == nil {
+		return nil
+	}
+	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
+	if err != nil {
+		return err
+	}
+	if ok && bs.DataDir != dataDir {
+		return &DataDirChangedError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Recorded:  bs.DataDir,
+			Requested: dataDir,
+		}
 	}
 	return nil
 }
