@@ -11446,9 +11446,13 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 // while recording the new one, and a later RemoveData or ImportSnapshot,
 // which locate the tree by the record, would act on the wrong directory.
 type DataDirChangedError struct {
-	ShardID   uint64
+	// ShardID is the shard whose start was refused.
+	ShardID uint64
+	// ReplicaID is the replica whose start was refused.
 	ReplicaID uint64
-	Recorded  string
+	// Recorded is the DataDir the replica's bootstrap record states.
+	Recorded string
+	// Requested is the DataDir of the Config passed to StartShard.
 	Requested string
 }
 
