@@ -111,6 +111,10 @@ cfg.TransportConfig.RevocationConfig = &config.RevocationConfig{
 }
 ```
 
+`ExampleTransportConfig_Validate_revocation` in
+`pkg/config/example_transport_test.go` runs this rule: mode `"crl"` with a CRL
+path validates, and mode `"ocsp"` with no `OCSPResponderURL` is refused.
+
 Understand the default before you enable it: unknown status fails closed. A
 mode with no usable source refuses connections rather than treating them as
 unrevoked, in every mode including `"crl"`. That is the correct behaviour, and
@@ -138,6 +142,10 @@ cfg.TransportConfig.UDPSendBufSize = 7 << 20
 cfg.TransportConfig.MessageReceiveBudgetFrames = 4 // or set MaxMessageReceiveMemory outright
 cfg.TransportConfig.MaxSnapshotReceiveRate = 256 << 20
 ```
+
+`ExampleTransportConfig_SetDefaults` in `pkg/config/example_transport_test.go`
+shows `SetDefaults` filling both UDP buffer sizes with 7 MB and keeping a size
+set before the call.
 
 Two things people get wrong:
 
@@ -187,7 +195,9 @@ host, err := quicraft.NewHost(cfg, quicraft.WithoutTransport(), quicraft.Without
 
 For single-node embedded deployments and tests. The QUIC transport is not
 constructed, mTLS validation is skipped, and member identities are not
-required, because nothing crosses a wire.
+required, because nothing crosses a wire. Such a host has no key, so
+`Host.NodeIdentity()` returns `""`; `ExampleHost_NodeIdentity` in
+`pkg/example_transport_test.go` runs it.
 
 ## Task: choose a FIPS mode
 
@@ -236,6 +246,8 @@ cfg.TransportConfig.RevocationConfig = &config.RevocationConfig{
 	CheckInterval: 60 * time.Second,
 }
 ```
+
+`ExampleTransportConfig_Validate_revocation` validates this configuration.
 
 Leaving `RevocationConfig` nil also avoids OCSP, at the cost of no revocation
 checking at all. That is a security tradeoff, not a FIPS one; see
