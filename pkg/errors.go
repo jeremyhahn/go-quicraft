@@ -1785,6 +1785,57 @@ func MaybeApplied(err error) bool {
 	return errors.As(err, &m)
 }
 
+// ContextError is returned when a Host call ends because the caller's
+// context was done. Err is the quicraft sentinel the context error maps to
+// (ErrTimeout for a deadline, ErrCanceled for a cancellation) and Cause is
+// the context error itself, so errors.Is matches both ErrTimeout and
+// context.DeadlineExceeded (or ErrCanceled and context.Canceled).
+type ContextError struct {
+	// Err is ErrTimeout or ErrCanceled.
+	Err error
+	// Cause is the context's error, possibly wrapped.
+	Cause error
+}
+
+// Error returns "<sentinel>: <cause>".
+func (e *ContextError) Error() string {
+	return e.Err.Error() + ": " + e.Cause.Error()
+}
+
+// Is reports whether target is the quicraft sentinel Err.
+func (e *ContextError) Is(target error) bool {
+	return target == e.Err
+}
+
+// Unwrap returns the context error.
+func (e *ContextError) Unwrap() error { return e.Cause }
+
+// RemoveDataError is returned by Host.RemoveData when one of its storage
+// steps (the removal intent, the snapshot directory or a directory sync)
+// fails. Op names the step and Path the file or directory it acted on; Err
+// is the underlying error, so errors.Is and errors.As see through it.
+type RemoveDataError struct {
+	// ShardID is the shard whose data was being removed.
+	ShardID uint64
+	// ReplicaID is the replica whose data was being removed.
+	ReplicaID uint64
+	// Op names the removal step that failed.
+	Op string
+	// Path is the file or directory the failed step operated on.
+	Path string
+	// Err is the underlying error of the failed step.
+	Err error
+}
+
+// Error returns a human-readable description of the failed step.
+func (e *RemoveDataError) Error() string {
+	return fmt.Sprintf("quicraft: RemoveData shard %d replica %d: %s %s: %v",
+		e.ShardID, e.ReplicaID, e.Op, e.Path, e.Err)
+}
+
+// Unwrap returns the underlying error.
+func (e *RemoveDataError) Unwrap() error { return e.Err }
+
 // NotLeader reports whether err indicates this replica is not the leader,
 // and returns the known leader's replica ID when the error carries one.
 //
