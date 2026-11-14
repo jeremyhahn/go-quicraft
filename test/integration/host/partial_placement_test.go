@@ -232,6 +232,7 @@ func TestPartialPlacement_OverlappingShardsAreIndependent(t *testing.T) {
 	host4 := cluster.hosts[3]
 	opCtx, opCancel := context.WithTimeout(ctx, 3*time.Second)
 	defer opCancel()
+	//quicraft:direct-read the test is about host 4, which does not host shard A, refusing it
 	if _, err := host4.SyncRead(opCtx, partialShardA, "a-after"); !errors.Is(err, quicraft.ErrShardNotFound) {
 		t.Errorf("host 4 SyncRead(shard A) = %v, want ErrShardNotFound", err)
 	}
