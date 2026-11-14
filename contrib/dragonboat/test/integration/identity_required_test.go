@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"time"
 
 	dragonboat "github.com/jeremyhahn/go-quicraft/contrib/dragonboat"
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
@@ -69,35 +68,18 @@ func requireIdentityRefusal(ctx context.Context, t *testing.T, desc string, err 
 }
 
 // requireAsyncIdentityRefusal checks the answer of an async identity-less
-// add: either the call returns ErrMemberIdentityRequired at once with a nil
-// RequestState, or the RequestState it returns resolves to a result that is
-// not Completed.
+// add: the call must return ErrMemberIdentityRequired at once with a nil
+// RequestState, as the submission path does. A RequestState means the add
+// was admitted; its later Timeout, Dropped or Aborted outcome says nothing
+// about the identity check, so it fails the test whatever it resolves to.
 func requireAsyncIdentityRefusal(ctx context.Context, t *testing.T, desc string, rs *dragonboat.RequestState, err error) {
 	t.Helper()
-	if err != nil {
-		if rs != nil {
-			rs.Release()
-			t.Fatalf("%s returned both an error (%v) and a RequestState", desc, err)
-		}
-		requireIdentityRefusal(ctx, t, desc, err)
-		return
+	if rs != nil {
+		rs.Release()
+		t.Fatalf("%s returned a RequestState (err=%v); an add that carries no node "+
+			"identity must be refused at submission with ErrMemberIdentityRequired", desc, err)
 	}
-	if rs == nil {
-		t.Fatalf("%s returned neither an error nor a RequestState", desc)
-	}
-	defer rs.Release()
-	select {
-	case result := <-rs.ResultC():
-		if result.Completed() {
-			t.Fatalf("%s completed; a NodeHost with a transport must refuse an add "+
-				"that carries no node identity", desc)
-		}
-		t.Logf("%s resolved without completing: %v", desc, result)
-	case <-time.After(defaultTimeout):
-		t.Fatalf("%s: RequestState did not resolve within %v", desc, defaultTimeout)
-	case <-ctx.Done():
-		t.Fatalf("%s: context ended before the RequestState resolved: %v", desc, ctx.Err())
-	}
+	requireIdentityRefusal(ctx, t, desc, err)
 }
 
 // TestIntegration_DB_IdentityRequired verifies that a dragonboat NodeHost
