@@ -77,9 +77,19 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	heldCtx, cancelHeld := context.WithCancel(ctx)
 	defer cancelHeld()
 	results := make(chan concurrentProposeResult, held+1)
+	// propose submits on the calling goroutine, so every held proposal is
+	// pending at the leader before the followers are stopped; only the wait
+	// runs in the background. This is SyncPropose split at its submission:
+	// a refusal at Propose is recorded at once, as SyncPropose returns it.
 	propose := func(key string) {
+		rs, err := proposer.Propose(heldCtx, concurrentProposeShard, []byte(key))
+		if err != nil {
+			results <- concurrentProposeResult{key, err}
+			return
+		}
 		go func() {
-			_, err := proposer.SyncPropose(heldCtx, concurrentProposeShard, []byte(key))
+			defer rs.Release()
+			_, err := awaitResult(heldCtx, rs)
 			results <- concurrentProposeResult{key, err}
 		}()
 	}
