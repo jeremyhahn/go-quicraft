@@ -37,7 +37,16 @@ Two rules:
    be behind, and a stale `ConfigChangeID` guarantees the change is refused.
 2. **Pass `ConfigChangeID`.** It is the replay guard. If another change landed
    between your read and your write you get `*StaleConfigChangeError`; re-read
-   and retry. Passing 0 skips the guard; don't.
+   and retry. Passing 0 skips the guard; don't pass a literal 0. A shard that
+   has had no config change since it was formed reports `ConfigChangeID` 0,
+   so its first change is unguarded even when you follow this pattern; every
+   applied change advances the value, and from then on the guard holds.
+
+`ExampleHost_SyncGetShardMembership` and
+`ExampleHost_SyncRequestAddObserverWithIdentity` in
+[`pkg/example_membership_test.go`](../../pkg/example_membership_test.go) run
+this pattern, and show the value at 0 before the first change and non-zero
+after it.
 
 Only one change can be in flight. Adding three replicas is three sequential
 changes, each with a fresh `ConfigChangeID`.
@@ -75,6 +84,11 @@ err := host.SyncRequestAddObserverWithIdentity(ctx, shardID, id, addr, identity,
 // Witness: votes, stores no log data, cannot propose or serve reads.
 err = host.SyncRequestAddWitnessWithIdentity(ctx, shardID, id, addr, identity, m.ConfigChangeID)
 ```
+
+`ExampleHost_SyncRequestAddObserverWithIdentity` in
+[`pkg/example_membership_test.go`](../../pkg/example_membership_test.go) runs
+the observer add: the membership then lists the observer and its committed
+identity.
 
 Choose by what you want:
 
@@ -154,6 +168,11 @@ err = removedHost.StopShard(shardID)
 err = removedHost.RemoveData(shardID, replicaID)
 ```
 
+`ExampleHost_SyncRequestRemoveNode` in
+[`pkg/example_membership_test.go`](../../pkg/example_membership_test.go) runs
+step 2: afterwards the membership no longer lists the replica and `Removed`
+names it.
+
 Step 3 does not reach consensus. It acts on the local copy, and `RemoveData`
 deletes it. `*ShardNotStoppedError` catches deleting before stopping; nothing
 catches running step 3 before step 2, which leaves a cluster that still counts
@@ -189,8 +208,12 @@ m, err := host.SyncGetShardMembership(ctx, shardID)
 // m.Removed            replica IDs that have been removed
 // m.Identities         committed node identity per replica
 // m.RemovedIdentities  identities banned from the shard
-// m.ConfigChangeID     pass this as the next configChangeIndex
+// m.ConfigChangeID     pass this as the next configChangeIndex (0 until the first change)
 ```
+
+`ExampleHost_SyncGetShardMembership` in
+[`pkg/example_membership_test.go`](../../pkg/example_membership_test.go) runs
+this read on a running single-node shard.
 
 ## Troubleshooting
 

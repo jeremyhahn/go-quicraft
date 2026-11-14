@@ -818,7 +818,8 @@ default is a trap:
 | `HostConfig.MaxRetainedEpochs` | 0 (retain all) | see [seal-barrier](../seal-barrier/user.md) |
 | `Config.SnapshotEntries` | 100000 | zero selects the default; use `config.SnapshotsDisabled` |
 | `Config.SessionExpiryEntries` | 100000 | zero selects the default; use `config.SessionExpiryDisabled` |
-| `Config.CheckQuorum`, `PreVote`, `OrderedConfigChange` | nil = enabled | use `config.BoolPtr(false)` to disable; each logs a warning |
+| `Config.CheckQuorum`, `PreVote` | nil = enabled | use `config.BoolPtr(false)` to disable; each logs a warning |
+| `Config.OrderedConfigChange` | nil = enabled | no effect: membership changes are always serialised; `config.BoolPtr(false)` is accepted and logs a warning |
 | `Config.MaxResponsesPerSession` | 128 | bounds cached responses per session, not sessions |
 | `Config.LeaseRead` | false | requires `CheckQuorum` (`ErrLeaseReadRequiresCheckQuorum`) |
 | `Config.Witness` | zero | bootstrap seed only; the live policy is replicated |
