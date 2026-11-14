@@ -196,9 +196,17 @@ func TestRequestStateConcurrent_ResultCAfterRelease(t *testing.T) {
 	}
 	runConcurrently(ctx, t, fns...)
 
+	// runConcurrently returns before its own waiter and workers have
+	// fully exited, so the process-wide count may briefly sit above the
+	// baseline: wait (bounded) for it to settle rather than reading it
+	// once. A goroutine ResultC leaked would keep it above.
 	after := runtime.NumGoroutine()
+	for deadline := time.Now().Add(5 * time.Second); after > before && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+		after = runtime.NumGoroutine()
+	}
 	if after > before {
-		t.Fatalf("ResultC after Release started goroutines: before=%d after=%d", before, after)
+		t.Fatalf("ResultC after Release left goroutines running: before=%d after=%d", before, after)
 	}
 	for i, ch := range got {
 		if ch == nil {
