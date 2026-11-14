@@ -11446,7 +11446,7 @@ type removeDataLayoutUnknownError struct {
 // Error returns a human-readable description of the error.
 func (e *removeDataLayoutUnknownError) Error() string {
 	return fmt.Sprintf(
-		"quicraft: RemoveData of shard %d replica %d: snapshot record path %q lies in no replica snapshot layout",
+		"quicraft: RemoveData of shard %d replica %d: snapshot path %q (from its snapshot record or removal intent) lies in no replica snapshot layout",
 		e.shardID, e.replicaID, e.filepath,
 	)
 }
@@ -11573,7 +11573,19 @@ func (h *Host) readRemoveDataIntent(shardID, replicaID uint64) (string, bool, er
 		// one was never written by RemoveData.
 		return "", false, fmt.Errorf("removal intent %s is empty", p)
 	}
-	return string(data), true, nil
+	// RemoveData passes the intent to RemoveAll, so a damaged intent must
+	// not redirect the deletion: it is trusted only when it names exactly
+	// the replica's own snapshot directory in a layout StartShard creates,
+	// never an ancestor, a path below it or another replica's directory.
+	named := string(data)
+	if dir, ok := replicaSnapshotDirFromRecord(named, shardID, replicaID); !ok || dir != named {
+		return "", false, fmt.Errorf("removal intent %s: %w", p, &removeDataLayoutUnknownError{
+			shardID:   shardID,
+			replicaID: replicaID,
+			filepath:  named,
+		})
+	}
+	return named, true, nil
 }
 
 // writeRemoveDataIntent durably records that the replica's snapshot
