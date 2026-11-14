@@ -2693,17 +2693,31 @@ func TestStateMachine_RLockContext_CancelThenUnlockBeforeResume(t *testing.T) {
 	defer rsm.Close()
 
 	rsm.lockApply()
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(rsm.unlockApply) }
 	ctx := &flagCancelCtx{Context: context.Background(), done: make(chan struct{})}
 	errs := make(chan error, 1)
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		_, lookupErr := rsm.Lookup(ctx, "key")
 		errs <- lookupErr
+	}()
+	// Runs before the deferred Close (defers are LIFO): a failed line must
+	// not leave the guard held or the reader parked, or Close blocks on the
+	// guard forever. The guard is released exactly once, then the reader is
+	// cancelled through Done and joined.
+	defer func() {
+		unlock()
+		ctx.cancelled.Store(true)
+		close(ctx.done)
+		<-readerDone
 	}()
 	waitFor(t, 2*time.Second, "the reader to register in readWait", func() bool {
 		return rsm.readWait.waiters.Load() > 0
 	})
 	ctx.cancelled.Store(true)
-	rsm.unlockApply()
+	unlock()
 
 	select {
 	case lookupErr := <-errs:
