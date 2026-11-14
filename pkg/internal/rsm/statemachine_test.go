@@ -2525,12 +2525,21 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 	}
 	defer rsm.Close()
 
+	// held is true while a writer (the gate or a writer goroutine) holds
+	// the guard. Every read starts only while it is true, so each Lookup
+	// contends with a writer instead of only the first: a reader that has
+	// the guard cannot run its remaining reads on the fast path before a
+	// writer is scheduled, whatever GOMAXPROCS is.
+	var held atomic.Bool
+
 	// Gate: the test holds the guard as the initial writer, so the reader
 	// cannot finish its reads before the writer stream starts.
 	rsm.lockApply()
+	held.Store(true)
 	gated := true
 	defer func() {
 		if gated {
+			held.Store(false)
 			rsm.unlockApply()
 		}
 	}()
@@ -2542,6 +2551,13 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 	done := make(chan error, 1)
 	go func() {
 		for i := 0; i < reads; i++ {
+			for !held.Load() {
+				if ctx.Err() != nil {
+					done <- ctx.Err()
+					return
+				}
+				runtime.Gosched()
+			}
 			if _, lookupErr := rsm.Lookup(ctx, "key"); lookupErr != nil {
 				done <- lookupErr
 				return
@@ -2570,7 +2586,9 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 				}
 				entered.Add(1)
 				rsm.lockApply()
+				held.Store(true)
 				time.Sleep(2 * time.Millisecond)
+				held.Store(false)
 				rsm.unlockApply()
 				cycles.Add(1)
 			}
@@ -2595,27 +2613,27 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 
 	cyclesAtRelease := cycles.Load()
 	gated = false
+	held.Store(false)
 	rsm.unlockApply()
 	select {
 	case lookupErr := <-done:
 		if lookupErr != nil {
 			t.Fatalf("Lookup under continuous Update = %v", lookupErr)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		cancel()
 		<-done
-		t.Fatalf("%d of %d cancel-only Lookups completed within 5s under a continuous Update stream: read starvation", completed.Load(), reads)
+		t.Fatalf("%d of %d cancel-only Lookups completed within 10s under a continuous Update stream: read starvation", completed.Load(), reads)
 	}
-	// With the handoff each writer cycle admits the waiting reader, so the
-	// reads finish within at most about half a cycle each (measured 19-114
-	// cycles for 200 reads). Without it the reader gets in only when its poll
-	// lands in the gap between two writers (measured 555-1290 cycles); a cycle-count bound, unlike a wall-clock one,
+	// Each read waits for a held guard, so it outlasts a writer cycle of
+	// its own whatever the scheduler does. With the handoff the woken reader
+	// goes before the writers that have not yet passed lockApply's drain
+	// (measured 476-497 cycles for 200 reads, GOMAXPROCS 1 and 4). Without
+	// it the reads starve: none of the measured runs finished 200 reads
+	// within the 10s timeout. A cycle-count bound, unlike a wall-clock one,
 	// holds on a slow runner.
 	n := cycles.Load() - cyclesAtRelease
-	if n == 0 {
-		t.Fatalf("no writer cycle ran while the %d reads ran: the reads were not contended", reads)
-	}
-	if limit := int64(3 * reads / 2); n > limit {
+	if limit := int64(4 * reads); n > limit {
 		t.Fatalf("%d writer cycles ran while %d reads completed, want at most %d: readers are not handed the guard between Updates", n, reads, limit)
 	}
 }
