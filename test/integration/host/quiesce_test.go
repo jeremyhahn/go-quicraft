@@ -5,6 +5,7 @@ package host_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
@@ -35,6 +37,92 @@ type quiesceLog struct {
 	mu        sync.Mutex
 	campaigns []config.EventShardInfo
 	leaders   []config.LeaderInfo
+	// quiesces and heartbeats are the arrival times of the Quiesce and
+	// Heartbeat messages this host received for quiesceShard.
+	quiesces   []time.Time
+	heartbeats []time.Time
+}
+
+// quiesceMetrics records, on one host, the arrival of every Quiesce and
+// Heartbeat message for quiesceShard. A follower that receives Quiesce has
+// seen its leader enter quiescence; the Heartbeat arrivals give the leader's
+// heartbeat cadence, which quiescence cuts from one per heartbeat RTT to one
+// liveness probe per quiesceLivenessInterval.
+type quiesceMetrics struct {
+	quicraft.NoOpMetricsCollector
+	log *quiesceLog
+}
+
+func (m quiesceMetrics) IncMessagesReceived(shardID, _ uint64, msgType uint64) {
+	if shardID != quiesceShard || (msgType != proto.Quiesce && msgType != proto.Heartbeat) {
+		return
+	}
+	now := time.Now()
+	m.log.mu.Lock()
+	defer m.log.mu.Unlock()
+	if msgType == proto.Quiesce {
+		m.log.quiesces = append(m.log.quiesces, now)
+	} else {
+		m.log.heartbeats = append(m.log.heartbeats, now)
+	}
+}
+
+// quiescedWithin reports whether this host has received a Quiesce message
+// and at most maxHeartbeats Heartbeat messages in the window ending now. It
+// also returns both figures for diagnostics.
+func (l *quiesceLog) quiescedWithin(window time.Duration, maxHeartbeats int) (ok bool, quiesces, heartbeats int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	from := time.Now().Add(-window)
+	for _, at := range l.heartbeats {
+		if at.After(from) {
+			heartbeats++
+		}
+	}
+	quiesces = len(l.quiesces)
+	return quiesces > 0 && heartbeats <= maxHeartbeats, quiesces, heartbeats
+}
+
+// quiesceWindow is the trailing window over which assertQuiesced measures
+// the leader's heartbeat cadence. Unquiesced, a follower receives one
+// heartbeat per heartbeat RTT (one tick): 20 in this window. Quiesced, the
+// leader sends only a liveness probe every quiesceLivenessInterval, so at
+// most one lands in it; quiesceMaxHeartbeats allows one more for a
+// heartbeat in flight when quiescence began.
+const (
+	quiesceWindow        = 2 * quiesceElectionTimeout
+	quiesceMaxHeartbeats = 2
+)
+
+// assertQuiesced fails the test unless every live follower of the leader at
+// leaderIdx has received a Quiesce message and, within quiesceIdle, sees the
+// leader's heartbeats drop to the quiesced cadence for a whole
+// quiesceWindow. With Config.Quiesce ignored neither holds, so the wake and
+// failover paths that follow it are known to start from quiesced replicas.
+func assertQuiesced(t *testing.T, c *testCluster, logs []*quiesceLog, leaderIdx int, phase string) {
+	t.Helper()
+	waitForConditionDiag(t, quiesceIdle, phase+": followers see the leader quiesced", func() bool {
+		for _, i := range c.liveNodeIndexes() {
+			if i == leaderIdx {
+				continue
+			}
+			if ok, _, _ := logs[i].quiescedWithin(quiesceWindow, quiesceMaxHeartbeats); !ok {
+				return false
+			}
+		}
+		return true
+	}, func() string {
+		var b strings.Builder
+		for _, i := range c.liveNodeIndexes() {
+			if i == leaderIdx {
+				continue
+			}
+			_, q, hb := logs[i].quiescedWithin(quiesceWindow, quiesceMaxHeartbeats)
+			fmt.Fprintf(&b, "host[%d]: %d Quiesce received, %d heartbeats in the last %v (max %d)\n",
+				i, q, hb, quiesceWindow, quiesceMaxHeartbeats)
+		}
+		return b.String()
+	})
 }
 
 func (l *quiesceLog) listener() *config.EventListener {
@@ -90,7 +178,8 @@ func newQuiesceCluster(t *testing.T, logs []*quiesceLog) *testCluster {
 		cfg := testHostConfig(t, kernelAddr, leaves[i])
 		cfg.EventListener = logs[i].listener()
 		dirs[i] = cfg.NodeHostDir
-		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
+		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption(),
+			quicraft.WithMetrics(quiesceMetrics{log: logs[i]}))
 		if err != nil {
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
@@ -188,6 +277,9 @@ func proposeWithin(t *testing.T, c *testCluster, idx int, key, value string, bud
 // behaviour on three Hosts over the real QUIC transport: an idle shard
 // keeps its leader without elections, wakes on the next proposal and read,
 // and a quiesced follower still elects a new leader when the leader dies.
+// Before each wake and the failover, assertQuiesced checks the followers
+// received the leader's Quiesce message and see its heartbeats cut to the
+// quiesced cadence, so the test fails when Config.Quiesce is ignored.
 func TestQuiesce_IdleShardKeepsLeaderAndWakes(t *testing.T) {
 	logs := []*quiesceLog{{}, {}, {}}
 	c := newQuiesceCluster(t, logs)
@@ -222,6 +314,7 @@ func TestQuiesce_IdleShardKeepsLeaderAndWakes(t *testing.T) {
 	// (a) Idle for 12 election timeouts: no campaign, same leader.
 	snap := quiesceSnapshot(logs)
 	time.Sleep(quiesceIdle)
+	assertQuiesced(t, c, logs, leaderIdx, "(a) idle")
 	assertQuietSince(t, c, logs, snap, leaderID, "(a) idle")
 	t.Logf("(a) idle %v: no campaign, leader %d on every host", quiesceIdle, leaderID)
 
@@ -234,6 +327,7 @@ func TestQuiesce_IdleShardKeepsLeaderAndWakes(t *testing.T) {
 	// last write.
 	snap = quiesceSnapshot(logs)
 	time.Sleep(quiesceIdle)
+	assertQuiesced(t, c, logs, leaderIdx, "(c) idle")
 	assertQuietSince(t, c, logs, snap, leaderID, "(c) idle")
 	start := time.Now()
 	got := readFromLeader(t, c, quiesceShard, "wake", 5*quiesceElectionTimeout)
@@ -246,6 +340,7 @@ func TestQuiesce_IdleShardKeepsLeaderAndWakes(t *testing.T) {
 	// within 4 liveness intervals and it serves a proposal.
 	snap = quiesceSnapshot(logs)
 	time.Sleep(quiesceIdle)
+	assertQuiesced(t, c, logs, leaderIdx, "(d) idle")
 	assertQuietSince(t, c, logs, snap, leaderID, "(d) idle")
 	stopped := time.Now()
 	c.stopNode(leaderIdx)
