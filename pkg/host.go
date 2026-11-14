@@ -5552,17 +5552,22 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	}
 	h.setShardAnchor(cfg.ShardID, cfg.MemberIdentities)
 
-	// Save bootstrap info if we have a LogDB and this is not a join.
-	if h.logdb != nil && !join {
+	// Save bootstrap info if we have a LogDB. A join records one too, with
+	// Join set and no Addresses (a joining replica has no initial
+	// membership), so the snapshot layout below is known for it as well.
+	if h.logdb != nil {
 		bootstrap := logdb.Bootstrap{
-			Addresses: nodesCopy,
-			Join:      join,
-			Type:      ns.smType,
+			Join: join,
+			Type: ns.smType,
 			// Record where this shard's on-disk tree is rooted. Operations
-			// that run while the shard is STOPPED — Host.ImportSnapshot — have
-			// no other way to discover it, and writing an artifact outside the
-			// tree costs the artifact's DEK at the next purge.
+			// that run while the shard is STOPPED — Host.ImportSnapshot and
+			// Host.RemoveData — have no other way to discover it, and writing
+			// an artifact outside the tree costs the artifact's DEK at the
+			// next purge.
 			DataDir: cfg.DataDir,
+		}
+		if !join {
+			bootstrap.Addresses = nodesCopy
 		}
 		if err := h.logdb.SaveBootstrap(cfg.ShardID, cfg.ReplicaID, bootstrap); err != nil {
 			// Mark the nodeState stopped BEFORE removing it from h.nodes
@@ -5575,6 +5580,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 			h.clearShardJoining(cfg.ShardID)
 			h.anchors.Delete(cfg.ShardID)
 			h.activeNodes.Add(-1)
+			// A start that lost a race with Close finds the LogDB closed:
+			// report the host closed, as the publish check below would.
+			if h.closed.Load() || errors.Is(err, logdb.ErrClosed) {
+				return ErrClosed
+			}
 			return ErrLogDBWrite
 		}
 	}
@@ -5926,6 +5936,19 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 	return sm.Result{Value: result.Value, Data: result.Data}, nil
 }
 
+// syncReadLookupHook, when set, runs after SyncRead or SyncReadBuf has its
+// read index applied and before it takes the state machine's read guard.
+// Tests set it to hold an Update across the lookup stage; it is nil in
+// production, costing one atomic load per read.
+var syncReadLookupHook atomic.Pointer[func()]
+
+// runSyncReadLookupHook runs syncReadLookupHook if one is set.
+func runSyncReadLookupHook() {
+	if hook := syncReadLookupHook.Load(); hook != nil {
+		(*hook)()
+	}
+}
+
 // SyncRead performs a linearizable read in a single call. It confirms
 // leadership via ReadIndex, waits for the local SM to catch up, then
 // executes the query. This provides the strongest consistency guarantee:
@@ -5979,10 +6002,7 @@ func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) 
 			return nil, result.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 lookup:
 
@@ -5992,6 +6012,7 @@ lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 
 	// Step 3: Execute the query on the caught-up state machine.
 	ns, err := h.getNode(shardID)
@@ -6007,7 +6028,11 @@ lookup:
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
 	}
-	return ns.rsm.Lookup(ctx, query)
+	result, lookupErr := ns.rsm.Lookup(ctx, query)
+	if lookupErr != nil {
+		return nil, mapLocalReadError(lookupErr)
+	}
+	return result, nil
 }
 
 // SyncReadBuf is the pooled-buffer variant of SyncRead for []byte key queries.
@@ -6048,15 +6073,13 @@ func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (res
 			return nil, nopHostRelease, r.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, nopHostRelease, ErrTimeout
-		}
-		return nil, nopHostRelease, ErrCanceled
+		return nil, nopHostRelease, mapContextError(ctx.Err())
 	}
 lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, nopHostRelease, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 	ns, nsErr := h.getNode(shardID)
 	if nsErr != nil {
 		return nil, nopHostRelease, nsErr
@@ -6068,9 +6091,9 @@ lookup:
 	if ns.rsm == nil {
 		return nil, nopHostRelease, ErrShardNotReady
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
@@ -6078,7 +6101,7 @@ lookup:
 	// Fall back to the generic Lookup path (result is []byte or interface{}).
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
@@ -6121,16 +6144,16 @@ func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (re
 	if ns.barrierSealed() {
 		return nil, nopHostRelease, ErrBarrierSealed
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
 	}
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
@@ -6853,7 +6876,8 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 		return nil, ErrBarrierSealed
 	}
 
-	return ns.rsm.Lookup(ctx, query)
+	v, lookupErr := ns.rsm.Lookup(ctx, query)
+	return v, mapLocalReadError(lookupErr)
 }
 
 // StaleRead reads this replica's state machine directly, without any
@@ -6946,7 +6970,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 
 	// Fast path: SM has already applied up to the committed index.
 	if ns.lastApplied.Load() >= committed {
-		return ns.rsm.Lookup(ctx, query)
+		v, lookupErr := ns.rsm.Lookup(ctx, query)
+		return v, mapLocalReadError(lookupErr)
 	}
 
 	// Slow path: poll until lastApplied catches up, the shard or host shuts
@@ -6967,7 +6992,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 		select {
 		case <-ticker.C:
 			if ns.lastApplied.Load() >= committed {
-				return ns.rsm.Lookup(ctx, query)
+				v, lookupErr := ns.rsm.Lookup(ctx, query)
+				return v, mapLocalReadError(lookupErr)
 			}
 			if ns.stopped.Load() || h.closed.Load() {
 				return nil, ErrClosed
@@ -7348,10 +7374,7 @@ func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Mem
 			return nil, result.Err
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 
 	// Step 3: Read membership from the Raft peer. GetMembership returns a
@@ -7713,7 +7736,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 		if errors.Is(err, engine.ErrStopped) {
 			return ErrClosed
 		}
-		return err
+		return mapContextError(err)
 	}
 	return nil
 }
@@ -7816,7 +7839,7 @@ func pauseTransferTarget(progress []raft.RemoteProgress, self uint64) uint64 {
 // ResumeShard returns ctx.Err() and changes nothing.
 func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return mapContextError(err)
 	}
 	if h.closed.Load() {
 		return ErrClosed
@@ -7831,7 +7854,7 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	}
 	// A pause in its leadership transfer holds the gate; ctx bounds the wait.
 	if !ns.pauseGate.lock(ctx.Done()) {
-		return ctx.Err()
+		return mapContextError(ctx.Err())
 	}
 	h.engine.ResumeNode(engNode)
 	ns.paused.Store(false)
@@ -8260,6 +8283,9 @@ func (e *SnapshotArtifactError) Unwrap() error { return e.Err }
 // never be imported, even by a caller that ignored the error. It is still not
 // an artifact and should be discarded.
 func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return mapContextError(err)
+	}
 	if h.closed.Load() {
 		return ErrClosed
 	}
@@ -8314,6 +8340,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
 		return ErrSnapshotEncryptedBarrierUnavailable
 	}
+	// Checked again: the lookups above may outlast the caller's context.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
 	}
@@ -8925,7 +8952,7 @@ func resolveImportMembership(
 // the next PurgeEpochsBefore destroy the DEK it needs.
 //
 // The option remains meaningful for a shard whose layout cannot be discovered:
-// one with NO bootstrap record (started with join=true, which records none).
+// one with NO bootstrap record (never started on this host, joined or not).
 // It fails closed with ErrImportLayoutUnknown unless the caller states the
 // layout here, and the stated value is trusted because there is nothing to
 // cross-check it against.
@@ -8956,8 +8983,8 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 	// With a record, its DataDir is authoritative: every bootstrap record
 	// states it ("" means the tree is rooted under NodeHostDir), and a
 	// WithImportDataDir that disagrees is a contradiction, refused below.
-	// Without one (a shard started with join=true records none), the layout
-	// is unknown.
+	// Without one (a shard this host never started, joined or not), the
+	// layout is unknown.
 	if !ok {
 		// No recorded layout. Only the caller can supply it, and a wrong
 		// guess costs the artifact's DEK, so refuse rather than assume.
@@ -11262,16 +11289,21 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 		}
 		return result.Value, nil
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return 0, ErrTimeout
-		}
-		return 0, ErrCanceled
+		return 0, mapContextError(ctx.Err())
 	}
 }
 
-// RemoveData removes all LogDB data for the given shard/replica pair and
-// retires the replica ID on this host: StartShard refuses it from then on
-// (ReplicaRetiredError), across restarts. The shard must be
+// RemoveData removes all LogDB data for the given shard/replica pair, retires
+// the replica ID on this host (StartShard refuses it from then on with
+// ReplicaRetiredError, across restarts), and then removes the replica's
+// snapshot directory.
+//
+// The steps are ordered so a failure never strands a replica: the snapshot
+// directory is resolved, a durable removal intent naming it is written under
+// NodeHostDir/remove-data, the replica is retired, the directory is removed,
+// and the intent is dropped. A failure at any step returns its error and a
+// retry finishes the remaining steps from the intent; the snapshot of a
+// replica that was not retired is never touched. The shard must be
 // stopped on this host before calling RemoveData. This is used to clean up
 // persistent state after a node has been permanently removed from a shard; a
 // replica that is to rejoin does so under a new replica ID, as Raft requires.
@@ -11310,7 +11342,61 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 		}
 	}
 
+	// Resolve the replica's snapshot directory before the LogDB removal
+	// drops the bootstrap record that states the shard's DataDir (the
+	// nodeState holding the Config is gone once the replica is unloaded).
+	snapDir, intentPending, err := h.removeDataSnapshotDir(shardID, replicaID)
+	if err != nil {
+		return err
+	}
+
+	// Record the removal intent, durably, BEFORE anything is retired or
+	// deleted: once RemoveNodeData drops the bootstrap record, the intent is
+	// what still locates the snapshot directory for a retry after a failure
+	// or crash. A pending intent was published by an earlier call whose
+	// directory sync may have failed, so it is synced again here; a failed
+	// sync returns with the replica unretired.
+	if !intentPending {
+		if err := h.writeRemoveDataIntent(shardID, replicaID, snapDir); err != nil {
+			return err
+		}
+	} else if err := syncRemoveDataIntentDir(h.snapshotFsys(), h.cfg.NodeHostDir); err != nil {
+		return err
+	}
+
+	// Retire the replica BEFORE its snapshots are deleted. An unretired
+	// replica may still start, and its compacted log depends on its
+	// snapshot, so a failure here leaves the snapshot directory untouched.
+	// A retired replica is refused by StartShard, so its snapshot is never
+	// needed again. RemoveNodeData of an already retired replica is a no-op,
+	// so a retry from a pending intent repeats it safely.
 	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
+		return err
+	}
+
+	// Remove the retired replica's snapshot directory. RemoveAll of a missing
+	// directory is nil, so a retry is idempotent.
+	if err := h.snapshotFsys().RemoveAll(snapDir); err != nil {
+		return fmt.Errorf("remove snapshot directory %s: %w", snapDir, err)
+	}
+
+	// Make the removal durable BEFORE the intent is dropped: sync the parent
+	// that held the snapshot directory's entry, or a power loss could bring
+	// the directory back with no intent and no record left to find it. A
+	// missing parent holds no entry to sync. A failed sync keeps the intent,
+	// so a retry finishes the removal.
+	if parent := filepath.Dir(snapDir); parent != snapDir {
+		if _, err := h.snapshotFsys().Stat(parent); err == nil {
+			if err := syncDir(h.snapshotFsys(), parent); err != nil {
+				return fmt.Errorf("sync snapshot parent directory %s: %w", parent, err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat snapshot parent directory %s: %w", parent, err)
+		}
+	}
+
+	// Every step is done and durable: drop the intent.
+	if err := h.clearRemoveDataIntent(shardID, replicaID); err != nil {
 		return err
 	}
 
@@ -11342,16 +11428,230 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 	return nil
 }
 
+// removeDataLayoutUnknownError is returned by RemoveData when the replica
+// has no bootstrap record and no pending removal intent, and its LogDB
+// snapshot record names a Filepath that lies in no replica snapshot layout
+// this host creates. RemoveData refuses before anything is retired or
+// deleted, rather than report a success that leaves the snapshots behind.
+// It matches ErrInvalidOperation under errors.Is.
+type removeDataLayoutUnknownError struct {
+	// shardID is the shard whose data was to be removed.
+	shardID uint64
+	// replicaID is the replica whose data was to be removed.
+	replicaID uint64
+	// filepath is the snapshot record's path that matched no layout.
+	filepath string
+}
+
+// Error returns a human-readable description of the error.
+func (e *removeDataLayoutUnknownError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: RemoveData of shard %d replica %d: snapshot record path %q lies in no replica snapshot layout",
+		e.shardID, e.replicaID, e.filepath,
+	)
+}
+
+// Is reports whether target is ErrInvalidOperation, so callers classify the
+// refusal with errors.Is(err, ErrInvalidOperation).
+func (e *removeDataLayoutUnknownError) Is(target error) bool {
+	return target == ErrInvalidOperation
+}
+
+// removeDataSnapshotDir resolves the snapshot directory RemoveData removes
+// for the replica, and reports whether it came from a pending removal intent
+// (which then need not be written again). In order: the bootstrap record's
+// DataDir (StartShard records one for every start, a join included); else
+// a pending intent's path (a removal that retired the replica, dropping the
+// record, and then failed or crashed); else the replica directory the LogDB
+// snapshot record's Filepath lies in (a replica imported with
+// WithImportDataDir, or joined before joins were recorded, under a custom
+// DataDir); else, with no snapshot record, the NodeHostDir layout StartShard
+// uses for an empty DataDir. A snapshot record whose Filepath lies in no
+// replica layout is a *removeDataLayoutUnknownError (errors.Is
+// ErrInvalidOperation), returned before anything is retired or deleted.
+func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, error) {
+	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
+	if err != nil {
+		return "", false, err
+	}
+	if ok {
+		return engine.ReplicaSnapshotDir(
+			shardSnapshotBaseDir(h.cfg.NodeHostDir, bs.DataDir, shardID), shardID, replicaID), false, nil
+	}
+	if p, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil {
+		return "", false, err
+	} else if pending {
+		return p, true, nil
+	}
+	ss, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil && !errors.Is(err, logdb.ErrNoSnapshot) {
+		return "", false, err
+	}
+	if err == nil && ss.Filepath != "" {
+		dir, ok := replicaSnapshotDirFromRecord(ss.Filepath, shardID, replicaID)
+		if !ok {
+			return "", false, &removeDataLayoutUnknownError{
+				shardID:   shardID,
+				replicaID: replicaID,
+				filepath:  ss.Filepath,
+			}
+		}
+		return dir, false, nil
+	}
+	return engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, "", shardID), shardID, replicaID), false, nil
+}
+
+// replicaSnapshotDirFromRecord returns the replica snapshot directory a
+// snapshot record's path lies in. It walks up from path to the ancestor
+// named replica-<replicaID> whose parent is shard-<shardID>, derives the
+// DataDir that layout implies (shardSnapshotBaseDir puts one more
+// shard-<shardID> level between the DataDir and that parent), and accepts
+// the ancestor only when it is exactly the directory StartShard creates for
+// that DataDir. The NodeHostDir layout is the DataDir NodeHostDir/snapshots.
+func replicaSnapshotDirFromRecord(path string, shardID, replicaID uint64) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	replicaBase := fmt.Sprintf("replica-%d", replicaID)
+	shardBase := fmt.Sprintf("shard-%d", shardID)
+	dir := filepath.Clean(path)
+	for {
+		parent := filepath.Dir(dir)
+		if filepath.Base(dir) == replicaBase && filepath.Base(parent) == shardBase {
+			dataDir := filepath.Dir(filepath.Dir(parent))
+			want := engine.ReplicaSnapshotDir(shardSnapshotBaseDir("", dataDir, shardID), shardID, replicaID)
+			if dir == want {
+				return dir, true
+			}
+			return "", false
+		}
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
+// removeDataIntentDir is the directory under NodeHostDir holding RemoveData's
+// removal intents, one file per replica being removed.
+const removeDataIntentDir = "remove-data"
+
+// removeDataIntentPath returns the removal intent file of the replica:
+// <NodeHostDir>/remove-data/shard-<S>-replica-<R>.
+//
+// The intent is a host-local file RemoveData alone writes and reads, holding
+// nothing but the replica's snapshot directory path. It is not part of any
+// versioned format (no LogDB record, snapshot artifact or wire message
+// changes) and carries no version of its own.
+func removeDataIntentPath(nodeHostDir string, shardID, replicaID uint64) string {
+	return filepath.Join(nodeHostDir, removeDataIntentDir,
+		fmt.Sprintf("shard-%d-replica-%d", shardID, replicaID))
+}
+
+// readRemoveDataIntent returns the snapshot directory a pending removal
+// intent of the replica names, and whether one exists.
+func (h *Host) readRemoveDataIntent(shardID, replicaID uint64) (string, bool, error) {
+	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
+	f, err := h.snapshotFsys().Open(p)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("open removal intent %s: %w", p, err)
+	}
+	data, readErr := io.ReadAll(f)
+	closeErr := f.Close()
+	if readErr != nil {
+		return "", false, fmt.Errorf("read removal intent %s: %w", p, readErr)
+	}
+	if closeErr != nil {
+		return "", false, fmt.Errorf("close removal intent %s: %w", p, closeErr)
+	}
+	if len(data) == 0 {
+		// An intent is published by rename only once complete, so an empty
+		// one was never written by RemoveData.
+		return "", false, fmt.Errorf("removal intent %s is empty", p)
+	}
+	return string(data), true, nil
+}
+
+// writeRemoveDataIntent durably records that the replica's snapshot
+// directory snapDir is being removed: a temporary file in the intent
+// directory, written and synced, renamed into place, and then the intent
+// directory and NodeHostDir synced (syncRemoveDataIntentDir).
+func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) error {
+	fsys := h.snapshotFsys()
+	dir := filepath.Join(h.cfg.NodeHostDir, removeDataIntentDir)
+	if err := fsys.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("create removal intent directory %s: %w", dir, err)
+	}
+	tmp, err := fsys.CreateTemp(dir, ".intent-*")
+	if err != nil {
+		return fmt.Errorf("create removal intent in %s: %w", dir, err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write([]byte(snapDir)); err != nil {
+		_ = tmp.Close()
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("write removal intent %s: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("sync removal intent %s: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("close removal intent %s: %w", tmpPath, err)
+	}
+	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
+	if err := fsys.Rename(tmpPath, p); err != nil {
+		_ = fsys.Remove(tmpPath)
+		return fmt.Errorf("publish removal intent %s: %w", p, err)
+	}
+	return syncRemoveDataIntentDir(fsys, h.cfg.NodeHostDir)
+}
+
+// syncRemoveDataIntentDir makes the removal intents under nodeHostDir
+// durable: it syncs the intent directory, which holds each intent's entry,
+// and then nodeHostDir, which holds the intent directory's entry. Both are
+// synced on every call, whichever of them existed before, so neither a
+// rewrite after the directory was created nor a retry from a pending intent
+// relies on an earlier sync that may have failed.
+func syncRemoveDataIntentDir(fsys snapshotFS, nodeHostDir string) error {
+	dir := filepath.Join(nodeHostDir, removeDataIntentDir)
+	if err := syncDir(fsys, dir); err != nil {
+		return fmt.Errorf("sync removal intent directory %s: %w", dir, err)
+	}
+	if err := syncDir(fsys, nodeHostDir); err != nil {
+		return fmt.Errorf("sync removal intent parent directory %s: %w", nodeHostDir, err)
+	}
+	return nil
+}
+
+// clearRemoveDataIntent durably removes the replica's removal intent once
+// every step it records is done. A missing intent is not an error.
+func (h *Host) clearRemoveDataIntent(shardID, replicaID uint64) error {
+	fsys := h.snapshotFsys()
+	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
+	if err := fsys.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove removal intent %s: %w", p, err)
+	}
+	dir := filepath.Dir(p)
+	if err := syncDir(fsys, dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("sync removal intent directory %s: %w", dir, err)
+	}
+	return nil
+}
+
 // SyncRemoveData is a synchronous alias for RemoveData. Since LogDB
 // operations are already blocking, it behaves identically. Provided
 // for API consistency with other Sync* methods.
 func (h *Host) SyncRemoveData(ctx context.Context, shardID, replicaID uint64) error {
 	select {
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
+		return mapContextError(ctx.Err())
 	default:
 	}
 	return h.RemoveData(shardID, replicaID)
@@ -12022,8 +12322,16 @@ func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, 
 				return id, nil
 			}
 		}
-		// Invalid format: regenerate.
+		// Invalid format: regenerate. os.WriteFile applies its mode only
+		// when it creates the file, so the malformed file is removed first:
+		// otherwise the new ID would inherit its mode instead of
+		// hostIDFilePerms. Only this branch removes, where ReadFile proved
+		// the path is a readable file; anything else at the path (such as
+		// a directory) still fails the write below.
 		logger.Warn("host ID file has invalid format, regenerating", "path", idPath)
+		if err := os.Remove(idPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", &HostInitError{Field: "host_id", Err: err}
+		}
 	}
 
 	// Generate new ID.
@@ -12901,16 +13209,28 @@ func walShardIDs(db logdb.LogDB) []uint64 {
 }
 
 // mapContextError translates a context error into the corresponding
-// quicraft sentinel error. This ensures callers always see ErrCanceled
-// or ErrTimeout rather than raw context.Canceled / context.DeadlineExceeded.
+// quicraft sentinel error that wraps it, so errors.Is holds for both
+// ErrCanceled and context.Canceled, or for both ErrTimeout and
+// context.DeadlineExceeded.
 func mapContextError(err error) error {
-	if err == context.DeadlineExceeded {
-		return ErrTimeout
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrTimeout, err)
 	}
-	if err == context.Canceled {
-		return ErrCanceled
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%w: %w", ErrCanceled, err)
 	}
 	return err
+}
+
+// mapLocalReadError maps a context error returned by a local state machine
+// read (a read abandoned while an Update held the state machine) to
+// ErrCanceled or ErrTimeout, as the read's own context checks do. An error
+// that already carries ErrCanceled or ErrTimeout is returned unchanged.
+func mapLocalReadError(err error) error {
+	if err == nil || errors.Is(err, ErrCanceled) || errors.Is(err, ErrTimeout) {
+		return err
+	}
+	return mapContextError(err)
 }
 
 // effectiveMaxPayload returns the effective maximum proposal payload size

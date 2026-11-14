@@ -891,17 +891,22 @@ func TestStartShard_Join_NoBootstrap(t *testing.T) {
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
+	scfg.DataDir = t.TempDir()
 	err = h.StartShard(members, true, testCreateFunc, scfg)
 	if err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	// Join should not save bootstrap.
+	// A join records its snapshot layout but no initial membership.
 	db.mu.Lock()
-	_, ok := db.bootstraps[mockNodeKey{1, 1}]
+	bs, ok := db.bootstraps[mockNodeKey{1, 1}]
 	db.mu.Unlock()
-	if ok {
-		t.Error("bootstrap should not be saved for join shard")
+	if !ok {
+		t.Fatal("no bootstrap record for a join shard: its DataDir is unknown once stopped")
+	}
+	if !bs.Join || len(bs.Addresses) != 0 || bs.DataDir != scfg.DataDir {
+		t.Errorf("join bootstrap = {Join:%v Addresses:%v DataDir:%q}, want "+
+			"{Join:true Addresses:none DataDir:%q}", bs.Join, bs.Addresses, bs.DataDir, scfg.DataDir)
 	}
 }
 
@@ -9292,9 +9297,9 @@ func TestSyncRemoveData_ContextCanceled_NotRawContextError(t *testing.T) {
 	cancel()
 
 	err := h.SyncRemoveData(ctx, 1, 1)
-	// Verify the error is NOT raw context.Canceled.
-	if errors.Is(err, context.Canceled) {
-		t.Error("SyncRemoveData should return ErrCanceled, not context.Canceled")
+	// The error is ErrCanceled, which also matches context.Canceled.
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("SyncRemoveData error = %v, want it to match context.Canceled", err)
 	}
 	if !errors.Is(err, ErrCanceled) {
 		t.Errorf("SyncRemoveData error = %v, want ErrCanceled", err)
@@ -16874,8 +16879,11 @@ func TestStartShard_LosesRaceWithClose(t *testing.T) {
 
 	startErr := make(chan error, 1)
 	go func() {
-		// join=true so the shard never writes bootstrap state: this test is
-		// about the publish race, not about LogDB writes after Close.
+		// The bootstrap-failure case: the bootstrap save after Close fails
+		// on the closed LogDB, so this start exits through the failed
+		// SaveBootstrap branch and must still report ErrClosed and roll
+		// back. TestStartShard_LosesRaceWithClose_AfterBootstrapSave covers
+		// the post-publication guard after LoadNode.
 		startErr <- h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, true,
 			create, testShardConfig(1, 1))
 	}()
@@ -16899,6 +16907,99 @@ func TestStartShard_LosesRaceWithClose(t *testing.T) {
 		t.Fatal("StartShard did not return")
 	}
 
+	if _, loaded := h.nodes.Load(uint64(1)); loaded {
+		t.Fatal("shard published into a closed host: it is inert and nothing will ever stop it")
+	}
+	if n := h.activeNodes.Load(); n != 0 {
+		t.Fatalf("activeNodes = %d after the losing StartShard, want 0", n)
+	}
+	if !smClosed.Load() {
+		t.Fatal("state machine left open by the losing StartShard: its file lock bricks the next host start")
+	}
+	if node := h.engine.GetNode(1); node != nil {
+		t.Fatal("engine still holds the node of a shard that never started")
+	}
+}
+
+// bootstrapGateLogDB saves a bootstrap record to the inner LogDB, records
+// that the save succeeded, and then blocks until the test releases it.
+type bootstrapGateLogDB struct {
+	logdb.LogDB
+	saved   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (db *bootstrapGateLogDB) SaveBootstrap(shardID, replicaID uint64, b logdb.Bootstrap) error {
+	if err := db.LogDB.SaveBootstrap(shardID, replicaID, b); err != nil {
+		return err
+	}
+	db.saved.Store(true)
+	close(db.entered)
+	<-db.release
+	return nil
+}
+
+// TestStartShard_LosesRaceWithClose_AfterBootstrapSave: a StartShard whose
+// bootstrap save succeeded before Close ran passes LoadNode, and the
+// post-publication shutdown guard must still roll it back.
+func TestStartShard_LosesRaceWithClose_AfterBootstrapSave(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := &bootstrapGateLogDB{
+		LogDB:   memdb.New(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+
+	var smClosed atomic.Bool
+	create := func(_, _ uint64) interface{} {
+		return &gatedStateMachine{closed: &smClosed}
+	}
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, true,
+			create, testShardConfig(1, 1))
+	}()
+
+	// StartShard has saved its bootstrap record and is held before LoadNode.
+	select {
+	case <-db.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("StartShard did not reach SaveBootstrap")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- h.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		close(db.release)
+		t.Fatal("Close blocked on the in-flight SaveBootstrap")
+	}
+
+	// Let StartShard continue past the successful save into LoadNode.
+	close(db.release)
+
+	select {
+	case err := <-startErr:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("StartShard returned %v, want ErrClosed", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("StartShard did not return")
+	}
+
+	if !db.saved.Load() {
+		t.Fatal("SaveBootstrap did not succeed: the start took the save-failure path, not the guard")
+	}
 	if _, loaded := h.nodes.Load(uint64(1)); loaded {
 		t.Fatal("shard published into a closed host: it is inert and nothing will ever stop it")
 	}

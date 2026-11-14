@@ -20,9 +20,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"runtime"
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
@@ -2443,6 +2445,67 @@ func TestStateMachine_NALookupBuf_NotSupported(t *testing.T) {
 		t.Errorf("NALookupBuf result = %v, want nil", result)
 	}
 	release() // must be safe to call even when not supported
+}
+
+// TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine holds the
+// read guard for writing, as a stalled Update does, cancels 100 contended
+// Lookups and requires the goroutine count to return to its baseline while
+// the guard is still held: an abandoned read must leave nothing behind.
+func TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	rsm.readGuard.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			rsm.readGuard.Unlock()
+		}
+	}()
+	baseline := runtime.NumGoroutine()
+
+	const readers = 100
+	ctx, cancel := context.WithCancel(context.Background())
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			_, lookupErr := rsm.Lookup(ctx, "key")
+			errs <- lookupErr
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < readers; i++ {
+		select {
+		case lookupErr := <-errs:
+			if !errors.Is(lookupErr, context.Canceled) {
+				t.Fatalf("Lookup = %v, want context.Canceled", lookupErr)
+			}
+		case <-deadline:
+			t.Fatalf("only %d of %d cancelled Lookups returned within 2s", i, readers)
+		}
+	}
+
+	settle := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baseline && time.Now().Before(settle) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > baseline {
+		t.Fatalf("goroutines = %d with the guard still held, baseline %d: cancelled reads left waiters", n, baseline)
+	}
+
+	rsm.readGuard.Unlock()
+	locked = false
+	if _, lookupErr := rsm.Lookup(context.Background(), "key"); lookupErr != nil {
+		t.Fatalf("Lookup after release = %v", lookupErr)
+	}
 }
 
 func TestStateMachine_NALookupBuf_ErrorPropagated(t *testing.T) {
