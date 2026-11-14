@@ -20,7 +20,8 @@ import (
 // (Err is fs.ErrExist, so errors.Is(err, fs.ErrExist) holds), or looking Path
 // up failed with something other than not-exist (Err is that failure, since
 // the destination may still hold a published pair). Re-key into a fresh
-// directory.
+// directory. It is part of the root-key rotation runbook
+// (docs/seal-barrier/user.md), with ReencryptSnapshotFile.
 type SnapshotDestinationError struct {
 	// Path is the refused destination.
 	Path string
