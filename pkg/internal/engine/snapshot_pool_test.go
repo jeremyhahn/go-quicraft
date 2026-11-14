@@ -3493,6 +3493,30 @@ func TestHandleRequest_CompletionNamesItsOperation(t *testing.T) {
 	}
 }
 
+// TestHandleRequest_RecoveryReportsTheRecoveredIndex checks that a recovery
+// that restores a recorded snapshot completes with that snapshot's index, so
+// the SnapshotRecovered event carries it rather than 0.
+func TestHandleRequest_RecoveryReportsTheRecoveredIndex(t *testing.T) {
+	f := newRecoverFixture(t, snapshotPayload(100, 4096), 0)
+	stopC := make(chan struct{})
+	defer close(stopC)
+	cb := newTestCallback()
+	pool := newSnapshotPool(1, f.ldb, nil, cb, NewWorkSignal(1), stopC, nil)
+
+	node := f.req.node
+	node.snapshotting.Store(true)
+	pool.inFlight.Store(f.req.shardID, node)
+	pool.handleRequest(f.req)
+
+	calls := cb.getSnapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("OnSnapshotCompleted called %d times, want 1", len(calls))
+	}
+	if c := calls[0]; c.op != SnapshotRecover || c.err != nil || c.index != 100 {
+		t.Fatalf("recovery completed as %+v, want SnapshotRecover at index 100 without error", c)
+	}
+}
+
 // TestHandleRequest_FailedSaveIsLoggedNotLatched: a failed save only READ the
 // state machine, so it must not trip the failure latch or report a shard
 // failure. It must still be reported: an automatic save has no requester to
