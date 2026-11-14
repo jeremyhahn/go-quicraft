@@ -91,6 +91,25 @@ func waitForAgreedLeader(ctx context.Context, t *testing.T, c *testCluster, shar
 	}
 }
 
+// waitForAgreedLeaderOn waits until every running host in idxs agrees that
+// the host at want leads shardID, and returns that leader's view.
+func waitForAgreedLeaderOn(ctx context.Context, t *testing.T, c *testCluster, shardID uint64, idxs []int, want int) (int, *quicraft.ShardInfo) {
+	t.Helper()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if idx, info := agreedLeader(c, shardID, idxs); idx == want {
+			return idx, info
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("shard %d: hosts %v never agreed host %d leads: %v", shardID, hostNumbers(idxs), want+1, ctx.Err())
+			return -1, nil
+		case <-ticker.C:
+		}
+	}
+}
+
 // agreedLeader is one poll of waitForAgreedLeader: -1 when no leader is
 // agreed yet.
 func agreedLeader(c *testCluster, shardID uint64, idxs []int) (int, *quicraft.ShardInfo) {
@@ -196,20 +215,30 @@ func TestPartialPlacement_OverlappingShardsAreIndependent(t *testing.T) {
 	commitOnHosts(ctx, t, cluster, trackersA, partialShardA, partialHostsA, "a-before", "1")
 	commitOnHosts(ctx, t, cluster, trackersB, partialShardB, partialHostsB, "b-before", "1")
 
+	// Shard A may have elected any of hosts 1-3; move its leadership to
+	// host 1, the host this test stops, so stopping it forces a shard-A
+	// failover instead of leaving an untouched leader on host 2 or 3.
+	transferLeadershipTo(t, cluster, partialShardA, 0, failoverTimeout)
+	leaderA, infoA := waitForAgreedLeaderOn(ctx, t, cluster, partialShardA, partialHostsA, 0)
+	termA := infoA.Term
+
 	// Re-read B's leader after its first commit: that is the steady state
 	// stopping host 1 must not disturb.
 	leaderB, infoB := waitForAgreedLeader(ctx, t, cluster, partialShardB, partialHostsB)
 	termB := infoB.Term
-	t.Logf("before stop: shard A leader host %d, shard B leader host %d term %d", leaderA+1, leaderB+1, termB)
+	t.Logf("before stop: shard A leader host %d term %d, shard B leader host %d term %d", leaderA+1, termA, leaderB+1, termB)
 
-	// (b) Stop host 1.
+	// (b) Stop host 1, shard A's leader.
 	cluster.stopNode(0)
 
 	failCtx, failCancel := context.WithTimeout(ctx, failoverTimeout)
-	newLeaderA, _ := waitForAgreedLeader(failCtx, t, cluster, partialShardA, partialHostsA)
+	newLeaderA, newInfoA := waitForAgreedLeader(failCtx, t, cluster, partialShardA, partialHostsA)
 	failCancel()
 	if newLeaderA != 1 && newLeaderA != 2 {
 		t.Fatalf("shard A leader after stopping host 1 is host %d, want host 2 or 3", newLeaderA+1)
+	}
+	if newInfoA.Term <= termA {
+		t.Fatalf("shard A successor on host %d has term %d, want a term above %d", newLeaderA+1, newInfoA.Term, termA)
 	}
 	commitOnHosts(ctx, t, cluster, trackersA, partialShardA, partialHostsA, "a-after", "2")
 	commitOnHosts(ctx, t, cluster, trackersB, partialShardB, partialHostsB, "b-after", "2")
