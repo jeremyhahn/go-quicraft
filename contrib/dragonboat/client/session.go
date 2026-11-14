@@ -187,9 +187,15 @@ func (s *Session) PrepareForUnregister() {
 //   - ShardID must match
 //   - ClientID must not be 0 (not a no-op session)
 //   - SeriesID must not be a register/unregister sentinel
-//   - RespondedTo must not exceed SeriesID
+//   - RespondedTo must be below SeriesID: a series that has already been
+//     responded to (RespondedTo == SeriesID) is not proposed again until
+//     ProposalCompleted advances it
 func (s *Session) ValidForProposal(shardID uint64) bool {
-	return s.inner.Load().ValidForProposal(shardID)
+	in := s.inner.Load()
+	if !in.ValidForProposal(shardID) {
+		return false
+	}
+	return in.RespondedTo() < in.SeriesID()
 }
 
 // ValidForSessionOp returns true if the session is valid for session
