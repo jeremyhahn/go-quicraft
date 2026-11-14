@@ -5990,7 +5990,7 @@ func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) 
 	select {
 	case result := <-resultC:
 		if result.Err != nil {
-			return nil, result.Err
+			return nil, withDeadlineCause(ctx, result.Err)
 		}
 		goto lookup
 	default:
@@ -5999,7 +5999,7 @@ func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) 
 	select {
 	case result := <-resultC:
 		if result.Err != nil {
-			return nil, result.Err
+			return nil, withDeadlineCause(ctx, result.Err)
 		}
 	case <-ctx.Done():
 		return nil, mapContextError(ctx.Err())
@@ -6062,7 +6062,7 @@ func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (res
 	select {
 	case r := <-resultC:
 		if r.Err != nil {
-			return nil, nopHostRelease, r.Err
+			return nil, nopHostRelease, withDeadlineCause(ctx, r.Err)
 		}
 		goto lookup
 	default:
@@ -6070,7 +6070,7 @@ func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (res
 	select {
 	case r := <-resultC:
 		if r.Err != nil {
-			return nil, nopHostRelease, r.Err
+			return nil, nopHostRelease, withDeadlineCause(ctx, r.Err)
 		}
 	case <-ctx.Done():
 		return nil, nopHostRelease, mapContextError(ctx.Err())
@@ -7371,7 +7371,7 @@ func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Mem
 	select {
 	case result := <-rs.ResultC():
 		if result.Err != nil {
-			return nil, result.Err
+			return nil, withDeadlineCause(ctx, result.Err)
 		}
 	case <-ctx.Done():
 		return nil, mapContextError(ctx.Err())
@@ -11285,7 +11285,7 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 	select {
 	case result := <-rs.ResultC():
 		if result.Err != nil {
-			return 0, result.Err
+			return 0, withDeadlineCause(ctx, result.Err)
 		}
 		return result.Value, nil
 	case <-ctx.Done():

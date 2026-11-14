@@ -16,6 +16,8 @@ package quicraft
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -305,12 +307,42 @@ func (rs *RequestState) lostWait(err error) error {
 func awaitResult(ctx context.Context, rs *RequestState) (RequestResult, error) {
 	select {
 	case result := <-rs.ResultC():
+		result.Err = withDeadlineCause(ctx, result.Err)
 		return result, result.Err
 	case <-ctx.Done():
 		// mapContextError keeps ctx.Err() under the ErrTimeout/ErrCanceled
 		// sentinel, so the error matches both inside a MaybeAppliedError.
 		return RequestResult{}, rs.lostWait(mapContextError(ctx.Err()))
 	}
+}
+
+// withDeadlineCause returns err, a result the request completed with, with
+// context.DeadlineExceeded attached when it is the sweeper's ErrTimeout and
+// the caller's context deadline has passed. pendingDeadline copies that
+// deadline into the request, so the sweeper can expire it before, or in
+// the same instant as, the context's own timer; whichever branch of the
+// caller's wait wins, the error then matches both ErrTimeout and
+// context.DeadlineExceeded, as ErrTimeout documents. A MaybeAppliedError
+// keeps its classification, with the cause attached inside it. Any other
+// err, or a timeout before the caller's deadline, is returned unchanged.
+func withDeadlineCause(ctx context.Context, err error) error {
+	if err == nil || !errors.Is(err, ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return err
+	}
+	switch ctxErr := ctx.Err(); {
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+	case ctxErr == nil && !time.Now().Before(deadline):
+	default:
+		return err
+	}
+	if mae, ok := err.(*MaybeAppliedError); ok {
+		return &MaybeAppliedError{Err: fmt.Errorf("%w: %w", mae.Err, context.DeadlineExceeded)}
+	}
+	return fmt.Errorf("%w: %w", err, context.DeadlineExceeded)
 }
 
 // ResultC returns a read-only channel that receives the result when the
