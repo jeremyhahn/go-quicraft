@@ -1815,11 +1815,16 @@ func (e *ContextError) Unwrap() error { return e.Cause }
 // fails. Op names the step and Path the file or directory it acted on; Err
 // is the underlying error, so errors.Is and errors.As see through it.
 type RemoveDataError struct {
-	ShardID   uint64
+	// ShardID is the shard whose data was being removed.
+	ShardID uint64
+	// ReplicaID is the replica whose data was being removed.
 	ReplicaID uint64
-	Op        string
-	Path      string
-	Err       error
+	// Op names the removal step that failed.
+	Op string
+	// Path is the file or directory the failed step operated on.
+	Path string
+	// Err is the underlying error of the failed step.
+	Err error
 }
 
 // Error returns a human-readable description of the failed step.
