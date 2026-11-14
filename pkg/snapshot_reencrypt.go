@@ -15,6 +15,27 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
+// SnapshotDestinationError reports a ReencryptSnapshotFile destination that
+// was refused before anything was written: Path already holds a snapshot.dat
+// (Err is fs.ErrExist, so errors.Is(err, fs.ErrExist) holds), or looking Path
+// up failed with something other than not-exist (Err is that failure, since
+// the destination may still hold a published pair). Re-key into a fresh
+// directory.
+type SnapshotDestinationError struct {
+	// Path is the refused destination.
+	Path string
+	// Err is fs.ErrExist or the lookup failure.
+	Err error
+}
+
+// Error returns a human-readable description of the refusal.
+func (e *SnapshotDestinationError) Error() string {
+	return fmt.Sprintf("quicraft: re-encrypt snapshot: destination %s refused: %v", e.Path, e.Err)
+}
+
+// Unwrap returns the underlying cause, fs.ErrExist or the lookup failure.
+func (e *SnapshotDestinationError) Unwrap() error { return e.Err }
+
 // SnapshotCommittedNotDurableError reports a snapshot re-encryption whose
 // destination is COMMITTED but not yet DURABLE: the rename succeeded, so
 // dstPath already holds the migrated artifact sealed at Epoch, and only the
@@ -259,9 +280,9 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 		_, statErr := fsys.Stat(dstPath)
 		switch {
 		case statErr == nil:
-			return 0, fmt.Errorf("re-encrypt snapshot: destination %s already exists: %w", dstPath, fs.ErrExist)
+			return 0, &SnapshotDestinationError{Path: dstPath, Err: fs.ErrExist}
 		case !errors.Is(statErr, fs.ErrNotExist):
-			return 0, fmt.Errorf("re-encrypt snapshot: look up destination %s: %w", dstPath, statErr)
+			return 0, &SnapshotDestinationError{Path: dstPath, Err: statErr}
 		}
 	}
 	srcReader, verifySrc := teeSourceVerifier(srcPath, srcMeta, src)

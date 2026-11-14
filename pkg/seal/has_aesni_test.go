@@ -50,12 +50,18 @@ func TestHasAESNI_Stable(t *testing.T) {
 	}
 }
 
-// TestHasAESNI_SelectOptimalAlgorithm asserts that, outside FIPS mode,
-// SelectOptimalAlgorithm picks AES-256-GCM whenever HasAESNI is true or the
-// operation is hardware backed, and the build's software fallback otherwise.
+// TestHasAESNI_SelectOptimalAlgorithm asserts that SelectOptimalAlgorithm
+// picks AES-256-GCM whenever HasAESNI is true or the operation is hardware
+// backed, and the build's software fallback otherwise; in FIPS mode it picks
+// AES-256-GCM unconditionally.
 func TestHasAESNI_SelectOptimalAlgorithm(t *testing.T) {
 	if FIPSEnabled() {
-		t.Skip("FIPS mode is on: SelectOptimalAlgorithm returns AES-256-GCM unconditionally")
+		for _, hw := range []bool{false, true} {
+			if got := SelectOptimalAlgorithm(hw); got != AlgAES256GCM {
+				t.Fatalf("FIPS mode: SelectOptimalAlgorithm(%v) = %s, want %s", hw, got, AlgAES256GCM)
+			}
+		}
+		return
 	}
 
 	t.Run("software path follows HasAESNI", func(t *testing.T) {
