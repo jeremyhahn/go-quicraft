@@ -843,6 +843,75 @@ func TestSyncRemoveData_RefusesUnknownSnapshotLayout(t *testing.T) {
 	}
 }
 
+// TestRemoveData_RefusesIntentOutsideReplica: a pending removal intent is
+// trusted only when it names the requested replica's own snapshot
+// directory. A damaged intent naming an ancestor (NodeHostDir), another
+// replica's directory or a path below the replica directory is refused
+// with ErrInvalidOperation, and nothing it names is deleted.
+func TestRemoveData_RefusesIntentOutsideReplica(t *testing.T) {
+	const shardID, replicaID uint64 = 7, 3
+	cases := []struct {
+		name   string
+		target func(nodeHostDir string) string
+	}{
+		{"NodeHostDir", func(nh string) string { return nh }},
+		{"shard base directory", func(nh string) string {
+			return shardSnapshotBaseDir(nh, "", shardID)
+		}},
+		{"another replica", func(nh string) string {
+			return engine.ReplicaSnapshotDir(shardSnapshotBaseDir(nh, "", shardID), shardID, replicaID+1)
+		}},
+		{"another shard", func(nh string) string {
+			return engine.ReplicaSnapshotDir(shardSnapshotBaseDir(nh, "", shardID+1), shardID+1, replicaID)
+		}},
+		{"below the replica directory", func(nh string) string {
+			return filepath.Join(engine.ReplicaSnapshotDir(
+				shardSnapshotBaseDir(nh, "", shardID), shardID, replicaID), "snapshot-1")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testHostConfig(t)
+			db := &removeDataLogDB{LogDB: memdb.New()}
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
+			if err != nil {
+				t.Fatalf("NewHost: %v", err)
+			}
+			defer h.Close()
+			db.set(0, true)
+
+			target := tc.target(cfg.NodeHostDir)
+			canary := filepath.Join(target, "canary")
+			if err := os.MkdirAll(target, 0o700); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if err := os.WriteFile(canary, []byte("keep"), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			intent := removeDataIntentFile(cfg.NodeHostDir, shardID, replicaID)
+			if err := os.MkdirAll(filepath.Dir(intent), 0o700); err != nil {
+				t.Fatalf("MkdirAll intent dir: %v", err)
+			}
+			if err := os.WriteFile(intent, []byte(target), 0o600); err != nil {
+				t.Fatalf("WriteFile intent: %v", err)
+			}
+
+			err = h.RemoveData(shardID, replicaID)
+			if !errors.Is(err, ErrInvalidOperation) {
+				t.Fatalf("RemoveData with an intent naming %s: err = %v, want %v",
+					target, err, ErrInvalidOperation)
+			}
+			if _, err := os.Stat(canary); err != nil {
+				t.Fatalf("RemoveData followed an intent outside the replica and deleted %s: %v",
+					target, err)
+			}
+			if _, err := os.Stat(intent); err != nil {
+				t.Fatalf("the refused intent was dropped (stat err %v): %s", err, intent)
+			}
+		})
+	}
+}
+
 // failParentSyncFS removes the armed directory for real, then fails the
 // next Open of its parent once: the directory sync that makes the removal
 // durable.
