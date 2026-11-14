@@ -15,6 +15,7 @@
 package dragonboat
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -138,6 +139,13 @@ type removedKey struct {
 // quicraft extension that opts into a bound.
 const defaultQueryTimeout time.Duration = 0
 
+// maxDetachedLookups bounds the timed local lookups (see SetQueryTimeout)
+// in flight on one NodeHost. A lookup holds its slot until the state
+// machine's Lookup or NALookup actually returns, so lookups that outlive
+// their deadline cannot accumulate without limit; a timed read that finds
+// every slot taken is refused with ErrSystemBusy.
+const maxDetachedLookups = 64
+
 // defaultWaitReadyTimeout bounds the Start*Replica readiness wait used
 // when Config.WaitReady is set. Dragonboat blocks on the node's
 // initializedC until the node is initialized or stopped; the adapter
@@ -180,6 +188,10 @@ type NodeHost struct {
 	// the state machine's Lookup with no deadline at all. Use
 	// SetQueryTimeout to opt into a bound.
 	queryTimeout atomic.Int64
+
+	// detachedLookups counts the timed local lookups whose state machine
+	// call has not returned yet, bounded by maxDetachedLookups.
+	detachedLookups atomic.Int64
 
 	// shardConfigs retains the dragonboat Config each shard was started
 	// with, keyed by shardID. OrderedConfigChange is only expressible in
@@ -503,6 +515,12 @@ func (nh *NodeHost) checkTimeout(timeout time.Duration) error {
 // bound and calls the state machine's Lookup with no deadline, which is
 // also this adapter's default. A zero or negative duration restores that
 // default. This method is safe for concurrent use.
+//
+// Under a positive deadline a lookup that outlives it keeps running in the
+// background: a []byte query is copied first, so its buffer may be reused
+// after ErrTimeout, but a query of another type must not be mutated after
+// one. At most maxDetachedLookups such lookups run at once; a timed read
+// beyond that is refused with ErrSystemBusy.
 func (nh *NodeHost) SetQueryTimeout(d time.Duration) {
 	if d < 0 {
 		d = 0
@@ -1149,17 +1167,97 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 	shardID := rs.ShardID()
 	// Dragonboat's ReadLocalNode calls sm.Lookup with no deadline at all,
 	// so the adapter imposes one only when SetQueryTimeout opted in.
-	ctx := context.Background()
-	if d := nh.QueryTimeout(); d > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, d)
-		defer cancel()
+	d := nh.QueryTimeout()
+	if d <= 0 {
+		val, err := nh.host.QueryLocalNode(context.Background(), shardID, query)
+		if err != nil {
+			return nil, translateError(err)
+		}
+		return val, nil
 	}
-	val, err := nh.host.QueryLocalNode(ctx, shardID, query)
-	if err != nil {
-		return nil, translateError(err)
+	// The dragonboat Lookup and NALookup take no context, so the deadline
+	// cannot reach the user's state machine: run the query in its own
+	// goroutine and stop waiting for it when the deadline passes. A lookup
+	// that outlives the deadline finishes in the background and its result
+	// is discarded.
+	//
+	// That lookup may still read the query after ErrTimeout returns, so
+	// it gets its own copy of a []byte query (and of the NAReadLocalNode
+	// key) and the caller may reuse its buffer at once. A query of any
+	// other type is passed as is: the caller must not mutate it after a
+	// timeout.
+	query = detachedQuery(query)
+	// Each lookup holds a slot until it actually returns, not until its
+	// caller stops waiting, so stuck lookups cannot pile up.
+	if !nh.acquireDetachedLookup() {
+		return nil, ErrSystemBusy
 	}
-	return val, nil
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	type lookupResult struct {
+		val      interface{}
+		err      error
+		panicked bool
+		panicVal interface{}
+	}
+	done := make(chan lookupResult, 1)
+	go func() {
+		defer nh.detachedLookups.Add(-1)
+		var r lookupResult
+		// A Lookup panic must not end the process from this goroutine,
+		// which no caller can recover: carry it back to the caller,
+		// which re-raises it inside its own panic-handling boundary,
+		// as the synchronous call did. A panic after the caller stopped
+		// waiting has no caller left and is dropped.
+		defer func() {
+			if p := recover(); p != nil {
+				r = lookupResult{panicked: true, panicVal: p}
+			}
+			done <- r
+		}()
+		r.val, r.err = nh.host.QueryLocalNode(ctx, shardID, query)
+	}()
+	select {
+	case r := <-done:
+		if r.panicked {
+			panic(r.panicVal)
+		}
+		if r.err != nil {
+			return nil, translateError(r.err)
+		}
+		return r.val, nil
+	case <-ctx.Done():
+		return nil, translateError(ctx.Err())
+	}
+}
+
+// detachedQuery returns a copy of query that a lookup outliving its
+// caller's deadline can own: []byte and nalookup.Query keys are cloned,
+// any other value is returned unchanged.
+func detachedQuery(query interface{}) interface{} {
+	switch q := query.(type) {
+	case []byte:
+		return bytes.Clone(q)
+	case nalookup.Query:
+		return nalookup.Query{Key: bytes.Clone(q.Key)}
+	default:
+		return query
+	}
+}
+
+// acquireDetachedLookup takes one of the maxDetachedLookups slots for a
+// timed local lookup, reporting false when all are taken. The lookup's
+// goroutine releases the slot when the state machine call returns.
+func (nh *NodeHost) acquireDetachedLookup() bool {
+	for {
+		n := nh.detachedLookups.Load()
+		if n >= maxDetachedLookups {
+			return false
+		}
+		if nh.detachedLookups.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
 }
 
 // StaleRead reads local state machine state directly without any
@@ -1192,8 +1290,9 @@ func (nh *NodeHost) SyncGetShardMembership(ctx context.Context, shardID uint64) 
 
 // GetShardInfo returns information about the specified shard. The bool
 // return value is true when the shard is found, false when it is not
-// loaded on this host. This matches dragonboat's three-value return
-// signature for shard info queries.
+// loaded on this host; a shard that is not loaded also returns a nil
+// ShardInfo and ErrShardNotFound. This matches dragonboat's three-value
+// return signature for shard info queries.
 func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
 	info, err := nh.host.ShardInfo(shardID)
 	if err != nil {
@@ -1213,6 +1312,12 @@ func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
 func (nh *NodeHost) GetShardMembership(shardID uint64) (*Membership, error) {
 	m, err := nh.host.ShardMembership(shardID)
 	if err != nil {
+		// quicraft answers a shard with no engine node as not ready;
+		// dragonboat reports a shard this host does not run as
+		// ErrShardNotFound.
+		if _, infoErr := nh.host.ShardInfo(shardID); errors.Is(infoErr, quicraft.ErrShardNotFound) {
+			return nil, ErrShardNotFound
+		}
 		return nil, translateError(err)
 	}
 	return fromQuicraftMembership(m), nil
