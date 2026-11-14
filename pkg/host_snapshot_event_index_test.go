@@ -76,3 +76,19 @@ func TestOnLogCompacted_PanickingListenerKeepsLogDBCompacted(t *testing.T) {
 		t.Fatalf("OnLogDBCompacted got %+v, want exactly one %+v", got, want)
 	}
 }
+
+// TestFireSnapshotListeners_RecoveredCarriesIndex checks that a recovery's
+// OnSnapshotRecovered reports the index of the snapshot it restored.
+func TestFireSnapshotListeners_RecoveredCarriesIndex(t *testing.T) {
+	var got []config.SnapshotInfo
+	el := &config.EventListener{
+		OnSnapshotRecovered: func(info config.SnapshotInfo) { got = append(got, info) },
+	}
+
+	fireSnapshotListeners(el, 7, 1, 42, engine.SnapshotRecover, nil)
+
+	want := config.SnapshotInfo{ShardID: 7, ReplicaID: 1, Index: 42}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("OnSnapshotRecovered got %+v, want exactly one %+v", got, want)
+	}
+}
