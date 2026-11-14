@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2524,8 +2525,38 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 	}
 	defer rsm.Close()
 
+	// Gate: the test holds the guard as the initial writer, so the reader
+	// cannot finish its reads before the writer stream starts.
+	rsm.lockApply()
+	gated := true
+	defer func() {
+		if gated {
+			rsm.unlockApply()
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	const reads = 200
+	var completed atomic.Int64
+	done := make(chan error, 1)
+	go func() {
+		for i := 0; i < reads; i++ {
+			if _, lookupErr := rsm.Lookup(ctx, "key"); lookupErr != nil {
+				done <- lookupErr
+				return
+			}
+			completed.Add(1)
+		}
+		done <- nil
+	}()
+	waitFor(t, 2*time.Second, "the reader to register in readWait", func() bool {
+		return rsm.readWait.waiters.Load() > 0
+	})
+
 	stop := make(chan struct{})
 	var writers sync.WaitGroup
+	var entered, cycles atomic.Int64
 	const writerCount = 4
 	for i := 0; i < writerCount; i++ {
 		writers.Add(1)
@@ -2537,9 +2568,11 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 					return
 				default:
 				}
+				entered.Add(1)
 				rsm.lockApply()
 				time.Sleep(2 * time.Millisecond)
 				rsm.unlockApply()
+				cycles.Add(1)
 			}
 		}()
 	}
@@ -2547,20 +2580,22 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 		close(stop)
 		writers.Wait()
 	}()
+	// Contention: every writer is queued behind the gate (or the registered
+	// reader) and the reader is still waiting.
+	waitFor(t, 2*time.Second, "every writer to enter lockApply", func() bool {
+		return entered.Load() >= writerCount
+	})
+	time.Sleep(10 * time.Millisecond)
+	if n := completed.Load(); n != 0 {
+		t.Fatalf("%d reads completed while the gate was held", n)
+	}
+	if n := cycles.Load(); n != 0 {
+		t.Fatalf("%d writer cycles completed while the gate was held", n)
+	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	const reads = 200
-	done := make(chan error, 1)
-	go func() {
-		for i := 0; i < reads; i++ {
-			if _, lookupErr := rsm.Lookup(ctx, "key"); lookupErr != nil {
-				done <- lookupErr
-				return
-			}
-		}
-		done <- nil
-	}()
+	cyclesAtRelease := cycles.Load()
+	gated = false
+	rsm.unlockApply()
 	select {
 	case lookupErr := <-done:
 		if lookupErr != nil {
@@ -2569,8 +2604,93 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 	case <-time.After(5 * time.Second):
 		cancel()
 		<-done
-		t.Fatalf("%d cancel-only Lookups did not complete within 5s under a continuous Update stream: read starvation", reads)
+		t.Fatalf("%d of %d cancel-only Lookups completed within 5s under a continuous Update stream: read starvation", completed.Load(), reads)
 	}
+	// With the handoff each writer cycle admits the waiting reader, so the
+	// reads finish within at most about half a cycle each (measured 19-114
+	// cycles for 200 reads). Without it the reader gets in only when its poll
+	// lands in the gap between two writers (measured 555-1290 cycles); a cycle-count bound, unlike a wall-clock one,
+	// holds on a slow runner.
+	n := cycles.Load() - cyclesAtRelease
+	if n == 0 {
+		t.Fatalf("no writer cycle ran while the %d reads ran: the reads were not contended", reads)
+	}
+	if limit := int64(3 * reads / 2); n > limit {
+		t.Fatalf("%d writer cycles ran while %d reads completed, want at most %d: readers are not handed the guard between Updates", n, reads, limit)
+	}
+}
+
+// waitFor polls cond until it holds or timeout passes.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for %s", timeout, what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// flagCancelCtx reports cancellation through Err only: its Done channel never
+// closes, so a reader parked in rlockContext can wake solely through the
+// readWait signal, the schedule in which a cancelled reader resumes after the
+// guard was released.
+type flagCancelCtx struct {
+	context.Context
+	done      chan struct{}
+	cancelled atomic.Bool
+}
+
+func (c *flagCancelCtx) Done() <-chan struct{} { return c.done }
+
+func (c *flagCancelCtx) Err() error {
+	if c.cancelled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// TestStateMachine_RLockContext_CancelThenUnlockBeforeResume covers a queued
+// reader whose context is cancelled and whose writer releases the guard
+// before the reader resumes: the reader must return ctx.Err() and must not
+// run the lookup or keep the guard.
+func TestStateMachine_RLockContext_CancelThenUnlockBeforeResume(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	rsm.lockApply()
+	ctx := &flagCancelCtx{Context: context.Background(), done: make(chan struct{})}
+	errs := make(chan error, 1)
+	go func() {
+		_, lookupErr := rsm.Lookup(ctx, "key")
+		errs <- lookupErr
+	}()
+	waitFor(t, 2*time.Second, "the reader to register in readWait", func() bool {
+		return rsm.readWait.waiters.Load() > 0
+	})
+	ctx.cancelled.Store(true)
+	rsm.unlockApply()
+
+	select {
+	case lookupErr := <-errs:
+		if !errors.Is(lookupErr, context.Canceled) {
+			t.Fatalf("Lookup after cancel then unlock = %v, want context.Canceled", lookupErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup did not return within 2s after cancel then unlock")
+	}
+	// The cancelled reader released the guard: a writer takes it at once.
+	if !rsm.readGuard.TryLock() {
+		t.Fatal("read guard still held after the cancelled reader returned")
+	}
+	rsm.readGuard.Unlock()
 }
 
 func TestStateMachine_NALookupBuf_ErrorPropagated(t *testing.T) {
