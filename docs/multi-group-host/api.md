@@ -765,10 +765,13 @@ path. It stages into a temporary directory it created and renames it into place
 once the artifact is complete and durable.
 
 **Layout discovery.** The snapshot tree root comes from the `Config.DataDir`
-that `StartShard` recorded in the LogDB bootstrap record. A shard started with
-`join=true`, or never started on this host, has no record; a record written
-before the field existed has none either. Both fail closed with
-`ErrImportLayoutUnknown` unless you state the layout with `WithImportDataDir`.
+that `StartShard` recorded in the LogDB bootstrap record. `StartShard` writes
+that record for `join=true` as well, so a replica that joined on this host
+after the record carried `DataDir` needs no option once stopped. Three cases
+have no recorded layout: a shard never started on this host, a replica that
+joined before `StartShard` recorded joins, and a record written before the
+field existed. They fail closed with `ErrImportLayoutUnknown` unless you state
+the layout with `WithImportDataDir`.
 `WithImportDataDir("")` asserts the shard has no `DataDir`. A value that
 contradicts the recorded one is refused.
 
