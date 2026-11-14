@@ -132,8 +132,9 @@ func (m *MemDB) AtRestProtection() logdb.AtRestProtection {
 // backend holds the entire Raft log of every shard on the heap, so a Close that
 // only flipped a flag left all of it alive for as long as the caller kept the
 // handle — which, in a host that closes one store and opens another, is the
-// full log twice. No operation can observe the released map: every exported
-// method checks the closed flag before it reaches the nodes.
+// full log twice. No operation can observe the released map: a writer checks
+// the closed flag under removalMu (beginWrite) and a reader under mu
+// (readNode), and Close sets the flag before it takes either lock.
 func (m *MemDB) Close() error {
 	m.closed.Store(true)
 	// Wait out every write already in flight so none is split by the release
@@ -407,7 +408,10 @@ func (m *MemDB) IterateEntries(
 		return entries, size, nil
 	}
 
-	nd := m.getNode(shardID, replicaID)
+	nd, err := m.readNode(shardID, replicaID)
+	if err != nil {
+		return entries, size, err
+	}
 	if nd == nil {
 		return entries, size, logdb.ErrUnavailable
 	}
@@ -486,7 +490,10 @@ func (m *MemDB) ReadState(shardID uint64, replicaID uint64) (logdb.State, logdb.
 		return logdb.State{}, logdb.Membership{}, logdb.ErrClosed
 	}
 
-	nd := m.getNode(shardID, replicaID)
+	nd, err := m.readNode(shardID, replicaID)
+	if err != nil {
+		return logdb.State{}, logdb.Membership{}, err
+	}
 	if nd == nil {
 		return logdb.State{}, logdb.Membership{}, logdb.ErrNoState
 	}
@@ -512,7 +519,10 @@ func (m *MemDB) EntryRange(shardID uint64, replicaID uint64) (uint64, uint64, er
 		return 0, 0, logdb.ErrClosed
 	}
 
-	nd := m.getNode(shardID, replicaID)
+	nd, err := m.readNode(shardID, replicaID)
+	if err != nil {
+		return 0, 0, err
+	}
 	if nd == nil {
 		return 0, 0, nil
 	}
@@ -654,7 +664,10 @@ func (m *MemDB) GetSnapshot(shardID uint64, replicaID uint64) (logdb.Snapshot, e
 		return logdb.Snapshot{}, logdb.ErrClosed
 	}
 
-	nd := m.getNode(shardID, replicaID)
+	nd, err := m.readNode(shardID, replicaID)
+	if err != nil {
+		return logdb.Snapshot{}, err
+	}
 	if nd == nil {
 		return logdb.Snapshot{}, logdb.ErrNoSnapshot
 	}
@@ -724,6 +737,11 @@ func (m *MemDB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	// Again under mu: a Close between the check above and the lock has
+	// released the map, and listing it would report no nodes (see readNode).
+	if m.closed.Load() {
+		return nil, logdb.ErrClosed
+	}
 
 	result := make([]logdb.NodeInfo, 0, len(m.nodes))
 	for k := range m.nodes {
@@ -766,7 +784,10 @@ func (m *MemDB) GetBootstrap(shardID uint64, replicaID uint64) (logdb.Bootstrap,
 		return logdb.Bootstrap{}, false, logdb.ErrClosed
 	}
 
-	nd := m.getNode(shardID, replicaID)
+	nd, err := m.readNode(shardID, replicaID)
+	if err != nil {
+		return logdb.Bootstrap{}, false, err
+	}
 	if nd == nil {
 		return logdb.Bootstrap{}, false, nil
 	}
@@ -793,6 +814,25 @@ func (m *MemDB) getNode(shardID, replicaID uint64) *nodeData {
 	m.mu.RUnlock()
 
 	return nd
+}
+
+// readNode is getNode for a reader, which holds no lock that orders it against
+// Close: it checks the closed flag again under mu. Close sets the flag before
+// it takes mu to release the map, so a reader that passed its first check just
+// before a Close and resolves its node after the release sees the flag here and
+// returns ErrClosed, instead of reporting the released map as a node with no
+// entries, state, snapshot or bootstrap. A node resolved before the release is
+// still whole (Close drops the map, not the nodes), so reading it returns the
+// state from before the close.
+func (m *MemDB) readNode(shardID, replicaID uint64) (*nodeData, error) {
+	key := nodeKey{shardID: shardID, replicaID: replicaID}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed.Load() {
+		return nil, logdb.ErrClosed
+	}
+	return m.nodes[key], nil
 }
 
 // getOrCreateNode returns the nodeData for the given key, creating it if
