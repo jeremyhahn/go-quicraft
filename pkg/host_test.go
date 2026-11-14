@@ -765,6 +765,77 @@ func waitForLogEntry(t *testing.T, h *Host, shardID uint64) LogRange {
 // NewHost
 // ---------------------------------------------------------------------------
 
+// TestContextError_IsUnwrap: mapContextError returns a *ContextError that
+// matches its quicraft sentinel through Is and the context error through
+// Unwrap, and keeps the "sentinel: cause" message.
+func TestContextError_IsUnwrap(t *testing.T) {
+	cases := []struct {
+		cause    error
+		sentinel error
+		other    error
+	}{
+		{context.DeadlineExceeded, ErrTimeout, ErrCanceled},
+		{context.Canceled, ErrCanceled, ErrTimeout},
+	}
+	for _, tc := range cases {
+		err := mapContextError(fmt.Errorf("wrapped: %w", tc.cause))
+		var ce *ContextError
+		if !errors.As(err, &ce) {
+			t.Fatalf("mapContextError(%v) = %T %v, want *ContextError", tc.cause, err, err)
+		}
+		if ce.Err != tc.sentinel {
+			t.Fatalf("ContextError.Err = %v, want %v", ce.Err, tc.sentinel)
+		}
+		if !errors.Is(err, tc.sentinel) || !errors.Is(err, tc.cause) {
+			t.Fatalf("errors.Is(%v) misses %v or %v", err, tc.sentinel, tc.cause)
+		}
+		if errors.Is(err, tc.other) {
+			t.Fatalf("errors.Is(%v, %v) = true", err, tc.other)
+		}
+		if want := tc.sentinel.Error() + ": wrapped: " + tc.cause.Error(); err.Error() != want {
+			t.Fatalf("Error() = %q, want %q", err.Error(), want)
+		}
+	}
+	plain := errors.New("plain")
+	if got := mapContextError(plain); got != plain {
+		t.Fatalf("mapContextError(plain) = %v, want it unchanged", got)
+	}
+}
+
+// TestRemoveDataError_IsUnwrap: a RemoveData step failure is a
+// *RemoveDataError naming the shard, replica, step and path, and unwraps to
+// the underlying error.
+func TestRemoveDataError_IsUnwrap(t *testing.T) {
+	cause := os.ErrPermission
+	err := error(&RemoveDataError{ShardID: 3, ReplicaID: 4, Op: "remove snapshot directory", Path: "/d", Err: cause})
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("errors.Is(%v, os.ErrPermission) = false", err)
+	}
+	if want := "quicraft: RemoveData shard 3 replica 4: remove snapshot directory /d: permission denied"; err.Error() != want {
+		t.Fatalf("Error() = %q, want %q", err.Error(), want)
+	}
+
+	// An empty removal intent is refused as a typed ErrInvalidOperation.
+	dir := t.TempDir()
+	h := &Host{}
+	h.cfg.NodeHostDir = dir
+	p := removeDataIntentPath(dir, 3, 4)
+	if mkErr := os.MkdirAll(filepath.Dir(p), 0o700); mkErr != nil {
+		t.Fatal(mkErr)
+	}
+	if wErr := os.WriteFile(p, nil, 0o600); wErr != nil {
+		t.Fatal(wErr)
+	}
+	_, ok, readErr := h.readRemoveDataIntent(3, 4)
+	var rde *RemoveDataError
+	if ok || !errors.As(readErr, &rde) {
+		t.Fatalf("readRemoveDataIntent(empty) = %v, %T %v, want *RemoveDataError", ok, readErr, readErr)
+	}
+	if rde.ShardID != 3 || rde.ReplicaID != 4 || rde.Path != p || !errors.Is(readErr, ErrInvalidOperation) {
+		t.Fatalf("RemoveDataError = %+v, want shard 3 replica 4 path %s matching ErrInvalidOperation", rde, p)
+	}
+}
+
 func TestNewHost_ValidConfig(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
