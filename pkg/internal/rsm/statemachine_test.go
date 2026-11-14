@@ -2532,23 +2532,36 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 	// writer is scheduled, whatever GOMAXPROCS is.
 	var held atomic.Bool
 
+	ctx, cancel := context.WithCancel(context.Background())
+	const reads = 200
+	var completed atomic.Int64
+	done := make(chan error, 1)
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	readerJoined := false
+
 	// Gate: the test holds the guard as the initial writer, so the reader
 	// cannot finish its reads before the writer stream starts.
 	rsm.lockApply()
 	held.Store(true)
 	gated := true
+	// One ordered cleanup, whatever line fails: release the gate and cancel
+	// the reader first, so blocked writers can pass lockApply and the reader
+	// can return, and only then join the writers and the reader. Joining the
+	// writers while the gate is still held would hang the package.
 	defer func() {
 		if gated {
 			held.Store(false)
 			rsm.unlockApply()
 		}
+		cancel()
+		close(stop)
+		writers.Wait()
+		if !readerJoined {
+			<-done
+		}
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	const reads = 200
-	var completed atomic.Int64
-	done := make(chan error, 1)
 	go func() {
 		for i := 0; i < reads; i++ {
 			for !held.Load() {
@@ -2570,8 +2583,6 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 		return rsm.readWait.waiters.Load() > 0
 	})
 
-	stop := make(chan struct{})
-	var writers sync.WaitGroup
 	var entered, cycles atomic.Int64
 	const writerCount = 4
 	for i := 0; i < writerCount; i++ {
@@ -2594,10 +2605,6 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 			}
 		}()
 	}
-	defer func() {
-		close(stop)
-		writers.Wait()
-	}()
 	// Contention: every writer is queued behind the gate (or the registered
 	// reader) and the reader is still waiting.
 	waitFor(t, 2*time.Second, "every writer to enter lockApply", func() bool {
@@ -2617,12 +2624,14 @@ func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.
 	rsm.unlockApply()
 	select {
 	case lookupErr := <-done:
+		readerJoined = true
 		if lookupErr != nil {
 			t.Fatalf("Lookup under continuous Update = %v", lookupErr)
 		}
 	case <-time.After(10 * time.Second):
 		cancel()
 		<-done
+		readerJoined = true
 		t.Fatalf("%d of %d cancel-only Lookups completed within 10s under a continuous Update stream: read starvation", completed.Load(), reads)
 	}
 	// Each read waits for a held guard, so it outlasts a writer cycle of
