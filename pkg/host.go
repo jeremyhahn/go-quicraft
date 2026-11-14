@@ -11327,7 +11327,9 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 // and the intent is dropped. A failure at any step returns its error and a
 // retry finishes the remaining steps from the intent; the snapshot of a
 // replica that was not retired is never touched. The shard must be
-// stopped on this host before calling RemoveData. This is used to clean up
+// stopped on this host before calling RemoveData, and the stop must have
+// returned: a replica whose StopShard is still unloading it is refused with
+// ErrShardNotStopped, and the caller retries. This is used to clean up
 // persistent state after a node has been permanently removed from a shard; a
 // replica that is to rejoin does so under a new replica ID, as Raft requires.
 func (h *Host) RemoveData(shardID, replicaID uint64) error {
@@ -11349,7 +11351,13 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	}
 	defer releaseImportLock()
 
-	// Check if the shard is still loaded on this host.
+	// Check if the shard is still loaded on this host. A matching replica is
+	// refused for as long as its nodeState is in h.nodes, stopping or not:
+	// StopShard sets ns.stopped before Engine.UnloadNode stops the engine
+	// node and waits out its write leases, and removes the nodeState only
+	// after that, so until then a snapshot save can still publish into the
+	// directory removed below — leaving a snapshot behind a removal that
+	// reported success. The caller retries once the stop has finished.
 	if v, loaded := h.nodes.Load(shardID); loaded {
 		ns, ok := v.(*nodeState)
 		if !ok {
@@ -11360,7 +11368,7 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 					ExpectedType: "*nodeState",
 					ActualValue:  v,
 				})
-		} else if !ns.stopped.Load() && ns.replicaID == replicaID {
+		} else if ns.replicaID == replicaID {
 			return &ShardNotStoppedError{ShardID: shardID, ReplicaID: replicaID}
 		}
 	}
