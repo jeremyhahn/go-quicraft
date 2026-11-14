@@ -92,8 +92,10 @@ func Host(address string) string {
 }
 
 // Canonical normalises a whole "host:port" Raft address: the host through
-// CanonicalHost, the port verbatim. An address with no port canonicalises as a
-// bare host.
+// CanonicalHost, the port numerically through canonicalPort. An IPv6 host is
+// re-bracketed; an IPv4-mapped IPv6 host collapses onto its IPv4 spelling and
+// so is written unbracketed. An address with no port (including a bare or
+// bracketed IPv6 literal) canonicalises as a bare, unbracketed host.
 //
 // The PORT is part of the result, unlike Host. Two replicas on one machine at
 // different ports are a supported deployment and are genuinely distinct
