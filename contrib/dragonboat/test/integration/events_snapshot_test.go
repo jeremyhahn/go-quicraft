@@ -297,7 +297,6 @@ func TestIntegration_DB_SnapshotEvents_CreatedThenCompacted(t *testing.T) {
 // snapshot, and its host fires SnapshotRecovered for that shard and replica
 // with an index at or above the snapshot's.
 func TestIntegration_DB_SnapshotEvents_RecoveredOnLaggingReplica(t *testing.T) {
-	t.Skip("SnapshotRecovered reports index 0: pkg/host.go fireSnapshotListeners builds the SnapshotRecover SnapshotInfo without Index (row #1126 report)")
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotEventsBudget)
 	defer cancel()
 

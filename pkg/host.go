@@ -2881,6 +2881,7 @@ func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index u
 			el.OnSnapshotRecovered(config.SnapshotInfo{
 				ShardID:   shardID,
 				ReplicaID: replicaID,
+				Index:     index,
 			})
 		}
 	}
