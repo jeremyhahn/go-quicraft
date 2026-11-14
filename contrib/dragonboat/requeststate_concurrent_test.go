@@ -16,12 +16,15 @@ package dragonboat
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	dbSM "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/statemachine"
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
@@ -241,5 +244,55 @@ func TestRequestStateConcurrent_NoNotifyCommitIsAppliedC(t *testing.T) {
 	rs.mu.Unlock()
 	if aggr != nil {
 		t.Fatal("ResultC without NotifyCommit built an aggregate channel")
+	}
+}
+
+// goexitLookupSM is a state machine whose Lookup and NALookup end their
+// goroutine with runtime.Goexit instead of returning.
+type goexitLookupSM struct {
+	testStateMachine
+}
+
+func (sm *goexitLookupSM) Lookup(interface{}) (interface{}, error) {
+	runtime.Goexit()
+	return nil, nil
+}
+
+func (sm *goexitLookupSM) NALookup([]byte) ([]byte, error) {
+	runtime.Goexit()
+	return nil, nil
+}
+
+// A timed lookup whose Lookup or NALookup exits via runtime.Goexit never
+// returned a result, so ReadLocalNode and NAReadLocalNode must report
+// ErrAborted rather than a successful (nil, nil) read.
+func TestNodeHost_TimedLookupGoexitIsAborted(t *testing.T) {
+	for _, na := range []bool{false, true} {
+		t.Run(fmt.Sprintf("na=%v", na), func(t *testing.T) {
+			sm := &goexitLookupSM{}
+			nh := newTestNodeHost(t)
+			startTestShardWith(t, nh, 1, 1, func(_, _ uint64) dbSM.IStateMachine { return sm })
+			nh.SetQueryTimeout(5 * time.Second)
+			rs := completedReadIndex(t, nh, 1)
+			var (
+				val interface{}
+				err error
+			)
+			if na {
+				var b []byte
+				b, err = nh.NAReadLocalNode(rs, []byte("k"))
+				if b != nil {
+					val = b
+				}
+			} else {
+				val, err = nh.ReadLocalNode(rs, []byte("k"))
+			}
+			if !errors.Is(err, ErrAborted) {
+				t.Fatalf("err = %v, want ErrAborted", err)
+			}
+			if val != nil {
+				t.Fatalf("val = %v, want nil", val)
+			}
+		})
 	}
 }
