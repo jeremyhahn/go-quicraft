@@ -155,6 +155,29 @@ func (c *removeReaddCluster) checkRemovedNotPast(removed, removalApplied uint64,
 	}
 }
 
+// membership reads the shard's membership linearizably from its current
+// leader. A membership change can start an election, so the host that was
+// leader may answer ErrNotLeader with the leader unknown: wait for a known
+// leader and retry until ctx's deadline.
+func (c *removeReaddCluster) membership(ctx context.Context) *Membership {
+	c.t.Helper()
+	for {
+		_, lh := c.leader()
+		m, err := lh.SyncGetShardMembership(ctx, removeReaddShard)
+		if err == nil {
+			return m
+		}
+		if !errors.Is(err, ErrNotLeader) || ctx.Err() != nil {
+			c.t.Fatalf("SyncGetShardMembership: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			c.t.Fatalf("SyncGetShardMembership: %v (last error %v)", ctx.Err(), err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *testing.T) {
 	c := newRemoveReaddCluster(t)
 	for i := range 3 {
@@ -184,10 +207,7 @@ func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *test
 		t.Fatalf("SyncRequestRemoveNode(%d): %v", removed, err)
 	}
 
-	m, err := lh.SyncGetShardMembership(ctx, removeReaddShard)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership: %v", err)
-	}
+	m := c.membership(ctx)
 	if _, ok := m.Nodes[removed]; ok {
 		t.Fatalf("membership still lists removed replica %d as a voter: %v", removed, m.Nodes)
 	}
@@ -223,15 +243,12 @@ func TestRemoveReadd_RemovedReplicaStopsServingAndItsIDCannotBeAddedBack(t *test
 	c.checkRemovedNotPast(removed, removalApplied, "while the survivors advanced")
 
 	_, lh = c.leader()
-	err = lh.SyncRequestAddNode(ctx, removeReaddShard, removed, c.addrs[removed], 0)
+	err := lh.SyncRequestAddNode(ctx, removeReaddShard, removed, c.addrs[removed], 0)
 	if !errors.Is(err, ErrNodeRemoved) {
 		t.Fatalf("SyncRequestAddNode(%d) after its removal = %v, want ErrNodeRemoved", removed, err)
 	}
 
-	m, err = lh.SyncGetShardMembership(ctx, removeReaddShard)
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership after the refused add: %v", err)
-	}
+	m = c.membership(ctx)
 	if _, ok := m.Nodes[removed]; ok {
 		t.Fatalf("refused add still put replica %d back in the membership: %v", removed, m.Nodes)
 	}
