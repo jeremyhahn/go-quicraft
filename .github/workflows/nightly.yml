@@ -98,6 +98,7 @@ jobs:
         run: rm -f "$RUNNER_TEMP/gomodauth.env"
 
   trivy:
+    timeout-minutes: 60
     name: Trivy
     runs-on: ubuntu-latest
     steps:

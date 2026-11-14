@@ -25,6 +25,10 @@ host, err := quicraft.NewHost(cfg, quicraft.WithMetrics(c), quicraft.WithoutEncr
 http.Handle("/metrics", promhttp.HandlerFor(c.Registry, promhttp.HandlerOpts{}))
 ```
 
+`ExampleNewPrometheusMetricsCollector` in
+[`pkg/example_metrics_test.go`](../../pkg/example_metrics_test.go) runs this
+setup and scrapes the registry.
+
 The registry is dedicated, not the Prometheus default, so two hosts in one
 process do not collide and your own metrics are untouched. (`WithoutEncryption`
 stands in for whichever at-rest encryption choice your deployment makes.)
@@ -36,6 +40,9 @@ c := quicraft.NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{
     PerShardMetrics: true,
 })
 ```
+
+`ExampleNewPrometheusMetricsCollectorWithConfig` runs this and reads the mode
+back from `quicraft_metrics_per_shard_enabled`.
 
 Know what this costs. With it off, each active shard adds about 6 series; with
 it on, about 113. You lose no alerts by leaving it off: elections, dropped
@@ -50,7 +57,8 @@ s := quicraft.NewSampledMetricsCollector(c, 100) // record 1 in 100
 ```
 
 This samples commit-latency and apply-latency observations only; counters stay
-exact. Pass `s` to `WithMetrics`.
+exact. Pass `s` to `WithMetrics`, as `ExampleNewSampledMetricsCollector`
+does.
 
 Do not enable per-message metrics in production:
 
@@ -72,6 +80,9 @@ func (m *myCollector) RegisterShard(shardID uint64) {
 func (m *myCollector) UnregisterShard(shardID uint64) { /* release them */ }
 ```
 
+`ExampleNoOpMetricsCollector` plugs such a collector, overriding only
+`RegisterShard`, into a Host.
+
 Your code runs on the hot path:
 
 1. Don't panic. The library recovers and counts collector panics, but each one
@@ -89,6 +100,8 @@ logger := config.NewLogger(config.LogConfig{
 })
 host, err := quicraft.NewHost(cfg, quicraft.WithLogger(logger), quicraft.WithoutEncryption())
 ```
+
+`ExampleWithLogger` runs this setup.
 
 Without `WithLogger`, the host builds its logger from `cfg.LogConfig`.
 `config.NewLogger` writes to stderr; for any other destination, pass your own

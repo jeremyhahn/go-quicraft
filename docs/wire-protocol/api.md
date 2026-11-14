@@ -60,6 +60,10 @@ n, err := entry.MarshalTo(buf)
 // buf[:n] is the serialized form
 ```
 
+Compiled with checked output, including the `ErrBufferTooSmall` refusal of a
+buffer one byte short, as `ExampleEntry_MarshalTo` in
+[`pkg/proto/example_test.go`](../../pkg/proto/example_test.go).
+
 | | |
 |---|---|
 | Request | a destination buffer of at least `Size()` bytes |
@@ -79,6 +83,9 @@ var e proto.Entry
 n, err := e.UnmarshalFrom(buf)
 ```
 
+The round trip back to equal fields is `ExampleEntry_MarshalTo` in
+[`pkg/proto/example_test.go`](../../pkg/proto/example_test.go).
+
 | | |
 |---|---|
 | Request | a source buffer. **Treated as hostile.** |
@@ -93,6 +100,9 @@ n, err := e.UnmarshalFrom(buf)
 func GetEntrySlice() *[]Entry
 func PutEntrySlice(s *[]Entry)
 ```
+
+Get, append and put back are `ExampleGetEntrySlice` in
+[`pkg/proto/example_test.go`](../../pkg/proto/example_test.go).
 
 Reuse for the hot decode path. Anything aliasing a pooled buffer must be copied
 first; see the buffer-ownership rules in
@@ -111,6 +121,11 @@ func IsFreeOrderMessage(msgType uint64) bool
 reports whether a message may be sent **before** the state it promises is
 durable. The engine sends free-order messages from the step worker and holds the
 rest for the commit worker.
+
+`ExampleMessageTypeName` in
+[`pkg/proto/example_test.go`](../../pkg/proto/example_test.go) prints a known
+name, `Unknown(9999)`, and `IsFreeOrderMessage` for `Replicate` (true) and
+`ReplicateResp` (false).
 
 ### Constants: the protocol's bounds
 

@@ -922,7 +922,7 @@ jobs:
     runs-on: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","bigdisk-docker"]') || 'ubuntu-latest' }}
     needs: [preflight]
     if: ${{ !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
-    timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the lint stages (6 h cap)
+    timeout-minutes: 60
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
       CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
@@ -1263,7 +1263,7 @@ jobs:
     runs-on: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","linux","x64","bigdisk-docker"]') || 'ubuntu-latest' }}
     needs: [preflight]
     if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
-    timeout-minutes: 120     # hosted runner: a cold toolchain image build, then a quarter of the -race suite (6 h cap)
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -1577,7 +1577,7 @@ jobs:
     # still serializes them; on hosted runners it costs wall time only.
     needs: [image, preflight]
     # <<< CUSTOMIZE
-    timeout-minutes: 150     # hosted runner: a cold integration image build, then half the suite (6 h cap)
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
