@@ -100,12 +100,15 @@ func TestNodeHost_ExportImport_FreshNodeHostSameState(t *testing.T) {
 	// (b) A stopped: re-importing its own snapshot's index is refused as
 	// documented (or accepted), never a panic.
 	stopShard(t, a, exportImportShard, replicaID)
-	if err := importNoPanic(t, a, exportImportShard, artifact); err != nil {
+	if err := importNoPanic(t, a, exportImportShard, artifact); err == nil {
+		t.Fatal("ImportSnapshot into A's own recorded index = nil, want " +
+			"*ImportSnapshotOutOfDateError or *ImportSnapshotDirExistsError")
+	} else {
 		t.Logf("re-import into A: %v", err)
 		var outOfDate *quicraft.ImportSnapshotOutOfDateError
 		var dirExists *quicraft.ImportSnapshotDirExistsError
 		if !errors.As(err, &outOfDate) && !errors.As(err, &dirExists) {
-			t.Fatalf("ImportSnapshot into A's own recorded index = %v, want nil, "+
+			t.Fatalf("ImportSnapshot into A's own recorded index = %v, want "+
 				"*ImportSnapshotOutOfDateError or *ImportSnapshotDirExistsError", err)
 		}
 	}
