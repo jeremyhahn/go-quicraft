@@ -45,8 +45,21 @@ func TestSessionValidity_RespondedToBound(t *testing.T) {
 	if got := s.Inner().RespondedTo(); got != s.SeriesID() {
 		t.Fatalf("RespondedTo = %d, want %d", got, s.SeriesID())
 	}
+	// docs/plans/1126.md slice #1081: a proposal whose series has already
+	// been responded to (RespondedTo == SeriesID) is refused; proposing it
+	// again would replay an acknowledged series.
+	if s.ValidForProposal(10) {
+		t.Error("ValidForProposal must refuse RespondedTo == SeriesID")
+	}
+
+	// ProposalCompleted advances the series past RespondedTo, so the next
+	// proposal is valid again.
+	s.ProposalCompleted()
+	if got, sid := s.Inner().RespondedTo(), s.SeriesID(); got != sid-1 {
+		t.Fatalf("after ProposalCompleted RespondedTo = %d, want %d", got, sid-1)
+	}
 	if !s.ValidForProposal(10) {
-		t.Error("ValidForProposal must accept RespondedTo == SeriesID")
+		t.Error("ValidForProposal must accept RespondedTo < SeriesID")
 	}
 
 	s.Inner().SetRespondedTo(s.SeriesID() + 5)
