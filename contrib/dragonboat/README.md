@@ -86,7 +86,7 @@ this table or the table names one the package does not export.
 | `GetNodeHostInfo` | yes | |
 | `GetNodeHostRegistry` | yes | Always `nil, false`: QuicRaft has no gossip registry. |
 | `GetNodeUser` | yes | The shard must be running on this host. |
-| `GetShardInfo` | no | QuicRaft extension: the shard's `ShardInfo`, and false when it is not loaded here. |
+| `GetShardInfo` | no | QuicRaft extension: the shard's `ShardInfo`; a shard not loaded here returns false and `ErrShardNotFound`. |
 | `GetShardMembership` | no | QuicRaft extension: the committed membership from the local replica, without the `ReadIndex` of `SyncGetShardMembership`. |
 | `HasNodeInfo` | yes | |
 | `ID` | yes | |

@@ -2719,14 +2719,16 @@ func (c *hostEngineCallback) OnLogCompacted(shardID, replicaID uint64, compactio
 		return
 	}
 	info := config.EventShardInfo{ShardID: shardID, ReplicaID: replicaID, Index: compaction.Index}
-	c.dispatchListener("OnLogCompacted", shardID, func() {
-		if el.OnLogCompacted != nil {
-			el.OnLogCompacted(info)
-		}
-		if compaction.LogDB && el.OnLogDBCompacted != nil {
-			el.OnLogDBCompacted(info)
-		}
-	})
+	// Two dispatches, not one closure: the dispatcher recovers a listener
+	// panic per call, so a panicking OnLogCompacted must not take
+	// OnLogDBCompacted down with it. The dispatcher is FIFO, so the order
+	// is kept.
+	if el.OnLogCompacted != nil {
+		c.dispatchListener("OnLogCompacted", shardID, func() { el.OnLogCompacted(info) })
+	}
+	if compaction.LogDB && el.OnLogDBCompacted != nil {
+		c.dispatchListener("OnLogDBCompacted", shardID, func() { el.OnLogDBCompacted(info) })
+	}
 }
 
 // dispatchListener runs a fan-out to user EventListener code on the engine's
