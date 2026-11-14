@@ -81,14 +81,9 @@ func Example_enclaveWithBytes() {
 		return
 	}
 
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		fmt.Println("rand:", err)
-		return
-	}
 	plaintext, aad := []byte("hello"), []byte("header")
 
-	// gcm runs fn with an AES-GCM AEAD keyed from a fresh Open of key, built
+	// gcm runs fn with an AES-GCM AEAD (module-generated nonces, FIPS 140-only safe) keyed from a fresh Open of key, built
 	// inside the borrow and dropped with it.
 	gcm := func(fn func(cipher.AEAD) error) error {
 		buf, err := key.Open(ctx)
@@ -101,7 +96,7 @@ func Example_enclaveWithBytes() {
 			if err != nil {
 				return err
 			}
-			aead, err := cipher.NewGCM(block)
+			aead, err := cipher.NewGCMWithRandomNonce(block)
 			if err != nil {
 				return err
 			}
@@ -111,7 +106,7 @@ func Example_enclaveWithBytes() {
 
 	var ciphertext []byte
 	if err := gcm(func(aead cipher.AEAD) error {
-		ciphertext = aead.Seal(nil, nonce, plaintext, aad)
+		ciphertext = aead.Seal(nil, nil, plaintext, aad)
 		return nil
 	}); err != nil {
 		fmt.Println("encrypt:", err)
@@ -120,7 +115,7 @@ func Example_enclaveWithBytes() {
 	var opened []byte
 	if err := gcm(func(aead cipher.AEAD) error {
 		var err error
-		opened, err = aead.Open(nil, nonce, ciphertext, aad)
+		opened, err = aead.Open(nil, nil, ciphertext, aad)
 		return err
 	}); err != nil {
 		fmt.Println("decrypt:", err)
