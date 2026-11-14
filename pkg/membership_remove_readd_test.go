@@ -167,7 +167,10 @@ func (c *removeReaddCluster) membership(ctx context.Context) *Membership {
 		if err == nil {
 			return m
 		}
-		if !errors.Is(err, ErrNotLeader) || ctx.Err() != nil {
+		// A newly elected leader answers ErrReadIndexNotReady until it
+		// commits its first entry of the term; retry it like ErrNotLeader.
+		retryable := errors.Is(err, ErrNotLeader) || errors.Is(err, ErrReadIndexNotReady)
+		if !retryable || ctx.Err() != nil {
 			c.t.Fatalf("SyncGetShardMembership: %v", err)
 		}
 		select {
