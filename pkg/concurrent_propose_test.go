@@ -412,9 +412,6 @@ func (o *proposeOutcomes) record(key string, err error) (moved bool) {
 // TestMultipleConcurrentProposals_Complete (host_test.go) covers only ten
 // concurrent proposals on one replica and checks that each returns.
 func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T) {
-	if testing.Short() {
-		t.Skip("three-host cluster over loopback QUIC")
-	}
 	const (
 		goroutines = 64
 		perG       = 50

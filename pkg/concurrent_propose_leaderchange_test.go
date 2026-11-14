@@ -40,9 +40,6 @@ import (
 // once on every replica, and every other held proposal at most once, the
 // same number of times on every replica.
 func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
-	if testing.Short() {
-		t.Skip("three-host cluster over loopback QUIC")
-	}
 	c := newConcurrentProposeCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -197,9 +194,6 @@ func concurrentProposeSameCount(t *testing.T, c *concurrentProposeCluster, keys 
 // Each orphaned proposal is then applied at most once, the same number of
 // times on every replica.
 func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
-	if testing.Short() {
-		t.Skip("three-host cluster over loopback QUIC")
-	}
 	c := newConcurrentProposeCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
