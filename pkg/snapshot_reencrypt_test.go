@@ -19,10 +19,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
+
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
 // snapshotPlaintext returns a multi-chunk plaintext payload (>64KiB) so the
@@ -214,6 +218,61 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	}
 	if !bytes.Equal(dec.Bytes(), plain) {
 		t.Fatal("plaintext->keyed lost data")
+	}
+}
+
+// TestReencryptSnapshotFile_RefusesCorruptSource pins that a source
+// snapshot.dat whose bytes no longer match its snapshot.meta is refused before
+// a fresh snapshot.meta is stamped beside the destination. A same-length bit
+// flip in a serialized value is invisible to the FileSize check; restamping
+// would replace the original checksum with one that matches the damage, and
+// recovery would accept the corrupt state.
+func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
+	plain := snapshotPlaintext()
+	dir := t.TempDir()
+	srcDir := filepath.Join(dir, "src")
+	if err := os.MkdirAll(srcDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	srcPath := filepath.Join(srcDir, "snapshot.dat")
+	if err := os.WriteFile(srcPath, plain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("hash source: %v", err)
+	}
+	meta := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index: testSnapIndex, Term: 1, ShardID: testSnapShardID, ReplicaID: testSnapReplicaID,
+		DataLen: size, DataHash: sum,
+	})
+	if err := os.WriteFile(filepath.Join(srcDir, "snapshot.meta"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: the intact source migrates and gets a destination record.
+	okDst := filepath.Join(dir, "ok", "snapshot.dat")
+	if _, err := ReencryptSnapshotFile(srcPath, okDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil); err != nil {
+		t.Fatalf("intact source: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ok", "snapshot.meta")); err != nil {
+		t.Fatalf("intact source: destination snapshot.meta: %v", err)
+	}
+
+	// Flip one byte of the last serialized value: same length, wrong bytes.
+	flipSnapshotByte(t, srcPath, int64(len(plain)-1))
+
+	dstDir := filepath.Join(dir, "dst")
+	dstPath := filepath.Join(dstDir, "snapshot.dat")
+	_, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	if !errors.Is(err, ErrSnapshotCorrupt) {
+		t.Fatalf("corrupt source: err = %v, want ErrSnapshotCorrupt", err)
+	}
+	if _, err := os.Stat(filepath.Join(dstDir, "snapshot.meta")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt source: destination snapshot.meta stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(dstPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("corrupt source: destination snapshot.dat stat err = %v, want not exist", err)
 	}
 }
 
@@ -460,6 +519,53 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 			t.Error("nil destination barrier did not write the plaintext through")
 		}
 	})
+}
+
+// TestReencryptSnapshotFile_DestinationStatFailurePropagates pins the
+// overwrite guard's lookup: a Stat of the destination that fails with
+// anything other than fs.ErrNotExist (here EIO) does not establish that the
+// destination is absent, so the call must return that error before copying,
+// and the published snapshot.dat/snapshot.meta pair must stay unchanged.
+func TestReencryptSnapshotFile_DestinationStatFailurePropagates(t *testing.T) {
+	srcBarrier := createTestBarrier(t)
+	dstBarrier := createTestBarrier(t)
+
+	root := "/vol"
+	cfs := newCrashFS(root)
+	srcPath := filepath.Join(root, "src", "snapshot.dat")
+	dstDir := filepath.Join(root, "dst")
+	dstPath := filepath.Join(dstDir, "snapshot.dat")
+	dstMetaPath := filepath.Join(dstDir, "snapshot.meta")
+	srcData := encryptToBytes(t, srcBarrier, bytes.Repeat([]byte("new-source-content"), 200))
+	writeDurableFile(t, cfs, srcPath, srcData)
+	writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
+		reencryptTestSourceMeta(srcData))
+	oldData := encryptToBytes(t, dstBarrier, bytes.Repeat([]byte("published-destination"), 150))
+	oldMeta := reencryptTestSourceMeta(oldData)
+	writeDurableFile(t, cfs, dstPath, oldData)
+	writeDurableFile(t, cfs, dstMetaPath, oldMeta)
+
+	cfs.setHook(func(op crashOp, path string) error {
+		if op == opStat && filepath.Clean(path) == dstPath {
+			return &fs.PathError{Op: "stat", Path: path, Err: syscall.EIO}
+		}
+		return nil
+	})
+	_, err := reencryptSnapshotFile(cfs, srcPath, dstPath,
+		testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	cfs.setHook(nil)
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("err = %v, want the destination lookup's EIO", err)
+	}
+	if got, _ := cfs.liveBytes(dstPath); !bytes.Equal(got, oldData) {
+		t.Fatal("the published snapshot.dat was changed")
+	}
+	if got, _ := cfs.liveBytes(dstMetaPath); !bytes.Equal(got, oldMeta) {
+		t.Fatal("the published snapshot.meta was changed")
+	}
+	if names := cfs.entries(dstDir); len(names) != 2 {
+		t.Fatalf("%s holds %v, want only the published pair", dstDir, names)
+	}
 }
 
 // EncryptWithEpochPinnedContext is the path every snapshot frame now takes:
