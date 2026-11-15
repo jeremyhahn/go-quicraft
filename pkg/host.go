@@ -13360,10 +13360,16 @@ func mapContextError(err error) error {
 // mapLocalReadError maps a context error returned by a local state machine
 // read (a read abandoned while an Update held the state machine) to
 // ErrCanceled or ErrTimeout, as the read's own context checks do. An error
-// that already carries ErrCanceled or ErrTimeout is returned unchanged.
+// that already carries ErrCanceled or ErrTimeout is returned unchanged. A
+// read that passed its caller's stopped check and then found the state
+// machine closed by StopShard or Close reports ErrClosed, as that check
+// does, not the internal rsm error callers cannot match.
 func mapLocalReadError(err error) error {
 	if err == nil || errors.Is(err, ErrCanceled) || errors.Is(err, ErrTimeout) {
 		return err
+	}
+	if errors.Is(err, rsm.ErrClosed) {
+		return ErrClosed
 	}
 	return mapContextError(err)
 }
