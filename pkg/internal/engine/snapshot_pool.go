@@ -1293,16 +1293,27 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	if hook := saveStageHook.Load(); hook != nil {
 		(*hook)(node)
 	}
-	stageParent := filepath.Dir(canonicalDir)
-	if err := os.MkdirAll(stageParent, 0o750); err != nil {
+	// The stage itself, though, is created UNDER the lease, and only briefly.
+	// Its parent is the replica directory RemoveData deletes once UnloadNode
+	// has passed awaitWriteLeases, so a save that created it after that fence
+	// would bring the directory back, empty, inside a replica that has just
+	// been removed. With the lease held, the fence orders the creation either
+	// before it — so the removal deletes the stage, and every later create in
+	// it fails for want of a parent — or after it, when the node has stopped
+	// and the lease is refused, and nothing is created at all. The lease is
+	// the non-blocking form: the saving gate is held here, and waiting behind
+	// a pending unload while holding it would stall applies on a stopping
+	// node for no purpose.
+	if !node.TryAcquireWriteLease() {
 		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      true,
-			Err:       err,
+			Err:       ErrStopped,
 		}
 	}
-	stageDir, err := MkdirStageDir(stageParent, SaveStageDirPattern)
+	stageDir, f, err := openSaveStage(filepath.Dir(canonicalDir))
+	node.ReleaseWriteLease()
 	if err != nil {
 		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
@@ -1335,19 +1346,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 		}
 	}()
 	saveDir := stageDir
-
-	// Open data file. The engine.Snapshotter interface accepts io.Writer,
-	// and *os.File satisfies io.Writer, so we manage the file here.
 	dataPath := filepath.Join(saveDir, snapshotDataFile)
-	f, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return 0, LogCompaction{}, &SnapshotError{
-			ShardID:   req.shardID,
-			ReplicaID: req.replicaID,
-			Save:      true,
-			Err:       err,
-		}
-	}
 
 	// Save SM state to the data file. When Snappy compression is
 	// configured, wrap the file writer with a Snappy buffered writer
@@ -1612,7 +1611,22 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	// The (snapshotIndex, term) pair was captured together under the apply
 	// gate above; do NOT re-read lastAppliedTerm here — applies may have
 	// resumed since afterCapture released the gate.
-	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch, compression); err != nil {
+	//
+	// The metadata file is a create under the node's snapshot directory, so it
+	// too runs under a brief, non-blocking lease (see the stage creation): a
+	// node that has stopped since the capture is refused here, and the stage
+	// guard removes the stage.
+	if !node.TryAcquireWriteLease() {
+		return 0, LogCompaction{}, &SnapshotError{
+			ShardID:   req.shardID,
+			ReplicaID: req.replicaID,
+			Save:      true,
+			Err:       ErrStopped,
+		}
+	}
+	metaErr := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch, compression)
+	node.ReleaseWriteLease()
+	if err := metaErr; err != nil {
 		// The data file is (possibly encrypted) ciphertext with no
 		// snapshot.meta beside it. readSnapshotEpoch classifies such a directory
 		// UNEVALUABLE, which makes the global/per-barrier purge floor fail safe
@@ -1962,6 +1976,33 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	p.purgeOldEpochs(node.SnapshotDir(), req.shardID, req.replicaID)
 
 	return snapshotIndex, compaction, nil
+}
+
+// openSaveStage creates a save's staging directory under stageParent,
+// creating stageParent first when it is missing, and opens the staging data
+// file for writing. The caller holds the node's write lease. On failure it
+// removes the staging directory it created and returns no file.
+func openSaveStage(stageParent string) (string, *os.File, error) {
+	if err := os.MkdirAll(stageParent, 0o750); err != nil {
+		return "", nil, err
+	}
+	stageDir, err := MkdirStageDir(stageParent, SaveStageDirPattern)
+	if err != nil {
+		return "", nil, err
+	}
+	// The engine.Snapshotter interface accepts io.Writer, and *os.File
+	// satisfies io.Writer, so the save manages the file itself.
+	f, err := os.OpenFile(filepath.Join(stageDir, snapshotDataFile), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		if rmErr := os.RemoveAll(stageDir); rmErr != nil && !os.IsNotExist(rmErr) {
+			slog.Warn("snapshot: failed to remove a save staging directory whose data file could not be created",
+				"path", stageDir,
+				"error", rmErr,
+			)
+		}
+		return "", nil, err
+	}
+	return stageDir, f, nil
 }
 
 // publishStagedSave renames a save's staged artifact onto its canonical
