@@ -322,41 +322,96 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 		oldID, electedID, oldTerm, d, electedAt.Sub(submitAt), c.electionTimeout())
 
 	// The election was asserted above; leadership may have moved between
-	// survivors since, so the rest of the test uses the current leader.
-	newID, newHost, ok := c.leaderAmong(survivors, bound)
-	if !ok {
-		t.Fatalf("no survivor of %v leads after the election observed at replica %d", survivors, electedID)
+	// survivors since, and may move again during the reads below (a
+	// survivor can time out and campaign at any point), so the rest of the
+	// test uses the current leader. Within bound, leader selection, the
+	// read-readiness wait, the membership read and the reads of the
+	// acknowledged writes are repeated until one attempt runs on a leader
+	// throughout. Only a not-leader or read-index-not-ready error is
+	// retried; any other error fails the test.
+	retryable := func(err error) bool {
+		return errors.Is(err, ErrNotLeader) || errors.Is(err, ErrReadIndexNotReady)
 	}
-	// A new leader serves linearizable reads once it has committed an entry
-	// of its term (ShardReadReady); before that ReadIndex answers
-	// ErrReadIndexNotReady.
-	if !waitUntil(bound, func() bool {
-		lid, _, ready, err := newHost.ShardReadReady(removeLeaderShard)
-		return err == nil && ready && lid == newID
-	}) {
-		t.Fatalf("new leader %d was not read-ready within %v", newID, bound)
-	}
+	var (
+		newID   uint64
+		newHost *Host
+		m       *Membership
+	)
+	readDeadline := time.Now().Add(bound)
+	for attempt := 1; ; attempt++ {
+		var ok bool
+		newID, newHost, ok = c.leaderAmong(survivors, time.Until(readDeadline))
+		if !ok {
+			t.Fatalf("no survivor of %v leads after the election observed at replica %d (attempt %d)", survivors, electedID, attempt)
+		}
+		// A new leader serves linearizable reads once it has committed an
+		// entry of its term (ShardReadReady); before that ReadIndex answers
+		// ErrReadIndexNotReady. The wait ends early if the host stops
+		// leading, so the next attempt picks the current leader.
+		ready := false
+		waitUntil(time.Until(readDeadline), func() bool {
+			lid, _, r, err := newHost.ShardReadReady(removeLeaderShard)
+			if err == nil && r && lid == newID {
+				ready = true
+				return true
+			}
+			info, err := newHost.ShardInfo(removeLeaderShard)
+			return err == nil && !info.IsLeader
+		})
+		if !ready {
+			if time.Now().Before(readDeadline) {
+				continue
+			}
+			t.Fatalf("new leader %d was not read-ready within %v", newID, bound)
+		}
 
-	// The removal's ctx may already have expired (a MaybeApplied timeout is
-	// an accepted outcome), so the membership read gets its own timeout.
-	mctx, mcancel := context.WithTimeout(context.Background(), 5*time.Second)
-	m, err := newHost.SyncGetShardMembership(mctx, removeLeaderShard)
-	mcancel()
-	if err != nil {
-		t.Fatalf("SyncGetShardMembership on survivor %d: %v", newID, err)
-	}
-	if _, ok := m.Nodes[oldID]; ok {
-		t.Fatalf("membership still lists removed leader %d as a voter: %v", oldID, m.Nodes)
-	}
-	if _, ok := m.Removed[oldID]; !ok {
-		t.Fatalf("membership does not record removed leader %d as removed: %v", oldID, m.Removed)
-	}
-	if len(m.Nodes) != 2 {
-		t.Fatalf("membership has %d voters after the removal, want 2: %v", len(m.Nodes), m.Nodes)
-	}
+		// The removal's ctx may already have expired (a MaybeApplied
+		// timeout is an accepted outcome), so the membership read gets its
+		// own timeout.
+		mctx, mcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var err error
+		m, err = newHost.SyncGetShardMembership(mctx, removeLeaderShard)
+		mcancel()
+		if err != nil {
+			if retryable(err) && time.Now().Before(readDeadline) {
+				t.Logf("SyncGetShardMembership on survivor %d (attempt %d): %v; retrying on the current leader", newID, attempt, err)
+				continue
+			}
+			t.Fatalf("SyncGetShardMembership on survivor %d: %v", newID, err)
+		}
+		if _, ok := m.Nodes[oldID]; ok {
+			t.Fatalf("membership still lists removed leader %d as a voter: %v", oldID, m.Nodes)
+		}
+		if _, ok := m.Removed[oldID]; !ok {
+			t.Fatalf("membership does not record removed leader %d as removed: %v", oldID, m.Removed)
+		}
+		if len(m.Nodes) != 2 {
+			t.Fatalf("membership has %d voters after the removal, want 2: %v", len(m.Nodes), m.Nodes)
+		}
 
-	for i := range before {
-		c.checkRead(newHost, fmt.Sprintf("key-%02d", i), fmt.Sprintf("before-%02d", i))
+		var readErr error
+		for i := range before {
+			key, want := fmt.Sprintf("key-%02d", i), fmt.Sprintf("before-%02d", i)
+			rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+			got, err := newHost.SyncRead(rctx, removeLeaderShard, []byte(key))
+			rcancel()
+			if err != nil {
+				if retryable(err) && time.Now().Before(readDeadline) {
+					readErr = err
+					break
+				}
+				t.Fatalf("SyncRead(%q) on survivor %d: %v", key, newID, err)
+			}
+			b, ok := got.([]byte)
+			if !ok || !bytes.Equal(b, []byte(want)) {
+				t.Fatalf("SyncRead(%q) = %v (%T), want %q", key, got, got, want)
+			}
+		}
+		if readErr != nil {
+			t.Logf("SyncRead on survivor %d (attempt %d): %v; retrying on the current leader", newID, attempt, readErr)
+			continue
+		}
+		break
 	}
 
 	// (c) Further puts through the new leader succeed and read back.
