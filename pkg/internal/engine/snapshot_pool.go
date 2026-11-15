@@ -1992,9 +1992,9 @@ func openSaveStage(stageParent string) (string, *os.File, error) {
 	}
 	// The engine.Snapshotter interface accepts io.Writer, and *os.File
 	// satisfies io.Writer, so the save manages the file itself.
-	f, err := os.OpenFile(filepath.Join(stageDir, snapshotDataFile), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	f, err := saveStageOpenData(filepath.Join(stageDir, snapshotDataFile))
 	if err != nil {
-		if rmErr := os.RemoveAll(stageDir); rmErr != nil && !os.IsNotExist(rmErr) {
+		if rmErr := saveStageRemoveAll(stageDir); rmErr != nil && !os.IsNotExist(rmErr) {
 			slog.Warn("snapshot: failed to remove a save staging directory whose data file could not be created",
 				"path", stageDir,
 				"error", rmErr,
@@ -2004,6 +2004,17 @@ func openSaveStage(stageParent string) (string, *os.File, error) {
 	}
 	return stageDir, f, nil
 }
+
+// saveStageOpenData creates a save stage's data file. A variable so a test
+// can fail the create and reach the stage's cleanup path.
+var saveStageOpenData = func(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+}
+
+// saveStageRemoveAll removes a save stage whose data file could not be
+// created. A variable so a test can fail the removal and reach its
+// diagnostic.
+var saveStageRemoveAll = os.RemoveAll
 
 // publishStagedSave renames a save's staged artifact onto its canonical
 // snapshot-<index> directory. The caller holds the node's write lease and its

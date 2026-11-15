@@ -1,9 +1,13 @@
 package engine
 
 import (
+	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -84,5 +88,97 @@ func TestSnapshotPool_SaveStagingIsFencedByUnload(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("a save refused at the unload fence created %s (stat err %v)", path, err)
 		}
+	}
+}
+
+// exitingDiagnosticHandler is a slog.Handler that leaves its goroutine
+// abnormally, through exit, on any record whose message contains match, and
+// discards every other record.
+type exitingDiagnosticHandler struct {
+	match   string
+	reached chan struct{}
+	once    *sync.Once
+	exit    func()
+}
+
+func (h exitingDiagnosticHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h exitingDiagnosticHandler) Handle(_ context.Context, r slog.Record) error {
+	if !strings.Contains(r.Message, h.match) {
+		return nil
+	}
+	h.once.Do(func() { close(h.reached) })
+	h.exit()
+	return nil
+}
+
+func (h exitingDiagnosticHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h exitingDiagnosticHandler) WithGroup(string) slog.Handler { return h }
+
+// TestSnapshotPool_SaveStageDiagnosticExitReleasesLease: a save whose stage
+// data file cannot be created, and whose stage cannot then be removed, logs
+// that failure. A user slog.Handler that panics or calls runtime.Goexit on
+// that diagnostic must not leave the save's short write lease held, or the
+// unload waits for it forever.
+func TestSnapshotPool_SaveStageDiagnosticExitReleasesLease(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit func()
+	}{
+		{"panic", func() { panic("injected diagnostic panic") }},
+		{"goexit", runtime.Goexit},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stopC := make(chan struct{})
+			t.Cleanup(func() { close(stopC) })
+			ldb := newSnapshotTestLogDB()
+			p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
+			var wg sync.WaitGroup
+			p.start(&wg)
+
+			cfg := config.Config{ShardID: 10, ReplicaID: 1, CompactionOverhead: 50}
+			node := NewNode(nil, nil, nil, cfg, newSnapshotTestSnapshotter(100), t.TempDir(), nil)
+
+			prevOpen, prevRemove := saveStageOpenData, saveStageRemoveAll
+			saveStageOpenData = func(string) (*os.File, error) {
+				return nil, errors.New("injected data file create failure")
+			}
+			saveStageRemoveAll = func(string) error {
+				return errors.New("injected stage removal failure")
+			}
+			t.Cleanup(func() { saveStageOpenData, saveStageRemoveAll = prevOpen, prevRemove })
+
+			reached := make(chan struct{})
+			prevLog := slog.Default()
+			slog.SetDefault(slog.New(exitingDiagnosticHandler{
+				match:   "failed to remove a save staging directory",
+				reached: reached,
+				once:    &sync.Once{},
+				exit:    tc.exit,
+			}))
+			t.Cleanup(func() { slog.SetDefault(prevLog) })
+
+			if err := p.requestSnapshot(snapshotRequest{shardID: 10, replicaID: 1, node: node, save: true}); err != nil {
+				t.Fatalf("requestSnapshot: %v", err)
+			}
+			select {
+			case <-reached:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the save never logged its stage cleanup failure")
+			}
+
+			fenced := make(chan struct{})
+			go func() {
+				node.Stop()
+				node.awaitWriteLeases()
+				close(fenced)
+			}()
+			select {
+			case <-fenced:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the unload waited forever on a lease the abnormal diagnostic exit leaked")
+			}
+		})
 	}
 }
