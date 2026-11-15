@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -58,10 +59,13 @@ func TestStop_AnnouncesEveryQueuedConnectionWhenTheDrainOutlastsASecond(t *testi
 // queued connections' dialer ends once Stop has returned.
 //
 // Each queued connection is dialed with a qlog tracer and the dial waits for
-// the dialer's handshake_confirmed event. The server sends HANDSHAKE_DONE
-// only once its own handshake completed, which is what moves a connection into
-// the accept queue, so the connection is queued, not handshaking, when Stop
-// closes the listener.
+// the dialer's handshake_confirmed event, so its handshake has failed or
+// completed on the server. Handshake completion alone does not queue it:
+// quic-go moves the connection into the accept queue from a separate
+// goroutine afterwards, and a connection not yet queued when Stop closes the
+// listener is refused, not announced. So before Stop the helper waits until
+// the listener's accept queue holds all n connections (acceptQueueLen), and
+// the connections are queued, not handshaking, when Stop closes the listener.
 func stopWithQueuedConnections(t *testing.T, n int, beforeQueuedClose func()) []*quic.Conn {
 	t.Helper()
 	mtls := testMTLSConfig(t)
@@ -110,6 +114,13 @@ func stopWithQueuedConnections(t *testing.T, n int, beforeQueuedClose func()) []
 		t.Cleanup(func() { _ = c.CloseWithError(0, "") })
 		queued = append(queued, c)
 	}
+	queueDeadline := time.Now().Add(10 * time.Second)
+	for acceptQueueLen(t, receiver.listener) != n {
+		if time.Now().After(queueDeadline) {
+			t.Fatalf("the accept queue holds %d connections, want %d", acceptQueueLen(t, receiver.listener), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	stopped := make(chan struct{})
 	go func() {
@@ -157,6 +168,23 @@ func dialConfirmed(t *testing.T, addr string, sender *QUICTransport) *quic.Conn 
 		t.Fatal("the server never confirmed the queued connection's handshake")
 	}
 	return conn
+}
+
+// acceptQueueLen returns how many handshake-complete connections wait in ln's
+// accept queue. quic-go exports no such count, so it reads the length of the
+// listener's connQueue channel by reflection; reading a channel's length takes
+// nothing off it. It fails the test if quic-go's layout no longer matches.
+func acceptQueueLen(t *testing.T, ln *quic.Listener) int {
+	t.Helper()
+	srv := reflect.ValueOf(ln).Elem().FieldByName("baseServer")
+	if !srv.IsValid() || srv.Kind() != reflect.Pointer || srv.IsNil() {
+		t.Fatal("quic.Listener has no baseServer pointer; update acceptQueueLen")
+	}
+	q := srv.Elem().FieldByName("connQueue")
+	if !q.IsValid() || q.Kind() != reflect.Chan {
+		t.Fatal("quic-go's baseServer has no connQueue channel; update acceptQueueLen")
+	}
+	return q.Len()
 }
 
 // handshakeConfirmedTrace is a qlog trace that closes confirmed when its

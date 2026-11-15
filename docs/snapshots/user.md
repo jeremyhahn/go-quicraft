@@ -136,7 +136,7 @@ replica you are operating on.
 ## Re-key a snapshot
 
 ```go
-epoch, err := quicraft.ReencryptSnapshotFile(srcPath, dstPath,
+epoch, fileSize, err := quicraft.ReencryptSnapshotFile(srcPath, dstPath,
     shardID, replicaID, index, srcBarrier, dstBarrier)
 ```
 
@@ -156,24 +156,43 @@ fallback.
 
 **Record the returned epoch as the migrated snapshot's `Epoch`.** It is the
 destination's lowest epoch across all frames, and the key-purge floor uses it
-to protect every frame.
+to protect every frame. **Record the returned `fileSize` as its `FileSize`**:
+re-encryption changes the file's length whenever the framing differs
+(plaintext to encrypted, encrypted to plaintext, or a different nonce size),
+and the host checks the recorded size against `snapshot.dat` when it starts the
+shard. In a WAL migration, `waldb.ReencryptSized` records both for you from
+the hook's return values:
+
+```go
+snapFn := func(shardID, replicaID uint64, snap logdb.Snapshot) (uint64, uint64, error) {
+    rel, err := filepath.Rel(srcNodeDir, snap.Filepath)
+    if err != nil {
+        return 0, 0, err
+    }
+    return quicraft.ReencryptSnapshotFile(
+        filepath.Join(snap.Filepath, "snapshot.dat"),
+        filepath.Join(dstNodeDir, rel, "snapshot.dat"),
+        shardID, replicaID, snap.Index, srcBarrier, dstBarrier)
+}
+count, err := waldb.ReencryptSized(srcWAL, srcBarrier, dstWAL, dstBarrier, snapFn)
+```
 
 Handle this case specifically:
 
 ```go
-epoch, err := quicraft.ReencryptSnapshotFile(srcPath, dstPath,
+epoch, fileSize, err := quicraft.ReencryptSnapshotFile(srcPath, dstPath,
     shardID, replicaID, index, srcBarrier, dstBarrier)
 if err != nil {
     var cnd *quicraft.SnapshotCommittedNotDurableError
     if errors.As(err, &cnd) {
         // The rename succeeded: dstPath holds the migrated snapshot at
-        // cnd.Epoch, and only the directory sync failed. Record cnd.Epoch,
-        // then check the destination again.
-        recordEpoch(cnd.Epoch)
+        // cnd.Epoch with length fileSize, and only the directory sync
+        // failed. Record both, then check the destination again.
+        recordSnapshot(cnd.Epoch, fileSize)
     }
     return err
 }
-recordEpoch(epoch)
+recordSnapshot(epoch, fileSize)
 ```
 
 The usual `if err != nil { return err }` would drop that epoch, and the next

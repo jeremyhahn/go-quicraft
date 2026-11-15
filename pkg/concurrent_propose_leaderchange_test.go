@@ -77,9 +77,19 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	heldCtx, cancelHeld := context.WithCancel(ctx)
 	defer cancelHeld()
 	results := make(chan concurrentProposeResult, held+1)
+	// propose submits on the calling goroutine, so every held proposal is
+	// pending at the leader before the followers are stopped; only the wait
+	// runs in the background. This is SyncPropose split at its submission:
+	// a refusal at Propose is recorded at once, as SyncPropose returns it.
 	propose := func(key string) {
+		rs, err := proposer.Propose(heldCtx, concurrentProposeShard, []byte(key))
+		if err != nil {
+			results <- concurrentProposeResult{key, err}
+			return
+		}
 		go func() {
-			_, err := proposer.SyncPropose(heldCtx, concurrentProposeShard, []byte(key))
+			defer rs.Release()
+			_, err := awaitResult(heldCtx, rs)
 			results <- concurrentProposeResult{key, err}
 		}()
 	}
@@ -184,6 +194,44 @@ func concurrentProposeSameCount(t *testing.T, c *concurrentProposeCluster, keys 
 	}
 }
 
+// concurrentProposeProbeReachedStoppedLeader fails the test unless at least
+// one orphan probe was forwarded to the stopped leader. The survivors can
+// elect a replacement before the orphan goroutines submit anything, and then
+// every probe goes to the new leader (and commits) or is refused in the
+// leaderless window (a definite refusal, never maybe-applied); neither
+// exercises the forward to a dead replica. A probe the proposer's step worker
+// handed to raft while it still followed the stopped leader is failed by the
+// proposer's leader-change path (failLeaderChangeRequests in host.go) as a
+// maybe-applied *NotLeaderError naming no leader, or, if the change comes
+// after cancelOrphans, ends as a maybe-applied cancellation; and it was never
+// appended, so no replica applied it after the drain and the convergence.
+func concurrentProposeProbeReachedStoppedLeader(t *testing.T, c *concurrentProposeCluster,
+	out *proposeOutcomes, keys []string, leaderID uint64) {
+	t.Helper()
+	seen := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out.mu.Lock()
+		err, maybe := out.maybe[key]
+		_, acked := out.acked[key]
+		out.mu.Unlock()
+		applied := 0
+		for id := uint64(1); id <= 3; id++ {
+			applied += c.machine(id).snapshot()[key]
+		}
+		seen = append(seen, fmt.Sprintf("%s acked=%v err=%v applied=%d", key, acked, err, applied))
+		// Only the follower's leader-change failure proves the probe was
+		// handed to raft and forwarded to the stopped leader; a caller
+		// cancellation is not accepted (it resolves an untaken probe too).
+		var nl *NotLeaderError
+		if maybe && errors.As(err, &nl) && nl.LeaderID != leaderID && applied == 0 {
+			return
+		}
+	}
+	t.Fatalf("no orphan probe was forwarded to the stopped leader %d: every probe "+
+		"committed or was refused outright, so the survivors elected a "+
+		"replacement before any probe reached raft: %v", leaderID, seen)
+}
+
 // TestConcurrentPropose_ProposalToStoppedFormerLeader is the regression for
 // a proposal forwarded to a leader that is gone by the time the replicas are
 // compared (#928 review, finding 1). No test hook delays a single forwarded
@@ -243,6 +291,9 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 
 	c.closeHost(t, leader)
 	const orphans = 8
+	// The probes' context stays alive until a leader-change result arrives:
+	// a canceled probe resolves through the caller's cancellation, which
+	// proves nothing about where it went.
 	orphanCtx, cancelOrphans := context.WithCancel(ctx)
 	defer cancelOrphans()
 	results := make(chan concurrentProposeResult, orphans)
@@ -254,6 +305,29 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 			_, err := proposer.SyncPropose(orphanCtx, concurrentProposeShard, []byte(key))
 			results <- concurrentProposeResult{key, err}
 		}()
+	}
+	// Forwarding to the stopped leader is synchronized before the scenario
+	// advances: a probe the proposer's step worker has taken from the queue
+	// while it still names the stopped replica as leader was forwarded
+	// there. The leader ID only moves away from a stopped replica, so seeing
+	// it after the take proves the take happened under it.
+	pns, err := proposer.getNode(concurrentProposeShard)
+	if err != nil {
+		t.Fatalf("getNode: %v", err)
+	}
+	if !waitUntil(10*time.Second, func() bool {
+		taken := false
+		pns.pendingProposals.Range(func(_, value any) bool {
+			pp, ok := value.(*pendingProposal)
+			if ok && pp.node != nil {
+				taken, _ = pp.node.ProposalTaken(&pp.enqueuedAt)
+			}
+			return !taken
+		})
+		return taken && pns.leaderID.Load() == leaderID
+	}) {
+		t.Fatalf("no probe was handed to raft while the proposer still named "+
+			"the stopped leader %d", leaderID)
 	}
 	if !waitUntil(30*time.Second, func() bool {
 		for id := uint64(1); id <= 3; id++ {
@@ -269,11 +343,20 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	}) {
 		t.Fatalf("the survivors never elected a leader after replica %d stopped", leaderID)
 	}
-	cancelOrphans()
+	leaderChange := time.NewTimer(30 * time.Second)
+	defer leaderChange.Stop()
 	for range keys {
 		select {
 		case r := <-results:
 			out.record(r.key, r.err)
+			var nl *NotLeaderError
+			if MaybeApplied(r.err) && errors.As(r.err, &nl) {
+				// The leader-change result arrived; release the rest.
+				cancelOrphans()
+			}
+		case <-leaderChange.C:
+			t.Fatal("no probe forwarded to the stopped leader received a " +
+				"leader-change result")
 		case <-ctx.Done():
 			t.Fatal("a proposal forwarded to the stopped leader never returned")
 		}
@@ -287,6 +370,7 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	at, hashes := concurrentProposeConverge(ctx, t, c.hosts, want)
 	concurrentProposeCheck(t, c, out, barrierKey, barriers)
 	concurrentProposeSameCount(t, c, keys)
+	concurrentProposeProbeReachedStoppedLeader(t, c, out, keys, leaderID)
 	if hashes[0] != hashes[1] || hashes[0] != hashes[2] {
 		t.Fatalf("replica state hashes differ at index %d: %v", at, hashes)
 	}

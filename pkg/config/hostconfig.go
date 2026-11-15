@@ -367,8 +367,12 @@ type HostConfig struct {
 	// NumWorkers/2 (minimum 2).
 	NumWorkers uint64
 
-	// MaxApplyWorkers is the maximum concurrent per-shard apply
-	// goroutines. Default: runtime.NumCPU().
+	// MaxApplyWorkers is the maximum number of state machine Update calls
+	// that one apply worker runs at once, across the shards it owns. There
+	// are NumWorkers apply workers, each with its own MaxApplyWorkers
+	// slots, so the Host-wide bound is NumWorkers * MaxApplyWorkers. One
+	// shard's Updates always run one at a time, in log order.
+	// Default: runtime.NumCPU().
 	MaxApplyWorkers int
 
 	// CommitCBufferSize is the buffer size for the commit-to-apply

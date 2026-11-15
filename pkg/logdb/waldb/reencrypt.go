@@ -54,7 +54,19 @@ func (e *ReencryptError) Unwrap() error { return e.Err }
 // migration. It may be nil only when no barrier is involved on either side
 // (plaintext-to-plaintext) or when no node has a snapshot; otherwise Reencrypt
 // fails closed with ErrSnapshotReencryptRequired.
+//
+// It reports no destination length, so Reencrypt records the SOURCE FileSize:
+// correct only when re-encryption preserves the data file's length. Use
+// SnapshotReencryptSizedFunc with ReencryptSized when it may not.
 type SnapshotReencryptFunc func(shardID, replicaID uint64, snap logdb.Snapshot) (dstEpoch uint64, err error)
+
+// SnapshotReencryptSizedFunc is SnapshotReencryptFunc that also returns the
+// length of the re-encrypted destination data file. ReencryptSized records it
+// as the migrated snapshot's FileSize alongside dstEpoch: plaintext-to-sealed,
+// sealed-to-plaintext and different-nonce-size migrations change the length,
+// and the host checks the recorded FileSize against snapshot.dat when it
+// starts the shard.
+type SnapshotReencryptSizedFunc func(shardID, replicaID uint64, snap logdb.Snapshot) (dstEpoch, dstFileSize uint64, err error)
 
 // ErrSnapshotReencryptRequired is returned when a node has a snapshot that must
 // be re-encrypted during migration (a barrier is involved on at least one side)
@@ -121,7 +133,26 @@ var ErrSnapshotReencryptRequired = errors.New(
 // The srcBarrier and dstBarrier parameters are applied after opts and are
 // authoritative: a WithBarrier in opts cannot override the side-specific
 // barrier the caller named explicitly.
-func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier, snapFn SnapshotReencryptFunc, opts ...Option) (count int, err error) {
+//
+// Reencrypt records each migrated snapshot with the source FileSize (see
+// SnapshotReencryptFunc); ReencryptSized records the destination length the
+// hook reports.
+func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier, snapFn SnapshotReencryptFunc, opts ...Option) (int, error) {
+	var sized SnapshotReencryptSizedFunc
+	if snapFn != nil {
+		sized = func(shardID, replicaID uint64, snap logdb.Snapshot) (uint64, uint64, error) {
+			epoch, err := snapFn(shardID, replicaID, snap)
+			return epoch, snap.FileSize, err
+		}
+	}
+	return ReencryptSized(srcDir, srcBarrier, dstDir, dstBarrier, sized, opts...)
+}
+
+// ReencryptSized is Reencrypt with a snapshot hook that reports the destination
+// data file's length; the migrated snapshot record carries that FileSize and
+// the hook's epoch, so it describes the re-encrypted file even when the
+// re-encryption changed its length.
+func ReencryptSized(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier, snapFn SnapshotReencryptSizedFunc, opts ...Option) (count int, err error) {
 	srcOpts := make([]Option, 0, len(opts)+1)
 	srcOpts = append(srcOpts, opts...)
 	if srcBarrier != nil {
@@ -199,7 +230,7 @@ func closeReencryptSource(src *DB) {
 
 // reencryptNode copies a single shard/replica's persisted Raft state from src
 // to dst (which decrypt/encrypt under their respective barriers).
-func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn SnapshotReencryptFunc) error {
+func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn SnapshotReencryptSizedFunc) error {
 	// Bootstrap (shard type + initial membership + join flag).
 	if bs, ok, err := src.GetBootstrap(ni.ShardID, ni.ReplicaID); err != nil {
 		return &ReencryptError{Op: "get-bootstrap", Err: err}
@@ -228,11 +259,15 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 			if snapFn == nil {
 				return &ReencryptError{Op: "snapshot-reencrypt", Err: ErrSnapshotReencryptRequired}
 			}
-			dstEpoch, ferr := snapFn(ni.ShardID, ni.ReplicaID, snap)
+			dstEpoch, dstFileSize, ferr := snapFn(ni.ShardID, ni.ReplicaID, snap)
 			if ferr != nil {
 				return &ReencryptError{Op: "snapshot-reencrypt", Err: ferr}
 			}
+			// Epoch AND length describe the destination file: a re-encryption
+			// that changes the length (plaintext <-> sealed, another nonce
+			// size) leaves a source FileSize that StartShard rejects.
 			dstSnap.Epoch = dstEpoch
+			dstSnap.FileSize = dstFileSize
 		}
 		if err := dst.SaveSnapshot(ni.ShardID, ni.ReplicaID, dstSnap); err != nil {
 			return &ReencryptError{Op: "save-snapshot", Err: err}

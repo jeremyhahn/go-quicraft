@@ -340,11 +340,16 @@ A linearizable read in one call:
 The result reflects every write committed before the call.
 
 On a basic `sm.StateMachine`, step 3 waits for any in-flight `Apply`, which
-holds the RSM adapter's read guard for writing. `sync.RWMutex` has no
-context-aware acquire, so `ctx`'s deadline is not observed while the call waits
-on that lock. The same applies to `SyncReadBuf`, `FollowerRead`,
-`QueryLocalNode`, `StaleRead` and `StaleReadBuf`. `ConcurrentStateMachine` and
-`DiskStateMachine` lookups run alongside `Apply`. See
+holds the RSM adapter's read guard for writing. That wait observes `ctx`: the
+adapter acquires the guard with a context-aware retry, so a deadline or
+cancellation that fires while the read is queued behind `Apply` returns
+`ctx.Err()` without running `Lookup`. Once the guard is held, the call hands `ctx` to the
+embedder's `Lookup` and waits for it to return; whether a lookup that is already
+running stops on cancellation is up to that implementation (`NALookupInto`
+takes no context and always runs to completion). The
+same applies to `SyncReadBuf`, `FollowerRead`, `QueryLocalNode`, `StaleRead` and
+`StaleReadBuf`. `ConcurrentStateMachine` and `DiskStateMachine` lookups run
+alongside `Apply`, so they do not queue on the guard. See
 [Lookup concurrency](../state-machines/engineering.md#concurrency).
 
 #### SyncReadBuf
@@ -760,10 +765,13 @@ path. It stages into a temporary directory it created and renames it into place
 once the artifact is complete and durable.
 
 **Layout discovery.** The snapshot tree root comes from the `Config.DataDir`
-that `StartShard` recorded in the LogDB bootstrap record. A shard started with
-`join=true`, or never started on this host, has no record; a record written
-before the field existed has none either. Both fail closed with
-`ErrImportLayoutUnknown` unless you state the layout with `WithImportDataDir`.
+that `StartShard` recorded in the LogDB bootstrap record. `StartShard` writes
+that record for `join=true` as well, so a replica that joined on this host
+after the record carried `DataDir` needs no option once stopped. Three cases
+have no recorded layout: a shard never started on this host, a replica that
+joined before `StartShard` recorded joins, and a record written before the
+field existed. They fail closed with `ErrImportLayoutUnknown` unless you state
+the layout with `WithImportDataDir`.
 `WithImportDataDir("")` asserts the shard has no `DataDir`. A value that
 contradicts the recorded one is refused.
 
@@ -1062,7 +1070,7 @@ context, or none where one was present, fails authentication.
 
 ```go
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-    srcBarrier, dstBarrier Barrier) (uint64, error)
+    srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error)
 ```
 
 Re-keys a snapshot data file: every frame is decrypted under `srcBarrier` and
@@ -1075,6 +1083,14 @@ It returns the destination's minimum at-rest epoch across the written frames,
 which is the value to record as the snapshot's `Epoch` so the purge floor
 protects every frame. It is 0 for a plaintext destination; a sealed destination
 always writes at least a terminal frame, so even an empty source yields a real
+epoch.
+
+It also returns `fileSize`, the destination data file's length as written.
+Re-encryption changes the length whenever the framing differs (plaintext to
+encrypted, encrypted to plaintext, or a different nonce size), so record
+`fileSize`, not the source's length, as the snapshot's `FileSize`. A
+`waldb.ReencryptSized` hook returns the epoch and size, and the migrated record
+carries both. The committed-not-durable failure returns `fileSize` with the
 epoch.
 
 `shardID`, `replicaID` and `index` are required: frames are bound to their
