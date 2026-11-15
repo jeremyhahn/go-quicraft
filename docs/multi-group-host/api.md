@@ -1070,7 +1070,7 @@ context, or none where one was present, fails authentication.
 
 ```go
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-    srcBarrier, dstBarrier Barrier) (uint64, error)
+    srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error)
 ```
 
 Re-keys a snapshot data file: every frame is decrypted under `srcBarrier` and
@@ -1083,6 +1083,14 @@ It returns the destination's minimum at-rest epoch across the written frames,
 which is the value to record as the snapshot's `Epoch` so the purge floor
 protects every frame. It is 0 for a plaintext destination; a sealed destination
 always writes at least a terminal frame, so even an empty source yields a real
+epoch.
+
+It also returns `fileSize`, the destination data file's length as written.
+Re-encryption changes the length whenever the framing differs (plaintext to
+encrypted, encrypted to plaintext, or a different nonce size), so record
+`fileSize`, not the source's length, as the snapshot's `FileSize`. A
+`waldb.ReencryptSized` hook returns the epoch and size, and the migrated record
+carries both. The committed-not-durable failure returns `fileSize` with the
 epoch.
 
 `shardID`, `replicaID` and `index` are required: frames are bound to their

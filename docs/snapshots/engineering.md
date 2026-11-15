@@ -40,7 +40,7 @@ func WithImportMemberIdentities(identities map[uint64]string) ImportOption
 
 // Re-encryption (barrier migration)
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-    srcBarrier, dstBarrier Barrier) (uint64, error)
+    srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error)
 ```
 
 From the internal engine package, named because they fix the on-disk format:
@@ -204,9 +204,10 @@ committed but not yet durable: the rename succeeded, so `dstPath` already holds
 the migrated artifact sealed at `Epoch`, and only the directory fsync that makes
 the rename survive a crash failed.
 
-It exists because the `(epoch, error)` pair `ReencryptSnapshotFile` returns
-cannot carry this case on its own: the usual `if err != nil { return 0, err }`
-drops exactly the epoch it delivers.
+It exists because the `(epoch, fileSize, err)` triple `ReencryptSnapshotFile`
+returns cannot carry this case on its own: the usual
+`if err != nil { return 0, 0, err }` drops exactly the epoch and size it
+delivers.
 
 **A caller that gets this error must record `Epoch`.** Dropping it lets the next
 DEK purge orphan the artifact's key, and the artifact can then never be opened.

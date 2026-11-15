@@ -111,13 +111,13 @@ records as removed, is refused with `*ImportMembershipInvalidError`.
 
 ```go
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-    srcBarrier, dstBarrier Barrier) (uint64, error)
+    srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error)
 ```
 
 | | |
 |---|---|
 | Request | source and destination paths, the snapshot's identity, and both barriers |
-| Response | the destination's lowest at-rest epoch across the written frames. Record it as the migrated snapshot's `Epoch` so the DEK-purge floor protects every frame. `0` for an empty source or a plaintext destination. |
+| Response | the destination's lowest at-rest epoch across the written frames, and the destination data file's length. Record the epoch as the migrated snapshot's `Epoch` so the DEK-purge floor protects every frame (`0` for a plaintext destination), and `fileSize` as its `FileSize`: the length changes whenever the framing differs. A `waldb.ReencryptSized` hook returns both and the migrated record carries them. `*SnapshotCommittedNotDurableError` returns both too. |
 | Errors | `ErrSnapshotBarrierSealed`, `ErrSnapshotCorrupt` (a source frame is malformed or fails authentication), `*SnapshotCommittedNotDurableError`, and the underlying I/O errors |
 | Permission | none in this library; the barriers' credentials are the authorization |
 

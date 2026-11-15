@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: ci-template v1.34.1. No Go module proxy list ends in `direct` (`ci.yml`, `nightly.yml`, the devcontainer Dockerfile, `scripts/in-toolchain-image.sh`), so a module the proxy cannot serve fails the build instead of being fetched from its origin.
 - Dependencies: go-enclave v0.11.0-alpha (was v0.10.0-alpha), in the root module, `contrib/dragonboat` and `test/performance/quicraft`. Its additions (a Linux `memfd_secret` backend and `Sealed.OpenIn`) need no change here.
 - Dependencies: go-enclave v0.11.1-alpha (was v0.11.0-alpha), in the same three modules. It is the v0.11.0-alpha commit tagged again, so no code changes; go.sum carries the checksums the public module proxy serves.
+- API: `ReencryptSnapshotFile` returns `(epoch, fileSize, err)`: `fileSize` is the destination data file's length, which re-encryption changes whenever the framing differs. `waldb.ReencryptSized` takes a `SnapshotReencryptSizedFunc` hook returning both and records them as the migrated snapshot's `Epoch` and `FileSize`, so a Host starts the shard on a plaintext-to-encrypted re-key. The re-key runbook (`docs/seal-barrier/user.md`) uses it.
 
 ### Security
 
