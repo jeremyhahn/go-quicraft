@@ -175,7 +175,8 @@ type GossipConfig struct {
 
 // IsEmpty returns true when no gossip configuration fields are set.
 func (g *GossipConfig) IsEmpty() bool {
-	return g.BindAddress == "" && g.AdvertiseAddress == "" && len(g.Seed) == 0
+	return g.BindAddress == "" && g.AdvertiseAddress == "" &&
+		len(g.Seed) == 0 && len(g.Meta) == 0
 }
 
 // Validate checks the gossip configuration. Returns nil when the
