@@ -701,6 +701,54 @@ func TestReencryptSnapshotFile_ConcurrentDestinationIsExclusive(t *testing.T) {
 	}
 }
 
+// TestReencryptDestinationClaim_SymlinkAliasSharesTheClaim pins that two
+// spellings of one destination directory, one through a symlinked ancestor,
+// take the same claim: a call targeting /alias/new waits for the call that
+// holds /real/new, even before new exists.
+func TestReencryptDestinationClaim_SymlinkAliasSharesTheClaim(t *testing.T) {
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real")
+	if err := os.Mkdir(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	realDir := filepath.Join(realRoot, "new")
+	aliasDir := filepath.Join(aliasRoot, "new")
+
+	if got, want := destinationClaimKey(aliasDir), destinationClaimKey(realDir); got != want {
+		t.Fatalf("claim key for the alias = %q, want %q", got, want)
+	}
+
+	release := reencryptDestinationClaims.acquire(realDir)
+	acquired := make(chan func())
+	go func() { acquired <- reencryptDestinationClaims.acquire(aliasDir) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for reencryptDestinationWaiters(realDir) == 0 {
+		select {
+		case r := <-acquired:
+			r()
+			release()
+			t.Fatal("the aliased destination acquired a separate claim while the real one was held")
+		default:
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("the aliased call neither waited nor acquired")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	release()
+	select {
+	case r := <-acquired:
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the aliased call did not acquire after the real claim was released")
+	}
+}
+
 // EncryptWithEpochPinnedContext is the path every snapshot frame now takes:
 // the real barrier seals and pins in ONE step under its own lock, so a frame
 // can never exist unpinned. It records that pin for the assertions without
