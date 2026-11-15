@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os/exec"
 	"strings"
@@ -26,7 +27,7 @@ func (g gitBase) git(dir string, args ...string) ([]byte, error) {
 		path = "git"
 	}
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(path, append([]string{"-c", "safe.directory=*", "-C", dir}, args...)...) //#nosec G204 -- the commit comes from CI's merge base, the dir from the Makefile
+	cmd := exec.CommandContext(context.Background(), path, append([]string{"-c", "safe.directory=*", "-C", dir}, args...)...) //#nosec G204 -- the commit comes from CI's merge base, the dir from the Makefile
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

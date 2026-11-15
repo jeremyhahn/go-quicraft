@@ -12,7 +12,7 @@ import (
 var ErrLookupDisabled = errors.New("depscheck: GOPROXY=off disables module version lookup, so the latest release of each dependency cannot be known; run make deps-check with access to the module proxy and the dev Gitea")
 
 // ErrUsage is returned when no module directory is given.
-var ErrUsage = errors.New("depscheck: usage: depscheck [-go <go command>] [-first-party <module path prefix>] [-base <commit>] [-vuln [-govulncheck <command>] [-vuln-tags <tags>]] [-bump] <module dir>...")
+var ErrUsage = errors.New("depscheck: usage: depscheck [-go <go command>] [-first-party <module path prefix>] [-base <commit>] [-vuln [-govulncheck <command>] [-vuln-tags <tags>]] [-bump] <module dir> [<module dir> ...]")
 
 // ParseError reports a go.mod line the parser does not understand.
 type ParseError struct {

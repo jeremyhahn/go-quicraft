@@ -226,7 +226,8 @@ func report(findings []finding, vulns []vulnFinding, stdout, stderr io.Writer) i
 // an undocumented lag.
 func writeReport(findings []finding, vulns []vulnFinding, out, errOut *reportWriter) int {
 	lookups, undocumented := 0, 0
-	for _, f := range findings {
+	for i := range findings {
+		f := &findings[i]
 		d := f.Dep
 		switch {
 		case f.Lookup != nil:

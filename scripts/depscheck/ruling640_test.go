@@ -196,7 +196,7 @@ func TestGitBase(t *testing.T) {
 	repo := t.TempDir()
 	gitRun := func(dir string, args ...string) string {
 		t.Helper()
-		cmd := exec.Command(git, append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-C", dir}, args...)...)
+		cmd := exec.CommandContext(t.Context(), git, append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", "-C", dir}, args...)...)
 		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
 		out, err := cmd.CombinedOutput()
 		require.NoError(t, err, string(out))

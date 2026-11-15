@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -50,7 +51,7 @@ func (g govulncheck) Scan(dir string) (map[string][]advisory, error) {
 		args = append(args, "-tags", g.tags)
 	}
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(path, args...) //#nosec G204 -- the scanner and the tags come from the Makefile
+	cmd := exec.CommandContext(context.Background(), path, args...) //#nosec G204 -- the scanner and the tags come from the Makefile
 	cmd.Dir = run
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

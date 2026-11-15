@@ -19,8 +19,9 @@ func bumpable(f finding) bool {
 // printed as a hand edit, since go get does not rewrite a replace.
 func bumpModule(edit moduleEditor, dir string, findings []finding, stdout io.Writer) error {
 	moved := 0
-	for _, f := range findings {
-		if !bumpable(f) {
+	for i := range findings {
+		f := &findings[i]
+		if !bumpable(*f) {
 			continue
 		}
 		d := f.Dep

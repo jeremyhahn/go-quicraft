@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -62,7 +63,7 @@ func (g goCommand) List(dir string, modules []string) (map[string]listedModule, 
 
 func (g goCommand) run(dir string, args ...string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(g.path, args...) //#nosec G204 -- the go command comes from the Makefile, the arguments from the go.mod under check
+	cmd := exec.CommandContext(context.Background(), g.path, args...) //#nosec G204 -- the go command comes from the Makefile, the arguments from the go.mod under check
 	cmd.Dir = dir
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
