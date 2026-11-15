@@ -26,6 +26,9 @@ type countingHoldSM struct {
 	hold    chan struct{}
 	held    chan struct{}
 	parked  bool
+	// releaseOnce makes release idempotent, so the test's normal release
+	// and its cleanup can both call it.
+	releaseOnce sync.Once
 }
 
 func newCountingHoldSM(hold bool) *countingHoldSM {
@@ -35,6 +38,26 @@ func newCountingHoldSM(hold bool) *countingHoldSM {
 		s.held = make(chan struct{})
 	}
 	return s
+}
+
+// newHeldCountingSM is newCountingHoldSM(true) with release registered in
+// t's cleanup. It must be called after newTestHost, so the release runs
+// before Host.Close joins the parked apply goroutine: a Fatal before the
+// test's own release then fails the test instead of hanging the package.
+func newHeldCountingSM(t *testing.T) *countingHoldSM {
+	t.Helper()
+	s := newCountingHoldSM(true)
+	t.Cleanup(s.release)
+	return s
+}
+
+// release unparks the held apply. It is idempotent.
+func (s *countingHoldSM) release() {
+	s.releaseOnce.Do(func() {
+		if s.hold != nil {
+			close(s.hold)
+		}
+	})
 }
 
 func (s *countingHoldSM) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
@@ -188,7 +211,7 @@ func TestMaybeAppliedHostRefusalsBeforeRaft(t *testing.T) {
 // once after the apply is released.
 func TestMaybeAppliedHostDeadlineAppliesOnce(t *testing.T) {
 	h := newTestHost(t)
-	machine := newCountingHoldSM(true)
+	machine := newHeldCountingSM(t)
 	startMaybeAppliedShard(t, h, machine)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -210,7 +233,7 @@ func TestMaybeAppliedHostDeadlineAppliesOnce(t *testing.T) {
 	}
 	assertWrappedOnce(t, err)
 
-	close(machine.hold)
+	machine.release()
 	if err := maybeAppliedPropose(context.Background(), t, h, []byte("after-release")); err != nil {
 		t.Fatalf("SyncPropose after release: %v", err)
 	}
@@ -223,7 +246,7 @@ func TestMaybeAppliedHostDeadlineAppliesOnce(t *testing.T) {
 // when StopShard runs fails with MaybeApplied true, wrapped once.
 func TestMaybeAppliedHostStopShardWhilePending(t *testing.T) {
 	h := newTestHost(t)
-	machine := newCountingHoldSM(true)
+	machine := newHeldCountingSM(t)
 	startMaybeAppliedShard(t, h, machine)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -255,7 +278,7 @@ func TestMaybeAppliedHostStopShardWhilePending(t *testing.T) {
 	// StopShard waits for the in-flight apply; release it once the stop has
 	// begun so the teardown can finish.
 	time.Sleep(200 * time.Millisecond)
-	close(machine.hold)
+	machine.release()
 
 	var perr error
 	select {
