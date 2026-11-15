@@ -40,6 +40,15 @@ func snapshotPlaintext() []byte {
 	return p
 }
 
+// reencryptSnapshotFile is reencryptSnapshotFileSized without the
+// destination length, for tests that check only the epoch.
+func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, replicaID, index uint64,
+	srcBarrier, dstBarrier Barrier) (uint64, error) {
+	epoch, _, err := reencryptSnapshotFileSized(fsys, srcPath, dstPath, shardID, replicaID, index,
+		srcBarrier, dstBarrier)
+	return epoch, err
+}
+
 // TestReceiveSnapshotReencryptsPerNode is the cross-node regression: a snapshot
 // produced and encrypted by node A is streamed as PLAINTEXT (the sender decrypts
 // before sending — doSendSnapshot), the receiver node B re-encrypts it under its
@@ -139,7 +148,7 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 	writeEncryptedSnapshotFile(t, barA, srcPath, plain)
 
 	dstPath := filepath.Join(dir, "dst", "snapshot.dat")
-	epoch, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB)
+	epoch, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB)
 	if err != nil {
 		t.Fatalf("ReencryptSnapshotFile: %v", err)
 	}
@@ -201,12 +210,26 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyedDst := filepath.Join(dir, "keyed.dat")
-	epoch, err := ReencryptSnapshotFile(plainSrc, keyedDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, bar)
+	epoch, fileSize, err := ReencryptSnapshotFile(plainSrc, keyedDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, bar)
 	if err != nil {
 		t.Fatalf("plaintext->keyed: %v", err)
 	}
 	if epoch == 0 {
 		t.Fatal("plaintext->keyed epoch = 0, want non-zero")
+	}
+	// The framed destination is longer than the plaintext source, and the
+	// reported length is the destination's, not the source's.
+	plainInfo, err := os.Stat(plainSrc)
+	if err != nil {
+		t.Fatalf("stat plaintext source: %v", err)
+	}
+	keyedInfo, err := os.Stat(keyedDst)
+	if err != nil {
+		t.Fatalf("stat keyed destination: %v", err)
+	}
+	if fileSize != uint64(keyedInfo.Size()) || fileSize == uint64(plainInfo.Size()) {
+		t.Fatalf("plaintext->keyed fileSize = %d, want the destination's %d (source %d)",
+			fileSize, keyedInfo.Size(), plainInfo.Size())
 	}
 	kf, err := os.Open(keyedDst)
 	if err != nil {
@@ -253,7 +276,7 @@ func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
 
 	// Control: the intact source migrates and gets a destination record.
 	okDst := filepath.Join(dir, "ok", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, okDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil); err != nil {
+	if _, _, err := ReencryptSnapshotFile(srcPath, okDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil); err != nil {
 		t.Fatalf("intact source: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "ok", "snapshot.meta")); err != nil {
@@ -265,7 +288,7 @@ func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
 
 	dstDir := filepath.Join(dir, "dst")
 	dstPath := filepath.Join(dstDir, "snapshot.dat")
-	_, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	_, _, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
 	if !errors.Is(err, ErrSnapshotCorrupt) {
 		t.Fatalf("corrupt source: err = %v, want ErrSnapshotCorrupt", err)
 	}
@@ -341,7 +364,7 @@ func TestReencryptSnapshotFile_PinsSourceEpochs(t *testing.T) {
 
 	rec := &pinRecordingBarrier{Barrier: barA}
 	dstPath := filepath.Join(dir, "dst", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, rec, barB); err != nil {
+	if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, rec, barB); err != nil {
 		t.Fatalf("ReencryptSnapshotFile: %v", err)
 	}
 
@@ -438,7 +461,7 @@ func TestReencryptSnapshotFile_CreatesNestedDestination(t *testing.T) {
 	writeEncryptedSnapshotFile(t, bar, srcPath, plain)
 
 	dstPath := filepath.Join(dir, "a", "b", "c", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, bar, nil); err != nil {
+	if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, bar, nil); err != nil {
 		t.Fatalf("ReencryptSnapshotFile into nested destination: %v", err)
 	}
 	if got := mustRead(t, dstPath); !bytes.Equal(got, plain) {
@@ -475,7 +498,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		if err := barA.Seal(); err != nil {
 			t.Fatalf("Seal: %v", err)
 		}
-		if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+		if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
 			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed source "+
 				"must not have its ciphertext copied out as plaintext)", err)
 		}
@@ -491,7 +514,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		if err := barB.Seal(); err != nil {
 			t.Fatalf("Seal: %v", err)
 		}
-		if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+		if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
 			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed "+
 				"destination must not durably write plaintext)", err)
 		}
@@ -505,7 +528,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 	t.Run("nil destination still writes plaintext", func(t *testing.T) {
 		barA := createTestBarrier(t)
 		srcPath, dstPath := newSrc(t, barA)
-		epoch, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, nil)
+		epoch, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, nil)
 		if err != nil {
 			t.Fatalf("ReencryptSnapshotFile: %v", err)
 		}

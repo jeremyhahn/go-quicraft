@@ -191,12 +191,12 @@ func assertReencryptLeftSource(t *testing.T, name string, before, after map[stri
 // rekeyRunbookSnapFn is the runbook's snapshot hook: it re-encrypts each
 // snapshot data file under nodeDir into newNode at the same relative path,
 // from src to dst (a nil Barrier is a plaintext side), counting its calls.
-func rekeyRunbookSnapFn(nodeDir, newNode string, src, dst Barrier, calls *int) waldb.SnapshotReencryptFunc {
-	return func(sid, rid uint64, snap logdb.Snapshot) (uint64, error) {
+func rekeyRunbookSnapFn(nodeDir, newNode string, src, dst Barrier, calls *int) waldb.SnapshotReencryptSizedFunc {
+	return func(sid, rid uint64, snap logdb.Snapshot) (uint64, uint64, error) {
 		*calls++
 		rel, relErr := filepath.Rel(nodeDir, snap.Filepath)
 		if relErr != nil || strings.HasPrefix(rel, "..") {
-			return 0, fmt.Errorf("snapshot %s is outside the node directory", snap.Filepath)
+			return 0, 0, fmt.Errorf("snapshot %s is outside the node directory", snap.Filepath)
 		}
 		return ReencryptSnapshotFile(filepath.Join(snap.Filepath, "snapshot.dat"),
 			filepath.Join(newNode, rel, "snapshot.dat"), sid, rid, snap.Index, src, dst)
@@ -266,7 +266,7 @@ func TestRekeyRunbook_NewBarrierServesOldBarrierRefuses(t *testing.T) {
 	copyTreeExceptSnapshotData(t, nodeDir, newNode)
 	var snapCalls int
 	snapFn := rekeyRunbookSnapFn(nodeDir, newNode, barrierA, barrierB, &snapCalls)
-	count, err := waldb.Reencrypt(walDir, barrierA, newWAL, barrierB, snapFn)
+	count, err := waldb.ReencryptSized(walDir, barrierA, newWAL, barrierB, snapFn)
 	if err != nil {
 		t.Fatalf("waldb.Reencrypt: %v", err)
 	}
@@ -389,7 +389,7 @@ func TestRekeyRunbook_PlaintextToEncryptedSnapshotRestarts(t *testing.T) {
 	copyTreeExceptSnapshotData(t, nodeDir, newNode)
 	var snapCalls int
 	snapFn := rekeyRunbookSnapFn(nodeDir, newNode, nil, barrierB, &snapCalls)
-	if _, err := waldb.Reencrypt(walDir, nil, newWAL, barrierB, snapFn); err != nil {
+	if _, err := waldb.ReencryptSized(walDir, nil, newWAL, barrierB, snapFn); err != nil {
 		t.Fatalf("waldb.Reencrypt: %v", err)
 	}
 	if snapCalls == 0 {
