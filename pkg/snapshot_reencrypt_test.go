@@ -25,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
@@ -565,6 +566,138 @@ func TestReencryptSnapshotFile_DestinationStatFailurePropagates(t *testing.T) {
 	}
 	if names := cfs.entries(dstDir); len(names) != 2 {
 		t.Fatalf("%s holds %v, want only the published pair", dstDir, names)
+	}
+}
+
+// reencryptDestinationWaiters reports how many reencryptSnapshotFile calls
+// are blocked waiting for another call's claim on dstDir.
+func reencryptDestinationWaiters(dstDir string) int {
+	return 0
+}
+
+// TestReencryptSnapshotFile_ConcurrentDestinationIsExclusive drives two calls
+// at the same fresh destination through the interleaving that publishes a
+// torn pair: both pass the destination check, A publishes its snapshot.dat
+// and hashes it, B renames its own snapshot.dat over it and restamps
+// snapshot.meta, and A then restamps snapshot.meta for the inode B replaced.
+// The destination claim must serialize the two calls, so the second one finds
+// the published pair and is refused, and the pair left behind verifies.
+func TestReencryptSnapshotFile_ConcurrentDestinationIsExclusive(t *testing.T) {
+	srcBarrier := createTestBarrier(t)
+	dstBarrier := createTestBarrier(t)
+
+	root := "/vol"
+	cfs := newCrashFS(root)
+	srcPath := filepath.Join(root, "src", "snapshot.dat")
+	dstDir := filepath.Join(root, "dst")
+	dstPath := filepath.Join(dstDir, "snapshot.dat")
+	dstMetaPath := filepath.Join(dstDir, "snapshot.meta")
+	srcData := encryptToBytes(t, srcBarrier, bytes.Repeat([]byte("concurrent-source"), 200))
+	writeDurableFile(t, cfs, srcPath, srcData)
+	writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
+		reencryptTestSourceMeta(srcData))
+
+	aAtRename := make(chan struct{})
+	bAtRename := make(chan struct{})
+	aHashed := make(chan struct{})
+	bDone := make(chan struct{})
+	var mu sync.Mutex
+	dataRenames, metaTemps := 0, 0
+	aReleased := false
+	cfs.setHook(func(op crashOp, path string) error {
+		switch {
+		case op == opRename && path == dstPath:
+			mu.Lock()
+			dataRenames++
+			n := dataRenames
+			mu.Unlock()
+			switch n {
+			case 1: // A, before publishing its snapshot.dat.
+				close(aAtRename)
+				// Wait for B to pass the destination check, or to block on
+				// A's claim; either way B has run as far as it can.
+				for {
+					select {
+					case <-bAtRename:
+					default:
+						if reencryptDestinationWaiters(dstDir) == 0 {
+							time.Sleep(time.Millisecond)
+							continue
+						}
+					}
+					mu.Lock()
+					aReleased = true
+					mu.Unlock()
+					return nil
+				}
+			case 2: // B, after A hashed its snapshot.dat, if B got this far.
+				close(bAtRename)
+				<-aHashed
+			}
+		case op == opCreateTemp && path == dstDir:
+			mu.Lock()
+			if aReleased {
+				metaTemps++
+			}
+			n := metaTemps
+			mu.Unlock()
+			// The first destination CreateTemp after A publishes its
+			// snapshot.dat is A's snapshot.meta temp (B is held or blocked):
+			// A has hashed its snapshot.dat. Let B publish its whole pair
+			// first, when B got past the destination check.
+			if n == 1 {
+				select {
+				case <-bAtRename:
+					close(aHashed)
+					<-bDone
+				default:
+				}
+			}
+		}
+		return nil
+	})
+
+	var errA, errB error
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		_, errA = reencryptSnapshotFile(cfs, srcPath, dstPath,
+			testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	}()
+	<-aAtRename
+	go func() {
+		defer close(bDone)
+		_, errB = reencryptSnapshotFile(cfs, srcPath, dstPath,
+			testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	}()
+	<-doneA
+	<-bDone
+	cfs.setHook(nil)
+
+	if errA != nil {
+		t.Fatalf("first call: %v", errA)
+	}
+	if !errors.Is(errB, fs.ErrExist) {
+		t.Fatalf("second call: err = %v, want fs.ErrExist for the published destination", errB)
+	}
+	data, ok := cfs.liveBytes(dstPath)
+	if !ok {
+		t.Fatal("snapshot.dat is missing")
+	}
+	metaBytes, ok := cfs.liveBytes(dstMetaPath)
+	if !ok {
+		t.Fatal("snapshot.meta is missing")
+	}
+	meta, err := engine.ParseSnapshotMeta(metaBytes)
+	if err != nil {
+		t.Fatalf("parse snapshot.meta: %v", err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.DataHash != sum || meta.DataLen != size {
+		t.Fatal("snapshot.meta does not describe the published snapshot.dat: torn pair")
 	}
 }
 
