@@ -300,6 +300,59 @@ func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
 	}
 }
 
+// TestReencryptSnapshotFile_RefusesUncleanDestination pins that a destination
+// spelled with a ".." after a symlinked component is refused before anything
+// is written. The kernel resolves base/a/link/../dst through the symlink
+// (base/b/dst), while filepath.Dir collapses it lexically (base/a/dst): the
+// data would be published in one directory and its snapshot.meta restamped,
+// claimed and synced in another.
+func TestReencryptSnapshotFile_RefusesUncleanDestination(t *testing.T) {
+	plain := snapshotPlaintext()
+	base := t.TempDir()
+	srcDir := filepath.Join(base, "src")
+	for _, d := range []string{srcDir, filepath.Join(base, "a"), filepath.Join(base, "b", "child"), filepath.Join(base, "b", "dst")} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(base, "b", "child"), filepath.Join(base, "a", "link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	srcPath := filepath.Join(srcDir, "snapshot.dat")
+	if err := os.WriteFile(srcPath, plain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("hash source: %v", err)
+	}
+	meta := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index: testSnapIndex, Term: 1, ShardID: testSnapShardID, ReplicaID: testSnapReplicaID,
+		DataLen: size, DataHash: sum,
+	})
+	if err := os.WriteFile(filepath.Join(srcDir, "snapshot.meta"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Concatenated, not filepath.Join: Join would clean the spelling away.
+	sep := string(filepath.Separator)
+	dstPath := filepath.Join(base, "a", "link") + sep + ".." + sep + "dst" + sep + "snapshot.dat"
+	_, _, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	var destErr *SnapshotDestinationError
+	if !errors.As(err, &destErr) || !errors.Is(err, fs.ErrInvalid) {
+		t.Fatalf("err = %v, want a SnapshotDestinationError wrapping fs.ErrInvalid", err)
+	}
+	for _, d := range []string{filepath.Join(base, "b", "dst"), filepath.Join(base, "a", "dst")} {
+		entries, err := os.ReadDir(d)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("read %s: %v", d, err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("%s holds %d entries after a refused call, want none", d, len(entries))
+		}
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
