@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"path/filepath"
+	"sync"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
@@ -19,12 +20,18 @@ import (
 // was refused before anything was written: Path already holds a snapshot.dat
 // (Err is fs.ErrExist, so errors.Is(err, fs.ErrExist) holds), or looking Path
 // up failed with something other than not-exist (Err is that failure, since
-// the destination may still hold a published pair). Re-key into a fresh
-// directory.
+// the destination may still hold a published pair), or Path is not in clean
+// form (Err is fs.ErrInvalid: a ".." after a symlinked component would put
+// the data and its snapshot.meta in different directories; pass
+// filepath.Clean of the intended, symlink-resolved path). An unclean source
+// path is refused the same way, with Path set to the source. Re-key into a fresh
+// directory. It is part of the root-key rotation runbook
+// (docs/seal-barrier/user.md), with ReencryptSnapshotFile.
 type SnapshotDestinationError struct {
 	// Path is the refused destination.
 	Path string
-	// Err is fs.ErrExist or the lookup failure.
+	// Err is fs.ErrExist, the lookup failure, or fs.ErrInvalid for a path
+	// that is not in clean form (filepath.Clean would change it).
 	Err error
 }
 
@@ -33,7 +40,8 @@ func (e *SnapshotDestinationError) Error() string {
 	return fmt.Sprintf("quicraft: re-encrypt snapshot: destination %s refused: %v", e.Path, e.Err)
 }
 
-// Unwrap returns the underlying cause, fs.ErrExist or the lookup failure.
+// Unwrap returns the underlying cause: fs.ErrExist, the lookup failure or
+// fs.ErrInvalid.
 func (e *SnapshotDestinationError) Unwrap() error { return e.Err }
 
 // SnapshotCommittedNotDurableError reports a snapshot re-encryption whose
@@ -144,6 +152,13 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 // sealed destination always has at least its terminal frame, so an empty
 // plaintext source still yields a real epoch.
 //
+// It also returns fileSize, the length of the destination data file as
+// written. Re-encryption changes the length whenever the framing differs
+// (plaintext to encrypted, encrypted to plaintext, or a different nonce
+// size), so the caller records fileSize, not the source's length, as the
+// migrated snapshot's FileSize: pass both to waldb.ReencryptSized. The
+// committed-not-durable failure returns fileSize with the epoch.
+//
 // While the source is decrypted, every epoch referenced by its frames is
 // pinned on srcBarrier via RegisterInFlightEpoch so a concurrent
 // PurgeEpochsBefore cannot remove a DEK mid-migration (the same protection
@@ -171,33 +186,164 @@ func snapshotFrameEpochs(src io.ReadSeeker) ([]uint64, error) {
 // through the AEAD context AAD (see engine.NewSnapshotAAD) and there is no
 // weaker fallback for a caller that omits them.
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-	srcBarrier, dstBarrier Barrier) (uint64, error) {
-	return reencryptSnapshotFile(osSnapshotFS{}, srcPath, dstPath,
+	srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error) {
+	return reencryptSnapshotFileSized(osSnapshotFS{}, srcPath, dstPath,
 		shardID, replicaID, index, srcBarrier, dstBarrier)
 }
 
-// reencryptSnapshotFile is ReencryptSnapshotFile over an injectable
-// filesystem. The exported entry point pins the os-backed one; tests supply a
-// fault-injecting implementation to exercise the crash-safety sequence.
-func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, replicaID, index uint64,
-	srcBarrier, dstBarrier Barrier) (uint64, error) {
-	// Refuse before opening anything. A CONFIGURED barrier that is sealed
-	// means encryption is temporarily unavailable, never that the side is
-	// plaintext. Treating a sealed srcBarrier as plaintext would read the
-	// source's CIPHERTEXT as if it were plaintext and write it out recorded
-	// as plaintext -- silent corruption, not merely a downgrade -- and a
-	// sealed dstBarrier would durably write a plaintext destination for a
-	// snapshot that must be encrypted at rest.
+// reencryptDestinationClaims serializes the re-encryptions that publish into
+// one destination directory. A call publishes two files (snapshot.dat, then
+// snapshot.meta restamped from the bytes it hashed), so the destination check
+// and both publications must run under one claim: two calls that both found
+// the destination fresh could otherwise publish one call's snapshot.dat
+// beside the other's snapshot.meta, and both would report success.
+var reencryptDestinationClaims = &destinationClaims{claims: make(map[string]*destinationClaim)}
+
+// destinationClaims is a set of per-directory locks, each kept only while a
+// call holds or waits for it.
+type destinationClaims struct {
+	mu     sync.Mutex
+	claims map[string]*destinationClaim
+}
+
+// destinationClaim is one directory's lock and the number of calls holding
+// or waiting for it.
+type destinationClaim struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// destinationClaimKey names dir the same way for every spelling of it.
+func destinationClaimKey(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = filepath.Clean(dir)
+	}
+	// filepath.Abs is lexical: resolve the symlinks of the longest existing
+	// ancestor, so /alias/new and /real/new (alias -> real) share one claim
+	// even before new exists. The missing tail is rejoined lexically.
+	existing, tail := abs, ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(existing); err == nil {
+			if tail == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, tail)
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return abs
+		}
+		if tail == "" {
+			tail = filepath.Base(existing)
+		} else {
+			tail = filepath.Join(filepath.Base(existing), tail)
+		}
+		existing = parent
+	}
+}
+
+// acquire blocks until the caller holds dir's claim and returns its release.
+func (d *destinationClaims) acquire(dir string) (release func()) {
+	key := destinationClaimKey(dir)
+	d.mu.Lock()
+	c := d.claims[key]
+	if c == nil {
+		c = &destinationClaim{}
+		d.claims[key] = c
+	}
+	c.refs++
+	d.mu.Unlock()
+	c.mu.Lock()
+	return func() {
+		c.mu.Unlock()
+		d.mu.Lock()
+		c.refs--
+		if c.refs == 0 {
+			delete(d.claims, key)
+		}
+		d.mu.Unlock()
+	}
+}
+
+// waiters reports how many calls are blocked waiting for dir's claim.
+func (d *destinationClaims) waiters(dir string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	c := d.claims[destinationClaimKey(dir)]
+	if c == nil || c.refs == 0 {
+		return 0
+	}
+	return c.refs - 1
+}
+
+// reencryptCountingWriter counts the bytes written through it.
+type reencryptCountingWriter struct {
+	w io.Writer
+	n uint64
+}
+
+// Write writes p to the wrapped writer and counts what it accepted.
+func (c *reencryptCountingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += uint64(n)
+	return n, err
+}
+
+// checkReencryptPreconditions refuses a call before anything is opened.
+//
+// A CONFIGURED barrier that is sealed means encryption is temporarily
+// unavailable, never that the side is plaintext. Treating a sealed srcBarrier
+// as plaintext would read the source's CIPHERTEXT as if it were plaintext and
+// write it out recorded as plaintext -- silent corruption, not merely a
+// downgrade -- and a sealed dstBarrier would durably write a plaintext
+// destination for a snapshot that must be encrypted at rest.
+//
+// A destination not in clean form is refused too. The kernel resolves
+// "x/link/../dst" through the symlink, while filepath.Dir (and Join) collapse
+// it lexically, so the data rename and the snapshot.meta restamp, claim and
+// directory fsync would name different directories. A clean path has no ".."
+// after a named component, so every use of it resolves to one directory.
+//
+// The source gets the same rule, for the same reason: it is opened through
+// the kernel while its snapshot.meta is found with filepath.Dir, so an
+// unclean source could be read from one directory and its record looked up
+// (and found absent) in another, skipping source verification, the
+// existing-destination refusal and the restamp.
+func checkReencryptPreconditions(srcPath, dstPath string, srcBarrier, dstBarrier Barrier) error {
 	if srcBarrier != nil && srcBarrier.IsSealed() {
-		return 0, ErrSnapshotBarrierSealed
+		return ErrSnapshotBarrierSealed
 	}
 	if dstBarrier != nil && dstBarrier.IsSealed() {
-		return 0, ErrSnapshotBarrierSealed
+		return ErrSnapshotBarrierSealed
 	}
+	for _, p := range []string{srcPath, dstPath} {
+		if filepath.Clean(p) != p {
+			return &SnapshotDestinationError{Path: p, Err: fs.ErrInvalid}
+		}
+	}
+	return nil
+}
+
+// reencryptSnapshotFileSized is ReencryptSnapshotFile over an injectable
+// filesystem. The exported entry point pins the os-backed one; tests supply a
+// fault-injecting implementation to exercise the crash-safety sequence.
+func reencryptSnapshotFileSized(fsys snapshotFS, srcPath, dstPath string, shardID, replicaID, index uint64,
+	srcBarrier, dstBarrier Barrier) (uint64, uint64, error) {
+	if err := checkReencryptPreconditions(srcPath, dstPath, srcBarrier, dstBarrier); err != nil {
+		return 0, 0, err
+	}
+
+	// Claim the destination directory for the whole call: the destination
+	// check below and both publications (snapshot.dat, then snapshot.meta)
+	// must not interleave with another call publishing into it.
+	dstDir := filepath.Dir(dstPath)
+	release := reencryptDestinationClaims.acquire(dstDir)
+	defer release()
 
 	src, err := fsys.Open(srcPath)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer func() { _ = src.Close() }()
 
@@ -205,14 +351,13 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// BEFORE MkdirAll: the post-rename fsync chain must cover every directory
 	// MkdirAll creates, or a crash could lose the new directories' entries
 	// even though the renamed file's data was fsynced.
-	dstDir := filepath.Dir(dstPath)
 	syncRoot := fsutil.DeepestExistingAncestorWith(fsys.Stat, dstDir)
 	if err := fsys.MkdirAll(dstDir, 0o750); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	tmp, err := fsys.CreateTemp(dstDir, reencryptTempPattern)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	tmpPath := tmp.Name()
 	committed := false
@@ -240,7 +385,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 			}
 		}()
 		if _, err := src.Seek(0, io.SeekStart); err != nil {
-			return 0, err
+			return 0, 0, err
 		}
 	}
 
@@ -265,7 +410,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// and a mismatch fails here, before anything is committed.
 	srcMeta, err := readReencryptSourceMeta(fsys, srcPath, dstPath)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	// A destination that already holds a snapshot.dat is a published pair
 	// (or half of one). Replacing it would rename new data over the old
@@ -280,30 +425,34 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 		_, statErr := fsys.Stat(dstPath)
 		switch {
 		case statErr == nil:
-			return 0, &SnapshotDestinationError{Path: dstPath, Err: fs.ErrExist}
+			return 0, 0, &SnapshotDestinationError{Path: dstPath, Err: fs.ErrExist}
 		case !errors.Is(statErr, fs.ErrNotExist):
-			return 0, &SnapshotDestinationError{Path: dstPath, Err: statErr}
+			return 0, 0, &SnapshotDestinationError{Path: dstPath, Err: statErr}
 		}
 	}
 	srcReader, verifySrc := teeSourceVerifier(srcPath, srcMeta, src)
 
-	epoch, dstPins, err = copySnapshotAcrossBarriers(srcReader, tmp, shardID, replicaID, index,
+	// Count what reaches the temp file: that is the destination's length,
+	// which the caller records in place of the source's.
+	dstCount := &reencryptCountingWriter{w: tmp}
+	epoch, dstPins, err = copySnapshotAcrossBarriers(srcReader, dstCount, shardID, replicaID, index,
 		srcBarrier, dstBarrier)
+	size := dstCount.n
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := verifySrc(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	if err := tmp.Sync(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := tmp.Close(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if err := fsys.Rename(tmpPath, dstPath); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	// The rename SUCCEEDED: dstPath now holds the migrated artifact sealed at
 	// `epoch`, so the write is committed from here on even if the fsync below
@@ -319,7 +468,7 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// fsync below makes both durable. A failure comes back like the fsync
 	// failure below, epoch included, for the reason given there.
 	if err := restampReencryptedSnapshotMeta(fsys, dstPath, srcMeta, epoch); err != nil {
-		return epoch, &SnapshotCommittedNotDurableError{Path: dstPath, Epoch: epoch, Err: err}
+		return epoch, size, &SnapshotCommittedNotDurableError{Path: dstPath, Epoch: epoch, Err: err}
 	}
 
 	// Make the rename (and any directories MkdirAll created) durable before
@@ -340,13 +489,13 @@ func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, re
 	// alone cannot survive `if err != nil { return 0, err }`: see
 	// SnapshotCommittedNotDurableError.
 	if err := syncDirChain(fsys, dstDir, syncRoot); err != nil {
-		return epoch, &SnapshotCommittedNotDurableError{
+		return epoch, size, &SnapshotCommittedNotDurableError{
 			Path:  dstPath,
 			Epoch: epoch,
 			Err:   err,
 		}
 	}
-	return epoch, nil
+	return epoch, size, nil
 }
 
 // teeSourceVerifier returns the reader the copy consumes the source through

@@ -25,6 +25,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
@@ -37,6 +38,15 @@ func snapshotPlaintext() []byte {
 		p[i] = byte(i*7 + 3)
 	}
 	return p
+}
+
+// reencryptSnapshotFile is reencryptSnapshotFileSized without the
+// destination length, for tests that check only the epoch.
+func reencryptSnapshotFile(fsys snapshotFS, srcPath, dstPath string, shardID, replicaID, index uint64,
+	srcBarrier, dstBarrier Barrier) (uint64, error) {
+	epoch, _, err := reencryptSnapshotFileSized(fsys, srcPath, dstPath, shardID, replicaID, index,
+		srcBarrier, dstBarrier)
+	return epoch, err
 }
 
 // TestReceiveSnapshotReencryptsPerNode is the cross-node regression: a snapshot
@@ -138,7 +148,7 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 	writeEncryptedSnapshotFile(t, barA, srcPath, plain)
 
 	dstPath := filepath.Join(dir, "dst", "snapshot.dat")
-	epoch, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB)
+	epoch, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB)
 	if err != nil {
 		t.Fatalf("ReencryptSnapshotFile: %v", err)
 	}
@@ -200,12 +210,26 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyedDst := filepath.Join(dir, "keyed.dat")
-	epoch, err := ReencryptSnapshotFile(plainSrc, keyedDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, bar)
+	epoch, fileSize, err := ReencryptSnapshotFile(plainSrc, keyedDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, bar)
 	if err != nil {
 		t.Fatalf("plaintext->keyed: %v", err)
 	}
 	if epoch == 0 {
 		t.Fatal("plaintext->keyed epoch = 0, want non-zero")
+	}
+	// The framed destination is longer than the plaintext source, and the
+	// reported length is the destination's, not the source's.
+	plainInfo, err := os.Stat(plainSrc)
+	if err != nil {
+		t.Fatalf("stat plaintext source: %v", err)
+	}
+	keyedInfo, err := os.Stat(keyedDst)
+	if err != nil {
+		t.Fatalf("stat keyed destination: %v", err)
+	}
+	if fileSize != uint64(keyedInfo.Size()) || fileSize == uint64(plainInfo.Size()) {
+		t.Fatalf("plaintext->keyed fileSize = %d, want the destination's %d (source %d)",
+			fileSize, keyedInfo.Size(), plainInfo.Size())
 	}
 	kf, err := os.Open(keyedDst)
 	if err != nil {
@@ -252,7 +276,7 @@ func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
 
 	// Control: the intact source migrates and gets a destination record.
 	okDst := filepath.Join(dir, "ok", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, okDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil); err != nil {
+	if _, _, err := ReencryptSnapshotFile(srcPath, okDst, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil); err != nil {
 		t.Fatalf("intact source: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "ok", "snapshot.meta")); err != nil {
@@ -264,7 +288,7 @@ func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
 
 	dstDir := filepath.Join(dir, "dst")
 	dstPath := filepath.Join(dstDir, "snapshot.dat")
-	_, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	_, _, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
 	if !errors.Is(err, ErrSnapshotCorrupt) {
 		t.Fatalf("corrupt source: err = %v, want ErrSnapshotCorrupt", err)
 	}
@@ -273,6 +297,106 @@ func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
 	}
 	if _, err := os.Stat(dstPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("corrupt source: destination snapshot.dat stat err = %v, want not exist", err)
+	}
+}
+
+// TestReencryptSnapshotFile_RefusesUncleanDestination pins that a destination
+// spelled with a ".." after a symlinked component is refused before anything
+// is written. The kernel resolves base/a/link/../dst through the symlink
+// (base/b/dst), while filepath.Dir collapses it lexically (base/a/dst): the
+// data would be published in one directory and its snapshot.meta restamped,
+// claimed and synced in another.
+func TestReencryptSnapshotFile_RefusesUncleanDestination(t *testing.T) {
+	plain := snapshotPlaintext()
+	base := t.TempDir()
+	srcDir := filepath.Join(base, "src")
+	for _, d := range []string{srcDir, filepath.Join(base, "a"), filepath.Join(base, "b", "child"), filepath.Join(base, "b", "dst")} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(base, "b", "child"), filepath.Join(base, "a", "link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	srcPath := filepath.Join(srcDir, "snapshot.dat")
+	if err := os.WriteFile(srcPath, plain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("hash source: %v", err)
+	}
+	meta := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index: testSnapIndex, Term: 1, ShardID: testSnapShardID, ReplicaID: testSnapReplicaID,
+		DataLen: size, DataHash: sum,
+	})
+	if err := os.WriteFile(filepath.Join(srcDir, "snapshot.meta"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Concatenated, not filepath.Join: Join would clean the spelling away.
+	sep := string(filepath.Separator)
+	dstPath := filepath.Join(base, "a", "link") + sep + ".." + sep + "dst" + sep + "snapshot.dat"
+	_, _, err = ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	var destErr *SnapshotDestinationError
+	if !errors.As(err, &destErr) || !errors.Is(err, fs.ErrInvalid) {
+		t.Fatalf("err = %v, want a SnapshotDestinationError wrapping fs.ErrInvalid", err)
+	}
+	for _, d := range []string{filepath.Join(base, "b", "dst"), filepath.Join(base, "a", "dst")} {
+		entries, err := os.ReadDir(d)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("read %s: %v", d, err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("%s holds %d entries after a refused call, want none", d, len(entries))
+		}
+	}
+}
+
+// TestReencryptSnapshotFile_RefusesUncleanSource pins that a source spelled
+// with a ".." after a symlinked component is refused before it is opened.
+// The kernel opens base/a/link/../snapshot.dat through the symlink
+// (base/b/snapshot.dat), while filepath.Dir collapses it lexically
+// (base/a): the metadata lookup would miss base/b/snapshot.meta, skipping
+// source verification, the existing-destination refusal and the restamp.
+func TestReencryptSnapshotFile_RefusesUncleanSource(t *testing.T) {
+	plain := snapshotPlaintext()
+	base := t.TempDir()
+	for _, d := range []string{filepath.Join(base, "a"), filepath.Join(base, "b", "child")} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(base, "b", "child"), filepath.Join(base, "a", "link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "b", "snapshot.dat"), plain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("hash source: %v", err)
+	}
+	meta := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index: testSnapIndex, Term: 1, ShardID: testSnapShardID, ReplicaID: testSnapReplicaID,
+		DataLen: size, DataHash: sum,
+	})
+	if err := os.WriteFile(filepath.Join(base, "b", "snapshot.meta"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Concatenated, not filepath.Join: Join would clean the spelling away.
+	sep := string(filepath.Separator)
+	srcPath := filepath.Join(base, "a", "link") + sep + ".." + sep + "snapshot.dat"
+	dstDir := filepath.Join(base, "dst")
+	_, _, err = ReencryptSnapshotFile(srcPath, filepath.Join(dstDir, "snapshot.dat"),
+		testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	var destErr *SnapshotDestinationError
+	if !errors.As(err, &destErr) || !errors.Is(err, fs.ErrInvalid) || destErr.Path != srcPath {
+		t.Fatalf("err = %v, want a SnapshotDestinationError for %s wrapping fs.ErrInvalid", err, srcPath)
+	}
+	if _, err := os.Stat(dstDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("destination directory stat err = %v after a refused call, want not exist", err)
 	}
 }
 
@@ -340,7 +464,7 @@ func TestReencryptSnapshotFile_PinsSourceEpochs(t *testing.T) {
 
 	rec := &pinRecordingBarrier{Barrier: barA}
 	dstPath := filepath.Join(dir, "dst", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, rec, barB); err != nil {
+	if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, rec, barB); err != nil {
 		t.Fatalf("ReencryptSnapshotFile: %v", err)
 	}
 
@@ -437,7 +561,7 @@ func TestReencryptSnapshotFile_CreatesNestedDestination(t *testing.T) {
 	writeEncryptedSnapshotFile(t, bar, srcPath, plain)
 
 	dstPath := filepath.Join(dir, "a", "b", "c", "snapshot.dat")
-	if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, bar, nil); err != nil {
+	if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, bar, nil); err != nil {
 		t.Fatalf("ReencryptSnapshotFile into nested destination: %v", err)
 	}
 	if got := mustRead(t, dstPath); !bytes.Equal(got, plain) {
@@ -474,7 +598,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		if err := barA.Seal(); err != nil {
 			t.Fatalf("Seal: %v", err)
 		}
-		if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+		if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
 			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed source "+
 				"must not have its ciphertext copied out as plaintext)", err)
 		}
@@ -490,7 +614,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		if err := barB.Seal(); err != nil {
 			t.Fatalf("Seal: %v", err)
 		}
-		if _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
+		if _, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, barB); !errors.Is(err, ErrSnapshotBarrierSealed) {
 			t.Fatalf("error = %v, want ErrSnapshotBarrierSealed (a sealed "+
 				"destination must not durably write plaintext)", err)
 		}
@@ -504,7 +628,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 	t.Run("nil destination still writes plaintext", func(t *testing.T) {
 		barA := createTestBarrier(t)
 		srcPath, dstPath := newSrc(t, barA)
-		epoch, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, nil)
+		epoch, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, nil)
 		if err != nil {
 			t.Fatalf("ReencryptSnapshotFile: %v", err)
 		}
@@ -565,6 +689,186 @@ func TestReencryptSnapshotFile_DestinationStatFailurePropagates(t *testing.T) {
 	}
 	if names := cfs.entries(dstDir); len(names) != 2 {
 		t.Fatalf("%s holds %v, want only the published pair", dstDir, names)
+	}
+}
+
+// reencryptDestinationWaiters reports how many reencryptSnapshotFile calls
+// are blocked waiting for another call's claim on dstDir.
+func reencryptDestinationWaiters(dstDir string) int {
+	return reencryptDestinationClaims.waiters(dstDir)
+}
+
+// TestReencryptSnapshotFile_ConcurrentDestinationIsExclusive drives two calls
+// at the same fresh destination through the interleaving that publishes a
+// torn pair: both pass the destination check, A publishes its snapshot.dat
+// and hashes it, B renames its own snapshot.dat over it and restamps
+// snapshot.meta, and A then restamps snapshot.meta for the inode B replaced.
+// The destination claim must serialize the two calls, so the second one finds
+// the published pair and is refused, and the pair left behind verifies.
+func TestReencryptSnapshotFile_ConcurrentDestinationIsExclusive(t *testing.T) {
+	srcBarrier := createTestBarrier(t)
+	dstBarrier := createTestBarrier(t)
+
+	root := "/vol"
+	cfs := newCrashFS(root)
+	srcPath := filepath.Join(root, "src", "snapshot.dat")
+	dstDir := filepath.Join(root, "dst")
+	dstPath := filepath.Join(dstDir, "snapshot.dat")
+	dstMetaPath := filepath.Join(dstDir, "snapshot.meta")
+	srcData := encryptToBytes(t, srcBarrier, bytes.Repeat([]byte("concurrent-source"), 200))
+	writeDurableFile(t, cfs, srcPath, srcData)
+	writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
+		reencryptTestSourceMeta(srcData))
+
+	aAtRename := make(chan struct{})
+	bAtRename := make(chan struct{})
+	aHashed := make(chan struct{})
+	bDone := make(chan struct{})
+	var mu sync.Mutex
+	dataRenames, metaTemps := 0, 0
+	aReleased := false
+	cfs.setHook(func(op crashOp, path string) error {
+		switch {
+		case op == opRename && path == dstPath:
+			mu.Lock()
+			dataRenames++
+			n := dataRenames
+			mu.Unlock()
+			switch n {
+			case 1: // A, before publishing its snapshot.dat.
+				close(aAtRename)
+				// Wait for B to pass the destination check, or to block on
+				// A's claim; either way B has run as far as it can.
+				for {
+					select {
+					case <-bAtRename:
+					default:
+						if reencryptDestinationWaiters(dstDir) == 0 {
+							time.Sleep(time.Millisecond)
+							continue
+						}
+					}
+					mu.Lock()
+					aReleased = true
+					mu.Unlock()
+					return nil
+				}
+			case 2: // B, after A hashed its snapshot.dat, if B got this far.
+				close(bAtRename)
+				<-aHashed
+			}
+		case op == opCreateTemp && path == dstDir:
+			mu.Lock()
+			if aReleased {
+				metaTemps++
+			}
+			n := metaTemps
+			mu.Unlock()
+			// The first destination CreateTemp after A publishes its
+			// snapshot.dat is A's snapshot.meta temp (B is held or blocked):
+			// A has hashed its snapshot.dat. Let B publish its whole pair
+			// first, when B got past the destination check.
+			if n == 1 {
+				select {
+				case <-bAtRename:
+					close(aHashed)
+					<-bDone
+				default:
+				}
+			}
+		}
+		return nil
+	})
+
+	var errA, errB error
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		_, errA = reencryptSnapshotFile(cfs, srcPath, dstPath,
+			testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	}()
+	<-aAtRename
+	go func() {
+		defer close(bDone)
+		_, errB = reencryptSnapshotFile(cfs, srcPath, dstPath,
+			testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
+	}()
+	<-doneA
+	<-bDone
+	cfs.setHook(nil)
+
+	if errA != nil {
+		t.Fatalf("first call: %v", errA)
+	}
+	if !errors.Is(errB, fs.ErrExist) {
+		t.Fatalf("second call: err = %v, want fs.ErrExist for the published destination", errB)
+	}
+	data, ok := cfs.liveBytes(dstPath)
+	if !ok {
+		t.Fatal("snapshot.dat is missing")
+	}
+	metaBytes, ok := cfs.liveBytes(dstMetaPath)
+	if !ok {
+		t.Fatal("snapshot.meta is missing")
+	}
+	meta, err := engine.ParseSnapshotMeta(metaBytes)
+	if err != nil {
+		t.Fatalf("parse snapshot.meta: %v", err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.DataHash != sum || meta.DataLen != size {
+		t.Fatal("snapshot.meta does not describe the published snapshot.dat: torn pair")
+	}
+}
+
+// TestReencryptDestinationClaim_SymlinkAliasSharesTheClaim pins that two
+// spellings of one destination directory, one through a symlinked ancestor,
+// take the same claim: a call targeting /alias/new waits for the call that
+// holds /real/new, even before new exists.
+func TestReencryptDestinationClaim_SymlinkAliasSharesTheClaim(t *testing.T) {
+	base := t.TempDir()
+	realRoot := filepath.Join(base, "real")
+	if err := os.Mkdir(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(base, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	realDir := filepath.Join(realRoot, "new")
+	aliasDir := filepath.Join(aliasRoot, "new")
+
+	if got, want := destinationClaimKey(aliasDir), destinationClaimKey(realDir); got != want {
+		t.Fatalf("claim key for the alias = %q, want %q", got, want)
+	}
+
+	release := reencryptDestinationClaims.acquire(realDir)
+	acquired := make(chan func())
+	go func() { acquired <- reencryptDestinationClaims.acquire(aliasDir) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for reencryptDestinationWaiters(realDir) == 0 {
+		select {
+		case r := <-acquired:
+			r()
+			release()
+			t.Fatal("the aliased destination acquired a separate claim while the real one was held")
+		default:
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("the aliased call neither waited nor acquired")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	release()
+	select {
+	case r := <-acquired:
+		r()
+	case <-time.After(5 * time.Second):
+		t.Fatal("the aliased call did not acquire after the real claim was released")
 	}
 }
 
