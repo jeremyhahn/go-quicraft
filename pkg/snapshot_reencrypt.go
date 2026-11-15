@@ -23,7 +23,8 @@ import (
 // the destination may still hold a published pair), or Path is not in clean
 // form (Err is fs.ErrInvalid: a ".." after a symlinked component would put
 // the data and its snapshot.meta in different directories; pass
-// filepath.Clean of the intended, symlink-resolved path). Re-key into a fresh
+// filepath.Clean of the intended, symlink-resolved path). An unclean source
+// path is refused the same way, with Path set to the source. Re-key into a fresh
 // directory. It is part of the root-key rotation runbook
 // (docs/seal-barrier/user.md), with ReencryptSnapshotFile.
 type SnapshotDestinationError struct {
@@ -303,15 +304,23 @@ func (c *reencryptCountingWriter) Write(p []byte) (int, error) {
 // it lexically, so the data rename and the snapshot.meta restamp, claim and
 // directory fsync would name different directories. A clean path has no ".."
 // after a named component, so every use of it resolves to one directory.
-func checkReencryptPreconditions(dstPath string, srcBarrier, dstBarrier Barrier) error {
+//
+// The source gets the same rule, for the same reason: it is opened through
+// the kernel while its snapshot.meta is found with filepath.Dir, so an
+// unclean source could be read from one directory and its record looked up
+// (and found absent) in another, skipping source verification, the
+// existing-destination refusal and the restamp.
+func checkReencryptPreconditions(srcPath, dstPath string, srcBarrier, dstBarrier Barrier) error {
 	if srcBarrier != nil && srcBarrier.IsSealed() {
 		return ErrSnapshotBarrierSealed
 	}
 	if dstBarrier != nil && dstBarrier.IsSealed() {
 		return ErrSnapshotBarrierSealed
 	}
-	if filepath.Clean(dstPath) != dstPath {
-		return &SnapshotDestinationError{Path: dstPath, Err: fs.ErrInvalid}
+	for _, p := range []string{srcPath, dstPath} {
+		if filepath.Clean(p) != p {
+			return &SnapshotDestinationError{Path: p, Err: fs.ErrInvalid}
+		}
 	}
 	return nil
 }
@@ -321,7 +330,7 @@ func checkReencryptPreconditions(dstPath string, srcBarrier, dstBarrier Barrier)
 // fault-injecting implementation to exercise the crash-safety sequence.
 func reencryptSnapshotFileSized(fsys snapshotFS, srcPath, dstPath string, shardID, replicaID, index uint64,
 	srcBarrier, dstBarrier Barrier) (uint64, uint64, error) {
-	if err := checkReencryptPreconditions(dstPath, srcBarrier, dstBarrier); err != nil {
+	if err := checkReencryptPreconditions(srcPath, dstPath, srcBarrier, dstBarrier); err != nil {
 		return 0, 0, err
 	}
 
