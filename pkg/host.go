@@ -11460,7 +11460,8 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 }
 
 // DataDirChangedError is returned by StartShard when the replica's bootstrap
-// record states a different DataDir from the Config's. The replica's
+// record states a different DataDir from the Config's or, for a replica with
+// no bootstrap record, its snapshot record lies under a different one. The replica's
 // snapshots, and the LogDB records naming them, are under the recorded
 // DataDir: a start under another one would recover them from the old tree
 // while recording the new one, and a later RemoveData or ImportSnapshot,
@@ -11470,7 +11471,9 @@ type DataDirChangedError struct {
 	ShardID uint64
 	// ReplicaID is the replica whose start was refused.
 	ReplicaID uint64
-	// Recorded is the DataDir the replica's bootstrap record states.
+	// Recorded is the DataDir the replica's bootstrap record states or,
+	// for a replica with no bootstrap record, the DataDir its snapshot
+	// record's path lies under ("" for the NodeHostDir layout).
 	Recorded string
 	// Requested is the DataDir of the Config passed to StartShard.
 	Requested string
@@ -11483,7 +11486,8 @@ func (e *DataDirChangedError) Error() string {
 }
 
 // refuseDataDirChange returns *DataDirChangedError when the replica's
-// bootstrap record states a DataDir other than dataDir, and a LogDB error
+// bootstrap record states a DataDir other than dataDir or, with no bootstrap
+// record, its snapshot record lies under another DataDir, and a LogDB error
 // when that cannot be determined. It runs before StartShard recovers or
 // writes anything, so the bootstrap record keeps stating the tree the
 // replica's snapshots are in.
@@ -11495,15 +11499,50 @@ func (h *Host) refuseDataDirChange(shardID, replicaID uint64, dataDir string) er
 	if err != nil {
 		return err
 	}
-	if ok && bs.DataDir != dataDir {
-		return &DataDirChangedError{
-			ShardID:   shardID,
-			ReplicaID: replicaID,
-			Recorded:  bs.DataDir,
-			Requested: dataDir,
+	if ok {
+		if bs.DataDir != dataDir {
+			return &DataDirChangedError{
+				ShardID:   shardID,
+				ReplicaID: replicaID,
+				Recorded:  bs.DataDir,
+				Requested: dataDir,
+			}
 		}
+		return nil
 	}
-	return nil
+	// No bootstrap record: a replica joined before joins were recorded.
+	// Its snapshot record still names the tree its snapshots are in, and
+	// RemoveData locates them by it only until this start records dataDir,
+	// so the two must agree. A record in no replica layout is left to
+	// RemoveData, which refuses it.
+	ss, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if errors.Is(err, logdb.ErrNoSnapshot) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	recordedDir, inLayout := replicaSnapshotDirFromRecord(ss.Filepath, shardID, replicaID)
+	if !inLayout {
+		return nil
+	}
+	requestedDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, dataDir, shardID), shardID, replicaID)
+	if recordedDir == requestedDir {
+		return nil
+	}
+	// recordedDir is <DataDir>/shard-<id>/shard-<id>/replica-<id>; the
+	// NodeHostDir layout is reported as the empty DataDir that selects it.
+	recorded := filepath.Dir(filepath.Dir(filepath.Dir(recordedDir)))
+	if recorded == filepath.Join(h.cfg.NodeHostDir, "snapshots") {
+		recorded = ""
+	}
+	return &DataDirChangedError{
+		ShardID:   shardID,
+		ReplicaID: replicaID,
+		Recorded:  recorded,
+		Requested: dataDir,
+	}
 }
 
 // removeDataLayoutUnknownError is returned by RemoveData when the replica
