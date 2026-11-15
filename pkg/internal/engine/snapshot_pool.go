@@ -1304,16 +1304,16 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	// the non-blocking form: the saving gate is held here, and waiting behind
 	// a pending unload while holding it would stall applies on a stopping
 	// node for no purpose.
-	if !node.TryAcquireWriteLease() {
-		return 0, LogCompaction{}, &SnapshotError{
-			ShardID:   req.shardID,
-			ReplicaID: req.replicaID,
-			Save:      true,
-			Err:       ErrStopped,
-		}
+	// openLeasedSaveStage defers the release and logs nothing under the
+	// lease, so a user slog.Handler that panics, blocks or calls
+	// runtime.Goexit on the diagnostic below cannot hold it.
+	stageDir, f, cleanupErr, err := openLeasedSaveStage(node, filepath.Dir(canonicalDir))
+	if cleanupErr != nil {
+		slog.Warn("snapshot: failed to remove a save staging directory whose data file could not be created",
+			"path", stageDir,
+			"error", cleanupErr,
+		)
 	}
-	stageDir, f, err := openSaveStage(filepath.Dir(canonicalDir))
-	node.ReleaseWriteLease()
 	if err != nil {
 		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
@@ -1615,18 +1615,10 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	// The metadata file is a create under the node's snapshot directory, so it
 	// too runs under a brief, non-blocking lease (see the stage creation): a
 	// node that has stopped since the capture is refused here, and the stage
-	// guard removes the stage.
-	if !node.TryAcquireWriteLease() {
-		return 0, LogCompaction{}, &SnapshotError{
-			ShardID:   req.shardID,
-			ReplicaID: req.replicaID,
-			Save:      true,
-			Err:       ErrStopped,
-		}
-	}
-	metaErr := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch, compression)
-	node.ReleaseWriteLease()
-	if err := metaErr; err != nil {
+	// guard removes the stage. The release is deferred inside
+	// writeLeasedSnapshotMetadata, and the write logs nothing.
+	if err := writeLeasedSnapshotMetadata(node, saveDir, snapshotIndex, term, req.shardID, req.replicaID,
+		epoch, compression); err != nil {
 		// The data file is (possibly encrypted) ciphertext with no
 		// snapshot.meta beside it. readSnapshotEpoch classifies such a directory
 		// UNEVALUABLE, which makes the global/per-barrier purge floor fail safe
@@ -1982,27 +1974,53 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 // creating stageParent first when it is missing, and opens the staging data
 // file for writing. The caller holds the node's write lease. On failure it
 // removes the staging directory it created and returns no file.
-func openSaveStage(stageParent string) (string, *os.File, error) {
+func openSaveStage(stageParent string) (stageDir string, f *os.File, cleanupErr, err error) {
 	if err := os.MkdirAll(stageParent, 0o750); err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	stageDir, err := MkdirStageDir(stageParent, SaveStageDirPattern)
+	stageDir, err = MkdirStageDir(stageParent, SaveStageDirPattern)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	// The engine.Snapshotter interface accepts io.Writer, and *os.File
 	// satisfies io.Writer, so the save manages the file itself.
-	f, err := saveStageOpenData(filepath.Join(stageDir, snapshotDataFile))
+	f, err = saveStageOpenData(filepath.Join(stageDir, snapshotDataFile))
 	if err != nil {
+		// The failed removal is returned, not logged: this runs under the
+		// node's write lease, and no user slog.Handler may run under it.
 		if rmErr := saveStageRemoveAll(stageDir); rmErr != nil && !os.IsNotExist(rmErr) {
-			slog.Warn("snapshot: failed to remove a save staging directory whose data file could not be created",
-				"path", stageDir,
-				"error", rmErr,
-			)
+			return stageDir, nil, rmErr, err
 		}
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	return stageDir, f, nil
+	return stageDir, f, nil, nil
+}
+
+// openLeasedSaveStage runs openSaveStage under a brief, non-blocking write
+// lease on node. The release is deferred, so no exit from the open can leak
+// the lease, and the open logs nothing while it is held: a stage it could
+// not remove is returned as cleanupErr, with its path in stageDir, for the
+// caller to log once the lease is released. A node that has stopped is
+// refused the lease, and the result is ErrStopped with nothing created.
+func openLeasedSaveStage(node *Node, stageParent string) (stageDir string, f *os.File, cleanupErr, err error) {
+	if !node.TryAcquireWriteLease() {
+		return "", nil, nil, ErrStopped
+	}
+	defer node.ReleaseWriteLease()
+	return openSaveStage(stageParent)
+}
+
+// writeLeasedSnapshotMetadata runs writeSnapshotMetadata under a brief,
+// non-blocking write lease on node, released by defer so no exit from the
+// write can leak it. A node that has stopped is refused the lease, and the
+// result is ErrStopped with nothing written.
+func writeLeasedSnapshotMetadata(node *Node, dir string, index, term, shardID, replicaID, epoch uint64,
+	compression config.CompressionType) error {
+	if !node.TryAcquireWriteLease() {
+		return ErrStopped
+	}
+	defer node.ReleaseWriteLease()
+	return writeSnapshotMetadata(dir, index, term, shardID, replicaID, epoch, compression)
 }
 
 // saveStageOpenData creates a save stage's data file. A variable so a test
@@ -3934,7 +3952,7 @@ func DecompressingSnapshotReader(r io.Reader, c config.CompressionType) (io.Read
 // uncompressed ones. Both describe the artifact next to it, so a directory
 // that outlives its LogDB record still says how to read itself.
 func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch uint64,
-	compression config.CompressionType) error {
+	compression config.CompressionType) (err error) {
 	// Stamp the integrity fields over the data file AS WRITTEN. This runs
 	// after the data file has been written, encrypted and fsynced, so the
 	// bytes hashed here are exactly the bytes every consumer will later read.
@@ -3969,13 +3987,11 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 		if closed {
 			return
 		}
+		// The close error joins the write error rather than being logged:
+		// this runs under the node's write lease, and no user slog.Handler
+		// may run under it.
 		if closeErr := f.Close(); closeErr != nil {
-			slog.Debug("snapshot: metadata file close failed after write error",
-				"path", metaPath,
-				"shard_id", shardID,
-				"replica_id", replicaID,
-				"error", closeErr,
-			)
+			err = errors.Join(err, fmt.Errorf("close snapshot metadata %s after write error: %w", metaPath, closeErr))
 		}
 	}()
 
