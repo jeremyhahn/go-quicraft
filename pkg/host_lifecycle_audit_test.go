@@ -136,3 +136,92 @@ func TestAudit_LocalReadParkedBehindUpdateAcrossStopShard(t *testing.T) {
 		t.Fatal("QueryLocalNode parked behind the Update never returned after StopShard")
 	}
 }
+
+// startStoppedJoiner starts a joined replica (no members, join=true) with the
+// given DataDir, stops it, and returns the host after checking that its
+// bootstrap record is the join form: Join set, no Addresses, DataDir recorded.
+func startStoppedJoiner(t *testing.T, shardID, replicaID uint64, dataDir string) *Host {
+	t.Helper()
+	h, err := NewHost(testHostConfig(t), WithLogDB(newMockLogDB()), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	scfg := testShardConfig(shardID, replicaID)
+	scfg.DataDir = dataDir
+	if err := h.StartShard(nil, true, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard(join) failed: %v", err)
+	}
+	if err := h.StopShard(shardID); err != nil {
+		t.Fatalf("StopShard failed: %v", err)
+	}
+	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
+	if err != nil || !ok {
+		t.Fatalf("GetBootstrap = ok %v, err %v; want the join's record", ok, err)
+	}
+	if !bs.Join || len(bs.Addresses) != 0 || bs.DataDir != dataDir {
+		t.Fatalf("bootstrap = Join %v, Addresses %v, DataDir %q; want Join, none, %q",
+			bs.Join, bs.Addresses, bs.DataDir, dataDir)
+	}
+	return h
+}
+
+// joinedDataDirs are the two layouts a joiner can record: the NodeHostDir
+// tree (empty DataDir) and a custom DataDir.
+func joinedDataDirs(t *testing.T) map[string]string {
+	return map[string]string{"NodeHostDir": "", "custom DataDir": t.TempDir()}
+}
+
+// TestAudit_ResolveImportDataDir_JoinedRecordWithoutAddresses pins that the
+// import path takes a joined replica's recorded DataDir as authoritative:
+// the record has no Addresses, and none are needed to locate the tree.
+func TestAudit_ResolveImportDataDir_JoinedRecordWithoutAddresses(t *testing.T) {
+	const shardID, replicaID uint64 = 4431, 3
+	for name, dataDir := range joinedDataDirs(t) {
+		t.Run(name, func(t *testing.T) {
+			h := startStoppedJoiner(t, shardID, replicaID, dataDir)
+			got, err := h.resolveImportDataDir(shardID, replicaID, importOptions{})
+			if err != nil || got != dataDir {
+				t.Fatalf("resolveImportDataDir() = %q, %v; want the recorded %q", got, err, dataDir)
+			}
+			got, err = h.resolveImportDataDir(shardID, replicaID,
+				importOptions{dataDir: dataDir, dataDirSet: true})
+			if err != nil || got != dataDir {
+				t.Fatalf("resolveImportDataDir(agreeing) = %q, %v; want %q", got, err, dataDir)
+			}
+			other := t.TempDir()
+			_, err = h.resolveImportDataDir(shardID, replicaID,
+				importOptions{dataDir: other, dataDirSet: true})
+			var mm *ImportDataDirMismatchError
+			if !errors.As(err, &mm) || mm.Recorded != dataDir || mm.Declared != other {
+				t.Fatalf("resolveImportDataDir(disagreeing) = %v; want mismatch %q vs %q", err, dataDir, other)
+			}
+		})
+	}
+}
+
+// TestAudit_RefuseDataDirChange_JoinedRecordWithoutAddresses pins that a
+// joined replica's record, which has no Addresses, still guards its DataDir:
+// a restart with the same DataDir is admitted and a changed one refused.
+func TestAudit_RefuseDataDirChange_JoinedRecordWithoutAddresses(t *testing.T) {
+	const shardID, replicaID uint64 = 4432, 3
+	for name, dataDir := range joinedDataDirs(t) {
+		t.Run(name, func(t *testing.T) {
+			h := startStoppedJoiner(t, shardID, replicaID, dataDir)
+			if err := h.refuseDataDirChange(shardID, replicaID, dataDir); err != nil {
+				t.Fatalf("refuseDataDirChange(same) = %v, want nil", err)
+			}
+			other := t.TempDir()
+			err := h.refuseDataDirChange(shardID, replicaID, other)
+			var dc *DataDirChangedError
+			if !errors.As(err, &dc) || dc.Recorded != dataDir || dc.Requested != other {
+				t.Fatalf("refuseDataDirChange(changed) = %v; want DataDirChangedError %q -> %q", err, dataDir, other)
+			}
+			scfg := testShardConfig(shardID, replicaID)
+			scfg.DataDir = dataDir
+			if err := h.StartShard(nil, true, testCreateFunc, scfg); err != nil {
+				t.Fatalf("restart with the recorded DataDir = %v, want nil", err)
+			}
+		})
+	}
+}
