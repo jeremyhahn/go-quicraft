@@ -20,13 +20,17 @@ import (
 // was refused before anything was written: Path already holds a snapshot.dat
 // (Err is fs.ErrExist, so errors.Is(err, fs.ErrExist) holds), or looking Path
 // up failed with something other than not-exist (Err is that failure, since
-// the destination may still hold a published pair). Re-key into a fresh
+// the destination may still hold a published pair), or Path is not in clean
+// form (Err is fs.ErrInvalid: a ".." after a symlinked component would put
+// the data and its snapshot.meta in different directories; pass
+// filepath.Clean of the intended, symlink-resolved path). Re-key into a fresh
 // directory. It is part of the root-key rotation runbook
 // (docs/seal-barrier/user.md), with ReencryptSnapshotFile.
 type SnapshotDestinationError struct {
 	// Path is the refused destination.
 	Path string
-	// Err is fs.ErrExist or the lookup failure.
+	// Err is fs.ErrExist, the lookup failure, or fs.ErrInvalid for a path
+	// that is not in clean form (filepath.Clean would change it).
 	Err error
 }
 
@@ -35,7 +39,8 @@ func (e *SnapshotDestinationError) Error() string {
 	return fmt.Sprintf("quicraft: re-encrypt snapshot: destination %s refused: %v", e.Path, e.Err)
 }
 
-// Unwrap returns the underlying cause, fs.ErrExist or the lookup failure.
+// Unwrap returns the underlying cause: fs.ErrExist, the lookup failure or
+// fs.ErrInvalid.
 func (e *SnapshotDestinationError) Unwrap() error { return e.Err }
 
 // SnapshotCommittedNotDurableError reports a snapshot re-encryption whose
@@ -284,23 +289,40 @@ func (c *reencryptCountingWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// checkReencryptPreconditions refuses a call before anything is opened.
+//
+// A CONFIGURED barrier that is sealed means encryption is temporarily
+// unavailable, never that the side is plaintext. Treating a sealed srcBarrier
+// as plaintext would read the source's CIPHERTEXT as if it were plaintext and
+// write it out recorded as plaintext -- silent corruption, not merely a
+// downgrade -- and a sealed dstBarrier would durably write a plaintext
+// destination for a snapshot that must be encrypted at rest.
+//
+// A destination not in clean form is refused too. The kernel resolves
+// "x/link/../dst" through the symlink, while filepath.Dir (and Join) collapse
+// it lexically, so the data rename and the snapshot.meta restamp, claim and
+// directory fsync would name different directories. A clean path has no ".."
+// after a named component, so every use of it resolves to one directory.
+func checkReencryptPreconditions(dstPath string, srcBarrier, dstBarrier Barrier) error {
+	if srcBarrier != nil && srcBarrier.IsSealed() {
+		return ErrSnapshotBarrierSealed
+	}
+	if dstBarrier != nil && dstBarrier.IsSealed() {
+		return ErrSnapshotBarrierSealed
+	}
+	if filepath.Clean(dstPath) != dstPath {
+		return &SnapshotDestinationError{Path: dstPath, Err: fs.ErrInvalid}
+	}
+	return nil
+}
+
 // reencryptSnapshotFileSized is ReencryptSnapshotFile over an injectable
 // filesystem. The exported entry point pins the os-backed one; tests supply a
 // fault-injecting implementation to exercise the crash-safety sequence.
 func reencryptSnapshotFileSized(fsys snapshotFS, srcPath, dstPath string, shardID, replicaID, index uint64,
 	srcBarrier, dstBarrier Barrier) (uint64, uint64, error) {
-	// Refuse before opening anything. A CONFIGURED barrier that is sealed
-	// means encryption is temporarily unavailable, never that the side is
-	// plaintext. Treating a sealed srcBarrier as plaintext would read the
-	// source's CIPHERTEXT as if it were plaintext and write it out recorded
-	// as plaintext -- silent corruption, not merely a downgrade -- and a
-	// sealed dstBarrier would durably write a plaintext destination for a
-	// snapshot that must be encrypted at rest.
-	if srcBarrier != nil && srcBarrier.IsSealed() {
-		return 0, 0, ErrSnapshotBarrierSealed
-	}
-	if dstBarrier != nil && dstBarrier.IsSealed() {
-		return 0, 0, ErrSnapshotBarrierSealed
+	if err := checkReencryptPreconditions(dstPath, srcBarrier, dstBarrier); err != nil {
+		return 0, 0, err
 	}
 
 	// Claim the destination directory for the whole call: the destination
