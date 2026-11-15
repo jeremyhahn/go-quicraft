@@ -150,14 +150,14 @@ func TestSnapshotPool_SaveStageDiagnosticExitReleasesLease(t *testing.T) {
 			t.Cleanup(func() { saveStageOpenData, saveStageRemoveAll = prevOpen, prevRemove })
 
 			reached := make(chan struct{})
-			prevLog := slog.Default()
-			slog.SetDefault(slog.New(exitingDiagnosticHandler{
+			// Restores the log package's writer, flags and prefix too, so
+			// the handler does not outlive the test.
+			installDefaultSlogHandler(t, exitingDiagnosticHandler{
 				match:   "failed to remove a save staging directory",
 				reached: reached,
 				once:    &sync.Once{},
 				exit:    tc.exit,
-			}))
-			t.Cleanup(func() { slog.SetDefault(prevLog) })
+			})
 
 			if err := p.requestSnapshot(snapshotRequest{shardID: 10, replicaID: 1, node: node, save: true}); err != nil {
 				t.Fatalf("requestSnapshot: %v", err)

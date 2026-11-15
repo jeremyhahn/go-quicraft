@@ -1025,15 +1025,21 @@ func (h hostileHandler) WithGroup(string) slog.Handler      { return h }
 // ends.
 func installHostileLogger(t *testing.T, act func()) {
 	t.Helper()
-	// slog.SetDefault with a custom handler also redirects the log package's
-	// output into that handler, and restoring the original default (a
-	// *defaultHandler) does NOT undo the redirect: the default handler
-	// writes through the log package, so every later slog call in the
-	// package would still reach act. Restore the log package's writer,
-	// flags and prefix too.
+	installDefaultSlogHandler(t, hostileHandler{act: act})
+}
+
+// installDefaultSlogHandler makes h the default slog handler for the rest of
+// the test. slog.SetDefault with a custom handler also redirects the log
+// package's output into that handler, and restoring the original default (a
+// *defaultHandler) does NOT undo the redirect: the default handler writes
+// through the log package, so every later slog or log call in the package
+// would still reach h. The cleanup restores the log package's writer, flags
+// and prefix too.
+func installDefaultSlogHandler(t *testing.T, h slog.Handler) {
+	t.Helper()
 	prev := slog.Default()
 	prevW, prevFlags, prevPrefix := log.Writer(), log.Flags(), log.Prefix()
-	slog.SetDefault(slog.New(hostileHandler{act: act}))
+	slog.SetDefault(slog.New(h))
 	t.Cleanup(func() {
 		slog.SetDefault(prev)
 		log.SetOutput(prevW)
