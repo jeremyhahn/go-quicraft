@@ -205,10 +205,32 @@ type destinationClaim struct {
 
 // destinationClaimKey names dir the same way for every spelling of it.
 func destinationClaimKey(dir string) string {
-	if abs, err := filepath.Abs(dir); err == nil {
-		return abs
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = filepath.Clean(dir)
 	}
-	return filepath.Clean(dir)
+	// filepath.Abs is lexical: resolve the symlinks of the longest existing
+	// ancestor, so /alias/new and /real/new (alias -> real) share one claim
+	// even before new exists. The missing tail is rejoined lexically.
+	existing, tail := abs, ""
+	for {
+		if resolved, err := filepath.EvalSymlinks(existing); err == nil {
+			if tail == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, tail)
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return abs
+		}
+		if tail == "" {
+			tail = filepath.Base(existing)
+		} else {
+			tail = filepath.Join(filepath.Base(existing), tail)
+		}
+		existing = parent
+	}
 }
 
 // acquire blocks until the caller holds dir's claim and returns its release.
