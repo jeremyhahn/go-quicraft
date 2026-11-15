@@ -572,7 +572,7 @@ func TestReencryptSnapshotFile_DestinationStatFailurePropagates(t *testing.T) {
 // reencryptDestinationWaiters reports how many reencryptSnapshotFile calls
 // are blocked waiting for another call's claim on dstDir.
 func reencryptDestinationWaiters(dstDir string) int {
-	return 0
+	return reencryptDestinationClaims.waiters(dstDir)
 }
 
 // TestReencryptSnapshotFile_ConcurrentDestinationIsExclusive drives two calls
