@@ -353,6 +353,53 @@ func TestReencryptSnapshotFile_RefusesUncleanDestination(t *testing.T) {
 	}
 }
 
+// TestReencryptSnapshotFile_RefusesUncleanSource pins that a source spelled
+// with a ".." after a symlinked component is refused before it is opened.
+// The kernel opens base/a/link/../snapshot.dat through the symlink
+// (base/b/snapshot.dat), while filepath.Dir collapses it lexically
+// (base/a): the metadata lookup would miss base/b/snapshot.meta, skipping
+// source verification, the existing-destination refusal and the restamp.
+func TestReencryptSnapshotFile_RefusesUncleanSource(t *testing.T) {
+	plain := snapshotPlaintext()
+	base := t.TempDir()
+	for _, d := range []string{filepath.Join(base, "a"), filepath.Join(base, "b", "child")} {
+		if err := os.MkdirAll(d, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(base, "b", "child"), filepath.Join(base, "a", "link")); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "b", "snapshot.dat"), plain, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum, size, err := engine.HashSnapshotReader(bytes.NewReader(plain))
+	if err != nil {
+		t.Fatalf("hash source: %v", err)
+	}
+	meta := engine.MarshalSnapshotMeta(engine.SnapshotMeta{
+		Index: testSnapIndex, Term: 1, ShardID: testSnapShardID, ReplicaID: testSnapReplicaID,
+		DataLen: size, DataHash: sum,
+	})
+	if err := os.WriteFile(filepath.Join(base, "b", "snapshot.meta"), meta, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Concatenated, not filepath.Join: Join would clean the spelling away.
+	sep := string(filepath.Separator)
+	srcPath := filepath.Join(base, "a", "link") + sep + ".." + sep + "snapshot.dat"
+	dstDir := filepath.Join(base, "dst")
+	_, _, err = ReencryptSnapshotFile(srcPath, filepath.Join(dstDir, "snapshot.dat"),
+		testSnapShardID, testSnapReplicaID, testSnapIndex, nil, nil)
+	var destErr *SnapshotDestinationError
+	if !errors.As(err, &destErr) || !errors.Is(err, fs.ErrInvalid) || destErr.Path != srcPath {
+		t.Fatalf("err = %v, want a SnapshotDestinationError for %s wrapping fs.ErrInvalid", err, srcPath)
+	}
+	if _, err := os.Stat(dstDir); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("destination directory stat err = %v after a refused call, want not exist", err)
+	}
+}
+
 func mustRead(t *testing.T, path string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(path)
