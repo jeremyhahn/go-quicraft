@@ -1240,29 +1240,91 @@ jobs:
               echo "${EVENT_LABEL} was just added; reviewing $EVENT_SHA again under it." ;;
             *)
               # LOCAL (security): P1 "Bind reused approvals to the change
-              # reviewed against the target base". The standing approval is
-              # reused only when its verdict marker's patch= is the patch id
-              # of the change into this event's base, the key computed below
-              # (empty on both sides only where no diff can be read: Gitea,
-              # or a diff over GitHub's limit, which the gate then refuses).
-              # Otherwise (a retarget to another base) codex reviews again.
+              # reviewed against the target base" and P1 "Approval reuse omits
+              # the context half of the review key". The standing approval is
+              # reused only when its verdict marker's patch= and ctx= are the
+              # review key of the change into this event's base, computed as
+              # below (both empty only where no diff can be read: Gitea, or a
+              # diff over GitHub's limit, which the gate then refuses); a
+              # marker with no ctx= does not match. Otherwise (a retarget to
+              # another base) codex reviews again. P1 "Re-adding code-review
+              # cannot recover the gate after a failed re-review": nor is it
+              # reused when a `Codex review` job of this workflow's runs for
+              # this PR on the head (the gate's history check) failed, was
+              # cancelled or timed out after the approval was submitted; codex
+              # then reviews again, never carried, and posts a fresh verdict.
               reuse=""
               if jq -e 'any(.[]; .state == "APPROVED")' <<<"$mine" >/dev/null; then
-                reuse_patch=""
+                reuse_patch="" reuse_ctx=""
                 if pr_diff "$WORK/reuse.diff"; then
                   reuse_patch=$(git patch-id --verbatim < "$WORK/reuse.diff") || reuse_patch=""
                   reuse_patch=${reuse_patch%% *}
+                  reuse_ctx=$(awk '/^diff --git / { f = $NF; next }
+                                   /^@@ / { print f "\t" $0 }' "$WORK/reuse.diff" |
+                              sha1sum | awk '{print $1}') || reuse_ctx=""
                 fi
                 [[ $reuse_patch =~ ^[0-9a-f]{40}$ ]] || reuse_patch=""
+                [[ $reuse_ctx =~ ^[0-9a-f]{40}$ ]] && [ -n "$reuse_patch" ] || reuse_ctx=""
                 rm -f "$WORK/reuse.diff"
-                approved_patch=$(jq -r '
+                approval=$(jq -c '
                     [ .[] | select(.state == "APPROVED") ] | sort_by(.submitted_at // "", .id) | last
-                    | (.body // "") | ((capture("<!-- codex-review:verdict head=[0-9a-f]{40}(?<a>[^>]*)-->") | .a
-                                        | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // "")' <<<"$mine")
-                if [ "$approved_patch" = "$reuse_patch" ]; then
-                  reuse=1
+                    | ((.body // "") | (capture("<!-- codex-review:verdict head=[0-9a-f]{40}(?<a>[^>]*)-->") | .a) // "") as $a
+                    | { at: (.submitted_at // ""),
+                        patch: (($a | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // ""),
+                        ctx: (($a | capture("\\bctx=(?<c>[0-9a-f]{40})\\b") | .c) // "") }' <<<"$mine") ||
+                  die "could not read $REVIEWER's approval of $EVENT_SHA"
+                approved_patch=$(jq -r '.patch' <<<"$approval")
+                approved_ctx=$(jq -r '.ctx' <<<"$approval")
+                approved_at=$(jq -r '.at' <<<"$approval")
+                if [ "$approved_patch" != "$reuse_patch" ] || [ "$approved_ctx" != "$reuse_ctx" ]; then
+                  echo "$REVIEWER approved $EVENT_SHA as patch '${approved_patch:-none}' ctx '${approved_ctx:-none}'; the change into $BASE_REF is patch '${reuse_patch:-unknown}' ctx '${reuse_ctx:-unknown}'. Reviewing it again."
+                elif [ "$FORGE" = github ]; then
+                  [ -n "$approved_at" ] || die "$REVIEWER's approval of $EVENT_SHA has no submission time"
+                  rr_ids=() rr_page=1
+                  while :; do
+                    rr_got=$(gha "/actions/workflows/$wf/runs?head_sha=$EVENT_SHA&per_page=100&page=$rr_page") ||
+                      die "could not list this workflow's runs on $EVENT_SHA"
+                    rr_got=$(jq -r --argjson n "$PR_NUM" --argjson me "$GITHUB_RUN_ID" --arg t "Code Review: PR #$PR_NUM into " '
+                        if (.workflow_runs | type) == "array" then .workflow_runs else error("not a list") end
+                        | if length == 0 then "end" else
+                            (.[] | select(.id != $me and (any(.pull_requests[]?; .number == $n)
+                                                          or ((.display_title // "") | startswith($t))))
+                                 | .id), "more" end' <<<"$rr_got") ||
+                      die "could not read this workflow's runs on $EVENT_SHA"
+                    [ "${rr_got##*$'\n'}" = more ] || break
+                    for rr_id in $rr_got; do [ "$rr_id" = more ] || rr_ids+=("$rr_id"); done
+                    rr_page=$((rr_page + 1))
+                  done
+                  rr_jobs='[]'
+                  for rr_id in "${rr_ids[@]}"; do
+                    [[ $rr_id =~ ^[0-9]+$ ]] || die "this workflow's runs on $EVENT_SHA name a run '$rr_id'"
+                    rr_page=1
+                    while :; do
+                      rr_got=$(gha "/actions/runs/$rr_id/jobs?filter=all&per_page=100&page=$rr_page") ||
+                        die "could not read the jobs of run $rr_id"
+                      rr_got=$(jq -c 'if (.jobs | type) == "array" then .jobs else error("not a list") end' <<<"$rr_got") ||
+                        die "could not read the jobs of run $rr_id"
+                      [ "$(jq 'length' <<<"$rr_got")" -gt 0 ] || break
+                      rr_jobs=$(printf '%s\n%s\n' "$rr_jobs" "$rr_got" | jq -cs '.[0] + .[1]') ||
+                        die "could not join the jobs of run $rr_id"
+                      rr_page=$((rr_page + 1))
+                    done
+                  done
+                  rr_failed=$(jq -r --arg t "$approved_at" '
+                      [ .[] | select(.name == "Codex review" and .status == "completed"
+                                     and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")
+                                     and (.completed_at // "~") > $t) ]
+                      | sort_by(.completed_at // "", .id) | last
+                      | if . != null then "\(.conclusion) at \(.completed_at // "an unknown time")" else empty end' <<<"$rr_jobs") ||
+                    die "could not read the review jobs on $EVENT_SHA"
+                  if [ -n "$rr_failed" ]; then
+                    again=1
+                    echo "A Codex review of $EVENT_SHA requested after $REVIEWER's approval ended $rr_failed; reviewing it again."
+                  else
+                    reuse=1
+                  fi
                 else
-                  echo "$REVIEWER approved $EVENT_SHA as patch '${approved_patch:-none}'; the change into $BASE_REF is '${reuse_patch:-unknown}'. Reviewing it again."
+                  reuse=1
                 fi
               fi
               if [ -n "$reuse" ]; then
@@ -3127,9 +3189,10 @@ jobs:
                                and (.state == "APPROVED" or .state == "REQUEST_CHANGES")) ]
                 | sort_by(.submitted_at // "", .id) | last
                 | if . != null and .state == "APPROVED" then
-                    { at: (.submitted_at // "~"),
-                      patch: ((.body // "") | ((capture("<!-- codex-review:verdict head=[0-9a-f]{40}(?<a>[^>]*)-->") | .a
-                                                | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // "")) }
+                    ((.body // "") | (capture("<!-- codex-review:verdict head=[0-9a-f]{40}(?<a>[^>]*)-->") | .a) // "") as $a
+                    | { at: (.submitted_at // "~"),
+                        patch: (($a | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // ""),
+                        ctx: (($a | capture("\\bctx=(?<c>[0-9a-f]{40})\\b") | .c) // "") }
                   else empty end') ||
               fail "cannot read the reviews of PR $PR_NUM"
             if [ -n "$approval" ]; then
@@ -3148,8 +3211,18 @@ jobs:
               patch=$(git patch-id --verbatim < gate-pr.diff) || fail "cannot compute the patch id of $BASE_SHA...$EVENT_SHA"
               patch=${patch%% *}
               [[ $patch =~ ^[0-9a-f]{40}$ ]] || fail "no patch id for the diff $BASE_SHA...$EVENT_SHA"
-              [ "$approved_patch" = "$patch" ] ||
-                fail "the approval of $EVENT_SHA is of patch '${approved_patch:-none}', not $patch, the change into $BASE_REF ($BASE_SHA...$EVENT_SHA); re-add code-review"
+              # P1 "Approval reuse omits the context half of the review key":
+              # git patch-id leaves out the whole `@@` line, so the same edits
+              # at other lines or in other functions keep it. ctx= is the
+              # review job's hunk_ctx: the sha1 of one "<path><TAB><@@ line>"
+              # line per hunk, in diff order. A marker with no ctx= fails.
+              ctx=$(awk '/^diff --git / { f = $NF; next }
+                         /^@@ / { print f "\t" $0 }' gate-pr.diff |
+                    sha1sum | awk '{print $1}') || fail "cannot compute the hunk context of $BASE_SHA...$EVENT_SHA"
+              [[ $ctx =~ ^[0-9a-f]{40}$ ]] || fail "no hunk context for the diff $BASE_SHA...$EVENT_SHA"
+              approved_ctx=$(jq -r '.ctx' <<<"$approval")
+              [ "$approved_patch" = "$patch" ] && [ "$approved_ctx" = "$ctx" ] ||
+                fail "the approval of $EVENT_SHA is of patch '${approved_patch:-none}' ctx '${approved_ctx:-none}', not patch $patch ctx $ctx, the change into $BASE_REF ($BASE_SHA...$EVENT_SHA); re-add code-review"
               # P1 "Scope historical failed review jobs to the same pull
               # request" and P1 "Grant the gate token permission to read check
               # runs": the history is read through the Actions API this job
