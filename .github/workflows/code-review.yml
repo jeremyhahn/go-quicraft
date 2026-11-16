@@ -3015,17 +3015,20 @@ jobs:
           # above is classified against the event's base, and again after
           # the wait: nothing passes past a review job its guard ended red
           # on a retarget, nor unless the live PR still has the event's base
-          # ref, base sha and head.
+          # ref and head. P1 "Allow ordinary base-branch advancement without
+          # failing the gate": the live base sha follows the target branch's
+          # tip, so only the base ref is compared; $BASE_SHA stays the pin of
+          # the classified diff.
           live_base_guard() {
             if [ "$REVIEW_RESULT" = failure ] && [ "$REVIEW_SKIP" = retargeted ]; then
               fail "the review job ended red: PR $PR_NUM was retargeted off $BASE_REF"
             fi
             [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || fail "the event names no base commit"
             local pin
-            pin=$(get "/pulls/$PR_NUM" | jq -r '"\(.base.ref // "") \(.base.sha // "") \(.head.sha // "")"') ||
+            pin=$(get "/pulls/$PR_NUM" | jq -r '"\(.base.ref // "") \(.head.sha // "")"') ||
               fail "cannot read PR $PR_NUM"
-            [ "$pin" = "$BASE_REF $BASE_SHA $EVENT_SHA" ] ||
-              fail "PR $PR_NUM is now at base/base sha/head '$pin', not the event's '$BASE_REF $BASE_SHA $EVENT_SHA'; push a new head or re-add code-review"
+            [ "$pin" = "$BASE_REF $EVENT_SHA" ] ||
+              fail "PR $PR_NUM is now at base/head '$pin', not the event's '$BASE_REF $EVENT_SHA'; push a new head or re-add code-review"
           }
           live_base_guard
           if [ "$exempt" = 1 ]; then
@@ -3033,6 +3036,13 @@ jobs:
             exit 0
           fi
           echo "$n changed files; at least one is code, so $REVIEWER must approve $EVENT_SHA."
+          # LOCAL (security): P1 "Preserve failed re-reviews in the required
+          # gate". A review this run requested (the guard's again path) that
+          # failed or was cancelled never lets an older approval of the head
+          # pass; a skipped review job (no review requested) still reads it.
+          case "$REVIEW_RESULT" in
+            failure|cancelled) fail "the Codex review job of this run ended $REVIEW_RESULT; re-add code-review" ;;
+          esac
 
           # Wait for the in-flight review of this PR and head, if any, so this
           # check, the newest on the head, reads its verdict (GitHub; on Gitea
