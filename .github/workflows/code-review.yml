@@ -3009,6 +3009,25 @@ jobs:
                       grep -Ec "$REVIEW_REQUIRED_PATHS" || true)
             [ "$outside" = 0 ] && [ "$guarded" = 0 ] && exempt=1
           fi
+          # LOCAL (security): P1 "Preserve the live-base guard in the new
+          # required gate" and P1 "The no-review exit bypasses the live-base
+          # guard". Checked before the exemption is granted, since the change
+          # above is classified against the event's base, and again after
+          # the wait: nothing passes past a review job its guard ended red
+          # on a retarget, nor unless the live PR still has the event's base
+          # ref, base sha and head.
+          live_base_guard() {
+            if [ "$REVIEW_RESULT" = failure ] && [ "$REVIEW_SKIP" = retargeted ]; then
+              fail "the review job ended red: PR $PR_NUM was retargeted off $BASE_REF"
+            fi
+            [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || fail "the event names no base commit"
+            local pin
+            pin=$(get "/pulls/$PR_NUM" | jq -r '"\(.base.ref // "") \(.base.sha // "") \(.head.sha // "")"') ||
+              fail "cannot read PR $PR_NUM"
+            [ "$pin" = "$BASE_REF $BASE_SHA $EVENT_SHA" ] ||
+              fail "PR $PR_NUM is now at base/base sha/head '$pin', not the event's '$BASE_REF $BASE_SHA $EVENT_SHA'; push a new head or re-add code-review"
+          }
+          live_base_guard
           if [ "$exempt" = 1 ]; then
             echo "All $n changed files are on the no-review list (docs and CI config); no review is required."
             exit 0
@@ -3046,18 +3065,8 @@ jobs:
             done
           fi
 
-          # LOCAL (security): P1 "Preserve the live-base guard in the new
-          # required gate". Read after the wait: no approval counts past a
-          # review job its guard ended red on a retarget, nor unless the live
-          # PR still has the event's base ref, base sha and head.
-          if [ "$REVIEW_RESULT" = failure ] && [ "$REVIEW_SKIP" = retargeted ]; then
-            fail "the review job ended red: PR $PR_NUM was retargeted off $BASE_REF"
-          fi
-          [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || fail "the event names no base commit"
-          pin=$(get "/pulls/$PR_NUM" | jq -r '"\(.base.ref // "") \(.base.sha // "") \(.head.sha // "")"') ||
-            fail "cannot read PR $PR_NUM"
-          [ "$pin" = "$BASE_REF $BASE_SHA $EVENT_SHA" ] ||
-            fail "PR $PR_NUM is now at base/base sha/head '$pin', not the event's '$BASE_REF $BASE_SHA $EVENT_SHA'; push a new head or re-add code-review"
+          # LOCAL (security): the live-base guard again, read after the wait.
+          live_base_guard
 
           # (b) The reviewer's latest standing verdict on this head. PENDING,
           # COMMENTED and dismissed reviews are no verdict.
