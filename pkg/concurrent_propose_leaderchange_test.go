@@ -289,7 +289,34 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 		t.Logf("SyncPropose(%s) through a follower raced a leader change: %v", key, err)
 	}
 
-	c.closeHost(t, leader)
+	// The election is held behind a gate until a probe handoff is recorded.
+	// The third replica is paused, so it neither campaigns nor votes and no
+	// survivor can win a quorum. The proposer's engine node is paused, so its
+	// raft clock is frozen as a follower of the leader while the probes
+	// queue; the host still admits them, and a resumed follower keeps the
+	// leader it knew (raft.Peer.RejoinAfterPause). Neither the leader's
+	// shutdown nor scheduling can then elect a replacement before a probe is
+	// forwarded to the stopped leader.
+	otherID := 6 - leaderID - (leaderID%3 + 1)
+	other := c.hosts[otherID-1]
+	if err := other.PauseShard(ctx, concurrentProposeShard); err != nil {
+		t.Fatalf("PauseShard(replica %d): %v", otherID, err)
+	}
+	pns, err := proposer.getNode(concurrentProposeShard)
+	if err != nil {
+		t.Fatalf("getNode: %v", err)
+	}
+	pnode := proposer.engine.GetNode(concurrentProposeShard)
+	if pnode == nil {
+		t.Fatal("the proposer has no engine node")
+	}
+	proposer.engine.BeginPause(pnode)
+	if err := proposer.engine.AwaitPause(ctx, pnode); err != nil {
+		t.Fatalf("AwaitPause: %v", err)
+	}
+	if got := pns.leaderID.Load(); got != leaderID {
+		t.Fatalf("the proposer named leader %d, not %d, when its clock froze", got, leaderID)
+	}
 	const orphans = 8
 	// The probes' context stays alive until a leader-change result arrives:
 	// a canceled probe resolves through the caller's cancellation, which
@@ -306,28 +333,41 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 			results <- concurrentProposeResult{key, err}
 		}()
 	}
-	// Forwarding to the stopped leader is synchronized before the scenario
-	// advances: a probe the proposer's step worker has taken from the queue
-	// while it still names the stopped replica as leader was forwarded
-	// there. The leader ID only moves away from a stopped replica, so seeing
-	// it after the take proves the take happened under it.
-	pns, err := proposer.getNode(concurrentProposeShard)
-	if err != nil {
-		t.Fatalf("getNode: %v", err)
-	}
+	// Every probe is queued on the frozen proposer before the leader stops.
+	// The probes are captured here, so a handoff is recorded through the
+	// queue even after a probe has resolved and left pendingProposals.
+	var probes []*pendingProposal
 	if !waitUntil(10*time.Second, func() bool {
-		taken := false
+		probes = probes[:0]
 		pns.pendingProposals.Range(func(_, value any) bool {
-			pp, ok := value.(*pendingProposal)
-			if ok && pp.node != nil {
-				taken, _ = pp.node.ProposalTaken(&pp.enqueuedAt)
+			if pp, ok := value.(*pendingProposal); ok && pp.node == pnode {
+				probes = append(probes, pp)
 			}
-			return !taken
+			return true
 		})
-		return taken && pns.leaderID.Load() == leaderID
+		return len(probes) >= orphans
 	}) {
-		t.Fatalf("no probe was handed to raft while the proposer still named "+
-			"the stopped leader %d", leaderID)
+		t.Fatalf("only %d of %d probes were queued on the paused proposer", len(probes), orphans)
+	}
+	c.closeHost(t, leader)
+	proposer.engine.ResumeNode(pnode)
+	// No replacement can be elected yet, so the resumed proposer hands a
+	// probe to raft while it still names the stopped leader, and raft
+	// forwards it there.
+	if !waitUntil(10*time.Second, func() bool {
+		for _, pp := range probes {
+			if taken, _ := pnode.ProposalTaken(&pp.enqueuedAt); taken {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no probe was handed to raft after the proposer resumed "+
+			"naming the stopped leader %d", leaderID)
+	}
+	// Release the election.
+	if err := other.ResumeShard(ctx, concurrentProposeShard); err != nil {
+		t.Fatalf("ResumeShard(replica %d): %v", otherID, err)
 	}
 	if !waitUntil(30*time.Second, func() bool {
 		for id := uint64(1); id <= 3; id++ {
