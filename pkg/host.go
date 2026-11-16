@@ -11408,7 +11408,7 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	// Remove the retired replica's snapshot directory. RemoveAll of a missing
 	// directory is nil, so a retry is idempotent.
 	if err := h.snapshotFsys().RemoveAll(snapDir); err != nil {
-		return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: "remove snapshot directory", Path: snapDir, Err: err}
+		return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "remove snapshot directory", Path: snapDir, Err: err}
 	}
 
 	// Make the removal durable BEFORE the intent is dropped: sync the parent
@@ -11419,10 +11419,10 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	if parent := filepath.Dir(snapDir); parent != snapDir {
 		if _, err := h.snapshotFsys().Stat(parent); err == nil {
 			if err := syncDir(h.snapshotFsys(), parent); err != nil {
-				return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync snapshot parent directory", Path: parent, Err: err}
+				return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync snapshot parent directory", Path: parent, Err: err}
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: "stat snapshot parent directory", Path: parent, Err: err}
+			return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "stat snapshot parent directory", Path: parent, Err: err}
 		}
 	}
 
@@ -11459,14 +11459,14 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 	return nil
 }
 
-// DataDirChangedError is returned by StartShard when the replica's bootstrap
+// dataDirChangedError is returned by StartShard when the replica's bootstrap
 // record states a different DataDir from the Config's or, for a replica with
 // no bootstrap record, its snapshot record lies under a different one. The replica's
 // snapshots, and the LogDB records naming them, are under the recorded
 // DataDir: a start under another one would recover them from the old tree
 // while recording the new one, and a later RemoveData or ImportSnapshot,
 // which locate the tree by the record, would act on the wrong directory.
-type DataDirChangedError struct {
+type dataDirChangedError struct {
 	// ShardID is the shard whose start was refused.
 	ShardID uint64
 	// ReplicaID is the replica whose start was refused.
@@ -11480,12 +11480,12 @@ type DataDirChangedError struct {
 }
 
 // Error implements the error interface.
-func (e *DataDirChangedError) Error() string {
+func (e *dataDirChangedError) Error() string {
 	return fmt.Sprintf("quicraft: shard %d replica %d was started with DataDir %q, refusing DataDir %q",
 		e.ShardID, e.ReplicaID, e.Recorded, e.Requested)
 }
 
-// refuseDataDirChange returns *DataDirChangedError when the replica's
+// refuseDataDirChange returns *dataDirChangedError when the replica's
 // bootstrap record states a DataDir other than dataDir or, with no bootstrap
 // record, its snapshot record lies under another DataDir, and a LogDB error
 // when that cannot be determined. It runs before StartShard recovers or
@@ -11501,7 +11501,7 @@ func (h *Host) refuseDataDirChange(shardID, replicaID uint64, dataDir string) er
 	}
 	if ok {
 		if bs.DataDir != dataDir {
-			return &DataDirChangedError{
+			return &dataDirChangedError{
 				ShardID:   shardID,
 				ReplicaID: replicaID,
 				Recorded:  bs.DataDir,
@@ -11537,7 +11537,7 @@ func (h *Host) refuseDataDirChange(shardID, replicaID uint64, dataDir string) er
 	if recorded == filepath.Join(h.cfg.NodeHostDir, "snapshots") {
 		recorded = ""
 	}
-	return &DataDirChangedError{
+	return &dataDirChangedError{
 		ShardID:   shardID,
 		ReplicaID: replicaID,
 		Recorded:  recorded,
@@ -11671,7 +11671,7 @@ func removeDataIntentPath(nodeHostDir string, shardID, replicaID uint64) string 
 func (h *Host) readRemoveDataIntent(shardID, replicaID uint64) (string, bool, error) {
 	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
 	fail := func(op string, err error) (string, bool, error) {
-		return "", false, &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: op, Path: p, Err: err}
+		return "", false, &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: op, Path: p, Err: err}
 	}
 	f, err := h.snapshotFsys().Open(p)
 	if err != nil {
@@ -11715,7 +11715,7 @@ func (h *Host) readRemoveDataIntent(shardID, replicaID uint64) (string, bool, er
 func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) error {
 	fsys := h.snapshotFsys()
 	fail := func(op, path string, err error) error {
-		return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: op, Path: path, Err: err}
+		return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: op, Path: path, Err: err}
 	}
 	dir := filepath.Join(h.cfg.NodeHostDir, removeDataIntentDir)
 	if err := fsys.MkdirAll(dir, 0o700); err != nil {
@@ -11757,10 +11757,10 @@ func (h *Host) writeRemoveDataIntent(shardID, replicaID uint64, snapDir string) 
 func syncRemoveDataIntentDir(fsys snapshotFS, nodeHostDir string, shardID, replicaID uint64) error {
 	dir := filepath.Join(nodeHostDir, removeDataIntentDir)
 	if err := syncDir(fsys, dir); err != nil {
-		return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync removal intent directory", Path: dir, Err: err}
+		return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync removal intent directory", Path: dir, Err: err}
 	}
 	if err := syncDir(fsys, nodeHostDir); err != nil {
-		return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync removal intent parent directory", Path: nodeHostDir, Err: err}
+		return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync removal intent parent directory", Path: nodeHostDir, Err: err}
 	}
 	return nil
 }
@@ -11771,11 +11771,11 @@ func (h *Host) clearRemoveDataIntent(shardID, replicaID uint64) error {
 	fsys := h.snapshotFsys()
 	p := removeDataIntentPath(h.cfg.NodeHostDir, shardID, replicaID)
 	if err := fsys.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: "remove removal intent", Path: p, Err: err}
+		return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "remove removal intent", Path: p, Err: err}
 	}
 	dir := filepath.Dir(p)
 	if err := syncDir(fsys, dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return &RemoveDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync removal intent directory", Path: dir, Err: err}
+		return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync removal intent directory", Path: dir, Err: err}
 	}
 	return nil
 }
@@ -13349,10 +13349,10 @@ func walShardIDs(db logdb.LogDB) []uint64 {
 // context.DeadlineExceeded.
 func mapContextError(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &ContextError{Err: ErrTimeout, Cause: err}
+		return &contextError{Err: ErrTimeout, Cause: err}
 	}
 	if errors.Is(err, context.Canceled) {
-		return &ContextError{Err: ErrCanceled, Cause: err}
+		return &contextError{Err: ErrCanceled, Cause: err}
 	}
 	return err
 }

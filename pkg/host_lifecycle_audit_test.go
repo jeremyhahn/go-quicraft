@@ -213,9 +213,9 @@ func TestAudit_RefuseDataDirChange_JoinedRecordWithoutAddresses(t *testing.T) {
 			}
 			other := t.TempDir()
 			err := h.refuseDataDirChange(shardID, replicaID, other)
-			var dc *DataDirChangedError
+			var dc *dataDirChangedError
 			if !errors.As(err, &dc) || dc.Recorded != dataDir || dc.Requested != other {
-				t.Fatalf("refuseDataDirChange(changed) = %v; want DataDirChangedError %q -> %q", err, dataDir, other)
+				t.Fatalf("refuseDataDirChange(changed) = %v; want dataDirChangedError %q -> %q", err, dataDir, other)
 			}
 			scfg := testShardConfig(shardID, replicaID)
 			scfg.DataDir = dataDir

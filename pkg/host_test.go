@@ -765,10 +765,10 @@ func waitForLogEntry(t *testing.T, h *Host, shardID uint64) LogRange {
 // NewHost
 // ---------------------------------------------------------------------------
 
-// TestContextError_IsUnwrap: mapContextError returns a *ContextError that
+// Test_IsUnwrap_contextError: mapContextError returns a *contextError that
 // matches its quicraft sentinel through Is and the context error through
 // Unwrap, and keeps the "sentinel: cause" message.
-func TestContextError_IsUnwrap(t *testing.T) {
+func Test_IsUnwrap_contextError(t *testing.T) {
 	cases := []struct {
 		cause    error
 		sentinel error
@@ -779,12 +779,12 @@ func TestContextError_IsUnwrap(t *testing.T) {
 	}
 	for _, tc := range cases {
 		err := mapContextError(fmt.Errorf("wrapped: %w", tc.cause))
-		var ce *ContextError
+		var ce *contextError
 		if !errors.As(err, &ce) {
-			t.Fatalf("mapContextError(%v) = %T %v, want *ContextError", tc.cause, err, err)
+			t.Fatalf("mapContextError(%v) = %T %v, want *contextError", tc.cause, err, err)
 		}
 		if ce.Err != tc.sentinel {
-			t.Fatalf("ContextError.Err = %v, want %v", ce.Err, tc.sentinel)
+			t.Fatalf("contextError.Err = %v, want %v", ce.Err, tc.sentinel)
 		}
 		if !errors.Is(err, tc.sentinel) || !errors.Is(err, tc.cause) {
 			t.Fatalf("errors.Is(%v) misses %v or %v", err, tc.sentinel, tc.cause)
@@ -802,12 +802,12 @@ func TestContextError_IsUnwrap(t *testing.T) {
 	}
 }
 
-// TestRemoveDataError_IsUnwrap: a RemoveData step failure is a
-// *RemoveDataError naming the shard, replica, step and path, and unwraps to
+// Test_IsUnwrap_removeDataError: a RemoveData step failure is a
+// *removeDataError naming the shard, replica, step and path, and unwraps to
 // the underlying error.
-func TestRemoveDataError_IsUnwrap(t *testing.T) {
+func Test_IsUnwrap_removeDataError(t *testing.T) {
 	cause := os.ErrPermission
-	err := error(&RemoveDataError{ShardID: 3, ReplicaID: 4, Op: "remove snapshot directory", Path: "/d", Err: cause})
+	err := error(&removeDataError{ShardID: 3, ReplicaID: 4, Op: "remove snapshot directory", Path: "/d", Err: cause})
 	if !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("errors.Is(%v, os.ErrPermission) = false", err)
 	}
@@ -827,12 +827,12 @@ func TestRemoveDataError_IsUnwrap(t *testing.T) {
 		t.Fatal(wErr)
 	}
 	_, ok, readErr := h.readRemoveDataIntent(3, 4)
-	var rde *RemoveDataError
+	var rde *removeDataError
 	if ok || !errors.As(readErr, &rde) {
-		t.Fatalf("readRemoveDataIntent(empty) = %v, %T %v, want *RemoveDataError", ok, readErr, readErr)
+		t.Fatalf("readRemoveDataIntent(empty) = %v, %T %v, want *removeDataError", ok, readErr, readErr)
 	}
 	if rde.ShardID != 3 || rde.ReplicaID != 4 || rde.Path != p || !errors.Is(readErr, ErrInvalidOperation) {
-		t.Fatalf("RemoveDataError = %+v, want shard 3 replica 4 path %s matching ErrInvalidOperation", rde, p)
+		t.Fatalf("removeDataError = %+v, want shard 3 replica 4 path %s matching ErrInvalidOperation", rde, p)
 	}
 }
 

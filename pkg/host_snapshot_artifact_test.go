@@ -85,11 +85,11 @@ func assertDataDirChangeRefused(t *testing.T, err error) {
 		t.Errorf("StartShard accepted DataDir B for a replica recorded under DataDir A")
 		return
 	}
-	var dc *DataDirChangedError
+	var dc *dataDirChangedError
 	if !errors.As(err, &dc) {
-		t.Fatalf("StartShard with a changed DataDir = %v, want *DataDirChangedError", err)
+		t.Fatalf("StartShard with a changed DataDir = %v, want *dataDirChangedError", err)
 	}
 	if dc.ShardID != removeDataShard || dc.Recorded == dc.Requested {
-		t.Fatalf("DataDirChangedError = %+v, want shard %d with distinct DataDirs", dc, removeDataShard)
+		t.Fatalf("dataDirChangedError = %+v, want shard %d with distinct DataDirs", dc, removeDataShard)
 	}
 }

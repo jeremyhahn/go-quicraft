@@ -1785,12 +1785,12 @@ func MaybeApplied(err error) bool {
 	return errors.As(err, &m)
 }
 
-// ContextError is returned when a Host call ends because the caller's
+// contextError is returned when a Host call ends because the caller's
 // context was done. Err is the quicraft sentinel the context error maps to
 // (ErrTimeout for a deadline, ErrCanceled for a cancellation) and Cause is
 // the context error itself, so errors.Is matches both ErrTimeout and
 // context.DeadlineExceeded (or ErrCanceled and context.Canceled).
-type ContextError struct {
+type contextError struct {
 	// Err is ErrTimeout or ErrCanceled.
 	Err error
 	// Cause is the context's error, possibly wrapped.
@@ -1798,23 +1798,23 @@ type ContextError struct {
 }
 
 // Error returns "<sentinel>: <cause>".
-func (e *ContextError) Error() string {
+func (e *contextError) Error() string {
 	return e.Err.Error() + ": " + e.Cause.Error()
 }
 
 // Is reports whether target is the quicraft sentinel Err.
-func (e *ContextError) Is(target error) bool {
+func (e *contextError) Is(target error) bool {
 	return target == e.Err
 }
 
 // Unwrap returns the context error.
-func (e *ContextError) Unwrap() error { return e.Cause }
+func (e *contextError) Unwrap() error { return e.Cause }
 
-// RemoveDataError is returned by Host.RemoveData when one of its storage
+// removeDataError is returned by Host.RemoveData when one of its storage
 // steps (the removal intent, the snapshot directory or a directory sync)
 // fails. Op names the step and Path the file or directory it acted on; Err
 // is the underlying error, so errors.Is and errors.As see through it.
-type RemoveDataError struct {
+type removeDataError struct {
 	// ShardID is the shard whose data was being removed.
 	ShardID uint64
 	// ReplicaID is the replica whose data was being removed.
@@ -1828,13 +1828,13 @@ type RemoveDataError struct {
 }
 
 // Error returns a human-readable description of the failed step.
-func (e *RemoveDataError) Error() string {
+func (e *removeDataError) Error() string {
 	return fmt.Sprintf("quicraft: RemoveData shard %d replica %d: %s %s: %v",
 		e.ShardID, e.ReplicaID, e.Op, e.Path, e.Err)
 }
 
 // Unwrap returns the underlying error.
-func (e *RemoveDataError) Unwrap() error { return e.Err }
+func (e *removeDataError) Unwrap() error { return e.Err }
 
 // NotLeader reports whether err indicates this replica is not the leader,
 // and returns the known leader's replica ID when the error carries one.
