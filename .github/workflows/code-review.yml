@@ -3078,6 +3078,48 @@ jobs:
           # LOCAL (security): the live-base guard again, read after the wait.
           live_base_guard
 
+          # LOCAL (security): P1 "Preserve failed re-reviews across subsequent
+          # workflow runs". A review an earlier run requested (an effort or
+          # model label on an approved head) that failed, was cancelled or
+          # timed out keeps the older approval from passing in every later
+          # run: one whose review job was skipped or ended at a benign guard
+          # exit, and after the twin wait above. Every completed `Codex review`
+          # check run on the head counts, not only the latest, since a later
+          # benign exit (skip=reviewed) ends success without reviewing. A new
+          # approval submitted after the failure clears it. GitHub only: Gitea
+          # has no check-runs API.
+          if [ "$FORGE" = github ]; then
+            approved_at=$(get_all "/pulls/$PR_NUM/reviews?" | jq -r --arg u "$REVIEWER" --arg s "$EVENT_SHA" '
+                [ .[] | (if .state == "CHANGES_REQUESTED" then .state = "REQUEST_CHANGES" else . end)
+                      | select(.user.login == $u and .commit_id == $s and (.dismissed | not)
+                               and (.state == "APPROVED" or .state == "REQUEST_CHANGES")) ]
+                | sort_by(.submitted_at // "", .id) | last
+                | if . != null and .state == "APPROVED" then .submitted_at // "~" else empty end') ||
+              fail "cannot read the reviews of PR $PR_NUM"
+            if [ -n "$approved_at" ]; then
+              [ "$approved_at" != "~" ] || fail "the approval of $EVENT_SHA has no submission time"
+              runs='[]' page=1
+              while :; do
+                got=$(get "/commits/$EVENT_SHA/check-runs?check_name=Codex%20review&filter=all&per_page=100&page=$page" |
+                      jq -c 'if (.check_runs | type) == "array" then .check_runs else error("not a list") end') ||
+                  fail "cannot read the check runs of $EVENT_SHA"
+                [ "$(jq 'length' <<<"$got")" -gt 0 ] || break
+                runs=$(printf '%s\n%s\n' "$runs" "$got" | jq -cs '.[0] + .[1]') ||
+                  fail "cannot join the check runs of $EVENT_SHA"
+                page=$((page + 1))
+              done
+              failed=$(jq -r --arg t "$approved_at" '
+                  [ .[] | select(.name == "Codex review" and .status == "completed"
+                                 and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")
+                                 and (.completed_at // "~") > $t) ]
+                  | sort_by(.completed_at // "", .id) | last
+                  | if . != null then "\(.conclusion) at \(.completed_at // "an unknown time")" else empty end' <<<"$runs") ||
+                fail "cannot read the check runs of $EVENT_SHA"
+              [ -z "$failed" ] ||
+                fail "a Codex review of $EVENT_SHA requested after its approval ended $failed; re-add code-review"
+            fi
+          fi
+
           # (b) The reviewer's latest standing verdict on this head. PENDING,
           # COMMENTED and dismissed reviews are no verdict.
           verdict=$(get_all "/pulls/$PR_NUM/reviews?" | jq -r --arg u "$REVIEWER" --arg s "$EVENT_SHA" '
