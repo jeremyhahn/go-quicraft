@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
+	"sync"
 )
 
 // bumpable reports whether -bump moves this finding: a require behind its
@@ -17,7 +19,10 @@ func bumpable(f finding) bool {
 
 // bumpModule runs `go get path@latest` for each bumpable require in dir,
 // and `go get path@fixed` for each required module, direct or // indirect,
-// govulncheck reports vulnerable with a fixed version, then `go mod tidy`, and prints each move. A replace that would move is
+// govulncheck reports vulnerable with a fixed version (a floor, skipped
+// once met), then `go mod tidy`, and prints each move. A module that
+// replaces a module moved earlier in the run with a local directory is
+// tidied even when nothing of its own moves. A replace that would move is
 // printed as a hand edit, since go get does not rewrite a replace.
 func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []finding, stdout io.Writer) error {
 	// A failed lookup (go list -e reports it as an Error entry, not a
@@ -58,6 +63,12 @@ func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []find
 		planned[d.Path] = len(plan)
 		plan = append(plan, step{path: d.Path, from: d.Version, to: f.Latest})
 	}
+	// A fix is a minimum version, not an exact one: an earlier go get can
+	// already have raised the module past it, and an exact go get of the
+	// fix would then lower it and the upgrade that raised it. So each step
+	// re-reads the versions go.mod selects after the steps before it and
+	// is skipped when its module is already at or above its target: no
+	// step selects a version below the current requirement.
 	for _, v := range fixes {
 		if at, ok := planned[v.Module]; ok {
 			if semverLess(plan[at].to, v.fixed) {
@@ -68,18 +79,86 @@ func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []find
 		planned[v.Module] = len(plan)
 		plan = append(plan, step{path: v.Module, from: v.Version, to: v.fixed})
 	}
+	moved := false
 	for _, s := range plan {
+		selected, err := requiredVersions(dir)
+		if err != nil {
+			return err
+		}
+		if cur, ok := selected[s.path]; ok {
+			if !semverLess(cur, s.to) {
+				continue
+			}
+			s.from = cur
+		}
 		if err := edit.Get(dir, s.path+"@"+s.to); err != nil {
 			return err
 		}
+		moved = true
 		if _, err := fmt.Fprintf(stdout, "bumped %s %s -> %s\n", s.path, s.from, s.to); err != nil {
 			return err
 		}
 	}
-	if len(plan) == 0 {
-		return nil
+	// A module that replaces a module bumped earlier in this run with a
+	// local directory (contrib/dragonboat and test/performance/quicraft
+	// replace the root) has no bump of its own, but the root's raised
+	// requirements raise its floors: it is tidied too.
+	if !moved {
+		upstream, err := localUpstreamMoved(dir)
+		if err != nil || !upstream {
+			return err
+		}
 	}
-	return edit.Tidy(dir)
+	if err := edit.Tidy(dir); err != nil {
+		return err
+	}
+	markMoved(dir)
+	return nil
+}
+
+// movedDirs holds the absolute directories of the modules this run
+// bumped or tidied; deps-bump names the root before its dependents.
+var movedDirs = struct {
+	sync.Mutex
+	dirs map[string]bool
+}{dirs: make(map[string]bool)}
+
+func markMoved(dir string) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	movedDirs.Lock()
+	defer movedDirs.Unlock()
+	movedDirs.dirs[abs] = true
+}
+
+// localUpstreamMoved reports whether the go.mod in dir replaces a module
+// with a local directory this run bumped or tidied.
+func localUpstreamMoved(dir string) (bool, error) {
+	directives, err := readGoMod(dir)
+	if err != nil {
+		return false, err
+	}
+	movedDirs.Lock()
+	defer movedDirs.Unlock()
+	for _, d := range directives {
+		if d.Kind != kindReplace || d.NewVersion != "" {
+			continue
+		}
+		target := d.NewPath
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(dir, target)
+		}
+		abs, err := filepath.Abs(target)
+		if err != nil {
+			return false, err
+		}
+		if movedDirs.dirs[abs] {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // vulnFix is a vulnerable required module version and the lowest version

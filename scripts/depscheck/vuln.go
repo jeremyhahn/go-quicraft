@@ -166,22 +166,41 @@ func (v vulnFinding) note() string {
 // requiredModules is the set of module paths with a require line, direct
 // or // indirect, in the go.mod of dir.
 func requiredModules(dir string) (map[string]bool, error) {
+	versions, err := requiredVersions(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(versions))
+	for p := range versions {
+		out[p] = true
+	}
+	return out, nil
+}
+
+// requiredVersions maps each module the go.mod in dir requires, direct
+// or // indirect, to the version it requires now.
+func requiredVersions(dir string) (map[string]string, error) {
+	directives, err := readGoMod(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string)
+	for _, d := range directives {
+		if d.Kind == kindRequire {
+			out[d.Path] = d.Version
+		}
+	}
+	return out, nil
+}
+
+// readGoMod parses the go.mod in dir.
+func readGoMod(dir string) ([]directive, error) {
 	file := filepath.Join(dir, "go.mod")
 	data, err := os.ReadFile(file) //#nosec G304 -- the go.mod of a module directory the Makefile names
 	if err != nil {
 		return nil, err
 	}
-	directives, err := parseGoMod(file, data)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]bool)
-	for _, d := range directives {
-		if d.Kind == kindRequire {
-			out[d.Path] = true
-		}
-	}
-	return out, nil
+	return parseGoMod(file, data)
 }
 
 // vulnFindings turns a scan into findings in a stable order, marking each
