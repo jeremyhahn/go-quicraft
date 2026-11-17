@@ -156,33 +156,54 @@ jobs:
           git diff --cached --stat
           echo "CHANGED=$(git diff --cached --name-only | tr '\n' ' ')" >> "$GITHUB_ENV"
 
-      # One commit through the git data API, so GitHub signs it, then a
-      # fast-forward ref update (force: false) or a new ref.
+      # One commit through GraphQL createCommitOnBranch. GitHub makes that
+      # commit itself: committer GitHub <noreply@github.com> (login web-flow),
+      # signed with GitHub's key and verified, with the App bot as author.
+      # That is the one GitHub-made identity ci.yml's Signatures job accepts
+      # (committer email noreply@github.com, API verified, committer login
+      # web-flow). The REST git/commits call would make github-actions[bot]
+      # the committer, which the job rejects. The branch is created at the
+      # base when missing; expectedHeadOid makes the commit fail, not race,
+      # if the branch moved since the base was read. The last check reads the
+      # commit back and fails here, not in the dispatched CI, if GitHub ever
+      # makes it otherwise.
       - name: Commit to ci/deps-bump
         if: ${{ env.CHANGED != '' }}
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           set -euo pipefail
-          entries='[]'
+          # File contents go through a file, not an argument: a go.sum in
+          # base64 can pass the 128 KiB single-argument limit.
+          add="$RUNNER_TEMP/bump-additions.jsonl"
+          : > "$add"
+          deletions='[]'
           for f in $CHANGED; do
             if [ -f "$f" ]; then
-              blob=$(base64 -w0 "$f" | jq -Rs '{content: ., encoding: "base64"}' | gh api "repos/$REPO/git/blobs" --input - --jq .sha)
-              entries=$(jq -c --arg p "$f" --arg s "$blob" '. + [{path: $p, mode: "100644", type: "blob", sha: $s}]' <<<"$entries")
+              base64 -w0 "$f" | jq -Rsc --arg p "$f" '{path: $p, contents: .}' >> "$add"
             else
-              entries=$(jq -c --arg p "$f" '. + [{path: $p, mode: "100644", type: "blob", sha: null}]' <<<"$entries")
+              deletions=$(jq -c --arg p "$f" '. + [{path: $p}]' <<<"$deletions")
             fi
           done
-          base_tree=$(gh api "repos/$REPO/git/commits/$BASE_SHA" --jq .tree.sha)
-          tree=$(jq -n --arg b "$base_tree" --argjson e "$entries" '{base_tree: $b, tree: $e}' | gh api "repos/$REPO/git/trees" --input - --jq .sha)
-          msg=$(printf 'deps: bump dependencies to latest (ruling 640)\n\n%s\n' "$(git diff --cached --stat)")
-          commit=$(jq -n --arg m "$msg" --arg t "$tree" --arg p "$BASE_SHA" '{message: $m, tree: $t, parents: [$p]}' | gh api "repos/$REPO/git/commits" --input - --jq .sha)
-          if gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$REPO/git/refs/heads/$BRANCH" -f sha="$commit" -F force=false >/dev/null
-          else
-            gh api "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$commit" >/dev/null
+          if ! gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$BASE_SHA" >/dev/null
           fi
-          echo "deps-bump: $commit on $BRANCH"
+          body=$(git diff --cached --stat)
+          # shellcheck disable=SC2016 # GraphQL variables, not shell
+          query='mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }'
+          commit=$(jq -n --arg q "$query" --arg repo "$REPO" --arg br "$BRANCH" --arg head "$BASE_SHA" \
+              --arg h 'deps: bump dependencies to latest (ruling 640)' --arg b "$body" \
+              --slurpfile add "$add" --argjson del "$deletions" \
+              '{query: $q, variables: {input: {branch: {repositoryNameWithOwner: $repo, branchName: $br}, expectedHeadOid: $head, message: {headline: $h, body: $b}, fileChanges: {additions: $add, deletions: $del}}}}' \
+            | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid)
+          [ -n "$commit" ] || { echo "::error::createCommitOnBranch returned no commit"; exit 1; }
+          v=$(gh api "repos/$REPO/commits/$commit" --jq '[(.commit.verification.verified|tostring), .commit.committer.email, (.committer.login // "none")] | @tsv')
+          IFS=$'\t' read -r ok email login <<<"$v"
+          if [ "$ok" != true ] || [ "$email" != noreply@github.com ] || [ "$login" != web-flow ]; then
+            echo "::error::$commit is not a verified web-flow commit (verified=$ok committer=$email login=$login): the Signatures job would reject it"
+            exit 1
+          fi
+          echo "deps-bump: $commit on $BRANCH (GitHub web-flow, verified)"
 
       - name: Open the PR and label it
         id: pr
@@ -209,4 +230,4 @@ jobs:
 
       - name: Tear down
         if: always()
-        run: rm -f "$RUNNER_TEMP/gomodauth.env" "$RUNNER_TEMP/bump.b64" "$RUNNER_TEMP/bump.patch"
+        run: rm -f "$RUNNER_TEMP/gomodauth.env" "$RUNNER_TEMP/bump.b64" "$RUNNER_TEMP/bump.patch" "$RUNNER_TEMP/bump-additions.jsonl"
