@@ -1,7 +1,6 @@
 package main
 
 import (
-	"slices"
 	"strings"
 	"time"
 )
@@ -67,7 +66,7 @@ func assess(dep dependency, mod listedModule, listed bool, firstParty string, no
 		return f
 	}
 	f.Latest = latestVersion(dep, mod, strings.HasPrefix(dep.Path, firstParty))
-	f.Behind = isBehind(dep.Version, f.Latest, mod.Versions)
+	f.Behind = isBehind(dep.Version, f.Latest)
 	if f.Behind && mod.Update != nil && mod.Update.Version == f.Latest {
 		f.Released = mod.Update.Time
 		f.Fresh = isFresh(f.Released, now)
@@ -111,15 +110,12 @@ func latestVersion(dep dependency, mod listedModule, firstParty bool) string {
 // (a pseudo-version) is behind any tag the latest names; a latest that is
 // not in the list came from Update, which the go command reports only when
 // it is newer.
-func isBehind(current, latest string, versions []string) bool {
-	if latest == current {
-		return false
-	}
-	at := slices.Index(versions, latest)
-	if at < 0 {
-		return true
-	}
-	return slices.Index(versions, current) < at
+func isBehind(current, latest string) bool {
+	// SemVer precedence, not the position in go list's Versions: a
+	// pseudo-version is normally absent from that list, and one cut after
+	// the latest tag must not read as behind it (a bump would move it back
+	// to the older tag).
+	return latest != current && semverLess(current, latest)
 }
 
 func releasesOnly(versions []string) []string {

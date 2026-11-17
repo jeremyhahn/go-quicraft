@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strconv"
-	"strings"
 )
 
 // bumpable reports whether -bump moves this finding: a require behind its
@@ -124,38 +122,4 @@ func vulnFixes(scan vulnScanner, dir string) ([]vulnFix, error) {
 		}
 	}
 	return out, nil
-}
-
-// semverLess reports whether version a sorts before b: vMAJOR.MINOR.PATCH
-// compared numerically, then a prerelease before its release, then the
-// prerelease text. Build metadata is ignored.
-func semverLess(a, b string) bool {
-	core := func(v string) ([3]int, string) {
-		v = strings.TrimPrefix(v, "v")
-		v, _, _ = strings.Cut(v, "+")
-		v, pre, _ := strings.Cut(v, "-")
-		var n [3]int
-		for i, p := range strings.SplitN(v, ".", 3) {
-			n[i], _ = strconv.Atoi(p)
-		}
-		return n, pre
-	}
-	an, ap := core(a)
-	bn, bp := core(b)
-	if an != bn {
-		for i := range an {
-			if an[i] != bn[i] {
-				return an[i] < bn[i]
-			}
-		}
-	}
-	switch {
-	case ap == bp:
-		return false
-	case ap == "":
-		return false
-	case bp == "":
-		return true
-	}
-	return ap < bp
 }
