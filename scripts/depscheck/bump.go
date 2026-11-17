@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 )
@@ -18,6 +19,19 @@ func bumpable(f finding) bool {
 // then `go mod tidy`, and prints each move. A replace that would move is
 // printed as a hand edit, since go get does not rewrite a replace.
 func bumpModule(edit moduleEditor, dir string, findings []finding, stdout io.Writer) error {
+	// A failed lookup (go list -e reports it as an Error entry, not a
+	// failing exit) leaves that requirement unchecked: stop before any edit
+	// rather than report a bump that never looked at it.
+	var lookups []error
+	for _, f := range findings {
+		if f.Lookup != nil {
+			lookups = append(lookups, fmt.Errorf("deps-bump: %s:%d: %w", f.Dep.File, f.Dep.Line, f.Lookup))
+		}
+	}
+	if len(lookups) > 0 {
+		lookups = append(lookups, fmt.Errorf("deps-bump: FAILED: the latest version of %d module(s) in %s could not be looked up; go.mod left unchanged", len(lookups), dir))
+		return errors.Join(lookups...)
+	}
 	moved := 0
 	for i := range findings {
 		f := &findings[i]
