@@ -20,7 +20,11 @@
 #     The branch of a merged PR, still at that PR's head, is deleted and
 #     re-created from main, which loses nothing. A branch with no open PR
 #     whose tip is its merge base with main (a placeholder a failed run
-#     created at the base) is reused: the bump builds on its tip. The
+#     created at the base) is reused: the bump builds on its tip. So is
+#     a branch with no open PR whose every commit main lacks is this
+#     workflow's own verified web-flow bump commit (a run that committed
+#     and failed before it opened the PR): the bump builds on its tip and
+#     the PR is opened only while the branch is at the head expected. The
 #     commit step deletes a branch it created when the commit fails. Every
 #     deletion is a push that names the tip read as the expected old value
 #     (--force-with-lease), so a commit pushed since is never removed.
@@ -84,6 +88,36 @@ jobs:
           set -euo pipefail
           owner=${REPO%%/*}
           stale=
+          recover=
+          # Succeeds when every commit in $1..$2 is one this workflow's
+          # commit step makes, read back as that step reads its own commit:
+          # verified, committer noreply@github.com with login web-flow, and
+          # the bump's headline. The list is pinned to the tip read, not
+          # the branch, so a commit pushed since is not vouched for.
+          owned() {
+            local list n s v ok email login msg
+            local -a shas
+            if ! list=$(gh api "repos/$REPO/compare/$1...$2" --jq '.total_commits, .commits[].sha'); then
+              return 1
+            fi
+            mapfile -t shas <<<"$list"
+            n=${shas[0]:-0}
+            shas=("${shas[@]:1}")
+            if [ "$n" -lt 1 ] || [ "${#shas[@]}" -ne "$n" ]; then
+              echo "$BRANCH: $n commits beyond $1, ${#shas[@]} listed: not recovered"
+              return 1
+            fi
+            for s in "${shas[@]}"; do
+              if ! v=$(gh api "repos/$REPO/commits/$s" --jq '[(.commit.verification.verified|tostring), .commit.committer.email, (.committer.login // "none"), (.commit.message|split("\n")[0])] | @tsv'); then
+                return 1
+              fi
+              IFS=$'\t' read -r ok email login msg <<<"$v"
+              if [ "$ok" != true ] || [ "$email" != noreply@github.com ] || [ "$login" != web-flow ] || [ "$msg" != 'deps: bump dependencies to latest (ruling 640)' ]; then
+                echo "$BRANCH: $s is not this workflow's commit (verified=$ok committer=$email login=$login): not recovered"
+                return 1
+              fi
+            done
+          }
           pr=$(gh api "repos/$REPO/pulls?state=open&head=$owner:$BRANCH&base=main" --jq '.[0].number // empty')
           if [ -n "$pr" ]; then
             head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
@@ -118,16 +152,26 @@ jobs:
               if [ "$tip" = "$mbase" ]; then
                 sha=$tip
                 echo "$BRANCH at $tip has no open PR and no commit main lacks: a leftover placeholder, reused; the commit fails if it moves"
-              elif [ -z "$merged" ]; then
-                echo "::error::$BRANCH exists with no open PR and its last PR was not merged; close or delete it by hand (this job never force-updates a ref)"
-                exit 1
-              elif [ "$tip" != "$mhead" ]; then
-                echo "::error::$BRANCH is at $tip, not at the head $mhead of its merged PR: it carries later commits; close or delete it by hand"
-                exit 1
-              else
+              elif [ -n "$merged" ] && [ "$tip" = "$mhead" ]; then
                 # Deleted after checkout, and only while it is still at $tip.
                 stale=$tip
                 echo "$BRANCH belonged to a merged PR at $tip: deleted while still there, re-created from main"
+              elif [ "$tip" != "$mhead" ] && owned "$mbase" "$tip"; then
+                # Every commit main lacks is one this workflow made, and no
+                # PR was ever closed at this tip: a run whose commit landed
+                # and that failed or was cancelled before it opened the PR.
+                # The bump builds on the tip, the commit's expectedHeadOid
+                # is that tip, and the PR step opens the missing PR only
+                # while the branch is still at the head it expects.
+                sha=$tip
+                recover=$tip
+                echo "$BRANCH at $tip has no open PR and carries only this workflow's verified commits: recovered, its PR is opened"
+              elif [ -z "$merged" ]; then
+                echo "::error::$BRANCH exists with no open PR and its last PR was not merged; close or delete it by hand (this job never force-updates a ref)"
+                exit 1
+              else
+                echo "::error::$BRANCH is at $tip, not at the head $mhead of its merged PR: it carries later commits; close or delete it by hand"
+                exit 1
               fi
             fi
             echo "no open PR on $BRANCH; building on main $sha"
@@ -136,6 +180,7 @@ jobs:
             echo "pr=$pr"
             echo "sha=$sha"
             echo "stale=$stale"
+            echo "recover=$recover"
           } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -261,28 +306,49 @@ jobs:
               '{query: $q, variables: {input: {branch: {repositoryNameWithOwner: $repo, branchName: $br}, expectedHeadOid: $head, message: {headline: $h, body: $b}, fileChanges: {additions: $add, deletions: $del}}}}' \
             | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid)
           [ -n "$commit" ] || { echo "::error::createCommitOnBranch returned no commit"; exit 1; }
-          v=$(gh api "repos/$REPO/commits/$commit" --jq '[(.commit.verification.verified|tostring), .commit.committer.email, (.committer.login // "none")] | @tsv')
-          IFS=$'\t' read -r ok email login <<<"$v"
+          v=$(gh api "repos/$REPO/commits/$commit" --jq '[(.commit.verification.verified|tostring), .commit.committer.email, (.committer.login // "none"), (.commit.message|split("\n")[0])] | @tsv')
+          IFS=$'\t' read -r ok email login _ <<<"$v"
           if [ "$ok" != true ] || [ "$email" != noreply@github.com ] || [ "$login" != web-flow ]; then
             echo "::error::$commit is not a verified web-flow commit (verified=$ok committer=$email login=$login): the Signatures job would reject it"
             exit 1
           fi
+          # The head the PR step opens the PR at.
+          echo "HEAD_SHA=$commit" >> "$GITHUB_ENV"
           echo "deps-bump: $commit on $BRANCH (GitHub web-flow, verified)"
 
       - name: Open the PR and label it
         id: pr
-        if: ${{ env.CHANGED != '' || steps.base.outputs.pr != '' }}
+        if: ${{ env.CHANGED != '' || steps.base.outputs.pr != '' || steps.base.outputs.recover != '' }}
         env:
           PR: ${{ steps.base.outputs.pr }}
+          # This run's commit, or with none the recovered tip.
+          EXPECT: ${{ env.HEAD_SHA || steps.base.outputs.sha }}
         run: |
           set -euo pipefail
           if [ -z "$PR" ]; then
+            # A PR opens on the branch by name, so the head is checked
+            # before and read back after: a branch that moved from the
+            # head this run made or recovered gets no PR, and a PR that
+            # opened on a moved head is closed before it is labelled.
+            tip=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha)
+            if [ "$tip" != "$EXPECT" ]; then
+              echo "::error::$BRANCH is at $tip, not at $EXPECT: it moved; no PR opened, close or delete it by hand"
+              exit 1
+            fi
+            changed=${CHANGED:-}
+            [ -n "$changed" ] || changed="nothing new; the commits already on the branch, whose run did not open this PR"
             # shellcheck disable=SC2016 # backquotes are markdown, not a command
             body=$(printf '%s\n\n%s\n' \
               'The daily dependency bump (deps-bump.yml, ruling 640): every go.mod requirement behind its latest release, with no reason comment and past the 7-day window, moved to latest, then `make deps-check` and `make build` passed.' \
-              "Changed: $CHANGED")
+              "Changed: $changed")
             PR=$(jq -n --arg t "$PR_TITLE" --arg h "$BRANCH" --arg b "$body" '{title: $t, head: $h, base: "main", body: $b}' | gh api "repos/$REPO/pulls" --input - --jq .number)
-            echo "opened #$PR"
+            head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+            if [ "$head" != "$EXPECT" ]; then
+              gh api -X PATCH "repos/$REPO/pulls/$PR" -f state=closed >/dev/null || true
+              echo "::error::#$PR opened at $head, not at $EXPECT: $BRANCH moved; the PR is closed, close or delete the branch by hand"
+              exit 1
+            fi
+            echo "opened #$PR at $EXPECT"
           fi
           gh api "repos/$REPO/issues/$PR/labels" -f 'labels[]=code-review' -f 'labels[]=task:ready' >/dev/null
           echo "number=$PR" >> "$GITHUB_OUTPUT"
