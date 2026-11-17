@@ -111,9 +111,11 @@ jobs:
               # killed runner cannot). It is reused, never deleted: the
               # bump builds on the tip read above, and the commit's
               # expectedHeadOid is that tip, so a commit pushed since makes
-              # the commit fail instead of being lost.
+              # the commit fail instead of being lost. This holds whatever
+              # the last closed PR was: an earlier merged PR does not make a
+              # later run's placeholder anything but a placeholder.
               mbase=$(gh api "repos/$REPO/compare/main...$BRANCH" --jq .merge_base_commit.sha)
-              if [ -z "$merged" ] && [ "$tip" = "$mbase" ]; then
+              if [ "$tip" = "$mbase" ]; then
                 sha=$tip
                 echo "$BRANCH at $tip has no open PR and no commit main lacks: a leftover placeholder, reused; the commit fails if it moves"
               elif [ -z "$merged" ]; then
