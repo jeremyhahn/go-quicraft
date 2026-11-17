@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -467,6 +468,147 @@ func TestBump(t *testing.T) {
 			assert.Contains(t, stderr, ErrUsage.Error())
 		})
 	}
+}
+
+// graphEditor is a moduleEditor over a tiny module graph that rewrites
+// the require block of go.mod the way go get does: upgrading a module
+// raises the requirements of its new version (minimal version
+// selection), and go get of an exact version lowers any module whose
+// selected version needs more than that, back to v1.0.0.
+type graphEditor struct {
+	deps   map[string]map[string]string // path@version -> path -> minimum version
+	gets   []string
+	tidied []string
+}
+
+func (g *graphEditor) Get(dir, pathAtVersion string) error {
+	g.gets = append(g.gets, pathAtVersion)
+	sel, err := goModRequires(dir)
+	if err != nil {
+		return err
+	}
+	path, version, _ := strings.Cut(pathAtVersion, "@")
+	sel[path] = version
+	for p, min := range g.deps[pathAtVersion] {
+		if semverLess(sel[p], min) {
+			sel[p] = min
+		}
+	}
+	for m, v := range sel {
+		if need, ok := g.deps[m+"@"+v][path]; ok && semverLess(version, need) {
+			sel[m] = "v1.0.0"
+		}
+	}
+	paths := make([]string, 0, len(sel))
+	for p := range sel {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	var b strings.Builder
+	b.WriteString("module example.com/m\n\ngo 1.22\n\nrequire (\n")
+	for _, p := range paths {
+		b.WriteString("\t" + p + " " + sel[p] + "\n")
+	}
+	b.WriteString(")\n")
+	return os.WriteFile(filepath.Join(dir, "go.mod"), []byte(b.String()), 0o600)
+}
+
+func (g *graphEditor) Tidy(dir string) error {
+	g.tidied = append(g.tidied, dir)
+	return nil
+}
+
+// behindFinding is a bumpable lag of the go.mod require of path.
+// goModRequires reads the require versions of dir/go.mod.
+func goModRequires(dir string) (map[string]string, error) {
+	file := filepath.Join(dir, "go.mod")
+	data, err := os.ReadFile(file) //#nosec G304 -- a test fixture
+	if err != nil {
+		return nil, err
+	}
+	directives, err := parseGoMod(file, data)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string)
+	for _, d := range directives {
+		if d.Kind == kindRequire {
+			out[d.Path] = d.Version
+		}
+	}
+	return out, nil
+}
+
+func behindFinding(dir, path, version, latest string) finding {
+	return finding{
+		Dep:    dependency{Kind: kindRequire, Module: path, Path: path, Version: version, File: filepath.Join(dir, "go.mod"), Line: 1},
+		Latest: latest, Behind: true,
+	}
+}
+
+func TestBumpFixIsAFloor(t *testing.T) {
+	// Upgrading example.com/a to v1.1.0 raises example.com/b to v1.5.0;
+	// b's advisory is fixed in v1.1.0. A go get b@v1.1.0 after the upgrade
+	// would lower a again; the fix is a floor already met, so it is
+	// skipped.
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/m\n\ngo 1.22\n\nrequire (\n\texample.com/a v1.0.0\n\texample.com/b v1.0.0 // indirect\n)\n")
+	edit := &graphEditor{deps: map[string]map[string]string{
+		"example.com/a@v1.1.0": {"example.com/b": "v1.5.0"},
+	}}
+	vuln := fakeVuln{hits: map[string][]advisory{"example.com/b@v1.0.0": {{ID: "GO-2026-0020", Fixed: "v1.1.0"}}}}
+	var stdout bytes.Buffer
+	err := bumpModule(edit, vuln, dir, []finding{behindFinding(dir, "example.com/a", "v1.0.0", "v1.1.0")}, &stdout)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/a@v1.1.0"}, edit.gets, "no exact go get below the selected b")
+	sel, err := goModRequires(dir)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"example.com/a": "v1.1.0", "example.com/b": "v1.5.0"}, sel)
+	assert.Equal(t, []string{dir}, edit.tidied)
+}
+
+func TestBumpFixBelowSelectionStillApplies(t *testing.T) {
+	// The fix is not met by the upgrade: it is applied after it, and the
+	// final selection keeps both.
+	dir := t.TempDir()
+	writeFile(t, dir, "go.mod", "module example.com/m\n\ngo 1.22\n\nrequire (\n\texample.com/a v1.0.0\n\texample.com/b v1.0.0 // indirect\n)\n")
+	edit := &graphEditor{deps: map[string]map[string]string{
+		"example.com/a@v1.1.0": {"example.com/b": "v1.2.0"},
+	}}
+	vuln := fakeVuln{hits: map[string][]advisory{"example.com/b@v1.0.0": {{ID: "GO-2026-0021", Fixed: "v1.3.0"}}}}
+	var stdout bytes.Buffer
+	require.NoError(t, bumpModule(edit, vuln, dir, []finding{behindFinding(dir, "example.com/a", "v1.0.0", "v1.1.0")}, &stdout))
+	assert.Equal(t, []string{"example.com/a@v1.1.0", "example.com/b@v1.3.0"}, edit.gets)
+	assert.Contains(t, stdout.String(), "bumped example.com/b v1.2.0 -> v1.3.0")
+}
+
+func TestBumpTidiesLocalReplaceDependents(t *testing.T) {
+	// root/dep replaces example.com/root with ../, so none of its own
+	// requirements is a bump candidate; the root bump still raises its
+	// floors, so it is tidied after the root moved, and only then.
+	newPair := func(t *testing.T) (string, string) {
+		root := t.TempDir()
+		writeFile(t, root, "go.mod", "module example.com/m\n\ngo 1.22\n\nrequire example.com/a v1.0.0\n")
+		dep := filepath.Join(root, "dep")
+		writeFile(t, dep, "go.mod", "module example.com/dep\n\ngo 1.22\n\nrequire example.com/m v0.0.0\n\nreplace example.com/m => ../\n")
+		return root, dep
+	}
+	t.Run("after a root bump", func(t *testing.T) {
+		root, dep := newPair(t)
+		edit := &graphEditor{}
+		var stdout bytes.Buffer
+		require.NoError(t, bumpModule(edit, fakeVuln{}, root, []finding{behindFinding(root, "example.com/a", "v1.0.0", "v1.1.0")}, &stdout))
+		require.NoError(t, bumpModule(edit, fakeVuln{}, dep, nil, &stdout))
+		assert.Equal(t, []string{root, dep}, edit.tidied)
+	})
+	t.Run("not when the root did not move", func(t *testing.T) {
+		root, dep := newPair(t)
+		edit := &graphEditor{}
+		var stdout bytes.Buffer
+		require.NoError(t, bumpModule(edit, fakeVuln{}, root, nil, &stdout))
+		require.NoError(t, bumpModule(edit, fakeVuln{}, dep, nil, &stdout))
+		assert.Empty(t, edit.tidied)
+	})
 }
 
 func TestBumpable(t *testing.T) {
