@@ -543,12 +543,17 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 	return cfg
 }
 
-// TestHarness_HostConfigSkipsWALSync pins testHostConfig to NoSyncWAL: a
-// stalled fdatasync holds every election past its timeout (#362).
-func TestHarness_HostConfigSkipsWALSync(t *testing.T) {
-	cfg := testHostConfig(t, "127.0.0.1:0", nil)
-	if !cfg.NoSyncWAL {
-		t.Fatal("testHostConfig must set NoSyncWAL: a stalled fdatasync holds every election past its timeout")
+// TestHarness_WALSyncMode pins this suite to NoSyncWAL whatever the
+// QUICRAFT_IT_WAL_SYNC switch says: a stalled fdatasync holds every election
+// past its timeout (#362), and only the linearizability and e2e harnesses
+// size their elections for WAL-sync mode (make integration-test-walsync).
+// Restarted hosts keep the real sync (TestHarness_RestartConfigKeepsWALSync).
+func TestHarness_WALSyncMode(t *testing.T) {
+	for _, v := range []string{"", "0", "1"} {
+		t.Setenv("QUICRAFT_IT_WAL_SYNC", v)
+		if cfg := testHostConfig(t, "127.0.0.1:0", nil); !cfg.NoSyncWAL {
+			t.Fatalf("QUICRAFT_IT_WAL_SYNC=%q: testHostConfig must set NoSyncWAL", v)
+		}
 	}
 }
 
