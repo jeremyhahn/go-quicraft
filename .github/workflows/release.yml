@@ -270,7 +270,7 @@ jobs:
           format: sarif
           output: trivy-results.sarif
           exit-code: 0
-          skip-dirs: test,examples,contrib
+          skip-dirs: test,examples,contrib,scripts/depscheck/testdata
           trivyignores: .trivyignore
 
       - name: Upload Trivy SARIF
@@ -290,7 +290,7 @@ jobs:
           severity: CRITICAL,HIGH
           exit-code: 1
           format: table
-          skip-dirs: test,examples,contrib
+          skip-dirs: test,examples,contrib,scripts/depscheck/testdata
           trivyignores: .trivyignore
 
       - name: Install Trivy (Gitea)
@@ -299,7 +299,7 @@ jobs:
 
       - name: Trivy gate (Gitea)
         if: github.server_url != 'https://github.com'
-        run: trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --format table --skip-dirs test,examples,contrib --ignorefile .trivyignore .
+        run: trivy fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 --format table --skip-dirs test,examples,contrib,scripts/depscheck/testdata --ignorefile .trivyignore .
 
   integration:
     name: Gate - integration suite

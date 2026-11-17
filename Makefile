@@ -1524,12 +1524,13 @@ vuln:
 
 .PHONY: trivy
 # Scoped to what ships: test/performance/* are separate benchmark modules that
-# consumers never fetch, and .build-cache is a local artifact. A missing binary
+# consumers never fetch, scripts/depscheck/testdata holds go.mod fixtures that
+# pin vulnerable versions on purpose, and .build-cache is a local artifact. A missing binary
 # fails rather than skips (check-trivy), because trivy is the only secret
 # scanner here.
 trivy: check-trivy
 	$(TRIVY) fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 \
-		--skip-dirs .build-cache --skip-dirs test/performance .
+		--skip-dirs .build-cache --skip-dirs test/performance --skip-dirs scripts/depscheck/testdata .
 
 # Scans the devcontainer integration image (handbook devops.md §8). CI's `image`
 # job runs the same scan on the image it builds at the commit under test.
@@ -1568,7 +1569,7 @@ security-sarif: check-trivy
 	@rc=0; \
 	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium -fmt=sarif -out=$(BUILD_DIR)/gosec-results.sarif ./... || rc=1; \
 	$(TRIVY) fs --severity CRITICAL,HIGH --exit-code 1 \
-		--skip-dirs .build-cache --skip-dirs test/performance \
+		--skip-dirs .build-cache --skip-dirs test/performance --skip-dirs scripts/depscheck/testdata \
 		--format sarif --output $(BUILD_DIR)/trivy-results.sarif . || rc=1; \
 	echo "SARIF reports generated in $(BUILD_DIR)/"; \
 	if [ $$rc -ne 0 ]; then \
