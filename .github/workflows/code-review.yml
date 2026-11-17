@@ -1041,6 +1041,12 @@ jobs:
           twin_waited=0
           if [ "$FORGE" = github ]; then
             printf 'Authorization: Bearer %s\n' "$ACTIONS_TOKEN" > "$WORK/gha.hdr"
+            # LOCAL (security): P1 "Keep the Actions credential header until
+            # approval-reuse checks finish". The reuse branch below reads the
+            # review history through gha() after the twin wait, so the header
+            # is removed when this step exits (every exit 0, exit 1 and die),
+            # not after the wait.
+            trap 'rm -f "$WORK/gha.hdr"' EXIT
             gha() { # GET path with the job's own token -> body; dies unless 2xx
               local code
               code=$(curl -sS --proto '=https' --max-time 60 --retry 3 --retry-all-errors \
@@ -1122,7 +1128,8 @@ jobs:
               sleep 30
               twin_waited=$((twin_waited + 30))
             done
-            rm -f "$WORK/gha.hdr"
+            # LOCAL (security): the header stays for the reuse branch's gha()
+            # calls; the EXIT trap set where it is written removes it.
             # A twin that waited ends on the first twin's verdict, before any
             # route or label case: its approval ends skip=reviewed, its
             # rejection fails, and only no verdict asks for a re-run. Too little
