@@ -68,7 +68,9 @@ jobs:
       # publish from this tree.
       - name: Build the devcontainer images
         run: |
-          APK_INDEX_SUM=$(scripts/apk-index-sum.sh)
+          # As ci.yml: the Dockerfile's GO_IMAGE ARG has no default, so the base
+          # image comes from scripts/tool-pins.sh as APK_BASE_IMAGES.
+          APK_INDEX_SUM=$(. scripts/tool-pins.sh && APK_BASE_IMAGES="$GO_IMAGE" scripts/apk-index-sum.sh)
           export APK_INDEX_SUM
           echo "APK_INDEX_SUM=$APK_INDEX_SUM" >> "$GITHUB_ENV"
           it=$(make -s it-image)

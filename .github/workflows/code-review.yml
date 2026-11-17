@@ -1206,7 +1206,10 @@ jobs:
       || startsWith(github.event.label.name, 'agent:')
       || startsWith(github.event.label.name, 'model:')
       || startsWith(github.event.label.name, 'effort:'))
-      && needs.scope.outputs.skip != 'true'
+    # LOCAL (security): no `needs.scope.outputs.skip` test here. The gate
+    # requires a review of every workflow file (REVIEW_REQUIRED_PATHS), so a
+    # change InfoSec's guard clears still takes a round (Codex P1 on #1170;
+    # test/buildgates TestReviewRunsWhereTheGateNeedsIt).
     # v5.9.7: on GitHub the group is the PR, its head sha and the run id, so
     # it never holds a pending run that a newer one could replace: a replaced
     # run is cancelled with no `Code Review (codex)` check-run, and a ruleset
