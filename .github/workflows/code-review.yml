@@ -1,4 +1,4 @@
-# code-review-template: v5.12.2 -- the code review in Gitea or GitHub CI for a pull request
+# code-review-template: v5.12.3 -- the code review in Gitea or GitHub CI for a pull request
 # that carries `code-review` and `task:ready`, routed by its labels through
 # route-labels (labels.md §2). Codex on the `codex` runner reviews every such
 # PR; `agent:opencode` adds an advisory COMMENT review by the opencode job on
@@ -28,6 +28,15 @@
 #   COORDINATOR_TURNS         the codex rounds the project coordinator has
 #                             on a `needs-coordinator` PR after the two-round
 #                             stop (v5.9.8, Tenant Agent m2185); default 3
+#
+# v5.12.3 (2026-11-17, Tenant Agent; Codex's P1 on go-xkms #2251): THE SCOPE
+# JOB IS NOT CANCELLED. v5.12.2 gave it a per-head group with
+# cancel-in-progress, so an unrelated label (dept:*, ci:full) added while a
+# review-requesting run's scope job ran cancelled it, that run's review was
+# skipped, and the newer run's review failed its label allowlist: the head
+# had no review left. The scope job has no group again; it is one short
+# hosted job per event. The review job's group (no cancelling) and the
+# gate's (cancelling, and its twin wait reads the review in flight) stay.
 #
 # v5.12.2 (2026-11-17, Tenant Agent; go-trusted-platform ran 4 to 7 runs per
 # PR head, #2010 to #2015, and Codex's P1s on the v5.12.1 rollout PRs
@@ -747,11 +756,9 @@ jobs:
   scope:
     name: Review scope (InfoSec guard)
     if: github.event.pull_request.state == 'open'
-    # v5.12.2: the newest event on a head runs the guard; an older one's is
-    # cancelled, and that run's review and gate with it.
-    concurrency:
-      group: ${{ format('code-review-scope-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
-      cancel-in-progress: true
+    # v5.12.3: no concurrency group. Cancelling an older run's scope job
+    # skipped that run's requested review (v5.12.2), so each event's guard
+    # runs to the end; it is a short API-only job.
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     # The guard's python runs at most 240 s (its timeout -k 10 240).
     timeout-minutes: 10
