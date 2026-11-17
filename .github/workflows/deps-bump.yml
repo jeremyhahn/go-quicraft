@@ -18,7 +18,9 @@
 #     force-updates a ref: a ref update is a fast-forward, and a branch left
 #     behind by an unmerged closed PR fails the job, for a person to close.
 #     The branch of a merged PR is deleted and re-created from main, which
-#     loses nothing.
+#     loses nothing; so is a branch with no open PR whose tip is its merge
+#     base with main (a placeholder a failed run created at the base). The
+#     commit step deletes a branch it created when the commit fails.
 #   - A govulncheck finding on the standard library, the toolchain or an
 #     indirect-only module is reported, not failed, by deps-check, so it does
 #     not stop the verify: the portfolio-wide toolchain pass carries stdlib.
@@ -94,14 +96,24 @@ jobs:
             echo "open PR #$pr on $BRANCH; building on its tip $sha"
           else
             sha=$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)
-            if gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            if tip=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null); then
               merged=$(gh api "repos/$REPO/pulls?state=closed&head=$owner:$BRANCH&base=main&sort=updated&direction=desc" --jq '.[0].merged_at // empty')
-              if [ -z "$merged" ]; then
+              # A branch whose tip is its merge base with main carries no
+              # commit main lacks: the placeholder a run leaves when it
+              # created the branch at the base and then failed before the
+              # commit (the commit step deletes it, but a cancelled or
+              # killed runner cannot). Deleting it loses nothing.
+              mbase=$(gh api "repos/$REPO/compare/main...$BRANCH" --jq .merge_base_commit.sha)
+              if [ -z "$merged" ] && [ "$tip" = "$mbase" ]; then
+                gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null
+                echo "$BRANCH at $tip has no open PR and no commit main lacks: a leftover placeholder, deleted, re-created from main"
+              elif [ -z "$merged" ]; then
                 echo "::error::$BRANCH exists with no open PR and its last PR was not merged; close or delete it by hand (this job never force-updates a ref)"
                 exit 1
+              else
+                gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null
+                echo "$BRANCH belonged to a merged PR: deleted, re-created from main"
               fi
-              gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null
-              echo "$BRANCH belonged to a merged PR: deleted, re-created from main"
             fi
             echo "no open PR on $BRANCH; building on main $sha"
           fi
@@ -185,8 +197,28 @@ jobs:
               deletions=$(jq -c --arg p "$f" '. + [{path: $p}]' <<<"$deletions")
             fi
           done
+          # A branch this run creates and then fails to commit to is
+          # deleted on the way out while its tip is still BASE_SHA, so a
+          # failed mutation leaves no placeholder for the next run's guard.
+          created=
+          cleanup() {
+            rc=$?
+            if [ "$rc" -ne 0 ] && [ -n "$created" ]; then
+              tip=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null || true)
+              if [ "$tip" = "$BASE_SHA" ]; then
+                if gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null; then
+                  echo "::warning::commit failed: deleted $BRANCH, created by this run at $BASE_SHA"
+                else
+                  echo "::warning::commit failed and $BRANCH could not be deleted; the next run removes the placeholder"
+                fi
+              fi
+            fi
+            exit "$rc"
+          }
+          trap cleanup EXIT
           if ! gh api "repos/$REPO/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
             gh api "repos/$REPO/git/refs" -f ref="refs/heads/$BRANCH" -f sha="$BASE_SHA" >/dev/null
+            created=1
           fi
           body=$(git diff --cached --stat)
           # shellcheck disable=SC2016 # GraphQL variables, not shell
