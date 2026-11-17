@@ -15,12 +15,18 @@
 package quicraft
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
 // TestAudit_MapLocalReadError_StateMachineClosed checks the StopShard
@@ -223,5 +229,116 @@ func TestAudit_RefuseDataDirChange_JoinedRecordWithoutAddresses(t *testing.T) {
 				t.Fatalf("restart with the recorded DataDir = %v, want nil", err)
 			}
 		})
+	}
+}
+
+// newPendingRemovalHost returns a host whose replica (shardID, replicaID) has
+// LogDB data but no readable bootstrap record (a legacy join), a snapshot
+// imported under dataDirA, and a removal intent naming that tree left
+// pending by a RemoveData whose intent directory sync failed.
+func newPendingRemovalHost(t *testing.T, shardID, replicaID, index uint64, dataDirA string) (*Host, string) {
+	t.Helper()
+	cfg := testHostConfig(t)
+	real := memdb.New()
+	db := &removeDataLogDB{LogDB: real}
+	fsys := &intentSyncFS{}
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption(), withSnapshotFS(fsys))
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	if err := real.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+		Addresses: map[uint64]string{replicaID: "127.0.0.1:5000"},
+	}); err != nil {
+		t.Fatalf("SaveBootstrap: %v", err)
+	}
+	db.set(0, true)
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("TREE-A")))
+	if err := h.ImportSnapshot(context.Background(), shardID, bytes.NewReader(artifact),
+		WithImportDataDir(dataDirA)); err != nil {
+		t.Fatalf("ImportSnapshot into A: %v", err)
+	}
+	dirA := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(cfg.NodeHostDir, dataDirA, shardID), shardID, replicaID)
+	fsys.watch(cfg.NodeHostDir)
+	if err := h.RemoveData(shardID, replicaID); !errors.Is(err, errInjectedIntentDirSync) {
+		t.Fatalf("RemoveData with a failing intent directory sync: err = %v, want %v",
+			err, errInjectedIntentDirSync)
+	}
+	if p, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil || !pending || p != dirA {
+		t.Fatalf("removal intent = %q, %v (err %v), want %q pending", p, pending, err, dirA)
+	}
+	if removed, err := h.logdb.NodeRemoved(shardID, replicaID); err != nil || removed {
+		t.Fatalf("NodeRemoved after the failed intent sync = %v (err %v), want false", removed, err)
+	}
+	return h, dirA
+}
+
+// TestAudit_ImportSnapshot_RefusedWhileRemovalIntentPending: a pending
+// removal intent names the tree RemoveData's retry deletes, so an import of a
+// newer snapshot into another tree must be refused: accepting it recorded the
+// snapshot under B, the retry retired the replica, dropped B's record and
+// deleted only A, and B's snapshot data stayed orphaned.
+func TestAudit_ImportSnapshot_RefusedWhileRemovalIntentPending(t *testing.T) {
+	const shardID, replicaID uint64 = 7, 3
+	dataDirA, dataDirB := t.TempDir(), t.TempDir()
+	h, dirA := newPendingRemovalHost(t, shardID, replicaID, 900, dataDirA)
+	dirB := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, dataDirB, shardID), shardID, replicaID)
+
+	newer := buildSnapshotArtifact(t, 1000, 6, 0, proto.Membership{},
+		snapshotEnvelope([]byte("TREE-B")))
+	importErr := h.ImportSnapshot(context.Background(), shardID, bytes.NewReader(newer),
+		WithImportDataDir(dataDirB))
+	if !errors.Is(importErr, ErrInvalidOperation) {
+		t.Errorf("ImportSnapshot while a removal intent is pending: err = %v, want ErrInvalidOperation", importErr)
+	}
+	if ss, err := h.logdb.GetSnapshot(shardID, replicaID); err != nil || ss.Index != 900 {
+		t.Errorf("recorded snapshot after the import = %+v (err %v), want index 900 under A", ss, err)
+	}
+
+	if err := h.RemoveData(shardID, replicaID); err != nil {
+		t.Fatalf("RemoveData retry: %v", err)
+	}
+	for _, dir := range []string{dirA, dirB} {
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("snapshot directory left orphaned after the removal (stat err %v): %s", err, dir)
+		}
+	}
+	if removed, err := h.logdb.NodeRemoved(shardID, replicaID); err != nil || !removed {
+		t.Errorf("NodeRemoved after the retry = %v (err %v), want true", removed, err)
+	}
+	if _, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil || pending {
+		t.Errorf("removal intent after the retry pending = %v (err %v), want cleared", pending, err)
+	}
+}
+
+// TestAudit_RefuseDataDirChange_PendingRemovalIntent: StartShard is the other
+// path to a new snapshot record (the started node saves and receives
+// snapshots). With no bootstrap record, a start whose DataDir places the
+// replica's snapshots outside the tree a pending removal intent names is
+// refused, so RemoveData's retry cannot delete one tree and orphan another.
+// The intent's own tree is accepted.
+func TestAudit_RefuseDataDirChange_PendingRemovalIntent(t *testing.T) {
+	const shardID, replicaID uint64 = 7, 3
+	dataDirA := t.TempDir()
+	h, _ := newPendingRemovalHost(t, shardID, replicaID, 900, dataDirA)
+	if err := h.refuseDataDirChange(shardID, replicaID, dataDirA); err != nil {
+		t.Fatalf("refuseDataDirChange(the intent's DataDir) = %v, want nil", err)
+	}
+	// Drop the snapshot record so only the intent locates the tree.
+	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
+		t.Fatalf("RemoveNodeData: %v", err)
+	}
+	if _, err := h.logdb.GetSnapshot(shardID, replicaID); !errors.Is(err, logdb.ErrNoSnapshot) {
+		t.Fatalf("GetSnapshot after RemoveNodeData: err = %v, want ErrNoSnapshot", err)
+	}
+	other := t.TempDir()
+	err := h.refuseDataDirChange(shardID, replicaID, other)
+	var dce *dataDirChangedError
+	if !errors.As(err, &dce) || dce.Recorded != dataDirA || dce.Requested != other {
+		t.Fatalf("refuseDataDirChange(another DataDir) = %T %v, want *dataDirChangedError %q -> %q",
+			err, err, dataDirA, other)
 	}
 }
