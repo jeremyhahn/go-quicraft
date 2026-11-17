@@ -1494,8 +1494,20 @@ modverify:
 # and does not fail). deps-latest, by contrast, only updates github.com/jeremyhahn/*.
 # Runs nightly rather than in the push gate, since an upstream release does not
 # make a commit wrong. Needs only a go toolchain and network.
+# deps-check and deps-bump: the shared depscheck v1.0.0 (handbook
+# templates/deps/depscheck, ruling 640). With DEPS_CHECK_BASE (ci.yml passes
+# the PR base or the push's before) a lag fails only on a go.mod line the
+# change adds or bumps; -vuln fails a vulnerable version of a go.mod
+# requirement. deps-bump moves every failing requirement to latest; the
+# daily deps-bump.yml PR carries it.
+DEPS_CHECK_MODULES ?= . contrib/dragonboat test/performance test/performance/dragonboat test/performance/etcd test/performance/quicraft
+
 deps-check:
-	@./scripts/deps-check.sh
+	$(GO) run ./scripts/depscheck -go $(GO) $(if $(DEPS_CHECK_BASE),-base $(DEPS_CHECK_BASE)) -vuln -govulncheck $(GOVULNCHECK) $(if $(DEPS_CHECK_VULN_TAGS),-vuln-tags $(DEPS_CHECK_VULN_TAGS)) $(DEPS_CHECK_MODULES)
+
+.PHONY: deps-bump
+deps-bump:
+	$(GO) run ./scripts/depscheck -go $(GO) -bump $(DEPS_CHECK_MODULES)
 
 .PHONY: gosec
 # gosec alone, no network (handbook devops.md §4, §8). CI's lint job runs it
@@ -1512,12 +1524,13 @@ vuln:
 
 .PHONY: trivy
 # Scoped to what ships: test/performance/* are separate benchmark modules that
-# consumers never fetch, and .build-cache is a local artifact. A missing binary
+# consumers never fetch, scripts/depscheck/testdata holds go.mod fixtures that
+# pin vulnerable versions on purpose, and .build-cache is a local artifact. A missing binary
 # fails rather than skips (check-trivy), because trivy is the only secret
 # scanner here.
 trivy: check-trivy
 	$(TRIVY) fs --scanners vuln,secret --severity CRITICAL,HIGH --exit-code 1 \
-		--skip-dirs .build-cache --skip-dirs test/performance .
+		--skip-dirs .build-cache --skip-dirs test/performance --skip-dirs scripts/depscheck/testdata .
 
 # Scans the devcontainer integration image (handbook devops.md §8). CI's `image`
 # job runs the same scan on the image it builds at the commit under test.
@@ -1556,7 +1569,7 @@ security-sarif: check-trivy
 	@rc=0; \
 	$(GOSEC) -exclude=$(GOSEC_EXCLUDE) -exclude-dir=test/performance -severity=medium -confidence=medium -fmt=sarif -out=$(BUILD_DIR)/gosec-results.sarif ./... || rc=1; \
 	$(TRIVY) fs --severity CRITICAL,HIGH --exit-code 1 \
-		--skip-dirs .build-cache --skip-dirs test/performance \
+		--skip-dirs .build-cache --skip-dirs test/performance --skip-dirs scripts/depscheck/testdata \
 		--format sarif --output $(BUILD_DIR)/trivy-results.sarif . || rc=1; \
 	echo "SARIF reports generated in $(BUILD_DIR)/"; \
 	if [ $$rc -ne 0 ]; then \

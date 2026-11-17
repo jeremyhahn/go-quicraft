@@ -181,6 +181,27 @@ func (e *MTLSConfigRequiredError) Is(target error) bool {
 	return ok
 }
 
+// ErrNoSyncWALOutsideTest is the sentinel for NoSyncWALOutsideTestError.
+// Use errors.Is to match.
+var ErrNoSyncWALOutsideTest = &NoSyncWALOutsideTestError{}
+
+// NoSyncWALOutsideTestError is returned by HostConfig.Validate when
+// NoSyncWAL is true in a binary that is not a test binary. NoSyncWAL
+// disables the WAL fdatasync that makes an acknowledged entry durable, so
+// it is allowed only under `go test` (including benchmarks).
+type NoSyncWALOutsideTestError struct{}
+
+// Error returns a human-readable description naming the NoSyncWAL field.
+func (e *NoSyncWALOutsideTestError) Error() string {
+	return "config: NoSyncWAL is allowed only in test binaries; it disables the WAL fdatasync that makes an acknowledged entry durable"
+}
+
+// Is reports whether target matches this error type.
+func (e *NoSyncWALOutsideTestError) Is(target error) bool {
+	_, ok := target.(*NoSyncWALOutsideTestError)
+	return ok
+}
+
 // ErrLeaseReadRequiresCheckQuorum is the sentinel for
 // LeaseReadRequiresCheckQuorumError. Use errors.Is to match.
 var ErrLeaseReadRequiresCheckQuorum = &LeaseReadRequiresCheckQuorumError{}

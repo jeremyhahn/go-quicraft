@@ -17,8 +17,15 @@ package config
 import (
 	"log/slog"
 	"runtime"
+	"testing"
 	"time"
 )
+
+// isTestBinary reports whether the process is a test binary built by
+// `go test` (including benchmark runs). HostConfig.Validate refuses
+// NoSyncWAL when it returns false. It is a variable so unit tests can
+// exercise the non-test-binary path.
+var isTestBinary = testing.Testing
 
 // Default values for HostConfig fields.
 const (
@@ -410,7 +417,9 @@ type HostConfig struct {
 	// the WAL does not wait for OS-level write synchronisation. This trades
 	// durability for performance and is appropriate only for testing
 	// environments where overlay2/Docker fdatasync latency causes Raft
-	// proposal timeouts. Never use in production.
+	// proposal timeouts. Validate refuses it with ErrNoSyncWALOutsideTest
+	// unless the process is a test binary (`go test`, including
+	// benchmarks); in a test binary Validate logs a warning instead.
 	NoSyncWAL bool
 
 	// MaxTotalInMemLogSize is the maximum total in-memory log size across
@@ -542,14 +551,18 @@ func (hc *HostConfig) Validate() error {
 			"key_rotation_interval", hc.KeyRotationInterval,
 		)
 	}
+	if hc.NoSyncWAL && !isTestBinary() {
+		return ErrNoSyncWALOutsideTest
+	}
 	hc.warnDisabledSafetyFlags()
 	return nil
 }
 
 // warnDisabledSafetyFlags emits warnings for host settings that trade a
-// durability or safety guarantee for performance. They are not rejected —
-// benchmarking and containerised test environments legitimately need them —
-// but a config copied into production must leave a trace in the logs.
+// durability or safety guarantee for performance. Validate calls it only
+// after refusing NoSyncWAL outside a test binary, so the NoSyncWAL warning
+// fires only in test binaries (unit, integration and benchmark runs), where
+// it still leaves a trace in the logs.
 func (hc *HostConfig) warnDisabledSafetyFlags() {
 	if hc.NoSyncWAL {
 		slog.Warn("NoSyncWAL enabled: Raft WAL writes are not fsynced, committed entries can be lost on power loss or OS crash (testing only)")
