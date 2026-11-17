@@ -17,10 +17,13 @@
 #     PUT pulls/N/update-branch and builds on the PR's new tip. It never
 #     force-updates a ref: a ref update is a fast-forward, and a branch left
 #     behind by an unmerged closed PR fails the job, for a person to close.
-#     The branch of a merged PR is deleted and re-created from main, which
-#     loses nothing; so is a branch with no open PR whose tip is its merge
-#     base with main (a placeholder a failed run created at the base). The
-#     commit step deletes a branch it created when the commit fails.
+#     The branch of a merged PR, still at that PR's head, is deleted and
+#     re-created from main, which loses nothing. A branch with no open PR
+#     whose tip is its merge base with main (a placeholder a failed run
+#     created at the base) is reused: the bump builds on its tip. The
+#     commit step deletes a branch it created when the commit fails. Every
+#     deletion is a push that names the tip read as the expected old value
+#     (--force-with-lease), so a commit pushed since is never removed.
 #   - A govulncheck finding on the standard library, the toolchain or an
 #     indirect-only module is reported, not failed, by deps-check, so it does
 #     not stop the verify: the portfolio-wide toolchain pass carries stdlib.
@@ -80,6 +83,7 @@ jobs:
         run: |
           set -euo pipefail
           owner=${REPO%%/*}
+          stale=
           pr=$(gh api "repos/$REPO/pulls?state=open&head=$owner:$BRANCH&base=main" --jq '.[0].number // empty')
           if [ -n "$pr" ]; then
             head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
@@ -97,32 +101,59 @@ jobs:
           else
             sha=$(gh api "repos/$REPO/git/ref/heads/main" --jq .object.sha)
             if tip=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null); then
-              merged=$(gh api "repos/$REPO/pulls?state=closed&head=$owner:$BRANCH&base=main&sort=updated&direction=desc" --jq '.[0].merged_at // empty')
+              closed="repos/$REPO/pulls?state=closed&head=$owner:$BRANCH&base=main&sort=updated&direction=desc"
+              merged=$(gh api "$closed" --jq '.[0].merged_at // empty')
+              mhead=$(gh api "$closed" --jq '.[0].head.sha // empty')
               # A branch whose tip is its merge base with main carries no
               # commit main lacks: the placeholder a run leaves when it
               # created the branch at the base and then failed before the
               # commit (the commit step deletes it, but a cancelled or
-              # killed runner cannot). Deleting it loses nothing.
+              # killed runner cannot). It is reused, never deleted: the
+              # bump builds on the tip read above, and the commit's
+              # expectedHeadOid is that tip, so a commit pushed since makes
+              # the commit fail instead of being lost.
               mbase=$(gh api "repos/$REPO/compare/main...$BRANCH" --jq .merge_base_commit.sha)
               if [ -z "$merged" ] && [ "$tip" = "$mbase" ]; then
-                gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null
-                echo "$BRANCH at $tip has no open PR and no commit main lacks: a leftover placeholder, deleted, re-created from main"
+                sha=$tip
+                echo "$BRANCH at $tip has no open PR and no commit main lacks: a leftover placeholder, reused; the commit fails if it moves"
               elif [ -z "$merged" ]; then
                 echo "::error::$BRANCH exists with no open PR and its last PR was not merged; close or delete it by hand (this job never force-updates a ref)"
                 exit 1
+              elif [ "$tip" != "$mhead" ]; then
+                echo "::error::$BRANCH is at $tip, not at the head $mhead of its merged PR: it carries later commits; close or delete it by hand"
+                exit 1
               else
-                gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null
-                echo "$BRANCH belonged to a merged PR: deleted, re-created from main"
+                # Deleted after checkout, and only while it is still at $tip.
+                stale=$tip
+                echo "$BRANCH belonged to a merged PR at $tip: deleted while still there, re-created from main"
               fi
             fi
             echo "no open PR on $BRANCH; building on main $sha"
           fi
-          echo "pr=$pr" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "pr=$pr"
+            echo "sha=$sha"
+            echo "stale=$stale"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ steps.base.outputs.sha }}
+
+      # The push names the tip the base step read as the ref's expected old
+      # value, which the server checks under the ref lock: the deletion
+      # applies only while the branch is still there, so a commit pushed
+      # since is never removed.
+      - name: Delete the merged PR's branch
+        if: ${{ steps.base.outputs.stale != '' }}
+        env:
+          STALE: ${{ steps.base.outputs.stale }}
+        run: |
+          set -euo pipefail
+          if ! git push --force-with-lease="refs/heads/$BRANCH:$STALE" origin ":refs/heads/$BRANCH"; then
+            echo "::error::$BRANCH moved from $STALE since it was read: left as it is; close or delete it by hand"
+            exit 1
+          fi
 
       - name: Mask the forge credentials
         run: |
@@ -198,19 +229,18 @@ jobs:
             fi
           done
           # A branch this run creates and then fails to commit to is
-          # deleted on the way out while its tip is still BASE_SHA, so a
-          # failed mutation leaves no placeholder for the next run's guard.
+          # deleted on the way out, so a failed mutation leaves no
+          # placeholder for the next run's guard. The push names BASE_SHA
+          # as the ref's expected old value, which the server checks under
+          # the ref lock: a branch that moved since is left as it is.
           created=
           cleanup() {
             rc=$?
             if [ "$rc" -ne 0 ] && [ -n "$created" ]; then
-              tip=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha 2>/dev/null || true)
-              if [ "$tip" = "$BASE_SHA" ]; then
-                if gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" >/dev/null; then
-                  echo "::warning::commit failed: deleted $BRANCH, created by this run at $BASE_SHA"
-                else
-                  echo "::warning::commit failed and $BRANCH could not be deleted; the next run removes the placeholder"
-                fi
+              if git push --force-with-lease="refs/heads/$BRANCH:$BASE_SHA" origin ":refs/heads/$BRANCH"; then
+                echo "::warning::commit failed: deleted $BRANCH, created by this run at $BASE_SHA"
+              else
+                echo "::warning::commit failed and $BRANCH was not deleted (it moved from $BASE_SHA, or the push failed); the next run reuses or refuses it"
               fi
             fi
             exit "$rc"
