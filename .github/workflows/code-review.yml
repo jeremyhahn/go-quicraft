@@ -3068,9 +3068,17 @@ jobs:
             local page=1 all='[]' got n size=limit=50
             [ "$FORGE" != github ] || size=per_page=100
             while :; do
-              got=$(get "$1&$size&page=$page")
+              # LOCAL (security): P1 "Fail closed when fetching a review-history
+              # page fails". Every caller runs get_all under `|| fail`, which
+              # turns errexit off inside it, so a page that get failed would
+              # end the loop with the pages read so far (an approval passing
+              # over a newer rejection on the unread page). Each page fetch
+              # fails the step, and a count that is not a number fails it
+              # rather than ending the loop, as api_all does.
+              got=$(get "$1&$size&page=$page") || fail "cannot read page $page of $1"
               n=$(jq 'if type == "array" then length else error("not a list") end' <<<"$got") ||
                 fail "GET $1 did not answer a list"
+              [[ $n =~ ^[0-9]+$ ]] || fail "GET $1 page $page gave no count"
               [ "$n" -gt 0 ] || break
               all=$(printf '%s\n%s\n' "$all" "$got" | jq -cs '.[0] + .[1]') || fail "cannot join the pages of $1"
               page=$((page + 1))
