@@ -221,9 +221,17 @@ func TestAssess(t *testing.T) {
 			dep: first, mod: listedModule{Version: "v0.3.0-alpha", Versions: []string{"v0.0.0", "v0.2.0-alpha", "v0.3.0-alpha"}},
 			latest: "v0.3.0-alpha",
 		},
-		"first-party at an untagged commit": {
+		"first-party at an untagged commit newer than the latest tag": {
+			// The pseudo-version is not in Versions; by SemVer it sorts
+			// after v0.3.0-alpha, so it is not behind and no bump moves
+			// it back to the older tag.
 			dep:    dependency{Kind: kindRequire, Module: "github.com/jeremyhahn/go-a", Path: "github.com/jeremyhahn/go-a", Version: "v0.3.1-0.20260101000000-abcdefabcdef"},
 			mod:    listedModule{Version: "v0.3.1-0.20260101000000-abcdefabcdef", Versions: []string{"v0.3.0-alpha"}},
+			latest: "v0.3.0-alpha",
+		},
+		"first-party at an untagged commit older than the latest tag": {
+			dep:    dependency{Kind: kindRequire, Module: "github.com/jeremyhahn/go-a", Path: "github.com/jeremyhahn/go-a", Version: "v0.2.1-0.20250101000000-abcdefabcdef"},
+			mod:    listedModule{Version: "v0.2.1-0.20250101000000-abcdefabcdef", Versions: []string{"v0.2.0-alpha", "v0.3.0-alpha"}},
 			latest: "v0.3.0-alpha", behind: true,
 		},
 		"replace behind the highest release, prerelease ignored": {
