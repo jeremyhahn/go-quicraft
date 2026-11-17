@@ -84,23 +84,49 @@ case "$method $path" in
   *head.sha*) echo "${FAKE_MERGED_HEAD:-}" ;;
   *) exit 98 ;;
   esac ;;
+"GET repos/$REPO/pulls")
+  cat > /dev/null
+  move pulls
+  if [ -n "${FAKE_PULLS_FAIL:-}" ]; then echo "pulls: failed" >&2; exit 1; fi
+  echo 41 ;;
+"GET repos/$REPO/pulls/"*) G rev-parse "$ref" ;;
+"PATCH repos/$REPO/pulls/"*) : ;;
+"GET repos/$REPO/issues/"*/labels) : ;;
 "GET repos/$REPO/git/ref/heads/main") G rev-parse refs/heads/main ;;
 "GET repos/$REPO/git/ref/heads/$BRANCH")
   G rev-parse -q --verify "$ref" || { echo '{"message":"Not Found"}' >&2; exit 1; } ;;
 "GET repos/$REPO/compare/main...$BRANCH") move compare; G merge-base refs/heads/main "$ref" ;;
+"GET repos/$REPO/compare/"*)
+  r=${path#"repos/$REPO/compare/"}
+  G rev-list --count "${r%%...*}..${r#*...}"
+  G rev-list --reverse "${r%%...*}..${r#*...}" ;;
 "DELETE repos/$REPO/git/refs/heads/$BRANCH") move delete; G update-ref -d "$ref" ;;
 "GET repos/$REPO/git/refs")
   sha=
   for a in "$@"; do case "$a" in sha=*) sha=${a#sha=} ;; esac; done
   G update-ref "$ref" "$sha" "" || { echo "Reference already exists" >&2; exit 1; } ;;
 "GET graphql")
-  exp=$(jq -r .variables.input.expectedHeadOid)
+  in=$(cat)
+  exp=$(jq -r .variables.input.expectedHeadOid <<<"$in")
+  msg=$(jq -r .variables.input.message.headline <<<"$in")
   move graphql
   if [ -n "${FAKE_GRAPHQL_FAIL:-}" ]; then echo "graphql: failed" >&2; exit "$FAKE_GRAPHQL_FAIL"; fi
-  new=$(G commit-tree -p "$exp" -m bump "$exp^{tree}") || exit 1
+  new=$(G commit-tree -p "$exp" -m "$msg" "$exp^{tree}") || exit 1
   G update-ref "$ref" "$new" "$exp" || { echo "graphql: expectedHeadOid $exp is not the head" >&2; exit 1; }
+  echo "$new" >> "$FAKE_ORIGIN/web-flow"
   echo "$new" ;;
-"GET repos/$REPO/commits/"*) printf 'true\tnoreply@github.com\tweb-flow\n' ;;
+"GET repos/$REPO/commits/"*)
+  sha=${path##*/}
+  web=
+  if [ -f "$FAKE_ORIGIN/web-flow" ]; then
+    while read -r w; do [ "$w" = "$sha" ] && web=1; done < "$FAKE_ORIGIN/web-flow"
+  fi
+  subject=$(G log -1 --format=%s "$sha") || exit 1
+  if [ -n "$web" ]; then
+    printf 'true\tnoreply@github.com\tweb-flow\t%s\n' "$subject"
+  else
+    printf 'false\tt@example.com\tnone\t%s\n' "$subject"
+  fi ;;
 *) echo "fake gh: unexpected call: $method $path $*" >&2; exit 99 ;;
 esac
 `
@@ -226,7 +252,8 @@ func (f *forge) step(name string, env ...string) (int, string, map[string]string
 	cmd.Env = append(append([]string(nil), f.baseEnv...),
 		"PATH="+f.bin+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"REPO=owner/repo", "BRANCH="+bumpBranch, "GH_TOKEN=fake",
-		"GITHUB_OUTPUT="+outputs, "RUNNER_TEMP="+dir,
+		"GITHUB_OUTPUT="+outputs, "GITHUB_ENV="+filepath.Join(dir, "github_env"), "RUNNER_TEMP="+dir,
+		"PR_TITLE=deps: bump dependencies to latest (ruling 640)",
 		"FAKE_ORIGIN="+f.origin, "FAKE_REAL_GIT="+f.git, "FAKE_LOG="+f.log)
 	cmd.Env = append(cmd.Env, env...)
 	out, err := cmd.CombinedOutput()
@@ -262,6 +289,7 @@ const (
 	findBase     = "Find the base commit"
 	deleteMerged = "Delete the merged PR's branch"
 	commitStep   = "Commit to ci/deps-bump"
+	openPR       = "Open the PR and label it"
 )
 
 func TestDepsBumpBaseStep(t *testing.T) {
@@ -386,5 +414,109 @@ func TestDepsBumpCommitStep(t *testing.T) {
 		require.Equal(t, 0, code, out)
 		assert.Contains(t, out, "GitHub web-flow, verified")
 		assert.Equal(t, f.m, f.run("", "--git-dir="+f.origin, "rev-parse", f.branch()+"^"))
+	})
+}
+
+// landWithoutPR runs the commit step on a new branch at main and then the PR
+// step with PR creation failing: the window the recovery closes. It returns
+// the commit left on the branch.
+func landWithoutPR(t *testing.T, f *forge) string {
+	t.Helper()
+	code, out, _ := f.step(commitStep, "BASE_SHA="+f.m, "CHANGED=go.mod")
+	require.Equal(t, 0, code, out)
+	landed := f.branch()
+	code, out, _ = f.step(openPR, "PR=", "EXPECT="+landed, "CHANGED=go.mod", "FAKE_PULLS_FAIL=1")
+	require.NotEqual(t, 0, code, out)
+	require.Contains(t, out, "pulls: failed", "the PR creation is what failed")
+	require.Equal(t, landed, f.branch())
+	return landed
+}
+
+func TestDepsBumpRecovery(t *testing.T) {
+	t.Run("a commit that landed without its PR is recovered and its PR opened", func(t *testing.T) {
+		f := newForge(t)
+		landed := landWithoutPR(t, f)
+		code, out, got := f.step(findBase)
+		require.Equal(t, 0, code, out)
+		assert.Equal(t, landed, got["recover"])
+		assert.Equal(t, landed, got["sha"], "the bump builds on the recovered tip")
+		assert.Empty(t, got["stale"])
+		assert.NotContains(t, f.calls(), "DELETE")
+
+		code, out, opened := f.step(openPR, "PR=", "EXPECT="+got["sha"])
+		require.Equal(t, 0, code, out)
+		assert.Equal(t, "41", opened["number"])
+		assert.Contains(t, out, "opened #41 at "+landed)
+		assert.Equal(t, landed, f.branch())
+	})
+	t.Run("a recovered branch takes this run's commit on its tip", func(t *testing.T) {
+		f := newForge(t)
+		landed := landWithoutPR(t, f)
+		code, out, got := f.step(findBase)
+		require.Equal(t, 0, code, out)
+		code, out, _ = f.step(commitStep, "BASE_SHA="+got["sha"], "CHANGED=go.mod")
+		require.Equal(t, 0, code, out)
+		tip := f.branch()
+		assert.Equal(t, landed, f.run("", "--git-dir="+f.origin, "rev-parse", tip+"^"))
+		code, out, opened := f.step(openPR, "PR=", "EXPECT="+tip, "CHANGED=go.mod")
+		require.Equal(t, 0, code, out)
+		assert.Equal(t, "41", opened["number"])
+	})
+	t.Run("a branch with one commit not the workflow's is refused", func(t *testing.T) {
+		f := newForge(t)
+		f.setBranch(f.c)
+		code, out, _ := f.step(commitStep, "BASE_SHA="+f.c, "CHANGED=go.mod")
+		require.Equal(t, 0, code, out)
+		tip := f.branch()
+		code, out, got := f.step(findBase)
+		assert.Equal(t, 1, code, out)
+		assert.Contains(t, out, f.c+" is not this workflow's commit")
+		assert.Contains(t, out, "its last PR was not merged")
+		assert.Empty(t, got["recover"])
+		assert.Equal(t, tip, f.branch())
+	})
+	t.Run("a branch whose PR was closed unmerged at its tip is refused", func(t *testing.T) {
+		f := newForge(t)
+		landed := landWithoutPR(t, f)
+		code, out, _ := f.step(findBase, "FAKE_MERGED_HEAD="+landed)
+		assert.Equal(t, 1, code, out)
+		assert.Contains(t, out, "its last PR was not merged")
+		assert.Equal(t, landed, f.branch())
+	})
+	t.Run("a branch that moves before the PR step gets no PR", func(t *testing.T) {
+		f := newForge(t)
+		landed := landWithoutPR(t, f)
+		code, out, got := f.step(findBase)
+		require.Equal(t, 0, code, out)
+		require.Equal(t, landed, got["recover"])
+		f.setBranch(f.d)
+		code, out, _ = f.step(openPR, "PR=", "EXPECT="+got["sha"])
+		assert.Equal(t, 1, code, out)
+		assert.Contains(t, out, "no PR opened")
+		assert.NotContains(t, f.calls(), "labels")
+		assert.Equal(t, f.d, f.branch(), "the moved branch is not overwritten")
+	})
+	t.Run("a PR opened on a branch that moved is closed, the branch kept", func(t *testing.T) {
+		f := newForge(t)
+		landed := landWithoutPR(t, f)
+		code, out, got := f.step(findBase)
+		require.Equal(t, 0, code, out)
+		require.Equal(t, landed, got["recover"])
+		code, out, _ = f.step(openPR, "PR=", "EXPECT="+got["sha"], "FAKE_MOVE_ON=pulls", "FAKE_MOVE_TO="+f.d)
+		assert.Equal(t, 1, code, out)
+		assert.Contains(t, out, "the PR is closed")
+		assert.Contains(t, f.calls(), "-X PATCH repos/owner/repo/pulls/41")
+		assert.NotContains(t, f.calls(), "labels")
+		assert.Equal(t, f.d, f.branch(), "the moved branch is not overwritten")
+	})
+	t.Run("a recovered branch that moves before the commit is kept", func(t *testing.T) {
+		f := newForge(t)
+		landWithoutPR(t, f)
+		code, out, got := f.step(findBase)
+		require.Equal(t, 0, code, out)
+		code, out, _ = f.step(commitStep, "BASE_SHA="+got["sha"], "CHANGED=go.mod", "FAKE_MOVE_ON=graphql", "FAKE_MOVE_TO="+f.d)
+		assert.Equal(t, 1, code, out)
+		assert.Contains(t, out, "is not the head")
+		assert.Equal(t, f.d, f.branch())
 	})
 }
