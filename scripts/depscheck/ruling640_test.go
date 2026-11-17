@@ -362,7 +362,7 @@ func TestDecodeVulns(t *testing.T) {
 func TestBump(t *testing.T) {
 	t.Run("moves every failing lag and tidies", func(t *testing.T) {
 		edit := &fakeEditor{}
-		code, stdout, stderr := runTools(t, toolset{edit: edit}, "-bump", "testdata/fail")
+		code, stdout, stderr := runTools(t, toolset{edit: edit, vuln: fakeVuln{}}, "-bump", "testdata/fail")
 		assert.Equal(t, exitOK, code, stderr)
 		assert.Equal(t, []string{
 			"testdata/fail example.com/behind@v1.3.0",
@@ -375,22 +375,64 @@ func TestBump(t *testing.T) {
 	})
 	t.Run("nothing to move", func(t *testing.T) {
 		edit := &fakeEditor{}
-		code, stdout, _ := runTools(t, toolset{src: fixtureSource{goproxy: "direct"}, edit: edit}, "-bump", "testdata/pass")
+		code, stdout, _ := runTools(t, toolset{src: fixtureSource{goproxy: "direct"}, edit: edit, vuln: fakeVuln{}}, "-bump", "testdata/pass")
 		assert.Equal(t, exitOK, code)
 		assert.Empty(t, edit.gets, "a fresh release waits out its 7 days")
 		assert.Equal(t, 0, edit.tidy)
 		assert.NotContains(t, stdout, "bumped")
 	})
+	t.Run("a vulnerable indirect requirement with a fix is bumped", func(t *testing.T) {
+		// testdata/pass has no lag past the 7-day window: without the scan
+		// the bump would move nothing and the deps-check after it would
+		// fail on the vulnerable // indirect line.
+		edit := &fakeEditor{}
+		vuln := fakeVuln{hits: map[string][]advisory{
+			"golang.org/x/net@v0.29.0":  {{ID: "GO-2026-0002", Fixed: "v0.30.0"}, {ID: "GO-2026-0004", Fixed: "v0.31.0"}},
+			"example.com/nofix@v1.0.0":  {{ID: "GO-2026-0005"}},
+			"stdlib@v1.27.0":            {{ID: "GO-2026-0100", Fixed: "v1.27.1"}},
+			"example.com/notreq@v1.0.0": {{ID: "GO-2026-0006", Fixed: "v1.0.1"}},
+		}}
+		code, stdout, stderr := runTools(t, toolset{src: fixtureSource{goproxy: "direct"}, edit: edit, vuln: vuln}, "-bump", "testdata/vulnbump")
+		assert.Equal(t, exitOK, code, stderr)
+		assert.Equal(t, []string{"testdata/vulnbump golang.org/x/net@v0.31.0"}, edit.gets,
+			"the highest fix of a required // indirect module; no fix, stdlib and unrequired modules stay")
+		assert.Equal(t, 1, edit.tidy)
+		assert.Contains(t, stdout, "bumped golang.org/x/net v0.29.0 -> v0.31.0")
+	})
+	t.Run("a vulnerable lag moves to the higher of latest and its fix", func(t *testing.T) {
+		edit := &fakeEditor{}
+		vuln := fakeVuln{hits: map[string][]advisory{
+			"example.com/behind@v1.2.0":  {{ID: "GO-2026-0007", Fixed: "v1.2.1"}},
+			"example.com/current@v1.4.0": {{ID: "GO-2026-0001", Fixed: "v1.4.1"}},
+			"example.com/dep@v1.0.0":     {{ID: "GO-2026-0003", Fixed: "v1.0.2"}},
+		}}
+		code, _, stderr := runTools(t, toolset{edit: edit, vuln: vuln}, "-bump", "testdata/fail")
+		assert.Equal(t, exitOK, code, stderr)
+		assert.Equal(t, []string{
+			"testdata/fail example.com/behind@v1.3.0",
+			"testdata/fail example.com/pseudo@v0.0.0-20260101000000-123456123456",
+			"testdata/fail github.com/jeremyhahn/go-lib@v0.4.0-alpha",
+			"testdata/fail example.com/current@v1.4.1",
+			"testdata/fail example.com/dep@v1.0.2",
+		}, edit.gets)
+	})
+	t.Run("a scan failure stops the bump before any edit", func(t *testing.T) {
+		edit := &fakeEditor{}
+		code, _, stderr := runTools(t, toolset{edit: edit, vuln: fakeVuln{err: &VulnError{Dir: "testdata/fail", Err: errors.New("exit status 1")}}}, "-bump", "testdata/fail")
+		assert.Equal(t, exitLookup, code)
+		assert.Contains(t, stderr, "govulncheck in testdata/fail")
+		assert.Empty(t, edit.gets)
+	})
 	t.Run("go get fails", func(t *testing.T) {
 		edit := &fakeEditor{err: &GoCommandError{Dir: "testdata/fail", Args: []string{"get"}, Err: errors.New("exit status 1")}, after: 2}
-		code, _, stderr := runTools(t, toolset{edit: edit}, "-bump", "testdata/fail")
+		code, _, stderr := runTools(t, toolset{edit: edit, vuln: fakeVuln{}}, "-bump", "testdata/fail")
 		assert.Equal(t, exitLookup, code)
 		assert.Len(t, edit.gets, 2)
 		assert.Contains(t, stderr, "exit status 1")
 	})
 	t.Run("go mod tidy fails", func(t *testing.T) {
 		edit := &fakeEditor{err: errors.New("tidy refused")}
-		code, _, stderr := runTools(t, toolset{edit: edit}, "-bump", "testdata/fail")
+		code, _, stderr := runTools(t, toolset{edit: edit, vuln: fakeVuln{}}, "-bump", "testdata/fail")
 		assert.Equal(t, exitLookup, code)
 		assert.Contains(t, stderr, "tidy refused")
 	})
