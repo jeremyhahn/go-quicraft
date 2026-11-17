@@ -89,7 +89,7 @@ func runWith(args []string, tools toolset, now time.Time, stdout, stderr io.Writ
 	vuln := flags.Bool("vuln", false, "fail any version govulncheck reports vulnerable of a module go.mod requires")
 	vulnPath := flags.String("govulncheck", "govulncheck", "the govulncheck command")
 	vulnTags := flags.String("vuln-tags", "", "comma-separated build tags for the govulncheck module scan, for a module whose every file is behind a tag")
-	bump := flags.Bool("bump", false, "go get every failing lag to latest, go mod tidy, and exit 0")
+	bump := flags.Bool("bump", false, "go get every failing lag to latest and every vulnerable requirement, direct or indirect, to its fixed version, go mod tidy, and exit 0")
 	if err := flags.Parse(args); err != nil {
 		return exitLookup
 	}
@@ -124,7 +124,7 @@ func runWith(args []string, tools toolset, now time.Time, stdout, stderr io.Writ
 			}
 		}
 		if *bump {
-			if err := bumpModule(tools.edit, dir, found, stdout); err != nil {
+			if err := bumpModule(tools.edit, tools.vuln, dir, found, stdout); err != nil {
 				return fail(err)
 			}
 			continue
