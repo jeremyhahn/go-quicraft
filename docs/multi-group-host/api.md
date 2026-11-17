@@ -2030,7 +2030,7 @@ Source: `pkg/config/hostconfig.go`.
 | `CommitCBufferSize` | `int` | `64` | commit channel buffer per worker |
 | `ShutdownTimeout` | `time.Duration` | `30s` | bounds `Drain` only; see below |
 | `MaxWALDiskSize` | `uint64` | `0` (unlimited) | WAL size budget in bytes |
-| `NoSyncWAL` | `bool` | `false` | skip WAL `fdatasync`; testing only, and `Validate` logs a warning |
+| `NoSyncWAL` | `bool` | `false` | skip WAL `fdatasync`; testing only: outside a test binary `Validate` refuses it with `ErrNoSyncWALOutsideTest`; in one it logs a warning |
 | `MaxTotalInMemLogSize` | `uint64` | `0` (disabled) | global rate limiter threshold in bytes |
 | `NotifyCommit` | `bool` | `false` | enables `RequestState.CommittedC()` |
 | `EventListener` | `*EventListener` | `nil` | event callbacks; nil costs nothing |

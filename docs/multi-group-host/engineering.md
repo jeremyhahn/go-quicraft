@@ -813,7 +813,7 @@ default is a trap:
 |---|---|---|
 | `HostConfig.MaxTotalInMemLogSize` | 0 (disabled) | without it one client can grow the in-memory log until the process dies |
 | `HostConfig.MaxWALDiskSize` | 0 (unbounded) | without it the WAL fills the volume and a failed `fdatasync` poisons the store |
-| `HostConfig.NoSyncWAL` | false | tests and container benchmarks only; `Validate` logs a warning |
+| `HostConfig.NoSyncWAL` | false | tests and container benchmarks only; outside a test binary `Validate` refuses it with `ErrNoSyncWALOutsideTest`, in one it logs a warning |
 | `HostConfig.KeyRotationInterval` | 0 | no scheduled rotation; 24h is a reasonable production value. Budget-driven rotation runs whenever a barrier is configured |
 | `HostConfig.MaxRetainedEpochs` | 0 (retain all) | see [seal-barrier](../seal-barrier/user.md) |
 | `Config.SnapshotEntries` | 100000 | zero selects the default; use `config.SnapshotsDisabled` |
