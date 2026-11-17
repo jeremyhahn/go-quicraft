@@ -1,0 +1,151 @@
+# scans-template: v1.0.0 (customized) — the scheduled scans on main.
+# ci-template v1.42 makes the CI Gate hermetic (owner ruling 742 (1)), so the
+# checks that fail on the state of the world rather than on a change run on
+# main, never on a pull_request or a push: `make security` (gosec,
+# govulncheck, go mod verify, trivy fs) and `trivy image` of the integration
+# image here, and deps-check's full gate in deps-bump.yml (ruling 640). This
+# workflow is not the one named CI, so a finding never reads as a red main
+# and never blocks a PR. A finding opens or updates ONE issue, found by its
+# fixed title (SCAN_ISSUE_TITLE), with the run link, and fails this job, so
+# the Actions run is red; a run with no finding closes that issue.
+#
+# CUSTOMIZE (go-quicraft), against the template:
+#   - No bump half and no deps-check: deps-bump.yml (deps-bump-template
+#     v1.0.0, customized, with its recovery and its tests in
+#     scripts/depscheck) carries the bump PR and deps-check's full gate.
+#     Folding it into this file is the template's v1.42 adoption, left to the
+#     full catch-up.
+#   - The cron minute: off ci.yml's Thursday 05:00 and deps-bump.yml's 06:19.
+
+name: Scheduled Scans
+
+on:
+  schedule:
+    - cron: '41 6 * * *'   # CUSTOMIZE: the minute, per repository
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write   # the one issue for a finding
+
+concurrency:
+  group: scans-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  GO_BUILD_TAGS: ""   # CUSTOMIZE: ci.yml's GO_BUILD_TAGS
+  SCAN_ISSUE_TITLE: 'scans: findings the scheduled scans report on main (ruling 742)'
+
+jobs:
+  scans:
+    name: Scheduled scans
+    if: ${{ github.server_url == 'https://github.com' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: pr
+      CI_IMAGE_NAMESPACE: ${{ vars.CI_IMAGE_NAMESPACE }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
+      # The toolchain and integration images, as ci.yml's image job builds
+      # them (APK_INDEX_SUM, IT_IMAGE), so trivy image scans what CI would
+      # publish from this tree.
+      - name: Build the devcontainer images
+        run: |
+          APK_INDEX_SUM=$(scripts/apk-index-sum.sh)
+          export APK_INDEX_SUM
+          echo "APK_INDEX_SUM=$APK_INDEX_SUM" >> "$GITHUB_ENV"
+          it=$(make -s it-image)
+          echo "IT_IMAGE=$it" >> "$GITHUB_ENV"
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          make docker-build MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$it"
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # The checks that left ci.yml (ruling 742 (1)). Each runs to the end;
+      # FIRED lists the ones that fail, and the step's own log keeps their
+      # output. trivy image keeps ci.yml's former flags (devops.md §8).
+      - name: Scans (make security, trivy image)
+        id: scans
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        env:
+          IN_IMAGE_NETWORK: bridge
+        run: |
+          fired=
+          scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make security GO_BUILD_TAGS='$GO_BUILD_TAGS'" || fired="$fired security"
+          if docker save -o it-image.tar "$IT_IMAGE"; then
+            scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" \
+              trivy image --input it-image.tar --ignore-unfixed --skip-dirs /opt/go/mod --severity CRITICAL,HIGH --exit-code 1 || fired="$fired trivy-image"
+          else
+            fired="$fired trivy-image"
+          fi
+          rm -f it-image.tar
+          fired=${fired# }
+          echo "scans: ${fired:-none fired}"
+          echo "fired=$fired" >> "$GITHUB_OUTPUT"
+
+      # ONE issue for the findings, found by its exact title among the open
+      # issues (pull requests excluded): created when none is open, its body
+      # replaced when one is, and closed with a comment by the first run with
+      # no finding.
+      - name: Open, update or close the scan issue
+        if: ${{ !cancelled() && steps.scans.outcome == 'success' }}
+        env:
+          FIRED: ${{ steps.scans.outputs.fired }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          issue=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100" \
+            --jq ".[] | select(.pull_request == null and .title == \"$SCAN_ISSUE_TITLE\") | .number" | head -n1)
+          if [ -z "$FIRED" ]; then
+            if [ -n "$issue" ]; then
+              gh api "repos/$REPO/issues/$issue/comments" -f body="The scheduled scans found nothing. Run: $RUN_URL" >/dev/null
+              gh api -X PATCH "repos/$REPO/issues/$issue" -f state=closed -f state_reason=completed >/dev/null
+              echo "closed #$issue"
+            fi
+            exit 0
+          fi
+          body=$(printf '%s\n\n%s\n\n%s\n' \
+            'The scheduled scans on main (scans.yml, ruling 742 (1)) fired: a vulnerable version or an image package. Each needs a fix PR or a documented reason (devops.md §9). The Scans step log of the run names each finding.' \
+            "Firing: $FIRED." \
+            "Run: $RUN_URL")
+          if [ -z "$issue" ]; then
+            issue=$(jq -n --arg t "$SCAN_ISSUE_TITLE" --arg b "$body" '{title: $t, body: $b}' | gh api "repos/$REPO/issues" --input - --jq .number)
+            echo "opened #$issue"
+          else
+            jq -n --arg b "$body" '{body: $b}' | gh api -X PATCH "repos/$REPO/issues/$issue" --input - >/dev/null
+            echo "updated #$issue"
+          fi
+
+      # A finding fails the run, after the issue is open, so it is seen and
+      # fixed. This is not CI: no PR and no main commit status reads it.
+      - name: Fail on a finding
+        if: ${{ !cancelled() && steps.scans.outputs.fired != '' }}
+        env:
+          FIRED: ${{ steps.scans.outputs.fired }}
+        run: |
+          echo "::error title=scheduled scans::firing: $FIRED (see the Scans step log)"
+          exit 1
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env" it-image.tar
