@@ -386,9 +386,9 @@ func TestHostConfig_Validate_KeyRotationInterval(t *testing.T) {
 }
 
 // TestHostConfig_Validate_NoSyncWALWarns asserts that disabling WAL fsync
-// leaves a trace in the logs. NoSyncWAL is not rejected — containerised test
-// environments need it — but a config copied into production would otherwise
-// ack Raft commits that are not durable with nothing recorded.
+// leaves a trace in the logs. In a test binary NoSyncWAL is accepted —
+// containerised test environments need it — and warned about; outside a test
+// binary Validate refuses it (see nosyncwal_test.go).
 func TestHostConfig_Validate_NoSyncWALWarns(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
