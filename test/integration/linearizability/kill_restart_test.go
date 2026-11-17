@@ -208,7 +208,12 @@ func (p *killProposers) freeze(needInFlight bool) int {
 // machines record (helpers_test.go's sink, which only a t.Cleanup would
 // otherwise report and a SIGKILLed child never runs) to the parent: each is
 // written to the ack file and the child exits non-zero at once.
+//
+// It also forwards the child test's own failure: a t.Error from any of the
+// child's goroutines (or a helper given its t) only marks the test failed,
+// and the SIGKILL would otherwise discard that mark.
 type killViolationWatch struct {
+	t        testing.TB
 	mu       sync.Mutex
 	reported int
 }
@@ -229,6 +234,10 @@ func (w *killViolationWatch) scan(acks *ackLog) int {
 	w.reported += len(found)
 	if len(found) > 0 {
 		killChildDie("apply-order violation: %s", found[0])
+	}
+	if w.t.Failed() {
+		acks.line(ackLineViolation + "child test marked failed")
+		killChildDie("child test marked failed; see its output above")
 	}
 	return w.reported
 }
@@ -326,7 +335,7 @@ func TestKillRestart_Child(t *testing.T) {
 	// parent's pre-kill SIGUSR1 (sent only after the ready line) gets a final
 	// scan and the in-flight count before it sends SIGKILL.
 	props := &killProposers{}
-	watch := &killViolationWatch{}
+	watch := &killViolationWatch{t: t}
 	go func() {
 		for {
 			time.Sleep(2 * time.Millisecond)
@@ -504,7 +513,14 @@ func startKillChild(t *testing.T, spec killChildSpec, name string) *killChild {
 
 	cmd := exec.CommandContext(t.Context(), os.Args[0],
 		"-test.run=^TestKillRestart_Child$", "-test.count=1", "-test.timeout=30m")
-	cmd.Env = append(os.Environ(), killRestartChildEnv+"=1", killRestartSpecEnv+"="+specPath)
+	// A race report must stop the child at once: a SIGKILLed child never
+	// reaches the exit that -race would otherwise fail. Options already in
+	// GORACE are kept; the later halt_on_error wins.
+	gorace := "halt_on_error=1"
+	if g := os.Getenv("GORACE"); g != "" {
+		gorace = g + " " + gorace
+	}
+	cmd.Env = append(os.Environ(), killRestartChildEnv+"=1", killRestartSpecEnv+"="+specPath, "GORACE="+gorace)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -524,6 +540,9 @@ func startKillChild(t *testing.T, spec killChildSpec, name string) *killChild {
 			_ = cmd.Process.Kill()
 			<-c.exited
 		}
+		if failure := c.logFailure(); failure != "" {
+			t.Errorf("%s: child log holds a failure report:\n%s", name, failure)
+		}
 	})
 	t.Logf("%s: started child pid %d (mode %s)", name, cmd.Process.Pid, spec.Mode)
 	return c
@@ -536,6 +555,35 @@ func (c *killChild) logTail() string {
 		b = b[len(b)-4096:]
 	}
 	return string(b)
+}
+
+// logFailure scans the child's whole log for a report that a SIGKILL would
+// otherwise hide: a race detector report, a panic, a Go runtime fatal error
+// or a failed child test. It returns the log from the first such line
+// (capped at 16 KiB), or "" if there is none.
+func (c *killChild) logFailure() string {
+	b, err := os.ReadFile(c.logPath)
+	if err != nil {
+		return fmt.Sprintf("read child log %s: %v", c.logPath, err)
+	}
+	s := string(b)
+	for off := 0; off < len(s); {
+		end := strings.IndexByte(s[off:], '\n')
+		if end < 0 {
+			end = len(s) - off
+		}
+		l := s[off : off+end]
+		if l == "WARNING: DATA RACE" || strings.HasPrefix(l, "panic: ") ||
+			strings.HasPrefix(l, "fatal error: ") || strings.HasPrefix(l, "--- FAIL") {
+			r := s[off:]
+			if len(r) > 16<<10 {
+				r = r[:16<<10]
+			}
+			return r
+		}
+		off += end + 1
+	}
+	return ""
 }
 
 // ackLines is every complete line of the child's ack file. A line the kill
@@ -571,6 +619,9 @@ func (c *killChild) waitLines(t *testing.T, desc string, pred func(lines []strin
 		}
 		select {
 		case <-c.exited:
+			if failure := c.logFailure(); failure != "" {
+				t.Fatalf("child exited (%v) before %s with a failure report in its log:\n%s", c.cmd.ProcessState, desc, failure)
+			}
 			t.Fatalf("child exited (%v) before %s; log:\n%s", c.cmd.ProcessState, desc, c.logTail())
 		default:
 		}
@@ -609,6 +660,9 @@ func (c *killChild) kill(t *testing.T, name string) int {
 	case <-c.exited:
 	case <-time.After(30 * time.Second):
 		t.Fatalf("%s: child did not exit within 30s of SIGKILL", name)
+	}
+	if failure := c.logFailure(); failure != "" {
+		t.Fatalf("%s: child log holds a failure report:\n%s", name, failure)
 	}
 	ps := c.cmd.ProcessState
 	if code := ps.ExitCode(); code != -1 {
