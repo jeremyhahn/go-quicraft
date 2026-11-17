@@ -60,6 +60,14 @@ jobs:
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
 
+      # A hosted runner starts with about 14 GB free, less than the two image
+      # builds and the stages' caches need (ci.yml's image job does the same).
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune --all --force
+          df -h /
+
       - name: Pull the toolchain image from the registry cache
         run: scripts/ci-image-cache.sh pull || true
 
