@@ -23,6 +23,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 )
 
 // ---------------------------------------------------------------------------
@@ -106,7 +108,13 @@ func waitForUnanimousLeader(t *testing.T, c *testCluster, shardID uint64, timeou
 // no traffic at all, a leader trivially remains leader, and this test would be
 // asserting nothing about behaviour under load.
 //
-// A follower that forgets the leader, a term that advances or a missed write
+// The property has a precondition: Raft keeps a healthy leader only while
+// heartbeats arrive well inside the election timeout, and a follower cannot
+// tell a leader the host is not scheduling from a dead one. The suite's
+// 500ms-1s timeout is shorter than goroutine freezes recorded on loaded CI
+// hosts, so this test runs its shard on stableElectionRTT, whose 4s floor
+// outlasts two back-to-back worst freezes (see its comment). With that margin
+// a follower that forgets the leader, a term that advances or a missed write
 // floor is a verdict on the engine and fails the test; two replicas leading
 // one term is a safety violation and fails it too. The second subtest is the
 // control that keeps the first honest: it runs the same observation loop and
@@ -119,6 +127,72 @@ func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 
 // settledShard is a three-node shard whose every node names the same leader
 // in the same term, after an entry committed in that term.
+// worstRecordedFreeze is the longest a running goroutine of this suite has
+// been seen frozen by the host's scheduler: per-send and per-receive
+// timestamps on a 24-core box at load ~200 recorded freezes of 0.37s to 1.6s,
+// the longest with the leader's step worker `runnable` mid-iteration, holding
+// no lock, with no I/O in its path. Nothing in the engine stopped; the kernel
+// stopped running it.
+const worstRecordedFreeze = 1600 * time.Millisecond
+
+// stableElectionRTT is the ElectionRTT the leader-stability shard runs with,
+// derived from worstRecordedFreeze rather than chosen.
+//
+// A heartbeat needs one wake-up on the leader's side to be sent and one on
+// the follower's side to be delivered, so two freezes back to back, one per
+// side of the wire, are 2 x 1.6s = 3.2s of silence from a leader that never
+// stopped sending. The shortest election timeout a follower can draw is
+// ElectionRTT ticks, so it is set to two and a half worst freezes, 4s: 0.8s
+// above the worst two-sided silence. At the suite's 50ms tick that is
+// ElectionRTT 80. The suite-wide ElectionRTT 10 (a 500ms floor) sits below a
+// single recorded freeze, which is why this test, the one test whose subject
+// is that NO election happens, runs on its own timing: with this margin a
+// lost leader, an advanced term or a missed floor is a verdict on the engine.
+const stableElectionRTT = uint64(5 * worstRecordedFreeze / 2 / raftTick)
+
+// stableElectionRound is the longest randomised election timeout the
+// stability shard can draw (2 x ElectionRTT ticks, 8s); the load window
+// outlasts it, so an election the engine causes still fires inside it.
+var stableElectionRound = electionbudget.Round(stableElectionRTT, testRTTMillisecond)
+
+// stableLeaderElection bounds the stability shard's first election, as
+// leaderElectionTimeout does for the suite's own timing.
+var stableLeaderElection = electionbudget.LeaderElection(stableElectionRTT, testRTTMillisecond)
+
+// startStableShard is (*testCluster).startShard with the shard's ElectionRTT
+// raised to stableElectionRTT. It mirrors that method rather than calling it
+// because the shard config is built inside it.
+func startStableShard(c *testCluster, shardID uint64) []*smTracker {
+	c.t.Helper()
+
+	members := make(map[uint64]string, len(c.hosts))
+	for i, addr := range c.addrs {
+		members[uint64(i+1)] = addr
+	}
+
+	// Every founder names every member's identity: the same map on each.
+	identities := make(map[uint64]string, len(c.hosts))
+	for i, h := range c.hosts {
+		identities[uint64(i+1)] = h.NodeIdentity()
+	}
+
+	trackers := make([]*smTracker, len(c.hosts))
+	for i, h := range c.hosts {
+		createFn, tracker := kvCreateFunc()
+		trackers[i] = tracker
+
+		scfg := testShardConfig(shardID, uint64(i+1))
+		scfg.ElectionRTT = stableElectionRTT
+		scfg.MemberIdentities = identities
+		if err := h.StartShard(members, false, createFn, scfg); err != nil {
+			c.t.Fatalf("StartShard[%d] failed: %v", i, err)
+		}
+	}
+
+	c.trackers = trackers
+	return trackers
+}
+
 type settledShard struct {
 	cluster  *testCluster
 	trackers []*smTracker
@@ -136,13 +210,14 @@ func settleShard(t *testing.T, shardID uint64) settledShard {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(cluster.close)
 
-	trackers := cluster.startShard(shardID)
-	warmupIdx := cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
+	trackers := startStableShard(cluster, shardID)
+	warmupIdx := cluster.waitForClusterLeader(shardID, stableLeaderElection)
 
 	// A committed entry in the current term (PhD 6.4) before anything is
 	// measured, so the leader is fully established rather than mid-handover.
-	proposeCommitted(t, cluster.hosts[warmupIdx], shardID, "stability-warmup", "ok", defaultTimeout)
-	leader, term := waitForUnanimousLeader(t, cluster, shardID, leaderElectionTimeout)
+	// A warmup that spans an election takes up to one stability round.
+	proposeCommitted(t, cluster.hosts[warmupIdx], shardID, "stability-warmup", "ok", defaultTimeout+stableElectionRound)
+	leader, term := waitForUnanimousLeader(t, cluster, shardID, stableLeaderElection)
 	t.Logf("settled: replica %d leads term %d", leader, term)
 
 	// The caller addresses the replica the baseline was actually taken from,
@@ -218,14 +293,18 @@ func testLeaderHoldsTermUnderLoad(t *testing.T) {
 	const (
 		shardID    = uint64(1)
 		numWriters = 4
-		loadWindow = 4 * time.Second
-		// writeFloor is deliberately well under the measured rate: 5/4
-		// committed writes per writer-second, where the linearizability suite
-		// records 5-19 per client-second against this configuration. A run
-		// that stalled entirely cannot clear it; a healthy one clears it by
-		// four times or more.
-		writeFloor = numWriters * int64(loadWindow/time.Second) * 5 / 4
+		// writesPerWriterSecond is the write floor's rate, deliberately well
+		// under the measured one: 5/4 committed writes per writer-second,
+		// where the linearizability suite records 5-19 per client-second
+		// against this configuration. A run that stalled entirely cannot
+		// clear it; a healthy one clears it by four times or more.
+		writesPerWriterSecondNum, writesPerWriterSecondDen = 5, 4
 	)
+	// The load window outlasts the longest election timeout the shard can
+	// draw, so an election the engine causes fires inside it, and the write
+	// floor scales with it.
+	loadWindow := stableElectionRound + 2*time.Second
+	writeFloor := numWriters * int64(loadWindow/time.Second) * writesPerWriterSecondNum / writesPerWriterSecondDen
 
 	s := settleShard(t, shardID)
 
@@ -301,9 +380,9 @@ func testClosedLeaderAdvancesTerm(t *testing.T) {
 		closeAfter = time.Second
 	)
 	// After the close, the survivors need up to one randomised election
-	// timeout to stop expecting the leader (electionRound bounds it) and one
-	// more round for the election that advances the term.
-	controlWindow := closeAfter + 2*electionRound
+	// timeout to stop expecting the leader (stableElectionRound bounds it)
+	// and one more round for the election that advances the term.
+	controlWindow := closeAfter + 2*stableElectionRound
 
 	s := settleShard(t, shardID)
 
