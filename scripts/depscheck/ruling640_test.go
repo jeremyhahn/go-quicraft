@@ -408,6 +408,10 @@ func TestBump(t *testing.T) {
 		assert.Contains(t, stderr, "cannot look up the latest version of github.com/jeremyhahn/go-private: git ls-remote -q origin: exit status 128")
 		assert.Contains(t, stderr, "deps-bump: FAILED: the latest version of 1 module(s) in testdata/lookup could not be looked up; go.mod left unchanged")
 		assert.NotContains(t, stdout, "deps-bump: done")
+		// testdata/lookup lists example.com/behind, outdated and eligible,
+		// before the failing lookup: a check that ran after (or inside) the
+		// edit loop would already have called Get on it.
+		assert.NotContains(t, stdout, "bumped example.com/behind")
 		assert.Empty(t, edit.gets)
 		assert.Equal(t, 0, edit.tidy)
 		after, err := os.ReadFile(gomod)
