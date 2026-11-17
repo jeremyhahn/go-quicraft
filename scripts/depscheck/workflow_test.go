@@ -281,6 +281,24 @@ func TestDepsBumpBaseStep(t *testing.T) {
 		assert.NotEqual(t, f.a, tip)
 		assert.Equal(t, f.a, f.run("", "--git-dir="+f.origin, "rev-parse", tip+"^"), "one commit on the placeholder")
 	})
+	t.Run("a placeholder is reused after an earlier PR merged", func(t *testing.T) {
+		// An earlier bump PR (head c) merged; a later run re-created the
+		// branch at a, a commit of main, and was cancelled before its
+		// commit. The closed-PR lookup still returns the merged PR, but
+		// the placeholder carries nothing main lacks: it is reused.
+		f := newForge(t)
+		f.setBranch(f.a)
+		code, out, got := f.step(findBase, "FAKE_MERGED=2026-11-01T00:00:00Z", "FAKE_MERGED_HEAD="+f.c)
+		require.Equal(t, 0, code, out)
+		assert.Equal(t, f.a, got["sha"], "the bump builds on the placeholder's tip")
+		assert.Empty(t, got["stale"])
+		assert.Equal(t, f.a, f.branch())
+		assert.NotContains(t, f.calls(), "DELETE")
+
+		code, out, _ = f.step(commitStep, "BASE_SHA="+got["sha"], "CHANGED=go.mod")
+		require.Equal(t, 0, code, out)
+		assert.Equal(t, f.a, f.run("", "--git-dir="+f.origin, "rev-parse", f.branch()+"^"), "one commit on the placeholder")
+	})
 	t.Run("a placeholder that moves after the tip check is not deleted", func(t *testing.T) {
 		// The tip reads a; b, a commit main lacks, lands before the merge
 		// base is read, and the merge base of main and b is still a.
