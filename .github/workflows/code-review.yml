@@ -608,8 +608,17 @@ on:
   # route, and starts the opencode review when `agent:opencode` is added.
   # v5.10.12 (2026-11-12, Tenant Agent m2586 (1)): `ready_for_review` too, so
   # a draft marked ready is reviewed without a push or a reopen.
+  # LOCAL (security): P1 "A completed no-review gate remains green after the
+  # PR is retargeted". `edited` too: a retarget emits only `edited`, and the
+  # required gate must re-run against the new base (the event's base sha and
+  # ref are the new base's). On `edited` the review jobs skip (no PR-head
+  # code is checked out or run) and only the gate runs, on every `edited`,
+  # a title or body edit included: a skipped job's check run counts as
+  # success for a required check, so a gate skipped on a title edit would
+  # turn a red gate green. Its verdict on a title edit is the same live
+  # recomputation, so it only repeats the standing one.
   pull_request_target:
-    types: [opened, reopened, synchronize, labeled, ready_for_review]
+    types: [opened, reopened, synchronize, labeled, ready_for_review, edited]
 
 # v5.9.4: no workflow-level concurrency. A group there takes every run the
 # events create, a run whose job the `if:` skips among them, and a newer
@@ -678,8 +687,10 @@ jobs:
     # re-run replays this payload, as it did before.
     # v5.10.6 (Tenant Agent m2331 (2)): a head in this repository only; a
     # fork's head never takes a codex runner.
+    # LOCAL (security): never on `edited` (only the gate job runs on it).
     if: >-
-      github.event.pull_request.state == 'open'
+      github.event.action != 'edited'
+      && github.event.pull_request.state == 'open'
       && contains(github.event.pull_request.labels.*.name, 'code-review')
       && contains(github.event.pull_request.labels.*.name, 'task:ready')
       && !contains(github.event.pull_request.labels.*.name, 'task:in-progress')
@@ -2579,7 +2590,8 @@ jobs:
     name: Code Review (opencode)
     needs: review
     # Gitea only (v5.9.0): its token check and permission read are Gitea's.
-    if: needs.review.outputs.agent == 'opencode' && github.server_url != 'https://github.com'
+    # LOCAL (security): never on `edited` (only the gate job runs on it).
+    if: github.event.action != 'edited' && needs.review.outputs.agent == 'opencode' && github.server_url != 'https://github.com'
     runs-on: qwen  # CUSTOMIZE: the opencode review host's runner label
     # 3300 s >= 1530 + 630 (the two runs, kill grace included) + 2 x 130 (the
     # debug calls) + 880 s for checkout, guard, prepare, post and cleanup.
@@ -3013,6 +3025,9 @@ jobs:
   gate:
     name: Code Review (codex)
     needs: review
+    # LOCAL (security): `always()` on `edited` too, never skipped (see `on:`):
+    # on a retarget the event's BASE_SHA/BASE_REF are the new base's, so the
+    # exemption and the approval's patch=/ctx= are recomputed against it.
     if: always()
     runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
     timeout-minutes: 80
