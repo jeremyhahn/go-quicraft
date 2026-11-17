@@ -42,7 +42,9 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -76,6 +78,11 @@ const (
 	ackLineDone           = "done"
 	ackLineSnapshotSaved  = "snapshot-saved"
 	ackLineSnapshotSaving = "snapshot-saving"
+	// ackLineViolation prefixes one apply-order violation the child's state
+	// machine recorded; ackLinePreKill prefixes the child's answer to the
+	// parent's pre-kill SIGUSR1: "pre-kill in-flight N violations M".
+	ackLineViolation = "violation "
+	ackLinePreKill   = "pre-kill "
 
 	// killChildWait bounds every wait on a child line; a child that never
 	// writes it has failed, and its log is printed.
@@ -163,6 +170,67 @@ func (a *ackLog) line(s string) {
 func killChildDie(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "kill-restart child: "+format+"\n", args...)
 	os.Exit(3)
+}
+
+// killProposers gates the child's proposers. Before the kill the parent asks
+// the child to freeze its ack record: a proposal that returns after the
+// freeze is never recorded as acknowledged, so the recorded ack set is
+// closed, and inFlight is the number of proposals submitted to the engine
+// and not yet returned. The proposers keep submitting fresh keys after the
+// freeze, so the WAL stays busy until the SIGKILL.
+type killProposers struct {
+	mu       sync.Mutex
+	frozen   bool
+	inFlight int
+}
+
+// freeze closes the ack record and returns the in-flight count. With
+// needInFlight it waits until at least one proposal is in flight, so the
+// count it reports is above zero.
+func (p *killProposers) freeze(needInFlight bool) int {
+	deadline := time.Now().Add(killChildWait)
+	for {
+		p.mu.Lock()
+		p.frozen = true
+		n := p.inFlight
+		p.mu.Unlock()
+		if n > 0 || !needInFlight {
+			return n
+		}
+		if time.Now().After(deadline) {
+			killChildDie("no proposal in flight within %v of the freeze", killChildWait)
+		}
+		time.Sleep(100 * time.Microsecond)
+	}
+}
+
+// killViolationWatch forwards the apply-order violations the child's state
+// machines record (helpers_test.go's sink, which only a t.Cleanup would
+// otherwise report and a SIGKILLed child never runs) to the parent: each is
+// written to the ack file and the child exits non-zero at once.
+type killViolationWatch struct {
+	mu       sync.Mutex
+	reported int
+}
+
+// scan reports every violation not yet reported and returns the total.
+func (w *killViolationWatch) scan(acks *ackLog) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var found []string
+	applyOrderViolations.mu.Lock()
+	if list := applyOrderViolations.list; len(list) > w.reported {
+		found = slices.Clone(list[w.reported:])
+	}
+	applyOrderViolations.mu.Unlock()
+	for _, v := range found {
+		acks.line(ackLineViolation + strings.ReplaceAll(v, "\n", " "))
+	}
+	w.reported += len(found)
+	if len(found) > 0 {
+		killChildDie("apply-order violation: %s", found[0])
+	}
+	return w.reported
 }
 
 // killLoadMTLS reads a testpki leaf from the files LeafFiles wrote.
@@ -254,6 +322,29 @@ func TestKillRestart_Child(t *testing.T) {
 	}
 	acks := openAckLog(spec.AckFile)
 
+	// Apply-order violations reach the parent within milliseconds, and the
+	// parent's pre-kill SIGUSR1 (sent only after the ready line) gets a final
+	// scan and the in-flight count before it sends SIGKILL.
+	props := &killProposers{}
+	watch := &killViolationWatch{}
+	go func() {
+		for {
+			time.Sleep(2 * time.Millisecond)
+			watch.scan(acks)
+		}
+	}()
+	preKill := make(chan os.Signal, 1)
+	signal.Notify(preKill, syscall.SIGUSR1)
+	go func() {
+		<-preKill
+		n := 0
+		if spec.Mode == killModeBatch || spec.Mode == killModeSnapshot {
+			n = props.freeze(spec.Mode == killModeBatch)
+		}
+		v := watch.scan(acks)
+		acks.line(fmt.Sprintf("%sin-flight %d violations %d", ackLinePreKill, n, v))
+	}()
+
 	createFn, tracker := kvCreateFunc()
 	if spec.Mode == killModeSnapshot {
 		blockAt := spec.BlockSnapshot
@@ -291,7 +382,7 @@ func TestKillRestart_Child(t *testing.T) {
 	case killModeAcks:
 		killWaitLeader(h)
 		for seq, acked := 0, 0; acked < spec.Count; seq++ {
-			if killProposeOnce(h, acks, 0, seq) {
+			if killProposeOnce(h, acks, props, 0, seq) {
 				acked++
 			}
 		}
@@ -301,7 +392,7 @@ func TestKillRestart_Child(t *testing.T) {
 		for w := range spec.Workers {
 			go func(worker int) {
 				for seq := 0; ; seq++ {
-					killProposeOnce(h, acks, worker, seq)
+					killProposeOnce(h, acks, props, worker, seq)
 				}
 			}(w)
 		}
@@ -329,22 +420,30 @@ func killWaitLeader(h *quicraft.Host) {
 // killProposeOnce proposes killKey(worker, seq) once and records the ack.
 // An error leaves the key in flight: it may or may not be applied, and the
 // caller moves on to a fresh key.
-func killProposeOnce(h *quicraft.Host, acks *ackLog, worker, seq int) bool {
+func killProposeOnce(h *quicraft.Host, acks *ackLog, props *killProposers, worker, seq int) bool {
 	key := killKey(worker, seq)
 	value := killValue(key)
 	ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
 	defer cancel()
+	props.mu.Lock()
+	props.inFlight++
+	props.mu.Unlock()
 	//quicraft:direct-propose single-voter shard: h is the only replica
 	result, err := h.SyncPropose(ctx, killRestartShardID, encodeKVPut(key, value))
-	if err != nil {
-		time.Sleep(10 * time.Millisecond)
-		return false
-	}
-	if result.Value != uint64(len(value)) {
+	if err == nil && result.Value != uint64(len(value)) {
 		killChildDie("put(%s) acknowledged with Value=%d, want %d", key, result.Value, len(value))
 	}
-	acks.line("ack " + key + " " + value)
-	return true
+	props.mu.Lock()
+	props.inFlight--
+	acked := err == nil && !props.frozen
+	if acked {
+		acks.line("ack " + key + " " + value)
+	}
+	props.mu.Unlock()
+	if err != nil {
+		time.Sleep(10 * time.Millisecond)
+	}
+	return acked
 }
 
 // killServe dumps the serve-mode child's state machine every 100ms, written
@@ -483,9 +582,26 @@ func (c *killChild) waitLines(t *testing.T, desc string, pred func(lines []strin
 }
 
 // kill SIGKILLs the child and asserts it died by that signal: an exit code
-// of -1 and a SIGKILL wait status, never a clean or error exit.
-func (c *killChild) kill(t *testing.T, name string) {
+// of -1 and a SIGKILL wait status, never a clean or error exit. It fails the
+// test on any apply-order violation the child reported and returns the
+// number of proposals in flight at the child's pre-kill freeze.
+func (c *killChild) kill(t *testing.T, name string) int {
 	t.Helper()
+	// Pre-kill handshake: the child freezes its ack record, scans for
+	// apply-order violations one last time and reports both.
+	if err := c.cmd.Process.Signal(syscall.SIGUSR1); err != nil {
+		t.Fatalf("%s: signal child: %v", name, err)
+	}
+	var report string
+	c.waitLines(t, "pre-kill report", func(l []string) bool {
+		for _, s := range l {
+			if strings.HasPrefix(s, ackLinePreKill) {
+				report = s
+				return true
+			}
+		}
+		return false
+	})
 	if err := c.cmd.Process.Kill(); err != nil {
 		t.Fatalf("%s: kill child: %v", name, err)
 	}
@@ -503,6 +619,22 @@ func (c *killChild) kill(t *testing.T, name string) {
 		t.Fatalf("%s: child wait status %v, want killed by SIGKILL", name, ps)
 	}
 	t.Logf("%s: child pid %d exited by signal %v (exit code %d)", name, ps.Pid(), ws.Signal(), ps.ExitCode())
+
+	var inFlight, violations int
+	if _, err := fmt.Sscanf(report, ackLinePreKill+"in-flight %d violations %d", &inFlight, &violations); err != nil {
+		t.Fatalf("%s: malformed pre-kill report %q: %v", name, report, err)
+	}
+	var reported []string
+	for _, s := range c.ackLines(t) {
+		if strings.HasPrefix(s, ackLineViolation) {
+			reported = append(reported, strings.TrimPrefix(s, ackLineViolation))
+		}
+	}
+	if violations != 0 || len(reported) != 0 {
+		t.Fatalf("%s: child reported %d apply-order violations: %q", name, max(violations, len(reported)), reported)
+	}
+	t.Logf("%s: child reported 0 apply-order violations; %d proposals in flight at the pre-kill freeze", name, inFlight)
+	return inFlight
 }
 
 // countAcks is the number of "ack" lines.
@@ -677,7 +809,13 @@ func TestKillRestart_MidBatch(t *testing.T) {
 	spec.Workers = 8
 	child := startKillChild(t, spec, name)
 	child.waitLines(t, "60 acks recorded", func(l []string) bool { return countAcks(l) >= 60 })
-	child.kill(t, name)
+	// kill freezes the ack record first; the child answers only once a
+	// submitted proposal has not been acknowledged, and keeps proposing.
+	inFlight := child.kill(t, name)
+	if inFlight <= 0 {
+		t.Fatalf("%s: %d proposals in flight at the kill, want at least one", name, inFlight)
+	}
+	t.Logf("%s: %d submitted, unacknowledged proposals in flight at the kill", name, inFlight)
 
 	verifySingleReplicaRestart(t, spec, ackedEntries(t, child.ackLines(t)))
 	t.Logf("%s: wall time %v", name, time.Since(start).Round(time.Millisecond))
