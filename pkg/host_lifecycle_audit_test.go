@@ -294,6 +294,10 @@ func TestAudit_ImportSnapshot_RefusedWhileRemovalIntentPending(t *testing.T) {
 	if !errors.Is(importErr, ErrInvalidOperation) {
 		t.Errorf("ImportSnapshot while a removal intent is pending: err = %v, want ErrInvalidOperation", importErr)
 	}
+	var rpe *removalPendingError
+	if !errors.As(importErr, &rpe) || rpe.ShardID != shardID || rpe.ReplicaID != replicaID || rpe.Dir != dirA {
+		t.Errorf("ImportSnapshot refusal = %T %v, want *removalPendingError naming %s", importErr, importErr, dirA)
+	}
 	if ss, err := h.logdb.GetSnapshot(shardID, replicaID); err != nil || ss.Index != 900 {
 		t.Errorf("recorded snapshot after the import = %+v (err %v), want index 900 under A", ss, err)
 	}

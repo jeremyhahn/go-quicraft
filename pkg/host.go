@@ -9436,6 +9436,17 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	if err := h.refuseRetiredReplica(shardID, replicaID); err != nil {
 		return 0, err
 	}
+	// A pending removal intent names the tree RemoveData's retry deletes.
+	// An import records its snapshot in the tree resolveImportDataDir picks,
+	// which with no bootstrap record need not be that one, so importing now
+	// could record a snapshot the retry orphans: it retires the replica,
+	// drops the record and deletes only the intent's tree. The second call,
+	// under the import lock RemoveData also holds, is the binding check.
+	if p, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil {
+		return 0, err
+	} else if pending {
+		return 0, &removalPendingError{ShardID: shardID, ReplicaID: replicaID, Dir: p}
+	}
 
 	// A CONFIGURED but SEALED barrier means at-rest encryption is temporarily
 	// unavailable for this shard, not that the shard is plaintext. Refuse
@@ -11515,6 +11526,31 @@ func (h *Host) refuseDataDirChange(shardID, replicaID uint64, dataDir string) er
 	// RemoveData locates them by it only until this start records dataDir,
 	// so the two must agree. A record in no replica layout is left to
 	// RemoveData, which refuses it.
+	requestedDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(h.cfg.NodeHostDir, dataDir, shardID), shardID, replicaID)
+	changed := func(recordedDir string) error {
+		// recordedDir is <DataDir>/shard-<id>/shard-<id>/replica-<id>; the
+		// NodeHostDir layout is reported as the empty DataDir that selects it.
+		recorded := filepath.Dir(filepath.Dir(filepath.Dir(recordedDir)))
+		if recorded == filepath.Join(h.cfg.NodeHostDir, "snapshots") {
+			recorded = ""
+		}
+		return &dataDirChangedError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Recorded:  recorded,
+			Requested: dataDir,
+		}
+	}
+	// A pending removal intent is what RemoveData's retry locates the tree
+	// by while no bootstrap record exists, so a start (whose node then
+	// records snapshots) must place them in the intent's tree too, or the
+	// retry deletes the intent's tree and orphans the new one.
+	if p, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil {
+		return err
+	} else if pending && p != requestedDir {
+		return changed(p)
+	}
 	ss, err := h.logdb.GetSnapshot(shardID, replicaID)
 	if errors.Is(err, logdb.ErrNoSnapshot) {
 		return nil
@@ -11523,26 +11559,10 @@ func (h *Host) refuseDataDirChange(shardID, replicaID uint64, dataDir string) er
 		return err
 	}
 	recordedDir, inLayout := replicaSnapshotDirFromRecord(ss.Filepath, shardID, replicaID)
-	if !inLayout {
+	if !inLayout || recordedDir == requestedDir {
 		return nil
 	}
-	requestedDir := engine.ReplicaSnapshotDir(
-		shardSnapshotBaseDir(h.cfg.NodeHostDir, dataDir, shardID), shardID, replicaID)
-	if recordedDir == requestedDir {
-		return nil
-	}
-	// recordedDir is <DataDir>/shard-<id>/shard-<id>/replica-<id>; the
-	// NodeHostDir layout is reported as the empty DataDir that selects it.
-	recorded := filepath.Dir(filepath.Dir(filepath.Dir(recordedDir)))
-	if recorded == filepath.Join(h.cfg.NodeHostDir, "snapshots") {
-		recorded = ""
-	}
-	return &dataDirChangedError{
-		ShardID:   shardID,
-		ReplicaID: replicaID,
-		Recorded:  recorded,
-		Requested: dataDir,
-	}
+	return changed(recordedDir)
 }
 
 // removeDataLayoutUnknownError is returned by RemoveData when the replica

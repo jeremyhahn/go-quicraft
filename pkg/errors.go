@@ -1836,6 +1836,32 @@ func (e *removeDataError) Error() string {
 // Unwrap returns the underlying error.
 func (e *removeDataError) Unwrap() error { return e.Err }
 
+// removalPendingError is returned when an operation that would record a new
+// snapshot for a replica is refused because a RemoveData of that replica is
+// pending: its durable removal intent names the snapshot tree the retry
+// deletes, so a snapshot recorded in another tree would be orphaned. The
+// caller retries RemoveData to finish the removal. It matches
+// ErrInvalidOperation.
+type removalPendingError struct {
+	// ShardID is the shard whose removal is pending.
+	ShardID uint64
+	// ReplicaID is the replica whose removal is pending.
+	ReplicaID uint64
+	// Dir is the snapshot directory the pending removal intent names.
+	Dir string
+}
+
+// Error returns a human-readable description of the error.
+func (e *removalPendingError) Error() string {
+	return fmt.Sprintf("quicraft: shard %d replica %d has a pending RemoveData of %s; "+
+		"retry RemoveData to finish it", e.ShardID, e.ReplicaID, e.Dir)
+}
+
+// Is reports whether target is ErrInvalidOperation.
+func (e *removalPendingError) Is(target error) bool {
+	return target == ErrInvalidOperation
+}
+
 // NotLeader reports whether err indicates this replica is not the leader,
 // and returns the known leader's replica ID when the error carries one.
 //
