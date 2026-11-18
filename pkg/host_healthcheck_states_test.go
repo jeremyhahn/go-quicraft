@@ -207,6 +207,113 @@ func TestHealthCheck_ReportsEveryCallerReachableState(t *testing.T) {
 	}
 }
 
+// notReadyShardsJSON decodes the not_ready_shards list from the JSON
+// encoding of status, the field an operator's probe reads.
+func notReadyShardsJSON(t *testing.T, status *HealthStatus) []uint64 {
+	t.Helper()
+	b, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("json.Marshal(HealthStatus): %v", err)
+	}
+	var got struct {
+		NotReadyShards []uint64 `json:"not_ready_shards"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	return got.NotReadyShards
+}
+
+// TestHealthCheck_NotReadyWhenLeaderlessPastElectionTimeout pins issue
+// #1175: a started shard that has had no known leader for longer than its
+// election timeout cannot commit a write, so the host is not ready, and
+// the status names the shard. A shard inside its election window is left
+// alone so a normal election does not flap health.
+func TestHealthCheck_NotReadyWhenLeaderlessPastElectionTimeout(t *testing.T) {
+	unreachable := map[uint64]string{
+		1: "127.0.0.1:5000",
+		2: "127.0.0.1:5001",
+		3: "127.0.0.1:5002",
+	}
+	newHost := func(t *testing.T) *Host {
+		t.Helper()
+		h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		t.Cleanup(func() { h.Close() })
+		return h
+	}
+
+	t.Run("unreachable peers past the election timeout", func(t *testing.T) {
+		h := newHost(t)
+		cfg := testShardConfig(7, 1)
+		timeout := time.Duration(cfg.ElectionRTT*testHostConfig(t).RTTMillisecond) * time.Millisecond
+		start := time.Now()
+		if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
+			t.Fatalf("StartShard: %v", err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		var status *HealthStatus
+		for {
+			status = h.HealthCheck()
+			if status.Status == "not-ready" || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if status.Status != "not-ready" {
+			t.Fatalf("Status = %q with no quorum reachable, want %q", status.Status, "not-ready")
+		}
+		if since := time.Since(start); since < timeout {
+			t.Errorf("not-ready after %v, before the election timeout %v", since, timeout)
+		}
+		if len(status.Shards) != 1 || status.Shards[0].LeaderID != 0 {
+			t.Fatalf("Shards = %+v, want one leaderless shard", status.Shards)
+		}
+		if got := notReadyShardsJSON(t, status); len(got) != 1 || got[0] != 7 {
+			t.Errorf("not_ready_shards = %v, want [7]", got)
+		}
+	})
+
+	t.Run("healthy single-member shard", func(t *testing.T) {
+		h := newPauseTestHost(t, 3)
+		cfg := testShardConfig(3, 1)
+		// Well past the election timeout: a led shard stays ok.
+		time.Sleep(5 * time.Duration(cfg.ElectionRTT*testHostConfig(t).RTTMillisecond) * time.Millisecond)
+		status := h.HealthCheck()
+		if status.Status != "ok" {
+			t.Errorf("Status = %q, want %q", status.Status, "ok")
+		}
+		if got := notReadyShardsJSON(t, status); len(got) != 0 {
+			t.Errorf("not_ready_shards = %v, want none", got)
+		}
+		checkHealthStatusJSON(t, status)
+	})
+
+	t.Run("leaderless within the election timeout", func(t *testing.T) {
+		h := newHost(t)
+		cfg := testShardConfig(9, 1)
+		// A 10 minute election timeout: the shard is still inside its first
+		// election window for the whole test.
+		cfg.ElectionRTT = 600_000
+		if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
+			t.Fatalf("StartShard: %v", err)
+		}
+		status := h.HealthCheck()
+		if status.Status != "ok" {
+			t.Errorf("Status = %q inside the election timeout, want %q", status.Status, "ok")
+		}
+		if len(status.Shards) != 1 || status.Shards[0].Health != ShardNoLeader {
+			t.Fatalf("Shards = %+v, want one shard with no leader", status.Shards)
+		}
+		if got := notReadyShardsJSON(t, status); len(got) != 0 {
+			t.Errorf("not_ready_shards = %v, want none", got)
+		}
+		checkHealthStatusJSON(t, status)
+	})
+}
+
 // checkHealthStatusJSON asserts status marshals with exactly the documented
 // field names and that the encoded values agree with the struct.
 func checkHealthStatusJSON(t *testing.T, status *HealthStatus) {
