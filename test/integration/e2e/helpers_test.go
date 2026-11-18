@@ -78,7 +78,46 @@ const defaultTimeout = 15 * time.Second
 // testHostConfig gives every host in this suite. One tick is one
 // RTTMillisecond, so every timeout the engine expresses in ticks is this many
 // milliseconds per tick.
-const testRTTMillisecond = 50
+//
+// It is the harness mode's tick (harnessRTTMillisecond): 50ms with the WAL
+// fsync skipped, 500ms in WAL-sync mode.
+var testRTTMillisecond = harnessRTTMillisecond(walSyncMode)
+
+// walSyncEnv names the switch that selects the harness's WAL-sync mode. With
+// QUICRAFT_IT_WAL_SYNC=1 every host fdatasyncs its WAL before an ack, as
+// production does (make integration-test-walsync runs the Partition cases
+// so); unset, the harness skips the fsync (NoSyncWAL).
+const walSyncEnv = "QUICRAFT_IT_WAL_SYNC"
+
+// noSyncRTTMillisecond is the tick of the default, NoSyncWAL mode.
+const noSyncRTTMillisecond = 50
+
+// walSyncRTTMillisecond is the tick of WAL-sync mode. A real fdatasync on a
+// shared, contended disk was measured to stall 2.5-4.6s, and Raft persists
+// term and vote before any vote leaves the node, so the shortest election
+// timeout, testElectionRTT ticks, must outlast that stall: 10 ticks of 500ms
+// is 5s. TestBudgetsDescribeTheClusterTheyBudgetFor pins it.
+const walSyncRTTMillisecond = 500
+
+// walSyncStallCeiling is the longest fdatasync stall measured on CI hosts.
+const walSyncStallCeiling = 4600 * time.Millisecond
+
+// walSyncMode is the mode this run of the suite is in, read once from the
+// environment.
+var walSyncMode = harnessWALSync(os.Getenv)
+
+// harnessWALSync reports whether getenv selects WAL-sync mode.
+func harnessWALSync(getenv func(string) string) bool {
+	return getenv(walSyncEnv) == "1"
+}
+
+// harnessRTTMillisecond is the Raft tick, in milliseconds, of a harness mode.
+func harnessRTTMillisecond(walSync bool) uint64 {
+	if walSync {
+		return walSyncRTTMillisecond
+	}
+	return noSyncRTTMillisecond
+}
 
 // testElectionRTT is the number of ticks a follower waits without hearing from
 // a leader before it stands for election.
@@ -89,7 +128,7 @@ const testRTTMillisecond = 50
 const testElectionRTT = config.DefaultElectionRTT
 
 // raftTick is one Raft tick in wall-clock time.
-const raftTick = testRTTMillisecond * time.Millisecond
+var raftTick = time.Duration(testRTTMillisecond) * time.Millisecond
 
 // The election budgets are test/electionbudget's, derived from this suite's
 // testElectionRTT and testRTTMillisecond. The derivation and the reasoning
@@ -675,6 +714,13 @@ func kvCreateFunc() (sm.CreateFunc, *smTracker) {
 // cluster must share the same CA certificate.
 func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) config.HostConfig {
 	t.Helper()
+	return harnessHostConfig(t, listenAddr, mtls, walSyncMode)
+}
+
+// harnessHostConfig is testHostConfig for an explicit harness mode, so the
+// pin tests can check both modes in one run.
+func harnessHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig, walSync bool) config.HostConfig {
+	t.Helper()
 	assertApplyOrder(t)
 	armEngineFailureDetector(t)
 	return config.HostConfig{
@@ -693,32 +739,50 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 		NodeHostDir:           t.TempDir(),
 		RaftAddress:           listenAddr,
 		ListenAddress:         listenAddr,
-		RTTMillisecond:        testRTTMillisecond,
+		RTTMillisecond:        harnessRTTMillisecond(walSync),
 		DeploymentID:          1,
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
 		MaxApplyWorkers:       1,
-		// The WAL still writes every record through the real segment code;
-		// only the fdatasync is skipped. Raft persists term and vote before a
-		// RequestVote or vote grant leaves the node, so once every sync on the
-		// shared disk takes longer than the 0.5-1s election timeout no
-		// election can finish and the shard stays leaderless (#362, #360).
-		// Every host here gets fresh directories and none is reopened (a
-		// replacement host joins as a new node), so durability across a
-		// restart is not what this suite checks.
-		NoSyncWAL: true,
+		// By default the WAL still writes every record through the real
+		// segment code; only the fdatasync is skipped. Raft persists term
+		// and vote before a RequestVote or vote grant leaves the node, so
+		// once every sync on the shared disk takes longer than the 0.5-1s
+		// election timeout no election can finish and the shard stays
+		// leaderless (#362, #360). Every host here gets fresh directories
+		// and none is reopened (a replacement host joins as a new node), so
+		// durability across a restart is not what this suite checks.
+		// WAL-sync mode (QUICRAFT_IT_WAL_SYNC=1) runs the fsync-before-ack
+		// path production uses, with a tick (walSyncRTTMillisecond) that
+		// puts the shortest election timeout above the stall.
+		NoSyncWAL: !walSync,
 		TransportConfig: config.TransportConfig{
 			MTLSConfig: mtls,
 		},
 	}
 }
 
-// TestHarness_HostConfigSkipsWALSync pins testHostConfig to NoSyncWAL: a
-// stalled fdatasync holds every election past its timeout (#362).
-func TestHarness_HostConfigSkipsWALSync(t *testing.T) {
-	cfg := testHostConfig(t, "127.0.0.1:0", nil)
-	if !cfg.NoSyncWAL {
-		t.Fatal("testHostConfig must set NoSyncWAL: a stalled fdatasync holds every election past its timeout")
+// TestHarness_WALSyncMode pins the harness mode of this suite: NoSyncWAL with
+// QUICRAFT_IT_WAL_SYNC unset, the real fdatasync with it set to 1
+// (make integration-test-walsync).
+func TestHarness_WALSyncMode(t *testing.T) {
+	for _, tc := range []struct {
+		env         map[string]string
+		wantNoSync  bool
+		description string
+	}{
+		{map[string]string{}, true, "unset"},
+		{map[string]string{walSyncEnv: "0"}, true, "0"},
+		{map[string]string{walSyncEnv: "1"}, false, "1"},
+	} {
+		walSync := harnessWALSync(func(k string) string { return tc.env[k] })
+		cfg := harnessHostConfig(t, "127.0.0.1:0", nil, walSync)
+		if cfg.NoSyncWAL != tc.wantNoSync {
+			t.Fatalf("%s=%s: NoSyncWAL=%v, want %v", walSyncEnv, tc.description, cfg.NoSyncWAL, tc.wantNoSync)
+		}
+	}
+	if got, want := testHostConfig(t, "127.0.0.1:0", nil).NoSyncWAL, !harnessWALSync(os.Getenv); got != want {
+		t.Fatalf("testHostConfig NoSyncWAL=%v under %s=%q, want %v", got, walSyncEnv, os.Getenv(walSyncEnv), want)
 	}
 }
 
@@ -2599,10 +2663,33 @@ func requestSnapshotSync(t *testing.T, host *quicraft.Host, shardID uint64) uint
 // it is wrong by that factor — which is exactly the drift the derivation
 // replaced a literal to prevent. This is the only place that can notice.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
+	for _, walSync := range []bool{false, true} {
+		rtt := harnessRTTMillisecond(walSync)
+		if got := harnessHostConfig(t, "127.0.0.1:1", nil, walSync).RTTMillisecond; got != rtt {
+			t.Fatalf("walSync=%v: harnessHostConfig sets RTTMillisecond=%d but the budgets "+
+				"are derived from harnessRTTMillisecond=%d", walSync, got, rtt)
+		}
+		if walSync {
+			shortest := time.Duration(testElectionRTT) * time.Duration(rtt) * time.Millisecond
+			if shortest <= walSyncStallCeiling {
+				t.Fatalf("WAL-sync mode's shortest election timeout %v does not outlast "+
+					"the %v fdatasync stall", shortest, walSyncStallCeiling)
+			}
+		}
+	}
 	if got := testHostConfig(t, "127.0.0.1:1", nil).RTTMillisecond; got != testRTTMillisecond {
 		t.Fatalf("testHostConfig sets RTTMillisecond=%d but the budgets are derived "+
 			"from testRTTMillisecond=%d; one Raft tick is not what electionRound (%v) "+
-			"thinks it is", got, uint64(testRTTMillisecond), electionRound)
+			"thinks it is", got, testRTTMillisecond, electionRound)
+	}
+	if testRTTMillisecond != harnessRTTMillisecond(walSyncMode) {
+		t.Fatalf("testRTTMillisecond=%d is not the tick of the run's mode (walSync=%v)",
+			testRTTMillisecond, walSyncMode)
+	}
+	if leaderElectionTimeout != electionbudget.LeaderElection(testElectionRTT, harnessRTTMillisecond(walSyncMode)) ||
+		failoverTimeout != electionbudget.Failover(testElectionRTT, harnessRTTMillisecond(walSyncMode)) {
+		t.Fatalf("leaderElectionTimeout=%v failoverTimeout=%v do not follow the mode's tick",
+			leaderElectionTimeout, failoverTimeout)
 	}
 	for _, tc := range []struct {
 		name string

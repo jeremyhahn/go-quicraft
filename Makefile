@@ -327,6 +327,7 @@ integration-test: docker-build-it
 	@status=0; \
 	GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)' \
 		run --rm integration $(IT_CMD) || status=$$?; \
+	if [ $$status -eq 0 ]; then :; $(IT_WALSYNC_RUN) fi; \
 	GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)' \
 		down --volumes >/dev/null 2>&1 || true; \
 	exit $$status
@@ -1699,6 +1700,33 @@ IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 # (`make it-shard-packages`).
 IT_PKGS    ?= $(INT_TEST_DIR)/...
 IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(IT_PKGS)
+# WAL-sync mode (#1164): the linearizability suite and the e2e Partition
+# cases again with QUICRAFT_IT_WAL_SYNC=1, so every host fdatasyncs its WAL
+# before an ack as production does (the harnesses' default skips it). Only the
+# packages of that pair that are in IT_PKGS run, and nothing when neither is,
+# so each ci.yml integration shard runs the ones it holds. integration-test
+# runs it after IT_CMD succeeds, under the same teardown; the target
+# integration-test-walsync runs it alone. Host side: the image has no make.
+IT_WALSYNC_ALL     = $(filter $(INT_TEST_DIR)/...,$(IT_PKGS))
+IT_WALSYNC_LIN     = $(if $(IT_WALSYNC_ALL)$(filter $(INT_TEST_DIR)/linearizability $(INT_TEST_DIR)/linearizability/...,$(IT_PKGS)),$(INT_TEST_DIR)/linearizability/...)
+IT_WALSYNC_E2E     = $(if $(IT_WALSYNC_ALL)$(filter $(INT_TEST_DIR)/e2e $(INT_TEST_DIR)/e2e/...,$(IT_PKGS)),$(INT_TEST_DIR)/e2e)
+IT_WALSYNC_TEST    = go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1
+IT_WALSYNC_COMPOSE = GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)' \
+	run --rm -e QUICRAFT_IT_WAL_SYNC=1 integration $(IT_WALSYNC_TEST)
+# A shell fragment, each command ended by `;`: it leaves the first failure's
+# exit code in $$status and runs nothing after a failure.
+IT_WALSYNC_RUN = \
+	$(if $(IT_WALSYNC_LIN),echo "==> WAL-sync mode: $(IT_WALSYNC_LIN)"; \
+	$(IT_WALSYNC_COMPOSE) $(IT_WALSYNC_LIN) || status=$$?;) \
+	$(if $(IT_WALSYNC_E2E),[ $$status -ne 0 ] || echo "==> WAL-sync mode: $(IT_WALSYNC_E2E) -run Partition"; \
+	[ $$status -ne 0 ] || $(IT_WALSYNC_COMPOSE) -run 'Partition' $(IT_WALSYNC_E2E) || status=$$?;)
+
+.PHONY: integration-test-walsync
+integration-test-walsync: $(if $(strip $(IT_WALSYNC_LIN)$(IT_WALSYNC_E2E)),docker-build-it)
+	@$(if $(strip $(IT_WALSYNC_LIN)$(IT_WALSYNC_E2E)),status=0; $(IT_WALSYNC_RUN) \
+	GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)' \
+		down --volumes >/dev/null 2>&1 || true; \
+	exit $$status,echo "==> WAL-sync mode: no linearizability or e2e package in IT_PKGS; nothing to run")
 # Internal: a devcontainer build of one stage. GO_IMAGE comes from the pin file;
 # GO_BUILD_PROXY, when set in the caller's environment, replaces the public
 # module proxy for the build-time fetches. Quoted: CI passes a `|`-separated
@@ -1829,6 +1857,7 @@ help:
 	@echo ""
 	@echo "Integration Tests (run in devcontainer automatically):"
 	@echo "  integration-test            Run all integration tests in devcontainer"
+	@echo "  integration-test-walsync    Linearizability + e2e Partition with WAL fsync on"
 	@echo "  integration-test-raft       Run raft integration tests in devcontainer"
 	@echo "  integration-test-host       Run Host API tests in devcontainer"
 	@echo "  integration-test-e2e        Run E2E multi-node cluster tests (Docker Compose)"
