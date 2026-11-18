@@ -325,9 +325,19 @@ type RemotesDiag struct {
 // HealthStatus describes the overall health of a Host instance. The Status
 // field is one of "ok", "degraded", "sealed", or "unhealthy".
 type HealthStatus struct {
-	// Status is the aggregate health verdict: "ok", "degraded", "sealed",
-	// or "unhealthy".
+	// Status is the aggregate health verdict: "ok", "degraded",
+	// "not-ready", "sealed", or "unhealthy". "not-ready" means at least one
+	// started, unpaused shard has had no known leader for longer than its
+	// election timeout (ElectionRTT * RTTMillisecond), so it cannot commit a
+	// write; NotReadyShards names those shards. A shard inside its election
+	// window does not count, so a normal election does not flap health.
 	Status string `json:"status"`
+
+	// NotReadyShards lists, in ascending order, the IDs of the shards that
+	// have had no known leader for longer than their election timeout.
+	// Omitted when empty. It is filled whatever Status is, so a "degraded"
+	// or "sealed" host still names its leaderless shards.
+	NotReadyShards []uint64 `json:"not_ready_shards,omitempty"`
 
 	// BarrierSealed is true when the barrier is configured and sealed.
 	BarrierSealed bool `json:"barrier_sealed"`

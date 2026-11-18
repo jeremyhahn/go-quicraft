@@ -330,6 +330,9 @@ func checkHealthStatusJSON(t *testing.T, status *HealthStatus) {
 	if len(status.Shards) > 0 {
 		want = append(want, "shards")
 	}
+	if len(status.NotReadyShards) > 0 {
+		want = append(want, "not_ready_shards")
+	}
 	assertKeys(t, "HealthStatus", top, want, nil)
 
 	var gotStatus string
