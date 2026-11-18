@@ -35,10 +35,13 @@ package linearizability_test
 // fdatasync reached the platter.
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"os/exec"
@@ -54,6 +57,7 @@ import (
 
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/test/netport"
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
@@ -80,7 +84,9 @@ const (
 	ackLineSnapshotSaving = "snapshot-saving"
 	// ackLineViolation prefixes one apply-order violation the child's state
 	// machine recorded; ackLinePreKill prefixes the child's answer to the
-	// parent's pre-kill SIGUSR1: "pre-kill in-flight N violations M".
+	// parent's pre-kill SIGUSR1: "pre-kill wal-held KEY violations M", KEY
+	// being the proposal the WAL barrier holds mid-write, or "-" when the
+	// mode has no barrier.
 	ackLineViolation = "violation "
 	ackLinePreKill   = "pre-kill "
 
@@ -175,33 +181,150 @@ func killChildDie(format string, args ...any) {
 // killProposers gates the child's proposers. Before the kill the parent asks
 // the child to freeze its ack record: a proposal that returns after the
 // freeze is never recorded as acknowledged, so the recorded ack set is
-// closed, and inFlight is the number of proposals submitted to the engine
-// and not yet returned. The proposers keep submitting fresh keys after the
-// freeze, so the WAL stays busy until the SIGKILL.
+// closed. The proposers keep submitting fresh keys after the freeze, so the
+// WAL stays busy until the SIGKILL.
 type killProposers struct {
-	mu       sync.Mutex
-	frozen   bool
-	inFlight int
+	mu     sync.Mutex
+	frozen bool
 }
 
-// freeze closes the ack record and returns the in-flight count. With
-// needInFlight it waits until at least one proposal is in flight, so the
-// count it reports is above zero.
-func (p *killProposers) freeze(needInFlight bool) int {
-	deadline := time.Now().Add(killChildWait)
-	for {
-		p.mu.Lock()
-		p.frozen = true
-		n := p.inFlight
-		p.mu.Unlock()
-		if n > 0 || !needInFlight {
-			return n
-		}
-		if time.Now().After(deadline) {
-			killChildDie("no proposal in flight within %v of the freeze", killChildWait)
-		}
-		time.Sleep(100 * time.Microsecond)
+// freeze closes the ack record.
+func (p *killProposers) freeze() {
+	p.mu.Lock()
+	p.frozen = true
+	p.mu.Unlock()
+}
+
+// killWALBarrier holds the mid-batch child's WAL inside a segment write.
+// It is armed only after the ack record is frozen. The first write after
+// that which carries a proposal's put command writes the first half of its
+// bytes to the segment, reports the proposal's key on held, and never
+// returns. Every later write that carries a put blocks the same way. From
+// then on the engine can persist, commit and acknowledge nothing, so the
+// parent's SIGKILL lands with that proposal submitted, unacknowledged and
+// half-written in the active segment, whatever the proposers and the
+// handshake do in the meantime.
+type killWALBarrier struct {
+	armed atomic.Bool
+	once  sync.Once
+	held  chan string
+}
+
+func newKillWALBarrier() *killWALBarrier {
+	return &killWALBarrier{held: make(chan string, 1)}
+}
+
+// intercept runs before every segment write. It returns at once unless the
+// barrier is armed and p carries a put; otherwise it never returns.
+// writeHead writes a prefix of p through the real file.
+func (b *killWALBarrier) intercept(p []byte, writeHead func([]byte) error) {
+	if !b.armed.Load() {
+		return
 	}
+	key := killPutKeyIn(p)
+	if key == "" {
+		return
+	}
+	first := false
+	b.once.Do(func() { first = true })
+	if first {
+		if err := writeHead(p[:len(p)/2]); err != nil {
+			killChildDie("WAL barrier: write the head of the held record: %v", err)
+		}
+		b.held <- key
+	}
+	select {} // held until the SIGKILL
+}
+
+// killPutKeyIn returns the key of the first complete encodeKVPut(key,
+// killValue(key)) command in p, or "" when p holds none. The command is
+// [op][keylen:2][key][value], so a match is fixed by the length field, the
+// key bytes and the value bytes together, not by a loose text search.
+func killPutKeyIn(p []byte) string {
+	const valPrefix = "val-"
+	for off := 0; off < len(p); {
+		i := bytes.Index(p[off:], []byte(valPrefix+"k-"))
+		if i < 0 {
+			return ""
+		}
+		v := off + i
+		off = v + 1
+		for n := len("k-0-0"); n <= 24 && n+2 <= v; n++ {
+			key := p[v-n : v]
+			if int(binary.BigEndian.Uint16(p[v-n-2:v-n])) != n || !bytes.HasPrefix(key, []byte("k-")) {
+				continue
+			}
+			end := v + len(valPrefix) + n
+			if end <= len(p) && bytes.Equal(p[v+len(valPrefix):end], key) {
+				return string(key)
+			}
+		}
+	}
+	return ""
+}
+
+// killWALFS is the mid-batch child's WAL filesystem: the real one, with
+// every file's writes routed through the barrier.
+type killWALFS struct {
+	waldb.FS
+	barrier *killWALBarrier
+}
+
+func (f *killWALFS) OpenFile(name string, flag int, perm fs.FileMode) (waldb.File, error) {
+	file, err := f.FS.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return &killWALFile{File: file, barrier: f.barrier}, nil
+}
+
+func (f *killWALFS) Open(name string) (waldb.File, error) {
+	file, err := f.FS.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &killWALFile{File: file, barrier: f.barrier}, nil
+}
+
+// LockDir keeps the real WAL directory lock: the wrapper must not drop the
+// optional interfaces waldb probes for.
+func (f *killWALFS) LockDir(dir, name string) (io.Closer, error) {
+	l, ok := f.FS.(waldb.DirLocker)
+	if !ok {
+		return nil, fmt.Errorf("WAL filesystem %T has no directory lock", f.FS)
+	}
+	return l.LockDir(dir, name)
+}
+
+type killWALFile struct {
+	waldb.File
+	barrier *killWALBarrier
+}
+
+func (f *killWALFile) Write(p []byte) (int, error) {
+	f.barrier.intercept(p, func(h []byte) error { _, err := f.File.Write(h); return err })
+	return f.File.Write(p)
+}
+
+func (f *killWALFile) WriteAt(p []byte, off int64) (int, error) {
+	f.barrier.intercept(p, func(h []byte) error { _, err := f.File.WriteAt(h, off); return err })
+	return f.File.WriteAt(p, off)
+}
+
+// SyncMetadata and PreAllocate forward the optional interfaces of the real
+// file, so directory syncs and segment preallocation behave as in production.
+func (f *killWALFile) SyncMetadata() error {
+	if ms, ok := f.File.(waldb.FileMetadataSyncer); ok {
+		return ms.SyncMetadata()
+	}
+	return f.File.Sync()
+}
+
+func (f *killWALFile) PreAllocate(size int64) error {
+	if pa, ok := f.File.(waldb.FilePreAllocator); ok {
+		return pa.PreAllocate(size)
+	}
+	return nil
 }
 
 // killViolationWatch forwards the apply-order violations the child's state
@@ -325,15 +448,29 @@ func TestKillRestart_Child(t *testing.T) {
 
 	mtls := killLoadMTLS(t, spec.CAFile, spec.CertFile, spec.KeyFile)
 	cfg := killHostConfig(t, spec.Addr, spec.WALDir, spec.NodeHostDir, mtls)
-	h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
+	// The mid-batch child opens the WAL itself, on the real filesystem
+	// behind the barrier; every other child, and every restart, takes the
+	// host's default WAL.
+	hostOpts := []quicraft.HostOption{quicraft.WithoutEncryption()}
+	var walBarrier *killWALBarrier
+	if spec.Mode == killModeBatch {
+		walBarrier = newKillWALBarrier()
+		db, err := waldb.Open(spec.WALDir, waldb.WithFS(&killWALFS{FS: waldb.DefaultFS(), barrier: walBarrier}))
+		if err != nil {
+			killChildDie("open WAL behind the barrier: %v", err)
+		}
+		hostOpts = append(hostOpts, quicraft.WithLogDB(db))
+	}
+	h, err := quicraft.NewHost(cfg, hostOpts...)
 	if err != nil {
 		killChildDie("NewHost: %v", err)
 	}
 	acks := openAckLog(spec.AckFile)
 
-	// Apply-order violations reach the parent within milliseconds, and the
-	// parent's pre-kill SIGUSR1 (sent only after the ready line) gets a final
-	// scan and the in-flight count before it sends SIGKILL.
+	// Apply-order violations reach the parent within milliseconds. The
+	// parent's pre-kill SIGUSR1 (sent only after the ready line) freezes the
+	// ack record, arms the WAL barrier in batch mode and waits until it
+	// holds a write, then gets a final scan before the report.
 	props := &killProposers{}
 	watch := &killViolationWatch{t: t}
 	go func() {
@@ -346,12 +483,18 @@ func TestKillRestart_Child(t *testing.T) {
 	signal.Notify(preKill, syscall.SIGUSR1)
 	go func() {
 		<-preKill
-		n := 0
-		if spec.Mode == killModeBatch || spec.Mode == killModeSnapshot {
-			n = props.freeze(spec.Mode == killModeBatch)
+		props.freeze()
+		held := "-"
+		if walBarrier != nil {
+			walBarrier.armed.Store(true)
+			select {
+			case held = <-walBarrier.held:
+			case <-time.After(killChildWait):
+				killChildDie("the WAL barrier held no proposal write within %v of arming", killChildWait)
+			}
 		}
 		v := watch.scan(acks)
-		acks.line(fmt.Sprintf("%sin-flight %d violations %d", ackLinePreKill, n, v))
+		acks.line(fmt.Sprintf("%swal-held %s violations %d", ackLinePreKill, held, v))
 	}()
 
 	createFn, tracker := kvCreateFunc()
@@ -434,16 +577,12 @@ func killProposeOnce(h *quicraft.Host, acks *ackLog, props *killProposers, worke
 	value := killValue(key)
 	ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
 	defer cancel()
-	props.mu.Lock()
-	props.inFlight++
-	props.mu.Unlock()
 	//quicraft:direct-propose single-voter shard: h is the only replica
 	result, err := h.SyncPropose(ctx, killRestartShardID, encodeKVPut(key, value))
 	if err == nil && result.Value != uint64(len(value)) {
 		killChildDie("put(%s) acknowledged with Value=%d, want %d", key, result.Value, len(value))
 	}
 	props.mu.Lock()
-	props.inFlight--
 	acked := err == nil && !props.frozen
 	if acked {
 		acks.line("ack " + key + " " + value)
@@ -634,12 +773,14 @@ func (c *killChild) waitLines(t *testing.T, desc string, pred func(lines []strin
 
 // kill SIGKILLs the child and asserts it died by that signal: an exit code
 // of -1 and a SIGKILL wait status, never a clean or error exit. It fails the
-// test on any apply-order violation the child reported and returns the
-// number of proposals in flight at the child's pre-kill freeze.
-func (c *killChild) kill(t *testing.T, name string) int {
+// test on any apply-order violation the child reported and returns the key
+// of the proposal the child's WAL barrier held mid-write at the kill, or ""
+// when the child has no barrier.
+func (c *killChild) kill(t *testing.T, name string) string {
 	t.Helper()
-	// Pre-kill handshake: the child freezes its ack record, scans for
-	// apply-order violations one last time and reports both.
+	// Pre-kill handshake: the child freezes its ack record, in batch mode
+	// waits until its WAL barrier holds a proposal's write (which it never
+	// releases), scans for apply-order violations one last time and reports.
 	if err := c.cmd.Process.Signal(syscall.SIGUSR1); err != nil {
 		t.Fatalf("%s: signal child: %v", name, err)
 	}
@@ -653,6 +794,7 @@ func (c *killChild) kill(t *testing.T, name string) int {
 		}
 		return false
 	})
+	t.Logf("%s: child pre-kill report %q; sending SIGKILL", name, report)
 	if err := c.cmd.Process.Kill(); err != nil {
 		t.Fatalf("%s: kill child: %v", name, err)
 	}
@@ -674,8 +816,9 @@ func (c *killChild) kill(t *testing.T, name string) int {
 	}
 	t.Logf("%s: child pid %d exited by signal %v (exit code %d)", name, ps.Pid(), ws.Signal(), ps.ExitCode())
 
-	var inFlight, violations int
-	if _, err := fmt.Sscanf(report, ackLinePreKill+"in-flight %d violations %d", &inFlight, &violations); err != nil {
+	var held string
+	var violations int
+	if _, err := fmt.Sscanf(report, ackLinePreKill+"wal-held %s violations %d", &held, &violations); err != nil {
 		t.Fatalf("%s: malformed pre-kill report %q: %v", name, report, err)
 	}
 	var reported []string
@@ -687,8 +830,12 @@ func (c *killChild) kill(t *testing.T, name string) int {
 	if violations != 0 || len(reported) != 0 {
 		t.Fatalf("%s: child reported %d apply-order violations: %q", name, max(violations, len(reported)), reported)
 	}
-	t.Logf("%s: child reported 0 apply-order violations; %d proposals in flight at the pre-kill freeze", name, inFlight)
-	return inFlight
+	if held == "-" {
+		t.Logf("%s: child reported 0 apply-order violations", name)
+		return ""
+	}
+	t.Logf("%s: child reported 0 apply-order violations; its WAL barrier held proposal %s mid-write when SIGKILL was sent", name, held)
+	return held
 }
 
 // countAcks is the number of "ack" lines.
@@ -832,6 +979,51 @@ func verifySingleReplicaRestart(t *testing.T, spec killChildSpec, acked map[stri
 	kv.mu.RUnlock()
 	t.Logf("after restart: %d acknowledged entries checked, all present with their values; "+
 		"%d unacknowledged in-flight entries applied, none corrupt", len(acked), inFlight)
+
+	killSinglePostRestart(t, h, 20)
+}
+
+// killSinglePostRestart is the single-replica cases' post-restart client
+// phase: the restarted replica must accept n fresh writes and serve each one
+// back, so a replica that recovers its log but cannot take new work fails.
+// Only operations issued after the restart are counted.
+func killSinglePostRestart(t *testing.T, h *quicraft.Host, n int) {
+	t.Helper()
+	writes, reads := 0, 0
+	for i := range n {
+		key := fmt.Sprintf("post-restart-%d", i)
+		value := killValue(key)
+		deadline := time.Now().Add(killChildWait)
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
+			//quicraft:direct-propose single-voter shard: h is the only replica
+			result, err := h.SyncPropose(ctx, killRestartShardID, encodeKVPut(key, value))
+			cancel()
+			if err == nil {
+				if result.Value != uint64(len(value)) {
+					t.Fatalf("post-restart put(%s) acknowledged with Value=%d, want %d", key, result.Value, len(value))
+				}
+				writes++
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("post-restart put(%s) failed for %v: %v", key, killChildWait, err)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		got, err := killReadBack(h, key)
+		if err != nil {
+			t.Fatalf("post-restart read of %s: %v", key, err)
+		}
+		if got != value {
+			t.Fatalf("post-restart read of %s returned %q, want %q", key, got, value)
+		}
+		reads++
+	}
+	if writes == 0 || reads == 0 {
+		t.Fatalf("post-restart phase: %d writes and %d reads succeeded, want both above zero", writes, reads)
+	}
+	t.Logf("after restart: post-restart client phase: %d writes and %d reads succeeded", writes, reads)
 }
 
 // TestKillRestart_AfterAcks kills a single-replica child after it has
@@ -854,8 +1046,11 @@ func TestKillRestart_AfterAcks(t *testing.T) {
 }
 
 // TestKillRestart_MidBatch kills a single-replica child while several
-// concurrent proposers keep proposals in flight, so the kill lands between
-// a batch's WAL write and its acknowledgements.
+// concurrent proposers keep proposals in flight. The child's WAL barrier
+// holds a segment write that carries an unacknowledged proposal, with half
+// its bytes written, and the parent kills only after the barrier reports
+// it: the kill lands inside a batch's WAL write, before its
+// acknowledgements.
 func TestKillRestart_MidBatch(t *testing.T) {
 	const name = "mid-batch"
 	start := time.Now()
@@ -863,15 +1058,20 @@ func TestKillRestart_MidBatch(t *testing.T) {
 	spec.Workers = 8
 	child := startKillChild(t, spec, name)
 	child.waitLines(t, "60 acks recorded", func(l []string) bool { return countAcks(l) >= 60 })
-	// kill freezes the ack record first; the child answers only once a
-	// submitted proposal has not been acknowledged, and keeps proposing.
-	inFlight := child.kill(t, name)
-	if inFlight <= 0 {
-		t.Fatalf("%s: %d proposals in flight at the kill, want at least one", name, inFlight)
+	// kill freezes the ack record first; the child answers only once its WAL
+	// barrier holds a proposal's write half-done, and the barrier never
+	// releases it, so the SIGKILL lands inside that write.
+	held := child.kill(t, name)
+	if held == "" {
+		t.Fatalf("%s: the child's WAL barrier reported no held write before the kill", name)
 	}
-	t.Logf("%s: %d submitted, unacknowledged proposals in flight at the kill", name, inFlight)
+	acked := ackedEntries(t, child.ackLines(t))
+	if _, ok := acked[held]; ok {
+		t.Fatalf("%s: the WAL barrier held proposal %s, which the child had already acknowledged", name, held)
+	}
+	t.Logf("%s: killed inside the WAL write of submitted, unacknowledged proposal %s", name, held)
 
-	verifySingleReplicaRestart(t, spec, ackedEntries(t, child.ackLines(t)))
+	verifySingleReplicaRestart(t, spec, acked)
 	t.Logf("%s: wall time %v", name, time.Since(start).Round(time.Millisecond))
 }
 
@@ -950,6 +1150,82 @@ func killMoveLeaderToChild(t *testing.T, c *testCluster) string {
 	return "follower"
 }
 
+const (
+	// killDownMin is the least time the cluster case keeps replica 3 dead.
+	killDownMin = 4 * time.Second
+	// killPostMin is the least time the cluster case keeps the load running
+	// after the restart, so the restarted replica rejoins under load.
+	killPostMin = 5 * time.Second
+	// killClientCap bounds the cluster case's clients only if stopClients
+	// is never reached; every phase ends on a condition well before it.
+	killClientCap = 10 * time.Minute
+)
+
+// killRunClients starts the linearizability clients with no fixed window:
+// they run until the returned stop is called (or killClientCap passes).
+// stop is idempotent and waits for every client to return.
+func killRunClients(t *testing.T, cluster *testCluster, numClients, numKeys int, recorder *opRecorder) func() {
+	t.Helper()
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range numClients {
+		wg.Add(1)
+		go func(clientID int) {
+			defer wg.Done()
+			clientWorker(t, cluster, killRestartShardID, clientID, numKeys, killClientCap, recorder, done)
+		}(i)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+		wg.Wait()
+	}
+}
+
+// killOps counts determinately completed client operations in one phase,
+// with the values the phase's successful puts wrote.
+type killOps struct {
+	puts, gets int
+	values     map[string]bool
+}
+
+// killSeqMark returns the recorder's current sequence: an operation whose
+// call is stamped after it was issued after this point.
+func killSeqMark(r *opRecorder) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seq
+}
+
+// killOpsSince counts the operations called after mark.
+func killOpsSince(r *opRecorder, mark int64) killOps {
+	return killOpsBetween(r, mark, -1)
+}
+
+// killOpsBetween counts the successful operations called after from and,
+// unless to is negative, no later than to. An operation called before a
+// phase began never counts toward it.
+func killOpsBetween(r *opRecorder, from, to int64) killOps {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ops := killOps{values: make(map[string]bool)}
+	for _, op := range r.ops {
+		if !op.determinate || op.callSeq <= from || (to >= 0 && op.callSeq > to) {
+			continue
+		}
+		switch op.input.Op {
+		case "put":
+			if op.output.Ok {
+				ops.puts++
+				ops.values[op.input.Value] = true
+			}
+		case "get":
+			ops.gets++
+		}
+	}
+	return ops
+}
+
 // killReplicaData copies the in-process replica's state machine data.
 func killReplicaData(c *testCluster, idx int) map[string]string {
 	c.hostsMu.RLock()
@@ -971,13 +1247,15 @@ func killReplicaData(c *testCluster, idx int) map[string]string {
 // SIGKILLed (as leader when leadership can be moved to it, else as a
 // follower), restarted as a new child on the same directories while the load
 // keeps running, and then the history must be linearizable and the restarted
-// replica's state machine must match the survivors'.
+// replica's state machine must match the survivors'. The clients have no
+// fixed window: the pre-kill, down and post-restart phases each end only once
+// they have recorded successful writes and reads issued inside that phase,
+// and the restarted replica must hold values written after its restart.
 func TestKillRestart_3Node_Linearizable(t *testing.T) {
 	const (
 		name       = "3node"
 		numClients = 4
 		numKeys    = 10
-		testDur    = 40 * time.Second
 	)
 	start := time.Now()
 	dir := t.TempDir()
@@ -1049,27 +1327,61 @@ func TestKillRestart_3Node_Linearizable(t *testing.T) {
 		return killLeaderID(cluster) != 0
 	})
 
+	// The clients run, through every phase below, until stopClients: each
+	// phase ends on what it must observe, not on a fixed window.
 	recorder := &opRecorder{}
-	wait := runClients(t, cluster, killRestartShardID, numClients, numKeys, testDur, recorder)
+	stopClients := killRunClients(t, cluster, numClients, numKeys, recorder)
+	t.Cleanup(stopClients)
 
-	time.Sleep(3 * time.Second)
+	waitForCondition(t, killChildWait, "clients complete writes and reads before the kill", func() bool {
+		ops := killOpsSince(recorder, 0)
+		return ops.puts >= 20 && ops.gets >= 20
+	})
+	pre := killOpsSince(recorder, 0)
+	t.Logf("pre-kill phase: %d writes and %d reads succeeded", pre.puts, pre.gets)
+
 	role := killMoveLeaderToChild(t, cluster)
 	t.Logf("killing replica 3 (child) as %s under load", role)
 	child.kill(t, name+"-first")
+	killedAt, killMark := time.Now(), killSeqMark(recorder)
 
-	time.Sleep(4 * time.Second)
+	// Down phase: the two survivors must keep serving with replica 3 dead,
+	// for at least killDownMin so the restart is a real rejoin.
+	waitForCondition(t, killChildWait, "survivors serve writes and reads with replica 3 killed", func() bool {
+		ops := killOpsSince(recorder, killMark)
+		return ops.puts >= 5 && ops.gets >= 5 && time.Since(killedAt) >= killDownMin
+	})
 	spec.AckFile = filepath.Join(dir, "acks-2")
+	// A fresh dump file: the first child's last dump must not stand in for
+	// the restarted replica's state.
+	spec.DumpFile = filepath.Join(dir, "dump-2.json")
 	restarted := startKillChild(t, spec, name+"-restarted")
 	restarted.waitLines(t, "restarted child shard started", func(l []string) bool { return hasLine(l, ackLineReady) })
+	restartedAt, restartMark := time.Now(), killSeqMark(recorder)
+	down := killOpsBetween(recorder, killMark, restartMark)
+	t.Logf("down phase: %d writes and %d reads succeeded with replica 3 killed", down.puts, down.gets)
 	t.Logf("replica 3 restarted on the same directories as a new child")
 
-	wait()
+	// Post-restart phase: only operations the clients issued after the
+	// restarted child reported ready count, and both kinds must succeed.
+	waitForCondition(t, killChildWait, "clients complete writes and reads after the restart", func() bool {
+		ops := killOpsSince(recorder, restartMark)
+		return ops.puts >= 20 && ops.gets >= 20 && time.Since(restartedAt) >= killPostMin
+	})
+	stopClients()
+	post := killOpsSince(recorder, restartMark)
+	if post.puts == 0 || post.gets == 0 {
+		t.Fatalf("post-restart phase: %d writes and %d reads succeeded, want both above zero", post.puts, post.gets)
+	}
+	t.Logf("post-restart phase: %d writes and %d reads succeeded after the restart", post.puts, post.gets)
 	checkLinearizability(t, recorder, floorFor(numClients, 10*time.Second))
 
 	// With the load stopped, the restarted replica must converge on exactly
 	// the survivors' state: every write the cluster acknowledged, including
-	// those acknowledged before the kill, and nothing else.
-	var keys int
+	// those acknowledged before the kill, and nothing else. The state must
+	// hold a value written after the restart, so the match is not the
+	// pre-kill state replayed.
+	var keys, postValues int
 	waitForCondition(t, killChildWait, "restarted replica matches the survivors", func() bool {
 		b, err := os.ReadFile(spec.DumpFile)
 		if err != nil {
@@ -1083,10 +1395,19 @@ func TestKillRestart_3Node_Linearizable(t *testing.T) {
 		if len(r1) == 0 || !maps.Equal(r1, r2) || !maps.Equal(r1, d.Data) {
 			return false
 		}
+		postValues = 0
+		for _, v := range d.Data {
+			if post.values[v] {
+				postValues++
+			}
+		}
+		if postValues == 0 {
+			return false
+		}
 		keys = len(d.Data)
 		return true
 	})
 	restarted.kill(t, name+"-restarted")
-	t.Logf("after restart: replica 3 holds all %d keys the survivors hold, with equal values", keys)
+	t.Logf("after restart: replica 3 holds all %d keys the survivors hold, with equal values; %d of them written after the restart", keys, postValues)
 	t.Logf("%s: wall time %v", name, time.Since(start).Round(time.Millisecond))
 }
