@@ -131,9 +131,6 @@ func TestRequestStateConcurrent_ReleaseAndResultC(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), concurrentTestTimeout)
 	defer cancel()
 
-	runtime.GC()
-	baseline := runtime.NumGoroutine()
-
 	var cancels atomic.Int64
 	opCtx, opCancel := context.WithCancel(ctx)
 	defer opCancel()
@@ -141,18 +138,25 @@ func TestRequestStateConcurrent_ReleaseAndResultC(t *testing.T) {
 		cancels.Add(1)
 		opCancel()
 	}
-	rs := WrapRequestStateWithCancel(newConcurrentInner(ctx, t), countingCancel, true)
 
 	const each = 8
 	got := make([]chan RequestResult, each)
-	fns := make([]func(), 0, 2*each)
-	for i := 0; i < each; i++ {
-		fns = append(fns, rs.Release)
-		fns = append(fns, func() { got[i] = rs.ResultC() })
-	}
-	// runConcurrently returns only after every call has returned, including
-	// the one Release that won and waited for the bridge goroutines.
-	runConcurrently(ctx, t, fns...)
+	// The wrapper, its bridges and every concurrent caller run under a
+	// label unique to this test, so the leak check below counts only this
+	// test's bridges and not goroutines other tests in the package left
+	// winding down.
+	label := withBridgeLabel(t, func() {
+		rs := WrapRequestStateWithCancel(newConcurrentInner(ctx, t), countingCancel, true)
+		fns := make([]func(), 0, 2*each)
+		for i := 0; i < each; i++ {
+			fns = append(fns, rs.Release)
+			fns = append(fns, func() { got[i] = rs.ResultC() })
+		}
+		// runConcurrently returns only after every call has returned,
+		// including the one Release that won and waited for the bridge
+		// goroutines.
+		runConcurrently(ctx, t, fns...)
+	})
 
 	if n := cancels.Load(); n != 1 {
 		t.Fatalf("cancel func ran %d times, want exactly 1", n)
@@ -169,10 +173,7 @@ func TestRequestStateConcurrent_ReleaseAndResultC(t *testing.T) {
 		}
 	}
 
-	after := runtime.NumGoroutine()
-	if leaked := after - baseline; leaked > 5 {
-		t.Fatalf("goroutines not back to baseline: baseline=%d after=%d leaked=%d", baseline, after, leaked)
-	}
+	assertNoBridges(t, label)
 }
 
 // TestRequestStateConcurrent_ResultCAfterRelease checks that ResultC on a
@@ -182,32 +183,26 @@ func TestRequestStateConcurrent_ResultCAfterRelease(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), concurrentTestTimeout)
 	defer cancel()
 
-	rs := WrapRequestState(newConcurrentInner(ctx, t), true)
-	rs.Release()
-
-	runtime.GC()
-	before := runtime.NumGoroutine()
-
 	const callers = 8
 	got := make([]chan RequestResult, callers)
-	fns := make([]func(), callers)
-	for i := range fns {
-		fns[i] = func() { got[i] = rs.ResultC() }
-	}
-	runConcurrently(ctx, t, fns...)
+	var rs *RequestState
+	// The wrapper and every caller run under a label unique to this test,
+	// so the check below counts only bridges this test started, never
+	// goroutines other tests in the package left winding down.
+	label := withBridgeLabel(t, func() {
+		rs = WrapRequestState(newConcurrentInner(ctx, t), true)
+		rs.Release()
 
-	// runConcurrently returns before its own waiter and workers have
-	// fully exited, so the process-wide count may briefly sit above the
-	// baseline: wait (bounded) for it to settle rather than reading it
-	// once. A goroutine ResultC leaked would keep it above.
-	after := runtime.NumGoroutine()
-	for deadline := time.Now().Add(5 * time.Second); after > before && time.Now().Before(deadline); {
-		time.Sleep(5 * time.Millisecond)
-		after = runtime.NumGoroutine()
-	}
-	if after > before {
-		t.Fatalf("ResultC after Release left goroutines running: before=%d after=%d", before, after)
-	}
+		fns := make([]func(), callers)
+		for i := range fns {
+			fns[i] = func() { got[i] = rs.ResultC() }
+		}
+		runConcurrently(ctx, t, fns...)
+	})
+
+	// A bridge ResultC started after Release would never be stopped;
+	// assertNoBridges waits (bounded) for the labelled count to reach zero.
+	assertNoBridges(t, label)
 	for i, ch := range got {
 		if ch == nil {
 			t.Fatalf("ResultC caller %d got nil after Release", i)
