@@ -11460,6 +11460,15 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 // ErrShardNotStopped, and the caller retries. This is used to clean up
 // persistent state after a node has been permanently removed from a shard; a
 // replica that is to rejoin does so under a new replica ID, as Raft requires.
+//
+// RemoveData removes the one snapshot directory the replica's records agree
+// on. A replica whose LogDB snapshot record lies in another replica
+// directory than its bootstrap record's DataDir selects (a replica that
+// snapshotted under one DataDir and was restarted under another by a release
+// before v1.0.0) is refused with *RemoveDataLayoutConflictError
+// (ErrRemoveDataLayoutConflict) before anything is retired, deleted or
+// recorded, rather than report success while a snapshot remains; the error
+// documents the repair.
 func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	if h.closed.Load() {
 		return ErrClosed
@@ -11682,10 +11691,11 @@ func (h *Host) refuseDataDirChange(shardID, replicaID uint64, dataDir string) er
 	return changed(recordedDir)
 }
 
-// removeDataLayoutUnknownError is returned by RemoveData when the replica
-// has no bootstrap record and no pending removal intent, and its LogDB
-// snapshot record names a Filepath that lies in no replica snapshot layout
-// this host creates. RemoveData refuses before anything is retired or
+// removeDataLayoutUnknownError is returned by RemoveData when the replica's
+// LogDB snapshot record names a Filepath that lies in no replica snapshot
+// layout this host creates, whether or not a bootstrap record states its
+// DataDir (a pending removal intent, read only without a bootstrap record,
+// is checked the same way). RemoveData refuses before anything is retired or
 // deleted, rather than report a success that leaves the snapshots behind.
 // It matches ErrInvalidOperation under errors.Is.
 type removeDataLayoutUnknownError struct {
@@ -11722,15 +11732,48 @@ func (e *removeDataLayoutUnknownError) Is(target error) bool {
 // DataDir); else, with no snapshot record, the NodeHostDir layout StartShard
 // uses for an empty DataDir. A snapshot record whose Filepath lies in no
 // replica layout is a *removeDataLayoutUnknownError (errors.Is
-// ErrInvalidOperation), returned before anything is retired or deleted.
+// ErrInvalidOperation), and a snapshot record lying in another replica
+// directory than the bootstrap record's DataDir selects is a
+// *RemoveDataLayoutConflictError; both are returned before anything is
+// retired, deleted or recorded.
 func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, error) {
 	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
 	if err != nil {
 		return "", false, err
 	}
 	if ok {
-		return engine.ReplicaSnapshotDir(
-			shardSnapshotBaseDir(h.cfg.NodeHostDir, bs.DataDir, shardID), shardID, replicaID), false, nil
+		dir := engine.ReplicaSnapshotDir(
+			shardSnapshotBaseDir(h.cfg.NodeHostDir, bs.DataDir, shardID), shardID, replicaID)
+		// Releases before v1.0.0 let a replica that had snapshotted under
+		// one DataDir restart under another, which recovered the snapshot
+		// from the old tree but rewrote the bootstrap record to state the
+		// new one. The snapshot record still points into the old tree, so
+		// it is cross-checked here: removing only the bootstrap record's
+		// directory would retire the replica and report success while its
+		// snapshot survives elsewhere.
+		ss, err := h.logdb.GetSnapshot(shardID, replicaID)
+		if err != nil && !errors.Is(err, logdb.ErrNoSnapshot) {
+			return "", false, err
+		}
+		if err == nil && ss.Filepath != "" {
+			recorded, inLayout := replicaSnapshotDirFromRecord(ss.Filepath, shardID, replicaID)
+			if !inLayout {
+				return "", false, &removeDataLayoutUnknownError{
+					shardID:   shardID,
+					replicaID: replicaID,
+					filepath:  ss.Filepath,
+				}
+			}
+			if recorded != dir {
+				return "", false, &RemoveDataLayoutConflictError{
+					ShardID:      shardID,
+					ReplicaID:    replicaID,
+					BootstrapDir: dir,
+					SnapshotDir:  recorded,
+				}
+			}
+		}
+		return dir, false, nil
 	}
 	if p, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil {
 		return "", false, err

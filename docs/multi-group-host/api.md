@@ -1133,6 +1133,18 @@ identically, except that it first returns `ErrTimeout` or `ErrCanceled` for a
 `ImportSnapshot` for the shard is in progress), and LogDB errors. Retry the two
 transient refusals.
 
+`RemoveData` removes the one snapshot directory the replica's records agree on.
+A release before v1.0.0 let a replica that had snapshotted under one `DataDir`
+restart under another: the bootstrap record then states the new `DataDir` while
+the snapshot record still points into the old tree. `RemoveData` refuses that
+replica with `*RemoveDataLayoutConflictError` (`ErrRemoveDataLayoutConflict`,
+also `ErrInvalidOperation`) before anything is retired, deleted or recorded,
+rather than report success while a snapshot remains. To repair, start the
+replica under the `DataDir` its bootstrap record states (the error's
+`BootstrapDir` lies under it), take a snapshot so the snapshot record names that
+tree, stop it and retry `RemoveData`; then delete the error's `SnapshotDir`,
+which no record references any more.
+
 ### Replica management
 
 ```go
@@ -1673,6 +1685,7 @@ Shard state:
 | `ErrShardNotReady` | the shard is initializing or starting |
 | `ErrShardAlreadyExists` | `StartShard` for a running shard |
 | `ErrShardNotStopped` | `RemoveData` on a loaded shard |
+| `ErrRemoveDataLayoutConflict` | `RemoveData` of a replica whose snapshot and bootstrap records name different snapshot trees |
 | `ErrReplicaRetired` | `StartShard` of a replica ID `RemoveData` retired |
 | `ErrImportInProgress` | `StartShard` or `RemoveData` while an import of the shard runs |
 | `ErrShardFailed` | the shard's failure latch tripped. A `*SMPanicError` matches it |
@@ -1802,6 +1815,7 @@ Each type below implements `error`; those with an `Err` field implement
 | `SessionError` | `ClientID`, `Op` ("register" or "unregister"), `Err` | A session registration failed: `ErrInvalidOperation` when it was refused (a session cap), `ErrInvalidSession` when `RegisterSession` was given client ID 0. A client ID that could not be minted is a `*HostInitError` wrapping `ErrEntropyDegenerate` instead |
 | `SessionExpiredError` | `ShardID`, `ClientID` | A session-managed proposal named a client ID whose session is no longer registered. Matches `ErrSessionExpired` |
 | `ShardNotStoppedError` | `ShardID`, `ReplicaID` | `RemoveData` on a running shard. Matches `ErrShardNotStopped` |
+| `RemoveDataLayoutConflictError` | `ShardID`, `ReplicaID`, `BootstrapDir`, `SnapshotDir` | `RemoveData` of a replica whose snapshot record lies in another snapshot directory than its bootstrap record's `DataDir` selects; nothing was removed. Matches `ErrRemoveDataLayoutConflict` and `ErrInvalidOperation` |
 | `ReplicaNotFoundError` | `ShardID`, `ReplicaID` | The replica ID does not match the local replica (`StopReplica`, `RequestCompaction`) or names no member (`RequestLeaderTransfer`). Matches `ErrReplicaNotFound` |
 | `ReplicaRetiredError` | `ShardID`, `ReplicaID` | `StartShard` of a retired replica ID. Matches `ErrReplicaRetired` |
 | `StaleConfigChangeError` | `ShardID`, `Expected`, `Got` | The `configChangeIndex` guard failed. Matches `ErrStaleConfigChange`. Re-read membership; the identical request fails forever |
