@@ -1674,9 +1674,11 @@ type nodeState struct {
 	// the shard has had no known leader, or 0 while a leader is known. It
 	// is set when the shard starts, kept at its first value while the shard
 	// stays leaderless, and cleared by updateNodeLeader when a leader is
-	// published. HealthCheck reports the host not-ready once a shard has
-	// been leaderless for longer than its election timeout (#1175). An
-	// atomic, so the leader-update path takes no lock for it.
+	// published; ResumeShard restarts it, as the resumed peer starts a fresh
+	// election timeout. HealthCheck reports the host not-ready once a shard
+	// has been leaderless for longer than its election window
+	// (Host.leaderlessGrace, #1175). An atomic, so the leader-update path
+	// takes no lock for it.
 	leaderlessSince atomic.Int64
 
 	health      atomic.Uint32 // stores ShardHealth as uint32
@@ -7844,8 +7846,12 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	if !ns.pauseGate.lock(ctx.Done()) {
 		return ctx.Err()
 	}
+	wasPaused := ns.paused.Load()
 	h.engine.ResumeNode(engNode)
 	ns.paused.Store(false)
+	if wasPaused {
+		ns.restartLeaderlessWindow()
+	}
 	ns.pauseGate.unlock()
 	return nil
 }
@@ -10956,16 +10962,38 @@ func (h *Host) HealthCheck() *HealthStatus {
 }
 
 // leaderlessPastElectionTimeout reports whether ns has had no known leader
-// for longer than its election timeout (ElectionRTT * RTTMillisecond) as of
-// now (unix nanoseconds). A shard inside its election window, or one with a
-// known leader, reports false, so a normal election does not flap health.
+// for longer than its election window (leaderlessGrace) as of now (unix
+// nanoseconds). A shard inside the window, or one with a known leader,
+// reports false, so a normal election does not flap health.
 func (h *Host) leaderlessPastElectionTimeout(ns *nodeState, now int64) bool {
 	since := ns.leaderlessSince.Load()
 	if since == 0 {
 		return false
 	}
-	timeout := time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
-	return time.Duration(now-since) > timeout
+	return time.Duration(now-since) > h.leaderlessGrace(ns)
+}
+
+// leaderlessGrace is the election window a leaderless shard is allowed
+// before HealthCheck reports it not-ready: 3 * ElectionRTT *
+// RTTMillisecond. Raft draws each follower's election timeout from
+// [ElectionRTT, 2*ElectionRTT) ticks (raft.resetElectionTimeout) and
+// campaigns only once it expires, so a healthy shard may wait up to
+// 2*ElectionRTT before its election starts; the campaign then has one more
+// election timeout to win (vote round, log persist, leader publication)
+// before it counts as a failed election and the candidate starts another.
+func (h *Host) leaderlessGrace(ns *nodeState) time.Duration {
+	return 3 * time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
+}
+
+// restartLeaderlessWindow opens a fresh election window for a shard that
+// is leaderless, as ResumeShard does: a resumed peer starts a new election
+// timeout, so time spent paused must not count against it. A shard with a
+// known leader is left at 0. The CAS loses to a concurrent updateNodeLeader
+// that publishes a leader, so it never stamps a led shard.
+func (ns *nodeState) restartLeaderlessWindow() {
+	if since := ns.leaderlessSince.Load(); since != 0 {
+		ns.leaderlessSince.CompareAndSwap(since, time.Now().UnixNano())
+	}
 }
 
 // NodeIdentity returns this host's own stable node identity: the value peers

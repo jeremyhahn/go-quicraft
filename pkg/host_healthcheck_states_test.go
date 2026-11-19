@@ -316,9 +316,10 @@ func TestHealthCheck_NotReadyWhenLeaderlessPastElectionTimeout(t *testing.T) {
 
 // TestHealthCheck_LeaderlessGraceCoversRandomizedElection pins the window
 // to the randomized election timeout: raft campaigns after a timeout drawn
-// from [ElectionRTT, 2*ElectionRTT) ticks, so a shard leaderless for less
-// than 2 * ElectionRTT * RTTMillisecond may not have started its first
-// election and must not count as not-ready.
+// from [ElectionRTT, 2*ElectionRTT) ticks and the campaign then has one
+// more election timeout to win, so a shard leaderless for less than
+// 3 * ElectionRTT * RTTMillisecond may still be in a normal first election
+// and must not count as not-ready.
 func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -331,15 +332,20 @@ func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
 	nominal := time.Duration(cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
 	now := time.Now().UnixNano()
 
-	// Past the nominal timeout but inside the randomized one.
-	ns.leaderlessSince.Store(now - int64(nominal*19/10))
-	if h.leaderlessPastElectionTimeout(ns, now) {
-		t.Errorf("leaderless for %v (< 2 * %v) reported past the election window", nominal*19/10, nominal)
+	// Past the nominal timeout, and past the largest randomized one, but
+	// inside the campaign that follows it.
+	for _, tenths := range []time.Duration{11, 19, 29} {
+		age := nominal * tenths / 10
+		ns.leaderlessSince.Store(now - int64(age))
+		if h.leaderlessPastElectionTimeout(ns, now) {
+			t.Errorf("leaderless for %v (< 3 * %v) reported past the election window", age, nominal)
+		}
 	}
-	// Past the largest randomized timeout.
-	ns.leaderlessSince.Store(now - int64(nominal*21/10))
+	// Past the randomized timeout plus a full election round.
+	age := nominal * 31 / 10
+	ns.leaderlessSince.Store(now - int64(age))
 	if !h.leaderlessPastElectionTimeout(ns, now) {
-		t.Errorf("leaderless for %v (> 2 * %v) not reported past the election window", nominal*21/10, nominal)
+		t.Errorf("leaderless for %v (> 3 * %v) not reported past the election window", age, nominal)
 	}
 	// A known leader is never past the window.
 	ns.leaderlessSince.Store(0)
@@ -357,7 +363,11 @@ func TestHealthCheck_HealthyStartupNeverNotReady(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewHost: %v", err)
 		}
-		if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, testCreateFunc, testShardConfig(5, 1)); err != nil {
+		// 50ms nominal timeout: the election's fixed costs (log persist,
+		// leader publication, tick scheduling) stay small against it.
+		cfg := testShardConfig(5, 1)
+		cfg.ElectionRTT = 50
+		if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, testCreateFunc, cfg); err != nil {
 			h.Close()
 			t.Fatalf("StartShard: %v", err)
 		}
@@ -396,9 +406,9 @@ func TestHealthCheck_ResumeRestartsElectionWindow(t *testing.T) {
 	defer cancel()
 
 	cfg := testShardConfig(13, 1)
-	// A 1s nominal timeout (2s window) leaves the check after resume far
-	// inside the fresh window, even under the race detector.
-	cfg.ElectionRTT = 1000
+	// A 500ms nominal timeout (1.5s window) leaves the check after resume
+	// far inside the fresh window, even under the race detector.
+	cfg.ElectionRTT = 500
 	unreachable := map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001", 3: "127.0.0.1:5002"}
 	if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
 		t.Fatalf("StartShard: %v", err)
@@ -419,7 +429,7 @@ func TestHealthCheck_ResumeRestartsElectionWindow(t *testing.T) {
 		t.Fatalf("PauseShard: %v", err)
 	}
 	// Paused for longer than the whole election window.
-	time.Sleep(2*time.Duration(cfg.ElectionRTT*h.cfg.RTTMillisecond)*time.Millisecond + 200*time.Millisecond)
+	time.Sleep(3*time.Duration(cfg.ElectionRTT*h.cfg.RTTMillisecond)*time.Millisecond + 200*time.Millisecond)
 	if err := h.ResumeShard(ctx, 13); err != nil {
 		t.Fatalf("ResumeShard: %v", err)
 	}
