@@ -357,30 +357,57 @@ func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
 
 // TestHealthCheck_HealthyStartupNeverNotReady observes health on every
 // step of a healthy single-member shard's startup, from StartShard until
-// its leader is published: it never reports not-ready on the way.
+// its leader is published: it never reports not-ready inside the
+// election window, and reports ok once the leader is known.
+//
+// The window is wall-clock (docs/observability/api.md: 3 * ElectionRTT *
+// RTTMillisecond from StartShard) while the election runs on logical
+// ticks from a time.Ticker, which drops ticks whenever the step worker
+// overruns the tick interval. Under -race on a loaded runner a 1ms tick
+// overran often enough that the 50-100 tick election outlasted the 150ms
+// window (CI run 44581832844: not-ready 0.16s after StartShard). That
+// shard really was leaderless past its window, so not-ready was the
+// contract's answer. The test therefore uses a 10ms tick, against which
+// the step worker's per-tick cost is small, and fails only on a not-ready
+// report before the window has elapsed since StartShard was called.
 func TestHealthCheck_HealthyStartupNeverNotReady(t *testing.T) {
 	for round := 0; round < 5; round++ {
-		h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+		hc := testHostConfig(t)
+		hc.RTTMillisecond = 10
+		h, err := NewHost(hc, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 		if err != nil {
 			t.Fatalf("NewHost: %v", err)
 		}
-		// 50ms nominal timeout: the election's fixed costs (log persist,
-		// leader publication, tick scheduling) stay small against it.
+		// 100ms nominal timeout, 300ms window: the election's fixed costs
+		// (log persist, leader publication, tick scheduling) stay small
+		// against it.
 		cfg := testShardConfig(5, 1)
-		cfg.ElectionRTT = 50
+		cfg.ElectionRTT = 10
+		window := 3 * time.Duration(cfg.ElectionRTT*hc.RTTMillisecond) * time.Millisecond
+		start := time.Now()
 		if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, testCreateFunc, cfg); err != nil {
 			h.Close()
 			t.Fatalf("StartShard: %v", err)
 		}
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := start.Add(10 * time.Second)
 		for {
 			status := h.HealthCheck()
 			if status.Status == "not-ready" {
-				h.Close()
-				t.Fatalf("round %d: healthy startup reported not-ready: not_ready_shards = %v",
-					round, notReadyShardsJSON(t, status))
+				// Read the clock after the report: the window opened
+				// after start, so elapsed overstates the shard's age and
+				// a report it calls early is early.
+				if elapsed := time.Since(start); elapsed <= window {
+					h.Close()
+					t.Fatalf("round %d: healthy startup reported not-ready %v after StartShard, inside its %v window: not_ready_shards = %v",
+						round, elapsed, window, notReadyShardsJSON(t, status))
+				}
 			}
 			if len(status.Shards) == 1 && status.Shards[0].LeaderID != 0 {
+				if status.Status != "ok" {
+					h.Close()
+					t.Fatalf("round %d: leader %d known, Status = %q, want ok",
+						round, status.Shards[0].LeaderID, status.Status)
+				}
 				break
 			}
 			if time.Now().After(deadline) {
