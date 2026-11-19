@@ -334,8 +334,8 @@ func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
 
 	// Past the nominal timeout, and past the largest randomized one, but
 	// inside the campaign that follows it.
-	for _, tenths := range []time.Duration{11, 19, 29} {
-		age := nominal * tenths / 10
+	for _, tenths := range []int64{11, 19, 29} {
+		age := time.Duration(int64(nominal) * tenths / 10)
 		ns.leaderlessSince.Store(now - int64(age))
 		if h.leaderlessPastElectionTimeout(ns, now) {
 			t.Errorf("leaderless for %v (< 3 * %v) reported past the election window", age, nominal)
