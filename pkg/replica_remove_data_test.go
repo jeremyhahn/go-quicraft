@@ -843,6 +843,92 @@ func TestSyncRemoveData_RefusesUnknownSnapshotLayout(t *testing.T) {
 	}
 }
 
+// TestSyncRemoveData_RefusesSnapshotUnderOtherDataDir covers the upgrade
+// sequence the merge base allowed: a replica snapshotted under DataDir A,
+// then restarted under DataDir B, which recovered the snapshot from A but
+// rewrote the bootstrap record to state B. Its snapshot record still points
+// into A. RemoveData must not trust the bootstrap record alone: deleting B
+// and retiring the replica would report success while the snapshot under A
+// survives. It is refused before anything is retired, deleted or recorded.
+func TestSyncRemoveData_RefusesSnapshotUnderOtherDataDir(t *testing.T) {
+	const f = 1
+	fid := uint64(f + 1)
+	var w *removeDataLogDB
+	c := newRemoveDataClusterWith(t, walWrapperFor(t, f, &w))
+	dirA, dirB := t.TempDir(), t.TempDir()
+	for i, h := range c.hosts {
+		scfg := c.shardConfig(uint64(i + 1))
+		if i == f {
+			scfg.DataDir = dirB
+		}
+		if err := h.StartShard(c.members(), false, hashingCreateFunc, scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	fh := c.hosts[f]
+	if err := fh.StopReplica(removeDataShard, fid); err != nil {
+		t.Fatalf("StopReplica: %v", err)
+	}
+
+	// The snapshot the base left under A, named by the snapshot record.
+	snapDirA := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(c.cfgs[f].NodeHostDir, dirA, removeDataShard), removeDataShard, fid)
+	snapFileA := filepath.Join(snapDirA, "snapshot-0000000000000001", "snapshot.dat")
+	if err := os.MkdirAll(filepath.Dir(snapFileA), 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(snapFileA, []byte("snapshot under A"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	snapDirB := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir(c.cfgs[f].NodeHostDir, dirB, removeDataShard), removeDataShard, fid)
+	if err := os.MkdirAll(snapDirB, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	w.setSnapshotPath(snapFileA)
+
+	err := fh.RemoveData(removeDataShard, fid)
+	if !errors.Is(err, ErrRemoveDataLayoutConflict) {
+		t.Fatalf("RemoveData with the snapshot under another DataDir: err = %v, want %v",
+			err, ErrRemoveDataLayoutConflict)
+	}
+	var ce *RemoveDataLayoutConflictError
+	if !errors.As(err, &ce) {
+		t.Fatalf("RemoveData error %v is not a *RemoveDataLayoutConflictError", err)
+	}
+	if ce.ShardID != removeDataShard || ce.ReplicaID != fid ||
+		ce.BootstrapDir != snapDirB || ce.SnapshotDir != snapDirA {
+		t.Fatalf("RemoveDataLayoutConflictError = %+v, want shard %d replica %d bootstrap %q snapshot %q",
+			*ce, removeDataShard, fid, snapDirB, snapDirA)
+	}
+	if removed, err := fh.logdb.NodeRemoved(removeDataShard, fid); err != nil || removed {
+		t.Fatalf("after the refusal NodeRemoved = %v (err %v), want false", removed, err)
+	}
+	if _, ok, err := fh.logdb.GetBootstrap(removeDataShard, fid); err != nil || !ok {
+		t.Fatalf("after the refusal GetBootstrap = ok %v err %v, want the record kept", ok, err)
+	}
+	intent := removeDataIntentFile(c.cfgs[f].NodeHostDir, removeDataShard, fid)
+	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the refused removal recorded an intent (stat err %v): %s", err, intent)
+	}
+	for _, p := range []string{snapFileA, snapDirB} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("the refused removal deleted %s: %v", p, err)
+		}
+	}
+
+	// The repair the refusal documents: once the snapshot record names the
+	// bootstrap record's tree (a snapshot taken under B), RemoveData removes
+	// the replica.
+	w.setSnapshotPath(filepath.Join(snapDirB, "snapshot-0000000000000002", "snapshot.dat"))
+	if err := fh.RemoveData(removeDataShard, fid); err != nil {
+		t.Fatalf("RemoveData once the records agree: %v", err)
+	}
+	if _, err := os.Stat(snapDirB); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("RemoveData left %s (stat err %v)", snapDirB, err)
+	}
+}
+
 // TestRemoveData_RefusesIntentOutsideReplica: a pending removal intent is
 // trusted only when it names the requested replica's own snapshot
 // directory. A damaged intent naming an ancestor (NodeHostDir), another
