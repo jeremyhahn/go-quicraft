@@ -198,7 +198,8 @@ func TestReencryptSnapshotFile_RekeyAcrossBarriers(t *testing.T) {
 
 // TestReencryptSnapshotFile_PlaintextSides covers the none->keyed path an
 // enable-encryption migration uses: plaintext source -> keyed dest, with the
-// data preserved. The keyed -> plaintext direction is asserted by
+// data preserved and the destination's length reported. The keyed ->
+// plaintext direction, data and reported length, is asserted by
 // TestReencryptSnapshotFile_SealedBarrierFailsClosed (nil destination).
 func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	bar := createTestBarrier(t)
@@ -628,7 +629,7 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 	t.Run("nil destination still writes plaintext", func(t *testing.T) {
 		barA := createTestBarrier(t)
 		srcPath, dstPath := newSrc(t, barA)
-		epoch, _, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, nil)
+		epoch, fileSize, err := ReencryptSnapshotFile(srcPath, dstPath, testSnapShardID, testSnapReplicaID, testSnapIndex, barA, nil)
 		if err != nil {
 			t.Fatalf("ReencryptSnapshotFile: %v", err)
 		}
@@ -641,6 +642,16 @@ func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 		}
 		if !bytes.Equal(got, plain) {
 			t.Error("nil destination barrier did not write the plaintext through")
+		}
+		// keyed -> plaintext drops the framing, so the reported length is
+		// the shorter destination's, not the framed source's.
+		srcInfo, err := os.Stat(srcPath)
+		if err != nil {
+			t.Fatalf("stat src: %v", err)
+		}
+		if fileSize != uint64(len(got)) || fileSize == uint64(srcInfo.Size()) {
+			t.Errorf("keyed->plaintext fileSize = %d, want the destination's %d (source %d)",
+				fileSize, len(got), srcInfo.Size())
 		}
 	})
 }
