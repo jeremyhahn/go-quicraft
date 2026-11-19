@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `Host.HealthCheck` reports `"not-ready"` instead of `"ok"` when a started, unpaused shard has had no known leader for longer than its election timeout (`ElectionRTT * RTTMillisecond`), for example a single node started with a peer list it cannot reach (#1175). The new `HealthStatus.NotReadyShards` (`not_ready_shards`) names those shards. A shard inside its election window is not counted, and `ShardError` still reports `"degraded"` first.
+- `Host.HealthCheck` reports `"not-ready"` instead of `"ok"` when a started, unpaused shard has had no known leader for longer than its election window (`3 * ElectionRTT * RTTMillisecond`: the largest randomized election timeout plus one for the campaign), for example a single node started with a peer list it cannot reach (#1175). The new `HealthStatus.NotReadyShards` (`not_ready_shards`) names those shards. A shard inside its election window (counted from start, leader loss or resume) is not counted, and `ShardError` still reports `"degraded"` first.
 
 ### Security
 

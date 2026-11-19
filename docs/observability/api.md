@@ -211,8 +211,11 @@ type HealthStatus struct {
 `unhealthy` (no shard loaded), `degraded` (any shard in `ShardError`),
 `not-ready`, then `ok`. `not-ready` means at least one started, unpaused
 shard has had no known leader (`LeaderID == 0`) for longer than its election
-timeout, `ElectionRTT * RTTMillisecond`, measured from when the shard
-started or last lost its leader; such a shard cannot commit a write.
+window, `3 * ElectionRTT * RTTMillisecond`, measured from when the shard
+started, last lost its leader or was last resumed from a pause; such a shard
+cannot commit a write. The window is the largest randomized election
+timeout (raft draws it from `[ElectionRTT, 2*ElectionRTT)` ticks) plus one
+election timeout for the campaign to win.
 `NotReadyShards` lists those shard IDs in ascending order whatever `Status`
 is, and is omitted when empty. A shard inside its election window is not
 listed, so a normal election does not flap the status. A paused shard is

@@ -328,13 +328,16 @@ type HealthStatus struct {
 	// Status is the aggregate health verdict: "ok", "degraded",
 	// "not-ready", "sealed", or "unhealthy". "not-ready" means at least one
 	// started, unpaused shard has had no known leader for longer than its
-	// election timeout (ElectionRTT * RTTMillisecond), so it cannot commit a
-	// write; NotReadyShards names those shards. A shard inside its election
-	// window does not count, so a normal election does not flap health.
+	// election window, 3 * ElectionRTT * RTTMillisecond (the largest
+	// randomized election timeout, 2*ElectionRTT, plus one election timeout
+	// for the campaign), so it cannot commit a write; NotReadyShards names
+	// those shards. The window starts when the shard starts, loses its
+	// leader, or is resumed from a pause, so a normal election does not flap
+	// health.
 	Status string `json:"status"`
 
 	// NotReadyShards lists, in ascending order, the IDs of the shards that
-	// have had no known leader for longer than their election timeout.
+	// have had no known leader for longer than their election window.
 	// Omitted when empty. It is filled whatever Status is, so a "degraded"
 	// or "sealed" host still names its leaderless shards.
 	NotReadyShards []uint64 `json:"not_ready_shards,omitempty"`
