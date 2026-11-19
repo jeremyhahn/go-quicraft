@@ -439,6 +439,12 @@ func withBridgeLabel(t *testing.T, f func()) string {
 // countBridges returns the number of live goroutines that carry label and
 // have a bridge function on their stack.
 func countBridges(label string) int {
+	return countBridgeFrames(label, bridgeFrames)
+}
+
+// countBridgeFrames is countBridges restricted to goroutines whose stack
+// contains one of frames.
+func countBridgeFrames(label string, frames []string) int {
 	var buf bytes.Buffer
 	if err := pprof.Lookup("goroutine").WriteTo(&buf, 1); err != nil {
 		panic(err)
@@ -452,7 +458,7 @@ func countBridges(label string) int {
 			continue
 		}
 		bridge := false
-		for _, fn := range bridgeFrames {
+		for _, fn := range frames {
 			bridge = bridge || strings.Contains(rec, fn)
 		}
 		if !bridge {
@@ -483,6 +489,75 @@ func assertNoBridges(t *testing.T, label string) {
 	if n != 0 {
 		t.Errorf("bridge goroutine leak: %d bridge goroutines still alive after Release", n)
 	}
+}
+
+// waitBridgeFrames polls countBridgeFrames for up to 2 s until it reports
+// want, and returns the last count seen.
+func waitBridgeFrames(label string, frames []string, want int) int {
+	deadline := time.Now().Add(2 * time.Second)
+	n := countBridgeFrames(label, frames)
+	for n != want && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		n = countBridgeFrames(label, frames)
+	}
+	return n
+}
+
+// TestCountBridges_DetectsLiveBridges is the positive control for the leak
+// tests: it keeps labelled bridges of all three bridge functions alive,
+// checks that the counter sees each of them, then releases them and checks
+// that the count returns to zero. Without it a counter that always returned
+// zero would let every leak test pass.
+func TestCountBridges_DetectsLiveBridges(t *testing.T) {
+	const count = 10
+	reqs := make([]*RequestState, count)
+	sysOps := make([]*SysOpState, count)
+	label := withBridgeLabel(t, func() {
+		for i := 0; i < count; i++ {
+			pool := quicraft.NewRequestStatePool()
+			reqs[i] = WrapRequestState(pool.Get().(*quicraft.RequestState), true)
+			if reqs[i].ResultC() == nil {
+				t.Fatalf("expected non-nil ResultC for state %d", i)
+			}
+			pool = quicraft.NewRequestStatePool()
+			sysOps[i] = WrapSysOpState(pool.Get().(*quicraft.RequestState))
+		}
+	})
+	released := false
+	release := func() {
+		if released {
+			return
+		}
+		released = true
+		for i := 0; i < count; i++ {
+			reqs[i].Release()
+			sysOps[i].Release()
+		}
+	}
+	defer release()
+
+	for _, frame := range bridgeFrames {
+		frames := []string{frame}
+		if n := waitBridgeFrames(label, frames, count); n != count {
+			t.Errorf("live bridges %q: counted %d, want %d", frame, n, count)
+		}
+	}
+	if n := countBridges(label); n != len(bridgeFrames)*count {
+		t.Errorf("live bridges total: counted %d, want %d", n, len(bridgeFrames)*count)
+	}
+	// A label no goroutine carries must count zero even with bridges alive.
+	if n := countBridges(fmt.Sprintf("%q:%q", "leaktest", t.Name()+"/absent")); n != 0 {
+		t.Errorf("unrelated label: counted %d bridges, want 0", n)
+	}
+
+	release()
+	for _, frame := range bridgeFrames {
+		frames := []string{frame}
+		if n := waitBridgeFrames(label, frames, 0); n != 0 {
+			t.Errorf("released bridges %q: counted %d, want 0", frame, n)
+		}
+	}
+	assertNoBridges(t, label)
 }
 
 // ---------------------------------------------------------------------------
