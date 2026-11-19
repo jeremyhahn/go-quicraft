@@ -117,10 +117,13 @@ func TestApplyWorker_RecoverFromSMPanic(t *testing.T) {
 		t.Fatal("expected SMPanicError to match ErrShardFailed via errors.Is")
 	}
 
-	// Verify commitPending was cleared (the deferred cleanup ran).
-	if node.commitPending.Load() {
-		t.Fatal("expected commitPending to be cleared after panic")
-	}
+	// Verify commitPending is cleared by the deferred cleanup. That
+	// outer defer runs after the panic-recovery defer (which called
+	// handleError), so it may not have run yet when errorReported is
+	// observed: wait for it rather than reading it once.
+	waitFor(t, 5*time.Second, time.Millisecond, "expected commitPending to be cleared after panic", func() bool {
+		return !node.commitPending.Load()
+	})
 
 	// Stop the worker cleanly.
 	close(stopC)
