@@ -182,6 +182,7 @@ other replica as its anchor, and no identity may be bound to two replicas. See
 | `ErrShardNotReady` | A concurrent `StartShard` of the same shard is still in progress (transient) |
 | `ErrImportInProgress` | An `ImportSnapshot` of this shard is running (transient) |
 | `*ReplicaRetiredError` | `RemoveData` retired this replica ID on this host. Rejoin under a new ID |
+| DataDir changed (unexported type; the message names the recorded and the requested `DataDir`) | `cfg.DataDir` differs from the `DataDir` this replica was first started with (its bootstrap record, or for a replica with none, its snapshot record). Its snapshots stay under the recorded tree: restart with the recorded `DataDir` |
 | `*EmptyMembersError` | Bootstrap with an empty `members` map |
 | `*SelfNotInMembersError` | `cfg.ReplicaID` absent from `members` on a bootstrap |
 | `*InvalidMemberError` | A member has a zero replica ID, an empty or malformed address, or a duplicate address; a required identity is missing or bound twice; a joiner names no anchor; or `MemberIdentities` contradicts the recovered membership. Matches `ErrInvalidMember` |
@@ -786,7 +787,7 @@ does not hold, or for an identity the artifact's tombstones hold, is refused.
 | Error | Condition |
 |---|---|
 | `ErrClosed` | Host closed |
-| `ErrInvalidOperation` (wrapped) | The shard is running (including one started while the import waited for its lock), there is no LogDB, or this host holds data for more than one replica of the shard. Remove the stale replica's data (`RemoveData`) first |
+| `ErrInvalidOperation` (wrapped) | The shard is running (including one started while the import waited for its lock), there is no LogDB, or this host holds data for more than one replica of the shard. Remove the stale replica's data (`RemoveData`) first. Also returned while an earlier `RemoveData` of the replica is pending (it failed or crashed after recording its intent): retry `RemoveData` to finish it |
 | `*ImportLayoutUnknownError` | Layout not discoverable and none supplied |
 | `*ImportDataDirMismatchError` | `WithImportDataDir` disagrees with the recorded `DataDir` |
 | `*ImportSnapshotOutOfDateError` | The artifact's index does not advance the recorded snapshot |
@@ -1121,7 +1122,9 @@ its replica ID on this host, across restarts: `StartShard` refuses it with
 `*ReplicaRetiredError`, because its term, vote and any lease vote window it owed
 are gone with its data and it could otherwise vote twice in one term. Rejoin
 under a new replica ID. If the replica is loaded on this host it must be stopped
-first; a shard that is not loaded needs nothing. `SyncRemoveData` behaves
+first, and the stop finished: a replica whose `StopShard` has not yet returned
+is still refused with `*ShardNotStoppedError`. A shard that is not loaded needs
+nothing. `SyncRemoveData` behaves
 identically, except that it first returns `ErrTimeout` or `ErrCanceled` for a
 `ctx` that has already ended, and exists for naming consistency.
 
@@ -1643,7 +1646,7 @@ Host and request lifecycle:
 
 | Error | Returned when |
 |---|---|
-| `ErrClosed` | the Host is closed, or the request never started |
+| `ErrClosed` | the Host is closed, or the request never started; also a local read whose shard `StopShard` closed while it waited |
 | `ErrDraining` | new work submitted during drain |
 | `ErrStopped` | the shard or engine stopped underneath an in-progress snapshot save or recovery, or the shard or host stopped while an `ExecuteOnLeader` request waited |
 | `ErrShutdownTimeout` | drain exceeded `ShutdownTimeout` |
@@ -2504,7 +2507,7 @@ System events:
 | `OnSnapshotSent` | `SnapshotInfo` | a snapshot transfer was sent |
 | `OnSnapshotSendAborted` | `SnapshotInfo` | a snapshot transfer was abandoned |
 | `OnSnapshotReceived` | `SnapshotInfo` | a snapshot transfer was received |
-| `OnSnapshotRecovered` | `SnapshotInfo` | the state machine was restored from a snapshot |
+| `OnSnapshotRecovered` | `SnapshotInfo` | a snapshot recovery completed. `Index` is the restored snapshot's index, 0 when the replica had no snapshot to restore |
 | `OnSnapshotCreated` | `SnapshotInfo` | an on-demand or automatic snapshot was written. A save with nothing new to capture writes none and fires nothing |
 | `OnSnapshotCompacted` | `SnapshotInfo` | old snapshot directories were reclaimed |
 | `OnLogCompacted` | `EventShardInfo` | log compaction completed; `Index` is the compaction point |

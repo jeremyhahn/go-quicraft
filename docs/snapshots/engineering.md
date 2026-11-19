@@ -369,10 +369,15 @@ running restore; the restore is handed the node's stop channel and should
 return promptly once it closes. A node that has already stopped refuses the
 lease, and its recovery never touches the state machine.
 
-A save takes no lease, so `UnloadNode` does not wait for a snapshot save to
-finish. That is deliberate. A save only reads the state machine, and it can
-stream for a long time after its capture point, so it should not hold up a
-shard stop. The state machine adapter covers the save instead: the stream
+A save holds no lease while it streams, so `UnloadNode` does not wait for a
+snapshot save to finish. That is deliberate. A save only reads the state
+machine, and it can stream for a long time after its capture point, so it
+should not hold up a shard stop. It takes the node's write lease only briefly,
+for each step that writes into the replica's snapshot tree: creating its
+`.save-*` stage, writing `snapshot.meta`, and the rename that publishes it. A
+node that has stopped refuses the lease and the save returns `ErrStopped`, so
+once `UnloadNode` returns no save can create or publish anything in a tree a
+later `RemoveData` deletes. The state machine adapter covers the save instead: the stream
 holds `streamGuard` until it ends, so `Close` waits for it, and a save that
 starts after `Close` returns `ErrClosed` (see
 [state-machines/engineering.md](../state-machines/engineering.md)).

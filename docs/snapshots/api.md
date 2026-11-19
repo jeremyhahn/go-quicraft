@@ -91,7 +91,7 @@ func WithImportMemberIdentities(identities map[uint64]string) ImportOption
 |---|---|
 | Request | the shard, a reader, and optionally the shard's data directory, a replacement membership, and node identities for the resulting membership |
 | Response | none |
-| Errors | `*SnapshotArtifactError` (also `ErrSnapshotCorrupt` on a length or hash mismatch), `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `*ReplicaRetiredError`, `ErrSnapshotBarrierSealed`. Before anything is read: `ErrInvalidOperation` (the shard is running on this host, or this host holds data for more than one of its replicas), `ErrShardNotFound` (no replica of the shard on this host), `ErrDiskFull`, `ErrClosed`, `ErrCanceled` / `ErrTimeout` |
+| Errors | `*SnapshotArtifactError` (also `ErrSnapshotCorrupt` on a length or hash mismatch), `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `*ReplicaRetiredError`, `ErrSnapshotBarrierSealed`. Before anything is read: `ErrInvalidOperation` (the shard is running on this host, this host holds data for more than one of its replicas, or a `RemoveData` of the replica is pending: retry `RemoveData` to finish it), `ErrShardNotFound` (no replica of the shard on this host), `ErrDiskFull`, `ErrClosed`, `ErrCanceled` / `ErrTimeout` |
 | Permission | none in this library |
 
 **This rewrites the replica's membership.** It is an offline, deliberate
