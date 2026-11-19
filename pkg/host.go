@@ -3451,7 +3451,10 @@ var _ engine.Callback = (*hostEngineCallback)(nil)
 // One Host per process. It manages shard lifecycle, proposal routing,
 // read operations, session management, and cluster membership.
 type Host struct {
-	cfg           config.HostConfig
+	cfg config.HostConfig
+	// clock measures the leaderless windows (nodeState.leaderlessSince); nil
+	// is the system clock. Tests swap it to step the wall clock.
+	clock         leaderlessClock
 	logger        *slog.Logger
 	logdb         logdb.LogDB
 	barrier       Barrier
@@ -5520,7 +5523,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	}
 	ns.health.Store(uint32(ShardHealthy))
 	// A starting shard knows no leader yet: its election window opens now.
-	ns.leaderlessSince.Store(time.Now().UnixNano())
+	ns.leaderlessSince.Store(h.leaderlessNow())
 
 	// Seed the host-side applied marker to the recovered index so that
 	// FollowerRead and the OnReadyToRead/OnApplied read-completion gates
@@ -7850,7 +7853,7 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	h.engine.ResumeNode(engNode)
 	ns.paused.Store(false)
 	if wasPaused {
-		ns.restartLeaderlessWindow()
+		ns.restartLeaderlessWindow(h.leaderlessNow())
 	}
 	ns.pauseGate.unlock()
 	return nil
@@ -10908,7 +10911,7 @@ func (h *Host) HealthCheck() *HealthStatus {
 	shards := make([]ShardInfo, 0, clampNonNegative(h.activeNodes.Load()))
 	// Shards leaderless for longer than their election timeout (#1175).
 	var notReady []uint64
-	now := time.Now().UnixNano()
+	now := h.leaderlessNow()
 	h.nodes.Range(func(_, value any) bool {
 		ns, ok := value.(*nodeState)
 		if !ok {
@@ -10989,11 +10992,45 @@ func (h *Host) leaderlessGrace(ns *nodeState) time.Duration {
 // is leaderless, as ResumeShard does: a resumed peer starts a new election
 // timeout, so time spent paused must not count against it. A shard with a
 // known leader is left at 0. The CAS loses to a concurrent updateNodeLeader
-// that publishes a leader, so it never stamps a led shard.
-func (ns *nodeState) restartLeaderlessWindow() {
+// that publishes a leader, so it never stamps a led shard. now is a
+// Host.leaderlessNow reading.
+func (ns *nodeState) restartLeaderlessWindow(now int64) {
 	if since := ns.leaderlessSince.Load(); since != 0 {
-		ns.leaderlessSince.CompareAndSwap(since, time.Now().UnixNano())
+		ns.leaderlessSince.CompareAndSwap(since, now)
 	}
+}
+
+// leaderlessClock is the clock the leaderless windows are measured on.
+type leaderlessClock interface {
+	// wallNanos reads the system wall clock (unix nanoseconds), which an
+	// operator or NTP can step backward or forward.
+	wallNanos() int64
+	// monoNanos reads monotonic nanoseconds since a process-local origin,
+	// which a wall-clock step never moves.
+	monoNanos() int64
+}
+
+// systemClock is the production leaderlessClock.
+type systemClock struct{}
+
+// monoOrigin is the process-local origin of systemClock.monoNanos. It
+// carries Go's monotonic reading, so time.Since(monoOrigin) is monotonic.
+var monoOrigin = time.Now()
+
+func (systemClock) wallNanos() int64 { return time.Now().UnixNano() }
+
+// monoNanos is at least 1, so a reading never collides with the 0 that
+// leaderlessSince stores while a leader is known.
+func (systemClock) monoNanos() int64 { return int64(time.Since(monoOrigin)) + 1 }
+
+// leaderlessNow is the reading leaderlessSince stores and
+// leaderlessPastElectionTimeout compares.
+func (h *Host) leaderlessNow() int64 {
+	var c leaderlessClock = systemClock{}
+	if h.clock != nil {
+		c = h.clock
+	}
+	return c.wallNanos()
 }
 
 // NodeIdentity returns this host's own stable node identity: the value peers
@@ -12699,7 +12736,7 @@ func (h *Host) updateNodeLeader(shardID, leaderID, term uint64) {
 	// leader opens the window once (CAS keeps the first loss time across
 	// repeated leaderless updates); a known leader closes it.
 	if leaderID == 0 {
-		ns.leaderlessSince.CompareAndSwap(0, time.Now().UnixNano())
+		ns.leaderlessSince.CompareAndSwap(0, h.leaderlessNow())
 	} else {
 		ns.leaderlessSince.Store(0)
 	}
