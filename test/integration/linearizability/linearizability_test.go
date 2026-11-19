@@ -280,6 +280,46 @@ func (r *opRecorder) completed() int64 {
 	return r.done.Load()
 }
 
+// mark returns the recorder's logical clock now: every operation begun after
+// the call has a callSeq above it.
+func (r *opRecorder) mark() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seq
+}
+
+// ackedSince counts the determinately acknowledged writes (put, append) and
+// reads (get) whose call began after mark.
+func (r *opRecorder) ackedSince(mark int64) (writes, reads int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, op := range r.ops {
+		if op.callSeq <= mark || !op.determinate {
+			continue
+		}
+		if op.input.Op == "get" {
+			reads++
+		} else {
+			writes++
+		}
+	}
+	return writes, reads
+}
+
+// requireServedSince fails the test unless the cluster acknowledged at least
+// one write and one read that began after mark, so a failover test cannot
+// pass on traffic from before the recovery it is meant to exercise.
+func requireServedSince(t *testing.T, r *opRecorder, mark int64, phase string) {
+	t.Helper()
+	writes, reads := r.ackedSince(mark)
+	t.Logf("acknowledged after %s: writes=%d reads=%d", phase, writes, reads)
+	if writes == 0 || reads == 0 {
+		t.Fatalf("the cluster acknowledged writes=%d reads=%d after %s; both must "+
+			"be above zero, or the workload ended before the recovered cluster "+
+			"served it", writes, reads, phase)
+	}
+}
+
 // begin registers a call and returns its record. Every begin MUST be followed
 // by exactly one finish or indeterminate.
 func (r *opRecorder) begin(clientID int, input kvInput) *opRecord {
@@ -1511,8 +1551,13 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 		numClients = 4
 		numKeys    = 10
 		shardID    = 1
-		testDur    = 5 * time.Second
+		// killAt is the normal operation before the leader is killed.
+		killAt = 2 * time.Second
 	)
+	// The run after the kill is sized in election rounds, not seconds, so it
+	// spans the same number of elections in either harness mode: 3s with the
+	// 1s round of the default mode, 30s in WAL-sync mode's 10s round.
+	testDur := killAt + 3*electionRound
 
 	cluster := newTestCluster(t, numNodes)
 	defer cluster.close()
@@ -1525,8 +1570,8 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 	recorder := &opRecorder{}
 	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
-	// After 2 seconds of normal operation, kill the leader.
-	chaosTimer := time.NewTimer(2 * time.Second)
+	// After killAt of normal operation, kill the leader.
+	chaosTimer := time.NewTimer(killAt)
 	<-chaosTimer.C
 	chaosTimer.Stop()
 	t.Logf("stopping leader node[%d]", leaderIdx)
@@ -1536,12 +1581,14 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 	electStart := time.Now()
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("new leader elected: node[%d] in %v (budget %v)", newLeaderIdx, time.Since(electStart), failoverTimeout)
+	elected := recorder.mark()
 
 	wait()
 
+	requireServedSince(t, recorder, elected, "the new leader's election")
 	// One election is expected to stall the clients, so only the serving
 	// portion of the run counts toward the floor.
-	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*time.Second))
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*electionRound))
 }
 
 // TestLinearizability_4Node_ElectionSafety exercises the election-safety
@@ -1578,8 +1625,15 @@ func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
 		numClients = 4
 		numKeys    = 10
 		shardID    = 1
-		testDur    = 12 * time.Second
+		// killAt is the normal operation before the leader is killed.
+		killAt = 3 * time.Second
 	)
+	// The run after the kill and the wait before the old leader restarts are
+	// sized in election rounds, not seconds, so they span the same number of
+	// elections in either harness mode: 9s and 4s with the 1s round of the
+	// default mode, 90s and 40s in WAL-sync mode's 10s round.
+	testDur := killAt + 9*electionRound
+	restartAfter := 4 * electionRound
 
 	cluster := newTestCluster(t, numNodes)
 	defer cluster.close()
@@ -1592,9 +1646,9 @@ func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
 	recorder := &opRecorder{}
 	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
-	// Kill the leader at 3s: the surviving 3 of 4 replicas are exactly the
-	// quorum, so the new term must be won unanimously.
-	killTimer := time.NewTimer(3 * time.Second)
+	// Kill the leader at killAt: the surviving 3 of 4 replicas are exactly
+	// the quorum, so the new term must be won unanimously.
+	killTimer := time.NewTimer(killAt)
 	<-killTimer.C
 	killTimer.Stop()
 	t.Logf("stopping leader node[%d]", leaderIdx)
@@ -1602,10 +1656,11 @@ func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
 
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("new leader elected: node[%d]", newLeaderIdx)
+	elected := recorder.mark()
 
-	// Restart the old leader at 7s. It comes back believing it led its old
-	// term; the guard keeps watching it as it rejoins.
-	restartTimer := time.NewTimer(4 * time.Second)
+	// Restart the old leader restartAfter later. It comes back believing it
+	// led its old term; the guard keeps watching it as it rejoins.
+	restartTimer := time.NewTimer(restartAfter)
 	<-restartTimer.C
 	restartTimer.Stop()
 	t.Logf("restarting old leader node[%d]", leaderIdx)
@@ -1618,10 +1673,13 @@ func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
 		_, err := h.ShardInfo(shardID)
 		return err == nil
 	})
+	rejoined := recorder.mark()
 
 	wait()
 
-	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*time.Second))
+	requireServedSince(t, recorder, elected, "the new leader's election")
+	requireServedSince(t, recorder, rejoined, "the old leader's rejoin")
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*electionRound))
 }
 
 // TestLinearizability_5Node_MultipleLeaderFailovers stresses repeated leader
@@ -1635,8 +1693,15 @@ func TestLinearizability_5Node_MultipleLeaderFailovers(t *testing.T) {
 		numClients = 4
 		numKeys    = 10
 		shardID    = 1
-		testDur    = 15 * time.Second
+		// killAt is the normal operation before the first leader is killed.
+		killAt = 3 * time.Second
 	)
+	// The run after the first kill and the wait before the second are sized
+	// in election rounds, not seconds, so they span the same number of
+	// elections in either harness mode: 12s and 5s with the 1s round of the
+	// default mode, 120s and 50s in WAL-sync mode's 10s round.
+	testDur := killAt + 12*electionRound
+	secondKillAfter := 5 * electionRound
 
 	cluster := newTestCluster(t, numNodes)
 	defer cluster.close()
@@ -1649,8 +1714,8 @@ func TestLinearizability_5Node_MultipleLeaderFailovers(t *testing.T) {
 	recorder := &opRecorder{}
 	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
-	// First leader kill at 3s.
-	firstKillTimer := time.NewTimer(3 * time.Second)
+	// First leader kill at killAt.
+	firstKillTimer := time.NewTimer(killAt)
 	<-firstKillTimer.C
 	firstKillTimer.Stop()
 	t.Logf("stopping first leader node[%d]", leaderIdx)
@@ -1659,8 +1724,8 @@ func TestLinearizability_5Node_MultipleLeaderFailovers(t *testing.T) {
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("new leader elected: node[%d]", newLeaderIdx)
 
-	// Second leader kill at 8s.
-	secondKillTimer := time.NewTimer(5 * time.Second)
+	// Second leader kill secondKillAfter later.
+	secondKillTimer := time.NewTimer(secondKillAfter)
 	<-secondKillTimer.C
 	secondKillTimer.Stop()
 	t.Logf("stopping second leader node[%d]", newLeaderIdx)
@@ -1668,11 +1733,13 @@ func TestLinearizability_5Node_MultipleLeaderFailovers(t *testing.T) {
 
 	finalLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("final leader elected: node[%d]", finalLeaderIdx)
+	finalElected := recorder.mark()
 
 	wait()
 
+	requireServedSince(t, recorder, finalElected, "the final leader's election")
 	// Two elections are expected to stall the clients.
-	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*time.Second))
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*electionRound))
 }
 
 // TestLinearizability_5Node_MinorityDown verifies that a 5-node cluster
@@ -1934,8 +2001,15 @@ func TestLinearizability_3Node_LeaderRestart(t *testing.T) {
 		numClients = 4
 		numKeys    = 10
 		shardID    = 1
-		testDur    = 12 * time.Second
+		// killAt is the normal operation before the leader is stopped.
+		killAt = 2 * time.Second
 	)
+	// The run after the stop and the wait before the old leader restarts are
+	// sized in election rounds, not seconds, so they span the same number of
+	// elections in either harness mode: 10s and 4s with the 1s round of the
+	// default mode, 100s and 40s in WAL-sync mode's 10s round.
+	testDur := killAt + 10*electionRound
+	restartAfter := 4 * electionRound
 
 	cluster := newTestCluster(t, numNodes)
 	defer cluster.close()
@@ -1948,8 +2022,8 @@ func TestLinearizability_3Node_LeaderRestart(t *testing.T) {
 	recorder := &opRecorder{}
 	wait := runClients(t, cluster, shardID, numClients, numKeys, testDur, recorder)
 
-	// At 2s, stop the leader.
-	stopLeaderTimer := time.NewTimer(2 * time.Second)
+	// At killAt, stop the leader.
+	stopLeaderTimer := time.NewTimer(killAt)
 	<-stopLeaderTimer.C
 	stopLeaderTimer.Stop()
 	t.Logf("stopping leader node[%d]", leaderIdx)
@@ -1958,9 +2032,10 @@ func TestLinearizability_3Node_LeaderRestart(t *testing.T) {
 	// Wait for a new leader from the remaining 2 nodes.
 	newLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("new leader elected: node[%d]", newLeaderIdx)
+	elected := recorder.mark()
 
-	// At 6s, restart the old leader (becomes follower).
-	restartLeaderTimer := time.NewTimer(4 * time.Second)
+	// restartAfter later, restart the old leader (becomes follower).
+	restartLeaderTimer := time.NewTimer(restartAfter)
 	<-restartLeaderTimer.C
 	restartLeaderTimer.Stop()
 	t.Logf("restarting old leader node[%d]", leaderIdx)
@@ -1977,10 +2052,14 @@ func TestLinearizability_3Node_LeaderRestart(t *testing.T) {
 		return err == nil
 	})
 	t.Logf("old leader node[%d] has rejoined the cluster", leaderIdx)
+	rejoined := recorder.mark()
 
 	wait()
 
-	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*time.Second))
+	requireServedSince(t, recorder, elected, "the new leader's election")
+	requireServedSince(t, recorder, rejoined, "the old leader's rejoin")
+	// One election is expected to stall the clients.
+	checkLinearizability(t, recorder, floorFor(numClients, testDur-4*electionRound))
 }
 
 // TestLinearizability_5Node_MembershipAddRemove verifies that dynamic
