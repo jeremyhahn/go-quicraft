@@ -14180,34 +14180,39 @@ func TestWalShardIDs_NilAndEmpty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: OnSnapshotCompleted - recovery (index=0) fires OnSnapshotRecovered
+// Coverage: OnSnapshotCompleted - a recovery fires OnSnapshotRecovered
 // ---------------------------------------------------------------------------
 
+// TestOnSnapshotCompleted_SnapshotRecovery: the operation, not the index,
+// marks a recovery. A recovery that restored nothing completes at index 0
+// and still fires OnSnapshotRecovered{Index: 0}; one that restored a
+// recorded snapshot carries that snapshot's index.
 func TestOnSnapshotCompleted_SnapshotRecovery(t *testing.T) {
-	recoveryCalled := false
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnSnapshotRecovered: func(info config.SnapshotInfo) {
-			recoveryCalled = true
-			if info.ShardID != 1 {
-				t.Errorf("SnapshotInfo.ShardID = %d, want 1", info.ShardID)
-			}
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	t.Cleanup(func() { h.Close() })
-	addTestNodeState(h, 1, 1)
+	for _, index := range []uint64{0, 100} {
+		var recovered []config.SnapshotInfo
+		hostCfg := testHostConfig(t)
+		hostCfg.EventListener = &config.EventListener{
+			OnSnapshotRecovered: func(info config.SnapshotInfo) {
+				recovered = append(recovered, info)
+			},
+		}
+		h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		addTestNodeState(h, 1, 1)
 
-	cb := &hostEngineCallback{h: h}
-	// index=0 means recovery.
-	cb.OnSnapshotCompleted(1, 0, engine.SnapshotRecover, nil)
-	flushListeners(t, cb)
+		cb := &hostEngineCallback{h: h}
+		cb.OnSnapshotCompleted(1, index, engine.SnapshotRecover, nil)
+		flushListeners(t, cb)
+		h.Close()
 
-	if !recoveryCalled {
-		t.Error("OnSnapshotRecovered was not called for index=0 snapshot")
+		if len(recovered) != 1 {
+			t.Fatalf("index %d: OnSnapshotRecovered fired %d times, want 1", index, len(recovered))
+		}
+		if got := recovered[0]; got.ShardID != 1 || got.ReplicaID != 1 || got.Index != index {
+			t.Fatalf("index %d: OnSnapshotRecovered(%+v), want shard 1 replica 1 index %d", index, got, index)
+		}
 	}
 }
 

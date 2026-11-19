@@ -3488,8 +3488,10 @@ func TestHandleRequest_CompletionNamesItsOperation(t *testing.T) {
 	if c := calls[0]; c.op != SnapshotSave || c.index != 0 || c.err != nil {
 		t.Fatalf("no-op save completed as %+v, want SnapshotSave at index 0 without error", c)
 	}
-	if c := calls[1]; c.op != SnapshotRecover || c.err != nil {
-		t.Fatalf("recovery completed as %+v, want SnapshotRecover without error", c)
+	// A recovery that restored nothing completes at index 0: the operation,
+	// not the index, tells the host it was a recovery.
+	if c := calls[1]; c.op != SnapshotRecover || c.index != 0 || c.err != nil {
+		t.Fatalf("recovery completed as %+v, want SnapshotRecover at index 0 without error", c)
 	}
 }
 
