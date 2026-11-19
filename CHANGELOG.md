@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependencies: go-enclave v0.11.1-alpha (was v0.11.0-alpha), in the same three modules. It is the v0.11.0-alpha commit tagged again, so no code changes; go.sum carries the checksums the public module proxy serves.
 - API: `ReencryptSnapshotFile` returns `(epoch, fileSize, err)`: `fileSize` is the destination data file's length, which re-encryption changes whenever the framing differs. `waldb.ReencryptSized` takes a `SnapshotReencryptSizedFunc` hook returning both and records them as the migrated snapshot's `Epoch` and `FileSize`, so a Host starts the shard on a plaintext-to-encrypted re-key. The re-key runbook (`docs/seal-barrier/user.md`) uses it.
 
+### Fixed
+
+- `Host.HealthCheck` reports `"not-ready"` instead of `"ok"` when a started, unpaused shard has had no known leader for longer than its election window (`3 * ElectionRTT * RTTMillisecond`: the largest randomized election timeout plus one for the campaign), for example a single node started with a peer list it cannot reach (#1175). The new `HealthStatus.NotReadyShards` (`not_ready_shards`) names those shards. A shard inside its election window (counted from start, leader loss or resume) is not counted, and `ShardError` still reports `"degraded"` first.
+
 ### Security
 
 - **Go toolchain 1.27.4 for GO-2026-6859, net/http (#725).** govulncheck reports GO-2026-6859 in the go1.27.3 standard library, fixed in go1.27.4 (2026-11-02). Every Go version pin moves to 1.27.4: the `go` directive of all six modules (root, `contrib/dragonboat`, `test/performance` and its `dragonboat`, `etcd` and `quicraft` modules), `GO_VERSION` in `batch.yml`, `fuzz.yml`, `nightly.yml` and `release.yml`, the `run.go` value in `.golangci.yml` (was 1.27.1), the `golang` base images of the three devcontainer Dockerfiles and the three performance Dockerfiles, the tool-pins image (`golang:1.27.4-alpine3.24`, new digest), and the required version in the README, `CONTRIBUTING.md` and the feature docs.

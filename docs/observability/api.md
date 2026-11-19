@@ -196,7 +196,8 @@ type ShardHealth uint8 // ShardHealthy, ShardNoLeader, ShardLagging, ShardUnload
                        // ShardError, ShardRecovering, ShardSnapshotting
 
 type HealthStatus struct {
-    Status             string      `json:"status"` // ok | degraded | sealed | unhealthy
+    Status             string      `json:"status"` // ok | degraded | not-ready | sealed | unhealthy
+    NotReadyShards     []uint64    `json:"not_ready_shards,omitempty"`
     BarrierSealed      bool        `json:"barrier_sealed"`
     DiskOK             bool        `json:"disk_ok"`
     ShardCount         int         `json:"shard_count"`
@@ -206,6 +207,19 @@ type HealthStatus struct {
 ```
 
 `HealthCheck` returns a value; serving it is the embedder's job.
+`Status` is decided in this order: `sealed` (the barrier is sealed),
+`unhealthy` (no shard loaded), `degraded` (any shard in `ShardError`),
+`not-ready`, then `ok`. `not-ready` means at least one started, unpaused
+shard has had no known leader (`LeaderID == 0`) for longer than its election
+window, `3 * ElectionRTT * RTTMillisecond`, measured from when the shard
+started, last lost its leader or was last resumed from a pause; such a shard
+cannot commit a write. The window is the largest randomized election
+timeout (raft draws it from `[ElectionRTT, 2*ElectionRTT)` ticks) plus one
+election timeout for the campaign to win.
+`NotReadyShards` lists those shard IDs in ascending order whatever `Status`
+is, and is omitted when empty. A shard inside its election window is not
+listed, so a normal election does not flap the status. A paused shard is
+never listed: `ShardInfo.Paused` already reports it.
 `DiagnosticsDropped` is the number of library log records dropped since the
 process started because the `slog.SetDefault` handler was not taking them (the
 library never blocks on its own diagnostics: see

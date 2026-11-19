@@ -166,7 +166,17 @@ status := host.HealthCheck() // *HealthStatus
 ```
 
 The library returns a value and serves nothing. Wire it into your own readiness
-endpoint. `status.DiagnosticsDropped` counts library log records dropped
+endpoint. `status.Status` is `"ok"`, `"degraded"` (a shard is in
+`ShardError`), `"not-ready"`, `"sealed"` or `"unhealthy"` (no shard loaded).
+`"not-ready"` means a started, unpaused shard has had no known leader for
+longer than its election window (`3 * ElectionRTT * RTTMillisecond`: the
+largest randomized election timeout plus one more for the campaign), so it
+cannot commit a write: for example a node started with a peer list it cannot
+reach. `status.NotReadyShards` lists those shard IDs. A shard that has just
+started, just lost its leader or just been resumed is not counted until that
+window passes, so
+a normal election does not flip readiness; treat `"not-ready"` as failing a
+readiness probe. `status.DiagnosticsDropped` counts library log records dropped
 because your `slog` handler was not taking them; alert on it rising. It is
 process-wide and is not exported as a metric, so copy it into your own gauge
 if you want a graph. For incident response, `host.ShardInfo`,
