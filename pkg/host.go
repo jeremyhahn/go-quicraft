@@ -1670,8 +1670,9 @@ type nodeState struct {
 	// leaderChanged.
 	leaderWake atomic.Pointer[chan struct{}]
 
-	// leaderlessSince is the wall-clock time (unix nanoseconds) from which
-	// the shard has had no known leader, or 0 while a leader is known. It
+	// leaderlessSince is the monotonic time (Host.leaderlessNow, nanoseconds
+	// since a process-local origin) from which the shard has had no known
+	// leader, or 0 while a leader is known. It
 	// is set when the shard starts, kept at its first value while the shard
 	// stays leaderless, and cleared by updateNodeLeader when a leader is
 	// published; ResumeShard restarts it, as the resumed peer starts a fresh
@@ -10965,8 +10966,8 @@ func (h *Host) HealthCheck() *HealthStatus {
 }
 
 // leaderlessPastElectionTimeout reports whether ns has had no known leader
-// for longer than its election window (leaderlessGrace) as of now (unix
-// nanoseconds). A shard inside the window, or one with a known leader,
+// for longer than its election window (leaderlessGrace) as of now (a
+// Host.leaderlessNow reading). A shard inside the window, or one with a known leader,
 // reports false, so a normal election does not flap health.
 func (h *Host) leaderlessPastElectionTimeout(ns *nodeState, now int64) bool {
 	since := ns.leaderlessSince.Load()
@@ -11030,7 +11031,9 @@ func (h *Host) leaderlessNow() int64 {
 	if h.clock != nil {
 		c = h.clock
 	}
-	return c.wallNanos()
+	// Monotonic, so a wall-clock step neither shortens nor lengthens a
+	// window (#1175 review round 2).
+	return c.monoNanos()
 }
 
 // NodeIdentity returns this host's own stable node identity: the value peers

@@ -331,7 +331,7 @@ func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
 	cfg.ElectionRTT = 10
 	ns := &nodeState{shardID: 11, replicaID: 1, cfg: cfg}
 	nominal := time.Duration(cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
-	now := time.Now().UnixNano()
+	now := h.leaderlessNow()
 
 	// Past the nominal timeout, and past the largest randomized one, but
 	// inside the campaign that follows it.
