@@ -1536,7 +1536,9 @@ var ErrRemoveDataLayoutConflict = errors.New("quicraft: RemoveData refused: the 
 // retry RemoveData; then delete SnapshotDir, which no record references any
 // more. It also matches ErrInvalidOperation under errors.Is.
 type RemoveDataLayoutConflictError struct {
-	ShardID   uint64
+	// ShardID is the shard whose data removal was refused.
+	ShardID uint64
+	// ReplicaID is the replica whose data removal was refused.
 	ReplicaID uint64
 	// BootstrapDir is the replica snapshot directory the bootstrap
 	// record's DataDir selects.
