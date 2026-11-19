@@ -49,17 +49,20 @@ both at once so that each loaded the other.
   - The fixed test, run on its own, passed all 8 x 40 runs under the
     same load.
 
-## Same cause, outside this lane's file map
+## Same cause in two `pkg/host_test.go` tests (fixed in the second slice)
 
 Under the same CPU-hog load, `TestHealthCheck_AllHealthy`
 (`pkg/host_test.go`, `Status = "not-ready", want "ok"`) and
-`TestHealthCheck_DiskFull` (`pkg/host_test.go`, same message) also fail.
+`TestHealthCheck_DiskFull` (`pkg/host_test.go`, same message) also failed,
+and the verifier saw `TestHealthCheck_DiskFull` fail under `GOMAXPROCS=1`.
 Both start a single-member shard with the default `ElectionRTT` at
-`RTTMillisecond = 1`, which gives a 30ms window. They then call
-`HealthCheck` once and expect `ok`, but under load more than 30ms can pass
-between `StartShard` and that call. Neither has failed without the extra
-load. The fix is the same one: wait for the leader before the assertion, or
-use a longer tick. `pkg/host_test.go` is outside this lane's file map.
+`RTTMillisecond = 1`, which gives a 30ms window. They then called
+`HealthCheck` once and expected `ok`, but under load more than 30ms can pass
+between `StartShard` and that call.
+
+Fixed: both tests now call `waitForLeader` after `StartShard` and before
+`HealthCheck`, so each asserts what it is about (all healthy, disk full)
+and not election timing. The product code and the window are unchanged.
 
 ## Fix (test only)
 
