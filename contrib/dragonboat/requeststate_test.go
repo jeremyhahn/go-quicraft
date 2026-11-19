@@ -15,8 +15,12 @@
 package dragonboat
 
 import (
+	"bytes"
+	"context"
 	"errors"
-	"runtime"
+	"fmt"
+	"runtime/pprof"
+	"strings"
 	"testing"
 	"time"
 
@@ -362,30 +366,22 @@ func TestSysOpState_DoubleReleaseReachesInnerOnce(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSysOpState_ReleaseBeforeCompletion_NoGoroutineLeak(t *testing.T) {
-	runtime.GC()
-	baseline := runtime.NumGoroutine()
-
 	// Create multiple SysOpStates whose inner channels will never
 	// receive a value, then Release them immediately.
 	const count = 50
 	states := make([]*SysOpState, count)
-	for i := range states {
-		pool := quicraft.NewRequestStatePool()
-		inner := pool.Get().(*quicraft.RequestState)
-		states[i] = WrapSysOpState(inner)
-	}
-
-	// Release all before any result is delivered. Release waits for the
-	// wrapper goroutine, so no grace sleep is needed before counting.
+	label := withBridgeLabel(t, func() {
+		for i := range states {
+			pool := quicraft.NewRequestStatePool()
+			inner := pool.Get().(*quicraft.RequestState)
+			states[i] = WrapSysOpState(inner)
+		}
+	})
+	// Release all before any result is delivered.
 	for _, s := range states {
 		s.Release()
 	}
-
-	after := runtime.NumGoroutine()
-	leaked := after - baseline
-	if leaked > 5 {
-		t.Errorf("SysOpState goroutine leak: baseline=%d, after=%d, leaked=%d", baseline, after, leaked)
-	}
+	assertNoBridges(t, label)
 }
 
 func TestSysOpState_DoubleRelease_NoPanic(t *testing.T) {
@@ -401,32 +397,91 @@ func TestSysOpState_DoubleRelease_NoPanic(t *testing.T) {
 
 func TestRequestState_ReleaseBeforeResult_CommittedChannel_NoLeak(t *testing.T) {
 	// Verify the ResultC aggregate bridge goroutine also exits on Release.
-	runtime.GC()
-	baseline := runtime.NumGoroutine()
-
 	const count = 50
 	states := make([]*RequestState, count)
-	for i := range states {
-		pool := quicraft.NewRequestStatePool()
-		inner := pool.Get().(*quicraft.RequestState)
-		states[i] = WrapRequestState(inner, true)
-		// Touch ResultC so the aggregate bridge goroutine is actually
-		// created; it is spawned lazily on first use.
-		if states[i].ResultC() == nil {
-			t.Fatalf("expected non-nil ResultC for state %d", i)
+	label := withBridgeLabel(t, func() {
+		for i := range states {
+			pool := quicraft.NewRequestStatePool()
+			inner := pool.Get().(*quicraft.RequestState)
+			states[i] = WrapRequestState(inner, true)
+			// Touch ResultC so the aggregate bridge goroutine is actually
+			// created; it is spawned lazily on first use.
+			if states[i].ResultC() == nil {
+				t.Fatalf("expected non-nil ResultC for state %d", i)
+			}
 		}
-	}
-
-	// Release waits for its bridges, so the goroutine count is back at the
-	// baseline the moment the loop finishes; no grace sleep needed.
+	})
 	for _, rs := range states {
 		rs.Release()
 	}
+	assertNoBridges(t, label)
+}
 
-	after := runtime.NumGoroutine()
-	leaked := after - baseline
-	if leaked > 5 {
-		t.Errorf("committed channel goroutine leak: baseline=%d, after=%d, leaked=%d", baseline, after, leaked)
+// bridgeFrames name the functions the wrappers run in their own
+// goroutines: the apply bridge, the ResultC aggregate bridge and the
+// SysOpState completion bridge.
+var bridgeFrames = []string{
+	".(*RequestState).makeAdaptedChannel.func",
+	".(*RequestState).ResultC.func",
+	".(*SysOpState).waitForCompletion",
+}
+
+// withBridgeLabel runs f under a pprof label unique to t and returns the
+// label as it appears in a goroutine profile. Every goroutine f starts
+// inherits the label, so countBridges sees only this test's bridges and
+// never those of another host or test in the package.
+func withBridgeLabel(t *testing.T, f func()) string {
+	t.Helper()
+	pprof.Do(context.Background(), pprof.Labels("leaktest", t.Name()), func(context.Context) { f() })
+	return fmt.Sprintf("%q:%q", "leaktest", t.Name())
+}
+
+// countBridges returns the number of live goroutines that carry label and
+// have a bridge function on their stack.
+func countBridges(label string) int {
+	var buf bytes.Buffer
+	if err := pprof.Lookup("goroutine").WriteTo(&buf, 1); err != nil {
+		panic(err)
+	}
+	total := 0
+	// debug=1 groups goroutines with an identical stack and label set into
+	// one record, headed by "<count> @ <pcs>"; records are blank-line
+	// separated.
+	for _, rec := range strings.Split(buf.String(), "\n\n") {
+		if !strings.Contains(rec, label) {
+			continue
+		}
+		bridge := false
+		for _, fn := range bridgeFrames {
+			bridge = bridge || strings.Contains(rec, fn)
+		}
+		if !bridge {
+			continue
+		}
+		for _, line := range strings.Split(rec, "\n") {
+			var n int
+			if _, err := fmt.Sscanf(line, "%d @", &n); err == nil {
+				total += n
+				break
+			}
+		}
+	}
+	return total
+}
+
+// assertNoBridges fails t unless every bridge goroutine carrying label has
+// exited. Release waits for its bridges, but a goroutine runs its deferred
+// wg.Done before it leaves the scheduler, so the check polls briefly.
+func assertNoBridges(t *testing.T, label string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	n := countBridges(label)
+	for n != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		n = countBridges(label)
+	}
+	if n != 0 {
+		t.Errorf("bridge goroutine leak: %d bridge goroutines still alive after Release", n)
 	}
 }
 
