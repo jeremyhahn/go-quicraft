@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
@@ -7852,10 +7853,13 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	}
 	wasPaused := ns.paused.Load()
 	h.engine.ResumeNode(engNode)
-	ns.paused.Store(false)
+	// Restart the window before publishing the shard as unpaused: HealthCheck
+	// does not take the pause gate, so it must never see an unpaused shard
+	// still carrying its pre-pause timestamp (#1175 review round 3).
 	if wasPaused {
 		ns.restartLeaderlessWindow(h.leaderlessNow())
 	}
+	ns.paused.Store(false)
 	ns.pauseGate.unlock()
 	return nil
 }
@@ -10985,8 +10989,15 @@ func (h *Host) leaderlessPastElectionTimeout(ns *nodeState, now int64) bool {
 // 2*ElectionRTT before its election starts; the campaign then has one more
 // election timeout to win (vote round, log persist, leader publication)
 // before it counts as a failed election and the candidate starts another.
+// StartShard only checks that the nominal timeout fits time.Duration, so a
+// tripled window past math.MaxInt64 saturates there instead of wrapping
+// negative (#1175 review round 3).
 func (h *Host) leaderlessGrace(ns *nodeState) time.Duration {
-	return 3 * time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
+	nominal := time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
+	if nominal > math.MaxInt64/3 {
+		return math.MaxInt64
+	}
+	return 3 * nominal
 }
 
 // restartLeaderlessWindow opens a fresh election window for a shard that
