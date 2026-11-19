@@ -6526,6 +6526,9 @@ func TestHealthCheck_AllHealthy(t *testing.T) {
 	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
+	// A leaderless shard past its election window reports not-ready;
+	// wait for the leader so the assertion is not about election timing.
+	waitForLeader(t, h, 1)
 
 	status := h.HealthCheck()
 	if status.Status != "ok" {
@@ -6605,6 +6608,9 @@ func TestHealthCheck_DiskFull(t *testing.T) {
 	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
+	// A leaderless shard past its election window reports not-ready;
+	// wait for the leader so the assertion is about the full disk only.
+	waitForLeader(t, h, 1)
 
 	// Simulate disk full.
 	h.diskFull.Store(true)
