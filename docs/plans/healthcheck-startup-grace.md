@@ -39,6 +39,28 @@ Two -race test binaries were built: one from the unchanged tree and one
 with the fix. Each ran `-test.count=200` of the test with `GOMAXPROCS=1`,
 both at once so that each loaded the other.
 
+- Without extra load, the unchanged test passed all 200 runs. The fixed
+  binary passed `-test.run 'TestHealthCheck_'` 200 times as well.
+- Eight `GOMAXPROCS=1` instances of each binary were then run on the
+  4-CPU lane, with 12 `yes > /dev/null` CPU hogs alongside them.
+  - Every instance of the unchanged test failed, with the CI message at the
+    same line: "round 0: healthy startup reported not-ready:
+    not_ready_shards = [5]", about 0.2s after "shard started".
+  - The fixed test, run on its own, passed all 8 x 40 runs under the
+    same load.
+
+## Same cause, outside this lane's file map
+
+Under the same CPU-hog load, `TestHealthCheck_AllHealthy`
+(`pkg/host_test.go`, `Status = "not-ready", want "ok"`) and
+`TestHealthCheck_DiskFull` (`pkg/host_test.go`, same message) also fail.
+Both start a single-member shard with the default `ElectionRTT` at
+`RTTMillisecond = 1`, which gives a 30ms window. They then call
+`HealthCheck` once and expect `ok`, but under load more than 30ms can pass
+between `StartShard` and that call. Neither has failed without the extra
+load. The fix is the same one: wait for the leader before the assertion, or
+use a longer tick. `pkg/host_test.go` is outside this lane's file map.
+
 ## Fix (test only)
 
 - The test uses a 10ms tick (`RTTMillisecond = 10`, `ElectionRTT = 10`:
