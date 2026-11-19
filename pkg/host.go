@@ -24,6 +24,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	mathrand "math/rand/v2"
 	"os"
 	"path/filepath"
@@ -1669,6 +1670,18 @@ type nodeState struct {
 	// the view to abandon the leader an attempt is in flight to. See
 	// leaderChanged.
 	leaderWake atomic.Pointer[chan struct{}]
+
+	// leaderlessSince is the monotonic time (Host.leaderlessNow, nanoseconds
+	// since a process-local origin) from which the shard has had no known
+	// leader, or 0 while a leader is known. It
+	// is set when the shard starts, kept at its first value while the shard
+	// stays leaderless, and cleared by updateNodeLeader when a leader is
+	// published; ResumeShard restarts it, as the resumed peer starts a fresh
+	// election timeout. HealthCheck reports the host not-ready once a shard
+	// has been leaderless for longer than its election window
+	// (Host.leaderlessGrace, #1175). An atomic, so the leader-update path
+	// takes no lock for it.
+	leaderlessSince atomic.Int64
 
 	health      atomic.Uint32 // stores ShardHealth as uint32
 	nodes       map[uint64]string
@@ -3440,7 +3453,10 @@ var _ engine.Callback = (*hostEngineCallback)(nil)
 // One Host per process. It manages shard lifecycle, proposal routing,
 // read operations, session management, and cluster membership.
 type Host struct {
-	cfg           config.HostConfig
+	cfg config.HostConfig
+	// clock measures the leaderless windows (nodeState.leaderlessSince); nil
+	// is the system clock. Tests swap it to step the wall clock.
+	clock         leaderlessClock
 	logger        *slog.Logger
 	logdb         logdb.LogDB
 	barrier       Barrier
@@ -5508,6 +5524,8 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		pendingSnapshots: make(map[uint64]*RequestState),
 	}
 	ns.health.Store(uint32(ShardHealthy))
+	// A starting shard knows no leader yet: its election window opens now.
+	ns.leaderlessSince.Store(h.leaderlessNow())
 
 	// Seed the host-side applied marker to the recovered index so that
 	// FollowerRead and the OnReadyToRead/OnApplied read-completion gates
@@ -7833,7 +7851,14 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	if !ns.pauseGate.lock(ctx.Done()) {
 		return ctx.Err()
 	}
+	wasPaused := ns.paused.Load()
 	h.engine.ResumeNode(engNode)
+	// Restart the window before publishing the shard as unpaused: HealthCheck
+	// does not take the pause gate, so it must never see an unpaused shard
+	// still carrying its pre-pause timestamp (#1175 review round 3).
+	if wasPaused {
+		ns.restartLeaderlessWindow(h.leaderlessNow())
+	}
 	ns.paused.Store(false)
 	ns.pauseGate.unlock()
 	return nil
@@ -10889,6 +10914,9 @@ func (h *Host) HealthCheck() *HealthStatus {
 	diskOK := h.diskFull == nil || !h.diskFull.Load()
 
 	shards := make([]ShardInfo, 0, clampNonNegative(h.activeNodes.Load()))
+	// Shards leaderless for longer than their election timeout (#1175).
+	var notReady []uint64
+	now := h.leaderlessNow()
 	h.nodes.Range(func(_, value any) bool {
 		ns, ok := value.(*nodeState)
 		if !ok {
@@ -10900,15 +10928,21 @@ func (h *Host) HealthCheck() *HealthStatus {
 				})
 			return true // skip malformed entry
 		}
-		shards = append(shards, *h.buildShardInfo(ns))
+		info := h.buildShardInfo(ns)
+		shards = append(shards, *info)
+		if info.LeaderID == 0 && !info.Paused && h.leaderlessPastElectionTimeout(ns, now) {
+			notReady = append(notReady, ns.shardID)
+		}
 		return true
 	})
+	slices.Sort(notReady)
 
 	status := &HealthStatus{
 		BarrierSealed:      sealed,
 		DiskOK:             diskOK,
 		ShardCount:         len(shards),
 		Shards:             shards,
+		NotReadyShards:     notReady,
 		DiagnosticsDropped: supervise.DiagnosticsDropped(),
 	}
 
@@ -10925,9 +10959,92 @@ func (h *Host) HealthCheck() *HealthStatus {
 				break
 			}
 		}
+		// A shard with no leader past its election timeout commits no
+		// write: the host is not ready. ShardError keeps precedence.
+		if status.Status == "ok" && len(notReady) > 0 {
+			status.Status = "not-ready"
+		}
 	}
 
 	return status
+}
+
+// leaderlessPastElectionTimeout reports whether ns has had no known leader
+// for longer than its election window (leaderlessGrace) as of now (a
+// Host.leaderlessNow reading). A shard inside the window, or one with a known leader,
+// reports false, so a normal election does not flap health.
+func (h *Host) leaderlessPastElectionTimeout(ns *nodeState, now int64) bool {
+	since := ns.leaderlessSince.Load()
+	if since == 0 {
+		return false
+	}
+	return time.Duration(now-since) > h.leaderlessGrace(ns)
+}
+
+// leaderlessGrace is the election window a leaderless shard is allowed
+// before HealthCheck reports it not-ready: 3 * ElectionRTT *
+// RTTMillisecond. Raft draws each follower's election timeout from
+// [ElectionRTT, 2*ElectionRTT) ticks (raft.resetElectionTimeout) and
+// campaigns only once it expires, so a healthy shard may wait up to
+// 2*ElectionRTT before its election starts; the campaign then has one more
+// election timeout to win (vote round, log persist, leader publication)
+// before it counts as a failed election and the candidate starts another.
+// StartShard only checks that the nominal timeout fits time.Duration, so a
+// tripled window past math.MaxInt64 saturates there instead of wrapping
+// negative (#1175 review round 3).
+func (h *Host) leaderlessGrace(ns *nodeState) time.Duration {
+	nominal := time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
+	if nominal > math.MaxInt64/3 {
+		return math.MaxInt64
+	}
+	return 3 * nominal
+}
+
+// restartLeaderlessWindow opens a fresh election window for a shard that
+// is leaderless, as ResumeShard does: a resumed peer starts a new election
+// timeout, so time spent paused must not count against it. A shard with a
+// known leader is left at 0. The CAS loses to a concurrent updateNodeLeader
+// that publishes a leader, so it never stamps a led shard. now is a
+// Host.leaderlessNow reading.
+func (ns *nodeState) restartLeaderlessWindow(now int64) {
+	if since := ns.leaderlessSince.Load(); since != 0 {
+		ns.leaderlessSince.CompareAndSwap(since, now)
+	}
+}
+
+// leaderlessClock is the clock the leaderless windows are measured on.
+type leaderlessClock interface {
+	// wallNanos reads the system wall clock (unix nanoseconds), which an
+	// operator or NTP can step backward or forward.
+	wallNanos() int64
+	// monoNanos reads monotonic nanoseconds since a process-local origin,
+	// which a wall-clock step never moves.
+	monoNanos() int64
+}
+
+// systemClock is the production leaderlessClock.
+type systemClock struct{}
+
+// monoOrigin is the process-local origin of systemClock.monoNanos. It
+// carries Go's monotonic reading, so time.Since(monoOrigin) is monotonic.
+var monoOrigin = time.Now()
+
+func (systemClock) wallNanos() int64 { return time.Now().UnixNano() }
+
+// monoNanos is at least 1, so a reading never collides with the 0 that
+// leaderlessSince stores while a leader is known.
+func (systemClock) monoNanos() int64 { return int64(time.Since(monoOrigin)) + 1 }
+
+// leaderlessNow is the reading leaderlessSince stores and
+// leaderlessPastElectionTimeout compares.
+func (h *Host) leaderlessNow() int64 {
+	var c leaderlessClock = systemClock{}
+	if h.clock != nil {
+		c = h.clock
+	}
+	// Monotonic, so a wall-clock step neither shortens nor lengthens a
+	// window (#1175 review round 2).
+	return c.monoNanos()
 }
 
 // NodeIdentity returns this host's own stable node identity: the value peers
@@ -12629,6 +12746,14 @@ func (h *Host) updateNodeLeader(shardID, leaderID, term uint64) {
 	ns.isLeader.Store(leaderID == ns.replicaID)
 	ns.readReady.Store(false)
 	ns.leaderSeq.Add(1)
+	// Outside the seqlock: no reader pairs it with the triple. A lost
+	// leader opens the window once (CAS keeps the first loss time across
+	// repeated leaderless updates); a known leader closes it.
+	if leaderID == 0 {
+		ns.leaderlessSince.CompareAndSwap(0, h.leaderlessNow())
+	} else {
+		ns.leaderlessSince.Store(0)
+	}
 	ns.signalLeaderChange()
 }
 

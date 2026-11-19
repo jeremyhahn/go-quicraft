@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -207,6 +208,499 @@ func TestHealthCheck_ReportsEveryCallerReachableState(t *testing.T) {
 	}
 }
 
+// notReadyShardsJSON decodes the not_ready_shards list from the JSON
+// encoding of status, the field an operator's probe reads.
+func notReadyShardsJSON(t *testing.T, status *HealthStatus) []uint64 {
+	t.Helper()
+	b, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("json.Marshal(HealthStatus): %v", err)
+	}
+	var got struct {
+		NotReadyShards []uint64 `json:"not_ready_shards"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	return got.NotReadyShards
+}
+
+// TestHealthCheck_NotReadyWhenLeaderlessPastElectionTimeout pins issue
+// #1175: a started shard that has had no known leader for longer than its
+// election timeout cannot commit a write, so the host is not ready, and
+// the status names the shard. A shard inside its election window is left
+// alone so a normal election does not flap health.
+func TestHealthCheck_NotReadyWhenLeaderlessPastElectionTimeout(t *testing.T) {
+	unreachable := map[uint64]string{
+		1: "127.0.0.1:5000",
+		2: "127.0.0.1:5001",
+		3: "127.0.0.1:5002",
+	}
+	newHost := func(t *testing.T) *Host {
+		t.Helper()
+		h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		t.Cleanup(func() { h.Close() })
+		return h
+	}
+
+	t.Run("unreachable peers past the election timeout", func(t *testing.T) {
+		h := newHost(t)
+		cfg := testShardConfig(7, 1)
+		timeout := time.Duration(cfg.ElectionRTT*testHostConfig(t).RTTMillisecond) * time.Millisecond
+		start := time.Now()
+		if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
+			t.Fatalf("StartShard: %v", err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		var status *HealthStatus
+		for {
+			status = h.HealthCheck()
+			if status.Status == "not-ready" || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if status.Status != "not-ready" {
+			t.Fatalf("Status = %q with no quorum reachable, want %q", status.Status, "not-ready")
+		}
+		if since := time.Since(start); since < timeout {
+			t.Errorf("not-ready after %v, before the election timeout %v", since, timeout)
+		}
+		if len(status.Shards) != 1 || status.Shards[0].LeaderID != 0 {
+			t.Fatalf("Shards = %+v, want one leaderless shard", status.Shards)
+		}
+		if got := notReadyShardsJSON(t, status); len(got) != 1 || got[0] != 7 {
+			t.Errorf("not_ready_shards = %v, want [7]", got)
+		}
+	})
+
+	t.Run("healthy single-member shard", func(t *testing.T) {
+		h := newPauseTestHost(t, 3)
+		cfg := testShardConfig(3, 1)
+		// Well past the election timeout: a led shard stays ok.
+		time.Sleep(5 * time.Duration(cfg.ElectionRTT*testHostConfig(t).RTTMillisecond) * time.Millisecond)
+		status := h.HealthCheck()
+		if status.Status != "ok" {
+			t.Errorf("Status = %q, want %q", status.Status, "ok")
+		}
+		if got := notReadyShardsJSON(t, status); len(got) != 0 {
+			t.Errorf("not_ready_shards = %v, want none", got)
+		}
+		checkHealthStatusJSON(t, status)
+	})
+
+	t.Run("leaderless within the election timeout", func(t *testing.T) {
+		h := newHost(t)
+		cfg := testShardConfig(9, 1)
+		// A 10 minute election timeout: the shard is still inside its first
+		// election window for the whole test.
+		cfg.ElectionRTT = 600_000
+		if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
+			t.Fatalf("StartShard: %v", err)
+		}
+		status := h.HealthCheck()
+		if status.Status != "ok" {
+			t.Errorf("Status = %q inside the election timeout, want %q", status.Status, "ok")
+		}
+		if len(status.Shards) != 1 || status.Shards[0].Health != ShardNoLeader {
+			t.Fatalf("Shards = %+v, want one shard with no leader", status.Shards)
+		}
+		if got := notReadyShardsJSON(t, status); len(got) != 0 {
+			t.Errorf("not_ready_shards = %v, want none", got)
+		}
+		checkHealthStatusJSON(t, status)
+	})
+}
+
+// TestHealthCheck_LeaderlessGraceCoversRandomizedElection pins the window
+// to the randomized election timeout: raft campaigns after a timeout drawn
+// from [ElectionRTT, 2*ElectionRTT) ticks and the campaign then has one
+// more election timeout to win, so a shard leaderless for less than
+// 3 * ElectionRTT * RTTMillisecond may still be in a normal first election
+// and must not count as not-ready.
+func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+	cfg := testShardConfig(11, 1)
+	cfg.ElectionRTT = 10
+	ns := &nodeState{shardID: 11, replicaID: 1, cfg: cfg}
+	nominal := time.Duration(cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
+	now := h.leaderlessNow()
+
+	// Past the nominal timeout, and past the largest randomized one, but
+	// inside the campaign that follows it.
+	for _, tenths := range []int64{11, 19, 29} {
+		age := time.Duration(int64(nominal) * tenths / 10)
+		ns.leaderlessSince.Store(now - int64(age))
+		if h.leaderlessPastElectionTimeout(ns, now) {
+			t.Errorf("leaderless for %v (< 3 * %v) reported past the election window", age, nominal)
+		}
+	}
+	// Past the randomized timeout plus a full election round.
+	age := nominal * 31 / 10
+	ns.leaderlessSince.Store(now - int64(age))
+	if !h.leaderlessPastElectionTimeout(ns, now) {
+		t.Errorf("leaderless for %v (> 3 * %v) not reported past the election window", age, nominal)
+	}
+	// A known leader is never past the window.
+	ns.leaderlessSince.Store(0)
+	if h.leaderlessPastElectionTimeout(ns, now) {
+		t.Error("shard with a known leader reported past the election window")
+	}
+}
+
+// TestHealthCheck_HealthyStartupNeverNotReady observes health on every
+// step of a healthy single-member shard's startup, from StartShard until
+// its leader is published: it never reports not-ready on the way.
+func TestHealthCheck_HealthyStartupNeverNotReady(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		// 50ms nominal timeout: the election's fixed costs (log persist,
+		// leader publication, tick scheduling) stay small against it.
+		cfg := testShardConfig(5, 1)
+		cfg.ElectionRTT = 50
+		if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, testCreateFunc, cfg); err != nil {
+			h.Close()
+			t.Fatalf("StartShard: %v", err)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			status := h.HealthCheck()
+			if status.Status == "not-ready" {
+				h.Close()
+				t.Fatalf("round %d: healthy startup reported not-ready: not_ready_shards = %v",
+					round, notReadyShardsJSON(t, status))
+			}
+			if len(status.Shards) == 1 && status.Shards[0].LeaderID != 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				h.Close()
+				t.Fatalf("round %d: no leader elected", round)
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+		h.Close()
+	}
+}
+
+// TestHealthCheck_ResumeRestartsElectionWindow pins that time spent paused
+// does not count against a resumed shard: ResumeShard gives the peer a
+// fresh election timeout, so a shard that was leaderless before a pause
+// longer than its window is not reported not-ready the moment it resumes.
+func TestHealthCheck_ResumeRestartsElectionWindow(t *testing.T) {
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg := testShardConfig(13, 1)
+	// A 500ms nominal timeout (1.5s window) leaves the check after resume
+	// far inside the fresh window, even under the race detector.
+	cfg.ElectionRTT = 500
+	unreachable := map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001", 3: "127.0.0.1:5002"}
+	if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	waitNotReady := func(what string) {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for h.HealthCheck().Status != "not-ready" {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: shard 13 never reported not-ready", what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	waitNotReady("before pause")
+
+	if err := h.PauseShard(ctx, 13); err != nil {
+		t.Fatalf("PauseShard: %v", err)
+	}
+	// Paused for longer than the whole election window.
+	time.Sleep(3*time.Duration(cfg.ElectionRTT*h.cfg.RTTMillisecond)*time.Millisecond + 200*time.Millisecond)
+	if err := h.ResumeShard(ctx, 13); err != nil {
+		t.Fatalf("ResumeShard: %v", err)
+	}
+	status := h.HealthCheck()
+	if status.Status != "ok" {
+		t.Errorf("Status right after resume = %q, want %q (fresh election window)", status.Status, "ok")
+	}
+	if got := notReadyShardsJSON(t, status); len(got) != 0 {
+		t.Errorf("not_ready_shards right after resume = %v, want none", got)
+	}
+	// Still no quorum: once the fresh window passes it is not-ready again.
+	waitNotReady("after resume")
+}
+
+// resumeProbeClock is a steppedClock that, once armed, runs probe on the
+// first reading taken while the shard is unpaused, then disarms. A reading
+// is how ResumeShard stamps the fresh window, so the probe lands exactly
+// in the interleaving a concurrent health probe can hit during a resume.
+type resumeProbeClock struct {
+	steppedClock
+	ns    atomic.Pointer[nodeState]
+	armed atomic.Bool
+	probe func()
+}
+
+func (c *resumeProbeClock) monoNanos() int64 {
+	if ns := c.ns.Load(); ns != nil && !ns.paused.Load() && c.armed.CompareAndSwap(true, false) {
+		c.probe()
+	}
+	return c.steppedClock.monoNanos()
+}
+
+// TestHealthCheck_ResumeNeverExposesExpiredWindow checks that a health
+// probe running concurrently with ResumeShard of a leaderless shard whose
+// window expired before the pause never reports not-ready from the
+// pre-pause timestamp (#1175 review round 3): the fresh window is in place
+// before the shard is published as unpaused.
+func TestHealthCheck_ResumeNeverExposesExpiredWindow(t *testing.T) {
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+	clk := &resumeProbeClock{}
+	clk.mono.Store(int64(time.Hour))
+	h.clock = clk
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg := testShardConfig(23, 1)
+	cfg.ElectionRTT = 10
+	unreachable := map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001", 3: "127.0.0.1:5002"}
+	if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	v, ok := h.nodes.Load(uint64(23))
+	if !ok {
+		t.Fatal("shard 23 not registered")
+	}
+	ns := v.(*nodeState)
+	grace := h.leaderlessGrace(ns)
+	clk.advance(2 * grace)
+	if got := h.HealthCheck().Status; got != "not-ready" {
+		t.Fatalf("leaderless for %v (window %v): Status = %q, want not-ready", 2*grace, grace, got)
+	}
+	if err := h.PauseShard(ctx, 23); err != nil {
+		t.Fatalf("PauseShard: %v", err)
+	}
+	clk.advance(2 * grace)
+
+	var during atomic.Pointer[HealthStatus]
+	clk.probe = func() {
+		// A separate goroutine, as a readiness probe is: ResumeShard holds
+		// the pause gate, which HealthCheck does not take.
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			during.Store(h.HealthCheck())
+		}()
+		<-done
+	}
+	clk.ns.Store(ns)
+	clk.armed.Store(true)
+	if err := h.ResumeShard(ctx, 23); err != nil {
+		t.Fatalf("ResumeShard: %v", err)
+	}
+	clk.armed.Store(false)
+	if s := during.Load(); s != nil && s.Status != "ok" {
+		t.Errorf("HealthCheck during ResumeShard: Status = %q (not_ready_shards %v), want ok: the pre-pause window leaked",
+			s.Status, notReadyShardsJSON(t, s))
+	}
+	if got := h.HealthCheck().Status; got != "ok" {
+		t.Errorf("Status right after resume = %q, want ok (fresh election window)", got)
+	}
+}
+
+// TestHealthCheck_UnrepresentableGraceNeverNotReady checks a configuration
+// whose nominal election timeout fits time.Duration but whose tripled
+// window does not (#1175 review round 3): a freshly started leaderless
+// shard must not report not-ready, and the window saturates rather than
+// wrapping negative.
+func TestHealthCheck_UnrepresentableGraceNeverNotReady(t *testing.T) {
+	hc := testHostConfig(t)
+	hc.RTTMillisecond = 60000
+	h, err := NewHost(hc, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+	clk := &steppedClock{}
+	clk.mono.Store(int64(time.Hour))
+	h.clock = clk
+
+	cfg := testShardConfig(24, 1)
+	cfg.ElectionRTT = 100000000 // nominal 6e18 ns fits; 3x does not
+	unreachable := map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001", 3: "127.0.0.1:5002"}
+	if err := h.StartShard(unreachable, false, testCreateFunc, cfg); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	v, ok := h.nodes.Load(uint64(24))
+	if !ok {
+		t.Fatal("shard 24 not registered")
+	}
+	ns := v.(*nodeState)
+	if grace := h.leaderlessGrace(ns); grace <= 0 {
+		t.Errorf("leaderlessGrace = %v, want a positive (saturated) window", grace)
+	}
+	if got := h.HealthCheck().Status; got != "ok" {
+		t.Errorf("freshly started leaderless shard: Status = %q, want ok", got)
+	}
+	// Past the nominal timeout but inside any representable window.
+	clk.advance(time.Duration(cfg.ElectionRTT*hc.RTTMillisecond)*time.Millisecond + time.Second)
+	if got := h.HealthCheck().Status; got != "ok" {
+		t.Errorf("leaderless just past the nominal timeout: Status = %q, want ok", got)
+	}
+}
+
+// steppedClock is a leaderlessClock whose wall clock a test can step
+// without moving its monotonic clock, as NTP or an operator does.
+type steppedClock struct{ wall, mono atomic.Int64 }
+
+func (c *steppedClock) wallNanos() int64 { return c.wall.Load() }
+func (c *steppedClock) monoNanos() int64 { return c.mono.Load() }
+
+// advance lets d of real time pass: both clocks move.
+func (c *steppedClock) advance(d time.Duration) {
+	c.wall.Add(int64(d))
+	c.mono.Add(int64(d))
+}
+
+// stepWall corrects the wall clock by d: the monotonic clock stays.
+func (c *steppedClock) stepWall(d time.Duration) { c.wall.Add(int64(d)) }
+
+// clockedShard is a leaderless shard registered on a host whose leaderless
+// windows run on a steppedClock.
+type clockedShard struct {
+	h     *Host
+	ns    *nodeState
+	clk   *steppedClock
+	grace time.Duration
+}
+
+func newClockedShard(t *testing.T, shardID uint64) *clockedShard {
+	t.Helper()
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	t.Cleanup(func() { h.Close() })
+	clk := &steppedClock{}
+	clk.wall.Store(time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC).UnixNano())
+	clk.mono.Store(int64(time.Hour))
+	h.clock = clk
+	cfg := testShardConfig(shardID, 1)
+	cfg.ElectionRTT = 10
+	ns := &nodeState{shardID: shardID, replicaID: 1, cfg: cfg}
+	// As StartShard does: a starting shard opens its election window.
+	ns.leaderlessSince.Store(h.leaderlessNow())
+	h.nodes.Store(shardID, ns)
+	// Runs before Close (cleanups are LIFO): Close never sees the bare state.
+	t.Cleanup(func() { h.nodes.Delete(shardID) })
+	return &clockedShard{h: h, ns: ns, clk: clk, grace: h.leaderlessGrace(ns)}
+}
+
+// notReady reports whether HealthCheck reports the host not-ready with
+// the shard listed.
+func (s *clockedShard) notReady(t *testing.T) bool {
+	t.Helper()
+	status := s.h.HealthCheck()
+	got := notReadyShardsJSON(t, status)
+	listed := len(got) == 1 && got[0] == s.ns.shardID
+	if listed != (status.Status == "not-ready") {
+		t.Fatalf("Status = %q with not_ready_shards %v", status.Status, got)
+	}
+	return listed
+}
+
+// TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps covers #1175
+// review round 2: the leaderless window is measured on the monotonic
+// clock, so a wall-clock correction neither makes a not-ready host ok
+// again nor fails readiness inside a normal election.
+func TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps(t *testing.T) {
+	t.Run("backward step keeps an expired window expired", func(t *testing.T) {
+		s := newClockedShard(t, 21)
+		s.clk.advance(2 * s.grace)
+		if !s.notReady(t) {
+			t.Fatalf("leaderless for %v (window %v): want not-ready", 2*s.grace, s.grace)
+		}
+		s.clk.stepWall(-time.Hour)
+		if !s.notReady(t) {
+			t.Error("wall clock stepped back an hour: host reported ready with no leader")
+		}
+	})
+
+	t.Run("forward step does not expire a fresh window", func(t *testing.T) {
+		s := newClockedShard(t, 22)
+		s.clk.stepWall(time.Hour)
+		if s.notReady(t) {
+			t.Error("wall clock stepped forward an hour: not-ready inside the election window")
+		}
+		s.clk.advance(s.grace / 2)
+		if s.notReady(t) {
+			t.Errorf("leaderless for %v (window %v): want ready", s.grace/2, s.grace)
+		}
+		s.clk.advance(s.grace)
+		if !s.notReady(t) {
+			t.Errorf("leaderless for %v (window %v): want not-ready", s.grace*3/2, s.grace)
+		}
+	})
+}
+
+// TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow covers #1175
+// review round 2: a shard that loses its leader long after startup gets a
+// fresh election window from the loss, repeated leaderless updates do not
+// postpone it, and a new leader clears it.
+func TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow(t *testing.T) {
+	s := newClockedShard(t, 23)
+	s.clk.advance(s.grace / 2)
+	s.h.updateNodeLeader(23, 1, 1)
+	if s.notReady(t) {
+		t.Fatal("shard with a leader reported not-ready")
+	}
+	// Far past the startup window, then the leader is lost.
+	s.clk.advance(2 * s.grace)
+	s.h.updateNodeLeader(23, 0, 2)
+	if s.notReady(t) {
+		t.Fatal("leader lost just now: not-ready inside the fresh election window")
+	}
+	half := s.grace / 2
+	s.clk.advance(half)
+	if s.notReady(t) {
+		t.Fatalf("leaderless for %v (window %v): want ready", half, s.grace)
+	}
+	// Another leaderless update (a new term with no winner) keeps the
+	// window at the loss time.
+	s.h.updateNodeLeader(23, 0, 3)
+	s.clk.advance(s.grace - half + time.Millisecond)
+	if !s.notReady(t) {
+		t.Fatalf("leaderless for %v (window %v) across a repeated update: want not-ready",
+			s.grace+time.Millisecond, s.grace)
+	}
+	s.h.updateNodeLeader(23, 1, 3)
+	if s.notReady(t) {
+		t.Error("new leader published: still not-ready")
+	}
+	if since := s.ns.leaderlessSince.Load(); since != 0 {
+		t.Errorf("leaderlessSince = %d with a known leader, want 0", since)
+	}
+}
+
 // checkHealthStatusJSON asserts status marshals with exactly the documented
 // field names and that the encoded values agree with the struct.
 func checkHealthStatusJSON(t *testing.T, status *HealthStatus) {
@@ -222,6 +716,9 @@ func checkHealthStatusJSON(t *testing.T, status *HealthStatus) {
 	want := append([]string(nil), healthStatusJSONKeys...)
 	if len(status.Shards) > 0 {
 		want = append(want, "shards")
+	}
+	if len(status.NotReadyShards) > 0 {
+		want = append(want, "not_ready_shards")
 	}
 	assertKeys(t, "HealthStatus", top, want, nil)
 
