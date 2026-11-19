@@ -1279,7 +1279,7 @@ func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SetSender and SetCallback after Start panics
+// Commit-worker panic recovery
 // ---------------------------------------------------------------------------
 
 // TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch verifies the
