@@ -11465,10 +11465,12 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 // on. A replica whose LogDB snapshot record lies in another replica
 // directory than its bootstrap record's DataDir selects (a replica that
 // snapshotted under one DataDir and was restarted under another by a release
-// before v1.0.0) is refused with *RemoveDataLayoutConflictError
-// (ErrRemoveDataLayoutConflict) before anything is retired, deleted or
-// recorded, rather than report success while a snapshot remains; the error
-// documents the repair.
+// before v1.0.0) is refused with an error matching ErrInvalidOperation that
+// names the shard, replica, bootstrap and snapshot directories, before
+// anything is retired, deleted or recorded, rather than report success while
+// a snapshot remains. To repair, start the replica again under the DataDir
+// its bootstrap record states, take a snapshot, stop it and retry RemoveData;
+// then delete the old snapshot directory, which no record references.
 func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	if h.closed.Load() {
 		return ErrClosed
@@ -11734,7 +11736,7 @@ func (e *removeDataLayoutUnknownError) Is(target error) bool {
 // replica layout is a *removeDataLayoutUnknownError (errors.Is
 // ErrInvalidOperation), and a snapshot record lying in another replica
 // directory than the bootstrap record's DataDir selects is a
-// *RemoveDataLayoutConflictError; both are returned before anything is
+// *removeDataLayoutConflictError; both are returned before anything is
 // retired, deleted or recorded.
 func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, error) {
 	bs, ok, err := h.logdb.GetBootstrap(shardID, replicaID)
@@ -11765,7 +11767,7 @@ func (h *Host) removeDataSnapshotDir(shardID, replicaID uint64) (string, bool, e
 				}
 			}
 			if recorded != dir {
-				return "", false, &RemoveDataLayoutConflictError{
+				return "", false, &removeDataLayoutConflictError{
 					ShardID:      shardID,
 					ReplicaID:    replicaID,
 					BootstrapDir: dir,

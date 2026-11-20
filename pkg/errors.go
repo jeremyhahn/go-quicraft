@@ -1518,11 +1518,12 @@ func (e *ImportDataDirMismatchError) Is(target error) bool {
 	return target == ErrImportDataDirMismatch
 }
 
-// ErrRemoveDataLayoutConflict is the sentinel for
-// *RemoveDataLayoutConflictError.
-var ErrRemoveDataLayoutConflict = errors.New("quicraft: RemoveData refused: the replica's snapshot record and bootstrap record name different snapshot trees")
+// errRemoveDataLayoutConflict is the sentinel for
+// *removeDataLayoutConflictError. It is unexported: callers match the
+// refusal with errors.Is(err, ErrInvalidOperation).
+var errRemoveDataLayoutConflict = errors.New("quicraft: RemoveData refused: the replica's snapshot record and bootstrap record name different snapshot trees")
 
-// RemoveDataLayoutConflictError is returned by Host.RemoveData when the
+// removeDataLayoutConflictError is returned by Host.RemoveData when the
 // replica's bootstrap record states a DataDir whose snapshot directory is not
 // the one its LogDB snapshot record points into. Releases before v1.0.0 let a
 // replica that had snapshotted under one DataDir restart under another: the
@@ -1534,8 +1535,8 @@ var ErrRemoveDataLayoutConflict = errors.New("quicraft: RemoveData refused: the 
 // To repair, start the replica again under the DataDir its bootstrap record
 // states, take a snapshot so the snapshot record names that tree, stop it and
 // retry RemoveData; then delete SnapshotDir, which no record references any
-// more. It also matches ErrInvalidOperation under errors.Is.
-type RemoveDataLayoutConflictError struct {
+// more. It matches ErrInvalidOperation under errors.Is.
+type removeDataLayoutConflictError struct {
 	// ShardID is the shard whose data removal was refused.
 	ShardID uint64
 	// ReplicaID is the replica whose data removal was refused.
@@ -1549,17 +1550,17 @@ type RemoveDataLayoutConflictError struct {
 }
 
 // Error returns a human-readable description of the conflict.
-func (e *RemoveDataLayoutConflictError) Error() string {
+func (e *removeDataLayoutConflictError) Error() string {
 	return fmt.Sprintf(
 		"quicraft: RemoveData of shard %d replica %d: bootstrap record selects snapshot directory %q but the snapshot record lies in %q",
 		e.ShardID, e.ReplicaID, e.BootstrapDir, e.SnapshotDir,
 	)
 }
 
-// Is reports whether target is ErrRemoveDataLayoutConflict or
+// Is reports whether target is errRemoveDataLayoutConflict or
 // ErrInvalidOperation.
-func (e *RemoveDataLayoutConflictError) Is(target error) bool {
-	return target == ErrRemoveDataLayoutConflict || target == ErrInvalidOperation
+func (e *removeDataLayoutConflictError) Is(target error) bool {
+	return target == errRemoveDataLayoutConflict || target == ErrInvalidOperation
 }
 
 // ImportSnapshotOutOfDateError is returned by Host.ImportSnapshot when the
