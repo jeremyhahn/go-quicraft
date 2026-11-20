@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# apk-index-sum: v1 (ci-template v1.29, Company Agent ruling 220(5),
-# 2026-10-27) — one checksum of the Alpine package indexes the devcontainer
-# build resolves against.
+# apk-index-sum: v3 (ci-template v1.29) — one
+# checksum of the Alpine package indexes the devcontainer build resolves
+# against.
 #
 # Each ci.yml job that names the integration image puts the printed value in
 # APK_INDEX_SUM, which the integration image's content tag hashes (`make -s
@@ -23,7 +23,16 @@
 #   replaces the FROM parse for a Dockerfile it cannot read.
 #
 # Prints a sha256 over each base image's name, repository list and index
-# checksums, or `none` when no base image has apk. Exits 1 when a base image
+# checksums, or `none` when no base image has apk. v2: a pool build fetches its
+# packages through the LAN apk mirror (DEVCACHE_APK_MIRROR), so the
+# probe fetches the indexes through it too, with the build's own apk-mirror.sh
+# from beside this script; unset, as on a hosted runner, the
+# indexes come from the public repositories. apk names each index file after
+# its repository URL, so only the files' contents are hashed: a current mirror
+# gives the public sum, a stale one another, and the image is rebuilt once the
+# mirror catches up. v3: the script reaches the probe on its stdin, never as a
+# bind mount: a pool's Docker daemon runs outside the job container and
+# resolves a -v source on its own host, where the checkout does not exist. Exits 1 when a base image
 # cannot be resolved, run or updated: a missing index is never a pass, since
 # the image build then cannot resolve its packages either.
 set -euo pipefail
@@ -86,24 +95,31 @@ fi
 
 [ "${#bases[@]}" -gt 0 ] || fail "no base image found in $dockerfile"
 
-# Runs in the base image. A base without apk contributes `none`.
+mirror_script=$(cd "$(dirname "$0")" && pwd)/apk-mirror.sh
+[ -f "$mirror_script" ] || fail "no apk-mirror.sh beside $0"
+
+# Runs in the base image, with apk-mirror.sh on its stdin. A base without apk
+# contributes `none`. The repository list is printed before apk-mirror
+# rewrites it (and restores it).
 # shellcheck disable=SC2016 # expanded by the container's shell
 probe='command -v apk >/dev/null 2>&1 || { echo none; exit 0; }
-apk update --quiet >/dev/null || exit 3
+cat > /tmp/apk-mirror || exit 5
+sed "s/[[:space:]]*$//" /etc/apk/repositories | grep -v "^#" | grep . | sort
+sh /tmp/apk-mirror update --quiet >/dev/null || exit 3
 set -- /var/cache/apk/APKINDEX.*.tar.gz
 [ -f "$1" ] || exit 4
-sed "s/[[:space:]]*$//" /etc/apk/repositories | grep -v "^#" | grep . | sort
-sha256sum "$@" | sed "s|  .*/| |" | sort'
+sha256sum "$@" | cut -d" " -f1 | sort'
 
 sum_input=
 alpine=0
 for img in "${bases[@]}"; do
-  out=$(docker run --rm --pull missing --network bridge --user 0 \
+  out=$(docker run -i --rm --pull missing --network bridge --user 0 \
           --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
-          --security-opt no-new-privileges --entrypoint /bin/sh "$img" -c "$probe") ||
+          --security-opt no-new-privileges -e APK_MIRROR="${DEVCACHE_APK_MIRROR:-}" \
+          --entrypoint /bin/sh "$img" -c "$probe" < "$mirror_script") ||
     fail "reading the Alpine package index of $img failed (exit $?)"
   [ "$out" = none ] || alpine=1
-  echo "apk-index-sum: $img: $(printf '%s\n' "$out" | grep -c 'APKINDEX' || true) index file(s)" >&2
+  echo "apk-index-sum: $img: $(printf '%s\n' "$out" | grep -cE '^[0-9a-f]{64}$' || true) index file(s)" >&2
   sum_input+="$img"$'\n'"$out"$'\n'
 done
 
