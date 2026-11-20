@@ -113,8 +113,11 @@ func TestHost_CloseJoinsRemoveData(t *testing.T) {
 		if err != nil {
 			t.Fatalf("held RemoveData: %v", err)
 		}
-	default:
-		t.Fatal("Close returned before the held RemoveData finished")
+	case <-time.After(10 * time.Second):
+		// Close already waited for the held removal (checked above); the
+		// goroutine sends its result only after RemoveData returns, so the
+		// receive is bounded rather than immediate.
+		t.Fatal("held RemoveData never delivered its result after Close returned")
 	}
 	intent := removeDataIntentFile(c.cfgs[f].NodeHostDir, removeDataShard, fid)
 	if _, err := os.Stat(intent); !errors.Is(err, os.ErrNotExist) {
