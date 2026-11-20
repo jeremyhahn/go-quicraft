@@ -181,9 +181,6 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// workflowsDir is the directory every workflow file lives in.
-var workflowsDir = filepath.Join(repoRoot, ".github", "workflows")
-
 func readWorkflow(t *testing.T, name string) []byte {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(workflowsDir, name))
