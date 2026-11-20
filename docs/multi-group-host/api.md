@@ -1141,9 +1141,14 @@ replica with an error matching `ErrInvalidOperation` that names the shard,
 replica, bootstrap and snapshot directories, before anything is retired, deleted or recorded,
 rather than report success while a snapshot remains. To repair, start the
 replica under the `DataDir` its bootstrap record states (the error's
-`BootstrapDir` lies under it), take a snapshot so the snapshot record names that
-tree, stop it and retry `RemoveData`; then delete the error's `SnapshotDir`,
-which no record references any more.
+`BootstrapDir` lies under it) and make sure a new entry has been committed and
+applied on it: for example propose a no-op or any write to the shard and wait
+for this replica to apply it. A snapshot request on a replica whose applied
+index has not advanced past its latest snapshot takes nothing and returns index
+0, so the snapshot record would still name the old tree. Then request a
+snapshot and confirm it reports an index greater than the one the old record
+held; only then stop the replica and retry `RemoveData`. Finally delete the
+error's `SnapshotDir`, which no record references any more.
 
 ### Replica management
 

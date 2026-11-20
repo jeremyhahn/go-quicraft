@@ -11482,8 +11482,13 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 // names the shard, replica, bootstrap and snapshot directories, before
 // anything is retired, deleted or recorded, rather than report success while
 // a snapshot remains. To repair, start the replica again under the DataDir
-// its bootstrap record states, take a snapshot, stop it and retry RemoveData;
-// then delete the old snapshot directory, which no record references.
+// its bootstrap record states, make sure a new entry has been committed and
+// applied on it (for example propose a no-op or any write to the shard and
+// wait for this replica to apply it), then request a snapshot and confirm it
+// reports an index greater than the one the old snapshot record held (an
+// index of 0 means nothing was taken, and the record still names the old
+// tree); only then stop it and retry RemoveData. Then delete the old snapshot
+// directory, which no record references.
 func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	// Admit the call into removeDataWG under admitMu: Close sets h.closed and
 	// then takes admitMu.Lock, so every call admitted before that barrier is

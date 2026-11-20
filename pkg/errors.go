@@ -1537,9 +1537,14 @@ var errRemoveDataLayoutConflict = errors.New("quicraft: RemoveData refused: the 
 // so RemoveData refuses before anything is retired, deleted or recorded.
 //
 // To repair, start the replica again under the DataDir its bootstrap record
-// states, take a snapshot so the snapshot record names that tree, stop it and
-// retry RemoveData; then delete SnapshotDir, which no record references any
-// more. It matches ErrInvalidOperation under errors.Is.
+// states and make sure a new entry has been committed and applied on it (for
+// example propose a no-op or any write to the shard and wait for this replica
+// to apply it): a snapshot request on a replica whose applied index has not
+// advanced past its latest snapshot takes nothing and returns index 0, which
+// leaves the snapshot record in the old tree. Then request a snapshot and
+// confirm it reports an index greater than the one the old record held; only
+// then stop the replica and retry RemoveData. Finally delete SnapshotDir,
+// which no record references any more. It matches ErrInvalidOperation under errors.Is.
 type removeDataLayoutConflictError struct {
 	// ShardID is the shard whose data removal was refused.
 	ShardID uint64
