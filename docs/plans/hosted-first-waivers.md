@@ -13,9 +13,8 @@ reason:
   job (`review`) in code-review.yml.
 
 A `runs-on` expression is refused even with a waiver, because it can pick a
-self-hosted label. No ci.yml or release.yml job carries a waiver. A job whose
-`runs-on` names `release` (ci.yml `publish-images`, off in this repo) is
-exempt: the release rule governs it.
+self-hosted label. No ci.yml or release.yml job carries a waiver, and no job
+is exempt for naming the `release` runner.
 
 ## Jobs kept off ubuntu-latest
 
@@ -27,6 +26,7 @@ exempt: the release rule governs it.
 code-review.yml's `scope` and `gate` jobs move from a server-conditional
 expression (which could pick `bigdisk`) to `runs-on: ubuntu-latest`, as in the
 code-review template's v5.12.4.
+ci.yml's `publish-images` drops its Gitea-only `release` arm for `runs-on: ubuntu-latest`; its `if:` still keeps it off on github.com (go-quicbaas #2587).
 
 ## The test
 

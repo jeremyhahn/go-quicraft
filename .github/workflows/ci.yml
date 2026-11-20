@@ -897,9 +897,9 @@ jobs:
     # #503: no release runner serves this repository, so the job is off. A
     # literal `if: false` fails actionlint (constant condition), so it is
     # gated on the CI_PUBLISH_IMAGES repository variable, unset here, ANDed
-    # with the template's condition. The server-conditional runs-on is the
-    # form the actionlint template (v7) requires for the release label.
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'release' }}
+    # with the template's condition. The job runs on the hosted runner, and
+    # its `if:` keeps it off on github.com.
+    runs-on: ubuntu-latest
     if: ${{ vars.CI_PUBLISH_IMAGES == 'true' && github.server_url != 'https://github.com' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # A job with no `needs` goes straight to a runner, which is what
     # evaluates its `if`; with no release runner it would stay queued and
