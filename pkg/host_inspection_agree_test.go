@@ -79,13 +79,50 @@ func waitInspectionQuiescent(t *testing.T, h *Host, shardID uint64) inspectionSa
 	for time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
 		cur := takeInspectionSample(t, h, shardID)
-		if cur == prev {
+		if sameQuiescentSample(prev, cur) {
 			return cur
 		}
 		prev = cur
 	}
 	t.Fatalf("shard %d did not become quiescent: last sample %+v", shardID, prev)
 	return inspectionSample{}
+}
+
+// sameQuiescentSample reports whether two consecutive samples show a
+// quiescent shard.
+func sameQuiescentSample(a, b inspectionSample) bool {
+	return a == b
+}
+
+// TestSameQuiescentSample_IgnoresTickCounters: the diag State carries the
+// heartbeat and election tick counters, which move every tick on a live
+// shard, so two samples of an idle shard differ in them forever. Quiescence
+// is the applied index and the published views holding still; a sample that
+// differs only in those counters is quiescent, one whose index moved is not.
+func TestSameQuiescentSample_IgnoresTickCounters(t *testing.T) {
+	base := inspectionSample{
+		logRangeLast: 7, getRangeLast: 7, nodeStateLast: 7, nodeStateTerm: 2,
+		diag:     RaftStateDiag{Term: 2, Committed: 7, Processed: 7, LastIndex: 7, State: "leader(hb=1 et=4)"},
+		leaderID: 1, leaderTerm: 2, leaderOK: true,
+		readyLeaderID: 1, readyTerm: 2, ready: true,
+		appliedIndex: 7, hashSupported: true,
+	}
+	ticked := base
+	ticked.diag.State = "leader(hb=0 et=5)"
+	if !sameQuiescentSample(base, ticked) {
+		t.Fatalf("samples differing only in the tick counters are not quiescent: %q vs %q",
+			base.diag.State, ticked.diag.State)
+	}
+	follower := base
+	follower.diag.State = "follower(et=7)"
+	if sameQuiescentSample(base, follower) {
+		t.Fatal("a role change was taken for quiescence")
+	}
+	moved := ticked
+	moved.appliedIndex = 8
+	if sameQuiescentSample(base, moved) {
+		t.Fatal("a moved applied index was taken for quiescence")
+	}
 }
 
 // assertInspectionAgree checks that one quiescent sample of every view
