@@ -4,7 +4,7 @@ go 1.27.4
 
 require (
 	github.com/jeremyhahn/dragonboat/v4 v4.0.1
-	github.com/jeremyhahn/go-quicraft/test/performance v0.0.0
+	github.com/jeremyhahn/go-quicraft/test/performance v0.24.3-alpha
 )
 
 require (
@@ -41,7 +41,7 @@ require (
 	// klauspost/compress, which Pebble uses for sstable zstd, follows the
 	// parent's prometheus/client_golang. Re-run the profiles when it moves
 	// rather than compare across the change.
-	github.com/jeremyhahn/go-quicraft v0.0.0 // indirect
+	github.com/jeremyhahn/go-quicraft v0.24.3-alpha // indirect
 	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
