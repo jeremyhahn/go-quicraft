@@ -72,28 +72,40 @@ func TestAwaitResult_SweeperExpiryKeepsDeadlineExceeded(t *testing.T) {
 // wrappers (awaitResult and withDeadlineCause) add the context cause.
 func TestRequestStateResult_TimeoutHasNoContextCause(t *testing.T) {
 	pool := NewRequestStatePool()
-	cases := []struct {
-		name     string
-		complete bool
-	}{
-		{"expired deadline", false},
-		{"swept ErrTimeout", true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rs := newRequestState(pool, 1, time.Now().Add(-time.Millisecond), false)
-			defer rs.Release()
-			if tc.complete {
-				rs.complete(RequestResult{Err: ErrTimeout})
-			}
+	t.Run("expired deadline", func(t *testing.T) {
+		rs := newRequestState(pool, 1, time.Now().Add(-time.Millisecond), false)
+		defer rs.Release()
+		_, err := rs.Result()
+		assertTimeoutWithoutContextCause(t, err)
+	})
+	t.Run("swept ErrTimeout", func(t *testing.T) {
+		// An unexpired deadline makes Result wait on completedC, so this
+		// case reads the result the sweeper delivered, not the
+		// expired-deadline shortcut.
+		rs := newRequestState(pool, 1, time.Now().Add(time.Hour), false)
+		defer rs.Release()
+		rs.complete(RequestResult{Err: ErrTimeout})
+		errC := make(chan error, 1)
+		go func() {
 			_, err := rs.Result()
-			if !errors.Is(err, ErrTimeout) {
-				t.Fatalf("Result() err = %v, want ErrTimeout", err)
-			}
-			if errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("Result() err = %v matches context.DeadlineExceeded; only the synchronous wrappers add it", err)
-			}
-		})
+			errC <- err
+		}()
+		select {
+		case err := <-errC:
+			assertTimeoutWithoutContextCause(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("Result() did not return the completed ErrTimeout within 5s")
+		}
+	})
+}
+
+func assertTimeoutWithoutContextCause(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("Result() err = %v, want ErrTimeout", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Result() err = %v matches context.DeadlineExceeded; only the synchronous wrappers add it", err)
 	}
 }
 
