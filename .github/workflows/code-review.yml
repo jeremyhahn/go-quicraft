@@ -720,8 +720,17 @@ on:
   # route, and starts the opencode review when `agent:opencode` is added.
   # v5.10.12 (2026-11-12, Tenant Agent m2586 (1)): `ready_for_review` too, so
   # a draft marked ready is reviewed without a push or a reopen.
+  # LOCAL (security): P1 "A completed no-review gate remains green after the
+  # PR is retargeted". `edited` too: a retarget emits only `edited`, and the
+  # required gate must re-run against the new base (the event's base sha and
+  # ref are the new base's). On `edited` the review jobs skip (no PR-head
+  # code is checked out or run) and only the gate runs, on every `edited`,
+  # a title or body edit included: a skipped job's check run counts as
+  # success for a required check, so a gate skipped on a title edit would
+  # turn a red gate green. Its verdict on a title edit is the same live
+  # recomputation, so it only repeats the standing one.
   pull_request_target:
-    types: [opened, reopened, synchronize, labeled, ready_for_review]
+    types: [opened, reopened, synchronize, labeled, ready_for_review, edited]
 
 # v5.9.4: no workflow-level concurrency. A group there takes every run the
 # events create, a run whose job the `if:` skips among them, and a newer
@@ -1224,8 +1233,10 @@ jobs:
     # re-run replays this payload, as it did before.
     # v5.10.6 (Tenant Agent m2331 (2)): a head in this repository only; a
     # fork's head never takes a codex runner.
+    # LOCAL (security): never on `edited` (only the gate job runs on it).
     if: >-
-      github.event.pull_request.state == 'open'
+      github.event.action != 'edited'
+      && github.event.pull_request.state == 'open'
       && contains(github.event.pull_request.labels.*.name, 'code-review')
       && contains(github.event.pull_request.labels.*.name, 'task:ready')
       && !contains(github.event.pull_request.labels.*.name, 'task:in-progress')
@@ -1236,7 +1247,10 @@ jobs:
       || startsWith(github.event.label.name, 'agent:')
       || startsWith(github.event.label.name, 'model:')
       || startsWith(github.event.label.name, 'effort:'))
-      && needs.scope.outputs.skip != 'true'
+    # LOCAL (security): no `needs.scope.outputs.skip` test here. The gate
+    # requires a review of every workflow file (REVIEW_REQUIRED_PATHS), so a
+    # change InfoSec's guard clears still takes a round (Codex P1 on #1170;
+    # test/buildgates TestReviewRunsWhereTheGateNeedsIt).
     # v5.9.7: on GitHub the group is the PR, its head sha and the run id, so
     # it never holds a pending run that a newer one could replace: a replaced
     # run is cancelled with no `Code Review (codex)` check-run, and a ruleset
@@ -1262,6 +1276,9 @@ jobs:
       agent: ${{ steps.guard.outputs.agent }}
       model: ${{ steps.guard.outputs.model }}
       effort: ${{ steps.guard.outputs.effort }}
+      # LOCAL (security): P1 "Preserve the live-base guard in the new required
+      # gate": the gate reads skip=retargeted from the guard.
+      skip: ${{ steps.guard.outputs.skip }}
     # One budget inside 75 minutes (JOB_BUDGET in lib.sh; v5.12.5: each lock
     # waits for what that budget has left, not a fixed 300 s and 600 s): the
     # refresh runs at most 130 s, codex runs at most
@@ -1607,6 +1624,12 @@ jobs:
           twin_waited=0
           if [ "$FORGE" = github ]; then
             printf 'Authorization: Bearer %s\n' "$ACTIONS_TOKEN" > "$WORK/gha.hdr"
+            # LOCAL (security): P1 "Keep the Actions credential header until
+            # approval-reuse checks finish". The reuse branch below reads the
+            # review history through gha() after the twin wait, so the header
+            # is removed when this step exits (every exit 0, exit 1 and die),
+            # not after the wait.
+            trap 'rm -f "$WORK/gha.hdr"' EXIT
             gha() { # GET path with the job's own token -> body; dies unless 2xx
               local code
               code=$(curl -sS --proto '=https' --max-time 60 --retry 3 --retry-all-errors \
@@ -1688,7 +1711,8 @@ jobs:
               sleep 30
               twin_waited=$((twin_waited + 30))
             done
-            rm -f "$WORK/gha.hdr"
+            # LOCAL (security): the header stays for the reuse branch's gha()
+            # calls; the EXIT trap set where it is written removes it.
             # A twin that waited ends on the first twin's verdict, before any
             # route or label case: its approval ends skip=reviewed, its
             # rejection fails, and only no verdict asks for a re-run. Too little
@@ -1805,7 +1829,95 @@ jobs:
               again=1
               echo "${EVENT_LABEL} was just added; reviewing $EVENT_SHA again under it." ;;
             *)
+              # LOCAL (security): P1 "Bind reused approvals to the change
+              # reviewed against the target base" and P1 "Approval reuse omits
+              # the context half of the review key". The standing approval is
+              # reused only when its verdict marker's patch= and ctx= are the
+              # review key of the change into this event's base, computed as
+              # below (both empty only where no diff can be read: Gitea, or a
+              # diff over GitHub's limit, which the gate then refuses); a
+              # marker with no ctx= does not match. Otherwise (a retarget to
+              # another base) codex reviews again. P1 "Re-adding code-review
+              # cannot recover the gate after a failed re-review": nor is it
+              # reused when a `Codex review` job of this workflow's runs for
+              # this PR on the head (the gate's history check) failed, was
+              # cancelled or timed out after the approval was submitted; codex
+              # then reviews again, never carried, and posts a fresh verdict.
+              reuse=""
               if jq -e 'any(.[]; .state == "APPROVED")' <<<"$mine" >/dev/null; then
+                reuse_patch="" reuse_ctx=""
+                if pr_diff "$WORK/reuse.diff"; then
+                  reuse_patch=$(git patch-id --verbatim < "$WORK/reuse.diff") || reuse_patch=""
+                  reuse_patch=${reuse_patch%% *}
+                  reuse_ctx=$(awk '/^diff --git / { f = $NF; next }
+                                   /^@@ / { print f "\t" $0 }' "$WORK/reuse.diff" |
+                              sha1sum | awk '{print $1}') || reuse_ctx=""
+                fi
+                [[ $reuse_patch =~ ^[0-9a-f]{40}$ ]] || reuse_patch=""
+                [[ $reuse_ctx =~ ^[0-9a-f]{40}$ ]] && [ -n "$reuse_patch" ] || reuse_ctx=""
+                rm -f "$WORK/reuse.diff"
+                approval=$(jq -c '
+                    [ .[] | select(.state == "APPROVED") ] | sort_by(.submitted_at // "", .id) | last
+                    | ((.body // "") | (capture("<!-- codex-review:verdict head=[0-9a-f]{40}(?<a>[^>]*)-->") | .a) // "") as $a
+                    | { at: (.submitted_at // ""),
+                        patch: (($a | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // ""),
+                        ctx: (($a | capture("\\bctx=(?<c>[0-9a-f]{40})\\b") | .c) // "") }' <<<"$mine") ||
+                  die "could not read $REVIEWER's approval of $EVENT_SHA"
+                approved_patch=$(jq -r '.patch' <<<"$approval")
+                approved_ctx=$(jq -r '.ctx' <<<"$approval")
+                approved_at=$(jq -r '.at' <<<"$approval")
+                if [ "$approved_patch" != "$reuse_patch" ] || [ "$approved_ctx" != "$reuse_ctx" ]; then
+                  echo "$REVIEWER approved $EVENT_SHA as patch '${approved_patch:-none}' ctx '${approved_ctx:-none}'; the change into $BASE_REF is patch '${reuse_patch:-unknown}' ctx '${reuse_ctx:-unknown}'. Reviewing it again."
+                elif [ "$FORGE" = github ]; then
+                  [ -n "$approved_at" ] || die "$REVIEWER's approval of $EVENT_SHA has no submission time"
+                  rr_ids=() rr_page=1
+                  while :; do
+                    rr_got=$(gha "/actions/workflows/$wf/runs?head_sha=$EVENT_SHA&per_page=100&page=$rr_page") ||
+                      die "could not list this workflow's runs on $EVENT_SHA"
+                    rr_got=$(jq -r --argjson n "$PR_NUM" --argjson me "$GITHUB_RUN_ID" --arg t "Code Review: PR #$PR_NUM into " '
+                        if (.workflow_runs | type) == "array" then .workflow_runs else error("not a list") end
+                        | if length == 0 then "end" else
+                            (.[] | select(.id != $me and (any(.pull_requests[]?; .number == $n)
+                                                          or ((.display_title // "") | startswith($t))))
+                                 | .id), "more" end' <<<"$rr_got") ||
+                      die "could not read this workflow's runs on $EVENT_SHA"
+                    [ "${rr_got##*$'\n'}" = more ] || break
+                    for rr_id in $rr_got; do [ "$rr_id" = more ] || rr_ids+=("$rr_id"); done
+                    rr_page=$((rr_page + 1))
+                  done
+                  rr_jobs='[]'
+                  for rr_id in "${rr_ids[@]}"; do
+                    [[ $rr_id =~ ^[0-9]+$ ]] || die "this workflow's runs on $EVENT_SHA name a run '$rr_id'"
+                    rr_page=1
+                    while :; do
+                      rr_got=$(gha "/actions/runs/$rr_id/jobs?filter=all&per_page=100&page=$rr_page") ||
+                        die "could not read the jobs of run $rr_id"
+                      rr_got=$(jq -c 'if (.jobs | type) == "array" then .jobs else error("not a list") end' <<<"$rr_got") ||
+                        die "could not read the jobs of run $rr_id"
+                      [ "$(jq 'length' <<<"$rr_got")" -gt 0 ] || break
+                      rr_jobs=$(printf '%s\n%s\n' "$rr_jobs" "$rr_got" | jq -cs '.[0] + .[1]') ||
+                        die "could not join the jobs of run $rr_id"
+                      rr_page=$((rr_page + 1))
+                    done
+                  done
+                  rr_failed=$(jq -r --arg t "$approved_at" '
+                      [ .[] | select(.name == "Codex review" and .status == "completed"
+                                     and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")
+                                     and (.completed_at // "~") > $t) ]
+                      | sort_by(.completed_at // "", .id) | last
+                      | if . != null then "\(.conclusion) at \(.completed_at // "an unknown time")" else empty end' <<<"$rr_jobs") ||
+                    die "could not read the review jobs on $EVENT_SHA"
+                  if [ -n "$rr_failed" ]; then
+                    again=1
+                    echo "A Codex review of $EVENT_SHA requested after $REVIEWER's approval ended $rr_failed; reviewing it again."
+                  else
+                    reuse=1
+                  fi
+                else
+                  reuse=1
+                fi
+              fi
+              if [ -n "$reuse" ]; then
                 # v5.10.8: not past `needs-owner`.
                 owner_hold "$labels"
                 echo "$REVIEWER already approved $EVENT_SHA. Not reviewing it twice."
@@ -3135,7 +3247,8 @@ jobs:
     name: Code Review (opencode)
     needs: review
     # Gitea only (v5.9.0): its token check and permission read are Gitea's.
-    if: needs.review.outputs.agent == 'opencode' && github.server_url != 'https://github.com'
+    # LOCAL (security): never on `edited` (only the gate job runs on it).
+    if: github.event.action != 'edited' && needs.review.outputs.agent == 'opencode' && github.server_url != 'https://github.com'
     runs-on: qwen  # CUSTOMIZE: the opencode review host's runner label # self-hosted: hardware: the GPU host that serves the model
     # 3300 s >= 1530 + 630 (the two runs, kill grace included) + 2 x 130 (the
     # debug calls) + 880 s for checkout, guard, prepare, post and cleanup.
@@ -3570,6 +3683,9 @@ jobs:
   gate:
     name: Code Review (codex)
     needs: [scope, review]
+    # LOCAL (security): `always()` on `edited` too, never skipped (see `on:`):
+    # on a retarget the event's BASE_SHA/BASE_REF are the new base's, so the
+    # exemption and the approval's patch=/ctx= are recomputed against it.
     if: always()
     # v5.12.2: one gate per head. A newer event's gate cancels an older one,
     # which no longer holds a hosted runner in the twin wait; the newest
@@ -3604,6 +3720,14 @@ jobs:
       SCOPE_SKIP: ${{ needs.scope.outputs.skip }}
       SCOPE_RESULT: ${{ needs.scope.result }}
       REVIEW_RESULT: ${{ needs.review.result }}
+      # LOCAL (security): P1 "Exclude the signing trust registry from the
+      # no-review exemption". These paths are never exempt, under .github/ or
+      # .gitea/ alike: the signer registry ci.yml's Signatures job trusts,
+      # and the workflow definitions, this gate's own included.
+      REVIEW_REQUIRED_PATHS: '^(\.github/(.+/)?allowed_signers|\.github/workflows/.+|\.gitea/workflows/.+)$'
+      # LOCAL (security): P1 "Preserve the live-base guard in the new required
+      # gate". The review job's result and its guard's skip= reason.
+      REVIEW_SKIP: ${{ needs.review.outputs.skip }}
     steps:
       - name: Require a Codex approval of the head, or a no-review change
         run: |
@@ -3629,9 +3753,17 @@ jobs:
             local page=1 all='[]' got n size=limit=50
             [ "$FORGE" != github ] || size=per_page=100
             while :; do
-              got=$(get "$1&$size&page=$page")
+              # LOCAL (security): P1 "Fail closed when fetching a review-history
+              # page fails". Every caller runs get_all under `|| fail`, which
+              # turns errexit off inside it, so a page that get failed would
+              # end the loop with the pages read so far (an approval passing
+              # over a newer rejection on the unread page). Each page fetch
+              # fails the step, and a count that is not a number fails it
+              # rather than ending the loop, as api_all does.
+              got=$(get "$1&$size&page=$page") || fail "cannot read page $page of $1"
               n=$(jq 'if type == "array" then length else error("not a list") end' <<<"$got") ||
                 fail "GET $1 did not answer a list"
+              [[ $n =~ ^[0-9]+$ ]] || fail "GET $1 page $page gave no count"
               [ "$n" -gt 0 ] || break
               all=$(printf '%s\n%s\n' "$all" "$got" | jq -cs '.[0] + .[1]') || fail "cannot join the pages of $1"
               page=$((page + 1))
@@ -3660,21 +3792,54 @@ jobs:
             names=$(jq -r '.[] | .filename, (.previous_filename // empty)' <<<"$files")
             off_docs=$(grep -Evc "$DOCS_PATHS" <<<"$names" || true)
             off_list=$(grep -Evc "$NO_REVIEW_PATHS" <<<"$names" || true)
+            # LOCAL (security): P1 "Exclude the signing trust registry from the
+            # no-review exemption": a REVIEW_REQUIRED_PATHS file needs review.
+            guarded=$(grep -Ec "$REVIEW_REQUIRED_PATHS" <<<"$names" || true)
             # v5.12.1 (ruling 443): CI config is exempt only inside InfoSec's
-            # guard, which the scope job ran on this event.
+            # guard, which the scope job ran on this event, and (LOCAL) never
+            # for a REVIEW_REQUIRED_PATHS file.
             if [ "$off_docs" = 0 ]; then
               exempt=1
-            elif [ "$off_list" = 0 ] && [ "$SCOPE_SKIP" = true ]; then
+            elif [ "$off_list" = 0 ] && [ "$guarded" = 0 ] && [ "$SCOPE_SKIP" = true ]; then
               exempt=1
             elif [ "$off_list" = 0 ]; then
-              echo "The change is docs and CI config, but InfoSec's guard did not clear it (scope skip=${SCOPE_SKIP:-none}), so it needs a Codex approval (ruling 443, v5.12.1)."
+              echo "The change is docs and CI config, but InfoSec's guard did not clear it (scope skip=${SCOPE_SKIP:-none}) or it touches a REVIEW_REQUIRED_PATHS file, so it needs a Codex approval (ruling 443, v5.12.1)."
             fi
           fi
+          # LOCAL (security): P1 "Preserve the live-base guard in the new
+          # required gate" and P1 "The no-review exit bypasses the live-base
+          # guard". Checked before the exemption is granted, since the change
+          # above is classified against the event's base, and again after
+          # the twin read: nothing passes past a review job its guard ended red
+          # on a retarget, nor unless the live PR still has the event's base
+          # ref and head. P1 "Allow ordinary base-branch advancement without
+          # failing the gate": the live base sha follows the target branch's
+          # tip, so only the base ref is compared; $BASE_SHA stays the pin of
+          # the classified diff.
+          live_base_guard() {
+            if [ "$REVIEW_RESULT" = failure ] && [ "$REVIEW_SKIP" = retargeted ]; then
+              fail "the review job ended red: PR $PR_NUM was retargeted off $BASE_REF"
+            fi
+            [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || fail "the event names no base commit"
+            local pin
+            pin=$(get "/pulls/$PR_NUM" | jq -r '"\(.base.ref // "") \(.head.sha // "")"') ||
+              fail "cannot read PR $PR_NUM"
+            [ "$pin" = "$BASE_REF $EVENT_SHA" ] ||
+              fail "PR $PR_NUM is now at base/head '$pin', not the event's '$BASE_REF $EVENT_SHA'; push a new head or re-add code-review"
+          }
+          live_base_guard
           if [ "$exempt" = 1 ]; then
             echo "All $n changed files are on the no-review list (docs, or CI config inside InfoSec's guard); no review is required."
             exit 0
           fi
           echo "$n changed files; at least one is code, so $REVIEWER must approve $EVENT_SHA."
+          # LOCAL (security): P1 "Preserve failed re-reviews in the required
+          # gate". A review this run requested (the guard's again path) that
+          # failed or was cancelled never lets an older approval of the head
+          # pass; a skipped review job (no review requested) still reads it.
+          case "$REVIEW_RESULT" in
+            failure|cancelled) fail "the Codex review job of this run ended $REVIEW_RESULT; re-add code-review" ;;
+          esac
 
           # v5.12.6 (ruling 1046): NO TWIN WAIT. A twin run (same head, same
           # run-name) whose `Codex review` job is queued or in progress posts
@@ -3703,6 +3868,116 @@ jobs:
                 [ "$rc" = 1 ] || twin=${twin:-$id}
               done
             done
+          fi
+
+          # LOCAL (security): the live-base guard again, read after the twin
+          # read (v5.12.6 has no twin wait; this keeps the live check last).
+          live_base_guard
+
+          # LOCAL (security): P1 "Preserve failed re-reviews across subsequent
+          # workflow runs". A review an earlier run requested (an effort or
+          # model label on an approved head) that failed, was cancelled or
+          # timed out keeps the older approval from passing in every later
+          # run: one whose review job was skipped or ended at a benign guard
+          # exit, and after the twin read above. Every completed `Codex review`
+          # job of this workflow's runs for this PR on the head counts, not
+          # only the latest, since a later benign exit (skip=reviewed) ends
+          # success without reviewing. A new approval submitted after the
+          # failure clears it. P1 "Bind reused approvals to the change
+          # reviewed against the target base": the approval counts only when
+          # its verdict marker's patch= is the patch id of the change into the
+          # event's base ($BASE_SHA...$EVENT_SHA, `git patch-id --verbatim`,
+          # the review job's key), so an approval into another base (a
+          # retarget) never passes for a different change. GitHub only: Gitea
+          # keys reviews by head and is retired for this repository.
+          if [ "$FORGE" = github ]; then
+            approval=$(get_all "/pulls/$PR_NUM/reviews?" | jq -c --arg u "$REVIEWER" --arg s "$EVENT_SHA" '
+                [ .[] | (if .state == "CHANGES_REQUESTED" then .state = "REQUEST_CHANGES" else . end)
+                      | select(.user.login == $u and .commit_id == $s and (.dismissed | not)
+                               and (.state == "APPROVED" or .state == "REQUEST_CHANGES")) ]
+                | sort_by(.submitted_at // "", .id) | last
+                | if . != null and .state == "APPROVED" then
+                    ((.body // "") | (capture("<!-- codex-review:verdict head=[0-9a-f]{40}(?<a>[^>]*)-->") | .a) // "") as $a
+                    | { at: (.submitted_at // "~"),
+                        patch: (($a | capture("\\bpatch=(?<p>[0-9a-f]{40})\\b") | .p) // ""),
+                        ctx: (($a | capture("\\bctx=(?<c>[0-9a-f]{40})\\b") | .c) // "") }
+                  else empty end') ||
+              fail "cannot read the reviews of PR $PR_NUM"
+            if [ -n "$approval" ]; then
+              approved_at=$(jq -r '.at' <<<"$approval")
+              approved_patch=$(jq -r '.patch' <<<"$approval")
+              [ "$approved_at" != "~" ] || fail "the approval of $EVENT_SHA has no submission time"
+              # P1 "Bind reused approvals ...": the patch of the change now.
+              [[ $BASE_SHA =~ ^[0-9a-f]{40}$ ]] || fail "the event names no base commit"
+              code=$(curl -sS --proto '=http,https' --max-time 60 --retry 3 --retry-all-errors \
+                       -o gate-pr.diff -w '%{http_code}' -H "Authorization: token $GH_API_TOKEN" \
+                       -H 'Accept: application/vnd.github.diff' -H 'X-GitHub-Api-Version: 2022-11-28' \
+                       "$REPO_API/compare/$BASE_SHA...$EVENT_SHA") ||
+                fail "cannot reach $REPO_API/compare/$BASE_SHA...$EVENT_SHA"
+              case "$code" in 2??) ;; *) fail "GET the diff $BASE_SHA...$EVENT_SHA answered HTTP $code" ;; esac
+              [ -s gate-pr.diff ] || fail "the diff $BASE_SHA...$EVENT_SHA is empty"
+              patch=$(git patch-id --verbatim < gate-pr.diff) || fail "cannot compute the patch id of $BASE_SHA...$EVENT_SHA"
+              patch=${patch%% *}
+              [[ $patch =~ ^[0-9a-f]{40}$ ]] || fail "no patch id for the diff $BASE_SHA...$EVENT_SHA"
+              # P1 "Approval reuse omits the context half of the review key":
+              # git patch-id leaves out the whole `@@` line, so the same edits
+              # at other lines or in other functions keep it. ctx= is the
+              # review job's hunk_ctx: the sha1 of one "<path><TAB><@@ line>"
+              # line per hunk, in diff order. A marker with no ctx= fails.
+              ctx=$(awk '/^diff --git / { f = $NF; next }
+                         /^@@ / { print f "\t" $0 }' gate-pr.diff |
+                    sha1sum | awk '{print $1}') || fail "cannot compute the hunk context of $BASE_SHA...$EVENT_SHA"
+              [[ $ctx =~ ^[0-9a-f]{40}$ ]] || fail "no hunk context for the diff $BASE_SHA...$EVENT_SHA"
+              approved_ctx=$(jq -r '.ctx' <<<"$approval")
+              [ "$approved_patch" = "$patch" ] && [ "$approved_ctx" = "$ctx" ] ||
+                fail "the approval of $EVENT_SHA is of patch '${approved_patch:-none}' ctx '${approved_ctx:-none}', not patch $patch ctx $ctx, the change into $BASE_REF ($BASE_SHA...$EVENT_SHA); re-add code-review"
+              # P1 "Scope historical failed review jobs to the same pull
+              # request" and P1 "Grant the gate token permission to read check
+              # runs": the history is read through the Actions API this job
+              # may read (actions: read), from this workflow's runs ($wf, read
+              # by the twin read above) on the head that belong to this PR,
+              # by its pull_requests or by its run-name, the PR number the
+              # twin read matches; a run of another PR with the same head is
+              # not this PR's.
+              [[ ${wf:-} =~ ^[0-9]+$ ]] || fail "cannot read this run's workflow"
+              ids=() page=1
+              while :; do
+                got=$(get "/actions/workflows/$wf/runs?head_sha=$EVENT_SHA&per_page=100&page=$page" |
+                      jq -r --argjson n "$PR_NUM" --argjson me "$GITHUB_RUN_ID" --arg t "Code Review: PR #$PR_NUM into " '
+                          if (.workflow_runs | type) == "array" then .workflow_runs else error("not a list") end
+                          | if length == 0 then "end" else
+                              (.[] | select(.id != $me and (any(.pull_requests[]?; .number == $n)
+                                                            or ((.display_title // "") | startswith($t))))
+                                   | .id), "more" end') ||
+                  fail "cannot list this workflow's runs on $EVENT_SHA"
+                [ "${got##*$'\n'}" = more ] || break
+                for id in $got; do [ "$id" = more ] || ids+=("$id"); done
+                page=$((page + 1))
+              done
+              jobs='[]'
+              for id in "${ids[@]}"; do
+                [[ $id =~ ^[0-9]+$ ]] || fail "this workflow's runs on $EVENT_SHA list no run id"
+                page=1
+                while :; do
+                  got=$(get "/actions/runs/$id/jobs?filter=all&per_page=100&page=$page" |
+                        jq -c 'if (.jobs | type) == "array" then .jobs else error("not a list") end') ||
+                    fail "cannot read the jobs of run $id"
+                  [ "$(jq 'length' <<<"$got")" -gt 0 ] || break
+                  jobs=$(printf '%s\n%s\n' "$jobs" "$got" | jq -cs '.[0] + .[1]') ||
+                    fail "cannot join the jobs of run $id"
+                  page=$((page + 1))
+                done
+              done
+              failed=$(jq -r --arg t "$approved_at" '
+                  [ .[] | select(.name == "Codex review" and .status == "completed"
+                                 and (.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out")
+                                 and (.completed_at // "~") > $t) ]
+                  | sort_by(.completed_at // "", .id) | last
+                  | if . != null then "\(.conclusion) at \(.completed_at // "an unknown time")" else empty end' <<<"$jobs") ||
+                fail "cannot read the review jobs on $EVENT_SHA"
+              [ -z "$failed" ] ||
+                fail "a Codex review of $EVENT_SHA requested after its approval ended $failed; re-add code-review"
+            fi
           fi
 
           # (b) The reviewer's latest standing verdict on this head. PENDING,
