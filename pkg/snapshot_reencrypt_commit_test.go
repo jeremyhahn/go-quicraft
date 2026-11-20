@@ -35,7 +35,7 @@ func TestReencryptSnapshotFile_DirFsyncFailureReturnsEpoch(t *testing.T) {
 	writeDurableFile(t, cfs, dstPath, encryptToBytes(t, dstBarrier, []byte("stale")))
 
 	cfs.failOnce(opDirSync, "dst", errInjected)
-	epoch, err := reencryptSnapshotFile(cfs, srcPath, dstPath,
+	epoch, size, err := reencryptSnapshotFileSized(cfs, srcPath, dstPath,
 		testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
 	if err == nil {
 		t.Fatal("a directory fsync failure must be reported, not swallowed")
@@ -53,6 +53,12 @@ func TestReencryptSnapshotFile_DirFsyncFailureReturnsEpoch(t *testing.T) {
 	stored, ok := cfs.liveBytes(dstPath)
 	if !ok {
 		t.Fatalf("%s is missing after the post-rename fsync failure", dstPath)
+	}
+	// The recovery procedure records the returned size, and StartShard
+	// rejects a wrong one: it must be the committed destination's length.
+	if size != uint64(len(stored)) {
+		t.Fatalf("returned size = %d, want the committed destination's %d bytes",
+			size, len(stored))
 	}
 	var out bytes.Buffer
 	if _, decErr := decryptSnapshotFrames(dstBarrier, testSnapShardID, testSnapReplicaID,
@@ -285,7 +291,7 @@ func TestReencryptSnapshotFile_RestampFaults(t *testing.T) {
 			writeDurableFile(t, cfs, filepath.Join(root, "src", "snapshot.meta"),
 				reencryptTestSourceMeta(srcData))
 
-			epoch, err := reencryptSnapshotFile(tc.inject(cfs), srcPath, dstPath,
+			epoch, size, err := reencryptSnapshotFileSized(tc.inject(cfs), srcPath, dstPath,
 				testSnapShardID, testSnapReplicaID, testSnapIndex, srcBarrier, dstBarrier)
 			if !errors.Is(err, tc.cause) {
 				t.Fatalf("err = %v, want the injected cause %v", err, tc.cause)
@@ -294,8 +300,9 @@ func TestReencryptSnapshotFile_RestampFaults(t *testing.T) {
 			isNotDurable := errors.As(err, &notDurable)
 
 			if !tc.committed {
-				if epoch != 0 {
-					t.Fatalf("epoch = %d for a failure before the commit, want 0", epoch)
+				if epoch != 0 || size != 0 {
+					t.Fatalf("epoch = %d size = %d for a failure before the commit, want 0, 0",
+						epoch, size)
 				}
 				if isNotDurable {
 					t.Fatalf("a failure before the commit reported %v as committed", err)
@@ -310,6 +317,10 @@ func TestReencryptSnapshotFile_RestampFaults(t *testing.T) {
 				t.Fatal("a failure after the data rename returned epoch 0; the caller " +
 					"records no epoch and the next DEK purge orphans the artifact")
 			}
+			if size == 0 {
+				t.Fatal("a failure after the data rename returned size 0; recovery " +
+					"records it and StartShard rejects the committed destination")
+			}
 			if !isNotDurable {
 				t.Fatalf("err = %v (%T), want a *SnapshotCommittedNotDurableError", err, err)
 			}
@@ -322,6 +333,12 @@ func TestReencryptSnapshotFile_RestampFaults(t *testing.T) {
 				stored, ok := cfs.liveBytes(dstPath)
 				if !ok {
 					t.Fatalf("%s is missing although the data rename committed", dstPath)
+				}
+				// The recovery procedure records the returned size, and
+				// StartShard rejects a wrong one.
+				if size != uint64(len(stored)) {
+					t.Fatalf("returned size = %d, want the committed destination's %d bytes",
+						size, len(stored))
 				}
 				var out bytes.Buffer
 				if _, decErr := decryptSnapshotFrames(dstBarrier, testSnapShardID,
