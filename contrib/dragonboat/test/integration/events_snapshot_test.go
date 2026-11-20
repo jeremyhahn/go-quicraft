@@ -305,7 +305,7 @@ func TestIntegration_DB_SnapshotEvents_RecoveredOnLaggingReplica(t *testing.T) {
 	defer cluster.close()
 
 	trackers := cluster.startShardWithConfig(1, func(shardID, replicaID uint64) dbConfig.Config {
-		return dbTestShardConfigWithSnapshot(shardID, replicaID, 10, 5)
+		return dbTestShardConfigWithSnapshot(shardID, replicaID, 0, 5)
 	})
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
@@ -330,7 +330,9 @@ func TestIntegration_DB_SnapshotEvents_RecoveredOnLaggingReplica(t *testing.T) {
 	cluster.addReplicaToLeader(t, 1, newReplicaID, newHost.RaftAddress(), newHost.NodeIdentity(),
 		membership.ConfigChangeID, membershipTimeout)
 	createFn, _ := dbKVCreateFunc()
-	cfg := dbTestShardConfigWithSnapshot(1, newReplicaID, 10, 5)
+	// SnapshotEntries 0: no automatic save may capture the applied index
+	// before the explicit request, which would then return index 0.
+	cfg := dbTestShardConfigWithSnapshot(1, newReplicaID, 0, 5)
 	cfg.MemberIdentities = cluster.identities()
 	if err := newHost.StartReplica(nil, true, createFn, cfg); err != nil {
 		t.Fatalf("StartReplica on the 4th host failed: %v", err)
