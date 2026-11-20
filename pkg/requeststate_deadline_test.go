@@ -65,6 +65,38 @@ func TestAwaitResult_SweeperExpiryKeepsDeadlineExceeded(t *testing.T) {
 	}
 }
 
+// TestRequestStateResult_TimeoutHasNoContextCause pins the asynchronous half
+// of the ErrTimeout contract: RequestState.Result has no caller context, so a
+// timeout it reports, whether its own deadline expiry or a swept result,
+// matches ErrTimeout but not context.DeadlineExceeded. Only the synchronous
+// wrappers (awaitResult and withDeadlineCause) add the context cause.
+func TestRequestStateResult_TimeoutHasNoContextCause(t *testing.T) {
+	pool := NewRequestStatePool()
+	cases := []struct {
+		name     string
+		complete bool
+	}{
+		{"expired deadline", false},
+		{"swept ErrTimeout", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rs := newRequestState(pool, 1, time.Now().Add(-time.Millisecond), false)
+			defer rs.Release()
+			if tc.complete {
+				rs.complete(RequestResult{Err: ErrTimeout})
+			}
+			_, err := rs.Result()
+			if !errors.Is(err, ErrTimeout) {
+				t.Fatalf("Result() err = %v, want ErrTimeout", err)
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("Result() err = %v matches context.DeadlineExceeded; only the synchronous wrappers add it", err)
+			}
+		})
+	}
+}
+
 // TestAwaitResult_ExpiredContextEitherBranch: with the request swept and
 // the caller's context expired, both select branches are ready; whichever
 // wins, the error matches ErrTimeout and context.DeadlineExceeded.
