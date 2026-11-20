@@ -21,14 +21,14 @@
 # image (image job) read the module proxy and advisory databases, so they
 # could fail a PR or turn main red with no change to the tree (main run
 # 44098214691 went red on make security). They leave this workflow on every
-# event: deps-check's full gate already runs in deps-bump.yml (ruling 640),
+# event: deps-check's full gate already runs in scans.yml's bump job (ruling 640),
 # and make security and trivy image run in .github/workflows/scans.yml, on a
 # schedule and on workflow_dispatch on main. `make gosec` reads only the tree
 # and now runs in the lint job on every event but a docs-only PR.
 # Ruling 640 (ci-template v1.39 deltas, adopted 2026-11-15): the lint job's
 # `Base commit for deps-check (ruling 640)` step passes DEPS_CHECK_BASE to
 # make deps-check (the shared depscheck v1.0.0 in scripts/depscheck), and a
-# workflow_dispatch on ci/deps-bump is not refused: deps-bump.yml dispatches
+# workflow_dispatch on ci/deps-bump is not refused: scans.yml's bump dispatches
 # this workflow there, because the PR it opens starts no pull_request run.
 # v1.35.1 (2026-11-11, CA m2557, Codex findings on go-luks2 #444 and
 # xkey-android #129): the Signatures job fetches a named base that is not in
@@ -1629,7 +1629,7 @@ jobs:
       # v1.42 (ruling 742 (1)): `Base commit for deps-check (ruling 640)` and
       # `make deps-check` left this job. deps-check reads the module proxy and
       # the vulnerability database, so its answer changes with no change to
-      # the tree; deps-bump.yml runs its full gate on a schedule (ruling 640).
+      # the tree; scans.yml's bump runs its full gate on a schedule (ruling 640).
 
       - name: Tear down
         if: always()

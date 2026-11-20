@@ -1500,7 +1500,7 @@ modverify:
 # the PR base or the push's before) a lag fails only on a go.mod line the
 # change adds or bumps; -vuln fails a vulnerable version of a go.mod
 # requirement. deps-bump moves every failing requirement to latest; the
-# daily deps-bump.yml PR carries it.
+# daily bump PR from scans.yml carries it.
 DEPS_CHECK_MODULES ?= . contrib/dragonboat test/performance test/performance/dragonboat test/performance/etcd test/performance/quicraft
 
 deps-check:
