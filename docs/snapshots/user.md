@@ -166,8 +166,8 @@ the hook's return values:
 ```go
 snapFn := func(shardID, replicaID uint64, snap logdb.Snapshot) (uint64, uint64, error) {
     rel, err := filepath.Rel(srcNodeDir, snap.Filepath)
-    if err != nil {
-        return 0, 0, err
+    if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+        return 0, 0, fmt.Errorf("snapshot %s is outside %s", snap.Filepath, srcNodeDir)
     }
     return quicraft.ReencryptSnapshotFile(
         filepath.Join(snap.Filepath, "snapshot.dat"),
@@ -176,6 +176,10 @@ snapFn := func(shardID, replicaID uint64, snap logdb.Snapshot) (uint64, uint64, 
 }
 count, err := waldb.ReencryptSized(srcWAL, srcBarrier, dstWAL, dstBarrier, snapFn)
 ```
+
+When `Config.DataDir` keeps snapshots outside the node directory, the hook
+above refuses them; stage and swap that snapshot tree separately, with its own
+source and destination roots.
 
 Handle this case specifically:
 
