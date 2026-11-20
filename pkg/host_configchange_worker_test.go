@@ -70,7 +70,7 @@ var workerAddKinds = []workerAddKind{
 // membership change (an observer add) after the Host's checks have passed and
 // before its entry reaches the leader's worker: the window the Host's early
 // check cannot close.
-func interleaveConfigChange(t *testing.T, h *Host, ctx context.Context) *bool {
+func interleaveConfigChange(ctx context.Context, t *testing.T, h *Host) *bool {
 	t.Helper()
 	fired := new(bool)
 	testHookBeforeConfigChangeDeliver = func(proto.ConfigChange) {
@@ -148,7 +148,7 @@ func TestRequestAdd_WorkerRefusesStaleIndex(t *testing.T) {
 					opts = append(opts, WithBoundConfigChangeIndex())
 				}
 
-				fired := interleaveConfigChange(t, h, ctx)
+				fired := interleaveConfigChange(ctx, t, h)
 				err := kind.add(ctx, h, 50, "127.0.0.1:6050", idx, opts...)
 				if !*fired {
 					t.Fatal("the interleaving hook never ran")
@@ -178,7 +178,7 @@ func TestRequestAdd_UnboundZeroIndexUnchecked(t *testing.T) {
 	h := startSingleVoterShard(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	fired := interleaveConfigChange(t, h, ctx)
+	fired := interleaveConfigChange(ctx, t, h)
 	if err := h.SyncRequestAddObserver(ctx, 1, 50, "127.0.0.1:6050", 0); err != nil {
 		t.Fatalf("unbound SyncRequestAddObserver at 0: %v", err)
 	}

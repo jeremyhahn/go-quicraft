@@ -937,8 +937,6 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
-// validateAddNode checks whether adding a full voting member would succeed
-// without mutating the membership. Returns the same errors as handleAddNode.
 // ErrStaleConfigChange is returned by the add validators when a bound change
 // (a non-zero ConfigChangeID, or ConfigChangeID 0 with
 // MustMatchConfigChangeID set) names a configuration other than the current
@@ -978,6 +976,8 @@ func (e *StaleConfigChangeError) Is(target error) bool {
 	return target == ErrStaleConfigChange
 }
 
+// validateAddNode checks whether adding a full voting member would succeed
+// without mutating the membership. Returns the same errors as handleAddNode.
 func validateAddNode(m *membership, cc proto.ConfigChange) error {
 	if err := checkConfigChangeBound(m, cc); err != nil {
 		return err

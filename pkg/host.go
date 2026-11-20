@@ -11134,7 +11134,14 @@ func (h *Host) ReloadMTLS(mtls *config.MTLSConfig) error {
 // RequestAddNode proposes adding a replica to the shard via a Raft
 // config change. The configChangeIndex should be obtained from
 // SyncGetShardMembership().ConfigChangeID to ensure ordered config
-// changes. Pass 0 to skip the ordering check.
+// changes. A non-zero index is checked twice: early by the Host, and again
+// by the leader's worker immediately before the change enters the log, so a
+// change that commits between the two is refused with
+// *StaleConfigChangeError (errors.Is ErrStaleConfigChange) and nothing is
+// appended. Pass 0 to skip the ordering check, or 0 with
+// WithBoundConfigChangeIndex to bind the add to the initial configuration.
+// The same applies to RequestAddObserver, RequestAddWitness and their
+// WithIdentity and Sync forms.
 //
 // It commits NO node identity for the replica. On a host with a transport that
 // is refused with ErrMemberIdentityRequired unless the configuration already
@@ -11321,7 +11328,9 @@ func (h *Host) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, r
 // RequestAddObserver requests adding a non-voting observer to a shard.
 // Observers receive log entries but do not participate in quorum.
 // The configChangeIndex should be obtained from
-// SyncGetShardMembership().ConfigChangeID. It commits no identity, which a
+// SyncGetShardMembership().ConfigChangeID and is checked as for
+// RequestAddNode (Host and leader worker; 0 is bound only with
+// WithBoundConfigChangeIndex). It commits no identity, which a
 // host with a transport refuses as RequestAddNode does; use
 // RequestAddObserverWithIdentity there.
 func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
@@ -11351,7 +11360,9 @@ func (h *Host) RequestAddObserverWithIdentity(ctx context.Context, shardID, repl
 // RequestAddWitness requests adding a voting witness to a shard.
 // Witnesses participate in quorum but do not store a state machine.
 // The configChangeIndex should be obtained from
-// SyncGetShardMembership().ConfigChangeID. It commits no identity, which a
+// SyncGetShardMembership().ConfigChangeID and is checked as for
+// RequestAddNode (Host and leader worker; 0 is bound only with
+// WithBoundConfigChangeIndex). It commits no identity, which a
 // host with a transport refuses as RequestAddNode does; use
 // RequestAddWitnessWithIdentity there.
 func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
