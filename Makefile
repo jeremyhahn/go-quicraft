@@ -1104,7 +1104,7 @@ ci: fmt no-mutants check-tool-versions vet lint lint-gates security build test
 .PHONY: check-tool-versions
 check-tool-versions: check-lint-toolchain
 	@pins=$$(git grep -hoE 'golangci-lint(@|.* )v[0-9]+\.[0-9]+\.[0-9]+' -- \
-		.github .devcontainer Makefile | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u); \
+		.github build/docker/devcontainer Makefile | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u); \
 	count=$$(printf '%s\n' "$$pins" | grep -c . || true); \
 	if [ "$$count" -lt 1 ]; then \
 		echo "FAIL: found no golangci-lint version pins at all."; \
@@ -1114,7 +1114,7 @@ check-tool-versions: check-lint-toolchain
 	if [ "$$pins" != "$(GOLANGCI_VERSION)" ]; then \
 		echo "FAIL: golangci-lint pins disagree with GOLANGCI_VERSION=$(GOLANGCI_VERSION):"; \
 		git grep -nE 'golangci-lint(@|.* )v[0-9]+\.[0-9]+\.[0-9]+' -- \
-			.github .devcontainer Makefile; \
+			.github build/docker/devcontainer Makefile; \
 		echo ""; \
 		echo "Every literal pin must equal GOLANGCI_VERSION. A developer or a"; \
 		echo "container linting on a different version gates on a different rule"; \
