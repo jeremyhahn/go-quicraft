@@ -1,4 +1,4 @@
-# code-review-template: v5.12.3 -- the code review in Gitea or GitHub CI for a pull request
+# code-review-template: v5.12.4 -- the code review in Gitea or GitHub CI for a pull request
 # that carries `code-review` and `task:ready`, routed by its labels through
 # route-labels (labels.md §2). Codex on the `codex` runner reviews every such
 # PR; `agent:opencode` adds an advisory COMMENT review by the opencode job on
@@ -28,6 +28,19 @@
 #   COORDINATOR_TURNS         the codex rounds the project coordinator has
 #                             on a `needs-coordinator` PR after the two-round
 #                             stop (v5.9.8, Tenant Agent m2185); default 3
+#
+# HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
+# waiver on its runs-on line that names its category and a reason:
+# `# self-hosted: hardware: <reason>` (the job needs specific hardware), or
+# `# self-hosted: oversize: <reason>` (it needs more than a standard runner's
+# 4 vCPU, 16 GB memory, about 45 GB disk or 6 hours). `credential:` is
+# accepted only for the Codex review job below. test/buildgates holds the rule.
+#
+# v5.12.4 (2026-11-20): the two self-hosted review jobs name their reason's
+# category for ci.yml's runner check: the opencode review runs on the GPU
+# host (`hardware:`), and the Codex review on the one runner that holds the
+# reviewer token (`credential:`). The scope and gate jobs run on
+# ubuntu-latest. Nothing else changes.
 #
 # v5.12.3 (2026-11-17, Tenant Agent; Codex's P1 on go-xkms #2251): THE SCOPE
 # JOB IS NOT CANCELLED. v5.12.2 gave it a per-head group with
@@ -759,7 +772,7 @@ jobs:
     # v5.12.3: no concurrency group. Cancelling an older run's scope job
     # skipped that run's requested review (v5.12.2), so each event's guard
     # runs to the end; it is a short API-only job.
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     # The guard's python runs at most 240 s (its timeout -k 10 240).
     timeout-minutes: 10
     permissions:
@@ -1236,7 +1249,7 @@ jobs:
     concurrency:
       group: ${{ format('code-review-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
       cancel-in-progress: false
-    runs-on: codex  # lab-string-ok: the public label of the Codex review runner, read by the review tier only
+    runs-on: codex  # lab-string-ok: the public label of the Codex review runner, read by the review tier only  # self-hosted: credential: the reviewer token is mounted on this runner alone
     # The route, for the opencode job.
     outputs:
       agent: ${{ steps.guard.outputs.agent }}
@@ -3192,7 +3205,7 @@ jobs:
     # Gitea only (v5.9.0): its token check and permission read are Gitea's.
     # LOCAL (security): never on `edited` (only the gate job runs on it).
     if: github.event.action != 'edited' && needs.review.outputs.agent == 'opencode' && github.server_url != 'https://github.com'
-    runs-on: qwen  # CUSTOMIZE: the opencode review host's runner label
+    runs-on: qwen  # CUSTOMIZE: the opencode review host's runner label  # self-hosted: hardware: the GPU host that serves the model
     # 3300 s >= 1530 + 630 (the two runs, kill grace included) + 2 x 130 (the
     # debug calls) + 880 s for checkout, guard, prepare, post and cleanup.
     timeout-minutes: 55
@@ -3635,7 +3648,7 @@ jobs:
     concurrency:
       group: ${{ format('code-review-gate-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
       cancel-in-progress: true
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 80
     permissions:
       contents: read

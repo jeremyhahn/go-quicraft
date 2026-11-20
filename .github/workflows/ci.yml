@@ -1,4 +1,12 @@
 # ci-template: v1.35.1 + v1.42 hermetic gate (customized)
+# HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
+# waiver on its runs-on line that names its category and a reason:
+# `# self-hosted: hardware: <reason>` (the job needs specific hardware), or
+# `# self-hosted: oversize: <reason>` (it needs more than a standard runner's
+# 4 vCPU, 16 GB memory, about 45 GB disk or 6 hours). No ci.yml job carries a
+# waiver today; `credential:` is accepted only for code-review.yml's Codex
+# review, and publish-images keeps its release form under the release rule.
+# test/buildgates/ci_runners_test.go holds the rule.
 # v1.42 hermetic gate only (owner ruling 742 (1), Tenant Agent rulings 754 and
 # the hermetic-gate rollout order): the CI Gate's outcome depends only on the
 # tree under test. `make deps-check` (lint job), `make security` (gosec,
@@ -889,9 +897,9 @@ jobs:
     # #503: no release runner serves this repository, so the job is off. A
     # literal `if: false` fails actionlint (constant condition), so it is
     # gated on the CI_PUBLISH_IMAGES repository variable, unset here, ANDed
-    # with the template's condition. The server-conditional runs-on is the
-    # form the actionlint template (v7) requires for the release label.
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'release' }}
+    # with the template's condition. The job runs on the hosted runner, and
+    # its `if:` keeps it off on github.com.
+    runs-on: ubuntu-latest
     if: ${{ vars.CI_PUBLISH_IMAGES == 'true' && github.server_url != 'https://github.com' && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     # A job with no `needs` goes straight to a runner, which is what
     # evaluates its `if`; with no release runner it would stay queued and
