@@ -892,6 +892,51 @@ func TestSnapshotPool_WriteSnapshotMetadata_InvalidDir(t *testing.T) {
 	}
 }
 
+// TestWriteSnapshotMetaFile_RewriteReplacesRecord pins that rewriting a
+// snapshot.meta over a longer earlier one leaves exactly the new record: a
+// stale tail would make readSnapshotEpoch classify the directory
+// unevaluable, which suppresses DEK purging for the barrier.
+func TestWriteSnapshotMetaFile_RewriteReplacesRecord(t *testing.T) {
+	dir := t.TempDir()
+	metaPath := filepath.Join(dir, snapshotMetadataFile)
+	stale := bytes.Repeat([]byte{0xA5}, 4096)
+	if err := os.WriteFile(metaPath, stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := SnapshotMeta{
+		Index:       42,
+		Term:        7,
+		ShardID:     3,
+		ReplicaID:   4,
+		Epoch:       9,
+		Compression: config.NoCompression,
+		DataLen:     1234,
+		DataHash:    0xDEADBEEF,
+	}
+	if err := writeSnapshotMetaFile(dir, want.Index, want.Term, want.ShardID, want.ReplicaID,
+		want.Epoch, want.Compression, want.DataHash, want.DataLen); err != nil {
+		t.Fatalf("writeSnapshotMetaFile: %v", err)
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, MarshalSnapshotMeta(want)) {
+		t.Fatalf("snapshot.meta is %d bytes after the rewrite, want exactly the %d-byte new record",
+			len(data), len(MarshalSnapshotMeta(want)))
+	}
+	got, err := ParseSnapshotMeta(data)
+	if err != nil {
+		t.Fatalf("ParseSnapshotMeta: %v", err)
+	}
+	if got.Index != want.Index || got.Term != want.Term || got.ShardID != want.ShardID ||
+		got.ReplicaID != want.ReplicaID || got.Epoch != want.Epoch ||
+		got.Compression != want.Compression || got.DataLen != want.DataLen ||
+		got.DataHash != want.DataHash {
+		t.Fatalf("ParseSnapshotMeta = %+v, want %+v", got, want)
+	}
+}
+
 // TestSnapshotPool_WriteLeasedSnapshotMetadata_HashesBeforeLease: the
 // snapshot.dat hash is a full read of the artifact, so it must not run under
 // the node's write lease, which UnloadNode waits out. With the hash held,
