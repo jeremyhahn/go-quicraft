@@ -160,7 +160,6 @@ func sentinelTable() []sentinelClassification {
 		{"ErrImportMembershipInvalid", ErrImportMembershipInvalid, false},
 		{"ErrImportDataDirMismatch", ErrImportDataDirMismatch, false},
 		{"ErrImportSnapshotDirExists", ErrImportSnapshotDirExists, false},
-		{"ErrRemoveDataLayoutConflict", ErrRemoveDataLayoutConflict, false},
 
 		// Re-exported from the engine, raft and transport packages because they
 		// reach a caller inside a failed proposal, config.ShardFailedInfo.Err or

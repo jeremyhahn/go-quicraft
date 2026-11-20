@@ -888,17 +888,20 @@ func TestSyncRemoveData_RefusesSnapshotUnderOtherDataDir(t *testing.T) {
 	w.setSnapshotPath(snapFileA)
 
 	err := fh.RemoveData(removeDataShard, fid)
-	if !errors.Is(err, ErrRemoveDataLayoutConflict) {
+	if !errors.Is(err, ErrInvalidOperation) {
 		t.Fatalf("RemoveData with the snapshot under another DataDir: err = %v, want %v",
-			err, ErrRemoveDataLayoutConflict)
+			err, ErrInvalidOperation)
 	}
-	var ce *RemoveDataLayoutConflictError
+	if !errors.Is(err, errRemoveDataLayoutConflict) {
+		t.Fatalf("RemoveData error %v does not match errRemoveDataLayoutConflict", err)
+	}
+	var ce *removeDataLayoutConflictError
 	if !errors.As(err, &ce) {
-		t.Fatalf("RemoveData error %v is not a *RemoveDataLayoutConflictError", err)
+		t.Fatalf("RemoveData error %v is not a *removeDataLayoutConflictError", err)
 	}
 	if ce.ShardID != removeDataShard || ce.ReplicaID != fid ||
 		ce.BootstrapDir != snapDirB || ce.SnapshotDir != snapDirA {
-		t.Fatalf("RemoveDataLayoutConflictError = %+v, want shard %d replica %d bootstrap %q snapshot %q",
+		t.Fatalf("removeDataLayoutConflictError = %+v, want shard %d replica %d bootstrap %q snapshot %q",
 			*ce, removeDataShard, fid, snapDirB, snapDirA)
 	}
 	if removed, err := fh.logdb.NodeRemoved(removeDataShard, fid); err != nil || removed {
