@@ -771,6 +771,11 @@ func TestMembership_ValidateAdd_ConfigChangeIDBound(t *testing.T) {
 					if !errors.Is(err, ErrStaleConfigChange) {
 						t.Fatalf("validate = %v, want ErrStaleConfigChange", err)
 					}
+					var stale *StaleConfigChangeError
+					if !errors.As(err, &stale) || stale.Expected != tc.current || stale.Got != tc.ccID {
+						t.Fatalf("validate = %#v, want *StaleConfigChangeError{Expected: %d, Got: %d}",
+							err, tc.current, tc.ccID)
+					}
 					return
 				}
 				if err != nil {

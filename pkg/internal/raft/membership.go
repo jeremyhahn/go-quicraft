@@ -954,10 +954,28 @@ func checkConfigChangeBound(m *membership, cc proto.ConfigChange) error {
 		return nil
 	}
 	if cc.ConfigChangeID != m.configChangeID {
-		return fmt.Errorf("%w: change checked membership %d, current is %d",
-			ErrStaleConfigChange, cc.ConfigChangeID, m.configChangeID)
+		return &StaleConfigChangeError{Expected: m.configChangeID, Got: cc.ConfigChangeID}
 	}
 	return nil
+}
+
+// StaleConfigChangeError is the add validators' refusal of a bound change:
+// Got is the ConfigChangeID the change was checked against, Expected the
+// membership's current one. It matches ErrStaleConfigChange with errors.Is.
+type StaleConfigChangeError struct {
+	Expected uint64
+	Got      uint64
+}
+
+// Error returns a human-readable description.
+func (e *StaleConfigChangeError) Error() string {
+	return fmt.Sprintf("raft: stale config change: change checked membership %d, current is %d",
+		e.Got, e.Expected)
+}
+
+// Is reports whether target is ErrStaleConfigChange.
+func (e *StaleConfigChangeError) Is(target error) bool {
+	return target == ErrStaleConfigChange
 }
 
 func validateAddNode(m *membership, cc proto.ConfigChange) error {

@@ -3364,6 +3364,18 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 		// commits succeeds.
 		return ErrRejected
 	}
+	var stale *raft.StaleConfigChangeError
+	if errors.As(err, &stale) {
+		// The leader's worker refused a bound add whose ConfigChangeID is no
+		// longer current: another membership change committed after the
+		// Host's early check. Nothing entered the log; the caller re-reads
+		// the membership and retries, as for the Host's own refusal.
+		var shardID uint64
+		if ns != nil {
+			shardID = ns.shardID
+		}
+		return &StaleConfigChangeError{ShardID: shardID, Expected: stale.Expected, Got: stale.Got}
+	}
 	return err
 }
 
