@@ -3544,6 +3544,11 @@ type Host struct {
 	// wireSwitchWG counts the retryWireSwitch goroutines; Close joins them
 	// once the engine, the only thing that starts one, has stopped.
 	wireSwitchWG sync.WaitGroup
+	// removeDataWG counts the RemoveData calls admitted (under admitMu, with
+	// h.closed unset) and still running. Close joins it before it closes the
+	// LogDB and releases NodeHostDir, so no removal writes under a directory
+	// the host has given up; a RemoveData after Close began is refused.
+	removeDataWG sync.WaitGroup
 	// wireSwitchFault is hostOptions.wireSwitchFault.
 	wireSwitchFault func() error
 
@@ -10190,6 +10195,14 @@ func (h *Host) Close() error {
 			}
 		}
 
+		// Join every admitted RemoveData before the LogDB it retires replicas
+		// in is closed and NodeHostDir, where it deletes snapshots and clears
+		// its intent, is released. The admitMu barrier waits out a call
+		// between its h.closed check and its count; later calls see h.closed.
+		h.admitMu.Lock()
+		h.admitMu.Unlock() //nolint:staticcheck // empty critical section is the admission barrier
+		h.removeDataWG.Wait()
+
 		// Close LogDB.
 		if h.logdb != nil {
 			if err := h.logdb.Close(); err != nil {
@@ -11472,9 +11485,17 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 // its bootstrap record states, take a snapshot, stop it and retry RemoveData;
 // then delete the old snapshot directory, which no record references.
 func (h *Host) RemoveData(shardID, replicaID uint64) error {
+	// Admit the call into removeDataWG under admitMu: Close sets h.closed and
+	// then takes admitMu.Lock, so every call admitted before that barrier is
+	// counted when Close waits, and every later one sees h.closed here.
+	h.admitMu.RLock()
 	if h.closed.Load() {
+		h.admitMu.RUnlock()
 		return ErrClosed
 	}
+	h.removeDataWG.Add(1)
+	h.admitMu.RUnlock()
+	defer h.removeDataWG.Done()
 
 	// Take the shard's import lock, which StartShard holds for the whole of a
 	// start: the checks below and the removal then cannot interleave with a
