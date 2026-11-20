@@ -9,6 +9,6 @@ go 1.27.4
 // MVS reads go-quicraft's whole requirement list, not just the stdlib-only
 // package imported, so this raises version floors in every module that
 // requires this one.
-require github.com/jeremyhahn/go-quicraft v0.0.0
+require github.com/jeremyhahn/go-quicraft v0.24.3-alpha
 
 replace github.com/jeremyhahn/go-quicraft => ../..
