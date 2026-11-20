@@ -836,6 +836,67 @@ func Test_IsUnwrap_removeDataError(t *testing.T) {
 	}
 }
 
+// Test_IsUnwrap_removalRefusals pins what a caller may assume of the two
+// RemoveData-era refusals: both match ErrInvalidOperation, neither matches
+// the other's sentinel or ErrClosed, and each message names the shard,
+// replica and directories involved.
+func Test_IsUnwrap_removalRefusals(t *testing.T) {
+	pending := error(&removalPendingError{ShardID: 5, ReplicaID: 6, Dir: "/snap/a"})
+	if !errors.Is(pending, ErrInvalidOperation) {
+		t.Fatalf("errors.Is(%v, ErrInvalidOperation) = false", pending)
+	}
+	if errors.Is(pending, errRemoveDataLayoutConflict) || errors.Is(pending, ErrClosed) {
+		t.Fatalf("removalPendingError %v matches an unrelated sentinel", pending)
+	}
+	if want := "quicraft: shard 5 replica 6 has a pending RemoveData of /snap/a; retry RemoveData to finish it"; pending.Error() != want {
+		t.Fatalf("Error() = %q, want %q", pending.Error(), want)
+	}
+
+	conflict := error(&removeDataLayoutConflictError{ShardID: 7, ReplicaID: 8, BootstrapDir: "/b", SnapshotDir: "/s"})
+	if !errors.Is(conflict, ErrInvalidOperation) || !errors.Is(conflict, errRemoveDataLayoutConflict) {
+		t.Fatalf("removeDataLayoutConflictError %v does not match ErrInvalidOperation and its sentinel", conflict)
+	}
+	if errors.Is(conflict, ErrClosed) {
+		t.Fatalf("removeDataLayoutConflictError %v matches ErrClosed", conflict)
+	}
+	if want := `quicraft: RemoveData of shard 7 replica 8: bootstrap record selects snapshot directory "/b" but the snapshot record lies in "/s"`; conflict.Error() != want {
+		t.Fatalf("Error() = %q, want %q", conflict.Error(), want)
+	}
+}
+
+// pastDeadlineCtx reports a deadline that has passed while its timer has not
+// fired yet (Err is nil): the window in which the request sweeper can expire
+// a request before the caller's context does.
+type pastDeadlineCtx struct{ context.Context }
+
+func (pastDeadlineCtx) Deadline() (time.Time, bool) { return time.Now().Add(-time.Second), true }
+
+// Test_withDeadlineCause_DeadlineEdges covers the failure paths of a
+// synchronous wait the sweeper ends: a deadline that has passed before the
+// context's timer fired still attaches context.DeadlineExceeded; a deadline
+// still ahead leaves ErrTimeout unchanged; an error that already carries the
+// cause is not wrapped twice.
+func Test_withDeadlineCause_DeadlineEdges(t *testing.T) {
+	got := withDeadlineCause(pastDeadlineCtx{context.Background()}, ErrTimeout)
+	if !errors.Is(got, ErrTimeout) || !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("withDeadlineCause(passed, timer pending) = %v, want ErrTimeout and DeadlineExceeded", got)
+	}
+
+	ahead, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	if got := withDeadlineCause(ahead, ErrTimeout); got != ErrTimeout {
+		t.Fatalf("withDeadlineCause(deadline ahead) = %v, want ErrTimeout unchanged", got)
+	}
+
+	already := mapContextError(context.DeadlineExceeded)
+	if got := withDeadlineCause(pastDeadlineCtx{context.Background()}, already); got != already {
+		t.Fatalf("withDeadlineCause(already caused) = %v, want it unchanged", got)
+	}
+	if got := withDeadlineCause(pastDeadlineCtx{context.Background()}, nil); got != nil {
+		t.Fatalf("withDeadlineCause(nil) = %v, want nil", got)
+	}
+}
+
 func TestNewHost_ValidConfig(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
