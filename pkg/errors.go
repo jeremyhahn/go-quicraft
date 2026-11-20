@@ -63,10 +63,14 @@ var (
 	// error as well, so errors.Is(err, context.Canceled) also holds.
 	ErrCanceled = errors.New("quicraft: request canceled")
 
-	// ErrTimeout is returned when a request exceeds its deadline. When the
-	// deadline is the caller's context, the returned error wraps the
-	// context error as well, so errors.Is(err, context.DeadlineExceeded)
-	// also holds.
+	// ErrTimeout is returned when a request exceeds its deadline. The
+	// synchronous calls that wait on the caller's context (SyncPropose,
+	// SyncRead and the other Sync* methods, and the session and membership
+	// calls that block until applied) wrap the context error as well when
+	// that context's deadline has passed, so errors.Is(err,
+	// context.DeadlineExceeded) also holds. An asynchronous RequestState's
+	// Result (for example after ReadIndex(ctx)) has no caller context and
+	// returns ErrTimeout without the context cause.
 	ErrTimeout = errors.New("quicraft: timeout")
 
 	// ErrRejected is returned when a proposal is rejected, for example
