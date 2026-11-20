@@ -1,8 +1,9 @@
 # code-review.yml v5.12.6: restore the LOCAL (security) blocks
 
 Status: the blocks are applied (17 `LOCAL (security)` markers, the same as
-main). `test/buildgates` fails on two `runs-on` lines that come from the
-template unchanged; see Checks.
+main), and scope and gate run on `runs-on: ubuntu-latest` (a LOCAL
+hosted-first override of the template's expression); every check passes,
+see Checks.
 
 ## The 17 blocks and where each goes in v5.12.6
 
@@ -38,26 +39,28 @@ None is covered by v5.12.6. All 17 are re-applied with their main-branch text.
     `verdict` stays as it is.
 
 The only wording change inside LOCAL comments in the gate is "twin wait" to
-"twin read". Template values are unchanged (header, `runs-on` expressions,
-the gate's `timeout-minutes: 10`).
+"twin read". Template values are unchanged (header, the gate's `timeout-minutes: 10`)
+except `runs-on` on scope and gate: commit 2dd7b2fe replaces the template's
+`${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}`
+with `runs-on: ubuntu-latest` under a `# LOCAL (hosted-first)` comment. On
+github.com the expression resolves to the same label, so behaviour there is
+unchanged; the literal keeps test/buildgates' hosted-first rule
+(#1185/#1186), which refuses any `runs-on` expression.
 
 ## Checks
 
-- YAML parse (`python3 -c 'import yaml ...'`): not run. The lane's read
-  guard refuses an inline script that reads the workflow file. actionlint
-  parses the file and passed.
+- YAML parse (`python3 -c 'import yaml ...'`): not run (PyYAML is not
+  installed where the checks ran). actionlint parses the file and passed,
+  at 814a2b96 and again at 2dd7b2fe.
 - `actionlint .github/workflows/code-review.yml`: pass, no findings.
 - `make lint`: pass, 0 issues in every module.
-- `go test -count=1 ./test/buildgates/...`: FAIL in TestCIRunsHostedFirst
-  and TestRunnerProblems (all subtests, which re-check the file):
-  `code-review.yml job scope runs on an expression, which can pick a
-  self-hosted label: "${{ github.server_url == 'https://github.com' &&
-  'ubuntu-latest' || 'bigdisk' }}"`, and the same message for job `gate`.
-  Both lines are template v5.12.6 verbatim (main had `runs-on:
-  ubuntu-latest`). Per the brief, neither the template lines nor the tests
-  were changed. The fix needs a decision: either a repository-local
-  `runs-on: ubuntu-latest` on scope and gate (main's hosted-first rule,
-  #1185/#1186), or a template revision. TestReviewRunsWhereTheGateNeedsIt
-  passes.
+- `go test -count=1 ./test/buildgates/...`: at 814a2b96 FAIL in
+  TestCIRunsHostedFirst and TestRunnerProblems (`code-review.yml job scope
+  runs on an expression, which can pick a self-hosted label`, and the same
+  for job `gate`). At 2dd7b2fe (the hosted-first override above): pass.
+  TestReviewRunsWhereTheGateNeedsIt passes at both.
+- `make lint`, `make vet`, `go build ./...`, `make lint-gates`,
+  `go test -count=1 ./test/releasability/...` and `make coverage
+  COVERAGE_THRESHOLD=90`: pass at 2dd7b2fe.
 - `git diff --stat 1b208ee3`: only .github/workflows/code-review.yml and
   this plan.
