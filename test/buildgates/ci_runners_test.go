@@ -37,12 +37,11 @@ import (
 // more than a standard runner's 4 vCPU, 16 GB, about 45 GB of disk or 6
 // hours. `credential:` is accepted only for code-review.yml's Codex review
 // job, whose reviewer token is mounted on one runner. ci.yml and release.yml
-// carry no waiver at all: every job in them runs on hostedRunner. A runs-on
-// that names the `release` label is the release rule's, not this one's.
+// carry no waiver at all: every job in them runs on hostedRunner, a job that
+// names the `release` label included.
 const (
 	hostedRunner     = "ubuntu-latest"
 	selfHostedWaiver = "# self-hosted: "
-	releaseLabel     = "release"
 )
 
 // waiverCategories are the categories any waived job may name.
@@ -112,10 +111,6 @@ func waiverProblem(comment string, credentialOK bool) string {
 
 // namesReleaseLabel reports whether a runs-on value names the release
 // runner, as a plain label or a quoted label in an expression.
-func namesReleaseLabel(value string) bool {
-	return value == releaseLabel || strings.Contains(value, "'"+releaseLabel+"'")
-}
-
 // runnerProblems lists every job of the workflow file (its base name) whose
 // runs-on breaks the hosted-first rule, given the workflow's text.
 func runnerProblems(file string, body []byte) []string {
@@ -134,8 +129,6 @@ func runnerProblems(file string, body []byte) []string {
 				problems = append(problems, where+" has no runs-on")
 			}
 			continue
-		case j.runsOn.Kind == yaml.ScalarNode && namesReleaseLabel(j.runsOn.Value):
-			continue // the release rule's
 		case hostedOnly && hasWaiver(j.runsOn.LineComment):
 			problems = append(problems, where+" carries a self-hosted waiver; every "+file+" job runs on "+hostedRunner)
 			continue
@@ -245,7 +238,7 @@ func TestRunnerProblems(t *testing.T) {
 		{"an oversize waiver is allowed", cr("scope", "bigdisk  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), ""},
 		{"a waiver after another comment is allowed", cr("review-opencode", "qwen  # CUSTOMIZE: the label "+selfHostedWaiver+"hardware: the model host"), ""},
 		{"the Codex job's credential waiver is allowed", cr("review", "codex  "+selfHostedWaiver+"credential: the token is here"), ""},
-		{"a release-label job is the release rule's", ci("coverage", `${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'release' }}`), ""},
+		{"the Gitea release arm put back", ci("publish-images", `${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'release' }}`), "ci.yml job publish-images runs on an expression"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			file, _ := c.mutate("")
