@@ -1,3 +1,11 @@
+# revert-red-main v1.3: a timeout-minutes on its job, so a hung run ends itself.
+# revert-red-main v1.2: AGENT_DOMAIN and AGENT_LOGIN are repository Actions
+# variables; no login or domain is written here.
+#
+# revert-red-main v1.1: REVERT_STEPS names ci.yml's `make lint-gates` step, a
+# deterministic lint stage, so a main that goes red in the lint-gates job
+# reverts like one red in `make lint`.
+#
 # revert-red-main v1 (ci-template v1.23; owner item 101 as approved, Company
 # Agent m650 item 3, 2026-10-18): "red on main reverts the merge and reopens
 # the PR". Source of truth: software/templates/github-actions/revert-red-main.yml
@@ -78,22 +86,21 @@ jobs:
           SERVER: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
           RED_RUN: ${{ github.event.workflow_run.id }}
-          AGENT_DOMAIN: example.internal
+          AGENT_LOGIN: ${{ vars.AGENT_LOGIN }}
+          AGENT_DOMAIN: ${{ vars.AGENT_DOMAIN }}
           GATE_CONTEXT: 'CI / CI Gate (push)'
           # CUSTOMIZE: the step names of the repo's deterministic stages, an
           # extended regex over ci.yml's step names. Add the repo's CUSTOMIZE
           # lint, build, unit, race and integration-class steps; never a
           # security, deps-check, trivy or setup step.
-          REVERT_STEPS: '^(make lint|Assert every build tag selects code|make build|make coverage.*|make integration-test.*|Soak.*|No direct go-objstore import.*|make ci-netfault|make ci-errfs|Run the 0-RTT tests without the race detector|make ci-fuzz-seeds|make ci-cross for .*|make ci-modules|contrib/dragonboat unit tests|contrib/dragonboat integration suite|Compile under the module, tagged and untagged|Approved-only gate|Exempt revocation tree, FIPS mode)$'
+          REVERT_STEPS: '^(make lint|make lint-gates|Assert every build tag selects code|make build|make coverage.*|make integration-test.*|Soak.*|No direct go-objstore import.*|make ci-netfault|make ci-errfs|Run the 0-RTT tests without the race detector|make ci-fuzz-seeds|make ci-cross for .*|make ci-modules|contrib/dragonboat unit tests|contrib/dragonboat integration suite|Compile under the module, tagged and untagged|Approved-only gate|Exempt revocation tree, FIPS mode)$'
           INFRA_MARKERS: 'Cannot connect to the Docker daemon|no space left on device|signal: killed|exit status 137|exit code 137|OOMKilled|toomanyrequests|lost communication with the server|The runner has received a shutdown signal'
         run: |
           set -euo pipefail
           shopt -s inherit_errexit
           [ -n "${BOT:-}" ] || { echo "::error::AGENT_TOKEN is not set on this repository"; exit 1; }
-          case "$REPOSITORY" in
-            */automatethethings) me=company-bot ;;
-            *) me="agent-${REPOSITORY#*/}" ;;
-          esac
+          [ -n "${AGENT_DOMAIN:-}" ] || { echo "::error::AGENT_DOMAIN is not set as a repository variable"; exit 1; }
+          me="${AGENT_LOGIN:-agent-${REPOSITORY#*/}}"
           me_email="$me@$AGENT_DOMAIN"
           # The token reaches curl as a header from a file descriptor, never
           # on its command line.
