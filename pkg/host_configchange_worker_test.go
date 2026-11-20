@@ -221,3 +221,56 @@ func TestConfigChange_BoundZeroIndexAccepted(t *testing.T) {
 		})
 	}
 }
+
+// TestConfigChange_BoundZeroExpiredBeforeWorkerStaysBound: a bound add from
+// index 0 whose deadline expires before the leader's worker takes it keeps
+// its binding. The expiry fails the caller but leaves the entry in the
+// proposal queue, so the worker still validates it later: after another
+// membership change committed in between, it must be refused as stale, not
+// committed as an unbound add.
+func TestConfigChange_BoundZeroExpiredBeforeWorkerStaysBound(t *testing.T) {
+	h := startWorkerShard(t, workerAddKinds[1])
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if id := currentConfigChangeID(t, h); id != 0 {
+		t.Fatalf("precondition: initial ConfigChangeID = %d, want 0", id)
+	}
+	ns, err := h.getNode(1)
+	if err != nil {
+		t.Fatalf("getNode: %v", err)
+	}
+	fired := false
+	testHookBeforeConfigChangeDeliver = func(proto.ConfigChange) {
+		testHookBeforeConfigChangeDeliver = nil
+		fired = true
+		if err := h.SyncRequestAddObserver(ctx, 1, 90, "127.0.0.1:6090", 0); err != nil {
+			t.Errorf("interleaved SyncRequestAddObserver: %v", err)
+		}
+		// Expire the bound add before it is delivered to the worker.
+		h.sweepPendingProposals(ns, time.Now().Add(time.Hour))
+	}
+	t.Cleanup(func() { testHookBeforeConfigChangeDeliver = nil })
+
+	err = h.SyncRequestAddObserver(ctx, 1, 50, "127.0.0.1:6050", 0, WithBoundConfigChangeIndex())
+	if !fired {
+		t.Fatal("the interleaving hook never ran")
+	}
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("expired bound add = %v, want ErrTimeout", err)
+	}
+	// The worker takes the expired entry on its own; give it time to commit
+	// it, which it must not.
+	for end := time.Now().Add(time.Second); time.Now().Before(end); time.Sleep(10 * time.Millisecond) {
+		if _, ok := h.engine.GetNode(1).Peer().GetMembership().Observers[50]; ok {
+			t.Fatal("expired bound add from index 0 committed after another membership change")
+		}
+	}
+	// Nothing is left pending: a change against the current index commits.
+	if err := h.SyncRequestAddObserver(ctx, 1, 91, "127.0.0.1:6091", currentConfigChangeID(t, h)); err != nil {
+		t.Fatalf("follow-up SyncRequestAddObserver: %v", err)
+	}
+	m := h.engine.GetNode(1).Peer().GetMembership()
+	if _, ok := m.Observers[91]; !ok {
+		t.Fatal("follow-up add did not commit")
+	}
+}
