@@ -1486,6 +1486,11 @@ func stepFollower(r *raft, msg proto.Message) error {
 	case proto.ReadIndexResp:
 		return r.handleReadIndexResp(msg)
 	case proto.Propose:
+		// Checked before the no-leader refusal so the binding is consumed
+		// either way, and before forwarding, which would drop it.
+		if r.takeBoundConfigChanges(msg.Entries) {
+			return ErrBoundConfigChangeNotLeader
+		}
 		if r.leaderID == noLeader {
 			return &NotLeaderError{LeaderID: 0}
 		}
@@ -1570,6 +1575,9 @@ func stepCandidate(r *raft, msg proto.Message) error {
 		r.stepDownToFollower(msg)
 		return r.handleSnapshot(msg)
 	case proto.Propose, proto.ReadIndex:
+		if msg.Type == proto.Propose && r.takeBoundConfigChanges(msg.Entries) {
+			return ErrBoundConfigChangeNotLeader
+		}
 		// A campaigning replica knows no leader, so it refuses both client
 		// request types the way handleFollowerReadIndex and stepFollower's
 		// Propose case do when r.leaderID == noLeader. ReadIndex must be
@@ -2661,6 +2669,16 @@ func (r *raft) validateProposedConfigChange(key uint64, cmd []byte) error {
 	}
 	return r.validateConfigChangePolicy(cc)
 }
+
+// ErrBoundConfigChangeNotLeader refuses, on a replica that is not the leader,
+// a Propose carrying a config change bound on this replica
+// (BindConfigChange). The binding is in-memory and the encoded entry carries
+// ConfigChangeID 0, so forwarding it would let the leader admit it as an
+// unbound change, perhaps after another membership change committed. The
+// whole batch is refused, nothing is forwarded, and the binding is consumed.
+// It matches ErrStaleConfigChange with errors.Is: the caller re-reads the
+// membership and retries, against the current leader.
+var ErrBoundConfigChangeNotLeader = fmt.Errorf("%w: bound config change proposed on a replica that is not the leader", ErrStaleConfigChange)
 
 // takeBoundConfigChanges consumes the binding of every bound config change
 // entry in entries (see takeBoundConfigChange) and reports whether any was

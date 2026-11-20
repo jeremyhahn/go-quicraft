@@ -3376,6 +3376,18 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 		}
 		return &StaleConfigChangeError{ShardID: shardID, Expected: stale.Expected, Got: stale.Got}
 	}
+	if errors.Is(err, raft.ErrBoundConfigChangeNotLeader) {
+		// A bound add from index 0 that this replica no longer leads for:
+		// raft refused it rather than forward it without its binding.
+		// Nothing entered the log; the caller re-reads the membership and
+		// retries against the current leader.
+		var shardID uint64
+		if ns != nil {
+			shardID = ns.shardID
+		}
+		return fmt.Errorf("%w: shard %d: bound config change reached a replica that is no longer the leader",
+			ErrStaleConfigChange, shardID)
+	}
 	return err
 }
 

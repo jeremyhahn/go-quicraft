@@ -909,6 +909,15 @@ func (p *Peer) markStep() {
 	p.stepMarkTerm, _ = p.r.log.lastTerm()
 }
 
+// releaseRefusedBindings forgets the bindings (BindConfigChange) of the
+// config changes in a refused Propose: it appended nothing, so they will
+// never be validated.
+func (p *Peer) releaseRefusedBindings(msg proto.Message, err error) {
+	if err != nil && msg.Type == proto.Propose {
+		p.r.takeBoundConfigChanges(msg.Entries)
+	}
+}
+
 // Handle routes an incoming Raft protocol message to the raft state
 // machine. The raft struct handles all message types: term-based
 // transitions, vote requests/responses, append entries, heartbeats,
@@ -952,11 +961,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 
 	err := p.r.step(msg)
 
-	// A refused Propose appended nothing, so a bound config change in it
-	// will never be validated: forget its binding (BindConfigChange).
-	if err != nil && msg.Type == proto.Propose {
-		p.r.takeBoundConfigChanges(msg.Entries)
-	}
+	p.releaseRefusedBindings(msg, err)
 
 	// raft.step DROPS a message whose term is behind ours and returns nil
 	// (see the msg.Term < r.term branch in step). A nil error therefore does
