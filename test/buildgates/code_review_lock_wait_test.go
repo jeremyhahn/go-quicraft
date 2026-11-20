@@ -131,7 +131,7 @@ func runLockWait(t *testing.T, lib lockWaitLib, fn string, start *string, body s
 	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bash, "-euo", "pipefail", path)
+	cmd := exec.CommandContext(t.Context(), bash, "-euo", "pipefail", path)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	r := lockWaitRun{work: work}

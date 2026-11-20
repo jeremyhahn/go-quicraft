@@ -29,6 +29,29 @@ differs around them:
 2. The budget comment above the codex job's steps: its first two lines are
    replaced as the hunk does.
 
+## Regression tests
+
+`test/buildgates/code_review_lock_wait_test.go` extracts `die()`, the
+`JOB_BUDGET=` line, the `lock_wait() { ... }` function and both callers'
+reserve expressions from the workflow text (a missing piece fails the test)
+and runs them in bash under lib.sh's options (`set -euo pipefail`,
+`inherit_errexit`) with `date` stubbed to a fixed epoch.
+
+- `TestCodeReviewLockWait`: a positive budget (elapsed time and the NEED
+  reserve are both subtracted); zero and negative budgets, a missing
+  `$WORK/job-start` and a malformed one (each dies with its reason on stderr
+  and in `$WORK/error`, with no output); the refresh reserve (3660 s) left
+  and exhausted; the review reserve at limit 1530 and at limit 2730, left
+  and exhausted.
+- `TestCodeReviewLockWaitStopsCaller`: `wait_s=$(lock_wait ...)` followed by
+  a stand-in for flock; when lock_wait dies the step stops non-zero with the
+  reason recorded and the flock stand-in never runs (refresh, review and
+  missing start).
+
+Removing `- $1` from a scratch copy of the function fails every budget case
+(the reserve is checked). The tests found no defect; the workflow is
+unchanged by them.
+
 ## Checks
 
 - The diff against the base is exactly the delta (43 lines added, 7 removed).
