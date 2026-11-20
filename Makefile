@@ -1732,8 +1732,11 @@ DEVCONTAINER_BUILD = docker buildx build --load $(DOCKER_SECRET_ARGS) \
 	$(if $(GO_BUILD_PROXY),--build-arg "GO_BUILD_PROXY=$(GO_BUILD_PROXY)") \
 	-f $(DEVCONTAINER_DIR)/Dockerfile
 
-# The make target docker-make runs inside the toolchain image.
+# The make target docker-make runs inside the toolchain image, and the
+# container network it runs on (bridge: the default ci target downloads
+# modules and advisories; none: an offline run such as DOCKER_MAKE_TARGET=test).
 DOCKER_MAKE_TARGET ?= ci
+DOCKER_MAKE_NETWORK ?= bridge
 
 # Builds both devcontainer images: toolchain, tagged by content, and integration.
 .PHONY: docker-build
@@ -1783,12 +1786,14 @@ it-image:
 
 # Runs `make $(DOCKER_MAKE_TARGET)` in the toolchain image against a copy of
 # the checkout (scripts/in-toolchain-image.sh), so nothing is bind-mounted and
-# it honours DOCKER_HOST. No network unless IN_IMAGE_NETWORK=bridge.
-#   make docker-make DOCKER_MAKE_TARGET=test
+# it honours DOCKER_HOST. The container runs on DOCKER_MAKE_NETWORK (default
+# bridge, which the ci target's lint and security downloads need); pass
+# DOCKER_MAKE_NETWORK=none for an offline run.
+#   make docker-make DOCKER_MAKE_NETWORK=none DOCKER_MAKE_TARGET=test
 #   DOCKER_HOST=ssh://user@bench-host.example make docker-make
 .PHONY: docker-make
 docker-make: docker-build-toolchain
-	scripts/in-toolchain-image.sh '$(TOOLCHAIN_IMAGE)' make $(DOCKER_MAKE_TARGET)
+	IN_IMAGE_NETWORK='$(DOCKER_MAKE_NETWORK)' scripts/in-toolchain-image.sh '$(TOOLCHAIN_IMAGE)' make $(DOCKER_MAKE_TARGET)
 
 # Removes the images the docker-build* targets made for this checkout.
 .PHONY: docker-clean
@@ -1962,7 +1967,8 @@ help:
 	@echo "  docker-run CMD='make lint'     Run CMD in the toolchain image, checkout bind-mounted"
 	@echo "  toolchain-image                Print the toolchain image tag (content-hashed)"
 	@echo "  docker-make                    Run make DOCKER_MAKE_TARGET (default ci) in the"
-	@echo "                                 toolchain image; honours DOCKER_HOST for a remote daemon"
+	@echo "                                 toolchain image; honours DOCKER_HOST for a remote daemon;"
+	@echo "                                 DOCKER_MAKE_NETWORK=none (default bridge) runs it offline"
 	@echo "  docker-clean                   Remove this checkout's docker-build* images"
 	@echo "  docker-shell                   Open a shell in the toolchain image"
 	@echo "  docker-test                    Run make test in the toolchain image"
