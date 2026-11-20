@@ -793,7 +793,10 @@ jobs:
     # v5.12.3: no concurrency group. Cancelling an older run's scope job
     # skipped that run's requested review (v5.12.2), so each event's guard
     # runs to the end; it is a short API-only job.
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    # LOCAL (hosted-first): a GitHub-hosted runner, never an expression that
+    # can pick a self-hosted label (test/buildgates TestCIRunsHostedFirst).
+    # On github.com the template's expression resolves to the same label.
+    runs-on: ubuntu-latest
     # The guard's python runs at most 240 s (its timeout -k 10 240).
     timeout-minutes: 10
     permissions:
@@ -3693,7 +3696,10 @@ jobs:
     concurrency:
       group: ${{ format('code-review-gate-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
       cancel-in-progress: true
-    runs-on: ${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}
+    # LOCAL (hosted-first): a GitHub-hosted runner, never an expression that
+    # can pick a self-hosted label (test/buildgates TestCIRunsHostedFirst).
+    # On github.com the template's expression resolves to the same label.
+    runs-on: ubuntu-latest
     # v5.12.6 (ruling 580): no twin wait is left, so 10 minutes.
     timeout-minutes: 10
     permissions:
