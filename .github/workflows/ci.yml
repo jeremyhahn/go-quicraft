@@ -1829,11 +1829,16 @@ jobs:
             docker create --name "$lease" "$IT_IMAGE" true >/dev/null && echo "IT_LEASE=$lease" >> "$GITHUB_ENV"
           fi
 
-      # Ruling 901: the images the job built or pulled carry no private address in their history or
+      # The images the job built carry no private address in their history or
       # config, checked after the build and before any use, on a pool runner.
       - name: Check the images carry no private address
-        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && env.IT_LEASE_ID != '' && runner.environment != 'github-hosted' }}
-        run: scripts/ci-image-history.sh "$TOOLCHAIN_IMAGE" "$IT_LEASE_ID"
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$TOOLCHAIN_IMAGE"
+
+      # The integration image the build step made, checked the same way.
+      - name: Check the integration image carries no private address
+        if: ${{ !cancelled() && env.IT_IMAGE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$IT_IMAGE"
 
       # v1.22: bound this repo's cache volumes on the host before the stages
       # add to them (ci-standard.md §6). It never fails the job.
@@ -2270,17 +2275,13 @@ jobs:
             || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
       # <<< CUSTOMIZE
 
-      # Ruling 901: the integration image the job leased carry no private address in their history or
-      # config, checked after the build and before any use, on a pool runner.
-      - name: Check the images carry no private address
-        if: ${{ !cancelled() && env.IT_LEASE_ID != '' && runner.environment != 'github-hosted' }}
-        run: scripts/ci-image-history.sh "$IT_LEASE_ID"
-
-      # Ruling 901: the integration image the job leased carry no private address in their history or
-      # config, checked after the build and before any use, on a pool runner.
-      - name: Check the images carry no private address
-        if: ${{ !cancelled() && env.IT_LEASE_ID != '' && runner.environment != 'github-hosted' }}
-        run: scripts/ci-image-history.sh "$IT_LEASE_ID"
+      # The integration image the job leased carries no private address in its
+      # history or config, checked before any use, on a pool runner. IT_LEASE
+      # is set only when the image is on this host, so the check never fails
+      # on an image the job has not got.
+      - name: Check the integration image carries no private address
+        if: ${{ !cancelled() && env.IT_IMAGE != '' && env.IT_LEASE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$IT_IMAGE"
 
       - name: Write the module credential file
         run: |
