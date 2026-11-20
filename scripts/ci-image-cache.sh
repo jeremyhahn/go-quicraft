@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# ci-image-cache.sh v4 (ci-template v1.45): publish runs
+# scripts/ci-image-history.sh on the toolchain image after the trivy scan and
+# before it logs in, and refuses the push when the image carries a private
+# address in its history or config: a published image leaves the LAN.
+# ci-image-cache.sh v3 (2026-11-16, ci-template v1.42):
+# publish scans the toolchain image it built with `trivy image` before the
+# push and refuses the push on a fixed CRITICAL or HIGH finding, because
+# ci.yml no longer runs trivy image (scans.yml does, on a schedule). The scan
+# runs through scripts/in-toolchain-image.sh in the image itself, with the
+# caller's IN_IMAGE_NETWORK (bridge, for the database).
+# ci-image-cache.sh v2 (2026-11-08): the
+# namespace comes only from CI_IMAGE_NAMESPACE, the repository Actions
+# variable; unset, the script stops.
 # ci-image-cache.sh v1 (ci-template v1.30, fix 1 of the 72-hour CI evaluation):
 # the toolchain image's registry cache. It ships beside ci.yml as
 # scripts/ci-image-cache.sh.
@@ -16,10 +29,11 @@
 # <registry>/<namespace>/<repo>-toolchain:<hash>-main, so the image is built
 # once per change to those files, by the release runner, and every other job
 # and runner pulls it instead of building it. The registry is the forge's own,
-# host[:port] from GITHUB_SERVER_URL, as in go-qrdb's scripts/ci-registry.sh;
-# no address is written here. The namespace is CI_IMAGE_NAMESPACE, by default
-# ci-images, public for anonymous pull (ruling 217(4)); only the release
-# runner writes there (rulings 169 and 173). On github.com both commands do
+# host[:port] from GITHUB_SERVER_URL;
+# no address is written here. The namespace is CI_IMAGE_NAMESPACE, the
+# repository Actions variable (v2: no default here), public for anonymous
+# pull; only the release
+# runner writes there. On github.com both commands do
 # nothing.
 #
 # pull exits 0 when the daemon holds the tag after it, and 1 otherwise; the
@@ -27,7 +41,7 @@
 # unreachable registry or a failed pull falls back to the local build, never to
 # a red job. A pulled image keeps its digest in the log.
 #
-# publish reads the release runner's credential contract (ruling 173):
+# publish reads the release runner's credential contract:
 # RELEASE_REGISTRY, which must be this forge's registry, RELEASE_REGISTRY_USER
 # and RELEASE_REGISTRY_TOKEN. No credential value is printed or put on a
 # command line: docker reads the token on stdin, into a private DOCKER_CONFIG
@@ -42,7 +56,8 @@ case ${GITHUB_SERVER_URL:-} in
 esac
 host=${GITHUB_SERVER_URL#*://}
 host=${host%%/*}
-ns=${CI_IMAGE_NAMESPACE:-ci-images}
+ns=${CI_IMAGE_NAMESPACE:-}
+[ -n "$ns" ] || die "CI_IMAGE_NAMESPACE is not set (the repository Actions variable)"
 
 local_tag=$(make -s toolchain-image) || die "make -s toolchain-image failed"
 case $local_tag in
@@ -82,6 +97,15 @@ case ${1:-} in
       exit 0
     fi
     make docker-build-toolchain "$@"
+    tar=toolchain-image.tar
+    trap 'cleanup; rm -f "$tar"' EXIT
+    docker save -o "$tar" "$local_tag"
+    scripts/in-toolchain-image.sh "$local_tag" \
+      trivy image --input "$tar" --ignore-unfixed --skip-dirs /opt/go/mod --severity CRITICAL,HIGH --exit-code 1 \
+      || die "trivy image found a fixed CRITICAL or HIGH vulnerability in $local_tag; refusing the push"
+    rm -f "$tar"
+    scripts/ci-image-history.sh "$local_tag" \
+      || die "$local_tag carries a private address in its history or config; refusing the push"
     printf '%s' "$RELEASE_REGISTRY_TOKEN" | DOCKER_CONFIG=$cfg docker login "$host" -u "$RELEASE_REGISTRY_USER" --password-stdin >/dev/null
     docker tag "$local_tag" "$remote"
     DOCKER_CONFIG=$cfg docker push -q "$remote" >/dev/null
