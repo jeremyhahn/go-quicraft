@@ -724,6 +724,63 @@ func membershipWith(fullReplicas, witnesses int, maxWitnesses uint64, requireFul
 	})
 }
 
+// TestMembership_ValidateAdd_ConfigChangeIDBound verifies that the three add
+// validators compare a bound change's ConfigChangeID with the membership's:
+// a non-zero ID, or ID 0 with MustMatchConfigChangeID set, must equal the
+// current configChangeID; an unbound change (ID 0, no marker) is not checked.
+func TestMembership_ValidateAdd_ConfigChangeIDBound(t *testing.T) {
+	validators := []struct {
+		name     string
+		typ      uint64
+		validate func(*membership, proto.ConfigChange) error
+	}{
+		{"AddNode", proto.AddNode, validateAddNode},
+		{"AddNonVoting", proto.AddNonVoting, validateAddNonVoting},
+		{"AddWitness", proto.AddWitness, validateAddWitness},
+	}
+	cases := []struct {
+		name      string
+		current   uint64
+		ccID      uint64
+		mustMatch bool
+		wantStale bool
+	}{
+		{"matching non-zero", 7, 7, false, false},
+		{"older non-zero", 7, 5, false, true},
+		{"newer non-zero", 7, 9, false, true},
+		{"unbound zero at non-zero", 7, 0, false, false},
+		{"bound zero at non-zero", 7, 0, true, true},
+		{"bound zero at zero", 0, 0, true, false},
+		{"unbound zero at zero", 0, 0, false, false},
+		{"bound non-zero at zero", 0, 3, true, true},
+	}
+	for _, v := range validators {
+		for _, tc := range cases {
+			t.Run(v.name+"/"+tc.name, func(t *testing.T) {
+				m := membershipWith(3, 0, 0, false)
+				m.configChangeID = tc.current
+				cc := proto.ConfigChange{
+					ConfigChangeID:          tc.ccID,
+					Type:                    v.typ,
+					ReplicaID:               50,
+					Address:                 "new-addr",
+					MustMatchConfigChangeID: tc.mustMatch,
+				}
+				err := v.validate(m, cc)
+				if tc.wantStale {
+					if !errors.Is(err, ErrStaleConfigChange) {
+						t.Fatalf("validate = %v, want ErrStaleConfigChange", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("validate = %v, want nil", err)
+				}
+			})
+		}
+	}
+}
+
 // TestMembership_WitnessPolicy_RequireFullReplicaMajority verifies that the
 // default RequireFullReplicaMajority policy rejects a witness add that would
 // leave the full replicas unable to form a quorum on their own, while allowing

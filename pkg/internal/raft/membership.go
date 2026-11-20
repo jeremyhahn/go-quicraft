@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
@@ -938,6 +939,12 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 
 // validateAddNode checks whether adding a full voting member would succeed
 // without mutating the membership. Returns the same errors as handleAddNode.
+// ErrStaleConfigChange is returned by the add validators when a bound change
+// (a non-zero ConfigChangeID, or ConfigChangeID 0 with
+// MustMatchConfigChangeID set) names a configuration other than the current
+// one: another membership change committed after the caller read the index.
+var ErrStaleConfigChange = errors.New("raft: stale config change")
+
 func validateAddNode(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress
