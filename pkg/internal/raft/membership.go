@@ -945,7 +945,25 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 // one: another membership change committed after the caller read the index.
 var ErrStaleConfigChange = errors.New("raft: stale config change")
 
+// checkConfigChangeBound refuses a bound add whose ConfigChangeID is not the
+// current one. It runs on the leader's worker, after the Host's early check,
+// so a change that committed between the two is caught here. An unbound add
+// (ConfigChangeID 0 without MustMatchConfigChangeID) is not checked.
+func checkConfigChangeBound(m *membership, cc proto.ConfigChange) error {
+	if cc.ConfigChangeID == 0 && !cc.MustMatchConfigChangeID {
+		return nil
+	}
+	if cc.ConfigChangeID != m.configChangeID {
+		return fmt.Errorf("%w: change checked membership %d, current is %d",
+			ErrStaleConfigChange, cc.ConfigChangeID, m.configChangeID)
+	}
+	return nil
+}
+
 func validateAddNode(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if cc.Address == "" {
 		return ErrEmptyAddress
 	}
@@ -1008,6 +1026,9 @@ func validateRemoveNode(m *membership, cc proto.ConfigChange) error {
 // succeed without mutating the membership. Returns the same errors as
 // handleAddNonVoting.
 func validateAddNonVoting(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if cc.Address == "" {
 		return ErrEmptyAddress
 	}
@@ -1028,6 +1049,9 @@ func validateAddNonVoting(m *membership, cc proto.ConfigChange) error {
 // the replicated witness-policy violations (validate-only — never enforced
 // on the apply path).
 func validateAddWitness(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if cc.Address == "" {
 		return ErrEmptyAddress
 	}
