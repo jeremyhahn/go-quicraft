@@ -11951,15 +11951,25 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	// Bind the in-memory MustMatchConfigChangeID marker to the proposal key
 	// so the leader's worker validates the decoded entry as bound. A non-zero
 	// ConfigChangeID needs no binding: it is in the encoded entry.
+	//
+	// The binding is NOT dropped by the failure hook. A deadline expiry or a
+	// leader change fails the caller but leaves the entry in the proposal
+	// queue, from where the worker may still take it (proposalMayReachRaft):
+	// unbinding then would let it be validated as an unbound add. raft
+	// consumes the binding wherever the entry is taken -- validated by a
+	// leader, refused by one, or refused instead of being forwarded by a
+	// non-leader -- so only the two paths below, on which the entry is never
+	// delivered, unbind here. An entry left untaken in a queue that closes
+	// dies with its Peer.
 	peer := engNode.Peer()
-	if cc.MustMatchConfigChangeID && cc.ConfigChangeID == 0 {
+	bound := cc.MustMatchConfigChangeID && cc.ConfigChangeID == 0
+	if bound {
 		peer.BindConfigChange(proposalKey)
-		pp.onFailure = func() {
-			peer.UnbindConfigChange(proposalKey)
-			rollbackPreRegister()
-		}
 	}
 	if err := h.registerPendingProposal(ns, engNode, proposalKey, pp); err != nil {
+		if bound {
+			peer.UnbindConfigChange(proposalKey)
+		}
 		pp.onFailure()
 		return nil, err
 	}
@@ -11985,6 +11995,9 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 			h.completePendingOp()
 		}
 		rs.Release()
+		if bound {
+			peer.UnbindConfigChange(proposalKey)
+		}
 		pp.onFailure()
 		if refusal := closedQueueRefusal(engNode); refusal != nil {
 			return nil, refusal

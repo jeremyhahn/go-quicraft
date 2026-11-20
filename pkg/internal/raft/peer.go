@@ -952,6 +952,12 @@ func (p *Peer) Handle(msg proto.Message) error {
 
 	err := p.r.step(msg)
 
+	// A refused Propose appended nothing, so a bound config change in it
+	// will never be validated: forget its binding (BindConfigChange).
+	if err != nil && msg.Type == proto.Propose {
+		p.r.takeBoundConfigChanges(msg.Entries)
+	}
+
 	// raft.step DROPS a message whose term is behind ours and returns nil
 	// (see the msg.Term < r.term branch in step). A nil error therefore does
 	// NOT mean raft acted on the message, and membership must never be
@@ -1215,8 +1221,9 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 // validation then refuses it unless the membership's current config change ID
 // still equals it (proto.ConfigChange.MustMatchConfigChangeID). The marker is
 // in-memory and never encoded, so it is carried here, beside the entry, by
-// key. Call it before the entry is delivered; the first validation of that
-// key consumes it. Safe for concurrent use.
+// key. Call it before the entry is delivered; the first Propose that carries
+// the key consumes it, whether it validates, refuses or (on a non-leader)
+// refuses to forward the entry. Safe for concurrent use.
 func (p *Peer) BindConfigChange(key uint64) {
 	if key != 0 {
 		p.boundConfigChanges.Store(key, struct{}{})
@@ -1224,7 +1231,10 @@ func (p *Peer) BindConfigChange(key uint64) {
 }
 
 // UnbindConfigChange forgets a key bound by BindConfigChange whose entry was
-// never validated (delivery refused, or the proposal failed first).
+// never delivered (registration or delivery refused). Do not call it for an
+// entry that may still be taken from the proposal queue, such as one whose
+// deadline expired: the raft layer consumes the binding when the entry is
+// taken (validated, refused, or refused instead of being forwarded).
 func (p *Peer) UnbindConfigChange(key uint64) {
 	p.boundConfigChanges.Delete(key)
 }

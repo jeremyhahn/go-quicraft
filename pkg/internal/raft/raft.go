@@ -2662,6 +2662,25 @@ func (r *raft) validateProposedConfigChange(key uint64, cmd []byte) error {
 	return r.validateConfigChangePolicy(cc)
 }
 
+// takeBoundConfigChanges consumes the binding of every bound config change
+// entry in entries (see takeBoundConfigChange) and reports whether any was
+// bound. A binding is kept while its entry can still reach the leader's
+// validation, so every path on which a taken entry is NOT validated -- a
+// refused Propose, or one this replica would forward -- consumes it here.
+func (r *raft) takeBoundConfigChanges(entries []proto.Entry) bool {
+	if r.takeBoundConfigChange == nil {
+		return false
+	}
+	found := false
+	for i := range entries {
+		if entries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange &&
+			entries[i].Key != 0 && r.takeBoundConfigChange(entries[i].Key) {
+			found = true
+		}
+	}
+	return found
+}
+
 // validateConfigChangePolicy enforces this node's WitnessConfig policy
 // against a proposed config change using the leader's live peer tracking
 // (remotes/witnesses; the leader itself is always a full voting replica).
