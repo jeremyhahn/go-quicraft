@@ -42,9 +42,10 @@ func TestTranslateProposalError_StaleConfigChange(t *testing.T) {
 type workerAddKind struct {
 	name string
 	add  func(ctx context.Context, h *Host, replicaID uint64, addr string, idx uint64, opts ...ConfigChangeOption) error
-	// prep runs before the index is read; the witness kind relaxes the
-	// full-replica-majority policy so a single-voter shard can take a witness.
-	prep func(ctx context.Context, t *testing.T, h *Host)
+	// witnessSeed starts the shard with a bootstrap witness policy that
+	// relaxes the full-replica majority, so a single-voter shard can take a
+	// witness with no prior policy change: its ConfigChangeID is still 0.
+	witnessSeed bool
 }
 
 var workerAddKinds = []workerAddKind{
@@ -56,14 +57,27 @@ var workerAddKinds = []workerAddKind{
 	}},
 	{name: "witness", add: func(ctx context.Context, h *Host, id uint64, addr string, idx uint64, opts ...ConfigChangeOption) error {
 		return h.SyncRequestAddWitness(ctx, 1, id, addr, idx, opts...)
-	}, prep: func(ctx context.Context, t *testing.T, h *Host) {
-		t.Helper()
-		if err := h.SyncRequestUpdateWitnessPolicy(ctx, 1, config.WitnessConfig{
-			RequireFullReplicaMajority: config.BoolPtr(false),
-		}, 0); err != nil {
-			t.Fatalf("SyncRequestUpdateWitnessPolicy: %v", err)
-		}
-	}},
+	}, witnessSeed: true},
+}
+
+// startWorkerShard starts the single-voter shard a workerAddKind needs:
+// for the witness kind the bootstrap witness policy is relaxed so the
+// witness add is admitted while the ConfigChangeID is still 0.
+func startWorkerShard(t *testing.T, kind workerAddKind) *Host {
+	t.Helper()
+	if !kind.witnessSeed {
+		return startSingleVoterShard(t)
+	}
+	h := newTestHost(t)
+	scfg := testShardConfig(1, 1)
+	scfg.CheckQuorum = config.BoolPtr(false)
+	scfg.Witness = config.WitnessConfig{RequireFullReplicaMajority: config.BoolPtr(false)}
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	waitForLeader(t, h, 1)
+	return h
 }
 
 // interleaveConfigChange makes the next config change request commit another
@@ -107,33 +121,24 @@ func assertWorkerStale(t *testing.T, err error, got uint64) {
 	}
 }
 
-// TestRequestAdd_WorkerRefusesStaleIndex verifies, on the real Host, that an
+// TestConfigChange_WorkerRefusesStaleIndex verifies, on the real Host, that an
 // add checked against index C is refused at the leader's worker when another
 // membership change commits between the Host's check and the proposal, for
 // voter, observer and witness, from C > 0 (the index is always bound) and
 // for voter and observer from the initial configuration (C = 0, bound by
 // WithBoundConfigChangeIndex). Nothing enters the log: the same replica is
 // then added successfully against the current index.
-func TestRequestAdd_WorkerRefusesStaleIndex(t *testing.T) {
+func TestConfigChange_WorkerRefusesStaleIndex(t *testing.T) {
 	for _, kind := range workerAddKinds {
 		for _, fromZero := range []bool{false, true} {
-			if fromZero && kind.prep != nil {
-				// The witness kind needs a policy change first, so it can
-				// never start from index 0 on a single-voter shard; the
-				// validator unit tests cover the bound witness add at 0.
-				continue
-			}
 			name := kind.name + "/from_C"
 			if fromZero {
 				name = kind.name + "/from_0"
 			}
 			t.Run(name, func(t *testing.T) {
-				h := startSingleVoterShard(t)
+				h := startWorkerShard(t, kind)
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
-				if kind.prep != nil {
-					kind.prep(ctx, t, h)
-				}
 				if !fromZero && currentConfigChangeID(t, h) == 0 {
 					if err := h.SyncRequestAddObserver(ctx, 1, 80, "127.0.0.1:6080", 0); err != nil {
 						t.Fatalf("SyncRequestAddObserver: %v", err)
@@ -171,37 +176,48 @@ func TestRequestAdd_WorkerRefusesStaleIndex(t *testing.T) {
 	}
 }
 
-// TestRequestAdd_UnboundZeroIndexUnchecked verifies that an add with index 0
+// TestConfigChange_UnboundZeroIndexUnchecked verifies that an add with index 0
 // and no WithBoundConfigChangeIndex is not checked, as before: it commits even
 // when another change commits inside the window.
-func TestRequestAdd_UnboundZeroIndexUnchecked(t *testing.T) {
-	h := startSingleVoterShard(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	fired := interleaveConfigChange(ctx, t, h)
-	if err := h.SyncRequestAddObserver(ctx, 1, 50, "127.0.0.1:6050", 0); err != nil {
-		t.Fatalf("unbound SyncRequestAddObserver at 0: %v", err)
-	}
-	if !*fired {
-		t.Fatal("the interleaving hook never ran")
+func TestConfigChange_UnboundZeroIndexUnchecked(t *testing.T) {
+	for _, kind := range workerAddKinds {
+		t.Run(kind.name+"/from_0", func(t *testing.T) {
+			h := startWorkerShard(t, kind)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if id := currentConfigChangeID(t, h); id != 0 {
+				t.Fatalf("precondition: initial ConfigChangeID = %d, want 0", id)
+			}
+			fired := interleaveConfigChange(ctx, t, h)
+			if err := kind.add(ctx, h, 50, "127.0.0.1:6050", 0); err != nil {
+				t.Fatalf("unbound %s add at 0: %v", kind.name, err)
+			}
+			if !*fired {
+				t.Fatal("the interleaving hook never ran")
+			}
+		})
 	}
 }
 
-// TestRequestAdd_BoundZeroIndexAccepted verifies that a bound add at 0 on the
+// TestConfigChange_BoundZeroIndexAccepted verifies that a bound add at 0 on the
 // initial configuration commits when nothing interleaves.
-func TestRequestAdd_BoundZeroIndexAccepted(t *testing.T) {
-	h := startSingleVoterShard(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if id := currentConfigChangeID(t, h); id != 0 {
-		t.Fatalf("precondition: initial ConfigChangeID = %d, want 0", id)
-	}
-	if err := h.SyncRequestAddObserver(ctx, 1, 50, "127.0.0.1:6050", 0, WithBoundConfigChangeIndex()); err != nil {
-		t.Fatalf("bound SyncRequestAddObserver at 0: %v", err)
-	}
-	// Bound at 0 after a change committed: refused by the Host's early check.
-	err := h.SyncRequestAddObserver(ctx, 1, 51, "127.0.0.1:6051", 0, WithBoundConfigChangeIndex())
-	if !errors.Is(err, ErrStaleConfigChange) {
-		t.Fatalf("bound add at 0 after a commit = %v, want ErrStaleConfigChange", err)
+func TestConfigChange_BoundZeroIndexAccepted(t *testing.T) {
+	for _, kind := range workerAddKinds {
+		t.Run(kind.name+"/from_0", func(t *testing.T) {
+			h := startWorkerShard(t, kind)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if id := currentConfigChangeID(t, h); id != 0 {
+				t.Fatalf("precondition: initial ConfigChangeID = %d, want 0", id)
+			}
+			if err := kind.add(ctx, h, 50, "127.0.0.1:6050", 0, WithBoundConfigChangeIndex()); err != nil {
+				t.Fatalf("bound %s add at 0: %v", kind.name, err)
+			}
+			// Bound at 0 after a change committed: refused by the Host's early check.
+			err := kind.add(ctx, h, 51, "127.0.0.1:6051", 0, WithBoundConfigChangeIndex())
+			if !errors.Is(err, ErrStaleConfigChange) {
+				t.Fatalf("bound %s add at 0 after a commit = %v, want ErrStaleConfigChange", kind.name, err)
+			}
+		})
 	}
 }
