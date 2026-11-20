@@ -89,9 +89,43 @@ func waitInspectionQuiescent(t *testing.T, h *Host, shardID uint64) inspectionSa
 }
 
 // sameQuiescentSample reports whether two consecutive samples show a
-// quiescent shard.
+// quiescent shard: equal once the per-tick parts of the diag are masked.
+// The State's hb=/et= timers and the outbound PendingMessages depth move
+// with every heartbeat on an idle shard; the indexes, terms, role, leader
+// and readiness views must hold still.
 func sameQuiescentSample(a, b inspectionSample) bool {
-	return a == b
+	return quiescentKey(a) == quiescentKey(b)
+}
+
+// quiescentKey returns s with the per-tick diag fields masked.
+func quiescentKey(s inspectionSample) inspectionSample {
+	s.diag.State = maskTickCounters(s.diag.State)
+	s.diag.PendingMessages = 0
+	return s
+}
+
+// maskTickCounters replaces the digits after each "hb=" and "et=" in a diag
+// State string with "*".
+func maskTickCounters(state string) string {
+	var b strings.Builder
+	for i := 0; i < len(state); {
+		if strings.HasPrefix(state[i:], "hb=") || strings.HasPrefix(state[i:], "et=") {
+			b.WriteString(state[i : i+3])
+			i += 3
+			j := i
+			for j < len(state) && state[j] >= '0' && state[j] <= '9' {
+				j++
+			}
+			if j > i {
+				b.WriteByte('*')
+			}
+			i = j
+			continue
+		}
+		b.WriteByte(state[i])
+		i++
+	}
+	return b.String()
 }
 
 // TestSameQuiescentSample_IgnoresTickCounters: the diag State carries the
