@@ -33,7 +33,8 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// .devcontainer/Dockerfile.integration: a failed build must fail the build
+// the integration stage of build/docker/devcontainer/Dockerfile (formerly a
+// separate integration Dockerfile): a failed build must fail the build
 //
 // The historical line was
 //
@@ -64,7 +65,23 @@ import (
 const repoRoot = "../.."
 
 // integrationDockerfile is the file under test.
-const integrationDockerfile = ".devcontainer/Dockerfile.integration"
+const integrationDockerfile = "build/docker/devcontainer/Dockerfile"
+
+// compileCommands are the commands that compile the integration suites: the
+// integration stage's `go vet -tags=integration`, and the `go test -c` of the
+// historical construct the harness is calibrated against.
+var compileCommands = []string{"go vet -tags=integration", "go test -c"}
+
+// compileStart returns the index of the first compile command in body, or -1.
+func compileStart(body string) int {
+	start := -1
+	for _, c := range compileCommands {
+		if i := strings.Index(body, c); i >= 0 && (start < 0 || i < start) {
+			start = i
+		}
+	}
+	return start
+}
 
 // historicalBuildCommand is the construct that shipped a green integration
 // suite over a failing compile, reproduced verbatim from the Dockerfile's own
@@ -102,13 +119,13 @@ func buildRunBody(t *testing.T) string {
 			}
 		}
 		block := strings.Join(joined, " ")
-		if !strings.Contains(block, "go test -c") {
+		if compileStart(block) < 0 {
 			continue
 		}
 		return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(block), "RUN "))
 	}
-	t.Fatalf("%s has no RUN instruction that compiles the integration binary "+
-		"with `go test -c`; the build step this test guards has moved or gone",
+	t.Fatalf("%s has no RUN instruction that compiles the integration suites "+
+		"(`go vet -tags=integration`); the build step this test guards has moved or gone",
 		integrationDockerfile)
 	return ""
 }
@@ -125,9 +142,9 @@ var compileCommandDelimiters = []string{";", "|", "&", "2>", ">", "<", "\n"}
 func stubCompileCommand(t *testing.T, body string) string {
 	t.Helper()
 
-	start := strings.Index(body, "go test -c")
+	start := compileStart(body)
 	if start < 0 {
-		t.Fatalf("no `go test -c` command in %q", body)
+		t.Fatalf("no integration compile command in %q", body)
 	}
 	end := len(body)
 	for _, d := range compileCommandDelimiters {
@@ -136,7 +153,8 @@ func stubCompileCommand(t *testing.T, body string) string {
 		}
 	}
 	script := body[:start] + ` "$BUILD" ` + body[end:]
-	return strings.ReplaceAll(script, "/integration-tests", `"$BIN"`)
+	script = strings.ReplaceAll(script, "/integration-tests", `"$BIN"`)
+	return strings.ReplaceAll(script, "/gocache", `"$CACHE"`)
 }
 
 // buildOutcome is what running a stubbed build produced.
@@ -160,7 +178,11 @@ func runStubbedBuild(t *testing.T, body, stub string) buildOutcome {
 		t.Fatalf("write stub: %v", err)
 	}
 	binPath := filepath.Join(dir, "integration-tests")
-	env := append(os.Environ(), "BUILD="+buildPath, "BIN="+binPath)
+	cachePath := filepath.Join(dir, "gocache")
+	if err := os.Mkdir(cachePath, 0o700); err != nil {
+		t.Fatalf("make cache dir: %v", err)
+	}
+	env := append(os.Environ(), "BUILD="+buildPath, "BIN="+binPath, "CACHE="+cachePath)
 
 	// A bounded context, not context.Background: the shell under test is the
 	// error-handling half of a Dockerfile RUN, and a construct that hangs
@@ -190,41 +212,27 @@ const failingCompile = "#!/bin/sh\necho 'compile error' >&2\nexit 1\n"
 // compile outcome that would leave `docker compose --exit-code-from
 // test-runner` reporting a green integration suite that ran nothing.
 func TestIntegrationBuildRefusesAFalseGreen(t *testing.T) {
+	// The integration stage builds no test binary: `make integration-test`
+	// runs `go test` on the baked source, which fails on its own when the
+	// suites do not compile. So only the failing-compile case applies; the
+	// zero-byte, missing and empty binary cases of the old runner stage have
+	// no equivalent.
 	for _, tc := range []struct {
 		name, stub, why string
 	}{
 		{
 			name: "the compile fails",
 			stub: failingCompile,
-			why: "the build step exited 0 on a FAILING compile. `docker compose " +
-				"--exit-code-from test-runner` would report the integration suite " +
-				"green having run nothing.",
+			why: "the build step exited 0 on a FAILING compile of the integration " +
+				"suites; the image would build and the run would be the first to " +
+				"notice, or a swallowed error would hide it.",
 		},
 		{
-			// The outcome the old `|| echo ... && touch` construct actually
-			// produced: a zero-byte executable that exits 0 when run.
-			name: "a zero-byte binary",
-			stub: "#!/bin/sh\n: > \"$BIN\"\nchmod +x \"$BIN\"\nexit 0\n",
-			why: "the build step exited 0 with a ZERO-BYTE binary installed. " +
-				"execve returns ENOEXEC, the shell runs it as an empty script, and " +
-				"it exits 0 -- a green suite that ran nothing.",
-		},
-		{
-			// `go test -c` on a package with NO test files writes no output
-			// file and still exits 0, so a successful-looking compile can
-			// leave nothing behind.
-			name: "no binary is produced",
-			stub: "#!/bin/sh\nexit 0\n",
-			why:  "the build step exited 0 having produced no binary at all.",
-		},
-		{
-			// Non-empty and executable, so `test -s` is satisfied; it simply
-			// has no tests in it. Only the -test.list assertion catches this.
-			name: "the binary contains no tests",
-			stub: "#!/bin/sh\nprintf '#!/bin/sh\\nexit 0\\n' > \"$BIN\"\nchmod +x \"$BIN\"\n",
-			why: "the build step exited 0 with a binary that lists NO tests; " +
-				"`test -s` alone cannot tell a real test binary from any other " +
-				"non-empty file.",
+			// A compile that prints its error and exits non-zero after
+			// writing partial output must still fail the step.
+			name: "the compile fails after writing output",
+			stub: "#!/bin/sh\necho partial\necho 'vet: type error' >&2\nexit 2\n",
+			why:  "the build step exited 0 on a compile that exited 2.",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -252,7 +260,7 @@ func TestIntegrationBuildSucceedsOnARealBinary(t *testing.T) {
 
 // TestTheHarnessDetectsTheSwallowingConstruct is the discrimination control.
 //
-// The four failure cases above assert that the CURRENT body fails. On their own
+// The failure cases above assert that the CURRENT body fails. On their own
 // they cannot show that the harness would have caught the OLD one -- a stub
 // substitution that quietly neutered the shell would make them pass over any
 // body at all. So the historical construct is run through the identical

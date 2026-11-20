@@ -48,7 +48,7 @@ import (
 // referenceDownloadDockerfile holds the module download RUN instruction every
 // other private-module image must repeat verbatim. Dockerfiles cannot include
 // one another, so identity is enforced here instead.
-const referenceDownloadDockerfile = ".devcontainer/Dockerfile.dev"
+const referenceDownloadDockerfile = "build/docker/devcontainer/Dockerfile"
 
 // forgeOnlyModule is the first-party module that is served from the project
 // forge and not from the public proxy. A build list that holds it cannot be
@@ -61,9 +61,6 @@ const forgeOnlyModule = "github.com/jeremyhahn/go-enclave"
 // listed here, so whether it needs the credential block is decided from its
 // go.sum rather than left to whoever adds it.
 var moduleDownloadDockerfiles = map[string]string{
-	".devcontainer/Dockerfile":               ".",
-	".devcontainer/Dockerfile.dev":           ".",
-	".devcontainer/Dockerfile.integration":   ".",
 	"build/docker/devcontainer/Dockerfile":   ".",
 	"test/performance/quicraft/Dockerfile":   "test/performance/quicraft",
 	"test/performance/etcd/Dockerfile":       "test/performance/etcd",
@@ -363,50 +360,40 @@ type composeFile struct {
 }
 
 func TestComposeServicesTakeCredentialsFromTheEnvFile(t *testing.T) {
-	for _, tc := range []struct {
-		file     string
-		services []string
-	}{
-		{".devcontainer/docker-compose.yml", []string{"devcontainer", "integration"}},
-		{".devcontainer/docker-compose.integration.yml", []string{"test-runner"}},
-	} {
-		var cf composeFile
-		if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join(repoRoot, tc.file))), &cf); err != nil {
-			t.Fatalf("parse %s: %v", tc.file, err)
+	// The devcontainer images are built by the Makefile, which passes the
+	// credential file as the gomodauth BuildKit secret; compose.yaml only
+	// runs them, with the modules baked in and GOPROXY=off. So no service
+	// may build an image itself (a build here would bypass the secret), set
+	// a credential inline, or fetch a module at run time.
+	const file = "build/docker/devcontainer/compose.yaml"
+	var cf composeFile
+	if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join(repoRoot, file))), &cf); err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	for _, name := range []string{"integration", "toolchain"} {
+		svc, ok := cf.Services[name]
+		if !ok {
+			t.Errorf("%s: no service %q", file, name)
+			continue
 		}
-		if got := cf.Secrets["gomodauth"].File; got != ".env" {
-			t.Errorf("%s: secret gomodauth comes from %q, want .env (the single "+
-				"credential file, beside the compose file)", tc.file, got)
+		if svc.Build.Dockerfile != "" || len(svc.Build.Secrets) > 0 {
+			t.Errorf("%s: service %s builds its image; the Makefile builds it "+
+				"with the gomodauth secret", file, name)
 		}
-		for _, name := range tc.services {
-			svc, ok := cf.Services[name]
-			if !ok {
-				t.Errorf("%s: no service %q", tc.file, name)
-				continue
+		env := nodeText(&svc.Environment)
+		for _, k := range moduleCredentialVars {
+			if strings.Contains(env, k) {
+				t.Errorf("%s: service %s sets %s inline; credentials live only in "+
+					"the credential file", file, name, k)
 			}
-			if !strings.Contains(strings.Join(svc.Build.Secrets, ","), "gomodauth") {
-				t.Errorf("%s: service %s does not pass the gomodauth secret to its build", tc.file, name)
-			}
-			// The runner stage of Dockerfile.integration holds a compiled
-			// binary and no toolchain, so it fetches nothing at run time.
-			if name == "test-runner" {
-				continue
-			}
-			found := false
-			for _, ef := range svc.EnvFile {
-				if ef.Path == ".env" && ef.Required != nil && !*ef.Required {
-					found = true
-				}
-			}
-			if !found {
-				t.Errorf("%s: service %s does not load .env (required: false) at run time; "+
-					"go inside the container could not reach the forge", tc.file, name)
-			}
-			for _, k := range moduleCredentialVars {
-				if strings.Contains(nodeText(&svc.Environment), k) {
-					t.Errorf("%s: service %s sets %s inline; credentials live only in .env", tc.file, name, k)
-				}
-			}
+		}
+		if !strings.Contains(env, "GOPROXY off") {
+			t.Errorf("%s: service %s does not set GOPROXY to off; go inside the "+
+				"container could fetch a module at run time (environment: %q)", file, name, env)
+		}
+		for _, ef := range svc.EnvFile {
+			t.Errorf("%s: service %s loads %s; the credential file stays out of "+
+				"the running container", file, name, ef.Path)
 		}
 	}
 }
