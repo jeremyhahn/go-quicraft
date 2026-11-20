@@ -836,6 +836,90 @@ func Test_IsUnwrap_removeDataError(t *testing.T) {
 	}
 }
 
+// TestReadRemoveDataIntent_FailurePaths pins readRemoveDataIntent's
+// refusals: an intent that cannot be read is a typed I/O error that is not
+// ErrInvalidOperation, and an intent that names anything other than the
+// replica's own canonical snapshot directory (a non-canonical spelling of
+// it, or a path below it) is refused, so RemoveAll never follows it.
+func TestReadRemoveDataIntent_FailurePaths(t *testing.T) {
+	const shardID, replicaID = 3, 4
+	dataDir := t.TempDir()
+	replicaDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir("", dataDir, shardID), shardID, replicaID)
+
+	newIntentHost := func(t *testing.T) (*Host, string) {
+		t.Helper()
+		dir := t.TempDir()
+		h := &Host{}
+		h.cfg.NodeHostDir = dir
+		p := removeDataIntentPath(dir, shardID, replicaID)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return h, p
+	}
+
+	t.Run("unreadable intent", func(t *testing.T) {
+		h, p := newIntentHost(t)
+		// A directory at the intent path opens but cannot be read.
+		if err := os.Mkdir(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		named, pending, err := h.readRemoveDataIntent(shardID, replicaID)
+		var rde *removeDataError
+		if pending || named != "" || !errors.As(err, &rde) {
+			t.Fatalf("readRemoveDataIntent(directory) = %q, %v, %T %v; want a *removeDataError",
+				named, pending, err, err)
+		}
+		if rde.Op != "read removal intent" || rde.Path != p {
+			t.Fatalf("removeDataError = %+v, want op %q path %s", rde, "read removal intent", p)
+		}
+		if errors.Is(err, ErrInvalidOperation) {
+			t.Fatalf("an I/O failure reading the intent matched ErrInvalidOperation: %v", err)
+		}
+	})
+
+	refused := []struct {
+		name, intent string
+	}{
+		{"trailing separator", replicaDir + string(filepath.Separator)},
+		{"dot segment", filepath.Join(replicaDir, "..", filepath.Base(replicaDir)) + string(filepath.Separator) + "."},
+		{"path below the replica directory", filepath.Join(replicaDir, "snapshot-0000000000000010")},
+		{"another replica", engine.ReplicaSnapshotDir(
+			shardSnapshotBaseDir("", dataDir, shardID), shardID, replicaID+1)},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			h, p := newIntentHost(t)
+			if err := os.WriteFile(p, []byte(tc.intent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			named, pending, err := h.readRemoveDataIntent(shardID, replicaID)
+			var le *removeDataLayoutUnknownError
+			if pending || named != "" || !errors.As(err, &le) {
+				t.Fatalf("readRemoveDataIntent(%q) = %q, %v, %v; want a *removeDataLayoutUnknownError",
+					tc.intent, named, pending, err)
+			}
+			if le.filepath != tc.intent || !errors.Is(err, ErrInvalidOperation) {
+				t.Fatalf("refusal = %+v (%v), want filepath %q matching ErrInvalidOperation",
+					le, err, tc.intent)
+			}
+		})
+	}
+
+	t.Run("canonical intent", func(t *testing.T) {
+		h, p := newIntentHost(t)
+		if err := os.WriteFile(p, []byte(replicaDir), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		named, pending, err := h.readRemoveDataIntent(shardID, replicaID)
+		if err != nil || !pending || named != replicaDir {
+			t.Fatalf("readRemoveDataIntent(canonical) = %q, %v, %v; want %q, true, nil",
+				named, pending, err, replicaDir)
+		}
+	})
+}
+
 // Test_IsUnwrap_removalRefusals pins what a caller may assume of the two
 // RemoveData-era refusals: both match ErrInvalidOperation, neither matches
 // the other's sentinel or ErrClosed, and each message names the shard,
