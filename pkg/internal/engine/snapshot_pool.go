@@ -2016,11 +2016,22 @@ func openLeasedSaveStage(node *Node, stageParent string) (stageDir string, f *os
 // result is ErrStopped with nothing written.
 func writeLeasedSnapshotMetadata(node *Node, dir string, index, term, shardID, replicaID, epoch uint64,
 	compression config.CompressionType) error {
+	// Hash snapshot.dat BEFORE the lease: it is a full read of the artifact,
+	// and UnloadNode waits out every write lease. Under the lease only the
+	// node is checked and the metadata file is written. A node already
+	// stopped is refused before the read, as the lease would refuse it.
+	if node.IsStopped() {
+		return ErrStopped
+	}
+	dataHash, dataLen, err := stampSnapshotHash(filepath.Join(dir, snapshotDataFile))
+	if err != nil {
+		return err
+	}
 	if !node.TryAcquireWriteLease() {
 		return ErrStopped
 	}
 	defer node.ReleaseWriteLease()
-	return writeSnapshotMetadata(dir, index, term, shardID, replicaID, epoch, compression)
+	return writeSnapshotMetaFile(dir, index, term, shardID, replicaID, epoch, compression, dataHash, dataLen)
 }
 
 // saveStageOpenData creates a save stage's data file. A variable so a test
@@ -3969,6 +3980,13 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 	if err != nil {
 		return err
 	}
+	return writeSnapshotMetaFile(dir, index, term, shardID, replicaID, epoch, compression, dataHash, dataLen)
+}
+
+// writeSnapshotMetaFile writes and fsyncs the snapshot.meta record in dir
+// with integrity fields the caller already computed over snapshot.dat.
+func writeSnapshotMetaFile(dir string, index, term, shardID, replicaID, epoch uint64,
+	compression config.CompressionType, dataHash, dataLen uint64) (err error) {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
