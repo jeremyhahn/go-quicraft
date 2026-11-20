@@ -2734,6 +2734,62 @@ func TestStateMachine_RLockContext_CancelThenUnlockBeforeResume(t *testing.T) {
 	rsm.readGuard.Unlock()
 }
 
+// TestStateMachine_RLockContext_NoDoneContextDoesNotQueue pins rlockContext's
+// branch for a context that can never be cancelled (Done() == nil): the read
+// blocks on the guard without registering in readWait, so lockApply never
+// waits for it to drain, and it completes once the apply releases the guard.
+func TestStateMachine_RLockContext_NoDoneContextDoesNotQueue(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	rsm.lockApply()
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(rsm.unlockApply) }
+	errs := make(chan error, 1)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		_, lookupErr := rsm.Lookup(context.Background(), "key")
+		errs <- lookupErr
+	}()
+	// Runs before the deferred Close: the guard is released and the reader
+	// joined even when a line below fails.
+	defer func() {
+		unlock()
+		<-readerDone
+	}()
+
+	// The reader is blocked on the guard; give it time to (wrongly) register.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case lookupErr := <-errs:
+		t.Fatalf("Lookup returned %v while the apply held the guard", lookupErr)
+	default:
+	}
+	if n := rsm.readWait.waiters.Load(); n != 0 {
+		t.Fatalf("a Background-context reader registered in readWait: waiters = %d", n)
+	}
+	if d := rsm.readWait.pending(); d != nil {
+		t.Fatal("readWait.pending() is non-nil for a reader that cannot be cancelled")
+	}
+	unlock()
+
+	select {
+	case lookupErr := <-errs:
+		if lookupErr != nil {
+			t.Fatalf("Lookup after the apply released the guard = %v, want nil", lookupErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup did not return within 2s after the apply released the guard")
+	}
+}
+
 func TestStateMachine_NALookupBuf_ErrorPropagated(t *testing.T) {
 	// testNALookupIntoSMError returns an error from BytesLookupInto.
 	kv := &testNALookupIntoSMError{}
