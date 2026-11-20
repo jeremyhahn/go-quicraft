@@ -892,6 +892,59 @@ func TestSnapshotPool_WriteSnapshotMetadata_InvalidDir(t *testing.T) {
 	}
 }
 
+// TestSnapshotPool_WriteLeasedSnapshotMetadata_HashesBeforeLease: the
+// snapshot.dat hash is a full read of the artifact, so it must not run under
+// the node's write lease, which UnloadNode waits out. With the hash held,
+// stopping the node and awaiting its leases returns at once; the released
+// save then finds the node stopped and writes no metadata.
+func TestSnapshotPool_WriteLeasedSnapshotMetadata_HashesBeforeLease(t *testing.T) {
+	node := newAuditNode(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, snapshotDataFile), []byte("snapshot"), 0o600); err != nil {
+		t.Fatalf("write data file: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	orig := stampSnapshotHash
+	stampSnapshotHash = func(path string) (uint64, uint64, error) {
+		close(entered)
+		<-release
+		return orig(path)
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		stampSnapshotHash = orig
+	})
+
+	saveErr := make(chan error, 1)
+	go func() {
+		saveErr <- writeLeasedSnapshotMetadata(node, dir, 5, 1, 10, 1, 0, config.NoCompression)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the metadata write never started its hash")
+	}
+
+	node.Stop()
+	awaitLeasesWithin(t, node, 2*time.Second)
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-saveErr:
+		if !errors.Is(err, ErrStopped) {
+			t.Fatalf("metadata write after the node stopped = %v, want ErrStopped", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the released metadata write never returned")
+	}
+	if _, err := os.Stat(filepath.Join(dir, snapshotMetadataFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a stopped node's save wrote snapshot.meta (stat err %v)", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Barrier/encryption test helpers
 // ---------------------------------------------------------------------------
