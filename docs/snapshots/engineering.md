@@ -188,6 +188,7 @@ workers, so a large save or recovery cannot stall step, commit or apply.
 | `*SnapshotSendError` / `*SnapshotReceiveError` | the transfer failed | yes |
 | `*SnapshotArtifactError` | an export artifact is malformed or fails verification: bad header, missing or malformed trailer, or a payload that does not match its trailer (which also matches `ErrSnapshotCorrupt`) | yes |
 | `*SnapshotOptionError` (`ErrInvalidSnapshotOption`) | `SnapshotOption.Validate` rejected the request | yes |
+| `*SnapshotDestinationError` | a re-encryption destination already holds `snapshot.dat` (`fs.ErrExist`), cannot be looked up, or the source or destination path is not in clean form (`fs.ErrInvalid`); refused before anything is written | yes |
 | `*SnapshotCommittedNotDurableError` | see below | partially; read this one |
 | `*ImportSnapshotDirExistsError` | the import destination directory already exists | yes |
 | `*ImportSnapshotOutOfDateError` | the imported snapshot is older than what the replica holds | yes |
@@ -209,7 +210,8 @@ returns cannot carry this case on its own: the usual
 `if err != nil { return 0, 0, err }` drops exactly the epoch and size it
 delivers.
 
-**A caller that gets this error must record `Epoch`.** Dropping it lets the next
+**A caller that gets this error must record `Epoch`**, and the `fileSize`
+returned beside it as the record's `FileSize`. Dropping the epoch lets the next
 DEK purge orphan the artifact's key, and the artifact can then never be opened.
 Treat the migration as unverified until the destination is checked again.
 
