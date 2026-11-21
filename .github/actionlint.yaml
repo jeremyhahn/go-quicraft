@@ -6,7 +6,9 @@ self-hosted-runner:
   labels:
     # Only the code-review workflow's runners are self-hosted
     # (workflows/code-review.yml): Codex reviews on `codex`, the advisory
-    # opencode review on `qwen` (CUSTOMIZE). Every other job runs on
-    # GitHub-hosted ubuntu-latest.
+    # opencode review on `qwen` (CUSTOMIZE). Only ci.yml's preflight job names
+    # `bigdisk`, the self-hosted bigdisk pool, and only on github.com
+    # (ci-template v1.49). Every other job runs on GitHub-hosted ubuntu-latest.
     - codex
     - qwen
+    - bigdisk

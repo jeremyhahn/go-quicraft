@@ -37,11 +37,15 @@ import (
 // more than a standard runner's 4 vCPU, 16 GB, about 45 GB of disk or 6
 // hours. `credential:` is accepted only for code-review.yml's Codex review
 // job, whose reviewer token is mounted on one runner. ci.yml and release.yml
-// carry no waiver at all: every job in them runs on hostedRunner, a job that
-// names the `release` label included.
+// carry no waiver at all: every job in release.yml runs on hostedRunner, a
+// job that names the `release` label included, and so does every ci.yml job
+// but preflight, whose one pinned pool expression, preflightRunsOn
+// (ci-template v1.49), falls back to hostedRunner off github.com and when
+// the repository variable CI_PREFLIGHT_RUNS_ON says so.
 const (
 	hostedRunner     = "ubuntu-latest"
 	selfHostedWaiver = "# self-hosted: "
+	preflightRunsOn  = `${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
 )
 
 // waiverCategories are the categories any waived job may name.
@@ -137,6 +141,8 @@ func runnerProblems(file string, body []byte) []string {
 			if p := waiverProblem(j.runsOn.LineComment, credentialOK); p != "" {
 				problems = append(problems, where+" "+p)
 			}
+		case file == "ci.yml" && j.name == "preflight" && j.runsOn.Value == preflightRunsOn:
+			continue
 		case strings.Contains(j.runsOn.Value, "${{"):
 			problems = append(problems, where+" runs on an expression, which can pick a self-hosted label: "+strconv.Quote(j.runsOn.Value))
 		case j.runsOn.Value == hostedRunner:
@@ -204,6 +210,26 @@ func TestCIRunsHostedFirst(t *testing.T) {
 	}
 }
 
+// TestCIPreflightRunsOnPinned keeps ci.yml's preflight runs-on equal to
+// preflightRunsOn, so the one expression runnerProblems admits cannot drift
+// from the workflow without this test failing.
+func TestCIPreflightRunsOnPinned(t *testing.T) {
+	jobs, problem := runnerJobs("ci.yml", readWorkflow(t, "ci.yml"))
+	if problem != "" {
+		t.Fatal(problem)
+	}
+	for _, j := range jobs {
+		if j.name != "preflight" {
+			continue
+		}
+		if j.runsOn == nil || j.runsOn.Value != preflightRunsOn {
+			t.Fatalf("ci.yml job preflight runs-on is not the pinned pool expression %q", preflightRunsOn)
+		}
+		return
+	}
+	t.Fatal("ci.yml has no preflight job")
+}
+
 // TestRunnerProblems shows that runnerProblems reports each regression of
 // the runner rule, and accepts a categorised waiver where one is allowed.
 func TestRunnerProblems(t *testing.T) {
@@ -234,6 +260,9 @@ func TestRunnerProblems(t *testing.T) {
 		{"a ci.yml job sent to a self-hosted label", ci("coverage", "bigdisk"), "ci.yml job coverage runs on \"bigdisk\"; every ci.yml job"},
 		{"a waived ci.yml job", ci("coverage", "bigdisk  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), "ci.yml job coverage carries a self-hosted waiver"},
 		{"a ci.yml expression", ci("coverage", expr), "ci.yml job coverage runs on an expression"},
+		{"preflight's pool expression on another job", ci("coverage", preflightRunsOn), "ci.yml job coverage runs on an expression"},
+		{"preflight's pool expression changed", ci("preflight", strings.Replace(preflightRunsOn, `"bigdisk"`, `"bigdisk-docker"`, 1)), "ci.yml job preflight runs on an expression"},
+		{"preflight back on the hosted runner is allowed", ci("preflight", hostedRunner), ""},
 		{"a hardware waiver is allowed", cr("scope", "bigdisk  "+selfHostedWaiver+"hardware: needs the attached device"), ""},
 		{"an oversize waiver is allowed", cr("scope", "bigdisk  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), ""},
 		{"a waiver after another comment is allowed", cr("review-opencode", "qwen  # CUSTOMIZE: the label "+selfHostedWaiver+"hardware: the model host"), ""},

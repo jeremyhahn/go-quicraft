@@ -1,13 +1,30 @@
-# ci-template: v1.48 (customized)
-# LOCAL against v1.48 (kept on purpose):
+# ci-template: v1.49 (customized)
+# v1.49: on github.com the preflight job runs on the self-hosted bigdisk
+# pool, `fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]')`,
+# so no run waits in the hosted queue for its ten seconds of work. The
+# repository variable CI_PREFLIGHT_RUNS_ON (runs-on JSON) is the fallback
+# switch: it is set to `"ubuntu-latest"` (quotes included; a value that is
+# not JSON fails the run) while that pool is down. Off github.com preflight
+# stays on `ubuntu-latest`. preflight sets up no Go, builds nothing and runs
+# none of the PR's tree; it reads the tree as text and checks out with
+# persist-credentials false. The schedule guard's AGENT_TOKEN is passed off
+# github.com only: on github.com the guard never reads it, so the secret
+# does not reach the self-hosted runner. The `Runner labels` step checks
+# preflight's runs-on with the variable unset and set to the fallback.
+# LOCAL against v1.49 (kept on purpose):
 # - CI_FULL_TIER keeps the v1.35.1 condition (a PR runs the full tier only
 #   with the ci:full label; test/buildgates/ci_gate_test.go asserts it), so
 #   v1.41's every-PR full tier is not taken and CI_FULL_LABEL is CI_FULL_TIER.
-# - Every job names ubuntu-latest directly (hosted first, below); v1.48's
-#   preflight runner selection and the overflow runs-on JSON are not taken.
+# - Every job but preflight names ubuntu-latest directly (hosted first,
+#   below); v1.48's preflight runner selection step and the overflow runs-on
+#   JSON are still not taken, so v1.49's hunk in that step's "In progress:"
+#   comment is not taken either (this repository does not carry the step).
 # - The Signatures job stays here (v1.35.2 moved it to signatures.yml).
-# HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
-# waiver on its runs-on line that names its category and a reason:
+# HOSTED FIRST: every job but preflight runs on ubuntu-latest. preflight's
+# v1.49 pool expression is the one exception, and
+# test/buildgates/ci_runners_test.go pins it exactly. Any other job leaves
+# ubuntu-latest only with a waiver on its runs-on line that names its
+# category and a reason:
 # `# self-hosted: hardware: <reason>` (the job needs specific hardware), or
 # `# self-hosted: oversize: <reason>` (it needs more than a standard runner's
 # 4 vCPU, 16 GB memory, about 45 GB disk or 6 hours). No ci.yml job carries a
@@ -45,10 +62,12 @@
 # (handbook software/templates/signing/<repo>.allowed_signers); every other
 # job, gate and tier is v1.34.1's.
 # v1.34: the changes, schedule-guard and arch-gates jobs are one `preflight` job (see its comment).
-# Hosted runners (go-quicraft, after go-quicbaas #261): every job runs on
-# GitHub-hosted ubuntu-latest (4 vCPU, 16 GB, about 14 GB free disk, a 6 h
-# job limit); no job names a self-hosted label (.github/actionlint.yaml keeps
-# only code-review.yml's review runners). Each job frees the runner's
+# Hosted runners (go-quicraft, after go-quicbaas #261): every job but
+# preflight runs on GitHub-hosted ubuntu-latest (4 vCPU, 16 GB, about 14 GB
+# free disk, a 6 h job limit); no other job names a self-hosted label.
+# preflight's pool on github.com is the exception (v1.49):
+# .github/actionlint.yaml lists bigdisk for it, beside code-review.yml's
+# review runners. Each job frees the runner's
 # preinstalled toolchains before it builds an image. The -race unit suite is
 # four `unit` shards (`make coverage-shard`) joined by the `coverage` job
 # (`make coverage-merge`, the threshold); integration is two shards
@@ -714,7 +733,12 @@ jobs:
   # v1.23: a lint-class check, so it stays on the PR tier.
   preflight:
     name: Preflight [changed files, schedule guard, architecture gates]
-    runs-on: ubuntu-latest
+    # v1.49: on github.com the self-hosted bigdisk pool, so no run waits in
+    # the hosted queue for its first ten seconds of work; the repository
+    # variable CI_PREFLIGHT_RUNS_ON, runs-on JSON, overrides it (set to
+    # `"ubuntu-latest"`, quotes included, while that pool is down). Off
+    # github.com ubuntu-latest, as before.
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -742,7 +766,10 @@ jobs:
           REPO_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
           JOB_TOKEN: ${{ github.token }}
           # v1.30: a push to main reads the tree proof with it as well.
-          BOT: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.AGENT_TOKEN || '' }}
+          # v1.49: off github.com only. On github.com the guard never reads it
+          # (no schedule check, no tree proof there), so the secret does not
+          # reach the step on the self-hosted runner.
+          BOT: ${{ github.server_url != 'https://github.com' && (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.AGENT_TOKEN || '' }}
         run: |
           set -uo pipefail
           # runs <token>: sets N to the number of this workflow's push runs
@@ -876,6 +903,10 @@ jobs:
       # output at its default ("ubuntu-latest", which must give a standard
       # image) and at its overflow, where exactly
       # [self-hosted, linux, x64, bigdisk] or [..., bigdisk-docker] passes too.
+      # v1.49: the preflight job's own runs-on, which reads
+      # vars.CI_PREFLIGHT_RUNS_ON, is checked with the variable unset, where
+      # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to
+      # `"ubuntu-latest"`, where it must give a standard image.
       # Its tests: testdata/runner-labels-tests.py.
       - name: Runner labels
         run: |
@@ -1201,6 +1232,15 @@ jobs:
           SEL_OUT = {"needs.preflight.outputs.runner": "bigdisk",
                      "needs.preflight.outputs.runner_docker": "bigdisk-docker"}
           OVERFLOW = [["self-hosted", "linux", "x64", v] for v in SEL_OUT.values()]
+          # v1.49: ci.yml's preflight job alone may read the repository
+          # variable CI_PREFLIGHT_RUNS_ON. Its runs-on is checked in two
+          # states of its own, in place of the selection's: unset, where
+          # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to
+          # the fallback `"ubuntu-latest"`, where it must give a standard image
+          # on every event. Another job that reads the variable reads an unknown.
+          PRE_JOB = "preflight"
+          PRE_VAR = "vars.ci_preflight_runs_on"
+          PRE_READ = re.compile(r"(?<![\w.])vars\.CI_PREFLIGHT_RUNS_ON(?![\w-])", re.I)
           HOSTED_CTX = [  # (event, ref, head repo) on github.com; o/r is this repository
               ("push", "refs/heads/main", None), ("push", "refs/heads/feature", None),
               ("pull_request", "refs/pull/1/merge", "o/r"), ("pull_request", "refs/pull/1/merge", "fork/r"),
@@ -1213,6 +1253,8 @@ jobs:
                   p = path.lower()
                   if sel and p in SEL_OUT:  # v1.48: the selection output, as JSON text
                       return json.dumps("ubuntu-latest" if sel == "default" else ["self-hosted", "linux", "x64", SEL_OUT[p]])
+                  if sel in ("unset", "set") and p == PRE_VAR:  # v1.49: unset, or the fallback switch
+                      return None if sel == "unset" else json.dumps("ubuntu-latest")
                   if p == "github.server_url":
                       return GH
                   if p == "github.repository":
@@ -1324,6 +1366,8 @@ jobs:
                                   continue
                               off = []
                               sels = ("default", "overflow") if path.replace("\\", "/").rsplit("/", 1)[-1] in SEL_FILES else (None,)
+                              if sels[0] is not None and job == PRE_JOB and PRE_READ.search(ro):
+                                  sels = ("unset", "set")  # v1.49: its own two states, no selection output
                               for ev, ref, head in HOSTED_CTX:
                                   for sel in sels:
                                       try:
@@ -1333,9 +1377,13 @@ jobs:
                                           continue
                                       if got is not None and sel == "overflow" and got in OVERFLOW:
                                           continue
+                                      if sel == "unset" and got == OVERFLOW[0]:
+                                          continue
                                       if got is None or len(got) != 1 or not STANDARD.fullmatch(got[0]):
                                           what = "an unknown label" if got is None else ", ".join(got)
                                           note = ", runner selection overflow" if sel == "overflow" else ""
+                                          if sel in ("unset", "set"):
+                                              note = ", CI_PREFLIGHT_RUNS_ON " + ("unset" if sel == "unset" else 'set to "ubuntu-latest"')
                                           off.append(f"{ev} ({ref}{', fork' if head == 'fork/r' else ''}{note}): {what}")
                               if off and BARE.search(ro_line):
                                   bad.append(f"{where}: (e) its `# self-hosted:` reason names no category; the template allows a self-hosted job "
