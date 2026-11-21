@@ -276,7 +276,7 @@ case("E5 self-hosted on some event beside the selection fails (c)",
                               "|| fromJSON(needs.preflight.outputs.runner) }}", name="mix"))}, 1,
      ["ci.yml:mix: (c)", "push (refs/heads/main)"])
 case("E6 an overflow to any other label fails (c)",
-     {"ci.yml": wf(PR_ON, job("${{ needs.preflight.outputs.runner_docker == '\"ubuntu-latest\"' && 'ubuntu-latest' || 'dells' }}",
+     {"ci.yml": wf(PR_ON, job("${{ needs.preflight.outputs.runner_docker == '\"ubuntu-latest\"' && 'ubuntu-latest' || 'other-pool' }}",
                               name="other"))}, 1, ["ci.yml:other: (c)", "runner selection overflow"])
 case("E7 another job's output is not the selection: (c)",
      {"ci.yml": wf(PR_ON, job("${{ fromJSON(needs.route.outputs.runner) }}", name="dyn"))}, 1, ["ci.yml:dyn: (c)"])
