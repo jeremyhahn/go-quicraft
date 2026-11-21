@@ -150,11 +150,13 @@ bench-statemachine:
 
 # check-coverage: extract percentage from coverage profile and fail if below threshold
 # Usage: $(call check-coverage,profile.out,package-name)
+# The comparison fails closed: a total that is not a number, or an awk that
+# cannot run, fails the recipe like a total below COVER_MIN.
 define check-coverage
 	@COVERAGE=$$($(GO) tool cover -func=$(1) | grep total | awk '{print $$3}' | sed 's/%//'); \
 	echo "$(2) coverage: $${COVERAGE}%"; \
-	if [ $$(echo "$${COVERAGE} < $(COVER_MIN)" | bc -l) -eq 1 ]; then \
-		echo "FAIL: $(2) coverage $${COVERAGE}% is below minimum $(COVER_MIN)%"; \
+	if ! awk -v c="$${COVERAGE}" -v m="$(COVER_MIN)" 'BEGIN { exit !(c ~ /^[0-9]+(\.[0-9]+)?$$/ && c + 0 >= m + 0) }'; then \
+		echo "FAIL: $(2) coverage $${COVERAGE}% is below minimum $(COVER_MIN)% or could not be read"; \
 		exit 1; \
 	fi
 endef
