@@ -15,10 +15,13 @@
 package buildgates
 
 import (
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -129,5 +132,105 @@ func TestImageHistoryProblemsCatchesAnUnsetVariable(t *testing.T) {
 		"        run: echo \"IT_IMAGE=x\" >> \"$GITHUB_ENV\"\n"
 	if p := imageHistoryProblems(late, ""); len(p) == 0 {
 		t.Error("a variable set only after the check was not reported")
+	}
+}
+
+// suiteStep is the part of a workflow step the integration-suite check reads.
+type suiteStep struct {
+	Name string `yaml:"name"`
+	ID   string `yaml:"id"`
+	If   string `yaml:"if"`
+	Run  string `yaml:"run"`
+}
+
+// integrationSuiteProblems reports how an integration job's steps could run
+// the suite on an image the image-history check has not passed: no step
+// before the check builds a missing image, the check is skipped on some
+// condition other than a hosted runner (or has no id to key on), or the
+// suite step does not require the check's success off hosted runners.
+func integrationSuiteProblems(steps []suiteStep) []string {
+	var probs []string
+	check := -1
+	for i, s := range steps {
+		if strings.Contains(s.Run, "scripts/ci-image-history.sh") && strings.Contains(s.Run, "$IT_IMAGE") {
+			check = i
+			break
+		}
+	}
+	if check < 0 {
+		return []string{"no step runs scripts/ci-image-history.sh on $IT_IMAGE"}
+	}
+	built := false
+	for _, s := range steps[:check] {
+		if strings.Contains(s.Run, "docker image inspect") && strings.Contains(s.Run, "make docker-build-it") {
+			built = true
+		}
+	}
+	if !built {
+		probs = append(probs, "no step before the image-history check builds the "+
+			"integration image when the daemon lacks it (make docker-build-it)")
+	}
+	c := steps[check]
+	if c.ID == "" {
+		probs = append(probs, "the image-history check has no id for the suite to key on")
+	}
+	if strings.Contains(c.If, "IT_LEASE") {
+		probs = append(probs, "the image-history check is skipped when IT_LEASE is "+
+			"empty, so a missing image runs unchecked")
+	}
+	suite := -1
+	for i, s := range steps {
+		if strings.Contains(s.Run, "make integration-test") {
+			suite = i
+		}
+	}
+	switch {
+	case suite < 0:
+		probs = append(probs, "no step runs make integration-test")
+	case suite < check:
+		probs = append(probs, "make integration-test runs before the image-history check")
+	default:
+		cond := steps[suite].If
+		if c.ID == "" || !strings.Contains(cond, "steps."+c.ID+".outcome == 'success'") ||
+			!strings.Contains(cond, "runner.environment == 'github-hosted'") {
+			probs = append(probs, fmt.Sprintf("make integration-test's if: %q does not "+
+				"require the image-history check's success off hosted runners", cond))
+		}
+	}
+	return probs
+}
+
+func TestIntegrationSuiteRunsOnlyOnACheckedImage(t *testing.T) {
+	raw, err := os.ReadFile(ciWorkflowPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", ciWorkflowPath, err)
+	}
+	var wf struct {
+		Jobs map[string]struct {
+			Steps []suiteStep `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(raw, &wf); err != nil {
+		t.Fatalf("parse %s: %v", ciWorkflowPath, err)
+	}
+	job, ok := wf.Jobs["integration"]
+	if !ok {
+		t.Fatalf("%s: no integration job", ciWorkflowPath)
+	}
+	for _, p := range integrationSuiteProblems(job.Steps) {
+		t.Errorf("integration job: %s", p)
+	}
+
+	// The form this replaces: the lease step leases only an image already on
+	// the daemon, the check is keyed on the lease, and the suite builds a
+	// missing image and runs it unchecked.
+	old := []suiteStep{
+		{Name: "Lease the integration image", Run: "if docker image inspect \"$IT_IMAGE\"; then docker create; fi"},
+		{Name: "Check", If: "${{ !cancelled() && env.IT_IMAGE != '' && env.IT_LEASE != '' && runner.environment != 'github-hosted' }}",
+			Run: "scripts/ci-image-history.sh \"$IT_IMAGE\""},
+		{Name: "make integration-test", Run: "make integration-test IT_IMAGE=\"$IT_IMAGE\""},
+	}
+	if p := integrationSuiteProblems(old); len(p) < 3 {
+		t.Errorf("the lease-keyed form was not fully reported: %v", p)
 	}
 }
