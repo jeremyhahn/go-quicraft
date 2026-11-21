@@ -78,6 +78,15 @@ type ConfigChange struct {
 	// learning it from the joiner's own connection is unsound in exactly the
 	// threat model identities exist to close.
 	NodeIdentity string
+	// MustMatchConfigChangeID is an IN-MEMORY marker, never encoded: it is
+	// excluded from Size, MarshalTo and UnmarshalFrom, so it changes neither
+	// the wire encoding nor any format version. It binds an add whose
+	// ConfigChangeID is 0 (the initial configuration) to that value: the
+	// leader's membership validator refuses the change unless the current
+	// config change ID is still 0. A non-zero ConfigChangeID is always bound
+	// and needs no marker. The marker is set by the Host's bound option and
+	// read by the validator before the change is marshaled into a log entry.
+	MustMatchConfigChangeID bool
 }
 
 // configChangeFixedSize is the wire size of the fixed fields:
@@ -242,4 +251,5 @@ func (cc *ConfigChange) Reset() {
 	cc.RequireFullReplicaMajority = false
 	cc.WireVersion = 0
 	cc.NodeIdentity = ""
+	cc.MustMatchConfigChangeID = false
 }

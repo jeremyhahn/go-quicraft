@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,11 @@ import (
 //	Step Worker -> Tick/Handle/Propose/GetUpdate -> sends Update via channel
 //	Commit Worker -> Commit -> ownership returns to Step Worker
 type Peer struct {
+	// boundConfigChanges holds the proposal keys of config change entries the
+	// Host bound to their ConfigChangeID even when it is 0 (see
+	// BindConfigChange). Written by the Host goroutine, consumed by the step
+	// worker in handleLeaderPropose; hence a sync.Map.
+	boundConfigChanges sync.Map
 	// r is the core Raft state machine. All protocol operations are
 	// delegated to it. It is not safe for concurrent access; the engine
 	// pipeline enforces single-owner semantics.
@@ -339,6 +345,7 @@ func NewPeer(cfg config.Config, logReader LogReader, globalRL *server.RateLimite
 	// than a copy taken here. Both this and handleLeaderPropose run on the step
 	// worker, which is the goroutine that owns that membership.
 	r.validateConfigChange = p.validateProposedConfigChange
+	r.takeBoundConfigChange = p.takeBoundConfigChange
 
 	p.publishMembership()
 	p.syncLeaderID()
@@ -902,6 +909,15 @@ func (p *Peer) markStep() {
 	p.stepMarkTerm, _ = p.r.log.lastTerm()
 }
 
+// releaseRefusedBindings forgets the bindings (BindConfigChange) of the
+// config changes in a refused Propose: it appended nothing, so they will
+// never be validated.
+func (p *Peer) releaseRefusedBindings(msg proto.Message, err error) {
+	if err != nil && msg.Type == proto.Propose {
+		p.r.takeBoundConfigChanges(msg.Entries)
+	}
+}
+
 // Handle routes an incoming Raft protocol message to the raft state
 // machine. The raft struct handles all message types: term-based
 // transitions, vote requests/responses, append entries, heartbeats,
@@ -944,6 +960,8 @@ func (p *Peer) Handle(msg proto.Message) error {
 	}
 
 	err := p.r.step(msg)
+
+	p.releaseRefusedBindings(msg, err)
 
 	// raft.step DROPS a message whose term is behind ours and returns nil
 	// (see the msg.Term < r.term branch in step). A nil error therefore does
@@ -1201,6 +1219,35 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 
 	p.syncLeaderID()
 	return nil
+}
+
+// BindConfigChange marks the config change entry with proposal key as bound
+// to its ConfigChangeID even when that ID is 0: the leader's propose-time
+// validation then refuses it unless the membership's current config change ID
+// still equals it (proto.ConfigChange.MustMatchConfigChangeID). The marker is
+// in-memory and never encoded, so it is carried here, beside the entry, by
+// key. Call it before the entry is delivered; the first Propose that carries
+// the key consumes it, whether it validates, refuses or (on a non-leader)
+// refuses to forward the entry. Safe for concurrent use.
+func (p *Peer) BindConfigChange(key uint64) {
+	if key != 0 {
+		p.boundConfigChanges.Store(key, struct{}{})
+	}
+}
+
+// UnbindConfigChange forgets a key bound by BindConfigChange whose entry was
+// never delivered (registration or delivery refused). Do not call it for an
+// entry that may still be taken from the proposal queue, such as one whose
+// deadline expired: the raft layer consumes the binding when the entry is
+// taken (validated, refused, or refused instead of being forwarded).
+func (p *Peer) UnbindConfigChange(key uint64) {
+	p.boundConfigChanges.Delete(key)
+}
+
+// takeBoundConfigChange reports whether key was bound and forgets it.
+func (p *Peer) takeBoundConfigChange(key uint64) bool {
+	_, ok := p.boundConfigChanges.LoadAndDelete(key)
+	return ok
 }
 
 // validateProposedConfigChange validates a config change against the MUTABLE
