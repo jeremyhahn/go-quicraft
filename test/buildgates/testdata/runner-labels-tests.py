@@ -311,8 +311,10 @@ case("F6 the variable without fromJSON fails (c): set, it is not an image name",
 case("F7 another variable is not the switch: (c)",
      {"ci.yml": wf(PR_ON, job(PRE.replace("CI_PREFLIGHT_RUNS_ON", "CI_PREFLIGHT_RUNS_ON_X"), name="preflight"))}, 1,
      ["ci.yml:preflight: (c)"])
-case("F8 the off-github.com label is not checked: the forge keeps ubuntu-latest",
-     {"ci.yml": wf(PR_ON, job(PRE.replace("|| 'ubuntu-latest'", "|| 'bigdisk'"), name="preflight"))}, 0, ["OK:"])
+case("F8 the fallback also serves a fork pull request on github.com: a self-hosted fallback fails (c)",
+     {"ci.yml": wf(PR_ON, job(PRE.replace("|| 'ubuntu-latest'", "|| 'bigdisk'"), name="preflight"))}, 1,
+     ["ci.yml:preflight: (c)", "pull_request (refs/pull/1/merge, fork, CI_PREFLIGHT_RUNS_ON unset): bigdisk"],
+     ["push (refs/heads/main"])
 case("F9 the default without the head-repository guard fails (c): a fork pull request would reach the pool",
      {"ci.yml": wf(PR_ON, job(PRE_UNGUARDED, name="preflight"))}, 1,
      ["ci.yml:preflight: (c)", "pull_request (refs/pull/1/merge, fork, CI_PREFLIGHT_RUNS_ON unset): self-hosted"],

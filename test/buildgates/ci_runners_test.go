@@ -41,11 +41,12 @@ import (
 // job that names the `release` label included, and so does every ci.yml job
 // but preflight, whose one pinned pool expression, preflightRunsOn
 // (ci-template v1.49), falls back to hostedRunner off github.com and when
-// the repository variable CI_PREFLIGHT_RUNS_ON says so.
+// the repository variable CI_PREFLIGHT_RUNS_ON says so, and (a local
+// security divergence) for a pull request from a fork.
 const (
 	hostedRunner     = "ubuntu-latest"
 	selfHostedWaiver = "# self-hosted: "
-	preflightRunsOn  = `${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
+	preflightRunsOn  = `${{ github.server_url == 'https://github.com' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
 )
 
 // waiverCategories are the categories any waived job may name.

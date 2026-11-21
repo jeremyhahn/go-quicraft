@@ -738,7 +738,11 @@ jobs:
     # variable CI_PREFLIGHT_RUNS_ON, runs-on JSON, overrides it (set to
     # `"ubuntu-latest"`, quotes included, while that pool is down). Off
     # github.com ubuntu-latest, as before.
-    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}
+    # LOCAL (security): a pull request from a fork runs untrusted code, so
+    # it always gets ubuntu-latest and never the self-hosted pool, whatever
+    # the variable says; only pushes, schedules, dispatches and same-repository
+    # pull requests take the pool.
+    runs-on: ${{ github.server_url == 'https://github.com' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -1235,7 +1239,8 @@ jobs:
           # v1.49: ci.yml's preflight job alone may read the repository
           # variable CI_PREFLIGHT_RUNS_ON. Its runs-on is checked in two
           # states of its own, in place of the selection's: unset, where
-          # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to
+          # exactly [self-hosted, linux, x64, bigdisk] passes too (never for a
+          # pull request from a fork, which must get a standard image), and set to
           # the fallback `"ubuntu-latest"`, where it must give a standard image
           # on every event. Another job that reads the variable reads an unknown.
           PRE_JOB = "preflight"
@@ -1377,8 +1382,8 @@ jobs:
                                           continue
                                       if got is not None and sel == "overflow" and got in OVERFLOW:
                                           continue
-                                      if sel == "unset" and got == OVERFLOW[0]:
-                                          continue
+                                      if sel == "unset" and got == OVERFLOW[0] and head != "fork/r":
+                                          continue  # a fork head never takes the pool
                                       if got is None or len(got) != 1 or not STANDARD.fullmatch(got[0]):
                                           what = "an unknown label" if got is None else ", ".join(got)
                                           note = ", runner selection overflow" if sel == "overflow" else ""
