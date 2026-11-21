@@ -46,7 +46,7 @@ import (
 const (
 	hostedRunner     = "ubuntu-latest"
 	selfHostedWaiver = "# self-hosted: "
-	preflightRunsOn  = `${{ github.server_url == 'https://github.com' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
+	preflightRunsOn  = `${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
 )
 
 // waiverCategories are the categories any waived job may name.

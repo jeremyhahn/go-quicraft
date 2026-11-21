@@ -1,4 +1,16 @@
-# ci-template: v1.51 (customized)
+# ci-template: v1.52 (customized)
+# v1.52: a pull request whose head repository is not this repository, a
+# deleted fork included, runs every job on ubuntu-latest. preflight's runs-on
+# reads `!startsWith(github.event_name, 'pull_request')`, so a fork's head
+# under pull_request or pull_request_target takes ubuntu-latest whatever
+# CI_PREFLIGHT_RUNS_ON holds (the stricter of v1.52's clause and the LOCAL
+# fork routing below, which tested pull_request alone). The `Runner labels`
+# step gives a fork's head under pull_request, as under pull_request_target
+# since v1.51, no overflow and no unset-variable exemption, and reads the
+# selection outputs for it at their hosted default. v1.52's hunks in the
+# preflight runner selection step are not taken (this repository does not
+# carry the step). test/buildgates/testdata/runner-labels-tests.py holds the
+# cases.
 # v1.51: the `Runner labels` step also reads every runs-on under
 # pull_request_target, for a same-repository and a fork head. In a workflow
 # with that trigger a fork's head gets no overflow and no unset-variable
@@ -20,7 +32,7 @@
 # github.com only: on github.com the guard never reads it, so the secret
 # does not reach the self-hosted runner. The `Runner labels` step checks
 # preflight's runs-on with the variable unset and set to the fallback.
-# LOCAL against v1.51 (kept on purpose):
+# LOCAL against v1.52 (kept on purpose):
 # - CI_FULL_TIER keeps the v1.35.1 condition (a PR runs the full tier only
 #   with the ci:full label; test/buildgates/ci_gate_test.go asserts it), so
 #   v1.41's every-PR full tier is not taken and CI_FULL_LABEL is CI_FULL_TIER.
@@ -30,8 +42,9 @@
 #   comment and v1.50's short-list fix in that step are not taken either
 #   (this repository does not carry the step).
 # - The `Runner labels` unset-variable exemption also skips a pull_request
-#   fork head (a fork pull request never reaches the pool), beside v1.51's
-#   `not fork_target` term for a pull_request_target fork head.
+#   fork head (a fork pull request never reaches the pool), beside the
+#   `not fork_target` term (v1.51, pull_request under v1.52), even in a
+#   workflow without the pull_request trigger: the stricter of the two.
 # - The `Runner labels` step fails closed, finding (g), on a workflow whose
 #   jobs it cannot read by lines (a quoted or flow-style jobs key, a job
 #   that is not a block mapping, an explicit or merge key, an alias, anchor
@@ -759,7 +772,10 @@ jobs:
     # it always gets ubuntu-latest and never the self-hosted pool, whatever
     # the variable says; only pushes, schedules, dispatches and same-repository
     # pull requests take the pool.
-    runs-on: ${{ github.server_url == 'https://github.com' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}
+    # v1.52: a pull request from a fork (its head repository is not this
+    # one) takes ubuntu-latest whatever the variable holds; a fork never
+    # reaches a self-hosted runner.
+    runs-on: ${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -928,6 +944,9 @@ jobs:
       # vars.CI_PREFLIGHT_RUNS_ON, is checked with the variable unset, where
       # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to
       # `"ubuntu-latest"`, where it must give a standard image.
+      # v1.52: a fork's head under pull_request, as under
+      # pull_request_target (v1.51), gets no unset-variable exemption, and the
+      # selection outputs read for it are the hosted default the step emits.
       # Its tests: test/buildgates/testdata/runner-labels-tests.py (the lint-gates job runs them).
       - name: Runner labels
         run: |
@@ -1280,7 +1299,9 @@ jobs:
               def get(path):
                   p = path.lower()
                   if sel and p in SEL_OUT:  # v1.48: the selection output, as JSON text
-                      return json.dumps("ubuntu-latest" if sel == "default" else ["self-hosted", "linux", "x64", SEL_OUT[p]])
+                      # v1.52: the step outputs the hosted default for a fork's head under pull_request.
+                      fork_pr = ev == "pull_request" and head == "fork/r"
+                      return json.dumps("ubuntu-latest" if sel == "default" or fork_pr else ["self-hosted", "linux", "x64", SEL_OUT[p]])
                   if sel in ("unset", "set") and p == PRE_VAR:  # v1.49: unset, or the fallback switch
                       return None if sel == "unset" else json.dumps("ubuntu-latest")
                   if p == "github.server_url":
@@ -1474,7 +1495,8 @@ jobs:
                               for ev, ref, head in HOSTED_CTX:
                                   # v1.51: under pull_request_target, a fork's head never
                                   # reaches a self-hosted runner, overflow or not.
-                                  fork_target = ev == "pull_request_target" and head == "fork/r" and "pull_request_target" in on
+                                  # v1.52: under pull_request too.
+                                  fork_target = ev in PR and head == "fork/r" and ev in on
                                   for sel in sels:
                                       try:
                                           got = runs_on_labels(ro, ev, ref, head, sel)
@@ -1492,7 +1514,7 @@ jobs:
                                           if sel in ("unset", "set"):
                                               note = ", CI_PREFLIGHT_RUNS_ON " + ("unset" if sel == "unset" else 'set to "ubuntu-latest"')
                                           if fork_target and got is not None:
-                                              note += ", pull_request_target: a fork never reaches a self-hosted runner"
+                                              note += f", {ev}: a fork never reaches a self-hosted runner"
                                           off.append(f"{ev} ({ref}{', fork' if head == 'fork/r' else ''}{note}): {what}")
                               if off and BARE.search(ro_line):
                                   bad.append(f"{where}: (e) its `# self-hosted:` reason names no category; the template allows a self-hosted job "
