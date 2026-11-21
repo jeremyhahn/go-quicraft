@@ -517,6 +517,64 @@ func TestDockerMakeRunsNetworked(t *testing.T) {
 	}
 }
 
+func TestContribCoverageGateFailsClosed(t *testing.T) {
+	// contrib/dragonboat's check-coverage must fail below COVER_MIN and
+	// when it cannot read or compare the total, whatever tools the image
+	// carries: the toolchain image has no bc, and a comparison that errors
+	// must not let the recipe succeed. The run uses a fake go and a PATH
+	// holding only the text tools the recipe names.
+	mk, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make not found")
+	}
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	cov := filepath.Join(tmp, "cov")
+	for _, d := range []string{bin, cov} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tool := range []string{"grep", "awk", "sed", "mkdir"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("%s not found", tool)
+		}
+		if err := os.Symlink(p, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeGo := filepath.Join(bin, "go")
+	const script = "#!/bin/sh\n" +
+		"if [ \"$1\" = tool ] && [ -n \"$FAKE_COVER\" ]; then\n" +
+		"  printf 'total:\\t(statements)\\t%s%%\\n' \"$FAKE_COVER\"\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(fakeGo, []byte(script), 0o755); err != nil { //nolint:gosec // an executable test script
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		cover string
+		pass  bool
+	}{
+		{"95.0", true},
+		{"90.0", true},
+		{"50.0", false},
+		{"", false},
+	} {
+		cmd := exec.CommandContext(t.Context(), mk, "-s", "-C", filepath.Join(repoRoot, "contrib/dragonboat"),
+			"coverage-client", "GO="+fakeGo, "COVER_DIR="+cov)
+		cmd.Env = []string{"PATH=" + bin, "HOME=" + tmp, "FAKE_COVER=" + tc.cover}
+		out, err := cmd.CombinedOutput()
+		if tc.pass && err != nil {
+			t.Errorf("coverage %q: make failed (%v), want success; output:\n%s", tc.cover, err, out)
+		}
+		if !tc.pass && err == nil {
+			t.Errorf("coverage %q: make succeeded, want failure below COVER_MIN or on an unreadable total; output:\n%s", tc.cover, out)
+		}
+	}
+}
+
 type dockerStage struct {
 	from  string
 	lines []string
