@@ -1057,7 +1057,9 @@ jobs:
                       elif ta is False:
                           a = b
                       else:
-                          a = b if truthy(b) is True else U
+                          # An unknown left operand is the result whenever it
+                          # is truthy, so the value stays unknown whatever b is.
+                          a = U
                   return a
 
               def andx(self):
@@ -1071,7 +1073,9 @@ jobs:
                       elif ta is True:
                           a = b
                       else:
-                          a = b if truthy(b) is False else U
+                          # An unknown left operand is the result whenever it
+                          # is falsy, so the value stays unknown whatever b is.
+                          a = U
                   return a
 
               def cmp(self):
