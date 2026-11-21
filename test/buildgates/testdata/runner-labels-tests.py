@@ -128,7 +128,7 @@ def wf(on, *jobs):
 REL = "[self-hosted, linux, x64, release]"
 
 # A. passes
-case("A1 the template directory's own workflows",
+case("A1 this repository's own workflows",
      {p.name: p.read_text() for p in WORKFLOW.parent.glob("*.yml")}, 0, ["OK:"])
 case("A2 release.yml: tag push on the release label",
      {"release.yml": wf("on:\n  push:\n    tags: ['v*']\n",
@@ -199,7 +199,7 @@ ROUTE = ("${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') 
          "&& fromJSON('[\"self-hosted\",\"linux\",\"x64\",\"bigdisk-docker\"]') || 'ubuntu-latest' }}")
 case("D1 ubuntu-24.04, ubuntu-latest-arm-free forms and ubuntu-slim pass",
      {"ci.yml": wf(PR_ON, job("ubuntu-24.04"), job("ubuntu-24.04-arm", name="arm"), job("ubuntu-slim", name="slim"))}, 0)
-case("D2 the template's server-conditional form passes",
+case("D2 the server-conditional form passes",
      {"ci.yml": wf(PR_ON, job("${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'ci-gate' }}"))}, 0)
 case("D3 the P1 routing expression fails (c): self-hosted on a push to main and a same-repository PR",
      {"ci.yml": wf(PR_ON, job(ROUTE, name="lint"))}, 1,
