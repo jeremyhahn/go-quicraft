@@ -167,7 +167,12 @@ func TestStaleReadAndQueryLocalNodeAgree(t *testing.T) {
 					"refused and the other did not", staleErr, queryErr)
 			}
 			if staleErr != nil {
-				if !errors.Is(staleErr, queryErr) || !errors.Is(queryErr, staleErr) {
+				// A context error is wrapped afresh on each call, so the two
+				// are distinct values; they must still match the same
+				// library error.
+				sameCtxErr := (errors.Is(staleErr, ErrCanceled) && errors.Is(queryErr, ErrCanceled)) ||
+					(errors.Is(staleErr, ErrTimeout) && errors.Is(queryErr, ErrTimeout))
+				if !sameCtxErr && (!errors.Is(staleErr, queryErr) || !errors.Is(queryErr, staleErr)) {
 					t.Fatalf("StaleRead err = %v, QueryLocalNode err = %v: the two "+
 						"entry points have drifted apart", staleErr, queryErr)
 				}

@@ -765,6 +765,222 @@ func waitForLogEntry(t *testing.T, h *Host, shardID uint64) LogRange {
 // NewHost
 // ---------------------------------------------------------------------------
 
+// Test_IsUnwrap_contextError: mapContextError returns a *contextError that
+// matches its quicraft sentinel through Is and the context error through
+// Unwrap, and keeps the "sentinel: cause" message.
+func Test_IsUnwrap_contextError(t *testing.T) {
+	cases := []struct {
+		cause    error
+		sentinel error
+		other    error
+	}{
+		{context.DeadlineExceeded, ErrTimeout, ErrCanceled},
+		{context.Canceled, ErrCanceled, ErrTimeout},
+	}
+	for _, tc := range cases {
+		err := mapContextError(fmt.Errorf("wrapped: %w", tc.cause))
+		var ce *contextError
+		if !errors.As(err, &ce) {
+			t.Fatalf("mapContextError(%v) = %T %v, want *contextError", tc.cause, err, err)
+		}
+		if ce.Err != tc.sentinel {
+			t.Fatalf("contextError.Err = %v, want %v", ce.Err, tc.sentinel)
+		}
+		if !errors.Is(err, tc.sentinel) || !errors.Is(err, tc.cause) {
+			t.Fatalf("errors.Is(%v) misses %v or %v", err, tc.sentinel, tc.cause)
+		}
+		if errors.Is(err, tc.other) {
+			t.Fatalf("errors.Is(%v, %v) = true", err, tc.other)
+		}
+		if want := tc.sentinel.Error() + ": wrapped: " + tc.cause.Error(); err.Error() != want {
+			t.Fatalf("Error() = %q, want %q", err.Error(), want)
+		}
+	}
+	plain := errors.New("plain")
+	if got := mapContextError(plain); got != plain {
+		t.Fatalf("mapContextError(plain) = %v, want it unchanged", got)
+	}
+}
+
+// Test_IsUnwrap_removeDataError: a RemoveData step failure is a
+// *removeDataError naming the shard, replica, step and path, and unwraps to
+// the underlying error.
+func Test_IsUnwrap_removeDataError(t *testing.T) {
+	cause := os.ErrPermission
+	err := error(&removeDataError{ShardID: 3, ReplicaID: 4, Op: "remove snapshot directory", Path: "/d", Err: cause})
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("errors.Is(%v, os.ErrPermission) = false", err)
+	}
+	if want := "quicraft: RemoveData shard 3 replica 4: remove snapshot directory /d: permission denied"; err.Error() != want {
+		t.Fatalf("Error() = %q, want %q", err.Error(), want)
+	}
+
+	// An empty removal intent is refused as a typed ErrInvalidOperation.
+	dir := t.TempDir()
+	h := &Host{}
+	h.cfg.NodeHostDir = dir
+	p := removeDataIntentPath(dir, 3, 4)
+	if mkErr := os.MkdirAll(filepath.Dir(p), 0o700); mkErr != nil {
+		t.Fatal(mkErr)
+	}
+	if wErr := os.WriteFile(p, nil, 0o600); wErr != nil {
+		t.Fatal(wErr)
+	}
+	_, ok, readErr := h.readRemoveDataIntent(3, 4)
+	var rde *removeDataError
+	if ok || !errors.As(readErr, &rde) {
+		t.Fatalf("readRemoveDataIntent(empty) = %v, %T %v, want *removeDataError", ok, readErr, readErr)
+	}
+	if rde.ShardID != 3 || rde.ReplicaID != 4 || rde.Path != p || !errors.Is(readErr, ErrInvalidOperation) {
+		t.Fatalf("removeDataError = %+v, want shard 3 replica 4 path %s matching ErrInvalidOperation", rde, p)
+	}
+}
+
+// TestReadRemoveDataIntent_FailurePaths pins readRemoveDataIntent's
+// refusals: an intent that cannot be read is a typed I/O error that is not
+// ErrInvalidOperation, and an intent that names anything other than the
+// replica's own canonical snapshot directory (a non-canonical spelling of
+// it, or a path below it) is refused, so RemoveAll never follows it.
+func TestReadRemoveDataIntent_FailurePaths(t *testing.T) {
+	const shardID, replicaID = 3, 4
+	dataDir := t.TempDir()
+	replicaDir := engine.ReplicaSnapshotDir(
+		shardSnapshotBaseDir("", dataDir, shardID), shardID, replicaID)
+
+	newIntentHost := func(t *testing.T) (*Host, string) {
+		t.Helper()
+		dir := t.TempDir()
+		h := &Host{}
+		h.cfg.NodeHostDir = dir
+		p := removeDataIntentPath(dir, shardID, replicaID)
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return h, p
+	}
+
+	t.Run("unreadable intent", func(t *testing.T) {
+		h, p := newIntentHost(t)
+		// A directory at the intent path opens but cannot be read.
+		if err := os.Mkdir(p, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		named, pending, err := h.readRemoveDataIntent(shardID, replicaID)
+		var rde *removeDataError
+		if pending || named != "" || !errors.As(err, &rde) {
+			t.Fatalf("readRemoveDataIntent(directory) = %q, %v, %T %v; want a *removeDataError",
+				named, pending, err, err)
+		}
+		if rde.Op != "read removal intent" || rde.Path != p {
+			t.Fatalf("removeDataError = %+v, want op %q path %s", rde, "read removal intent", p)
+		}
+		if errors.Is(err, ErrInvalidOperation) {
+			t.Fatalf("an I/O failure reading the intent matched ErrInvalidOperation: %v", err)
+		}
+	})
+
+	refused := []struct {
+		name, intent string
+	}{
+		{"trailing separator", replicaDir + string(filepath.Separator)},
+		{"dot segment", filepath.Join(replicaDir, "..", filepath.Base(replicaDir)) + string(filepath.Separator) + "."},
+		{"path below the replica directory", filepath.Join(replicaDir, "snapshot-0000000000000010")},
+		{"another replica", engine.ReplicaSnapshotDir(
+			shardSnapshotBaseDir("", dataDir, shardID), shardID, replicaID+1)},
+	}
+	for _, tc := range refused {
+		t.Run(tc.name, func(t *testing.T) {
+			h, p := newIntentHost(t)
+			if err := os.WriteFile(p, []byte(tc.intent), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			named, pending, err := h.readRemoveDataIntent(shardID, replicaID)
+			var le *removeDataLayoutUnknownError
+			if pending || named != "" || !errors.As(err, &le) {
+				t.Fatalf("readRemoveDataIntent(%q) = %q, %v, %v; want a *removeDataLayoutUnknownError",
+					tc.intent, named, pending, err)
+			}
+			if le.filepath != tc.intent || !errors.Is(err, ErrInvalidOperation) {
+				t.Fatalf("refusal = %+v (%v), want filepath %q matching ErrInvalidOperation",
+					le, err, tc.intent)
+			}
+		})
+	}
+
+	t.Run("canonical intent", func(t *testing.T) {
+		h, p := newIntentHost(t)
+		if err := os.WriteFile(p, []byte(replicaDir), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		named, pending, err := h.readRemoveDataIntent(shardID, replicaID)
+		if err != nil || !pending || named != replicaDir {
+			t.Fatalf("readRemoveDataIntent(canonical) = %q, %v, %v; want %q, true, nil",
+				named, pending, err, replicaDir)
+		}
+	})
+}
+
+// Test_IsUnwrap_removalRefusals pins what a caller may assume of the two
+// RemoveData-era refusals: both match ErrInvalidOperation, neither matches
+// the other's sentinel or ErrClosed, and each message names the shard,
+// replica and directories involved.
+func Test_IsUnwrap_removalRefusals(t *testing.T) {
+	pending := error(&removalPendingError{ShardID: 5, ReplicaID: 6, Dir: "/snap/a"})
+	if !errors.Is(pending, ErrInvalidOperation) {
+		t.Fatalf("errors.Is(%v, ErrInvalidOperation) = false", pending)
+	}
+	if errors.Is(pending, errRemoveDataLayoutConflict) || errors.Is(pending, ErrClosed) {
+		t.Fatalf("removalPendingError %v matches an unrelated sentinel", pending)
+	}
+	if want := "quicraft: shard 5 replica 6 has a pending RemoveData of /snap/a; retry RemoveData to finish it"; pending.Error() != want {
+		t.Fatalf("Error() = %q, want %q", pending.Error(), want)
+	}
+
+	conflict := error(&removeDataLayoutConflictError{ShardID: 7, ReplicaID: 8, BootstrapDir: "/b", SnapshotDir: "/s"})
+	if !errors.Is(conflict, ErrInvalidOperation) || !errors.Is(conflict, errRemoveDataLayoutConflict) {
+		t.Fatalf("removeDataLayoutConflictError %v does not match ErrInvalidOperation and its sentinel", conflict)
+	}
+	if errors.Is(conflict, ErrClosed) {
+		t.Fatalf("removeDataLayoutConflictError %v matches ErrClosed", conflict)
+	}
+	if want := `quicraft: RemoveData of shard 7 replica 8: bootstrap record selects snapshot directory "/b" but the snapshot record lies in "/s"`; conflict.Error() != want {
+		t.Fatalf("Error() = %q, want %q", conflict.Error(), want)
+	}
+}
+
+// pastDeadlineCtx reports a deadline that has passed while its timer has not
+// fired yet (Err is nil): the window in which the request sweeper can expire
+// a request before the caller's context does.
+type pastDeadlineCtx struct{ context.Context }
+
+func (pastDeadlineCtx) Deadline() (time.Time, bool) { return time.Now().Add(-time.Second), true }
+
+// Test_withDeadlineCause_DeadlineEdges covers the failure paths of a
+// synchronous wait the sweeper ends: a deadline that has passed before the
+// context's timer fired still attaches context.DeadlineExceeded; a deadline
+// still ahead leaves ErrTimeout unchanged; an error that already carries the
+// cause is not wrapped twice.
+func Test_withDeadlineCause_DeadlineEdges(t *testing.T) {
+	got := withDeadlineCause(pastDeadlineCtx{context.Background()}, ErrTimeout)
+	if !errors.Is(got, ErrTimeout) || !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("withDeadlineCause(passed, timer pending) = %v, want ErrTimeout and DeadlineExceeded", got)
+	}
+
+	ahead, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	if got := withDeadlineCause(ahead, ErrTimeout); got != ErrTimeout {
+		t.Fatalf("withDeadlineCause(deadline ahead) = %v, want ErrTimeout unchanged", got)
+	}
+
+	already := mapContextError(context.DeadlineExceeded)
+	if got := withDeadlineCause(pastDeadlineCtx{context.Background()}, already); got != already {
+		t.Fatalf("withDeadlineCause(already caused) = %v, want it unchanged", got)
+	}
+	if got := withDeadlineCause(pastDeadlineCtx{context.Background()}, nil); got != nil {
+		t.Fatalf("withDeadlineCause(nil) = %v, want nil", got)
+	}
+}
+
 func TestNewHost_ValidConfig(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -891,17 +1107,22 @@ func TestStartShard_Join_NoBootstrap(t *testing.T) {
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
+	scfg.DataDir = t.TempDir()
 	err = h.StartShard(members, true, testCreateFunc, scfg)
 	if err != nil {
 		t.Fatalf("StartShard failed: %v", err)
 	}
 
-	// Join should not save bootstrap.
+	// A join records its snapshot layout but no initial membership.
 	db.mu.Lock()
-	_, ok := db.bootstraps[mockNodeKey{1, 1}]
+	bs, ok := db.bootstraps[mockNodeKey{1, 1}]
 	db.mu.Unlock()
-	if ok {
-		t.Error("bootstrap should not be saved for join shard")
+	if !ok {
+		t.Fatal("no bootstrap record for a join shard: its DataDir is unknown once stopped")
+	}
+	if !bs.Join || len(bs.Addresses) != 0 || bs.DataDir != scfg.DataDir {
+		t.Errorf("join bootstrap = {Join:%v Addresses:%v DataDir:%q}, want "+
+			"{Join:true Addresses:none DataDir:%q}", bs.Join, bs.Addresses, bs.DataDir, scfg.DataDir)
 	}
 }
 
@@ -9298,9 +9519,9 @@ func TestSyncRemoveData_ContextCanceled_NotRawContextError(t *testing.T) {
 	cancel()
 
 	err := h.SyncRemoveData(ctx, 1, 1)
-	// Verify the error is NOT raw context.Canceled.
-	if errors.Is(err, context.Canceled) {
-		t.Error("SyncRemoveData should return ErrCanceled, not context.Canceled")
+	// The error is ErrCanceled, which also matches context.Canceled.
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("SyncRemoveData error = %v, want it to match context.Canceled", err)
 	}
 	if !errors.Is(err, ErrCanceled) {
 		t.Errorf("SyncRemoveData error = %v, want ErrCanceled", err)
@@ -14110,34 +14331,39 @@ func TestWalShardIDs_NilAndEmpty(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage: OnSnapshotCompleted - recovery (index=0) fires OnSnapshotRecovered
+// Coverage: OnSnapshotCompleted - a recovery fires OnSnapshotRecovered
 // ---------------------------------------------------------------------------
 
+// TestOnSnapshotCompleted_SnapshotRecovery: the operation, not the index,
+// marks a recovery. A recovery that restored nothing completes at index 0
+// and still fires OnSnapshotRecovered{Index: 0}; one that restored a
+// recorded snapshot carries that snapshot's index.
 func TestOnSnapshotCompleted_SnapshotRecovery(t *testing.T) {
-	recoveryCalled := false
-	hostCfg := testHostConfig(t)
-	hostCfg.EventListener = &config.EventListener{
-		OnSnapshotRecovered: func(info config.SnapshotInfo) {
-			recoveryCalled = true
-			if info.ShardID != 1 {
-				t.Errorf("SnapshotInfo.ShardID = %d, want 1", info.ShardID)
-			}
-		},
-	}
-	h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
-	if err != nil {
-		t.Fatalf("NewHost: %v", err)
-	}
-	t.Cleanup(func() { h.Close() })
-	addTestNodeState(h, 1, 1)
+	for _, index := range []uint64{0, 100} {
+		var recovered []config.SnapshotInfo
+		hostCfg := testHostConfig(t)
+		hostCfg.EventListener = &config.EventListener{
+			OnSnapshotRecovered: func(info config.SnapshotInfo) {
+				recovered = append(recovered, info)
+			},
+		}
+		h, err := NewHost(hostCfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost: %v", err)
+		}
+		addTestNodeState(h, 1, 1)
 
-	cb := &hostEngineCallback{h: h}
-	// index=0 means recovery.
-	cb.OnSnapshotCompleted(1, 0, engine.SnapshotRecover, nil)
-	flushListeners(t, cb)
+		cb := &hostEngineCallback{h: h}
+		cb.OnSnapshotCompleted(1, index, engine.SnapshotRecover, nil)
+		flushListeners(t, cb)
+		h.Close()
 
-	if !recoveryCalled {
-		t.Error("OnSnapshotRecovered was not called for index=0 snapshot")
+		if len(recovered) != 1 {
+			t.Fatalf("index %d: OnSnapshotRecovered fired %d times, want 1", index, len(recovered))
+		}
+		if got := recovered[0]; got.ShardID != 1 || got.ReplicaID != 1 || got.Index != index {
+			t.Fatalf("index %d: OnSnapshotRecovered(%+v), want shard 1 replica 1 index %d", index, got, index)
+		}
 	}
 }
 
@@ -16880,8 +17106,11 @@ func TestStartShard_LosesRaceWithClose(t *testing.T) {
 
 	startErr := make(chan error, 1)
 	go func() {
-		// join=true so the shard never writes bootstrap state: this test is
-		// about the publish race, not about LogDB writes after Close.
+		// The bootstrap-failure case: the bootstrap save after Close fails
+		// on the closed LogDB, so this start exits through the failed
+		// SaveBootstrap branch and must still report ErrClosed and roll
+		// back. TestStartShard_LosesRaceWithClose_AfterBootstrapSave covers
+		// the post-publication guard after LoadNode.
 		startErr <- h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, true,
 			create, testShardConfig(1, 1))
 	}()
@@ -16905,6 +17134,99 @@ func TestStartShard_LosesRaceWithClose(t *testing.T) {
 		t.Fatal("StartShard did not return")
 	}
 
+	if _, loaded := h.nodes.Load(uint64(1)); loaded {
+		t.Fatal("shard published into a closed host: it is inert and nothing will ever stop it")
+	}
+	if n := h.activeNodes.Load(); n != 0 {
+		t.Fatalf("activeNodes = %d after the losing StartShard, want 0", n)
+	}
+	if !smClosed.Load() {
+		t.Fatal("state machine left open by the losing StartShard: its file lock bricks the next host start")
+	}
+	if node := h.engine.GetNode(1); node != nil {
+		t.Fatal("engine still holds the node of a shard that never started")
+	}
+}
+
+// bootstrapGateLogDB saves a bootstrap record to the inner LogDB, records
+// that the save succeeded, and then blocks until the test releases it.
+type bootstrapGateLogDB struct {
+	logdb.LogDB
+	saved   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (db *bootstrapGateLogDB) SaveBootstrap(shardID, replicaID uint64, b logdb.Bootstrap) error {
+	if err := db.LogDB.SaveBootstrap(shardID, replicaID, b); err != nil {
+		return err
+	}
+	db.saved.Store(true)
+	close(db.entered)
+	<-db.release
+	return nil
+}
+
+// TestStartShard_LosesRaceWithClose_AfterBootstrapSave: a StartShard whose
+// bootstrap save succeeded before Close ran passes LoadNode, and the
+// post-publication shutdown guard must still roll it back.
+func TestStartShard_LosesRaceWithClose_AfterBootstrapSave(t *testing.T) {
+	cfg := testHostConfig(t)
+	db := &bootstrapGateLogDB{
+		LogDB:   memdb.New(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+
+	var smClosed atomic.Bool
+	create := func(_, _ uint64) interface{} {
+		return &gatedStateMachine{closed: &smClosed}
+	}
+
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, true,
+			create, testShardConfig(1, 1))
+	}()
+
+	// StartShard has saved its bootstrap record and is held before LoadNode.
+	select {
+	case <-db.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("StartShard did not reach SaveBootstrap")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- h.Close() }()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		close(db.release)
+		t.Fatal("Close blocked on the in-flight SaveBootstrap")
+	}
+
+	// Let StartShard continue past the successful save into LoadNode.
+	close(db.release)
+
+	select {
+	case err := <-startErr:
+		if !errors.Is(err, ErrClosed) {
+			t.Fatalf("StartShard returned %v, want ErrClosed", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("StartShard did not return")
+	}
+
+	if !db.saved.Load() {
+		t.Fatal("SaveBootstrap did not succeed: the start took the save-failure path, not the guard")
+	}
 	if _, loaded := h.nodes.Load(uint64(1)); loaded {
 		t.Fatal("shard published into a closed host: it is inert and nothing will ever stop it")
 	}

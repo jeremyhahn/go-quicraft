@@ -182,6 +182,7 @@ other replica as its anchor, and no identity may be bound to two replicas. See
 | `ErrShardNotReady` | A concurrent `StartShard` of the same shard is still in progress (transient) |
 | `ErrImportInProgress` | An `ImportSnapshot` of this shard is running (transient) |
 | `*ReplicaRetiredError` | `RemoveData` retired this replica ID on this host. Rejoin under a new ID |
+| DataDir changed (unexported type; the message names the recorded and the requested `DataDir`) | `cfg.DataDir` differs from the `DataDir` this replica was first started with (its bootstrap record, or for a replica with none, its snapshot record). Its snapshots stay under the recorded tree: restart with the recorded `DataDir` |
 | `*EmptyMembersError` | Bootstrap with an empty `members` map |
 | `*SelfNotInMembersError` | `cfg.ReplicaID` absent from `members` on a bootstrap |
 | `*InvalidMemberError` | A member has a zero replica ID, an empty or malformed address, or a duplicate address; a required identity is missing or bound twice; a joiner names no anchor; or `MemberIdentities` contradicts the recovered membership. Matches `ErrInvalidMember` |
@@ -340,11 +341,16 @@ A linearizable read in one call:
 The result reflects every write committed before the call.
 
 On a basic `sm.StateMachine`, step 3 waits for any in-flight `Apply`, which
-holds the RSM adapter's read guard for writing. `sync.RWMutex` has no
-context-aware acquire, so `ctx`'s deadline is not observed while the call waits
-on that lock. The same applies to `SyncReadBuf`, `FollowerRead`,
-`QueryLocalNode`, `StaleRead` and `StaleReadBuf`. `ConcurrentStateMachine` and
-`DiskStateMachine` lookups run alongside `Apply`. See
+holds the RSM adapter's read guard for writing. That wait observes `ctx`: the
+adapter acquires the guard with a context-aware retry, so a deadline or
+cancellation that fires while the read is queued behind `Apply` returns
+`ctx.Err()` without running `Lookup`. Once the guard is held, the call hands `ctx` to the
+embedder's `Lookup` and waits for it to return; whether a lookup that is already
+running stops on cancellation is up to that implementation (`NALookupInto`
+takes no context and always runs to completion). The
+same applies to `SyncReadBuf`, `FollowerRead`, `QueryLocalNode`, `StaleRead` and
+`StaleReadBuf`. `ConcurrentStateMachine` and `DiskStateMachine` lookups run
+alongside `Apply`, so they do not queue on the guard. See
 [Lookup concurrency](../state-machines/engineering.md#concurrency).
 
 #### SyncReadBuf
@@ -760,10 +766,13 @@ path. It stages into a temporary directory it created and renames it into place
 once the artifact is complete and durable.
 
 **Layout discovery.** The snapshot tree root comes from the `Config.DataDir`
-that `StartShard` recorded in the LogDB bootstrap record. A shard started with
-`join=true`, or never started on this host, has no record; a record written
-before the field existed has none either. Both fail closed with
-`ErrImportLayoutUnknown` unless you state the layout with `WithImportDataDir`.
+that `StartShard` recorded in the LogDB bootstrap record. `StartShard` writes
+that record for `join=true` as well, so a replica that joined on this host
+after the record carried `DataDir` needs no option once stopped. Three cases
+have no recorded layout: a shard never started on this host, a replica that
+joined before `StartShard` recorded joins, and a record written before the
+field existed. They fail closed with `ErrImportLayoutUnknown` unless you state
+the layout with `WithImportDataDir`.
 `WithImportDataDir("")` asserts the shard has no `DataDir`. A value that
 contradicts the recorded one is refused.
 
@@ -778,7 +787,7 @@ does not hold, or for an identity the artifact's tombstones hold, is refused.
 | Error | Condition |
 |---|---|
 | `ErrClosed` | Host closed |
-| `ErrInvalidOperation` (wrapped) | The shard is running (including one started while the import waited for its lock), there is no LogDB, or this host holds data for more than one replica of the shard. Remove the stale replica's data (`RemoveData`) first |
+| `ErrInvalidOperation` (wrapped) | The shard is running (including one started while the import waited for its lock), there is no LogDB, or this host holds data for more than one replica of the shard. Remove the stale replica's data (`RemoveData`) first. Also returned while an earlier `RemoveData` of the replica is pending (it failed or crashed after recording its intent): retry `RemoveData` to finish it |
 | `*ImportLayoutUnknownError` | Layout not discoverable and none supplied |
 | `*ImportDataDirMismatchError` | `WithImportDataDir` disagrees with the recorded `DataDir` |
 | `*ImportSnapshotOutOfDateError` | The artifact's index does not advance the recorded snapshot |
@@ -1062,7 +1071,7 @@ context, or none where one was present, fails authentication.
 
 ```go
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-    srcBarrier, dstBarrier Barrier) (uint64, error)
+    srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error)
 ```
 
 Re-keys a snapshot data file: every frame is decrypted under `srcBarrier` and
@@ -1075,6 +1084,14 @@ It returns the destination's minimum at-rest epoch across the written frames,
 which is the value to record as the snapshot's `Epoch` so the purge floor
 protects every frame. It is 0 for a plaintext destination; a sealed destination
 always writes at least a terminal frame, so even an empty source yields a real
+epoch.
+
+It also returns `fileSize`, the destination data file's length as written.
+Re-encryption changes the length whenever the framing differs (plaintext to
+encrypted, encrypted to plaintext, or a different nonce size), so record
+`fileSize`, not the source's length, as the snapshot's `FileSize`. A
+`waldb.ReencryptSized` hook returns the epoch and size, and the migrated record
+carries both. The committed-not-durable failure returns `fileSize` with the
 epoch.
 
 `shardID`, `replicaID` and `index` are required: frames are bound to their
@@ -1091,7 +1108,16 @@ The write is atomic and crash-safe: output goes to a temporary file in the
 destination directory, is fsynced, renamed, and the directory chain is fsynced
 before success. Any failure before the rename removes the temp file and leaves
 both paths untouched. The exception is a directory fsync that fails after the
-rename, which returns `*SnapshotCommittedNotDurableError` with the real epoch.
+rename, which returns `*SnapshotCommittedNotDurableError` with the real epoch
+and the destination's `fileSize`.
+
+Some destinations are refused with `*SnapshotDestinationError` before anything
+is written. `srcPath` or `dstPath` not in clean form (`filepath.Clean` would
+change it) matches `fs.ErrInvalid`. When the source has a `snapshot.meta`
+beside it, a `dstPath` that already exists matches `fs.ErrExist`, and a lookup
+of `dstPath` that fails for any reason other than not-exist returns that
+failure. In each case `Path` names the refused path. Re-key into a fresh
+directory.
 
 ### Data removal
 
@@ -1105,7 +1131,9 @@ its replica ID on this host, across restarts: `StartShard` refuses it with
 `*ReplicaRetiredError`, because its term, vote and any lease vote window it owed
 are gone with its data and it could otherwise vote twice in one term. Rejoin
 under a new replica ID. If the replica is loaded on this host it must be stopped
-first; a shard that is not loaded needs nothing. `SyncRemoveData` behaves
+first, and the stop finished: a replica whose `StopShard` has not yet returned
+is still refused with `*ShardNotStoppedError`. A shard that is not loaded needs
+nothing. `SyncRemoveData` behaves
 identically, except that it first returns `ErrTimeout` or `ErrCanceled` for a
 `ctx` that has already ended, and exists for naming consistency.
 
@@ -1113,6 +1141,23 @@ identically, except that it first returns `ErrTimeout` or `ErrCanceled` for a
 `StartShard` for the shard is in progress), `ErrImportInProgress` (an
 `ImportSnapshot` for the shard is in progress), and LogDB errors. Retry the two
 transient refusals.
+
+`RemoveData` removes the one snapshot directory the replica's records agree on.
+A release before v1.0.0 let a replica that had snapshotted under one `DataDir`
+restart under another: the bootstrap record then states the new `DataDir` while
+the snapshot record still points into the old tree. `RemoveData` refuses that
+replica with an error matching `ErrInvalidOperation` that names the shard,
+replica, bootstrap and snapshot directories, before anything is retired, deleted or recorded,
+rather than report success while a snapshot remains. To repair, start the
+replica under the `DataDir` its bootstrap record states (the error's
+`BootstrapDir` lies under it) and make sure a new entry has been committed and
+applied on it: for example propose a no-op or any write to the shard and wait
+for this replica to apply it. A snapshot request on a replica whose applied
+index has not advanced past its latest snapshot takes nothing and returns index
+0, so the snapshot record would still name the old tree. Then request a
+snapshot and confirm it reports an index greater than the one the old record
+held; only then stop the replica and retry `RemoveData`. Finally delete the
+error's `SnapshotDir`, which no record references any more.
 
 ### Replica management
 
@@ -1627,7 +1672,7 @@ Host and request lifecycle:
 
 | Error | Returned when |
 |---|---|
-| `ErrClosed` | the Host is closed, or the request never started |
+| `ErrClosed` | the Host is closed, or the request never started; also a local read whose shard `StopShard` closed while it waited |
 | `ErrDraining` | new work submitted during drain |
 | `ErrStopped` | the shard or engine stopped underneath an in-progress snapshot save or recovery, or the shard or host stopped while an `ExecuteOnLeader` request waited |
 | `ErrShutdownTimeout` | drain exceeded `ShutdownTimeout` |
@@ -1795,7 +1840,8 @@ Each type below implements `error`; those with an `Err` field implement
 | `SnapshotTooLargeError` | `ShardID`, `MaxSize` | Matches `ErrSnapshotTooLarge` |
 | `SnapshotArtifactError` | `Reason`, `Err` | An export artifact's header is malformed or its data fails the trailer check |
 | `SnapshotOptionError` | `Field`, `Reason` | From `SnapshotOption.Validate`. Matches `ErrInvalidSnapshotOption` |
-| `SnapshotCommittedNotDurableError` | `Path`, `Epoch`, `Err` | `ReencryptSnapshotFile`'s directory fsync failed after the rename. Record `Epoch` (dropping it lets the next purge orphan the artifact's key) and treat the migration as unverified |
+| `SnapshotCommittedNotDurableError` | `Path`, `Epoch`, `Err` | `ReencryptSnapshotFile`'s directory fsync failed after the rename. Record `Epoch` (dropping it lets the next purge orphan the artifact's key) and the `fileSize` returned beside it as the record's `FileSize`, and treat the migration as unverified |
+| `SnapshotDestinationError` | `Path`, `Err` | `ReencryptSnapshotFile` refused a path before writing anything: `Err` is `fs.ErrExist` (the destination already exists beside a source `snapshot.meta`), `fs.ErrInvalid` (a path not in clean form), or the destination lookup's failure. See [ReencryptSnapshotFile](#reencryptsnapshotfile) |
 | `UnauthorizedMessageError` | `ShardID`, `From`, `MsgType` | An inbound Raft message failed shard-membership authorization |
 | `TypeAssertionError` | `Context`, `ExpectedType`, `ActualValue` | An internal type assertion failed |
 | `LoopPanicError` | `LoopName`, `Value`, `Stack` | A recovered panic from a goroutine loop, with its stack |
@@ -2425,7 +2471,7 @@ than `(nil, nil)`, which would look like an empty value or a missing key.
 Source: `pkg/config/hostconfig.go`.
 
 ```go
-type EventListener struct { /* 27 optional func fields */ }
+type EventListener struct { /* 26 optional func fields */ }
 ```
 
 Set only the callbacks you need; nil callbacks are not invoked. Engine events
@@ -2488,7 +2534,7 @@ System events:
 | `OnSnapshotSent` | `SnapshotInfo` | a snapshot transfer was sent |
 | `OnSnapshotSendAborted` | `SnapshotInfo` | a snapshot transfer was abandoned |
 | `OnSnapshotReceived` | `SnapshotInfo` | a snapshot transfer was received |
-| `OnSnapshotRecovered` | `SnapshotInfo` | the state machine was restored from a snapshot |
+| `OnSnapshotRecovered` | `SnapshotInfo` | a snapshot recovery completed. `Index` is the restored snapshot's index, 0 when the replica had no snapshot to restore |
 | `OnSnapshotCreated` | `SnapshotInfo` | an on-demand or automatic snapshot was written. A save with nothing new to capture writes none and fires nothing |
 | `OnSnapshotCompacted` | `SnapshotInfo` | old snapshot directories were reclaimed |
 | `OnLogCompacted` | `EventShardInfo` | log compaction completed; `Index` is the compaction point |

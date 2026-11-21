@@ -2732,14 +2732,16 @@ func (c *hostEngineCallback) OnLogCompacted(shardID, replicaID uint64, compactio
 		return
 	}
 	info := config.EventShardInfo{ShardID: shardID, ReplicaID: replicaID, Index: compaction.Index}
-	c.dispatchListener("OnLogCompacted", shardID, func() {
-		if el.OnLogCompacted != nil {
-			el.OnLogCompacted(info)
-		}
-		if compaction.LogDB && el.OnLogDBCompacted != nil {
-			el.OnLogDBCompacted(info)
-		}
-	})
+	// Two dispatches, not one closure: the dispatcher recovers a listener
+	// panic per call, so a panicking OnLogCompacted must not take
+	// OnLogDBCompacted down with it. The dispatcher is FIFO, so the order
+	// is kept.
+	if el.OnLogCompacted != nil {
+		c.dispatchListener("OnLogCompacted", shardID, func() { el.OnLogCompacted(info) })
+	}
+	if compaction.LogDB && el.OnLogDBCompacted != nil {
+		c.dispatchListener("OnLogDBCompacted", shardID, func() { el.OnLogDBCompacted(info) })
+	}
 }
 
 // dispatchListener runs a fan-out to user EventListener code on the engine's
@@ -2892,6 +2894,7 @@ func fireSnapshotListeners(el *config.EventListener, shardID, replicaID, index u
 			el.OnSnapshotRecovered(config.SnapshotInfo{
 				ShardID:   shardID,
 				ReplicaID: replicaID,
+				Index:     index,
 			})
 		}
 	}
@@ -3565,6 +3568,11 @@ type Host struct {
 	// wireSwitchWG counts the retryWireSwitch goroutines; Close joins them
 	// once the engine, the only thing that starts one, has stopped.
 	wireSwitchWG sync.WaitGroup
+	// removeDataWG counts the RemoveData calls admitted (under admitMu, with
+	// h.closed unset) and still running. Close joins it before it closes the
+	// LogDB and releases NodeHostDir, so no removal writes under a directory
+	// the host has given up; a RemoveData after Close began is refused.
+	removeDataWG sync.WaitGroup
 	// wireSwitchFault is hostOptions.wireSwitchFault.
 	wireSwitchFault func() error
 
@@ -4845,6 +4853,14 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return err
 	}
 
+	// The bootstrap record's DataDir is where the replica's snapshots are,
+	// and what RemoveData and ImportSnapshot locate them by. A start under
+	// another DataDir would recover from the old tree while recording the
+	// new one, so it is refused before anything is recovered or overwritten.
+	if err := h.refuseDataDirChange(cfg.ShardID, cfg.ReplicaID, cfg.DataDir); err != nil {
+		return err
+	}
+
 	// Copy the members map to avoid aliasing.
 	nodesCopy := make(map[uint64]string, len(members))
 	for k, v := range members {
@@ -5256,9 +5272,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// published into the engine, so a failed StartShard does not leak the open
 	// store and brick subsequent retries on the same DataDir with "lock held by
 	// current process". Once published (smPublished=true, set after LoadNode),
-	// the node's lifecycle — including rsm.Close — is owned by StopShard/Close,
-	// and every error path between publication and LoadNode removes the
-	// nodeState first, so this never double-closes.
+	// the node's lifecycle — including rsm.Close — is owned by StopShard/Close.
+	// The error path between nodeState publication and LoadNode (a failed
+	// SaveBootstrap) claims ns.stopped first: it rolls back and keeps this
+	// close only when it wins the claim, and sets smPublished when a
+	// concurrent StopShard/Close won it, so this never double-closes.
 	smPublished := false
 	defer func() {
 		if !smPublished {
@@ -5594,29 +5612,49 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	}
 	h.setShardAnchor(cfg.ShardID, cfg.MemberIdentities)
 
-	// Save bootstrap info if we have a LogDB and this is not a join.
-	if h.logdb != nil && !join {
+	// Save bootstrap info if we have a LogDB. A join records one too, with
+	// Join set and no Addresses (a joining replica has no initial
+	// membership), so the snapshot layout below is known for it as well.
+	if h.logdb != nil {
 		bootstrap := logdb.Bootstrap{
-			Addresses: nodesCopy,
-			Join:      join,
-			Type:      ns.smType,
+			Join: join,
+			Type: ns.smType,
 			// Record where this shard's on-disk tree is rooted. Operations
-			// that run while the shard is STOPPED — Host.ImportSnapshot — have
-			// no other way to discover it, and writing an artifact outside the
-			// tree costs the artifact's DEK at the next purge.
+			// that run while the shard is STOPPED — Host.ImportSnapshot and
+			// Host.RemoveData — have no other way to discover it, and writing
+			// an artifact outside the tree costs the artifact's DEK at the
+			// next purge.
 			DataDir: cfg.DataDir,
 		}
+		if !join {
+			bootstrap.Addresses = nodesCopy
+		}
 		if err := h.logdb.SaveBootstrap(cfg.ShardID, cfg.ReplicaID, bootstrap); err != nil {
-			// Mark the nodeState stopped BEFORE removing it from h.nodes
-			// (matching StopShard/Close ordering): a reader that resolved ns
-			// just before the Delete must fail its stopped check rather than
-			// call into the state machine the deferred rollback is about to
-			// close.
-			ns.stopped.Store(true)
-			h.nodes.Delete(cfg.ShardID)
-			h.clearShardJoining(cfg.ShardID)
-			h.anchors.Delete(cfg.ShardID)
-			h.activeNodes.Add(-1)
+			// Claim teardown before rolling back, as StopShard and Close do.
+			// The nodeState was published before the save, so a Close or
+			// StopShard that ran while the save was in flight may already
+			// own it: that claimant removes the node, decrements
+			// activeNodes and closes the state machine, and a second
+			// rollback here would drive activeNodes negative and close the
+			// user's state machine twice. Losing the claim hands the
+			// deferred close to the claimant as well. Winning it marks the
+			// nodeState stopped BEFORE removing it from h.nodes, so a reader
+			// that resolved ns just before the Delete fails its stopped
+			// check rather than call into the state machine the deferred
+			// rollback is about to close.
+			if ns.stopped.CompareAndSwap(false, true) {
+				h.nodes.Delete(cfg.ShardID)
+				h.clearShardJoining(cfg.ShardID)
+				h.anchors.Delete(cfg.ShardID)
+				h.activeNodes.Add(-1)
+			} else {
+				smPublished = true
+			}
+			// A start that lost a race with Close finds the LogDB closed:
+			// report the host closed, as the publish check below would.
+			if h.closed.Load() || errors.Is(err, logdb.ErrClosed) {
+				return ErrClosed
+			}
 			return ErrLogDBWrite
 		}
 	}
@@ -5968,6 +6006,19 @@ func (h *Host) SyncPropose(ctx context.Context, shardID uint64, cmd []byte) (sm.
 	return sm.Result{Value: result.Value, Data: result.Data}, nil
 }
 
+// syncReadLookupHook, when set, runs after SyncRead or SyncReadBuf has its
+// read index applied and before it takes the state machine's read guard.
+// Tests set it to hold an Update across the lookup stage; it is nil in
+// production, costing one atomic load per read.
+var syncReadLookupHook atomic.Pointer[func()]
+
+// runSyncReadLookupHook runs syncReadLookupHook if one is set.
+func runSyncReadLookupHook() {
+	if hook := syncReadLookupHook.Load(); hook != nil {
+		(*hook)()
+	}
+}
+
 // SyncRead performs a linearizable read in a single call. It confirms
 // leadership via ReadIndex, waits for the local SM to catch up, then
 // executes the query. This provides the strongest consistency guarantee:
@@ -6009,7 +6060,7 @@ func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) 
 	select {
 	case result := <-resultC:
 		if result.Err != nil {
-			return nil, result.Err
+			return nil, withDeadlineCause(ctx, result.Err)
 		}
 		goto lookup
 	default:
@@ -6018,13 +6069,10 @@ func (h *Host) SyncRead(ctx context.Context, shardID uint64, query interface{}) 
 	select {
 	case result := <-resultC:
 		if result.Err != nil {
-			return nil, result.Err
+			return nil, withDeadlineCause(ctx, result.Err)
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 lookup:
 
@@ -6034,6 +6082,7 @@ lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 
 	// Step 3: Execute the query on the caught-up state machine.
 	ns, err := h.getNode(shardID)
@@ -6049,7 +6098,11 @@ lookup:
 	if ns.rsm == nil {
 		return nil, ErrShardNotReady
 	}
-	return ns.rsm.Lookup(ctx, query)
+	result, lookupErr := ns.rsm.Lookup(ctx, query)
+	if lookupErr != nil {
+		return nil, mapLocalReadError(lookupErr)
+	}
+	return result, nil
 }
 
 // SyncReadBuf is the pooled-buffer variant of SyncRead for []byte key queries.
@@ -6079,7 +6132,7 @@ func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (res
 	select {
 	case r := <-resultC:
 		if r.Err != nil {
-			return nil, nopHostRelease, r.Err
+			return nil, nopHostRelease, withDeadlineCause(ctx, r.Err)
 		}
 		goto lookup
 	default:
@@ -6087,18 +6140,16 @@ func (h *Host) SyncReadBuf(ctx context.Context, shardID uint64, key []byte) (res
 	select {
 	case r := <-resultC:
 		if r.Err != nil {
-			return nil, nopHostRelease, r.Err
+			return nil, nopHostRelease, withDeadlineCause(ctx, r.Err)
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, nopHostRelease, ErrTimeout
-		}
-		return nil, nopHostRelease, ErrCanceled
+		return nil, nopHostRelease, mapContextError(ctx.Err())
 	}
 lookup:
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return nil, nopHostRelease, mapContextError(ctxErr)
 	}
+	runSyncReadLookupHook()
 	ns, nsErr := h.getNode(shardID)
 	if nsErr != nil {
 		return nil, nopHostRelease, nsErr
@@ -6110,9 +6161,9 @@ lookup:
 	if ns.rsm == nil {
 		return nil, nopHostRelease, ErrShardNotReady
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
@@ -6120,7 +6171,7 @@ lookup:
 	// Fall back to the generic Lookup path (result is []byte or interface{}).
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
@@ -6163,16 +6214,16 @@ func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (re
 	if ns.barrierSealed() {
 		return nil, nopHostRelease, ErrBarrierSealed
 	}
-	buf, rel, supported, lookupErr := ns.rsm.NALookupBuf(key)
+	buf, rel, supported, lookupErr := ns.rsm.NALookupBufContext(ctx, key)
 	if lookupErr != nil {
-		return nil, nopHostRelease, lookupErr
+		return nil, nopHostRelease, mapLocalReadError(lookupErr)
 	}
 	if supported {
 		return buf, rel, nil
 	}
 	v, lookupErr2 := ns.rsm.Lookup(ctx, key)
 	if lookupErr2 != nil {
-		return nil, nopHostRelease, lookupErr2
+		return nil, nopHostRelease, mapLocalReadError(lookupErr2)
 	}
 	if b, ok := v.([]byte); ok {
 		return b, nopHostRelease, nil
@@ -6895,7 +6946,8 @@ func (h *Host) QueryLocalNode(ctx context.Context, shardID uint64, query interfa
 		return nil, ErrBarrierSealed
 	}
 
-	return ns.rsm.Lookup(ctx, query)
+	v, lookupErr := ns.rsm.Lookup(ctx, query)
+	return v, mapLocalReadError(lookupErr)
 }
 
 // StaleRead reads this replica's state machine directly, without any
@@ -6988,7 +7040,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 
 	// Fast path: SM has already applied up to the committed index.
 	if ns.lastApplied.Load() >= committed {
-		return ns.rsm.Lookup(ctx, query)
+		v, lookupErr := ns.rsm.Lookup(ctx, query)
+		return v, mapLocalReadError(lookupErr)
 	}
 
 	// Slow path: poll until lastApplied catches up, the shard or host shuts
@@ -7009,7 +7062,8 @@ func (h *Host) FollowerRead(ctx context.Context, shardID uint64, query interface
 		select {
 		case <-ticker.C:
 			if ns.lastApplied.Load() >= committed {
-				return ns.rsm.Lookup(ctx, query)
+				v, lookupErr := ns.rsm.Lookup(ctx, query)
+				return v, mapLocalReadError(lookupErr)
 			}
 			if ns.stopped.Load() || h.closed.Load() {
 				return nil, ErrClosed
@@ -7387,13 +7441,10 @@ func (h *Host) SyncGetShardMembership(ctx context.Context, shardID uint64) (*Mem
 	select {
 	case result := <-rs.ResultC():
 		if result.Err != nil {
-			return nil, result.Err
+			return nil, withDeadlineCause(ctx, result.Err)
 		}
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, ErrTimeout
-		}
-		return nil, ErrCanceled
+		return nil, mapContextError(ctx.Err())
 	}
 
 	// Step 3: Read membership from the Raft peer. GetMembership returns a
@@ -7755,7 +7806,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 		if errors.Is(err, engine.ErrStopped) {
 			return ErrClosed
 		}
-		return err
+		return mapContextError(err)
 	}
 	return nil
 }
@@ -7858,7 +7909,7 @@ func pauseTransferTarget(progress []raft.RemoteProgress, self uint64) uint64 {
 // ResumeShard returns ctx.Err() and changes nothing.
 func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	if err := ctx.Err(); err != nil {
-		return err
+		return mapContextError(err)
 	}
 	if h.closed.Load() {
 		return ErrClosed
@@ -7873,7 +7924,7 @@ func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	}
 	// A pause in its leadership transfer holds the gate; ctx bounds the wait.
 	if !ns.pauseGate.lock(ctx.Done()) {
-		return ctx.Err()
+		return mapContextError(ctx.Err())
 	}
 	wasPaused := ns.paused.Load()
 	h.engine.ResumeNode(engNode)
@@ -8309,6 +8360,9 @@ func (e *SnapshotArtifactError) Unwrap() error { return e.Err }
 // never be imported, even by a caller that ignored the error. It is still not
 // an artifact and should be discarded.
 func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return mapContextError(err)
+	}
 	if h.closed.Load() {
 		return ErrClosed
 	}
@@ -8363,6 +8417,7 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
 		return ErrSnapshotEncryptedBarrierUnavailable
 	}
+	// Checked again: the lookups above may outlast the caller's context.
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)
 	}
@@ -8974,7 +9029,7 @@ func resolveImportMembership(
 // the next PurgeEpochsBefore destroy the DEK it needs.
 //
 // The option remains meaningful for a shard whose layout cannot be discovered:
-// one with NO bootstrap record (started with join=true, which records none).
+// one with NO bootstrap record (never started on this host, joined or not).
 // It fails closed with ErrImportLayoutUnknown unless the caller states the
 // layout here, and the stated value is trusted because there is nothing to
 // cross-check it against.
@@ -9005,8 +9060,8 @@ func (h *Host) resolveImportDataDir(shardID, replicaID uint64, iopts importOptio
 	// With a record, its DataDir is authoritative: every bootstrap record
 	// states it ("" means the tree is rooted under NodeHostDir), and a
 	// WithImportDataDir that disagrees is a contradiction, refused below.
-	// Without one (a shard started with join=true records none), the layout
-	// is unknown.
+	// Without one (a shard this host never started, joined or not), the
+	// layout is unknown.
 	if !ok {
 		// No recorded layout. Only the caller can supply it, and a wrong
 		// guess costs the artifact's DEK, so refuse rather than assume.
@@ -9434,6 +9489,17 @@ func (h *Host) importPreflight(ctx context.Context, shardID uint64) (uint64, err
 	}
 	if err := h.refuseRetiredReplica(shardID, replicaID); err != nil {
 		return 0, err
+	}
+	// A pending removal intent names the tree RemoveData's retry deletes.
+	// An import records its snapshot in the tree resolveImportDataDir picks,
+	// which with no bootstrap record need not be that one, so importing now
+	// could record a snapshot the retry orphans: it retires the replica,
+	// drops the record and deletes only the intent's tree. The second call,
+	// under the import lock RemoveData also holds, is the binding check.
+	if p, pending, err := h.readRemoveDataIntent(shardID, replicaID); err != nil {
+		return 0, err
+	} else if pending {
+		return 0, &removalPendingError{ShardID: shardID, ReplicaID: replicaID, Dir: p}
 	}
 
 	// A CONFIGURED but SEALED barrier means at-rest encryption is temporarily
@@ -10152,6 +10218,14 @@ func (h *Host) Close() error {
 				// the race. Readers gate on ns.stopped (set in sweep 1).
 			}
 		}
+
+		// Join every admitted RemoveData before the LogDB it retires replicas
+		// in is closed and NodeHostDir, where it deletes snapshots and clears
+		// its intent, is released. The admitMu barrier waits out a call
+		// between its h.closed check and its count; later calls see h.closed.
+		h.admitMu.Lock()
+		h.admitMu.Unlock() //nolint:staticcheck // empty critical section is the admission barrier
+		h.removeDataWG.Wait()
 
 		// Close LogDB.
 		if h.logdb != nil {
@@ -11452,27 +11526,58 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 	select {
 	case result := <-rs.ResultC():
 		if result.Err != nil {
-			return 0, result.Err
+			return 0, withDeadlineCause(ctx, result.Err)
 		}
 		return result.Value, nil
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return 0, ErrTimeout
-		}
-		return 0, ErrCanceled
+		return 0, mapContextError(ctx.Err())
 	}
 }
 
-// RemoveData removes all LogDB data for the given shard/replica pair and
-// retires the replica ID on this host: StartShard refuses it from then on
-// (ReplicaRetiredError), across restarts. The shard must be
-// stopped on this host before calling RemoveData. This is used to clean up
+// RemoveData removes all LogDB data for the given shard/replica pair, retires
+// the replica ID on this host (StartShard refuses it from then on with
+// ReplicaRetiredError, across restarts), and then removes the replica's
+// snapshot directory.
+//
+// The steps are ordered so a failure never strands a replica: the snapshot
+// directory is resolved, a durable removal intent naming it is written under
+// NodeHostDir/remove-data, the replica is retired, the directory is removed,
+// and the intent is dropped. A failure at any step returns its error and a
+// retry finishes the remaining steps from the intent; the snapshot of a
+// replica that was not retired is never touched. The shard must be
+// stopped on this host before calling RemoveData, and the stop must have
+// returned: a replica whose StopShard is still unloading it is refused with
+// ErrShardNotStopped, and the caller retries. This is used to clean up
 // persistent state after a node has been permanently removed from a shard; a
 // replica that is to rejoin does so under a new replica ID, as Raft requires.
+//
+// RemoveData removes the one snapshot directory the replica's records agree
+// on. A replica whose LogDB snapshot record lies in another replica
+// directory than its bootstrap record's DataDir selects (a replica that
+// snapshotted under one DataDir and was restarted under another by a release
+// before v1.0.0) is refused with an error matching ErrInvalidOperation that
+// names the shard, replica, bootstrap and snapshot directories, before
+// anything is retired, deleted or recorded, rather than report success while
+// a snapshot remains. To repair, start the replica again under the DataDir
+// its bootstrap record states, make sure a new entry has been committed and
+// applied on it (for example propose a no-op or any write to the shard and
+// wait for this replica to apply it), then request a snapshot and confirm it
+// reports an index greater than the one the old snapshot record held (an
+// index of 0 means nothing was taken, and the record still names the old
+// tree); only then stop it and retry RemoveData. Then delete the old snapshot
+// directory, which no record references.
 func (h *Host) RemoveData(shardID, replicaID uint64) error {
+	// Admit the call into removeDataWG under admitMu: Close sets h.closed and
+	// then takes admitMu.Lock, so every call admitted before that barrier is
+	// counted when Close waits, and every later one sees h.closed here.
+	h.admitMu.RLock()
 	if h.closed.Load() {
+		h.admitMu.RUnlock()
 		return ErrClosed
 	}
+	h.removeDataWG.Add(1)
+	h.admitMu.RUnlock()
+	defer h.removeDataWG.Done()
 
 	// Take the shard's import lock, which StartShard holds for the whole of a
 	// start: the checks below and the removal then cannot interleave with a
@@ -11488,7 +11593,13 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	}
 	defer releaseImportLock()
 
-	// Check if the shard is still loaded on this host.
+	// Check if the shard is still loaded on this host. A matching replica is
+	// refused for as long as its nodeState is in h.nodes, stopping or not:
+	// StopShard sets ns.stopped before Engine.UnloadNode stops the engine
+	// node and waits out its write leases, and removes the nodeState only
+	// after that, so until then a snapshot save can still publish into the
+	// directory removed below — leaving a snapshot behind a removal that
+	// reported success. The caller retries once the stop has finished.
 	if v, loaded := h.nodes.Load(shardID); loaded {
 		ns, ok := v.(*nodeState)
 		if !ok {
@@ -11499,12 +11610,66 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 					ExpectedType: "*nodeState",
 					ActualValue:  v,
 				})
-		} else if !ns.stopped.Load() && ns.replicaID == replicaID {
+		} else if ns.replicaID == replicaID {
 			return &ShardNotStoppedError{ShardID: shardID, ReplicaID: replicaID}
 		}
 	}
 
+	// Resolve the replica's snapshot directory before the LogDB removal
+	// drops the bootstrap record that states the shard's DataDir (the
+	// nodeState holding the Config is gone once the replica is unloaded).
+	snapDir, intentPending, err := h.removeDataSnapshotDir(shardID, replicaID)
+	if err != nil {
+		return err
+	}
+
+	// Record the removal intent, durably, BEFORE anything is retired or
+	// deleted: once RemoveNodeData drops the bootstrap record, the intent is
+	// what still locates the snapshot directory for a retry after a failure
+	// or crash. A pending intent was published by an earlier call whose
+	// directory sync may have failed, so it is synced again here; a failed
+	// sync returns with the replica unretired.
+	if !intentPending {
+		if err := h.writeRemoveDataIntent(shardID, replicaID, snapDir); err != nil {
+			return err
+		}
+	} else if err := syncRemoveDataIntentDir(h.snapshotFsys(), h.cfg.NodeHostDir, shardID, replicaID); err != nil {
+		return err
+	}
+
+	// Retire the replica BEFORE its snapshots are deleted. An unretired
+	// replica may still start, and its compacted log depends on its
+	// snapshot, so a failure here leaves the snapshot directory untouched.
+	// A retired replica is refused by StartShard, so its snapshot is never
+	// needed again. RemoveNodeData of an already retired replica is a no-op,
+	// so a retry from a pending intent repeats it safely.
 	if err := h.logdb.RemoveNodeData(shardID, replicaID); err != nil {
+		return err
+	}
+
+	// Remove the retired replica's snapshot directory. RemoveAll of a missing
+	// directory is nil, so a retry is idempotent.
+	if err := h.snapshotFsys().RemoveAll(snapDir); err != nil {
+		return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "remove snapshot directory", Path: snapDir, Err: err}
+	}
+
+	// Make the removal durable BEFORE the intent is dropped: sync the parent
+	// that held the snapshot directory's entry, or a power loss could bring
+	// the directory back with no intent and no record left to find it. A
+	// missing parent holds no entry to sync. A failed sync keeps the intent,
+	// so a retry finishes the removal.
+	if parent := filepath.Dir(snapDir); parent != snapDir {
+		if _, err := h.snapshotFsys().Stat(parent); err == nil {
+			if err := syncDir(h.snapshotFsys(), parent); err != nil {
+				return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "sync snapshot parent directory", Path: parent, Err: err}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return &removeDataError{ShardID: shardID, ReplicaID: replicaID, Op: "stat snapshot parent directory", Path: parent, Err: err}
+		}
+	}
+
+	// Every step is done and durable: drop the intent.
+	if err := h.clearRemoveDataIntent(shardID, replicaID); err != nil {
 		return err
 	}
 
@@ -11542,10 +11707,7 @@ func (h *Host) refuseRetiredReplica(shardID, replicaID uint64) error {
 func (h *Host) SyncRemoveData(ctx context.Context, shardID, replicaID uint64) error {
 	select {
 	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
+		return mapContextError(ctx.Err())
 	default:
 	}
 	return h.RemoveData(shardID, replicaID)
@@ -12248,8 +12410,16 @@ func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, 
 				return id, nil
 			}
 		}
-		// Invalid format: regenerate.
+		// Invalid format: regenerate. os.WriteFile applies its mode only
+		// when it creates the file, so the malformed file is removed first:
+		// otherwise the new ID would inherit its mode instead of
+		// hostIDFilePerms. Only this branch removes, where ReadFile proved
+		// the path is a readable file; anything else at the path (such as
+		// a directory) still fails the write below.
 		logger.Warn("host ID file has invalid format, regenerating", "path", idPath)
+		if err := os.Remove(idPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", &HostInitError{Field: "host_id", Err: err}
+		}
 	}
 
 	// Generate new ID.
@@ -13135,16 +13305,34 @@ func walShardIDs(db logdb.LogDB) []uint64 {
 }
 
 // mapContextError translates a context error into the corresponding
-// quicraft sentinel error. This ensures callers always see ErrCanceled
-// or ErrTimeout rather than raw context.Canceled / context.DeadlineExceeded.
+// quicraft sentinel error that wraps it, so errors.Is holds for both
+// ErrCanceled and context.Canceled, or for both ErrTimeout and
+// context.DeadlineExceeded.
 func mapContextError(err error) error {
-	if err == context.DeadlineExceeded {
-		return ErrTimeout
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &contextError{Err: ErrTimeout, Cause: err}
 	}
-	if err == context.Canceled {
-		return ErrCanceled
+	if errors.Is(err, context.Canceled) {
+		return &contextError{Err: ErrCanceled, Cause: err}
 	}
 	return err
+}
+
+// mapLocalReadError maps a context error returned by a local state machine
+// read (a read abandoned while an Update held the state machine) to
+// ErrCanceled or ErrTimeout, as the read's own context checks do. An error
+// that already carries ErrCanceled or ErrTimeout is returned unchanged. A
+// read that passed its caller's stopped check and then found the state
+// machine closed by StopShard or Close reports ErrClosed, as that check
+// does, not the internal rsm error callers cannot match.
+func mapLocalReadError(err error) error {
+	if err == nil || errors.Is(err, ErrCanceled) || errors.Is(err, ErrTimeout) {
+		return err
+	}
+	if errors.Is(err, rsm.ErrClosed) {
+		return ErrClosed
+	}
+	return mapContextError(err)
 }
 
 // effectiveMaxPayload returns the effective maximum proposal payload size

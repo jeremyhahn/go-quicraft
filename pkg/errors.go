@@ -59,10 +59,18 @@ var (
 	ErrClosed = errors.New("quicraft: host closed")
 
 	// ErrCanceled is returned when a request is canceled by the caller
-	// via context cancellation.
+	// via context cancellation. The returned error wraps the context
+	// error as well, so errors.Is(err, context.Canceled) also holds.
 	ErrCanceled = errors.New("quicraft: request canceled")
 
-	// ErrTimeout is returned when a request exceeds its deadline.
+	// ErrTimeout is returned when a request exceeds its deadline. The
+	// synchronous calls that wait on the caller's context (SyncPropose,
+	// SyncRead and the other Sync* methods, and the session and membership
+	// calls that block until applied) wrap the context error as well when
+	// that context's deadline has passed, so errors.Is(err,
+	// context.DeadlineExceeded) also holds. An asynchronous RequestState's
+	// Result (for example after ReadIndex(ctx)) has no caller context and
+	// returns ErrTimeout without the context cause.
 	ErrTimeout = errors.New("quicraft: timeout")
 
 	// ErrRejected is returned when a proposal is rejected, for example
@@ -1514,6 +1522,56 @@ func (e *ImportDataDirMismatchError) Is(target error) bool {
 	return target == ErrImportDataDirMismatch
 }
 
+// errRemoveDataLayoutConflict is the sentinel for
+// *removeDataLayoutConflictError. It is unexported: callers match the
+// refusal with errors.Is(err, ErrInvalidOperation).
+var errRemoveDataLayoutConflict = errors.New("quicraft: RemoveData refused: the replica's snapshot record and bootstrap record name different snapshot trees")
+
+// removeDataLayoutConflictError is returned by Host.RemoveData when the
+// replica's bootstrap record states a DataDir whose snapshot directory is not
+// the one its LogDB snapshot record points into. Releases before v1.0.0 let a
+// replica that had snapshotted under one DataDir restart under another: the
+// restart recovered the snapshot from the old tree but recorded the new
+// DataDir. Removing only the bootstrap record's directory would retire the
+// replica and report success while its snapshot survives in the other tree,
+// so RemoveData refuses before anything is retired, deleted or recorded.
+//
+// To repair, start the replica again under the DataDir its bootstrap record
+// states and make sure a new entry has been committed and applied on it (for
+// example propose a no-op or any write to the shard and wait for this replica
+// to apply it): a snapshot request on a replica whose applied index has not
+// advanced past its latest snapshot takes nothing and returns index 0, which
+// leaves the snapshot record in the old tree. Then request a snapshot and
+// confirm it reports an index greater than the one the old record held; only
+// then stop the replica and retry RemoveData. Finally delete SnapshotDir,
+// which no record references any more. It matches ErrInvalidOperation under errors.Is.
+type removeDataLayoutConflictError struct {
+	// ShardID is the shard whose data removal was refused.
+	ShardID uint64
+	// ReplicaID is the replica whose data removal was refused.
+	ReplicaID uint64
+	// BootstrapDir is the replica snapshot directory the bootstrap
+	// record's DataDir selects.
+	BootstrapDir string
+	// SnapshotDir is the replica snapshot directory the snapshot record's
+	// Filepath lies in.
+	SnapshotDir string
+}
+
+// Error returns a human-readable description of the conflict.
+func (e *removeDataLayoutConflictError) Error() string {
+	return fmt.Sprintf(
+		"quicraft: RemoveData of shard %d replica %d: bootstrap record selects snapshot directory %q but the snapshot record lies in %q",
+		e.ShardID, e.ReplicaID, e.BootstrapDir, e.SnapshotDir,
+	)
+}
+
+// Is reports whether target is errRemoveDataLayoutConflict or
+// ErrInvalidOperation.
+func (e *removeDataLayoutConflictError) Is(target error) bool {
+	return target == errRemoveDataLayoutConflict || target == ErrInvalidOperation
+}
+
 // ImportSnapshotOutOfDateError is returned by Host.ImportSnapshot when the
 // artifact's snapshot index is not NEWER than the snapshot the shard already
 // has recorded in LogDB.
@@ -1779,6 +1837,83 @@ func MaybeApplied(err error) bool {
 	}
 	var m *MaybeAppliedError
 	return errors.As(err, &m)
+}
+
+// contextError is returned when a Host call ends because the caller's
+// context was done. Err is the quicraft sentinel the context error maps to
+// (ErrTimeout for a deadline, ErrCanceled for a cancellation) and Cause is
+// the context error itself, so errors.Is matches both ErrTimeout and
+// context.DeadlineExceeded (or ErrCanceled and context.Canceled).
+type contextError struct {
+	// Err is ErrTimeout or ErrCanceled.
+	Err error
+	// Cause is the context's error, possibly wrapped.
+	Cause error
+}
+
+// Error returns "<sentinel>: <cause>".
+func (e *contextError) Error() string {
+	return e.Err.Error() + ": " + e.Cause.Error()
+}
+
+// Is reports whether target is the quicraft sentinel Err.
+func (e *contextError) Is(target error) bool {
+	return target == e.Err
+}
+
+// Unwrap returns the context error.
+func (e *contextError) Unwrap() error { return e.Cause }
+
+// removeDataError is returned by Host.RemoveData when one of its storage
+// steps (the removal intent, the snapshot directory or a directory sync)
+// fails. Op names the step and Path the file or directory it acted on; Err
+// is the underlying error, so errors.Is and errors.As see through it.
+type removeDataError struct {
+	// ShardID is the shard whose data was being removed.
+	ShardID uint64
+	// ReplicaID is the replica whose data was being removed.
+	ReplicaID uint64
+	// Op names the removal step that failed.
+	Op string
+	// Path is the file or directory the failed step operated on.
+	Path string
+	// Err is the underlying error of the failed step.
+	Err error
+}
+
+// Error returns a human-readable description of the failed step.
+func (e *removeDataError) Error() string {
+	return fmt.Sprintf("quicraft: RemoveData shard %d replica %d: %s %s: %v",
+		e.ShardID, e.ReplicaID, e.Op, e.Path, e.Err)
+}
+
+// Unwrap returns the underlying error.
+func (e *removeDataError) Unwrap() error { return e.Err }
+
+// removalPendingError is returned when an operation that would record a new
+// snapshot for a replica is refused because a RemoveData of that replica is
+// pending: its durable removal intent names the snapshot tree the retry
+// deletes, so a snapshot recorded in another tree would be orphaned. The
+// caller retries RemoveData to finish the removal. It matches
+// ErrInvalidOperation.
+type removalPendingError struct {
+	// ShardID is the shard whose removal is pending.
+	ShardID uint64
+	// ReplicaID is the replica whose removal is pending.
+	ReplicaID uint64
+	// Dir is the snapshot directory the pending removal intent names.
+	Dir string
+}
+
+// Error returns a human-readable description of the error.
+func (e *removalPendingError) Error() string {
+	return fmt.Sprintf("quicraft: shard %d replica %d has a pending RemoveData of %s; "+
+		"retry RemoveData to finish it", e.ShardID, e.ReplicaID, e.Dir)
+}
+
+// Is reports whether target is ErrInvalidOperation.
+func (e *removalPendingError) Is(target error) bool {
+	return target == ErrInvalidOperation
 }
 
 // NotLeader reports whether err indicates this replica is not the leader,
