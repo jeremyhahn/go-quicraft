@@ -32,6 +32,10 @@
 # - The `Runner labels` unset-variable exemption also skips a pull_request
 #   fork head (a fork pull request never reaches the pool), beside v1.51's
 #   `not fork_target` term for a pull_request_target fork head.
+# - The `Runner labels` step fails closed, finding (g), on a workflow whose
+#   jobs it cannot read by lines (a quoted or flow-style jobs key, a job
+#   that is not a block mapping, an explicit or merge key, an alias, anchor
+#   or tag, no or two jobs keys), so such a workflow never gets its OK.
 # - The Signatures job stays here (v1.35.2 moved it to signatures.yml).
 # HOSTED FIRST: every job but preflight runs on ubuntu-latest. preflight's
 # v1.49 pool expression is the one exception, and
@@ -1359,13 +1363,88 @@ jobs:
               return t
 
 
+          TOP_KEY = re.compile(r"(['\"]?)([A-Za-z0-9_-]+)\1\s*:(?:\s+(.*))?$")
+          JOB_KEY = re.compile(r"([A-Za-z0-9_-]+)\s*:(?:\s+(.*))?$")
+          YAML_NODE = re.compile(r"(?:^|[\s,\[{:])[*&!]")  # an alias, anchor or tag
+
+
+          def block_children(lines, i):
+              """(line, text) for each line at the first child indent under line i."""
+              base, child, out = ind(lines[i]), None, []
+              for j in range(i + 1, len(lines)):
+                  s = lines[j]
+                  if not s.strip() or s.lstrip().startswith("#"):
+                      continue
+                  if ind(s) <= base:
+                      break
+                  child = ind(s) if child is None else child
+                  if ind(s) < child:
+                      return None
+                  if ind(s) == child:
+                      out.append((j, strip_comment(s).strip()))
+              return out
+
+
+          def jobs_block(lines):
+              """The line of the one block-style `jobs:` key, or why the jobs cannot be read.
+
+              LOCAL (fail closed): the validator reads YAML by its lines, so a
+              jobs block in any other form (a quoted key, a flow mapping, an
+              explicit or merge key, an alias, anchor or tag) is a finding,
+              never skipped into the final OK.
+              """
+              at = []
+              for i, s in enumerate(lines):
+                  if not s.strip() or s.lstrip().startswith("#") or ind(s) > 0:
+                      continue
+                  t = strip_comment(s).strip()
+                  if t in ("---", "..."):
+                      continue
+                  m = TOP_KEY.match(t)
+                  if not m:
+                      return None, f"line {i + 1} is not a block-style top-level key"
+                  if m.group(2) == "jobs":
+                      if m.group(1):
+                          return None, f"line {i + 1} quotes the jobs key"
+                      if m.group(3):
+                          return None, f"line {i + 1} gives jobs an inline value (a flow mapping, alias or scalar)"
+                      at.append(i)
+              if len(at) != 1:
+                  return None, ("it has no block-style jobs key" if not at else "it has more than one jobs key")
+              jobs = block_children(lines, at[0])
+              if not jobs:
+                  return None, "its jobs key opens no block mapping of jobs"
+              for j, t in jobs:
+                  m = JOB_KEY.match(t)
+                  if not m or m.group(2):
+                      return None, f"line {j + 1} is not a job opening a block mapping"
+                  keys = block_children(lines, j)
+                  if not keys:
+                      return None, f"job {m.group(1)} opens no block mapping"
+                  for k, kt in keys:
+                      km = TOP_KEY.match(kt)
+                      if not km and not kt.startswith("<<"):
+                          return None, f"line {k + 1} in job {m.group(1)} is not a block-style key"
+                      if not km or re.match(r"[*&!]", km.group(3) or ""):
+                          return None, f"line {k + 1} in job {m.group(1)} uses a merge key, alias, anchor or tag"
+                      if km.group(2) == "runs-on":
+                          ro = re.sub(r"\$\{\{.*?\}\}", "", body(lines, k, km.group(3) or ""), flags=re.S)
+                          if YAML_NODE.search(ro):
+                              return None, f"line {k + 1} in job {m.group(1)} gives runs-on through an alias, anchor or tag"
+              return at[0], None
+
+
           def check(path):
               lines = open(path, encoding="utf-8").read().splitlines()
               on = triggers(lines)
               bad = []
+              ji, why = jobs_block(lines)
+              if why:
+                  return [f"{path}: (g) its jobs cannot be read: {why}; the runner-label check reads only "
+                          f"block-style YAML and fails closed on any other form"]
               for i, s in enumerate(lines):
-                  if re.match(r"jobs\s*:\s*(#.*)?$", s):
-                      for j, job, _ in keys_under(lines, i):
+                  if i == ji:
+                      for j, job, _ in keys_under(lines, ji):
                           ro = cond = ro_line = None
                           for k, key, inline in keys_under(lines, j):
                               if key == "runs-on":
