@@ -907,7 +907,7 @@ jobs:
       # vars.CI_PREFLIGHT_RUNS_ON, is checked with the variable unset, where
       # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to
       # `"ubuntu-latest"`, where it must give a standard image.
-      # Its tests: testdata/runner-labels-tests.py.
+      # Its tests: test/buildgates/testdata/runner-labels-tests.py (the lint-gates job runs them).
       - name: Runner labels
         run: |
           python3 -I - <<'PY'
@@ -2165,6 +2165,11 @@ jobs:
       # before any step that builds can print one.
       - name: Mask the LAN addresses
         run: scripts/ci-mask-lan.sh
+
+      # The Runner labels step's rejection cases, on the runner's python3
+      # (the toolchain image has none): stdlib only, no make recipe.
+      - name: Runner labels tests
+        run: python3 -I test/buildgates/testdata/runner-labels-tests.py
 
       # A source check on the runner's shell: no make recipe runs here.
       - name: Does the Makefile define lint-gates?
