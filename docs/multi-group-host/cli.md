@@ -30,7 +30,7 @@ own repository.
 | `make build` | `go build ./...`. Produces no artifact |
 | `make test` | the unit suite (`go test -race -count=1 -v ./...`, no build tags) |
 | `make lint` | golangci-lint |
-| `make ci` | `fmt no-mutants check-tool-versions vet lint security build test` |
+| `make ci` | `fmt no-mutants check-tool-versions vet lint lint-gates security build test` |
 | `make ci-full` | `ci` plus all modules, cross-platform build and vet, I/O faults, fuzz seeds and mutation, integration, network faults and the FIPS targets |
 | `make coverage` | module coverage against `COVER_MIN = 91` |
 | `make coverage-packages` | every package under `pkg/` against `COVER_MIN` |
