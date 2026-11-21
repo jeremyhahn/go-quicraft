@@ -207,10 +207,11 @@ func runGateTwin(t *testing.T, s gateTwinScript, c gateTwinCase) (int, string) {
 func TestCodeReviewGateTwin(t *testing.T) {
 	s := extractGateTwin(t)
 	for _, c := range []gateTwinCase{
-		// The template (v5.12.6): an approval of the head passes while a twin
-		// reviews it; only a head not approved fails closed, naming the twin.
-		{name: "approved head, queued twin", twinState: "queued", verdict: "APPROVED", wantPass: true},
-		{name: "approved head, in_progress twin", twinState: "in_progress", verdict: "APPROVED", wantPass: true},
+		// The template (v5.12.12): a twin reviewing the head fails the gate
+		// closed, naming the twin, approval or not; with no twin an approved
+		// head passes.
+		{name: "approved head, queued twin", twinState: "queued", verdict: "APPROVED"},
+		{name: "approved head, in_progress twin", twinState: "in_progress", verdict: "APPROVED"},
 		{name: "approved head, no twin", verdict: "APPROVED", wantPass: true},
 		{name: "not approved, queued twin", twinState: "queued"},
 		{name: "changes requested, in_progress twin", twinState: "in_progress", verdict: "CHANGES_REQUESTED"},
