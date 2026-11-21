@@ -1888,9 +1888,12 @@ jobs:
         if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && runner.environment != 'github-hosted' }}
         run: scripts/ci-image-history.sh "$TOOLCHAIN_IMAGE"
 
-      # The integration image the build step made, checked the same way.
+      # The integration image the build step made, checked the same way. A
+      # pull request without ci:full builds only the toolchain image, and the
+      # lease step leases only an image that is present, so the check runs
+      # only on a lease (as the integration job runs only on its lease).
       - name: Check the integration image carries no private address
-        if: ${{ !cancelled() && env.IT_IMAGE != '' && runner.environment != 'github-hosted' }}
+        if: ${{ !cancelled() && env.IT_IMAGE != '' && env.IT_LEASE != '' && runner.environment != 'github-hosted' }}
         run: scripts/ci-image-history.sh "$IT_IMAGE"
 
       # v1.22: bound this repo's cache volumes on the host before the stages
