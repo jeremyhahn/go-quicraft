@@ -204,6 +204,80 @@ func TestCIRunsHostedFirst(t *testing.T) {
 	}
 }
 
+// templateConcurrencyGroup is ci-template v1.53's concurrency group: on main
+// the group is `main-{event}`, so a newer main run cancels the older one; a
+// schedule run is `schedule-{repository}`; every other ref is its own group.
+const templateConcurrencyGroup = "${{ github.workflow }}-${{ github.event_name == 'schedule' && " +
+	"format('schedule-{0}', github.repository) || github.ref == 'refs/heads/main' && " +
+	"format('main-{0}', github.event_name) || github.ref }}"
+
+// forkPullRequestRunner resolves a job's runs-on for a pull request whose head
+// repository is a fork. Only a literal label resolves: an expression can read
+// variables and job outputs this test cannot know, so it reports false.
+func forkPullRequestRunner(runsOn *yaml.Node) (string, bool) {
+	if runsOn == nil || runsOn.Kind != yaml.ScalarNode || strings.Contains(runsOn.Value, "${{") {
+		return "", false
+	}
+	return runsOn.Value, true
+}
+
+// forkRunnerProblems lists each ci.yml job that a fork's pull request could
+// run off the hosted runner (ci-template v1.52).
+func forkRunnerProblems(body []byte) []string {
+	jobs, problem := runnerJobs("ci.yml", body)
+	if problem != "" {
+		return []string{problem}
+	}
+	var problems []string
+	for _, j := range jobs {
+		if j.uses {
+			continue
+		}
+		if got, ok := forkPullRequestRunner(j.runsOn); !ok || got != hostedRunner {
+			problems = append(problems, "ci.yml job "+j.name+" does not resolve to "+hostedRunner+" for a fork's pull request")
+		}
+	}
+	return problems
+}
+
+// TestCIForkPullRequestRunsHosted pins ci-template v1.52's outcome: a fork's
+// pull request runs every ci.yml job on ubuntu-latest.
+func TestCIForkPullRequestRunsHosted(t *testing.T) {
+	body := readWorkflow(t, "ci.yml")
+	for _, p := range forkRunnerProblems(body) {
+		t.Error(p)
+	}
+	expr := `${{ fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') }}`
+	for _, c := range []struct{ name, job, runsOn string }{
+		{"a self-hosted label", "coverage", "bigdisk"},
+		{"an expression that can pick a self-hosted label", "preflight", expr},
+	} {
+		got := forkRunnerProblems([]byte(replaceJobRunner(t, string(body), c.job, c.runsOn)))
+		if len(got) != 1 || !strings.Contains(got[0], "job "+c.job+" ") {
+			t.Errorf("%s: want one finding for job %s, got %q", c.name, c.job, got)
+		}
+	}
+}
+
+// TestCIConcurrencyGroupIsMainPerEvent pins ci-template v1.53: main's
+// concurrency group is `main-{event}` and cancel-in-progress is a literal true.
+func TestCIConcurrencyGroupIsMainPerEvent(t *testing.T) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(readWorkflow(t, "ci.yml"), &doc); err != nil || len(doc.Content) == 0 {
+		t.Fatalf("ci.yml does not parse: %s", errString(err))
+	}
+	c := mapValue(doc.Content[0], "concurrency")
+	if c == nil {
+		t.Fatal("ci.yml has no concurrency block")
+	}
+	if g := mapValue(c, "group"); g == nil || g.Value != templateConcurrencyGroup {
+		t.Errorf("ci.yml concurrency.group is not ci-template v1.53's `main-{event}` group:\n got %v\nwant %q", g, templateConcurrencyGroup)
+	}
+	if v := mapValue(c, "cancel-in-progress"); v == nil || v.Value != "true" || v.Tag != "!!bool" {
+		t.Errorf("ci.yml cancel-in-progress is not a literal true")
+	}
+}
+
 // TestRunnerProblems shows that runnerProblems reports each regression of
 // the runner rule, and accepts a categorised waiver where one is allowed.
 func TestRunnerProblems(t *testing.T) {

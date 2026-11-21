@@ -1,4 +1,4 @@
-# ci-template: v1.35.1 + v1.42 hermetic gate (customized)
+# ci-template: v1.53 (customized)
 # HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
 # waiver on its runs-on line that names its category and a reason:
 # `# self-hosted: hardware: <reason>` (the job needs specific hardware), or
@@ -7,6 +7,25 @@
 # waiver today; `credential:` is accepted only for code-review.yml's Codex
 # review, and publish-images keeps its release form under the release rule.
 # test/buildgates/ci_runners_test.go holds the rule.
+# v1.53 (2026-11-21): main has one concurrency group per event again,
+# `main-{event}`, so a newer push to main cancels the older main run still
+# queued or in progress, and the newest run validates every merge under it.
+# This supersedes v1.26.2's `main-{event}-{sha}`. A schedule run keeps
+# `schedule-{repository}` and a workflow_dispatch run keeps
+# `main-workflow_dispatch`, so neither shares a group with a push run.
+# cancel-in-progress stays a literal `true`. Only the group changes; the
+# group line is the template's, character for character.
+# v1.52 (2026-11-21): a fork's pull request runs every job on ubuntu-latest.
+# Taken as its outcome: this repository's runner value for every ci.yml job is
+# the literal `ubuntu-latest` (HOSTED FIRST above), so the template's
+# selection, evaluated with this repository's values, gives `ubuntu-latest` to
+# a fork's pull request, a same-repository pull request and main alike. The
+# template's runs-on expressions, its `Hosted or overflow runner` step and its
+# inline `Runner labels` step are not taken: an expression runs-on can pick a
+# self-hosted label, which ci_runners_test.go refuses for ci.yml, and that Go
+# test is this repository's runner-label check. TestCIForkPullRequestRunsHosted
+# holds the fork case.
+# The rest of v1.36 to v1.51 is still to come (see the v1.42 paragraph).
 # v1.42 hermetic gate only (owner ruling 742 (1), Tenant Agent rulings 754 and
 # the hermetic-gate rollout order): the CI Gate's outcome depends only on the
 # tree under test. `make deps-check` (lint job), `make security` (gosec,
