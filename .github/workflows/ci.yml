@@ -1052,6 +1052,9 @@ jobs:
           def eq(a, b):
               if a is U or b is U:
                   return U
+              # LOCAL (security): arrays and objects compare by identity, as in GitHub expressions
+              if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
+                  return a is b
               if isinstance(a, str) and isinstance(b, str):
                   return a.lower() == b.lower()
               if type(a) is type(b) and not isinstance(a, (int, float)):
