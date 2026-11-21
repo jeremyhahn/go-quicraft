@@ -2509,6 +2509,182 @@ func TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine(t *testing.T
 	}
 }
 
+// newNALookupIntoStateMachine builds a StateMachine over an SM that
+// implements NALookupInto, holding "key" = "val".
+func newNALookupIntoStateMachine(t *testing.T) *StateMachine {
+	t.Helper()
+	kv := &testNALookupIntoSM{testHasherSM: testHasherSM{testKV: testKV{data: map[string]string{"key": "val"}}}}
+	createFn := func(shardID, replicaID uint64) interface{} {
+		return kv
+	}
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	t.Cleanup(func() { rsm.Close() })
+	return rsm
+}
+
+// TestStateMachine_NALookupBufContext_CancelledWhileGuardHeldLeavesNoWaiter
+// pins that NALookupBufContext, queued behind an apply holding the guard,
+// returns the context's error when the context is cancelled, and leaves no
+// goroutine and no registered waiter behind.
+func TestStateMachine_NALookupBufContext_CancelledWhileGuardHeldLeavesNoWaiter(t *testing.T) {
+	rsm := newNALookupIntoStateMachine(t)
+
+	rsm.readGuard.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			rsm.readGuard.Unlock()
+		}
+	}()
+	baseline := runtime.NumGoroutine()
+
+	const readers = 100
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type outcome struct {
+		result    []byte
+		release   func()
+		supported bool
+		err       error
+	}
+	outs := make(chan outcome, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+			outs <- outcome{r, rel, ok, lookupErr}
+		}()
+	}
+	queued := time.Now().Add(2 * time.Second)
+	for rsm.readWait.waiters.Load() < readers && time.Now().Before(queued) {
+		time.Sleep(time.Millisecond)
+	}
+	if n := rsm.readWait.waiters.Load(); n != readers {
+		t.Fatalf("queued waiters = %d, want %d", n, readers)
+	}
+	cancel()
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < readers; i++ {
+		select {
+		case o := <-outs:
+			if !errors.Is(o.err, context.Canceled) {
+				t.Fatalf("NALookupBufContext err = %v, want context.Canceled", o.err)
+			}
+			if o.result != nil || o.supported {
+				t.Fatalf("NALookupBufContext = (%q, supported=%v), want (nil, false) on cancel", o.result, o.supported)
+			}
+			if o.release == nil {
+				t.Fatal("NALookupBufContext returned a nil release on cancel")
+			}
+			o.release()
+		case <-deadline:
+			t.Fatalf("only %d of %d cancelled NALookupBufContext calls returned within 2s", i, readers)
+		}
+	}
+
+	if n := rsm.readWait.waiters.Load(); n != 0 {
+		t.Fatalf("queued waiters = %d after every cancelled read returned, want 0", n)
+	}
+	settle := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baseline && time.Now().Before(settle) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > baseline {
+		t.Fatalf("goroutines = %d with the guard still held, baseline %d: cancelled reads left waiters", n, baseline)
+	}
+
+	rsm.readGuard.Unlock()
+	locked = false
+	r, rel, ok, lookupErr := rsm.NALookupBufContext(context.Background(), []byte("key"))
+	if lookupErr != nil || !ok || string(r) != "val" {
+		t.Fatalf("NALookupBufContext after release = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+	}
+	rel()
+}
+
+// TestStateMachine_NALookupBufContext_LiveContextFreeGuardReturnsResult pins
+// that NALookupBufContext with a live cancellable context and a free guard
+// returns the state machine's result, on both the NALookupInto path and the
+// NALookup fallback.
+func TestStateMachine_NALookupBufContext_LiveContextFreeGuardReturnsResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Run("NALookupInto", func(t *testing.T) {
+		rsm := newNALookupIntoStateMachine(t)
+		r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+		if lookupErr != nil || !ok || string(r) != "val" {
+			t.Fatalf("NALookupBufContext = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+		}
+		rel()
+	})
+	t.Run("NALookupFallback", func(t *testing.T) {
+		kv := &testHasherSM{testKV: testKV{data: map[string]string{"key": "val"}}}
+		createFn := func(shardID, replicaID uint64) interface{} {
+			return kv
+		}
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+		if err != nil {
+			t.Fatalf("NewStateMachine = %v", err)
+		}
+		defer rsm.Close()
+		r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+		if lookupErr != nil || !ok || string(r) != "val" {
+			t.Fatalf("NALookupBufContext = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+		}
+		rel()
+	})
+	if n := ctx.Err(); n != nil {
+		t.Fatalf("ctx.Err() = %v, want the context still live", n)
+	}
+}
+
+// TestStateMachine_PreCancelledContextFreeGuard_RunsLookup pins today's
+// behavior for a context that is already cancelled when the guard is free:
+// rlockContext's fast path takes the guard before it looks at the context,
+// so Lookup and NALookupBufContext run the lookup and return its result with
+// no error. Only a read that has to queue observes the cancellation.
+func TestStateMachine_PreCancelledContextFreeGuard_RunsLookup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("Lookup", func(t *testing.T) {
+		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+			kv := newTestKV()
+			kv.data["key"] = "val"
+			return kv
+		})
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+		if err != nil {
+			t.Fatalf("NewStateMachine = %v", err)
+		}
+		defer rsm.Close()
+		got, lookupErr := rsm.Lookup(ctx, "key")
+		if lookupErr != nil {
+			t.Fatalf("Lookup(cancelled ctx, free guard) err = %v, want nil", lookupErr)
+		}
+		if got != "val" {
+			t.Fatalf("Lookup(cancelled ctx, free guard) = %v, want val", got)
+		}
+		if n := rsm.readWait.waiters.Load(); n != 0 {
+			t.Fatalf("queued waiters = %d, want 0", n)
+		}
+	})
+	t.Run("NALookupBufContext", func(t *testing.T) {
+		rsm := newNALookupIntoStateMachine(t)
+		r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+		if lookupErr != nil || !ok || string(r) != "val" {
+			t.Fatalf("NALookupBufContext(cancelled ctx, free guard) = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+		}
+		rel()
+		if n := rsm.readWait.waiters.Load(); n != 0 {
+			t.Fatalf("queued waiters = %d, want 0", n)
+		}
+	})
+}
+
 // TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate holds a
 // writer on the read guard at every instant (several goroutines loop on
 // lockApply/unlockApply, as a continuous Update stream does) and requires a
