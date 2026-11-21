@@ -2308,12 +2308,37 @@ jobs:
       # because `docker image rm` refuses an image a container uses. Tear down
       # removes the lease; one a dead job leaves behind is a stale container,
       # which the reap step removes after the job timeout like any other.
+      # The image job built this image on its own runner, so a runner that
+      # has not got it (a cache miss) builds it here first, with the module
+      # credentials as the BuildKit secret, as the image job does. Then the
+      # lease: the step fails without one, so IT_LEASE is always set after it.
       - name: Lease the integration image
         run: |
-          if docker image inspect "$IT_IMAGE" >/dev/null 2>&1; then
-            lease="${CI_STACK_PREFIX}lease-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
-            docker create --name "$lease" "$IT_IMAGE" true >/dev/null && echo "IT_LEASE=$lease" >> "$GITHUB_ENV"
+          if ! docker image inspect "$IT_IMAGE" >/dev/null 2>&1; then
+            ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+              for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+                if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+              done )
+            # As in the image job: Athens first when the runner sets
+            # DEVCACHE_GOPROXY and the cache answers, then proxy.golang.org.
+            bp=
+            if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+              bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org"
+            fi
+            rc=0
+            make docker-build-it ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE" || rc=$?
+            rm -f "$RUNNER_TEMP/gomodauth.env"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::could not build the integration image $IT_IMAGE (exit $rc)"
+              exit "$rc"
+            fi
           fi
+          lease="${CI_STACK_PREFIX}lease-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+          if ! docker create --name "$lease" "$IT_IMAGE" true >/dev/null; then
+            echo "::error::could not lease the integration image $IT_IMAGE"
+            exit 1
+          fi
+          echo "IT_LEASE=$lease" >> "$GITHUB_ENV"
 
       # CUSTOMIZE: host tuning the suite needs goes here, as in the test job.
       # >>> CUSTOMIZE (go-quicraft)
@@ -2323,12 +2348,13 @@ jobs:
             || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
       # <<< CUSTOMIZE
 
-      # The integration image the job leased carries no private address in its
-      # history or config, checked before any use, on a pool runner. IT_LEASE
-      # is set only when the image is on this host, so the check never fails
-      # on an image the job has not got.
+      # The integration image the job found or built carries no private
+      # address in its history or config, checked before any use. The lease
+      # step built a missing image, so the check runs on every pool run, and
+      # the suite runs only when it passed.
       - name: Check the integration image carries no private address
-        if: ${{ !cancelled() && env.IT_IMAGE != '' && env.IT_LEASE != '' && runner.environment != 'github-hosted' }}
+        id: it-history
+        if: ${{ !cancelled() && env.IT_IMAGE != '' && runner.environment != 'github-hosted' }}
         run: scripts/ci-image-history.sh "$IT_IMAGE"
 
       - name: Write the module credential file
@@ -2339,7 +2365,10 @@ jobs:
             if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
           done
 
+      # Its docker-build-it finds the tag the lease step found or built and
+      # builds nothing.
       - name: make integration-test (integration image)
+        if: ${{ success() && (runner.environment == 'github-hosted' || steps.it-history.outcome == 'success') }}
         run: |
           pkgs=$(make -s it-shard-packages SHARD="$SHARD" SHARDS="$IT_SHARDS" | tr '\n' ' ')
           [ -n "${pkgs// /}" ] || { echo "FAIL: integration shard $SHARD of $IT_SHARDS has no packages"; exit 1; }
