@@ -1,4 +1,6 @@
-# ci-template: v1.52 (customized)
+# ci-template: v1.53 (customized)
+# v1.53: main's concurrency group is `main-{event}`, so a newer main run
+# cancels the older one (the concurrency block below has the template's line).
 # v1.52: a pull request whose head repository is not this repository, a
 # deleted fork included, runs every job on ubuntu-latest. preflight's runs-on
 # reads `!startsWith(github.event_name, 'pull_request')`, so a fork's head
@@ -32,7 +34,7 @@
 # github.com only: on github.com the guard never reads it, so the secret
 # does not reach the self-hosted runner. The `Runner labels` step checks
 # preflight's runs-on with the variable unset and set to the fallback.
-# LOCAL against v1.52 (kept on purpose):
+# LOCAL against v1.53 (kept on purpose):
 # - CI_FULL_TIER keeps the v1.35.1 condition (a PR runs the full tier only
 #   with the ci:full label; test/buildgates/ci_gate_test.go asserts it), so
 #   v1.41's every-PR full tier is not taken and CI_FULL_LABEL is CI_FULL_TIER.
@@ -61,6 +63,25 @@
 # waiver today; `credential:` is accepted only for code-review.yml's Codex
 # review, and publish-images keeps its release form under the release rule.
 # test/buildgates/ci_runners_test.go holds the rule.
+# v1.53 (2026-11-21): main has one concurrency group per event again,
+# `main-{event}`, so a newer push to main cancels the older main run still
+# queued or in progress, and the newest run validates every merge under it.
+# This supersedes v1.26.2's `main-{event}-{sha}`. A schedule run keeps
+# `schedule-{repository}` and a workflow_dispatch run keeps
+# `main-workflow_dispatch`, so neither shares a group with a push run.
+# cancel-in-progress stays a literal `true`. Only the group changes; the
+# group line is the template's, character for character.
+# v1.52 (2026-11-21): a fork's pull request runs every job on ubuntu-latest.
+# Taken as its outcome: this repository's runner value for every ci.yml job is
+# the literal `ubuntu-latest` (HOSTED FIRST above), so the template's
+# selection, evaluated with this repository's values, gives `ubuntu-latest` to
+# a fork's pull request, a same-repository pull request and main alike. The
+# template's runs-on expressions, its `Hosted or overflow runner` step and its
+# inline `Runner labels` step are not taken: an expression runs-on can pick a
+# self-hosted label, which ci_runners_test.go refuses for ci.yml, and that Go
+# test is this repository's runner-label check. TestCIForkPullRequestRunsHosted
+# holds the fork case.
+# The rest of v1.36 to v1.51 is still to come (see the v1.42 paragraph).
 # v1.42 hermetic gate only (owner ruling 742 (1), Tenant Agent rulings 754 and
 # the hermetic-gate rollout order): the CI Gate's outcome depends only on the
 # tree under test. `make deps-check` (lint job), `make security` (gosec,
@@ -646,6 +667,8 @@ on:
   schedule:
     - cron: '0 5 * * 4'
 
+# v1.53 (ruling 1087): on main the group is the workflow and the event,
+# `main-{event}`, so a newer main run cancels the older one. Before v1.53:
 # v1.26.2: on main the group is the workflow, the event and the commit sha,
 # so each main run is its own group and a merge never cancels the main run in
 # progress; a schedule or workflow_dispatch run is in its own event's group
@@ -660,7 +683,7 @@ on:
 # at a time. It is tested first, so a schedule run never takes a main group.
 # The push, pull_request and workflow_dispatch groups do not change.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && format('schedule-{0}', github.repository) || github.ref == 'refs/heads/main' && format('main-{0}-{1}', github.event_name, github.sha) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && format('schedule-{0}', github.repository) || github.ref == 'refs/heads/main' && format('main-{0}', github.event_name) || github.ref }}
   cancel-in-progress: true
 
 permissions:
