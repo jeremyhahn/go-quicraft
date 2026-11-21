@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dependencies: go-enclave v0.11.0-alpha (was v0.10.0-alpha), in the root module, `contrib/dragonboat` and `test/performance/quicraft`. Its additions (a Linux `memfd_secret` backend and `Sealed.OpenIn`) need no change here.
 - Dependencies: go-enclave v0.11.1-alpha (was v0.11.0-alpha), in the same three modules. It is the v0.11.0-alpha commit tagged again, so no code changes; go.sum carries the checksums the public module proxy serves.
 - API: `ReencryptSnapshotFile` returns `(epoch, fileSize, err)`: `fileSize` is the destination data file's length, which re-encryption changes whenever the framing differs. `waldb.ReencryptSized` takes a `SnapshotReencryptSizedFunc` hook returning both and records them as the migrated snapshot's `Epoch` and `FileSize`, so a Host starts the shard on a plaintext-to-encrypted re-key. The re-key runbook (`docs/seal-barrier/user.md`) uses it.
+- `ReencryptSnapshotFile` refuses a source or destination path that is not clean (`filepath.Clean` changes it) with a `*SnapshotDestinationError` matching `fs.ErrInvalid`, before anything is written.
+- `RemoveData` refuses a replica whose `StopShard` has not yet returned with `*ShardNotStoppedError`, and a replica whose bootstrap and snapshot records name different `DataDir` trees with an error matching `ErrInvalidOperation`, before anything is retired, deleted or recorded. `Close` waits for a `RemoveData` in progress; one started after `Close` began returns `ErrClosed`.
+- `StartShard` refuses a `cfg.DataDir` that differs from the `DataDir` the replica was first started with; its snapshots stay under the recorded tree.
+- `ImportSnapshot` is refused with `ErrInvalidOperation` while a `RemoveData` intent for the replica is pending.
+- Reads: a read queued behind `Apply` observes its context, and a read closed by `StopShard` returns `ErrClosed`. Context errors wrap the context's cause, so they match `ErrTimeout` or `ErrCanceled` and, for the `Sync*` calls, `context.DeadlineExceeded` or `context.Canceled`.
+- `OnSnapshotRecovered` carries the recovered snapshot's `Index`.
 
 ### Fixed
 
