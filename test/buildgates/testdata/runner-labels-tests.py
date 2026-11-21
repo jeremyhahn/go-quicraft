@@ -70,7 +70,7 @@ the step does; nothing reaches the network.
      jobs mapping, job or workflow, an explicit-key or merge key in a job,
      an aliased runs-on, no jobs key and two jobs keys. The block-style
      form of the same workflow is read as before.
-  I. ci-template v1.52: a fork's pull request under pull_request never
+  J. ci-template v1.52: a fork's pull request under pull_request never
      reaches a self-hosted runner. ci.yml's preflight runs-on carries the
      fork clause for every pull_request event, and the lint gives a fork's
      head under pull_request, as under pull_request_target, no
@@ -431,21 +431,21 @@ case("I7 literal operands still evaluate exactly: 'bigdisk' && 'ubuntu-latest'",
 case("I8 an unknown variable cannot open a release guard that is false on its own",
      {"ci.yml": wf(PR_ON, job(REL, GUARD.replace(" }}", " && (vars.ALLOW_RELEASE || 'no') == 'yes' }}")))}, 0, ["OK:"])
 
-# I. a fork's pull request under pull_request (ci-template v1.52)
+# J. a fork's pull request under pull_request (ci-template v1.52)
 FORK_PR_NOTE = ("pull_request (refs/pull/1/merge, fork, CI_PREFLIGHT_RUNS_ON unset, "
                 "pull_request: a fork never reaches a self-hosted runner)")
-case("I1 ci.yml: the v1.49 preflight runs-on fails (c) for a fork's head under pull_request",
+case("J1 ci.yml: the v1.49 preflight runs-on fails (c) for a fork's head under pull_request",
      {"ci.yml": wf(PR_ON, job(PRE_UNGUARDED, name="preflight"))}, 1,
      ["ci.yml:preflight: (c)", FORK_PR_NOTE + ": self-hosted, linux, x64, bigdisk"],
      ["pull_request (refs/pull/1/merge, CI_PREFLIGHT_RUNS_ON unset", "push (refs/heads/main"])
-case("I2 ci.yml: the v1.52 preflight runs-on passes under pull_request and pull_request_target",
+case("J2 ci.yml: the v1.52 preflight runs-on passes under pull_request and pull_request_target",
      {"ci.yml": wf(PR_ON.replace("on:\n", "on:\n  pull_request_target:\n    branches: [main]\n"),
                    job(PRE, name="preflight"))}, 0, ["OK:"])
 CI_TEXT = WORKFLOW.read_text()
-case("I3 this repository's ci.yml with preflight's v1.49 runs-on fails (c), for the fork alone",
+case("J3 this repository's ci.yml with preflight's v1.49 runs-on fails (c), for the fork alone",
      {"ci.yml": CI_TEXT.replace(f"    runs-on: {PRE}   # v1.52\n", f"    runs-on: {PRE_UNGUARDED}   # v1.49\n")}, 1,
      ["ci.yml:preflight: (c)", FORK_PR_NOTE], ["ci.yml:lint:", "ci.yml:image:", "ci.yml:ci-gate:"])
-case("I4 a selection job that routes a fork's head to the pool itself fails (c) under pull_request",
+case("J4 a selection job that routes a fork's head to the pool itself fails (c) under pull_request",
      {"ci.yml": wf(PR_ON, job("${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && "
                               "fromJSON('[\"self-hosted\",\"linux\",\"x64\",\"bigdisk\"]') || "
                               "fromJSON(needs.preflight.outputs.runner) }}", name="lint"))}, 1,
@@ -486,11 +486,11 @@ def selection_case(label, head, want):
         print(f"  {len(got)} job(s) read; off: {bad or got}")
 
 
-selection_case("I5 this repository's ci.yml: every job runs on ubuntu-latest for a fork's pull request on github.com",
+selection_case("J5 this repository's ci.yml: every job runs on ubuntu-latest for a fork's pull request on github.com",
                "fork/r", lambda n, sel, l: l == ["ubuntu-latest"])
 # LOCAL: every job but preflight names ubuntu-latest directly (hosted first),
 # so a same-repository pull request keeps only preflight's pool default.
-selection_case("I6 this repository's ci.yml: a same-repository pull request keeps preflight's pool default",
+selection_case("J6 this repository's ci.yml: a same-repository pull request keeps preflight's pool default",
                "o/r", lambda n, sel, l: l == (["self-hosted", "linux", "x64", "bigdisk"]
                                              if n == "preflight" and sel == "unset" else ["ubuntu-latest"]))
 
