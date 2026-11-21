@@ -490,6 +490,33 @@ func TestDevcontainerDevStage(t *testing.T) {
 	}
 }
 
+func TestDockerMakeRunsNetworked(t *testing.T) {
+	// `make docker-make` defaults to the ci target, which lints the nested
+	// modules (dependencies outside the baked cache) and runs govulncheck
+	// and Trivy (advisory downloads). It runs on a bridge network by
+	// default, and a bridge run reopens GOPROXY to the public proxy with a
+	// writable module cache; DOCKER_MAKE_NETWORK=none keeps an offline run.
+	mk := readFile(t, filepath.Join(repoRoot, "Makefile"))
+	for _, want := range []string{
+		"DOCKER_MAKE_NETWORK ?= bridge",
+		"IN_IMAGE_NETWORK='$(DOCKER_MAKE_NETWORK)' scripts/in-toolchain-image.sh",
+	} {
+		if !strings.Contains(mk, want) {
+			t.Errorf("Makefile: missing %q", want)
+		}
+	}
+	const script = "scripts/in-toolchain-image.sh"
+	sh := readFile(t, filepath.Join(repoRoot, script))
+	for _, want := range []string{
+		`"GOPROXY=${DEVCACHE_GOPROXY:+$DEVCACHE_GOPROXY|}https://proxy.golang.org"`,
+		`"GOMODCACHE=$modcache"`,
+	} {
+		if !strings.Contains(sh, want) {
+			t.Errorf("%s: a bridge run does not set %s", script, want)
+		}
+	}
+}
+
 type dockerStage struct {
 	from  string
 	lines []string
