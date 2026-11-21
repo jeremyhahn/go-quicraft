@@ -32,7 +32,7 @@ func TestRunnerLabelsStepRejects(t *testing.T) {
 	if err != nil {
 		t.Skip("python3 not found; the lint-gates job runs these cases")
 	}
-	out, err := exec.Command(py, "-I", "testdata/runner-labels-tests.py").CombinedOutput()
+	out, err := exec.CommandContext(t.Context(), py, "-I", "testdata/runner-labels-tests.py").CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "ALL PASS") {
 		t.Fatalf("%s: err %v, want exit 0 and ALL PASS; output:\n%s", runnerLabelsTests, err, out)
 	}
