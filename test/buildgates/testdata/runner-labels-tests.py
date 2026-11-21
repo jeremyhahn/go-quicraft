@@ -65,6 +65,11 @@ the step does; nothing reaches the network.
      the unset-variable exemption, and the finding says a fork never reaches
      a self-hosted runner. Under pull_request alone the same text keeps its
      meaning.
+  H. A workflow whose jobs block the validator cannot read fails closed
+     (g) and never gets the final OK: a quoted `jobs` key, a flow-style
+     jobs mapping, job or workflow, an explicit-key or merge key in a job,
+     an aliased runs-on, no jobs key and two jobs keys. The block-style
+     form of the same workflow is read as before.
 
 Run: python3 -I test/buildgates/testdata/runner-labels-tests.py
 """
@@ -361,6 +366,38 @@ case("G7 ci.yml with pull_request_target: preflight's unset default is no exempt
 case("G8 a waived self-hosted job under pull_request_target is still the waiver's",
      {"signatures.yml": wf(PRT_ON, job("[self-hosted, linux, x64, bigdisk]  # self-hosted: oversize: test",
                                        name="signatures"))}, 0, ["OK:"])
+
+# H. A jobs block the validator cannot read fails closed (g), never OK.
+QWEN = "qwen  # self-hosted: hardware: GPU"
+AUX = ("on:\n  pull_request:\n    branches: [main]\n"
+       "jobs:\n  aux:\n    runs-on: " + QWEN + "\n    steps:\n      - run: echo hi\n")
+for label, text in (
+        ("H1 a double-quoted \"jobs\": key", AUX.replace("jobs:\n", '"jobs":\n')),
+        ("H2 a single-quoted 'jobs': key", AUX.replace("jobs:\n", "'jobs':\n")),
+        ("H3 a flow-style jobs mapping",
+         "on:\n  pull_request:\n    branches: [main]\n"
+         "jobs: {aux: {runs-on: qwen, steps: [{run: echo hi}]}}  # self-hosted: hardware: GPU\n"),
+        ("H4 a job written as a flow mapping",
+         "on:\n  pull_request:\n    branches: [main]\n"
+         "jobs:\n  aux: {runs-on: qwen, steps: [{run: echo hi}]}  # self-hosted: hardware: GPU\n"),
+        ("H5 a whole flow-style workflow",
+         "{on: {pull_request: {branches: [main]}}, jobs: {aux: {runs-on: qwen, steps: [{run: echo hi}]}}}\n"),
+        ("H6 a job key in an explicit-key form",
+         AUX.replace("    runs-on: " + QWEN, "    ? runs-on\n    : " + QWEN)),
+        ("H7 a merge key in a job",
+         "on:\n  pull_request:\n    branches: [main]\n"
+         "x-base: &base\n  runs-on: qwen\n"
+         "jobs:\n  aux:\n    <<: *base  # self-hosted: hardware: GPU\n    steps:\n      - run: echo hi\n"),
+        ("H8 an aliased runs-on",
+         "on:\n  pull_request:\n    branches: [main]\n"
+         "env:\n  R: &r qwen\n"
+         "jobs:\n  aux:\n    runs-on: *r  # self-hosted: hardware: GPU\n    steps:\n      - run: echo hi\n"),
+        ("H9 no jobs key at all", "on:\n  pull_request:\n    branches: [main]\n"),
+        ("H10 two jobs keys", AUX + "jobs:\n  other:\n    runs-on: ubuntu-latest\n"),
+):
+    case(f"{label}: (g), not OK", {"aux.yml": text}, 1, ["aux.yml", "(g)"], ["OK:"])
+case("H11 the block-style form of the same workflow is read: (f) for qwen outside code-review.yml",
+     {"aux.yml": AUX}, 1, ["aux.yml:aux: (f)"], ["(g)", "OK:"])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
