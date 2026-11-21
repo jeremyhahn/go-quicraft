@@ -1,4 +1,13 @@
-# ci-template: v1.49 (customized)
+# ci-template: v1.51 (customized)
+# v1.51: the `Runner labels` step also reads every runs-on under
+# pull_request_target, for a same-repository and a fork head. In a workflow
+# with that trigger a fork's head gets no overflow and no unset-variable
+# exemption (a fork never reaches a self-hosted runner), and its finding
+# says so. test/buildgates/testdata/runner-labels-tests.py holds the cases.
+# v1.50: a runs?status=queued listing short of its total_count is a lower
+# bound in the preflight runner selection step, so the overflow still fires
+# under load. This repository does not carry that step (see LOCAL below), so
+# v1.50 changes nothing here.
 # v1.49: on github.com the preflight job runs on the self-hosted bigdisk
 # pool, `fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]')`,
 # so no run waits in the hosted queue for its ten seconds of work. The
@@ -11,14 +20,18 @@
 # github.com only: on github.com the guard never reads it, so the secret
 # does not reach the self-hosted runner. The `Runner labels` step checks
 # preflight's runs-on with the variable unset and set to the fallback.
-# LOCAL against v1.49 (kept on purpose):
+# LOCAL against v1.51 (kept on purpose):
 # - CI_FULL_TIER keeps the v1.35.1 condition (a PR runs the full tier only
 #   with the ci:full label; test/buildgates/ci_gate_test.go asserts it), so
 #   v1.41's every-PR full tier is not taken and CI_FULL_LABEL is CI_FULL_TIER.
 # - Every job but preflight names ubuntu-latest directly (hosted first,
 #   below); v1.48's preflight runner selection step and the overflow runs-on
 #   JSON are still not taken, so v1.49's hunk in that step's "In progress:"
-#   comment is not taken either (this repository does not carry the step).
+#   comment and v1.50's short-list fix in that step are not taken either
+#   (this repository does not carry the step).
+# - The `Runner labels` unset-variable exemption also skips a pull_request
+#   fork head (a fork pull request never reaches the pool), beside v1.51's
+#   `not fork_target` term for a pull_request_target fork head.
 # - The Signatures job stays here (v1.35.2 moved it to signatures.yml).
 # HOSTED FIRST: every job but preflight runs on ubuntu-latest. preflight's
 # v1.49 pool expression is the one exception, and
@@ -1250,6 +1263,8 @@ jobs:
               ("push", "refs/heads/main", None), ("push", "refs/heads/feature", None),
               ("pull_request", "refs/pull/1/merge", "o/r"), ("pull_request", "refs/pull/1/merge", "fork/r"),
               ("workflow_dispatch", "refs/heads/main", None), ("schedule", "refs/heads/main", None),
+              # v1.51: the base-defined PR event code-review.yml and signatures.yml run on.
+              ("pull_request_target", "refs/heads/main", "o/r"), ("pull_request_target", "refs/heads/main", "fork/r"),
           ]
 
 
@@ -1374,21 +1389,27 @@ jobs:
                               if sels[0] is not None and job == PRE_JOB and PRE_READ.search(ro):
                                   sels = ("unset", "set")  # v1.49: its own two states, no selection output
                               for ev, ref, head in HOSTED_CTX:
+                                  # v1.51: under pull_request_target, a fork's head never
+                                  # reaches a self-hosted runner, overflow or not.
+                                  fork_target = ev == "pull_request_target" and head == "fork/r" and "pull_request_target" in on
                                   for sel in sels:
                                       try:
                                           got = runs_on_labels(ro, ev, ref, head, sel)
                                       except ValueError as e:
                                           off.append(f"{ev} ({ref}): cannot be read ({e})")
                                           continue
-                                      if got is not None and sel == "overflow" and got in OVERFLOW:
+                                      if got is not None and sel == "overflow" and got in OVERFLOW and not fork_target:
                                           continue
-                                      if sel == "unset" and got == OVERFLOW[0] and head != "fork/r":
-                                          continue  # a fork head never takes the pool
+                                      if (sel == "unset" and got == OVERFLOW[0] and not fork_target
+                                              and not (ev == "pull_request" and head == "fork/r")):
+                                          continue  # a fork pull request's head never takes the pool
                                       if got is None or len(got) != 1 or not STANDARD.fullmatch(got[0]):
                                           what = "an unknown label" if got is None else ", ".join(got)
                                           note = ", runner selection overflow" if sel == "overflow" else ""
                                           if sel in ("unset", "set"):
                                               note = ", CI_PREFLIGHT_RUNS_ON " + ("unset" if sel == "unset" else 'set to "ubuntu-latest"')
+                                          if fork_target and got is not None:
+                                              note += ", pull_request_target: a fork never reaches a self-hosted runner"
                                           off.append(f"{ev} ({ref}{', fork' if head == 'fork/r' else ''}{note}): {what}")
                               if off and BARE.search(ro_line):
                                   bad.append(f"{where}: (e) its `# self-hosted:` reason names no category; the template allows a self-hosted job "

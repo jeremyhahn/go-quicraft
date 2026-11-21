@@ -56,6 +56,15 @@ the step does; nothing reaches the network.
      fromJSON all stay (c). A pull request from a fork never reaches the
      pool: unset, the runs-on must give a standard image for a fork head,
      so the default without the head-repository guard stays (c).
+  G. ci-template v1.51: every runs-on is also read under
+     pull_request_target, same-repository and fork, the event
+     code-review.yml runs on. This repository's code-review.yml passes; a
+     label picked only under pull_request_target, or written out, is (c) on
+     that event (every event is read in every workflow); in a workflow with
+     that trigger a fork's head gets neither the selection's overflow nor
+     the unset-variable exemption, and the finding says a fork never reaches
+     a self-hosted runner. Under pull_request alone the same text keeps its
+     meaning.
 
 Run: python3 -I test/buildgates/testdata/runner-labels-tests.py
 """
@@ -322,6 +331,36 @@ case("F9 the default without the head-repository guard fails (c): a fork pull re
 case("F10 a guard that keeps every pull request off the pool passes",
      {"ci.yml": wf(PR_ON, job(PRE.replace(" || github.event.pull_request.head.repo.full_name == github.repository", ""),
                               name="preflight"))}, 0, ["OK:"])
+
+# G. pull_request_target, same-repository and fork (ci-template v1.51)
+PRT_ON = ("on:\n  pull_request_target:\n    branches: [main]\n    types: [opened, synchronize]\n"
+          "  push:\n    branches: [main]\n")
+PRT_ONLY = "${{ github.event_name == 'pull_request_target' && 'bigdisk' || 'ubuntu-latest' }}"
+FORK_NOTE = "pull_request_target: a fork never reaches a self-hosted runner"
+case("G1 code-review.yml: this repository's workflow passes alone",
+     {"code-review.yml": (WORKFLOW.parent / "code-review.yml").read_text()}, 0, ["OK:"])
+case("G2 a label picked only under pull_request_target fails (c) on that event, both heads",
+     {"signatures.yml": wf(PRT_ON, job(PRT_ONLY, name="signatures"))}, 1,
+     ["signatures.yml:signatures: (c)", "pull_request_target (refs/heads/main): bigdisk",
+      f"pull_request_target (refs/heads/main, fork, {FORK_NOTE}): bigdisk"])
+case("G3 the same text fails without the trigger too, as every event is read in every workflow; no fork note",
+     {"signatures.yml": wf(PR_ON, job(PRT_ONLY, name="signatures"))}, 1,
+     ["signatures.yml:signatures: (c)", "pull_request_target (refs/heads/main, fork): bigdisk"], [FORK_NOTE])
+case("G4 a hard-coded self-hosted label under pull_request_target fails (c) on both heads",
+     {"signatures.yml": wf(PRT_ON, job("[self-hosted, linux, x64, bigdisk]", name="signatures"))}, 1,
+     ["signatures.yml:signatures: (c)", "pull_request_target (refs/heads/main):",
+      "pull_request_target (refs/heads/main, fork"])
+case("G5 ci.yml with pull_request_target: the unguarded selection gets no overflow for a fork's head",
+     {"ci.yml": wf(PRT_ON, job(SEL_PLAIN, name="lint"))}, 1,
+     ["ci.yml:lint: (c)", f"pull_request_target (refs/heads/main, fork, runner selection overflow, {FORK_NOTE})"])
+case("G6 ci.yml under pull_request: the same selection keeps its overflow",
+     {"ci.yml": wf(PR_ON, job(SEL_PLAIN, name="lint"))}, 0, ["OK:"])
+case("G7 ci.yml with pull_request_target: preflight's unset default is no exemption for a fork's head",
+     {"ci.yml": wf(PRT_ON, job(PRE, name="preflight"))}, 1,
+     ["ci.yml:preflight: (c)", f"fork, CI_PREFLIGHT_RUNS_ON unset, {FORK_NOTE}"])
+case("G8 a waived self-hosted job under pull_request_target is still the waiver's",
+     {"signatures.yml": wf(PRT_ON, job("[self-hosted, linux, x64, bigdisk]  # self-hosted: oversize: test",
+                                       name="signatures"))}, 0, ["OK:"])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
