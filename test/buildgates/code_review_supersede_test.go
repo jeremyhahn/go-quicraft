@@ -429,7 +429,8 @@ func handoffRoutes(runs []string, ids ...int) map[string]stepAnswer {
 
 func TestCodeReviewGateHandoffRerun(t *testing.T) {
 	script := extractRunStep(t, "Re-run a newer twin's failed gate on this head")
-	env := []string{"EVENT_SHA=" + stepHead, "BASE_REF=main"}
+	// HANDOFF_POLL_S=0: the step's poll of a run still in progress does not sleep.
+	env := []string{"EVENT_SHA=" + stepHead, "BASE_REF=main", "HANDOFF_POLL_S=0"}
 	cases := []stepCase{
 		{
 			name: "permitted: a newer completed run of this PR on this head whose gate failed or was cancelled",
@@ -474,12 +475,14 @@ func TestCodeReviewGateHandoffRerun(t *testing.T) {
 			want: []string{"Run 620: its gate did not end red", "Run 621: its gate did not end red", "Run 622: its gate did not end red"},
 		},
 		{
-			name: "run still active: a red gate in a run not completed is a warning, not a re-run",
-			routes: handoffRoutes([]string{
+			// v5.12.11: a red gate in a run not yet completed is read again
+			// (the run, then its jobs) until the run ends, then re-run.
+			name: "run still active: a red gate in a run not completed is polled until the run ends, then re-run",
+			routes: with(handoffRoutes([]string{
 				handoffRun(630, 1001, "in_progress", stepPR, "main"),
-			}, 630),
-			want: []string{"run 630's gate ended red but the run is in_progress"},
-			warn: true,
+			}, 630), "GET /actions/runs/630", ok(`{"id":630,"status":"completed"}`)),
+			posts: []string{handoffRerun(6300)},
+			want:  []string{"Run 630 is in_progress; reading it again in 0 s."},
 		},
 		{
 			// Recorded behaviour: a refused re-run (the run was re-run or
