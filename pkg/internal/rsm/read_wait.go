@@ -101,10 +101,12 @@ func (q *readWaitQueue) signal() {
 	q.mu.Unlock()
 }
 
-// rlockContext takes the read guard, or returns ctx.Err() if ctx is done
-// first. Update holds the guard's write side for the whole user SM Update
-// call, so a plain RLock would keep a cancelled read waiting for as long as
-// that Update runs.
+// rlockContext takes the read guard. When the guard is free it takes it at
+// once without checking ctx, so a context that is already done does not stop
+// the read; it returns ctx.Err() only when ctx is done while the read is
+// waiting for the guard. Update holds the guard's write side for the whole
+// user SM Update call, so a plain RLock would keep a cancelled read waiting
+// for as long as that Update runs.
 //
 // When the guard is not free at once the caller registers in readWait and
 // retries TryRLock on its own goroutine, woken by each unlockApply (or every
