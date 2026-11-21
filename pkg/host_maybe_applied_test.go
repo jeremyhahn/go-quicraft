@@ -269,15 +269,27 @@ func TestMaybeAppliedHostStopShardWhilePending(t *testing.T) {
 		t.Fatalf("Propose pending: %v", err)
 	}
 	defer rs.Release()
-	// A single voter commits it at once; give the step worker time to take
-	// it from the queue so it is past the hand-off.
-	time.Sleep(200 * time.Millisecond)
+	// A single voter commits it at once; wait until the step worker has
+	// taken it from the queue so it is past the hand-off.
+	v, ok := testLoadNode(h, 1).pendingProposals.Load(rs.key)
+	if !ok {
+		t.Fatal("fixture: the pending proposal is not registered")
+	}
+	pp := v.(*pendingProposal)
+	if !waitUntil(5*time.Second, func() bool {
+		taken, _ := pp.node.ProposalTaken(&pp.enqueuedAt)
+		return taken
+	}) {
+		t.Fatal("the pending proposal was never taken by the step worker")
+	}
 
 	stopped := make(chan error, 1)
 	go func() { stopped <- h.StopShard(1) }()
-	// StopShard waits for the in-flight apply; release it once the stop has
-	// begun so the teardown can finish.
-	time.Sleep(200 * time.Millisecond)
+	// StopShard waits for the in-flight apply; release it once the engine
+	// node's stop has begun so the teardown can finish.
+	if !waitUntil(5*time.Second, pp.node.IsStopped) {
+		t.Fatal("StopShard never began stopping the engine node")
+	}
 	machine.release()
 
 	var perr error
