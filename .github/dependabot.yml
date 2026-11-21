@@ -79,9 +79,9 @@ updates:
     schedule:
       interval: weekly
 
-  # --- Docker base images (dev + benchmark containers) ---
+  # --- Docker base images (devcontainer + benchmark containers) ---
   - package-ecosystem: docker
-    directory: "/.devcontainer"
+    directory: "/build/docker/devcontainer"
     schedule:
       interval: weekly
   - package-ecosystem: docker

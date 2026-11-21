@@ -2,6 +2,7 @@
 # (handbook devcontainer.md §1).
 #
 #   tools        build-only: the pinned tools, built or downloaded into /out
+#   devtools     build-only: the pinned gopls, for the dev stage only
 #   modules      build-only: the module cache, fetched with the forge credentials
 #   base         the Go toolchain by digest, the C compiler -race needs, a
 #                non-root user and the verified module cache; GOPROXY=off
@@ -9,6 +10,10 @@
 #                `make security` and `make deps-check` run here, in CI too.
 #   integration  base + the source only. `make integration-test` runs it under
 #                the hardened compose service (compose.yaml beside this file).
+#   dev          toolchain + gopls: the editor's image (.devcontainer). The one
+#                stage that fetches modules at run time: the baked cache first,
+#                offline, then the public proxy into a writable cache under
+#                /home/dev. No credentials and no direct fetch. CI never runs it.
 #
 # Build with `make docker-build`: it passes GO_IMAGE and every tool version from
 # scripts/tool-pins.sh, the one pin file the Makefile also reads, and the forge
@@ -62,6 +67,16 @@ RUN set -eu; \
     sha256sum -c /tmp/trivy.sha256; \
     tar -xzf "/tmp/${f}" -C /out trivy; \
     rm -f "/tmp/${f}"
+
+# ---------------------------------------------------------------------------
+# The editor's language server, for the dev stage only.
+FROM ${GO_IMAGE} AS devtools
+ARG GO_BUILD_PROXY
+ENV GOTOOLCHAIN=local CGO_ENABLED=0 GOPROXY=${GO_BUILD_PROXY} GOBIN=/out
+COPY scripts/tool-pins.sh /tmp/tool-pins.sh
+RUN set -eu; \
+    . /tmp/tool-pins.sh; \
+    go install "golang.org/x/tools/gopls@${GOPLS_VERSION}"
 
 # ---------------------------------------------------------------------------
 # github.com/jeremyhahn/* modules resolve from the forge through git, so this
@@ -145,4 +160,16 @@ RUN set -eu; \
     go vet -tags=integration ./test/integration/...; \
     chmod -R a+rwX /gocache
 ENV HOME=/home/dev
+USER dev:dev
+
+# ---------------------------------------------------------------------------
+# The editor's image: the toolchain plus gopls. `make lint` walks the nested
+# modules, whose dependencies the baked cache does not hold, so this stage
+# serves the baked cache first, offline, and fetches anything else from the
+# public proxy into a cache dev can write. No credentials, no direct entry.
+FROM toolchain AS dev
+COPY --from=devtools /out/gopls /usr/local/bin/
+ENV HOME=/home/dev \
+    GOMODCACHE=/home/dev/go/pkg/mod \
+    GOPROXY=file:///gomodcache/cache/download,https://proxy.golang.org
 USER dev:dev

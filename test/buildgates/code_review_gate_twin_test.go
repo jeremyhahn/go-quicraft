@@ -11,14 +11,12 @@ import (
 	"testing"
 )
 
-// The gate job of code-review.yml must stay closed while a twin run (same
-// head, same run-name) has its `Codex review` job queued or in progress,
-// even when an older APPROVED verdict stands on the head: adding an effort
-// or model label to an approved head requests a fresh review, and a title
-// edit or unrelated label that starts another run while that review is
-// pending must not pass on the old verdict. These tests run the gate's own
-// shell (fail(), the twin read through its live-base guard, and the verdict
-// block) under bash with the forge API stubbed.
+// The gate job of code-review.yml (the handbook template, v5.12.6) fails
+// closed while a twin run (same head, same run-name) has its `Codex review`
+// job queued or in progress and the head is not approved: that run's gate
+// posts the head's check. An approval of the head passes. These tests run
+// the gate's own shell (fail(), the twin read up to the standing-verdict
+// block (b), and the verdict block) under bash with the forge API stubbed.
 
 const (
 	gateTwinSHA      = "0123456789abcdef0123456789abcdef01234567"
@@ -32,7 +30,7 @@ const (
 
 type gateTwinScript struct {
 	fail    string // the fail() definition
-	twin    string // `twin=` through the checks before the failed re-review block
+	twin    string // `twin=` up to the standing-verdict block (b)
 	verdict string // `verdict=$(get_all ...` through its `case "$verdict"` esac
 }
 
@@ -79,7 +77,7 @@ func extractGateTwin(t *testing.T) gateTwinScript {
 			s.fail = ts
 		case s.fail != "" && s.twin == "" && ts == "twin=":
 			s.twin, _ = sliceFrom(lines, i, func(f string) bool {
-				return strings.HasPrefix(strings.TrimSpace(f), `# LOCAL (security): P1 "Preserve failed re-reviews`)
+				return strings.HasPrefix(strings.TrimSpace(f), `# (b) The reviewer's latest standing verdict`)
 			}, false)
 		case s.twin != "" && s.verdict == "" && strings.HasPrefix(ts, `verdict=$(get_all "/pulls/$PR_NUM/reviews?"`):
 			indent := l[:len(l)-len(strings.TrimLeft(l, " "))]
@@ -95,8 +93,8 @@ func extractGateTwin(t *testing.T) gateTwinScript {
 	if s.fail == "" {
 		t.Fatal("code-review.yml: gate job has no fail() definition")
 	}
-	if s.twin == "" || !strings.Contains(s.twin, "live_base_guard") {
-		t.Fatal("code-review.yml: gate job has no twin read ending at its live-base guard before the failed re-review block")
+	if s.twin == "" || !strings.Contains(s.twin, "twin=${twin:-$id}") {
+		t.Fatal("code-review.yml: gate job has no twin read before its standing-verdict block (b)")
 	}
 	if s.verdict == "" {
 		t.Fatal(`code-review.yml: gate job has no verdict=$(get_all ...) block through its case "$verdict" esac`)
@@ -169,7 +167,6 @@ func runGateTwin(t *testing.T, s gateTwinScript, c gateTwinCase) (int, string) {
 	stub.WriteString("    *) echo \"stub: unexpected API path $1\" >&2; return 1 ;;\n  esac\n}\n")
 	stub.WriteString("get() { answer \"$1\"; }\n")
 	stub.WriteString("get_all() { answer \"$1\"; }\n")
-	stub.WriteString("live_base_guard() { :; }\n")
 
 	script := strings.Join([]string{
 		"set -euo pipefail",
@@ -210,8 +207,10 @@ func runGateTwin(t *testing.T, s gateTwinScript, c gateTwinCase) (int, string) {
 func TestCodeReviewGateTwin(t *testing.T) {
 	s := extractGateTwin(t)
 	for _, c := range []gateTwinCase{
-		{name: "approved head, queued twin re-review", twinState: "queued", verdict: "APPROVED"},
-		{name: "approved head, in_progress twin re-review", twinState: "in_progress", verdict: "APPROVED"},
+		// The template (v5.12.6): an approval of the head passes while a twin
+		// reviews it; only a head not approved fails closed, naming the twin.
+		{name: "approved head, queued twin", twinState: "queued", verdict: "APPROVED", wantPass: true},
+		{name: "approved head, in_progress twin", twinState: "in_progress", verdict: "APPROVED", wantPass: true},
 		{name: "approved head, no twin", verdict: "APPROVED", wantPass: true},
 		{name: "not approved, queued twin", twinState: "queued"},
 		{name: "changes requested, in_progress twin", twinState: "in_progress", verdict: "CHANGES_REQUESTED"},

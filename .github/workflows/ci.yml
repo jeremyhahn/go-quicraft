@@ -1,6 +1,60 @@
-# ci-template: v1.35.1 + v1.42 hermetic gate (customized)
-# HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
-# waiver on its runs-on line that names its category and a reason:
+# ci-template: v1.52 (customized)
+# v1.52: a pull request whose head repository is not this repository, a
+# deleted fork included, runs every job on ubuntu-latest. preflight's runs-on
+# reads `!startsWith(github.event_name, 'pull_request')`, so a fork's head
+# under pull_request or pull_request_target takes ubuntu-latest whatever
+# CI_PREFLIGHT_RUNS_ON holds (the stricter of v1.52's clause and the LOCAL
+# fork routing below, which tested pull_request alone). The `Runner labels`
+# step gives a fork's head under pull_request, as under pull_request_target
+# since v1.51, no overflow and no unset-variable exemption, and reads the
+# selection outputs for it at their hosted default. v1.52's hunks in the
+# preflight runner selection step are not taken (this repository does not
+# carry the step). test/buildgates/testdata/runner-labels-tests.py holds the
+# cases.
+# v1.51: the `Runner labels` step also reads every runs-on under
+# pull_request_target, for a same-repository and a fork head. In a workflow
+# with that trigger a fork's head gets no overflow and no unset-variable
+# exemption (a fork never reaches a self-hosted runner), and its finding
+# says so. test/buildgates/testdata/runner-labels-tests.py holds the cases.
+# v1.50: a runs?status=queued listing short of its total_count is a lower
+# bound in the preflight runner selection step, so the overflow still fires
+# under load. This repository does not carry that step (see LOCAL below), so
+# v1.50 changes nothing here.
+# v1.49: on github.com the preflight job runs on the self-hosted bigdisk
+# pool, `fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]')`,
+# so no run waits in the hosted queue for its ten seconds of work. The
+# repository variable CI_PREFLIGHT_RUNS_ON (runs-on JSON) is the fallback
+# switch: it is set to `"ubuntu-latest"` (quotes included; a value that is
+# not JSON fails the run) while that pool is down. Off github.com preflight
+# stays on `ubuntu-latest`. preflight sets up no Go, builds nothing and runs
+# none of the PR's tree; it reads the tree as text and checks out with
+# persist-credentials false. The schedule guard's AGENT_TOKEN is passed off
+# github.com only: on github.com the guard never reads it, so the secret
+# does not reach the self-hosted runner. The `Runner labels` step checks
+# preflight's runs-on with the variable unset and set to the fallback.
+# LOCAL against v1.52 (kept on purpose):
+# - CI_FULL_TIER keeps the v1.35.1 condition (a PR runs the full tier only
+#   with the ci:full label; test/buildgates/ci_gate_test.go asserts it), so
+#   v1.41's every-PR full tier is not taken and CI_FULL_LABEL is CI_FULL_TIER.
+# - Every job but preflight names ubuntu-latest directly (hosted first,
+#   below); v1.48's preflight runner selection step and the overflow runs-on
+#   JSON are still not taken, so v1.49's hunk in that step's "In progress:"
+#   comment and v1.50's short-list fix in that step are not taken either
+#   (this repository does not carry the step).
+# - The `Runner labels` unset-variable exemption also skips a pull_request
+#   fork head (a fork pull request never reaches the pool), beside the
+#   `not fork_target` term (v1.51, pull_request under v1.52), even in a
+#   workflow without the pull_request trigger: the stricter of the two.
+# - The `Runner labels` step fails closed, finding (g), on a workflow whose
+#   jobs it cannot read by lines (a quoted or flow-style jobs key, a job
+#   that is not a block mapping, an explicit or merge key, an alias, anchor
+#   or tag, no or two jobs keys), so such a workflow never gets its OK.
+# - The Signatures job stays here (v1.35.2 moved it to signatures.yml).
+# HOSTED FIRST: every job but preflight runs on ubuntu-latest. preflight's
+# v1.49 pool expression is the one exception, and
+# test/buildgates/ci_runners_test.go pins it exactly. Any other job leaves
+# ubuntu-latest only with a waiver on its runs-on line that names its
+# category and a reason:
 # `# self-hosted: hardware: <reason>` (the job needs specific hardware), or
 # `# self-hosted: oversize: <reason>` (it needs more than a standard runner's
 # 4 vCPU, 16 GB memory, about 45 GB disk or 6 hours). No ci.yml job carries a
@@ -14,18 +68,14 @@
 # image (image job) read the module proxy and advisory databases, so they
 # could fail a PR or turn main red with no change to the tree (main run
 # 44098214691 went red on make security). They leave this workflow on every
-# event: deps-check's full gate already runs in deps-bump.yml (ruling 640),
+# event: deps-check's full gate already runs in scans.yml's bump job (ruling 640),
 # and make security and trivy image run in .github/workflows/scans.yml, on a
 # schedule and on workflow_dispatch on main. `make gosec` reads only the tree
-# and now runs in the lint job on every event but a docs-only PR. Nothing
-# else of v1.36 to v1.42 is taken yet: v1.35.2/v1.35.3's signatures.yml move,
-# v1.36 host-local caches and in-toolchain-image.sh v6, v1.37 timeouts, v1.38
-# release label, v1.40 report-only lags, v1.41 PR/main parity, and folding
-# deps-bump.yml into scans.yml are the full catch-up, still to come.
+# and now runs in the lint job on every event but a docs-only PR.
 # Ruling 640 (ci-template v1.39 deltas, adopted 2026-11-15): the lint job's
 # `Base commit for deps-check (ruling 640)` step passes DEPS_CHECK_BASE to
 # make deps-check (the shared depscheck v1.0.0 in scripts/depscheck), and a
-# workflow_dispatch on ci/deps-bump is not refused: deps-bump.yml dispatches
+# workflow_dispatch on ci/deps-bump is not refused: scans.yml's bump dispatches
 # this workflow there, because the PR it opens starts no pull_request run.
 # v1.35.1 (2026-11-11, CA m2557, Codex findings on go-luks2 #444 and
 # xkey-android #129): the Signatures job fetches a named base that is not in
@@ -42,10 +92,12 @@
 # (handbook software/templates/signing/<repo>.allowed_signers); every other
 # job, gate and tier is v1.34.1's.
 # v1.34: the changes, schedule-guard and arch-gates jobs are one `preflight` job (see its comment).
-# Hosted runners (go-quicraft, after go-quicbaas #261): every job runs on
-# GitHub-hosted ubuntu-latest (4 vCPU, 16 GB, about 14 GB free disk, a 6 h
-# job limit); no job names a self-hosted label (.github/actionlint.yaml keeps
-# only code-review.yml's review runners). Each job frees the runner's
+# Hosted runners (go-quicraft, after go-quicbaas #261): every job but
+# preflight runs on GitHub-hosted ubuntu-latest (4 vCPU, 16 GB, about 14 GB
+# free disk, a 6 h job limit); no other job names a self-hosted label.
+# preflight's pool on github.com is the exception (v1.49):
+# .github/actionlint.yaml lists bigdisk for it, beside code-review.yml's
+# review runners. Each job frees the runner's
 # preinstalled toolchains before it builds an image. The -race unit suite is
 # four `unit` shards (`make coverage-shard`) joined by the `coverage` job
 # (`make coverage-merge`, the threshold); integration is two shards
@@ -87,7 +139,7 @@
 # New Makefile targets: `make gosec` (devops.md §4) and
 # `make docker-build-toolchain` (devcontainer.md §6). A repository adopts
 # v1.30 in one CI-file PR, bottom-up in stack order.
-# v1.29.5 (Company Agent ruling 262(a), 2026-10-30): one change, the
+# v1.29.5 (ruling 262(a), 2026-10-30): one change, the
 # GO_BUILD_PROXY separator. Each `make docker-build` passes
 # GO_BUILD_PROXY=<DEVCACHE_GOPROXY>|https://proxy.golang.org (v1.34.1: no
 # direct entry, so a module the proxy cannot serve fails the build), with
@@ -127,7 +179,7 @@
 # repository whose copy already holds a change (go-qrdb and
 # go-trusted-platform the memory bound, go-xkms the scratch volume,
 # trusted-firmware the guard order) keeps it and takes the rest.
-# v1.29.3 (Company Agent ruling 255(10)/(11)(c), 2026-10-29): one schedule
+# v1.29.3 (ruling 255(10)/(11)(c), 2026-10-29): one schedule
 # run per repository, skipped when a main run is in flight. The 04:00Z
 # nightly cron on every repository started six main runs over the throttle
 # and drove a bigdisk runner's data disk to 93 %. Two changes:
@@ -199,7 +251,7 @@
 # its tree. The parallel stage jobs move to v1.30: `runs-on` cannot take a
 # needs output on Gitea 1.27.1 (run 68501), and the registry-push question is
 # with the owner (169).
-# v1.28.0 (Company Agent ruling 219(3), 2026-10-26): `make deps-check` joins
+# v1.28.0 (ruling 219(3), 2026-10-26): `make deps-check` joins
 # the PR tier as a lint-class gate. Its step in the image job drops the
 # CI_FULL_TIER condition and runs on every event, as `make lint` does, so a
 # module behind its dependency floor fails the PR, not main after the merge
@@ -208,7 +260,7 @@
 # proxy and runs in seconds; it stays on the full tier too. The image job is
 # already `pr` in CI Gate, so no needs or results line changes. A repository
 # adopts v1.28 as a CI-file PR; none hand-patches its ci.yml ahead of it.
-# v1.27.0 (Company Agent m1192 (6), item 27, 2026-10-25): a new `lint-gates`
+# v1.27.0 (Tenant Agent m1192 (6), item 27, 2026-10-25): a new `lint-gates`
 # job runs a repository's `make -k lint-gates` in the toolchain image in
 # parallel with the image job's `make lint`, not in series after it, so Lint's
 # wall time is the longer of the two, not their sum. The job runs the target
@@ -222,18 +274,18 @@
 # lint target in the same PR, and a repository that ran `make lint-gates` as
 # a step of its lint or image job drops that step, or the gates run twice.
 # A gate that needs a network sets the job's IN_IMAGE_NETWORK (CUSTOMIZE).
-# v1.26.2 (Company Agent m1167 (5), ruling 145, 2026-10-24): main CI runs are
+# v1.26.2 (Tenant Agent m1167 (5), ruling 145, 2026-10-24): main CI runs are
 # keyed per sha, so a merge never cancels the main run in progress. The main
 # group is `main-{event}-{sha}`: each commit's run on main is its own group
 # and runs to the end, and a schedule or workflow_dispatch run still never
 # shares a group with a push run. This supersedes v1.25's `main-{event}`
 # group (m857, m774 option (i)). cancel-in-progress stays a literal `true`, so
 # a PR's newer push still cancels its older run. Only the group changes.
-# v1.26.1 (Company Agent m1128 (9), 2026-10-24): a docs-only PR runs the repository's
+# v1.26.1 (Tenant Agent m1128 (9), 2026-10-24): a docs-only PR runs the repository's
 # releasability test (RELEASABILITY_TEST, CUSTOMIZE), which make coverage
 # runs on every other PR, so a private value in README.md or docs/ fails the
 # PR rather than the main push after it merges.
-# v1.26 (Company Agent m804 item 3, m809 item 3; ruling 137, 2026-10-24): a
+# v1.26 (Tenant Agent m804 item 3, m809 item 3; ruling 137, 2026-10-24): a
 # draft pull request runs no CI. Every job but CI Gate skips when
 # github.event.pull_request.draft is true (Gitea sets it on a WIP: title),
 # and CI Gate fails on a draft without running anything, so no draft head
@@ -257,7 +309,7 @@
 # workflows passes its releasability scan. One job change: the `changes`
 # job's diff takes --no-renames, so a file moved from code into docs/ lists
 # its old path too and the PR is not docs-only.
-# v1.24 (owner ruling 2026-10-19, Company Agent m749 and m751 (a), (e)):
+# v1.24 (owner ruling 2026-10-19, Tenant Agent m749 and m751 (a), (e)):
 # a PR whose every changed file is markdown or under docs/ (DOCS_ONLY_PATTERN,
 # the new `changes` job) runs lint alone: build, the build-tag assertion and
 # make coverage skip. Soak moves off main pushes and ci:full to the nightly
@@ -267,7 +319,7 @@
 # ages an integration image from the later of its creation and its last tag,
 # so a parallel job's reaper no longer removes an image just rebuilt from
 # cache (go-quicraft main runs 57389 and 57484). No job changes.
-# v1.23 (owner item 101 as approved, Company Agent m650 item 3, 2026-10-18):
+# v1.23 (owner item 101 as approved, Tenant Agent m650 item 3, 2026-10-18):
 # two tiers. A pull request runs the PR tier only: lint (with
 # assert-build-tags and arch-gates), build, and the unit suite under -race
 # (`make coverage`, so unit test and race are one step). Integration, Soak,
@@ -305,7 +357,7 @@
 # a CUSTOMIZE copy with `cancel-in-progress: true` on every ref, main included
 # (devops.md §9); the copy goes and the canonical block replaces it. Adopted
 # with the v1.22 rollout.
-# v1.22 (Company Agent m616 item 2, 2026-10-18, after CI job layers filled the
+# v1.22 (Tenant Agent m616 item 2, 2026-10-18, after CI job layers filled the
 # runner disks): the image job's stages keep the Go build, golangci-lint and
 # module caches in named volumes on the runner's Docker host, kept across jobs
 # and split by trust class (CI_CACHE_CLASS: `main` for a push to main, `pr`
@@ -313,13 +365,13 @@
 # (ci-standard.md §6; in-toolchain-image.sh v2). A new step,
 # trim-ci-caches.sh, bounds the repo's cache volumes on the host
 # (CI_CACHE_MAX_GIB, default 32).
-# v1.21.1 (Company Agent m605 item 8, 2026-10-18, after a forge token printed
+# v1.21.1 (Tenant Agent m605 item 8, 2026-10-18, after a forge token printed
 # in a go-xkms run): the image and integration jobs mask the forge
 # credentials first, and no step or make target prints an env file, the job
 # environment or a matched line; lint steps and `make check-public-literals`
 # report path and line only, and `make stage-gomodauth` runs silent
 # (ci-standard.md §5). Every v1.21 rollout PR adopts v1.21.1 before it merges.
-# v1.21 (Company Agent m598 items 1 and 2, 2026-10-18): every stage runs in
+# v1.21 (Tenant Agent m598 items 1 and 2, 2026-10-18): every stage runs in
 # the project's own devcontainer image (ci-standard.md §2, devcontainer.md §7).
 # Through v1.20 lint, security, build and test installed Go with setup-go on
 # the runner and ran their own flag sets, which §2 ("not the runner image, ...
@@ -340,14 +392,14 @@
 # needs list and check lines are a CUSTOMIZE block (m598 item 2). The make
 # variables the jobs pass are in devcontainer.md §6 (m601 (b)).
 #
-# v1.20 (Company Agent m270 items 1 and 9, 2026-10-16): the CUSTOMIZE image
+# v1.20 (Tenant Agent m270 items 1 and 9, 2026-10-16): the CUSTOMIZE image
 # job's `trivy image` also takes `--skip-dirs /opt/go/mod`, so a secret match
 # in a third-party module's source inside the image's Go module cache no
 # longer fails the scan; a secret in the repo's own layers still does, and no
 # repo carries its own trivy secret config. A new `arch-gates` job (from
 # go-xkms) fails a direct go-objstore import outside the repo's storage seam,
 # and CI Gate needs it.
-# v1.19 (Company Agent m262 items 3 and 4, 2026-10-16): the CUSTOMIZE image
+# v1.19 (Tenant Agent m262 items 3 and 4, 2026-10-16): the CUSTOMIZE image
 # job takes `trivy image --ignore-unfixed` (devops.md §8): a fixed CVE still
 # blocks, an advisory with no fixed package does not, and no repo adds a
 # .trivyignore for it. The github.com gosec install builds the latest gosec
@@ -597,12 +649,12 @@ on:
 # v1.26.2: on main the group is the workflow, the event and the commit sha,
 # so each main run is its own group and a merge never cancels the main run in
 # progress; a schedule or workflow_dispatch run is in its own event's group
-# and never shares one with a push run (Company Agent m1167 (5), ruling 145,
+# and never shares one with a push run (Tenant Agent m1167 (5), ruling 145,
 # superseding v1.25's `main-{event}` group, m857 and m774 option (i)). Every
 # other ref is one group, so a PR's newer run cancels the older. No
 # expression reaches cancel-in-progress: Gitea 1.27.1 never released go-qrdb
 # main run 57063, the first run after v1.22.1 set it to an expression
-# (Company Agent m695).
+# (Tenant Agent m695).
 # v1.29.3 (ruling 255(10)/(11)(c)): a schedule run's group is
 # `schedule-{repository}`, with no sha, so a repository has one schedule run
 # at a time. It is tested first, so a schedule run never takes a main group.
@@ -625,12 +677,14 @@ env:
   GO_BUILD_TAGS: ""
   # v1.23: the full tier (ci-standard.md §8). Every event but pull_request
   # (push to main, schedule, workflow_dispatch), and a PR labelled ci:full.
+  # LOCAL: v1.41's every-PR full tier is not taken (test/buildgates
+  # ci_gate_test.go holds this condition), so the v1.35.1 form stays.
   # Steps read it as env.CI_FULL_TIER; a job-level `if:` cannot read env, so
   # the integration job repeats this expression. Keep them equal.
   # v1.30 (fix 5): a workflow_dispatch off main is not the full tier (the
   # schedule guard refuses it and CI Gate fails).
   CI_FULL_TIER: ${{ (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')) || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-  # v1.24 (CA m749, m751 (a)): the files a docs-only PR may touch. CUSTOMIZE: narrow it
+  # v1.24 (Tenant Agent m749, m751 (a)): the files a docs-only PR may touch. CUSTOMIZE: narrow it
   # in a repo that embeds or generates from docs/ (go:embed, OpenAPI, protos).
   DOCS_ONLY_PATTERN: '(\.md$|^docs/)'
   # v1.30 (fix 3): a PR runs the lint-gates job only when a changed file
@@ -638,7 +692,7 @@ env:
   # lint-gates read (scripts, workflows, generated code, go.mod). The default
   # matches every file, so lint-gates runs on every PR.
   LINT_GATES_PATTERN: '.'
-  # v1.26.1 (Company Agent m1128 (9)): the repository's releasability test, which
+  # v1.26.1 (Tenant Agent m1128 (9)): the repository's releasability test, which
   # a docs-only PR still runs because make coverage skips on it. CUSTOMIZE: the
   # `go test` arguments, package and -run pattern (for example
   # `./pkg/labstrings -run '^TestTheTrackedTreeIsPubliclyReleasable$'`).
@@ -709,7 +763,19 @@ jobs:
   # v1.23: a lint-class check, so it stays on the PR tier.
   preflight:
     name: Preflight [changed files, schedule guard, architecture gates]
-    runs-on: ubuntu-latest
+    # v1.49: on github.com the self-hosted bigdisk pool, so no run waits in
+    # the hosted queue for its first ten seconds of work; the repository
+    # variable CI_PREFLIGHT_RUNS_ON, runs-on JSON, overrides it (set to
+    # `"ubuntu-latest"`, quotes included, while that pool is down). Off
+    # github.com ubuntu-latest, as before.
+    # LOCAL (security): a pull request from a fork runs untrusted code, so
+    # it always gets ubuntu-latest and never the self-hosted pool, whatever
+    # the variable says; only pushes, schedules, dispatches and same-repository
+    # pull requests take the pool.
+    # v1.52: a pull request from a fork (its head repository is not this
+    # one) takes ubuntu-latest whatever the variable holds; a fork never
+    # reaches a self-hosted runner.
+    runs-on: ${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -737,7 +803,10 @@ jobs:
           REPO_API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
           JOB_TOKEN: ${{ github.token }}
           # v1.30: a push to main reads the tree proof with it as well.
-          BOT: ${{ (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.AGENT_TOKEN || '' }}
+          # v1.49: off github.com only. On github.com the guard never reads it
+          # (no schedule check, no tree proof there), so the secret does not
+          # reach the step on the self-hosted runner.
+          BOT: ${{ github.server_url != 'https://github.com' && (github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && secrets.AGENT_TOKEN || '' }}
         run: |
           set -uo pipefail
           # runs <token>: sets N to the number of this workflow's push runs
@@ -836,11 +905,666 @@ jobs:
           echo "proof=$PROOF" >> "$GITHUB_OUTPUT"
 
       # v1.34: the full history on a PR run for the changed-files diff, one
-      # commit otherwise. No credential is left in the checkout.
+      # commit otherwise. v1.41: every PR run, ci:full or not. No credential is left in the checkout.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-depth: ${{ (github.event_name == 'pull_request' && env.CI_FULL_TIER != 'true') && '0' || '1' }}
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
           persist-credentials: false
+
+      # v1.38: a job that names the
+      # `release` label runs only on a push to refs/heads/main or a tag, or a
+      # workflow_dispatch on main, and never for a pull request. This step
+      # reads every .github/workflows/*.yml and *.yaml of the repository as
+      # text, takes each job whose runs-on names `release` (plain, in a list,
+      # or as a quoted string inside an expression), and evaluates its `if:`
+      # under every other event: a pull_request or pull_request_target event
+      # in a workflow that has that trigger (a), and the push of another
+      # branch, a dispatch off main or on a tag, schedule, workflow_run,
+      # merge_group, release, create, issue_comment and repository_dispatch
+      # (b). A value it cannot know (vars, needs, secrets, the server) may
+      # hold anything, so the `if:` must be false whatever it holds; an `if:`
+      # it cannot read fails. It prints each file:job and the reason. A lint,
+      # not the gate: the runner side refuses such a job as well.
+      # v1.43: on github.com every other job runs on a standard
+      # GitHub-hosted image on every event (c), or its runs-on line says why
+      # it cannot, `# self-hosted: <reason>`; a larger runner is refused (d).
+      # v1.46: the reason names its category, hardware: or
+      # oversize: (credential: for the one Codex review job); a reason with
+      # no category is (e).
+      # v1.47: label and category are checked together. The
+      # review-only labels codex and qwen run only in code-review.yml, codex
+      # with credential: and qwen with hardware:, and credential: is only for
+      # codex; a waiver does not lift it (f).
+      # v1.48: in ci.yml, a runs-on that reads
+      # needs.preflight.outputs.runner or runner_docker is checked with the
+      # output at its default ("ubuntu-latest", which must give a standard
+      # image) and at its overflow, where exactly
+      # [self-hosted, linux, x64, bigdisk] or [..., bigdisk-docker] passes too.
+      # v1.49: the preflight job's own runs-on, which reads
+      # vars.CI_PREFLIGHT_RUNS_ON, is checked with the variable unset, where
+      # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to
+      # `"ubuntu-latest"`, where it must give a standard image.
+      # v1.52: a fork's head under pull_request, as under
+      # pull_request_target (v1.51), gets no unset-variable exemption, and the
+      # selection outputs read for it are the hosted default the step emits.
+      # Its tests: test/buildgates/testdata/runner-labels-tests.py (the lint-gates job runs them).
+      - name: Runner labels
+        run: |
+          python3 -I - <<'PY'
+          import glob, json, re, sys
+
+          # Reads .github/workflows/*.yml|yaml as text (no YAML library): the
+          # top-level `on:` keys, and each job's `runs-on` and `if`. A job names
+          # `release` when that label appears in its runs-on, plain, in a list or as a
+          # quoted string in an expression. Its `if` is evaluated under every event
+          # outside the release allow-list, with every value this step cannot know
+          # (vars, needs, secrets, server_url, ...) unknown; the job passes only when
+          # the `if` is false in each of them whatever the unknowns hold.
+          U = object()  # unknown value
+          OPEN = "$" "{{"  # split, so the runner does not read it as an expression
+          ALLOWED = "push to refs/heads/main or refs/tags/*, or workflow_dispatch on main"
+          PR = {"pull_request", "pull_request_target"}
+          CTX = [  # (event, ref) pairs a release job must never run on
+              ("pull_request", "refs/pull/1/merge"), ("pull_request_target", "refs/heads/main"),
+              ("push", "refs/heads/feature"), ("workflow_dispatch", "refs/heads/feature"),
+              ("workflow_dispatch", "refs/tags/v1.0.0"), ("schedule", "refs/heads/main"),
+              ("workflow_run", "refs/heads/main"), ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1"),
+              ("release", "refs/tags/v1.0.0"), ("create", "refs/tags/v1.0.0"),
+              ("issue_comment", "refs/heads/main"), ("repository_dispatch", "refs/heads/main"),
+          ]
+
+
+          def ctx_get(ev, ref, path):
+              p = path.lower()
+              name = ref.split("/", 2)[-1]
+              known = {"github.event_name": ev, "github.ref": ref, "github.event.ref": ref,
+                       "github.ref_name": name,
+                       "github.ref_type": "tag" if ref.startswith("refs/tags/") else "branch",
+                       "github.head_ref": "feature" if ev in PR else "",
+                       "github.base_ref": "main" if ev in PR else ""}
+              if p in known:
+                  return known[p]
+              if ev not in PR and (p == "github.event.pull_request" or p.startswith("github.event.pull_request.")):
+                  return None
+              return U
+
+
+          TOK = re.compile(r"\s*(?:(?P<s>'(?:[^']|'')*')|(?P<n>-?\d+(?:\.\d+)?)|(?P<op>&&|\|\||==|!=|<=|>=|[!<>()\[\],.])|(?P<id>[A-Za-z_][\w-]*|\*))")
+
+
+          def lex(s):
+              out, i = [], 0
+              while i < len(s):
+                  if s[i:].strip() == "":
+                      break
+                  m = TOK.match(s, i)
+                  if not m:
+                      raise ValueError(f"cannot read the expression at {s[i:i+20]!r}")
+                  i = m.end()
+                  if m.group("s"):
+                      out.append(("s", m.group("s")[1:-1].replace("''", "'")))
+                  elif m.group("n"):
+                      out.append(("v", float(m.group("n"))))
+                  elif m.group("op"):
+                      out.append(("op", m.group("op")))
+                  else:
+                      out.append(("id", m.group("id")))
+              return out
+
+
+          def truthy(v):
+              if v is U:
+                  return U
+              if isinstance(v, float) and v != v:
+                  return False
+              return v not in (None, False, 0, "", 0.0)
+
+
+          def num(v):
+              if v is None or v is False:
+                  return 0.0
+              if v is True:
+                  return 1.0
+              if isinstance(v, (int, float)):
+                  return float(v)
+              if isinstance(v, str):
+                  try:
+                      return float(v.strip() or 0)
+                  except ValueError:
+                      return float("nan")
+              return float("nan")
+
+
+          def eq(a, b):
+              if a is U or b is U:
+                  return U
+              if isinstance(a, str) and isinstance(b, str):
+                  return a.lower() == b.lower()
+              if type(a) is type(b) and not isinstance(a, (int, float)):
+                  return a == b
+              return num(a) == num(b)
+
+
+          class P:
+              def __init__(self, toks, get):
+                  self.t, self.i, self.get = toks, 0, get
+
+              def peek(self):
+                  return self.t[self.i] if self.i < len(self.t) else (None, None)
+
+              def take(self, want=None):
+                  k, v = self.peek()
+                  if want is not None and v != want:
+                      raise ValueError(f"expected {want!r}, found {v!r}")
+                  self.i += 1
+                  return k, v
+
+              def parse(self):
+                  v = self.orx()
+                  if self.i != len(self.t):
+                      raise ValueError(f"unexpected {self.peek()[1]!r}")
+                  return v
+
+              def orx(self):
+                  a = self.andx()
+                  while self.peek() == ("op", "||"):
+                      self.take()
+                      b = self.andx()
+                      ta = truthy(a)
+                      if ta is True:
+                          pass
+                      elif ta is False:
+                          a = b
+                      else:
+                          # An unknown left operand is the result whenever it
+                          # is truthy, so the value stays unknown whatever b is.
+                          a = U
+                  return a
+
+              def andx(self):
+                  a = self.cmp()
+                  while self.peek() == ("op", "&&"):
+                      self.take()
+                      b = self.cmp()
+                      ta = truthy(a)
+                      if ta is False:
+                          pass
+                      elif ta is True:
+                          a = b
+                      else:
+                          # An unknown left operand is the result whenever it
+                          # is falsy, so the value stays unknown whatever b is.
+                          a = U
+                  return a
+
+              def cmp(self):
+                  a = self.unary()
+                  while self.peek()[0] == "op" and self.peek()[1] in ("==", "!=", "<", "<=", ">", ">="):
+                      op = self.take()[1]
+                      b = self.unary()
+                      if op == "==":
+                          a = eq(a, b)
+                      elif op == "!=":
+                          r = eq(a, b)
+                          a = U if r is U else not r
+                      elif a is U or b is U:
+                          a = U
+                      else:
+                          x, y = (a.lower(), b.lower()) if isinstance(a, str) and isinstance(b, str) else (num(a), num(b))
+                          a = {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+                  return a
+
+              def unary(self):
+                  if self.peek() == ("op", "!"):
+                      self.take()
+                      t = truthy(self.unary())
+                      return U if t is U else not t
+                  return self.primary()
+
+              def primary(self):
+                  k, v = self.take()
+                  if k == "s" or k == "v":
+                      return v
+                  if (k, v) == ("op", "("):
+                      r = self.orx()
+                      self.take(")")
+                      return r
+                  if k != "id":
+                      raise ValueError(f"unexpected {v!r}")
+                  lv = v.lower()
+                  if lv in ("true", "false"):
+                      return lv == "true"
+                  if lv == "null":
+                      return None
+                  if self.peek() == ("op", "("):
+                      self.take()
+                      args = []
+                      if self.peek() != ("op", ")"):
+                          args.append(self.orx())
+                          while self.peek() == ("op", ","):
+                              self.take()
+                              args.append(self.orx())
+                      self.take(")")
+                      return self.call(lv, args)
+                  path, exact = v, True
+                  while self.peek() in (("op", "."), ("op", "[")):
+                      if self.take()[1] == ".":
+                          k2, v2 = self.take()
+                          if k2 != "id":
+                              raise ValueError(f"unexpected {v2!r} after '.'")
+                          path += "." + v2
+                          exact = exact and v2 != "*"
+                      else:
+                          idx = self.orx()
+                          self.take("]")
+                          if isinstance(idx, str):
+                              path += "." + idx
+                          else:
+                              exact = False
+                  return self.get(path) if exact else U
+
+              def call(self, f, a):
+                  if f == "always":
+                      return True
+                  if f in ("startswith", "endswith", "contains") and len(a) == 2:
+                      if U in a:
+                          return U
+                      if f == "contains" and isinstance(a[0], list):
+                          return any(eq(x, a[1]) is True for x in a[0])
+                      x, y = (str(s).lower() if s is not None else "" for s in a)
+                      return x.startswith(y) if f == "startswith" else x.endswith(y) if f == "endswith" else y in x
+                  if f == "fromjson" and len(a) == 1 and isinstance(a[0], str):
+                      try:
+                          return json.loads(a[0])
+                      except ValueError:
+                          return U
+                  if f == "format" and a and U not in a and isinstance(a[0], str):
+                      return re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1)) + 1]) if int(m.group(1)) + 1 < len(a) else m.group(0), a[0])
+                  return U  # success(), failure(), hashFiles(), ...: unknown
+
+
+          def unquote(s):
+              s = s.strip()
+              if len(s) >= 2 and s[0] == s[-1] == "'":
+                  return s[1:-1].replace("''", "'")
+              if len(s) >= 2 and s[0] == s[-1] == '"':
+                  return json.loads(s)
+              return s
+
+
+          def strip_comment(s):
+              q = None
+              for i, c in enumerate(s):
+                  if q:
+                      if c == q:
+                          q = None
+                  elif c in "'\"":
+                      q = c
+                  elif c == "#" and (i == 0 or s[i - 1] in " \t"):
+                      return s[:i].rstrip()
+              return s.rstrip()
+
+
+          def ind(line):
+              return len(line) - len(line.lstrip(" "))
+
+
+          def body(lines, i, inline):
+              """The value text of the key on line i: the inline part plus every deeper line."""
+              base, parts = ind(lines[i]), []
+              j = i + 1
+              while j < len(lines) and (not lines[j].strip() or ind(lines[j]) > base):
+                  if lines[j].strip() and not lines[j].lstrip().startswith("#"):
+                      parts.append(strip_comment(lines[j]).strip())
+                  j += 1
+              inline = strip_comment(inline).strip()
+              if inline[:1] in ("|", ">"):
+                  return (" " if inline[0] == ">" else "\n").join(parts)
+              return " ".join([inline] + parts).strip()
+
+
+          def keys_under(lines, i):
+              """(line, key) for each direct child key of the block opened on line i."""
+              base, out, child = ind(lines[i]), [], None
+              for j in range(i + 1, len(lines)):
+                  s = lines[j]
+                  if not s.strip() or s.lstrip().startswith("#"):
+                      continue
+                  if ind(s) <= base:
+                      break
+                  child = ind(s) if child is None else child
+                  if ind(s) == child:
+                      m = re.match(r"\s*(?:-\s+)?(['\"]?)([^'\":#]+)\1\s*(?::\s*(.*))?$", s)
+                      if m:
+                          out.append((j, m.group(2).strip(), m.group(3) or ""))
+              return out
+
+
+          def triggers(lines):
+              for i, s in enumerate(lines):
+                  m = re.match(r"(['\"]?)(on|true)\1\s*:\s*(.*)$", s)
+                  if m:
+                      v = strip_comment(m.group(3)).strip()
+                      if v.startswith("{"):  # a flow mapping: its keys, nested ones too
+                          return set(re.findall(r"([A-Za-z_]+)['\"]?\s*:", v))
+                      if v:
+                          return {unquote(x) for x in re.split(r"[\s,\[\]]+", v) if x}
+                      return {k for _, k, _ in keys_under(lines, i)}
+              return set()
+
+
+          # v1.43: the standard GitHub-hosted images, free on a public
+          # repository; a larger runner (cores, large, xlarge, gpu) bills even there.
+          STANDARD = re.compile(r"(ubuntu-(latest|24\.04|22\.04)(-arm)?|ubuntu-slim)")
+          LARGER = re.compile(r"(cores|xlarge|large|gpu)", re.I)
+          WAIVER = re.compile(r"#\s*self-hosted:\s*(hardware|oversize|credential)\s*:\s*\S")
+          BARE = re.compile(r"#\s*self-hosted:")  # v1.46: a waiver whose reason names no category
+          # v1.47: a review-only label runs only in code-review.yml, and
+          # only with its own category; credential: is the codex job's alone.
+          REVIEW = {"codex": "credential", "qwen": "hardware"}
+          REVIEW_FILES = {"code-review.yml", "code-review.yaml"}
+          REVIEW_TOKEN = re.compile(r"(?<![\w.-])['\"]?(codex|qwen)['\"]?(?![\w-])", re.I)
+          GH = "https://github.com"
+          # v1.48: the template's ci.yml preflight outputs runs-on JSON (this
+          # repository's jobs name ubuntu-latest directly), "ubuntu-latest" by default and the
+          # self-hosted overflow list when the hosted pool is full. In ci.yml only, a
+          # runs-on that reads exactly these outputs is checked under both: the
+          # default must be a standard image, as (c) asks of every job, and the
+          # overflow may also be exactly the list its output names. Any other
+          # self-hosted value still needs its waiver.
+          SEL_FILES = {"ci.yml", "ci.yaml"}
+          SEL_OUT = {"needs.preflight.outputs.runner": "bigdisk",
+                     "needs.preflight.outputs.runner_docker": "bigdisk-docker"}
+          OVERFLOW = [["self-hosted", "linux", "x64", v] for v in SEL_OUT.values()]
+          # v1.49: ci.yml's preflight job alone may read the repository
+          # variable CI_PREFLIGHT_RUNS_ON. Its runs-on is checked in two
+          # states of its own, in place of the selection's: unset, where
+          # exactly [self-hosted, linux, x64, bigdisk] passes too (never for a
+          # pull request from a fork, which must get a standard image), and set to
+          # the fallback `"ubuntu-latest"`, where it must give a standard image
+          # on every event. Another job that reads the variable reads an unknown.
+          PRE_JOB = "preflight"
+          PRE_VAR = "vars.ci_preflight_runs_on"
+          PRE_READ = re.compile(r"(?<![\w.])vars\.CI_PREFLIGHT_RUNS_ON(?![\w-])", re.I)
+          HOSTED_CTX = [  # (event, ref, head repo) on github.com; o/r is this repository
+              ("push", "refs/heads/main", None), ("push", "refs/heads/feature", None),
+              ("pull_request", "refs/pull/1/merge", "o/r"), ("pull_request", "refs/pull/1/merge", "fork/r"),
+              ("workflow_dispatch", "refs/heads/main", None), ("schedule", "refs/heads/main", None),
+              # v1.51: the base-defined PR event code-review.yml and signatures.yml run on.
+              ("pull_request_target", "refs/heads/main", "o/r"), ("pull_request_target", "refs/heads/main", "fork/r"),
+          ]
+
+
+          def hosted_get(ev, ref, head, sel=None):
+              def get(path):
+                  p = path.lower()
+                  if sel and p in SEL_OUT:  # v1.48: the selection output, as JSON text
+                      # v1.52: the step outputs the hosted default for a fork's head under pull_request.
+                      fork_pr = ev == "pull_request" and head == "fork/r"
+                      return json.dumps("ubuntu-latest" if sel == "default" or fork_pr else ["self-hosted", "linux", "x64", SEL_OUT[p]])
+                  if sel in ("unset", "set") and p == PRE_VAR:  # v1.49: unset, or the fallback switch
+                      return None if sel == "unset" else json.dumps("ubuntu-latest")
+                  if p == "github.server_url":
+                      return GH
+                  if p == "github.repository":
+                      return "o/r"
+                  if p == "github.event.pull_request.head.repo.full_name":
+                      return head if ev in PR else None
+                  if p == "github.event.pull_request.draft":
+                      return False if ev in PR else None
+                  return ctx_get(ev, ref, path)
+              return get
+
+
+          def labels(value):
+              # A runs-on value's labels: a string, a list, or an expression's result.
+              if value is U or value is None:
+                  return None
+              if isinstance(value, list):
+                  return [str(x) for x in value]
+              return [str(value)]
+
+
+          def runs_on_labels(text, ev, ref, head, sel=None):
+              t = text.strip()
+              if t.startswith("group:") or t.startswith("labels:") or " labels:" in t:
+                  m = re.search(r"labels:\s*(\[[^\]]*\]|\S+)", t)
+                  t = m.group(1) if m else ""
+              m = re.fullmatch(r"\$\{\{(.*)\}\}", unquote(t), re.S)
+              if m:
+                  return labels(P(lex(m.group(1)), hosted_get(ev, ref, head, sel)).parse())
+              if t.startswith("["):
+                  return [unquote(x) for x in re.split(r"\s*,\s*", t.strip("[] ")) if x]
+              if t.startswith("- "):
+                  return [unquote(x) for x in re.split(r"\s*-\s+", " " + t) if x.strip()]
+              return [unquote(t)]
+
+
+          def review_labels(text):
+              # The review-only labels a runs-on names, in its text or in what an
+              # expression there yields on any github.com event.
+              found = {m.lower() for m in REVIEW_TOKEN.findall(text)}
+              for ev, ref, head in HOSTED_CTX:
+                  try:
+                      got = runs_on_labels(text, ev, ref, head)
+                  except ValueError:
+                      continue
+                  found |= {g.lower() for g in got or [] if g.lower() in REVIEW}
+              return sorted(found)
+
+
+          def review_finding(path, where, ro, ro_line):
+              # v1.47: label and category together, whatever the waiver says.
+              names = review_labels(ro)
+              m = WAIVER.search(ro_line)
+              cat = m.group(1) if m else None
+              base = path.replace("\\", "/").rsplit("/", 1)[-1]
+              if names and base not in REVIEW_FILES:
+                  return (f"{where}: (f) names the review-only label {', '.join(names)}; the template reserves codex and "
+                          f"qwen to code-review.yml whatever the `# self-hosted:` waiver says")
+              if names:
+                  wrong = [n for n in names if cat != REVIEW[n]]
+                  if len(names) > 1 or wrong:
+                      return (f"{where}: (f) runs on {', '.join(names)} with the category {cat or 'none'}; the template pairs "
+                              f"codex with `credential:` and qwen with `hardware:`, one review label per job")
+                  return None
+              if cat == "credential":
+                  return (f"{where}: (f) uses the `credential:` category without the codex label; the template keeps it "
+                          f"for code-review.yml's Codex review job alone")
+              return None
+
+
+          def names_release(text):
+              return re.search(r"(?<![\w.-])['\"]?release['\"]?(?![\w-])", text) is not None
+
+
+          def condition(text):
+              t = unquote(text) if text else ""
+              m = re.fullmatch(r"\s*\$\{\{(.*)\}\}\s*", t, re.S)
+              if m and OPEN not in m.group(1):
+                  return m.group(1)
+              if OPEN in t:
+                  raise ValueError("text around the expression makes it a string, which is always true")
+              return t
+
+
+          TOP_KEY = re.compile(r"(['\"]?)([A-Za-z0-9_-]+)\1\s*:(?:\s+(.*))?$")
+          JOB_KEY = re.compile(r"([A-Za-z0-9_-]+)\s*:(?:\s+(.*))?$")
+          YAML_NODE = re.compile(r"(?:^|[\s,\[{:])[*&!]")  # an alias, anchor or tag
+
+
+          def block_children(lines, i):
+              """(line, text) for each line at the first child indent under line i."""
+              base, child, out = ind(lines[i]), None, []
+              for j in range(i + 1, len(lines)):
+                  s = lines[j]
+                  if not s.strip() or s.lstrip().startswith("#"):
+                      continue
+                  if ind(s) <= base:
+                      break
+                  child = ind(s) if child is None else child
+                  if ind(s) < child:
+                      return None
+                  if ind(s) == child:
+                      out.append((j, strip_comment(s).strip()))
+              return out
+
+
+          def jobs_block(lines):
+              """The line of the one block-style `jobs:` key, or why the jobs cannot be read.
+
+              LOCAL (fail closed): the validator reads YAML by its lines, so a
+              jobs block in any other form (a quoted key, a flow mapping, an
+              explicit or merge key, an alias, anchor or tag) is a finding,
+              never skipped into the final OK.
+              """
+              at = []
+              for i, s in enumerate(lines):
+                  if not s.strip() or s.lstrip().startswith("#") or ind(s) > 0:
+                      continue
+                  t = strip_comment(s).strip()
+                  if t in ("---", "..."):
+                      continue
+                  m = TOP_KEY.match(t)
+                  if not m:
+                      return None, f"line {i + 1} is not a block-style top-level key"
+                  if m.group(2) == "jobs":
+                      if m.group(1):
+                          return None, f"line {i + 1} quotes the jobs key"
+                      if m.group(3):
+                          return None, f"line {i + 1} gives jobs an inline value (a flow mapping, alias or scalar)"
+                      at.append(i)
+              if len(at) != 1:
+                  return None, ("it has no block-style jobs key" if not at else "it has more than one jobs key")
+              jobs = block_children(lines, at[0])
+              if not jobs:
+                  return None, "its jobs key opens no block mapping of jobs"
+              for j, t in jobs:
+                  m = JOB_KEY.match(t)
+                  if not m or m.group(2):
+                      return None, f"line {j + 1} is not a job opening a block mapping"
+                  keys = block_children(lines, j)
+                  if not keys:
+                      return None, f"job {m.group(1)} opens no block mapping"
+                  for k, kt in keys:
+                      km = TOP_KEY.match(kt)
+                      if not km and not kt.startswith("<<"):
+                          return None, f"line {k + 1} in job {m.group(1)} is not a block-style key"
+                      if not km or re.match(r"[*&!]", km.group(3) or ""):
+                          return None, f"line {k + 1} in job {m.group(1)} uses a merge key, alias, anchor or tag"
+                      if km.group(2) == "runs-on":
+                          ro = re.sub(r"\$\{\{.*?\}\}", "", body(lines, k, km.group(3) or ""), flags=re.S)
+                          if YAML_NODE.search(ro):
+                              return None, f"line {k + 1} in job {m.group(1)} gives runs-on through an alias, anchor or tag"
+              return at[0], None
+
+
+          def check(path):
+              lines = open(path, encoding="utf-8").read().splitlines()
+              on = triggers(lines)
+              bad = []
+              ji, why = jobs_block(lines)
+              if why:
+                  return [f"{path}: (g) its jobs cannot be read: {why}; the runner-label check reads only "
+                          f"block-style YAML and fails closed on any other form"]
+              for i, s in enumerate(lines):
+                  if i == ji:
+                      for j, job, _ in keys_under(lines, ji):
+                          ro = cond = ro_line = None
+                          for k, key, inline in keys_under(lines, j):
+                              if key == "runs-on":
+                                  ro, ro_line = body(lines, k, inline), lines[k]
+                              elif key == "if":
+                                  cond = body(lines, k, inline)
+                          where = f"{path}:{job}"
+                          if ro is not None and not names_release(ro):
+                              # v1.43: hosted first.
+                              if LARGER.search(ro) and re.search(r"ubuntu|windows|macos", ro):
+                                  bad.append(f"{where}: (d) names a larger GitHub-hosted runner ({ro}); it bills on a public repository")
+                                  continue
+                              rf = review_finding(path, where, ro, ro_line)
+                              if rf:
+                                  bad.append(rf)
+                                  continue
+                              if WAIVER.search(ro_line):
+                                  continue
+                              off = []
+                              sels = ("default", "overflow") if path.replace("\\", "/").rsplit("/", 1)[-1] in SEL_FILES else (None,)
+                              if sels[0] is not None and job == PRE_JOB and PRE_READ.search(ro):
+                                  sels = ("unset", "set")  # v1.49: its own two states, no selection output
+                              for ev, ref, head in HOSTED_CTX:
+                                  # v1.51: under pull_request_target, a fork's head never
+                                  # reaches a self-hosted runner, overflow or not.
+                                  # v1.52: under pull_request too.
+                                  fork_target = ev in PR and head == "fork/r" and ev in on
+                                  for sel in sels:
+                                      try:
+                                          got = runs_on_labels(ro, ev, ref, head, sel)
+                                      except ValueError as e:
+                                          off.append(f"{ev} ({ref}): cannot be read ({e})")
+                                          continue
+                                      if got is not None and sel == "overflow" and got in OVERFLOW and not fork_target:
+                                          continue
+                                      if (sel == "unset" and got == OVERFLOW[0] and not fork_target
+                                              and not (ev == "pull_request" and head == "fork/r")):
+                                          continue  # a fork pull request's head never takes the pool
+                                      if got is None or len(got) != 1 or not STANDARD.fullmatch(got[0]):
+                                          what = "an unknown label" if got is None else ", ".join(got)
+                                          note = ", runner selection overflow" if sel == "overflow" else ""
+                                          if sel in ("unset", "set"):
+                                              note = ", CI_PREFLIGHT_RUNS_ON " + ("unset" if sel == "unset" else 'set to "ubuntu-latest"')
+                                          if fork_target and got is not None:
+                                              note += f", {ev}: a fork never reaches a self-hosted runner"
+                                          off.append(f"{ev} ({ref}{', fork' if head == 'fork/r' else ''}{note}): {what}")
+                              if off and BARE.search(ro_line):
+                                  bad.append(f"{where}: (e) its `# self-hosted:` reason names no category; the template allows a self-hosted job "
+                                             f"only as `# self-hosted: hardware: <reason>` or `# self-hosted: oversize: <reason>`; it runs on " + "; ".join(dict.fromkeys(off)))
+                              elif off:
+                                  bad.append(f"{where}: (c) does not run on a standard GitHub-hosted image on github.com and its runs-on "
+                                             f"line gives no `# self-hosted: hardware|oversize: <reason>`; it runs on " + "; ".join(dict.fromkeys(off)))
+                              continue
+                          if ro is None:
+                              continue
+                          if cond is None:
+                              if on & PR:
+                                  bad.append(f"{where}: (a) names `release` in a workflow with a pull_request trigger, and has no `if:`")
+                              bad.append(f"{where}: (b) names `release` and has no `if:` restricting it to {ALLOWED}")
+                              continue
+                          try:
+                              expr = condition(cond)
+                              toks = lex(expr)
+                              runs = []
+                              for ev, ref in CTX:
+                                  r = truthy(P(toks, lambda p: ctx_get(ev, ref, p)).parse())
+                                  if r is not False:
+                                      runs.append((ev, ref))
+                          except ValueError as e:
+                              bad.append(f"{where}: (b) names `release` and its `if:` cannot be read ({e})")
+                              continue
+                          pr = [c for c in runs if c[0] in PR and c[0] in on]
+                          if pr:
+                              bad.append(f"{where}: (a) names `release` and a {pr[0][0]} event can run it")
+                          rest = [c for c in runs if c not in pr]
+                          if rest:
+                              bad.append(f"{where}: (b) names `release` and its `if:` does not restrict it to {ALLOWED}; it can run on "
+                                         + ", ".join(dict.fromkeys(f"{ev} ({ref})" for ev, ref in rest)))
+              return bad
+
+
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          bad = []
+          for f in files:
+              try:
+                  bad += check(f)
+              except (OSError, UnicodeError) as e:
+                  bad.append(f"{f}: cannot be read ({e})")
+          for b in bad:
+              print(f"::error::{b}")
+          if bad:
+              print(f"{len(bad)} runner-label finding(s) in {len(files)} workflow file(s): a `release` job runs only on {ALLOWED}, never for a pull request; every other job runs on a standard GitHub-hosted image, or its runs-on line names a hardware or oversize reason; codex and qwen run only in code-review.yml, with their own category")
+              sys.exit(1)
+          print(f"OK: {len(files)} workflow file(s); every job that names `release` runs only on {ALLOWED}, and every other job on a standard GitHub-hosted image or with a hardware or oversize reason")
+          PY
 
       - name: Is every changed file docs or markdown?
         id: diff
@@ -850,7 +1574,9 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           # v1.30: lint_gates is false only on a PR whose changed files all
-          # miss LINT_GATES_PATTERN; any doubt runs the job.
+          # miss LINT_GATES_PATTERN; any doubt runs the job. A ci:full
+          # PR keeps both scopes off. LOCAL: the template's CI_FULL_LABEL is
+          # CI_FULL_TIER here, which on a PR is exactly the ci:full label.
           docs_only=false lint_gates=true
           if [ "$EVENT" = pull_request ] && [ "$CI_FULL_TIER" != true ]; then
             if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
@@ -879,6 +1605,13 @@ jobs:
           fi
           echo "OK: no go-objstore import outside the storage seam"
 
+  # v1.38: `[self-hosted, linux, x64,
+  # release]`, the only label a publish job takes, and never a pull request
+  # (the preflight step `Runner labels` fails CI otherwise). On
+  # GitHub the job runs only when the repository variable RELEASE_RUNNER is
+  # `true`, which a repository sets once Infrastructure reports the release
+  # pools live; until then it skips, and no run waits on a label with no
+  # runner. On Gitea it runs on every push to main, as in v1.37.
   # v1.30 (fix 1): the toolchain image is built once per content hash, here,
   # and every other job pulls it (scripts/ci-image-cache.sh v1, ships beside
   # this file). On a push to main only, on the release runner, which alone
@@ -923,7 +1656,20 @@ jobs:
             case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
           done
 
+      # Ruling 887: the release runner is a pool host; the LAN addresses are
+      # masked before ci-image-cache.sh publish builds and prints.
+      - name: Mask the LAN addresses
+        run: scripts/ci-mask-lan.sh
+
+      # v1.42 (ruling 742 (1)): ci-image-cache.sh v3 scans the toolchain
+      # image it built with `trivy image` (--ignore-unfixed, --skip-dirs
+      # /opt/go/mod, CRITICAL and HIGH) before it pushes it, and refuses the
+      # push on a finding (devops.md §8: trivy image blocks before any push).
+      # This job runs on a push to main on the release runner, never on a PR,
+      # and is not in CI Gate's needs, so the PR gate stays hermetic.
       - name: Publish the toolchain image when the registry lacks its hash
+        env:
+          IN_IMAGE_NETWORK: bridge   # v1.42: the scan reads the trivy database
         run: |
           ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
             for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
@@ -981,6 +1727,11 @@ jobs:
           docker image prune --all --force
           df -h /
 
+      # Ruling 887: the LAN addresses this runner's environment names, masked
+      # before any step that builds can print one.
+      - name: Mask the LAN addresses
+        run: scripts/ci-mask-lan.sh
+
       # v1.30 (fix 1): the registry cache first. A miss, or an unreachable
       # registry, falls through to the local build below.
       - name: Pull the toolchain image from the registry cache
@@ -1002,6 +1753,12 @@ jobs:
           make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # Ruling 901: the images the job built or pulled carry no private address in their history or
+      # config, checked after the build and before any use, on a pool runner.
+      - name: Check the images carry no private address
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$TOOLCHAIN_IMAGE"
 
       # v1.22: bound this repo's cache volumes (as in the image job). It never
       # fails the job and keeps every volume a container mounts.
@@ -1025,7 +1782,7 @@ jobs:
         # <<< CUSTOMIZE
         run: scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" "make lint GO_BUILD_TAGS='$GO_BUILD_TAGS'"
 
-      # v1.26.1 (Company Agent m1128 (9)): a docs-only PR skips make coverage, so
+      # v1.26.1 (Tenant Agent m1128 (9)): a docs-only PR skips make coverage, so
       # it runs the releasability test alone; any other run gets it from make
       # coverage.
       - name: Releasability test (docs-only PR)
@@ -1051,7 +1808,7 @@ jobs:
       # v1.42 (ruling 742 (1)): `Base commit for deps-check (ruling 640)` and
       # `make deps-check` left this job. deps-check reads the module proxy and
       # the vulnerability database, so its answer changes with no change to
-      # the tree; deps-bump.yml runs its full gate on a schedule (ruling 640).
+      # the tree; scans.yml's bump runs its full gate on a schedule (ruling 640).
 
       - name: Tear down
         if: always()
@@ -1073,11 +1830,13 @@ jobs:
   # GO_BUILD_TAGS reaches every target as a make variable, so the tag set is
   # still written once. build, test and lint run with no network, on the
   # image's module cache; security and deps-check get one (IN_IMAGE_NETWORK=
-  # bridge) for the vulnerability databases and the module proxy.
+  # bridge) for the vulnerability databases and the module proxy. v1.42
+  # (ruling 742 (1)): security and deps-check run in scans.yml, so no ci.yml
+  # stage needs the network for an advisory or a version lookup.
   #
   # v1.23: lint, assert-build-tags, build and coverage are the PR tier and run
   # on every event. security and trivy image are full tier only
-  # (env.CI_FULL_TIER): main after every merge, nightly, dispatch, ci:full.
+  # (env.CI_FULL_TIER); v1.41: the full tier is every event, every PR too.
   # v1.28: deps-check is a lint-class gate on the PR tier and runs on every
   # event (ruling 219(3)).
   #
@@ -1086,7 +1845,7 @@ jobs:
   # (in-toolchain-image.sh v2, ci-standard.md §6), so a stage writes its
   # caches there and not into its container's layer.
   #
-  # v1.29 (Company Agent ruling 220(5)): the job reads the Alpine package
+  # v1.29 (ruling 220(5)): the job reads the Alpine package
   # indexes the build resolves against (scripts/apk-index-sum.sh, ships beside
   # this file) into APK_INDEX_SUM, which the integration image's tag hashes and
   # its build takes as a build argument (ci-standard.md §9, devcontainer.md
@@ -1099,7 +1858,7 @@ jobs:
   # No step and no make target prints that file, the job environment (`env`,
   # `printenv`, `set -x`) or a matched line: `make stage-gomodauth` and the
   # file writes run silent, and lint steps and `make check-public-literals`
-  # report path and line only (ci-standard.md §5, Company Agent m605 item 8).
+  # report path and line only (ci-standard.md §5, Tenant Agent m605 item 8).
   #
   # Runners: every job in this workflow runs on GitHub-hosted ubuntu-latest
   # (4 vCPU, 16 GB, about 14 GB free disk, a 6 h job limit), which has
@@ -1132,7 +1891,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      # v1.21.1 (Company Agent m605 item 8): mask the forge credentials before
+      # v1.21.1 (Tenant Agent m605 item 8): mask the forge credentials before
       # any other step. The runner injects them as plain environment
       # (dependency-resolution.md §6), which the log does not mask by itself,
       # and the token sits inside GIT_CONFIG_KEY_0's URL, so it is masked alone
@@ -1157,10 +1916,25 @@ jobs:
           docker image prune --all --force
           df -h /
 
+      # Ruling 887: the LAN addresses this runner's environment names, masked
+      # before any step that builds can print one.
+      - name: Mask the LAN addresses
+        run: scripts/ci-mask-lan.sh
+
+      # Ruling 887: the LAN addresses this runner's environment names, masked
+      # before any step that builds can print one.
+      - name: Mask the LAN addresses
+        run: scripts/ci-mask-lan.sh
+
+      # Ruling 887: the LAN addresses this runner's environment names, masked
+      # before any step that builds can print one.
+      - name: Mask the LAN addresses
+        run: scripts/ci-mask-lan.sh
+
       - name: Reap stale CI stacks
         run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
 
-      # v1.23 (Company Agent m674 item 3, 2026-10-18): the integration image is named by its content,
+      # v1.23 (Tenant Agent m674 item 3, 2026-10-18): the integration image is named by its content,
       # <repo>-ci-it:<hash> (`make -s it-image`, ci-standard.md §9), so every
       # job of every run on this runner names the same image for the same
       # tree, builds it once and reuses it. No job removes it; the reap step does.
@@ -1233,6 +2007,20 @@ jobs:
             lease="${CI_STACK_PREFIX}lease-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
             docker create --name "$lease" "$IT_IMAGE" true >/dev/null && echo "IT_LEASE=$lease" >> "$GITHUB_ENV"
           fi
+
+      # The images the job built carry no private address in their history or
+      # config, checked after the build and before any use, on a pool runner.
+      - name: Check the images carry no private address
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$TOOLCHAIN_IMAGE"
+
+      # The integration image the build step made, checked the same way. A
+      # pull request without ci:full builds only the toolchain image, and the
+      # lease step leases only an image that is present, so the check runs
+      # only on a lease (as the integration job runs only on its lease).
+      - name: Check the integration image carries no private address
+        if: ${{ !cancelled() && env.IT_IMAGE != '' && env.IT_LEASE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$IT_IMAGE"
 
       # v1.22: bound this repo's cache volumes on the host before the stages
       # add to them (ci-standard.md §6). It never fails the job.
@@ -1507,6 +2295,16 @@ jobs:
           docker image prune --all --force
           df -h /
 
+      # Ruling 887: the LAN addresses this runner's environment names, masked
+      # before any step that builds can print one.
+      - name: Mask the LAN addresses
+        run: scripts/ci-mask-lan.sh
+
+      # The Runner labels step's rejection cases, on the runner's python3
+      # (the toolchain image has none): stdlib only, no make recipe.
+      - name: Runner labels tests
+        run: python3 -I test/buildgates/testdata/runner-labels-tests.py
+
       # A source check on the runner's shell: no make recipe runs here.
       - name: Does the Makefile define lint-gates?
         id: probe
@@ -1546,6 +2344,12 @@ jobs:
           make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # Ruling 901: the images the job built or pulled carry no private address in their history or
+      # config, checked after the build and before any use, on a pool runner.
+      - name: Check the images carry no private address
+        if: ${{ !cancelled() && steps.probe.outputs.has_target == 'true' && env.TOOLCHAIN_IMAGE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$TOOLCHAIN_IMAGE"
 
       # v1.22: bound this repo's cache volumes (as in the image job). It never
       # fails the job and keeps every volume a container mounts.
@@ -1598,7 +2402,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      # v1.21.1 (Company Agent m605 item 8): mask the forge credentials before
+      # v1.21.1 (Tenant Agent m605 item 8): mask the forge credentials before
       # any other step. The runner injects them as plain environment
       # (dependency-resolution.md §6), which the log does not mask by itself,
       # and the token sits inside GIT_CONFIG_KEY_0's URL, so it is masked alone
@@ -1643,12 +2447,37 @@ jobs:
       # because `docker image rm` refuses an image a container uses. Tear down
       # removes the lease; one a dead job leaves behind is a stale container,
       # which the reap step removes after the job timeout like any other.
+      # The image job built this image on its own runner, so a runner that
+      # has not got it (a cache miss) builds it here first, with the module
+      # credentials as the BuildKit secret, as the image job does. Then the
+      # lease: the step fails without one, so IT_LEASE is always set after it.
       - name: Lease the integration image
         run: |
-          if docker image inspect "$IT_IMAGE" >/dev/null 2>&1; then
-            lease="${CI_STACK_PREFIX}lease-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
-            docker create --name "$lease" "$IT_IMAGE" true >/dev/null && echo "IT_LEASE=$lease" >> "$GITHUB_ENV"
+          if ! docker image inspect "$IT_IMAGE" >/dev/null 2>&1; then
+            ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+              for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+                if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+              done )
+            # As in the image job: Athens first when the runner sets
+            # DEVCACHE_GOPROXY and the cache answers, then proxy.golang.org.
+            bp=
+            if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+              bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org"
+            fi
+            rc=0
+            make docker-build-it ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env" IT_IMAGE="$IT_IMAGE" || rc=$?
+            rm -f "$RUNNER_TEMP/gomodauth.env"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::could not build the integration image $IT_IMAGE (exit $rc)"
+              exit "$rc"
+            fi
           fi
+          lease="${CI_STACK_PREFIX}lease-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')"
+          if ! docker create --name "$lease" "$IT_IMAGE" true >/dev/null; then
+            echo "::error::could not lease the integration image $IT_IMAGE"
+            exit 1
+          fi
+          echo "IT_LEASE=$lease" >> "$GITHUB_ENV"
 
       # CUSTOMIZE: host tuning the suite needs goes here, as in the test job.
       # >>> CUSTOMIZE (go-quicraft)
@@ -1658,6 +2487,15 @@ jobs:
             || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
       # <<< CUSTOMIZE
 
+      # The integration image the job found or built carries no private
+      # address in its history or config, checked before any use. The lease
+      # step built a missing image, so the check runs on every pool run, and
+      # the suite runs only when it passed.
+      - name: Check the integration image carries no private address
+        id: it-history
+        if: ${{ !cancelled() && env.IT_IMAGE != '' && runner.environment != 'github-hosted' }}
+        run: scripts/ci-image-history.sh "$IT_IMAGE"
+
       - name: Write the module credential file
         run: |
           umask 077
@@ -1666,7 +2504,10 @@ jobs:
             if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
           done
 
+      # Its docker-build-it finds the tag the lease step found or built and
+      # builds nothing.
       - name: make integration-test (integration image)
+        if: ${{ success() && (runner.environment == 'github-hosted' || steps.it-history.outcome == 'success') }}
         run: |
           pkgs=$(make -s it-shard-packages SHARD="$SHARD" SHARDS="$IT_SHARDS" | tr '\n' ' ')
           [ -n "${pkgs// /}" ] || { echo "FAIL: integration shard $SHARD of $IT_SHARDS has no packages"; exit 1; }
@@ -1683,7 +2524,7 @@ jobs:
   # Soak (v1.23, owner item 101): the integration suite looped in the
   # integration image until SOAK_MINUTES have passed, each iteration its own
   # compose stack, torn down before the next; the first red iteration fails
-  # the job. v1.24 (owner ruling 2026-10-19, Company Agent m751 (e)): nightly
+  # the job. v1.24 (owner ruling 2026-10-19, Tenant Agent m751 (e)): nightly
   # and workflow_dispatch only, off main pushes and off ci:full; the Gate marks
   # it `nightly`. It replaces nothing in batch.yml, whose soak stays a dispatch.
   soak:

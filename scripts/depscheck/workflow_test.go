@@ -9,13 +9,13 @@ import (
 	"testing"
 )
 
-// The deps-bump.yml ref mutations run as shell steps on a GitHub runner,
+// The scans.yml bump job's ref mutations run as shell steps on a GitHub runner,
 // which no Go test reaches through runWith. These tests take each step's
 // run: script out of the workflow and run it with bash against a fake gh
 // whose refs live in a real bare repository, the step's origin, so a
 // deletion pushed with --force-with-lease meets git's own old-value check.
 
-const workflowFile = "../../.github/workflows/deps-bump.yml"
+const workflowFile = "../../.github/workflows/scans.yml"
 
 const bumpBranch = "ci/deps-bump"
 

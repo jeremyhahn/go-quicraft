@@ -71,11 +71,15 @@ snapshot tests, and those failures look like Raft bugs. If that happens, rerun
 on an idle machine (`make remote-ci-full REMOTE_HOST=…`) before you start
 debugging.
 
-### Running the suites in the dev container
+### Running the suites in the devcontainer
 
-`make docker-make` builds the dev image (`.devcontainer/Dockerfile.dev`, which
-copies the source in) and runs one make target inside it, `ci` unless you name
-another:
+There is one devcontainer image definition, `build/docker/devcontainer/Dockerfile`
+(the editor's `.devcontainer/devcontainer.json` builds its `dev` stage: the
+toolchain plus gopls, with modules from the baked cache, then the public proxy).
+`make docker-shell` opens a shell in the toolchain image with the network on;
+like the editor, it fetches modules from the baked cache, then the public proxy.
+`make docker-make` builds the toolchain image, copies the checkout into a
+container of it and runs one make target there, `ci` unless you name another:
 
 ```sh
 cp .devcontainer/.env.example .devcontainer/.env   # then fill in, chmod 600
@@ -88,13 +92,12 @@ make docker-clean                                  # remove this checkout's imag
 `.devcontainer/.env` holds your own Gitea account and access token as the four
 `GOPRIVATE`/`GIT_CONFIG_*` variables. It is the only place they live: the image
 builds mount it as a BuildKit secret for `go mod download` (never written to a
-layer), and the container and the compose services load it as their
-environment. Without it the build fails at go-enclave, which only the forge
-serves. Building needs the `docker-buildx` plugin.
+layer); the containers run offline on the modules baked into the image.
+Without it the build fails at go-enclave, which only the forge serves.
+Building needs the `docker-buildx` plugin.
 
-The dev image also carries `.git` (its own `Dockerfile.dev.dockerignore` keeps
-it; every other image leaves it out), because the releasability gate in
-`make test` reads the git index. Run it from a regular clone: in a `git
+The copy carries `.git`, because the releasability gate in `make test` reads
+the git index. Run it from a regular clone: in a `git
 worktree`, `.git` is only a pointer to a path on your machine.
 
 Nothing is bind-mounted, so the same command works against a remote daemon

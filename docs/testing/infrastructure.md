@@ -65,22 +65,21 @@ Because `-p 1` makes every package share one deadline, the timeouts are large:
 smaller cap fails the suite with a timeout panic and zero test failures, which
 reads as a product bug instead of a budget.
 
-### E2E over Docker Compose
+### E2E in the devcontainer
 
-`make integration-test-e2e` brings up
-`.devcontainer/docker-compose.integration.yml`: one `test-runner` container
-running a binary compiled from `./test/integration/e2e/...`. The e2e package
-builds its own clusters (`newTestCluster`: real `quicraft.Host` instances over
-real QUIC with mTLS on loopback), so the container adds the pinned toolchain
-and the entrypoint's tuned UDP buffers, not topology. There is no node server
-binary; the only `package main` in the tree is the benchmark orchestrator.
+`make integration-test-e2e` builds the `integration` stage of
+`build/docker/devcontainer/Dockerfile` and runs `./test/integration/e2e/...`
+under the hardened `integration` service of
+`build/docker/devcontainer/compose.yaml`, as `make integration-test` does. The
+e2e package builds its own clusters (`newTestCluster`: real `quicraft.Host`
+instances over real QUIC with mTLS on loopback), so the container adds the
+pinned toolchain, not topology. There is no node server binary; the only
+`package main` in the tree is the benchmark orchestrator.
 
-The build step in `.devcontainer/Dockerfile.integration` compiles under
-`set -eux` with no stderr suppression and no fallback, then asserts the binary
-is non-empty and lists at least one test. Both checks matter: `go test -c` on a
-package with no test files writes nothing and still exits 0, and a zero-byte
-executable run through a shell exits 0 having tested nothing.
-`test/buildgates/dockerfile_integration_test.go` pins that shape.
+The integration stage compiles the suites (`go vet -tags=integration`) while
+the image builds, so a broken build fails the image instead of passing with
+nothing tested. `test/buildgates/dockerfile_integration_test.go` pins that
+shape.
 
 ### Network partition injection
 

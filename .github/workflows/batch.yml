@@ -1,5 +1,11 @@
-# batch-template: v1.1 — token-free CPU work on hosted runners: fuzz,
-# race-full, soak, bench. Dispatch only; never in a merge gate.
+# batch-template: v1.3 (customized) — token-free CPU work on hosted runners:
+# fuzz, race-full, soak, bench. Dispatch only; never in a merge gate.
+# v1.3: GitHub-hosted standard runners for every job possible. fuzz deals its
+# targets to eight shards of one target at a time (-parallel=4, a standard
+# runner's 4 vCPU) instead of four shards of two, so each target still gets
+# its full fuzztime. LOCAL: race-full stays a four-shard matrix, and soak and
+# bench stay on ubuntu-latest (hosted-first), sized under the 6 h job limit.
+# v1.2: GO_VERSION follows ci.yml's toolchain.
 #
 # It puts idle runner capacity to work: long CPU-bound checks that need no
 # model account and still find defects in the release-candidate products.
@@ -21,7 +27,7 @@
 #
 # RUNNERS. Every job runs on GitHub-hosted ubuntu-latest (4 vCPU, 16 GB RAM,
 # about 14 GB free disk, a 6 h job limit), so each is sized to finish well
-# inside that limit: fuzz and race-full are matrices of four shards, and every
+# inside that limit: fuzz is a matrix of eight shards, race-full of four, and every
 # timeout leaves headroom under the 6 h cap.
 #
 # ARTIFACTS. actions/upload-artifact v4 and later refuse any server that is
@@ -80,17 +86,17 @@ jobs:
   # Every package with Fuzz* targets; every target fuzzed for `fuzztime`.
   # The runner does not expand a matrix built from another job's output
   # (go-quicraft ci.yml), so the targets are split over a static matrix of
-  # four shards, and each shard fuzzes two targets at a time with
-  # -parallel=2: the runner's 4 cores, 20 minutes per pair of targets.
+  # eight shards (v1.3), and each shard fuzzes one target at a time with
+  # -parallel=4: a standard runner's 4 vCPU, 20 minutes per target.
   fuzz:
-    name: Fuzz (shard ${{ matrix.shard }}/4)
+    name: Fuzz (shard ${{ matrix.shard }}/8)
     if: inputs.jobs == 'all' || inputs.jobs == 'fuzz'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
@@ -107,7 +113,7 @@ jobs:
           go test -tags="$FUZZ_TAGS" -run='^$' -list='^Fuzz' ./... |
             awk '/^Fuzz/ {t[n++]=$1; next}
                  /^ok/   {for (i = 0; i < n; i++) print $2, t[i]; n = 0}' |
-            awk -v s=${{ matrix.shard }} '(NR - 1) % 4 == s' > fuzz-targets.txt
+            awk -v s=${{ matrix.shard }} '(NR - 1) % 8 == s' > fuzz-targets.txt
           echo "shard ${{ matrix.shard }}: $(wc -l < fuzz-targets.txt) targets"
           cat fuzz-targets.txt
 
@@ -120,7 +126,7 @@ jobs:
           fuzz_one() {
             pkg=$1 target=$2 log="fuzz-logs/$(echo "$pkg" | tr / _).$target.log"
             if go test -tags="$FUZZ_TAGS" -run='^$' -fuzz="^${target}\$" \
-                 -fuzztime="$FUZZTIME" -parallel=2 "$pkg" > "$log" 2>&1; then
+                 -fuzztime="$FUZZTIME" -parallel=4 "$pkg" > "$log" 2>&1; then
               echo "ok   $pkg $target"
             elif grep -q 'context deadline exceeded' "$log" &&
                  ! grep -q 'Failing input written to' "$log"; then
@@ -137,7 +143,7 @@ jobs:
           export -f fuzz_one
           export FUZZ_TAGS FUZZTIME
           rc=0
-          xargs -r -P 2 -L 1 bash -c 'fuzz_one "$@"' _ < fuzz-targets.txt || rc=1
+          xargs -r -P 1 -L 1 bash -c 'fuzz_one "$@"' _ < fuzz-targets.txt || rc=1
           # A failing input is written to <pkg dir>/testdata/fuzz/<Target>/.
           git ls-files --others --exclude-standard | grep '/testdata/fuzz/' > fuzz-new.txt || true
           mkdir -p fuzz-findings
