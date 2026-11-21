@@ -218,6 +218,10 @@ case("C7 an if that cannot be lexed",
 case("C8 a .yaml file is read too",
      {"ok.yml": wf("on: push\n", job("ubuntu-latest")), "rel.yaml": wf("on: push\n", job(REL))}, 1,
      ["rel.yaml:pub: (b)"], ["ok.yml"])
+case("C9 two parsed arrays are never the same instance, so != is true on a pull request",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ fromJSON('[]') != fromJSON('[]') }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C10 two parsed objects are never the same instance, so != is true on a pull request",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ fromJSON('{}') != fromJSON('{}') }}"))}, 1, ["ci.yml:pub: (a)"])
 
 # D. hosted first (v1.43)
 ROUTE = ("${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || "
