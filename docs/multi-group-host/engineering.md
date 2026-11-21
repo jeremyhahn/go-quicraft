@@ -108,7 +108,9 @@ StartShard(members, join, create, cfg)
   |     shard under it (ErrShardBarrierLogDBMismatch)
   |  5. Refuse: already running (ErrShardAlreadyExists), a concurrent start
   |     (ErrShardNotReady), an import in progress (ErrImportInProgress), a
-  |     retired replica ID (*ReplicaRetiredError)
+  |     retired replica ID (*ReplicaRetiredError), a cfg.DataDir other than
+  |     the one the replica's bootstrap record, pending RemoveData intent or
+  |     snapshot record names (dataDirChangedError, unexported)
   |  6. recoverLogReader (see Crash recovery)
   |  7. Membership:
   |     - recovered from a snapshot: used as is
@@ -125,7 +127,8 @@ StartShard(members, join, create, cfg)
   |     (type detection DiskSM > ConcurrentSM > StateMachine); Open
   | 10. Recover the recorded snapshot, if any: in-memory tiers always, an
   |     on-disk state machine only when Open returned 0
-  | 11. Save the bootstrap record (every non-join start)
+  | 11. Save the bootstrap record with DataDir: the members' addresses on a
+  |     non-join start, Join set and no addresses on a join
   | 12. engine.NewNode(...); engine.LoadNode(node), on step worker
   |     shardID % NumWorkers
   | 13. Register the effective membership's addresses in the registry
@@ -337,7 +340,9 @@ Procedure:
    configuration accepted by accident cannot be detected afterwards.
    Separately, an artifact whose index does not advance the replica's recorded
    snapshot is refused with `*ImportSnapshotOutOfDateError`; that includes the
-   survivor it was exported from, which already records that index.
+   survivor it was exported from, which already records that index. A replica
+   with a pending `RemoveData` (one that failed part-way) is refused with an
+   error matching `ErrInvalidOperation`; retry `RemoveData` to finish it first.
 
 5. **Restart the survivors** with `StartShard(survivors, false, create, cfg)`,
    with `cfg.MemberIdentities` naming the survivors' identities. The shard elects
@@ -377,7 +382,9 @@ Host.Close()
   |     claimed first), mark unloaded, cancel an in-progress
   |     DiskStateMachine.Open, fail pending proposals, reads and snapshots
   |     with ErrClosed; a second sweep catches requests registered during
-  |     the first; close each state machine
+  |     the first; close each state machine. Then take and release admitMu
+  |     (a barrier for a RemoveData between its closed check and its count)
+  |     and wait for every admitted RemoveData (removeDataWG.Wait())
   | 10. logdb.Close()
   | 11. Seal the host-wide barrier and every distinct per-shard barrier the
   |     host was given; an already-sealed barrier is not an error
@@ -496,9 +503,11 @@ durable and are applied on the next start.
 The commit pipeline is not the only writer. A local snapshot save captures the
 state machine into a `.save-*` staging directory, then publishes it: renames it
 onto `snapshot-<index>`, records it, moves the log reader's marker, removes the
-entries below it and reclaims superseded directories. Only the publish runs
-under the node's write lease (`Node.AcquireWriteLease`), which is refused once
-the node has stopped; `UnloadNode` waits for any lease already held. The capture
+entries below it and reclaims superseded directories. Three steps run under the
+node's write lease, which is refused once the node has stopped: creating the
+staging directory and writing its `snapshot.meta` each take it without waiting
+(`Node.TryAcquireWriteLease`, `ErrStopped` when refused), and the publish takes
+it with `Node.AcquireWriteLease`. `UnloadNode` waits for any lease already held. The capture
 is user code and `UnloadNode` never waits on it, which is why `SaveSnapshot` must
 honor its stopper (the state machine's own `Close` still waits for an in-flight
 stream). Saves and receives serialize on a per-node snapshot-directory lock,

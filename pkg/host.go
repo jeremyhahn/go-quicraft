@@ -7770,8 +7770,8 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 // stops heartbeating; the remaining voters elect a leader of their own.
 //
 // PauseShard returns nil once none of the shard's log, apply or snapshot
-// work is in flight. If ctx ends first it returns ctx.Err() and the shard
-// STAYS paused: the in-flight work settles on its own, and calling
+// work is in flight. If ctx ends first it returns ErrTimeout or ErrCanceled
+// wrapping ctx.Err() (see mapContextError) and the shard STAYS paused: the in-flight work settles on its own, and calling
 // PauseShard again waits for it. Pausing a paused shard is idempotent. A
 // pause is not persisted: a restarted replica starts unpaused. An unknown
 // shard returns ErrShardNotFound; a shard that stops while the pause waits
@@ -7906,7 +7906,8 @@ func pauseTransferTarget(progress []raft.RemoteProgress, self uint64) uint64 {
 // PauseShard and ResumeShard on one shard are serialized: a resume issued
 // while a pause is handing leadership over waits for the pause to reach the
 // engine, then undoes it, so the shard ends resumed. If ctx ends first,
-// ResumeShard returns ctx.Err() and changes nothing.
+// ResumeShard returns ErrTimeout or ErrCanceled wrapping ctx.Err() (see
+// mapContextError) and changes nothing.
 func (h *Host) ResumeShard(ctx context.Context, shardID uint64) error {
 	if err := ctx.Err(); err != nil {
 		return mapContextError(err)

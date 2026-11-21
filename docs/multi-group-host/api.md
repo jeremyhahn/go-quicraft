@@ -182,7 +182,7 @@ other replica as its anchor, and no identity may be bound to two replicas. See
 | `ErrShardNotReady` | A concurrent `StartShard` of the same shard is still in progress (transient) |
 | `ErrImportInProgress` | An `ImportSnapshot` of this shard is running (transient) |
 | `*ReplicaRetiredError` | `RemoveData` retired this replica ID on this host. Rejoin under a new ID |
-| DataDir changed (unexported type; the message names the recorded and the requested `DataDir`) | `cfg.DataDir` differs from the `DataDir` this replica was first started with (its bootstrap record, or for a replica with none, its snapshot record). Its snapshots stay under the recorded tree: restart with the recorded `DataDir` |
+| DataDir changed (unexported type; the message names the recorded and the requested `DataDir`) | `cfg.DataDir` differs from the `DataDir` this replica was first started with (its bootstrap record, or for a replica with none, a pending `RemoveData` removal intent or else its snapshot record). Its snapshots stay under the recorded tree: restart with the recorded `DataDir` |
 | `*EmptyMembersError` | Bootstrap with an empty `members` map |
 | `*SelfNotInMembersError` | `cfg.ReplicaID` absent from `members` on a bootstrap |
 | `*InvalidMemberError` | A member has a zero replica ID, an empty or malformed address, or a duplicate address; a required identity is missing or bound twice; a joiner names no anchor; or `MemberIdentities` contradicts the recovered membership. Matches `ErrInvalidMember` |
@@ -344,7 +344,8 @@ On a basic `sm.StateMachine`, step 3 waits for any in-flight `Apply`, which
 holds the RSM adapter's read guard for writing. That wait observes `ctx`: the
 adapter acquires the guard with a context-aware retry, so a deadline or
 cancellation that fires while the read is queued behind `Apply` returns
-`ctx.Err()` without running `Lookup`. Once the guard is held, the call hands `ctx` to the
+`ErrTimeout` or `ErrCanceled` (wrapping `ctx.Err()`, so `errors.Is` sees both)
+without running `Lookup`. Once the guard is held, the call hands `ctx` to the
 embedder's `Lookup` and waits for it to return; whether a lookup that is already
 running stops on cancellation is up to that implementation (`NALookupInto`
 takes no context and always runs to completion). The
@@ -484,7 +485,8 @@ elect a leader of their own.
 
 `PauseShard` returns once no log, apply or snapshot work of the shard is in
 flight. If `ctx` ends first — always the case for a `ctx` already done on
-entry, however quiet the shard — it returns `ctx.Err()` and **the shard stays
+entry, however quiet the shard — it returns `ErrTimeout` or `ErrCanceled`
+(wrapping `ctx.Err()`) and **the shard stays
 paused**; calling `PauseShard` again waits for the remaining work. `ResumeShard`
 rejoins the shard as a follower at its current term with a fresh election
 timeout. Call it after the barrier is unsealed.
@@ -492,13 +494,15 @@ timeout. Call it after the barrier is unsealed.
 Both calls are idempotent, and on one shard they are serialized: a
 `ResumeShard` issued while a `PauseShard` is handing leadership over waits for
 that pause to take effect, then undoes it. A `ResumeShard` whose `ctx` ends
-while it waits returns `ctx.Err()` and changes nothing. Calls on different
+while it waits returns `ErrTimeout` or `ErrCanceled` and changes nothing. Calls on different
 shards never wait on each other. A pause is not persisted: a restarted replica starts
 unpaused. A barrier sealed without a pause still holds the shard's refused log
 write until unseal (see [Serve requests while sealed](../seal-barrier/user.md#serve-requests-while-sealed)).
 
 **Errors:** `ErrClosed` (also when the shard stops while `PauseShard` waits),
-`ErrShardNotFound` (unknown shard), and `ctx.Err()` from either call.
+`ErrShardNotFound` (unknown shard), and `ErrTimeout` or `ErrCanceled` from
+either call when `ctx` ends (each wraps `ctx.Err()`, so `errors.Is` matches
+`context.DeadlineExceeded` or `context.Canceled` too).
 
 ### Membership changes
 
@@ -1139,8 +1143,14 @@ identically, except that it first returns `ErrTimeout` or `ErrCanceled` for a
 
 **Errors:** `ErrClosed`, `*ShardNotStoppedError`, `ErrShardNotReady` (a
 `StartShard` for the shard is in progress), `ErrImportInProgress` (an
-`ImportSnapshot` for the shard is in progress), and LogDB errors. Retry the two
-transient refusals.
+`ImportSnapshot` for the shard is in progress), an error matching
+`ErrInvalidOperation` when the replica's snapshot record lies outside every
+replica layout or disagrees with its bootstrap record (below), a storage-step
+error (the removal intent, the snapshot directory or a directory sync failed;
+it names the step and path and wraps the underlying error), and LogDB errors.
+Retry the two transient refusals. After a storage-step error, retry
+`RemoveData`: the durable removal intent, written before anything is retired or
+deleted, tells the retry which snapshot directory to finish removing.
 
 `RemoveData` removes the one snapshot directory the replica's records agree on.
 A release before v1.0.0 let a replica that had snapshotted under one `DataDir`
@@ -2072,7 +2082,7 @@ Source: `pkg/config/hostconfig.go`.
 | `AllowZeroDeploymentID` | `bool` | `false` | permits `DeploymentID == 0`, for development and tests |
 | `HostID` | `string` | `""` | when empty, the ID in `NodeHostDir/host.id` is used; if that file is absent or malformed, a random 128-bit hex ID is generated and written there |
 | `NumWorkers` | `uint64` | `runtime.NumCPU()` | workers per tier |
-| `MaxApplyWorkers` | `int` | `runtime.NumCPU()` | concurrent per-shard apply goroutines |
+| `MaxApplyWorkers` | `int` | `runtime.NumCPU()` | state machine `Update` calls one apply worker runs at once, across its shards; the host-wide bound is `NumWorkers * MaxApplyWorkers`, and one shard's updates always run one at a time |
 | `CommitCBufferSize` | `int` | `64` | commit channel buffer per worker |
 | `ShutdownTimeout` | `time.Duration` | `30s` | bounds `Drain` only; see below |
 | `MaxWALDiskSize` | `uint64` | `0` (unlimited) | WAL size budget in bytes |

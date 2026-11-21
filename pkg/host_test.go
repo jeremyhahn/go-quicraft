@@ -15604,8 +15604,9 @@ func TestRemoveData_BadNodeStateType(t *testing.T) {
 	h := newTestHost(t)
 	// Store a non-*nodeState value to trigger type assertion failure.
 	h.nodes.Store(uint64(1), "not-a-nodeState")
-	// RemoveData should proceed past the type assertion failure (logs warning)
-	// and call logdb.RemoveNodeData.
+	// RemoveData should log the type assertion failure at error level and
+	// proceed with the removal: resolve the snapshot directory, record the
+	// removal intent, then call logdb.RemoveNodeData.
 	err := h.RemoveData(1, 1)
 	// logdb.RemoveNodeData may return an error for unknown shard, which is fine.
 	// The key assertion is no panic on the type assertion.
