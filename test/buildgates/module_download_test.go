@@ -16,6 +16,7 @@ package buildgates
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -362,15 +363,18 @@ type composeFile struct {
 func TestComposeServicesTakeCredentialsFromTheEnvFile(t *testing.T) {
 	// The devcontainer images are built by the Makefile, which passes the
 	// credential file as the gomodauth BuildKit secret; compose.yaml only
-	// runs them, with the modules baked in and GOPROXY=off. So no service
-	// may build an image itself (a build here would bypass the secret), set
-	// a credential inline, or fetch a module at run time.
+	// runs them, with the modules baked in. So no service may build an image
+	// itself (a build here would bypass the secret) or set a credential
+	// inline. The integration and toolchain services, which CI runs, fetch no
+	// module at run time (GOPROXY=off). The shell service, a workstation
+	// shell CI never runs, serves the baked cache first and then the public
+	// proxy into a writable cache under /tmp: no direct fetch, no credentials.
 	const file = "build/docker/devcontainer/compose.yaml"
 	var cf composeFile
 	if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join(repoRoot, file))), &cf); err != nil {
 		t.Fatalf("parse %s: %v", file, err)
 	}
-	for _, name := range []string{"integration", "toolchain"} {
+	for _, name := range []string{"integration", "toolchain", "shell"} {
 		svc, ok := cf.Services[name]
 		if !ok {
 			t.Errorf("%s: no service %q", file, name)
@@ -387,15 +391,133 @@ func TestComposeServicesTakeCredentialsFromTheEnvFile(t *testing.T) {
 					"the credential file", file, name, k)
 			}
 		}
-		if !strings.Contains(env, "GOPROXY off") {
-			t.Errorf("%s: service %s does not set GOPROXY to off; go inside the "+
-				"container could fetch a module at run time (environment: %q)", file, name, env)
+		vars := composeEnv(&svc.Environment)
+		if name == "shell" {
+			if got := vars["GOPROXY"]; got != devGoproxy {
+				t.Errorf("%s: service shell sets GOPROXY %q, want %q (the baked cache, "+
+					"then the public proxy; never direct, never off)", file, got, devGoproxy)
+			}
+			if got := vars["GOMODCACHE"]; !strings.HasPrefix(got, "/tmp/") {
+				t.Errorf("%s: service shell sets GOMODCACHE %q, want a writable "+
+					"directory under /tmp", file, got)
+			}
+		} else if got := vars["GOPROXY"]; got != "off" {
+			t.Errorf("%s: service %s sets GOPROXY %q, not off; go inside the "+
+				"container could fetch a module at run time (environment: %q)", file, name, got, env)
 		}
 		for _, ef := range svc.EnvFile {
 			t.Errorf("%s: service %s loads %s; the credential file stays out of "+
 				"the running container", file, name, ef.Path)
 		}
 	}
+}
+
+// devGoproxy is the GOPROXY of the editor's dev stage and the compose shell
+// service: the module cache baked into the image first, offline, then the
+// public proxy. No direct entry and no credentials.
+const devGoproxy = "file:///gomodcache/cache/download,https://proxy.golang.org"
+
+// composeEnv returns a compose service's environment mapping as key/value
+// pairs.
+func composeEnv(n *yaml.Node) map[string]string {
+	out := map[string]string{}
+	if n == nil || n.Kind != yaml.MappingNode {
+		return out
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		out[n.Content[i].Value] = n.Content[i+1].Value
+	}
+	return out
+}
+
+func TestDevcontainerDevStage(t *testing.T) {
+	// The editor builds the dev stage: toolchain plus gopls, with modules
+	// from the baked cache and then the public proxy into a writable cache.
+	// Every other shipped stage keeps GOPROXY=off.
+	const djson = ".devcontainer/devcontainer.json"
+	var dc struct {
+		Build struct {
+			Target string `json:"target"`
+		} `json:"build"`
+	}
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(repoRoot, djson))), &dc); err != nil {
+		t.Fatalf("parse %s: %v", djson, err)
+	}
+	if dc.Build.Target != "dev" {
+		t.Errorf("%s: build target %q, want dev", djson, dc.Build.Target)
+	}
+
+	const file = "build/docker/devcontainer/Dockerfile"
+	stages := dockerfileStageLines(readFile(t, filepath.Join(repoRoot, file)))
+	dev, ok := stages["dev"]
+	if !ok {
+		t.Fatalf("%s: no dev stage", file)
+	}
+	if dev.from != "toolchain" {
+		t.Errorf("%s: dev stage is FROM %q, want FROM toolchain", file, dev.from)
+	}
+	body := strings.Join(dev.lines, "\n")
+	if !strings.Contains(body, "GOPROXY="+devGoproxy) {
+		t.Errorf("%s: dev stage does not set GOPROXY=%s", file, devGoproxy)
+	}
+	if !strings.Contains(body, "GOMODCACHE=/home/dev/") {
+		t.Errorf("%s: dev stage does not set a GOMODCACHE under /home/dev", file)
+	}
+	if !strings.Contains(body, "/out/gopls") {
+		t.Errorf("%s: dev stage does not copy gopls", file)
+	}
+	for _, name := range []string{"base", "toolchain", "integration"} {
+		st, ok := stages[name]
+		if !ok {
+			t.Errorf("%s: no %s stage", file, name)
+			continue
+		}
+		seenOff := name != "base"
+		for _, l := range st.lines {
+			if !strings.HasPrefix(l, "ENV ") || !strings.Contains(l, "GOPROXY=") {
+				continue
+			}
+			if name == "base" && !seenOff && l == "ENV GOPROXY=off" {
+				seenOff = true
+				continue
+			}
+			t.Errorf("%s: stage %s sets %q; only the dev stage fetches modules "+
+				"at run time", file, name, l)
+		}
+		if !seenOff {
+			t.Errorf("%s: base stage does not set ENV GOPROXY=off", file)
+		}
+	}
+}
+
+type dockerStage struct {
+	from  string
+	lines []string
+}
+
+// dockerfileStageLines splits a Dockerfile into its named stages, each with
+// its FROM image and its other lines, comments dropped.
+func dockerfileStageLines(src string) map[string]dockerStage {
+	stages := map[string]dockerStage{}
+	cur := ""
+	for _, raw := range strings.Split(src, "\n") {
+		l := strings.TrimSpace(raw)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		if f := strings.Fields(l); len(f) == 4 && strings.EqualFold(f[0], "FROM") && strings.EqualFold(f[2], "AS") {
+			cur = f[3]
+			stages[cur] = dockerStage{from: f[1]}
+			continue
+		}
+		if cur == "" {
+			continue
+		}
+		st := stages[cur]
+		st.lines = append(st.lines, l)
+		stages[cur] = st
+	}
+	return stages
 }
 
 // nodeText flattens a YAML node's scalar content for a containment check.
