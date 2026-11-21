@@ -135,6 +135,74 @@ func TestImageHistoryProblemsCatchesAnUnsetVariable(t *testing.T) {
 	}
 }
 
+// integrationHistoryGateProblems reports an integration-image history step
+// that can run when the job built no integration image. A job whose build
+// step can select the toolchain target alone (the PR tier without ci:full)
+// leaves IT_IMAGE named but unbuilt, so the step that checks "$IT_IMAGE"
+// must also require the lease the job takes only on a present image.
+func integrationHistoryGateProblems(job string) []string {
+	if !strings.Contains(job, "target=docker-build-toolchain") {
+		return nil
+	}
+	var problems []string
+	for _, step := range strings.Split(job, "\n      - ") {
+		if !strings.Contains(step, `scripts/ci-image-history.sh "$IT_IMAGE"`) {
+			continue
+		}
+		guarded := false
+		for _, line := range strings.Split(step, "\n") {
+			t := strings.TrimSpace(line)
+			if strings.HasPrefix(t, "if:") && strings.Contains(t, "env.IT_LEASE != ''") {
+				guarded = true
+			}
+		}
+		if !guarded {
+			problems = append(problems, "the integration-image history step runs when the build step built only the toolchain image (its if: does not require env.IT_LEASE != '')")
+		}
+	}
+	return problems
+}
+
+// TestIntegrationImageHistoryRunsOnlyWhenBuilt checks ci.yml's image job: an
+// ordinary pull request builds only the toolchain image there, and the
+// integration-image history step must skip rather than fail the job.
+func TestIntegrationImageHistoryRunsOnlyWhenBuilt(t *testing.T) {
+	raw, err := os.ReadFile(ciWorkflowPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", ciWorkflowPath, err)
+	}
+	body := string(raw)
+	job := regexp.MustCompile(`(?m)^  image:\n(?:(?:    |      |\n).*\n)*`).FindString(body)
+	if !strings.Contains(job, `scripts/ci-image-history.sh "$IT_IMAGE"`) || !strings.Contains(job, "target=docker-build-toolchain") {
+		t.Fatal("ci.yml's image job no longer has the toolchain-only build and the integration-image history step this test checks")
+	}
+	for _, p := range integrationHistoryGateProblems(job) {
+		t.Errorf("job \"image\": %s", p)
+	}
+
+	prTier := "  image:\n    steps:\n" +
+		"      - name: Build\n" +
+		"        run: |\n" +
+		"          target=docker-build-toolchain\n" +
+		"          [ \"$CI_FULL_TIER\" != true ] || target=docker-build\n" +
+		"      - name: Lease the integration image\n" +
+		"        run: echo \"IT_LEASE=x\" >> \"$GITHUB_ENV\"\n" +
+		"      - name: Check the integration image carries no private address\n" +
+		"        if: ${{ !cancelled() && env.IT_IMAGE != '' && runner.environment != 'github-hosted' }}\n" +
+		"        run: scripts/ci-image-history.sh \"$IT_IMAGE\"\n"
+	if p := integrationHistoryGateProblems(prTier); len(p) == 0 {
+		t.Error("a history step that runs on a toolchain-only build was not reported")
+	}
+	gated := strings.Replace(prTier, "env.IT_IMAGE != ''", "env.IT_IMAGE != '' && env.IT_LEASE != ''", 1)
+	if p := integrationHistoryGateProblems(gated); len(p) != 0 {
+		t.Errorf("a history step gated on the lease was reported: %v", p)
+	}
+	fullOnly := strings.Replace(prTier, "target=docker-build-toolchain\n", "target=docker-build\n", 1)
+	if p := integrationHistoryGateProblems(fullOnly); len(p) != 0 {
+		t.Errorf("a job that always builds the integration image was reported: %v", p)
+	}
+}
+
 // suiteStep is the part of a workflow step the integration-suite check reads.
 type suiteStep struct {
 	Name string `yaml:"name"`
