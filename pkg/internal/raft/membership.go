@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/netaddr"
@@ -936,9 +937,51 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
+// ErrStaleConfigChange is returned by the add validators when a bound change
+// (a non-zero ConfigChangeID, or ConfigChangeID 0 with
+// MustMatchConfigChangeID set) names a configuration other than the current
+// one: another membership change committed after the caller read the index.
+var ErrStaleConfigChange = errors.New("raft: stale config change")
+
+// checkConfigChangeBound refuses a bound add whose ConfigChangeID is not the
+// current one. It runs on the leader's worker, after the Host's early check,
+// so a change that committed between the two is caught here. An unbound add
+// (ConfigChangeID 0 without MustMatchConfigChangeID) is not checked.
+func checkConfigChangeBound(m *membership, cc proto.ConfigChange) error {
+	if cc.ConfigChangeID == 0 && !cc.MustMatchConfigChangeID {
+		return nil
+	}
+	if cc.ConfigChangeID != m.configChangeID {
+		return &StaleConfigChangeError{Expected: m.configChangeID, Got: cc.ConfigChangeID}
+	}
+	return nil
+}
+
+// StaleConfigChangeError is the add validators' refusal of a bound change:
+// Got is the ConfigChangeID the change was checked against, Expected the
+// membership's current one. It matches ErrStaleConfigChange with errors.Is.
+type StaleConfigChangeError struct {
+	Expected uint64
+	Got      uint64
+}
+
+// Error returns a human-readable description.
+func (e *StaleConfigChangeError) Error() string {
+	return fmt.Sprintf("raft: stale config change: change checked membership %d, current is %d",
+		e.Got, e.Expected)
+}
+
+// Is reports whether target is ErrStaleConfigChange.
+func (e *StaleConfigChangeError) Is(target error) bool {
+	return target == ErrStaleConfigChange
+}
+
 // validateAddNode checks whether adding a full voting member would succeed
 // without mutating the membership. Returns the same errors as handleAddNode.
 func validateAddNode(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if cc.Address == "" {
 		return ErrEmptyAddress
 	}
@@ -1001,6 +1044,9 @@ func validateRemoveNode(m *membership, cc proto.ConfigChange) error {
 // succeed without mutating the membership. Returns the same errors as
 // handleAddNonVoting.
 func validateAddNonVoting(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if cc.Address == "" {
 		return ErrEmptyAddress
 	}
@@ -1021,6 +1067,9 @@ func validateAddNonVoting(m *membership, cc proto.ConfigChange) error {
 // the replicated witness-policy violations (validate-only — never enforced
 // on the apply path).
 func validateAddWitness(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if cc.Address == "" {
 		return ErrEmptyAddress
 	}

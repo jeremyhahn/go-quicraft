@@ -3367,6 +3367,30 @@ func (h *Host) translateProposalError(ns *nodeState, err error) error {
 		// commits succeeds.
 		return ErrRejected
 	}
+	var stale *raft.StaleConfigChangeError
+	if errors.As(err, &stale) {
+		// The leader's worker refused a bound add whose ConfigChangeID is no
+		// longer current: another membership change committed after the
+		// Host's early check. Nothing entered the log; the caller re-reads
+		// the membership and retries, as for the Host's own refusal.
+		var shardID uint64
+		if ns != nil {
+			shardID = ns.shardID
+		}
+		return &StaleConfigChangeError{ShardID: shardID, Expected: stale.Expected, Got: stale.Got}
+	}
+	if errors.Is(err, raft.ErrBoundConfigChangeNotLeader) {
+		// A bound add from index 0 that this replica no longer leads for:
+		// raft refused it rather than forward it without its binding.
+		// Nothing entered the log; the caller re-reads the membership and
+		// retries against the current leader.
+		var shardID uint64
+		if ns != nil {
+			shardID = ns.shardID
+		}
+		return fmt.Errorf("%w: shard %d: bound config change reached a replica that is no longer the leader",
+			ErrStaleConfigChange, shardID)
+	}
 	return err
 }
 
@@ -11196,7 +11220,14 @@ func (h *Host) ReloadMTLS(mtls *config.MTLSConfig) error {
 // RequestAddNode proposes adding a replica to the shard via a Raft
 // config change. The configChangeIndex should be obtained from
 // SyncGetShardMembership().ConfigChangeID to ensure ordered config
-// changes. Pass 0 to skip the ordering check.
+// changes. A non-zero index is checked twice: early by the Host, and again
+// by the leader's worker immediately before the change enters the log, so a
+// change that commits between the two is refused with
+// *StaleConfigChangeError (errors.Is ErrStaleConfigChange) and nothing is
+// appended. Pass 0 to skip the ordering check, or 0 with
+// WithBoundConfigChangeIndex to bind the add to the initial configuration.
+// The same applies to RequestAddObserver, RequestAddWitness and their
+// WithIdentity and Sync forms.
 //
 // It commits NO node identity for the replica. On a host with a transport that
 // is refused with ErrMemberIdentityRequired unless the configuration already
@@ -11204,8 +11235,47 @@ func (h *Host) ReloadMTLS(mtls *config.MTLSConfig) error {
 // authorized by its identity and by nothing else; use
 // RequestAddNodeWithIdentity. It remains the form for a transportless host,
 // where nothing crosses the wire.
-func (h *Host) RequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
-	return h.RequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex)
+func (h *Host) RequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
+	return h.RequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex, opts...)
+}
+
+// ConfigChangeOption adjusts a membership add request (RequestAddNode,
+// RequestAddObserver, RequestAddWitness and their WithIdentity and Sync
+// forms).
+type ConfigChangeOption func(*configChangeOptions)
+
+type configChangeOptions struct {
+	bound bool
+}
+
+// WithBoundConfigChangeIndex binds the add to its configChangeIndex even when
+// that index is 0. A non-zero index is always checked; without this option an
+// index of 0 means "do not check", so an add meant for the INITIAL
+// configuration (whose index is 0) could not be guarded. With it, the add is
+// refused with *StaleConfigChangeError (errors.Is ErrStaleConfigChange) unless
+// the shard's configuration is still the one the index names, both by the
+// Host's early check and by the leader's worker immediately before the change
+// enters the log. The binding is local to the leader and is not encoded in
+// the replicated entry.
+func WithBoundConfigChangeIndex() ConfigChangeOption {
+	return func(o *configChangeOptions) { o.bound = true }
+}
+
+// testHookBeforeConfigChangeDeliver, when non-nil, runs in requestConfigChange
+// after the Host's checks and before the entry is delivered to the step
+// worker. Tests use it to commit another membership change inside that
+// window. Always nil in production.
+var testHookBeforeConfigChangeDeliver func(cc proto.ConfigChange)
+
+// boundConfigChange reports whether opts carry WithBoundConfigChangeIndex.
+func boundConfigChange(opts []ConfigChangeOption) bool {
+	var o configChangeOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+	return o.bound
 }
 
 // RequestAddNodeWithIdentity proposes adding a replica together with the stable
@@ -11236,14 +11306,15 @@ func (h *Host) RequestAddNode(ctx context.Context, shardID, replicaID uint64, ad
 // The identity must therefore come from outside the cluster, from the operator
 // or the provisioning system that issued the certificate.
 func (h *Host) RequestAddNodeWithIdentity(ctx context.Context, shardID, replicaID uint64,
-	addr, identity string, configChangeIndex uint64) (*RequestState, error) {
+	addr, identity string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
 
 	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
-		ConfigChangeID: configChangeIndex,
-		Type:           proto.AddNode,
-		ReplicaID:      replicaID,
-		Address:        addr,
-		NodeIdentity:   identity,
+		ConfigChangeID:          configChangeIndex,
+		Type:                    proto.AddNode,
+		ReplicaID:               replicaID,
+		Address:                 addr,
+		NodeIdentity:            identity,
+		MustMatchConfigChangeID: boundConfigChange(opts),
 	})
 }
 
@@ -11254,9 +11325,9 @@ func (h *Host) RequestAddNodeWithIdentity(ctx context.Context, shardID, replicaI
 //
 // The context must carry a deadline or timeout to bound the wait.
 func (h *Host) SyncRequestAddNodeWithIdentity(ctx context.Context, shardID, replicaID uint64,
-	addr, identity string, configChangeIndex uint64) error {
+	addr, identity string, configChangeIndex uint64, opts ...ConfigChangeOption) error {
 
-	rs, err := h.RequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex)
+	rs, err := h.RequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex, opts...)
 	return awaitConfigChange(ctx, rs, err)
 }
 
@@ -11289,8 +11360,8 @@ func (h *Host) RequestRemoveNode(ctx context.Context, shardID, replicaID uint64,
 // around RequestAddNode for callers that prefer a synchronous API.
 //
 // The context must carry a deadline or timeout to bound the wait.
-func (h *Host) SyncRequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error {
-	rs, err := h.RequestAddNode(ctx, shardID, replicaID, addr, configChangeIndex)
+func (h *Host) SyncRequestAddNode(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) error {
+	rs, err := h.RequestAddNode(ctx, shardID, replicaID, addr, configChangeIndex, opts...)
 	return awaitConfigChange(ctx, rs, err)
 }
 
@@ -11308,17 +11379,17 @@ func (h *Host) SyncRequestRemoveNode(ctx context.Context, shardID, replicaID uin
 // until the membership change is committed.
 //
 // The context must carry a deadline or timeout to bound the wait.
-func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error {
-	rs, err := h.RequestAddObserver(ctx, shardID, replicaID, addr, configChangeIndex)
+func (h *Host) SyncRequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) error {
+	rs, err := h.RequestAddObserver(ctx, shardID, replicaID, addr, configChangeIndex, opts...)
 	return awaitConfigChange(ctx, rs, err)
 }
 
 // SyncRequestAddObserverWithIdentity is SyncRequestAddObserver carrying the
 // observer's node identity; see RequestAddNodeWithIdentity.
 func (h *Host) SyncRequestAddObserverWithIdentity(ctx context.Context, shardID, replicaID uint64,
-	addr, identity string, configChangeIndex uint64) error {
+	addr, identity string, configChangeIndex uint64, opts ...ConfigChangeOption) error {
 
-	rs, err := h.RequestAddObserverWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex)
+	rs, err := h.RequestAddObserverWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex, opts...)
 	return awaitConfigChange(ctx, rs, err)
 }
 
@@ -11326,28 +11397,30 @@ func (h *Host) SyncRequestAddObserverWithIdentity(ctx context.Context, shardID, 
 // until the membership change is committed.
 //
 // The context must carry a deadline or timeout to bound the wait.
-func (h *Host) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) error {
-	rs, err := h.RequestAddWitness(ctx, shardID, replicaID, addr, configChangeIndex)
+func (h *Host) SyncRequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) error {
+	rs, err := h.RequestAddWitness(ctx, shardID, replicaID, addr, configChangeIndex, opts...)
 	return awaitConfigChange(ctx, rs, err)
 }
 
 // SyncRequestAddWitnessWithIdentity is SyncRequestAddWitness carrying the
 // witness's node identity; see RequestAddNodeWithIdentity.
 func (h *Host) SyncRequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64,
-	addr, identity string, configChangeIndex uint64) error {
+	addr, identity string, configChangeIndex uint64, opts ...ConfigChangeOption) error {
 
-	rs, err := h.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex)
+	rs, err := h.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, addr, identity, configChangeIndex, opts...)
 	return awaitConfigChange(ctx, rs, err)
 }
 
 // RequestAddObserver requests adding a non-voting observer to a shard.
 // Observers receive log entries but do not participate in quorum.
 // The configChangeIndex should be obtained from
-// SyncGetShardMembership().ConfigChangeID. It commits no identity, which a
+// SyncGetShardMembership().ConfigChangeID and is checked as for
+// RequestAddNode (Host and leader worker; 0 is bound only with
+// WithBoundConfigChangeIndex). It commits no identity, which a
 // host with a transport refuses as RequestAddNode does; use
 // RequestAddObserverWithIdentity there.
-func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
-	return h.RequestAddObserverWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex)
+func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
+	return h.RequestAddObserverWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex, opts...)
 }
 
 // RequestAddObserverWithIdentity adds a non-voting observer together with the
@@ -11358,25 +11431,28 @@ func (h *Host) RequestAddObserver(ctx context.Context, shardID, replicaID uint64
 // ReplicateResp advances a match index the leader reads — so it is bound by the
 // same gate as a voter.
 func (h *Host) RequestAddObserverWithIdentity(ctx context.Context, shardID, replicaID uint64,
-	addr, identity string, configChangeIndex uint64) (*RequestState, error) {
+	addr, identity string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
 
 	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
-		ConfigChangeID: configChangeIndex,
-		Type:           proto.AddNonVoting,
-		ReplicaID:      replicaID,
-		Address:        addr,
-		NodeIdentity:   identity,
+		ConfigChangeID:          configChangeIndex,
+		Type:                    proto.AddNonVoting,
+		ReplicaID:               replicaID,
+		Address:                 addr,
+		NodeIdentity:            identity,
+		MustMatchConfigChangeID: boundConfigChange(opts),
 	})
 }
 
 // RequestAddWitness requests adding a voting witness to a shard.
 // Witnesses participate in quorum but do not store a state machine.
 // The configChangeIndex should be obtained from
-// SyncGetShardMembership().ConfigChangeID. It commits no identity, which a
+// SyncGetShardMembership().ConfigChangeID and is checked as for
+// RequestAddNode (Host and leader worker; 0 is bound only with
+// WithBoundConfigChangeIndex). It commits no identity, which a
 // host with a transport refuses as RequestAddNode does; use
 // RequestAddWitnessWithIdentity there.
-func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64) (*RequestState, error) {
-	return h.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex)
+func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64, addr string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
+	return h.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, addr, "", configChangeIndex, opts...)
 }
 
 // RequestAddWitnessWithIdentity adds a voting witness together with the node
@@ -11387,14 +11463,15 @@ func (h *Host) RequestAddWitness(ctx context.Context, shardID, replicaID uint64,
 // a voter's do; committing its identity is no less important for holding no
 // state machine.
 func (h *Host) RequestAddWitnessWithIdentity(ctx context.Context, shardID, replicaID uint64,
-	addr, identity string, configChangeIndex uint64) (*RequestState, error) {
+	addr, identity string, configChangeIndex uint64, opts ...ConfigChangeOption) (*RequestState, error) {
 
 	return h.requestConfigChange(ctx, shardID, proto.ConfigChange{
-		ConfigChangeID: configChangeIndex,
-		Type:           proto.AddWitness,
-		ReplicaID:      replicaID,
-		Address:        addr,
-		NodeIdentity:   identity,
+		ConfigChangeID:          configChangeIndex,
+		Type:                    proto.AddWitness,
+		ReplicaID:               replicaID,
+		Address:                 addr,
+		NodeIdentity:            identity,
+		MustMatchConfigChangeID: boundConfigChange(opts),
 	})
 }
 
@@ -11890,15 +11967,16 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	// stale config changes from being proposed when two clients race to
 	// modify the membership (PhD thesis Section 4.1).
 	//
-	// NOTE: This check is intentionally conservative. The atomic load of
-	// configChangeIndex is not linearizable with the Raft log, so a
-	// concurrent config change that commits between the caller's
-	// SyncGetShardMembership and this check may cause a false rejection
-	// (false positive). This is safe: the caller simply re-reads the
-	// membership and retries. False negatives (accepting a truly stale
-	// index) cannot occur because configChangeIndex is monotonically
-	// updated on apply and this check requires an exact match.
-	if configChangeIndex != 0 {
+	// This is an EARLY check only. The atomic load of configChangeIndex is not
+	// linearizable with the Raft log: a change that commits after this load
+	// but before the entry is proposed would pass it. The authoritative check
+	// is the leader's worker (membership validation in handleLeaderPropose),
+	// which compares a bound add's ConfigChangeID with the membership it is
+	// about to append to, and whose refusal translateProposalError maps to the
+	// same *StaleConfigChangeError. An index of 0 is checked only under
+	// WithBoundConfigChangeIndex (cc.MustMatchConfigChangeID); that marker is
+	// not encoded, so it is bound to the proposal key on the Peer below.
+	if configChangeIndex != 0 || cc.MustMatchConfigChangeID {
 		current := ns.configChangeIndex.Load()
 		if configChangeIndex != current {
 			return nil, &StaleConfigChangeError{
@@ -11930,6 +12008,10 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 	// panic rebuildReplicaToBit's invariant. Returning the validation error
 	// here gives the caller a prompt, actionable failure instead.
 	if err := engNode.Peer().ValidateConfigChange(cc); err != nil {
+		var stale *raft.StaleConfigChangeError
+		if errors.As(err, &stale) {
+			return nil, h.translateProposalError(ns, err)
+		}
 		return nil, err
 	}
 
@@ -12040,8 +12122,29 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		// replica that never became a member.
 		onFailure: rollbackPreRegister,
 	}
+	// Bind the in-memory MustMatchConfigChangeID marker to the proposal key
+	// so the leader's worker validates the decoded entry as bound. A non-zero
+	// ConfigChangeID needs no binding: it is in the encoded entry.
+	//
+	// The binding is NOT dropped by the failure hook. A deadline expiry or a
+	// leader change fails the caller but leaves the entry in the proposal
+	// queue, from where the worker may still take it (proposalMayReachRaft):
+	// unbinding then would let it be validated as an unbound add. raft
+	// consumes the binding wherever the entry is taken -- validated by a
+	// leader, refused by one, or refused instead of being forwarded by a
+	// non-leader -- so only the two paths below, on which the entry is never
+	// delivered, unbind here. An entry left untaken in a queue that closes
+	// dies with its Peer.
+	peer := engNode.Peer()
+	bound := cc.MustMatchConfigChangeID && cc.ConfigChangeID == 0
+	if bound {
+		peer.BindConfigChange(proposalKey)
+	}
 	if err := h.registerPendingProposal(ns, engNode, proposalKey, pp); err != nil {
-		rollbackPreRegister()
+		if bound {
+			peer.UnbindConfigChange(proposalKey)
+		}
+		pp.onFailure()
 		return nil, err
 	}
 
@@ -12049,6 +12152,9 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 		Type: proto.EntryConfigChange,
 		Key:  proposalKey,
 		Cmd:  buf,
+	}
+	if hook := testHookBeforeConfigChangeDeliver; hook != nil {
+		hook(cc)
 	}
 	if !engNode.DeliverTrackedProposal([]proto.Entry{entry}, &pp.enqueuedAt) {
 		// Queue full — claim the entry before rolling back. The sweep and
@@ -12063,7 +12169,10 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 			h.completePendingOp()
 		}
 		rs.Release()
-		rollbackPreRegister()
+		if bound {
+			peer.UnbindConfigChange(proposalKey)
+		}
+		pp.onFailure()
 		if refusal := closedQueueRefusal(engNode); refusal != nil {
 			return nil, refusal
 		}
