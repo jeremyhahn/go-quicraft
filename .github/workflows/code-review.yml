@@ -3880,6 +3880,17 @@ jobs:
           # read (v5.12.6 has no twin wait; this keeps the live check last).
           live_base_guard
 
+          # LOCAL (security): P1 "Keep the gate closed while a requested
+          # re-review is outstanding". An effort or model label on an
+          # approved head requests a fresh review (the guard's `again` path);
+          # a title edit or unrelated label that starts another run while
+          # that review is queued or running skips this run's review job.
+          # An older approval does not pass while a twin's `Codex review`
+          # job is queued or in progress on the head: fail at once, whatever
+          # the standing verdict; that run's gate posts the head's check.
+          [ -z "$twin" ] ||
+            fail "the Codex review of $EVENT_SHA is queued or running in run $twin; that run's gate posts this head's check, and an earlier approval does not pass while it is outstanding"
+
           # LOCAL (security): P1 "Preserve failed re-reviews across subsequent
           # workflow runs". A review an earlier run requested (an effort or
           # model label on an approved head) that failed, was cancelled or
