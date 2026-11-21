@@ -74,7 +74,10 @@ debugging.
 ### Running the suites in the devcontainer
 
 There is one devcontainer image definition, `build/docker/devcontainer/Dockerfile`
-(the editor's `.devcontainer/devcontainer.json` builds its `toolchain` stage).
+(the editor's `.devcontainer/devcontainer.json` builds its `dev` stage: the
+toolchain plus gopls, with modules from the baked cache, then the public proxy).
+`make docker-shell` opens a shell in the toolchain image with the network on;
+like the editor, it fetches modules from the baked cache, then the public proxy.
 `make docker-make` builds the toolchain image, copies the checkout into a
 container of it and runs one make target there, `ci` unless you name another:
 

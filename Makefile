@@ -1813,13 +1813,15 @@ docker-run: docker-build-toolchain
 		docker compose -f $(DEVCONTAINER_COMPOSE) -p go-quicraft-tc-$(DOCKER_TAG) \
 		run --rm toolchain sh -c '$(CMD)'
 
-# An interactive shell in the toolchain image (compose service `toolchain`,
-# the checkout bind-mounted), as docker-run.
+# An interactive shell in the toolchain image (compose service `shell`, the
+# checkout bind-mounted, the network on): modules come from the baked cache,
+# then the public proxy into /tmp, so `make lint` works across the nested
+# modules. CI never runs it.
 .PHONY: docker-shell
 docker-shell: docker-build-toolchain
 	GO_QUICRAFT_TOOLCHAIN_TAG=$(TOOLCHAIN_TAG) GO_QUICRAFT_UID=$$(id -u) GO_QUICRAFT_GID=$$(id -g) \
 		docker compose -f $(DEVCONTAINER_COMPOSE) -p go-quicraft-tc-$(DOCKER_TAG) \
-		run --rm toolchain sh
+		run --rm shell sh
 
 .PHONY: docker-test
 docker-test:
@@ -1970,7 +1972,7 @@ help:
 	@echo "                                 toolchain image; honours DOCKER_HOST for a remote daemon;"
 	@echo "                                 DOCKER_MAKE_NETWORK=none (default bridge) runs it offline"
 	@echo "  docker-clean                   Remove this checkout's docker-build* images"
-	@echo "  docker-shell                   Open a shell in the toolchain image"
+	@echo "  docker-shell                   Open a networked shell in the toolchain image (modules via the public proxy)"
 	@echo "  docker-test                    Run make test in the toolchain image"
 	@echo "  docker-integration-down        Stop and clean integration containers"
 
