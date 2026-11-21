@@ -53,7 +53,9 @@ the step does; nothing reaches the network.
      This repository's ci.yml preflight passes (A1 too). The same text in
      another job, outside ci.yml, a default to any other label, a value that
      stays self-hosted with the variable set, and the variable read without
-     fromJSON all stay (c).
+     fromJSON all stay (c). A pull request from a fork never reaches the
+     pool: unset, the runs-on must give a standard image for a fork head,
+     so the default without the head-repository guard stays (c).
 
 Run: python3 -I test/buildgates/testdata/runner-labels-tests.py
 """
@@ -282,7 +284,10 @@ case("E7 another job's output is not the selection: (c)",
      {"ci.yml": wf(PR_ON, job("${{ fromJSON(needs.route.outputs.runner) }}", name="dyn"))}, 1, ["ci.yml:dyn: (c)"])
 
 # F. preflight on the self-hosted bigdisk pool by default, the variable its fallback
-PRE = ("${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || "
+PRE_UNGUARDED = ("${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || "
+                 "'[\"self-hosted\",\"linux\",\"x64\",\"bigdisk\"]') || 'ubuntu-latest' }}")
+PRE = ("${{ github.server_url == 'https://github.com' && (github.event_name != 'pull_request' || "
+       "github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || "
        "'[\"self-hosted\",\"linux\",\"x64\",\"bigdisk\"]') || 'ubuntu-latest' }}")
 PRE_TEXT = WORKFLOW.read_text()
 if PRE_TEXT.count(f"    runs-on: {PRE}\n") != 1:
@@ -308,6 +313,13 @@ case("F7 another variable is not the switch: (c)",
      ["ci.yml:preflight: (c)"])
 case("F8 the off-github.com label is not checked: the forge keeps ubuntu-latest",
      {"ci.yml": wf(PR_ON, job(PRE.replace("|| 'ubuntu-latest'", "|| 'bigdisk'"), name="preflight"))}, 0, ["OK:"])
+case("F9 the default without the head-repository guard fails (c): a fork pull request would reach the pool",
+     {"ci.yml": wf(PR_ON, job(PRE_UNGUARDED, name="preflight"))}, 1,
+     ["ci.yml:preflight: (c)", "pull_request (refs/pull/1/merge, fork, CI_PREFLIGHT_RUNS_ON unset): self-hosted"],
+     ["push (refs/heads/main"])
+case("F10 a guard that keeps every pull request off the pool passes",
+     {"ci.yml": wf(PR_ON, job(PRE.replace(" || github.event.pull_request.head.repo.full_name == github.repository", ""),
+                              name="preflight"))}, 0, ["OK:"])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
