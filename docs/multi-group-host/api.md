@@ -1108,7 +1108,16 @@ The write is atomic and crash-safe: output goes to a temporary file in the
 destination directory, is fsynced, renamed, and the directory chain is fsynced
 before success. Any failure before the rename removes the temp file and leaves
 both paths untouched. The exception is a directory fsync that fails after the
-rename, which returns `*SnapshotCommittedNotDurableError` with the real epoch.
+rename, which returns `*SnapshotCommittedNotDurableError` with the real epoch
+and the destination's `fileSize`.
+
+Some destinations are refused with `*SnapshotDestinationError` before anything
+is written. `srcPath` or `dstPath` not in clean form (`filepath.Clean` would
+change it) matches `fs.ErrInvalid`. When the source has a `snapshot.meta`
+beside it, a `dstPath` that already exists matches `fs.ErrExist`, and a lookup
+of `dstPath` that fails for any reason other than not-exist returns that
+failure. In each case `Path` names the refused path. Re-key into a fresh
+directory.
 
 ### Data removal
 
@@ -1831,7 +1840,8 @@ Each type below implements `error`; those with an `Err` field implement
 | `SnapshotTooLargeError` | `ShardID`, `MaxSize` | Matches `ErrSnapshotTooLarge` |
 | `SnapshotArtifactError` | `Reason`, `Err` | An export artifact's header is malformed or its data fails the trailer check |
 | `SnapshotOptionError` | `Field`, `Reason` | From `SnapshotOption.Validate`. Matches `ErrInvalidSnapshotOption` |
-| `SnapshotCommittedNotDurableError` | `Path`, `Epoch`, `Err` | `ReencryptSnapshotFile`'s directory fsync failed after the rename. Record `Epoch` (dropping it lets the next purge orphan the artifact's key) and treat the migration as unverified |
+| `SnapshotCommittedNotDurableError` | `Path`, `Epoch`, `Err` | `ReencryptSnapshotFile`'s directory fsync failed after the rename. Record `Epoch` (dropping it lets the next purge orphan the artifact's key) and the `fileSize` returned beside it as the record's `FileSize`, and treat the migration as unverified |
+| `SnapshotDestinationError` | `Path`, `Err` | `ReencryptSnapshotFile` refused a path before writing anything: `Err` is `fs.ErrExist` (the destination already exists beside a source `snapshot.meta`), `fs.ErrInvalid` (a path not in clean form), or the destination lookup's failure. See [ReencryptSnapshotFile](#reencryptsnapshotfile) |
 | `UnauthorizedMessageError` | `ShardID`, `From`, `MsgType` | An inbound Raft message failed shard-membership authorization |
 | `TypeAssertionError` | `Context`, `ExpectedType`, `ActualValue` | An internal type assertion failed |
 | `LoopPanicError` | `LoopName`, `Value`, `Stack` | A recovered panic from a goroutine loop, with its stack |
@@ -2461,7 +2471,7 @@ than `(nil, nil)`, which would look like an empty value or a missing key.
 Source: `pkg/config/hostconfig.go`.
 
 ```go
-type EventListener struct { /* 27 optional func fields */ }
+type EventListener struct { /* 26 optional func fields */ }
 ```
 
 Set only the callbacks you need; nil callbacks are not invoked. Engine events
