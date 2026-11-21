@@ -110,7 +110,7 @@ StartShard(members, join, create, cfg)
   |     (ErrShardNotReady), an import in progress (ErrImportInProgress), a
   |     retired replica ID (*ReplicaRetiredError), a cfg.DataDir other than
   |     the one the replica's bootstrap record, pending RemoveData intent or
-  |     snapshot record names (dataDirChangedError, unexported)
+  |     snapshot record names (matches ErrDataDirChanged)
   |  6. recoverLogReader (see Crash recovery)
   |  7. Membership:
   |     - recovered from a snapshot: used as is

@@ -182,7 +182,7 @@ other replica as its anchor, and no identity may be bound to two replicas. See
 | `ErrShardNotReady` | A concurrent `StartShard` of the same shard is still in progress (transient) |
 | `ErrImportInProgress` | An `ImportSnapshot` of this shard is running (transient) |
 | `*ReplicaRetiredError` | `RemoveData` retired this replica ID on this host. Rejoin under a new ID |
-| DataDir changed (unexported type; the message names the recorded and the requested `DataDir`) | `cfg.DataDir` differs from the `DataDir` this replica was first started with (its bootstrap record, or for a replica with none, a pending `RemoveData` removal intent or else its snapshot record). Its snapshots stay under the recorded tree: restart with the recorded `DataDir` |
+| `ErrDataDirChanged` (match with `errors.Is`; the message names the recorded and the requested `DataDir`) | `cfg.DataDir` differs from the `DataDir` this replica was first started with (its bootstrap record, or for a replica with none, a pending `RemoveData` removal intent or else its snapshot record). Its snapshots stay under the recorded tree: restart with the recorded `DataDir` |
 | `*EmptyMembersError` | Bootstrap with an empty `members` map |
 | `*SelfNotInMembersError` | `cfg.ReplicaID` absent from `members` on a bootstrap |
 | `*InvalidMemberError` | A member has a zero replica ID, an empty or malformed address, or a duplicate address; a required identity is missing or bound twice; a joiner names no anchor; or `MemberIdentities` contradicts the recovered membership. Matches `ErrInvalidMember` |

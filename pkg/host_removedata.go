@@ -51,6 +51,12 @@ func (e *dataDirChangedError) Error() string {
 		e.ShardID, e.ReplicaID, e.Recorded, e.Requested)
 }
 
+// Is reports whether target is ErrDataDirChanged, so a caller can match
+// StartShard's changed-DataDir refusal with errors.Is.
+func (e *dataDirChangedError) Is(target error) bool {
+	return target == ErrDataDirChanged
+}
+
 // refuseDataDirChange returns *dataDirChangedError when the replica's
 // bootstrap record states a DataDir other than dataDir or, with no bootstrap
 // record, its snapshot record lies under another DataDir, and a LogDB error
