@@ -399,5 +399,25 @@ for label, text in (
 case("H11 the block-style form of the same workflow is read: (f) for qwen outside code-review.yml",
      {"aux.yml": AUX}, 1, ["aux.yml:aux: (f)"], ["(g)", "OK:"])
 
+# I. `a || b` and `a && b` with an unknown left operand stay unknown: the left
+# operand's value, not the right one, is the result whenever it is truthy (||)
+# or falsy (&&).
+case("I1 an unknown variable before a hosted fallback is not the fallback",
+     {"ci.yml": wf(PR_ON, job("${{ vars.RUNNER || 'ubuntu-latest' }}"))}, 1, ["ci.yml:pub:"], ["OK:"])
+case("I2 an unknown variable before a hosted fallback is not the fallback, under &&",
+     {"ci.yml": wf(PR_ON, job("${{ vars.RUNNER && 'ubuntu-latest' }}"))}, 1, ["ci.yml:pub:"], ["OK:"])
+case("I3 a release job guarded by an unknown variable's fallback can run on a pull request",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ (vars.ALLOW_RELEASE || 'no') == 'yes' }}"))}, 1, ["ci.yml:pub:"], ["OK:"])
+case("I4 a release job guarded by an unknown variable under && can run on a pull request",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ (vars.ALLOW_RELEASE && 'no') == 'no' }}"))}, 1, ["ci.yml:pub:"], ["OK:"])
+case("I5 literal operands still evaluate exactly: 'ubuntu-latest' || 'bigdisk'",
+     {"ci.yml": wf(PR_ON, job("${{ 'ubuntu-latest' || 'bigdisk' }}"))}, 0, ["OK:"])
+case("I6 literal operands still evaluate exactly: '' || 'ubuntu-latest'",
+     {"ci.yml": wf(PR_ON, job("${{ '' || 'ubuntu-latest' }}"))}, 0, ["OK:"])
+case("I7 literal operands still evaluate exactly: 'bigdisk' && 'ubuntu-latest'",
+     {"ci.yml": wf(PR_ON, job("${{ 'bigdisk' && 'ubuntu-latest' }}"))}, 0, ["OK:"])
+case("I8 an unknown variable cannot open a release guard that is false on its own",
+     {"ci.yml": wf(PR_ON, job(REL, GUARD.replace(" }}", " && (vars.ALLOW_RELEASE || 'no') == 'yes' }}")))}, 0, ["OK:"])
+
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
