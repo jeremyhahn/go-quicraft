@@ -1257,17 +1257,6 @@ func decryptSnapshotToAnonymousScratch(fsys snapshotFS, scratchDir, srcPath stri
 	return tmpFile, nil
 }
 
-// decryptSnapshotFrames reads the encrypted snapshot frame format from src,
-// decrypts each frame, and writes the plaintext to dst. The on-disk encrypted
-// format is a sequence of frames: [4-byte LE length][encrypted chunk]...
-// terminated by EOF. Returns the total number of plaintext bytes written.
-//
-// Each frame is decrypted with the epoch EMBEDDED in its own ciphertext header
-// (barrier.Decrypt), not a single snapshot-wide epoch: a snapshot saved across
-// a key rotation contains frames sealed at different epochs, and using one
-// epoch for all of them would fail AEAD authentication on the mismatched
-// frames. Shared by the transport send path (decryptSnapshotForSend) and the
-// ExportSnapshot API so both emit identical plaintext.
 // encryptSnapshotFrames seals the plaintext snapshot data src yields into dst
 // through engine.SealSnapshotFrames, the one implementation of the frame
 // format the local save path writes: [4-byte LE length][AEAD ciphertext] per
@@ -1298,6 +1287,18 @@ func encryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
 // spliced, reordered or tail-truncated artifact fails. A mismatch is never
 // retried with a weaker (epoch-only) AAD. Damage to the artifact is reported
 // as ErrSnapshotCorrupt.
+//
+// It reads the encrypted snapshot frame format from src, decrypts each
+// frame, and writes the plaintext to dst. The on-disk encrypted format is a
+// sequence of frames: [4-byte LE length][encrypted chunk]... terminated by
+// EOF. Returns the total number of plaintext bytes written.
+//
+// Each frame is decrypted with the epoch EMBEDDED in its own ciphertext header
+// (barrier.Decrypt), not a single snapshot-wide epoch: a snapshot saved across
+// a key rotation contains frames sealed at different epochs, and using one
+// epoch for all of them would fail AEAD authentication on the mismatched
+// frames. Shared by the transport send path (decryptSnapshotForSend) and the
+// ExportSnapshot API so both emit identical plaintext.
 func decryptSnapshotFrames(barrier Barrier, shardID, replicaID, index uint64,
 	src io.Reader, dst io.Writer) (uint64, error) {
 	n, err := engine.OpenSnapshotFrames(barrier, shardID, replicaID, index, src, dst)
@@ -1338,17 +1339,6 @@ func (s *transportSender) notifySnapshotStatus(shardID, localReplicaID, targetRe
 	}
 }
 
-// forEachSnapshotChunk reads the snapshot data file referenced by the
-// InstallSnapshot message and streams transport-level chunks to the
-// provided emit callback one at a time. Only a single chunk's worth of
-// data (snapshotChunkSize = 2MB) is held in memory at any point,
-// preventing OOM on large snapshots (up to DefaultMaxSnapshotSize = 4GB).
-//
-// The emit callback is invoked synchronously for each chunk. If emit
-// returns an error, iteration stops and the error is returned to the
-// caller. This streaming design allows the transport layer to send
-// each chunk over the wire as it is produced, avoiding the O(fileSize)
-// memory overhead of materializing all chunks in a slice.
 // emptySnapshotChunk builds the single metadata-only chunk that represents a
 // snapshot with no data: a witness snapshot (no Filepath) or a data file that
 // is genuinely zero bytes.
@@ -1373,6 +1363,17 @@ func emptySnapshotChunk(msg proto.Message, snap *proto.Snapshot) proto.SnapshotC
 	}
 }
 
+// forEachSnapshotChunk reads the snapshot data file referenced by the
+// InstallSnapshot message and streams transport-level chunks to the
+// provided emit callback one at a time. Only a single chunk's worth of
+// data (snapshotChunkSize = 2MB) is held in memory at any point,
+// preventing OOM on large snapshots (up to DefaultMaxSnapshotSize = 4GB).
+//
+// The emit callback is invoked synchronously for each chunk. If emit
+// returns an error, iteration stops and the error is returned to the
+// caller. This streaming design allows the transport layer to send
+// each chunk over the wire as it is produced, avoiding the O(fileSize)
+// memory overhead of materializing all chunks in a slice.
 func forEachSnapshotChunk(fsys snapshotFS, msg proto.Message, emit func(proto.SnapshotChunk) error) error {
 	snap := &msg.Snapshot
 	filePath := snap.Filepath
@@ -6465,10 +6466,6 @@ func (h *Host) SyncProposeWithSession(ctx context.Context, session *Session, cmd
 	return sm.Result{Value: result.Value, Data: result.Data}, nil
 }
 
-// proposeEntry is the shared proposal pipeline used by Propose,
-// ProposeWithSession, and proposeSession. It handles rate limiting,
-// engine node validation, key generation, pending map registration,
-// delivery, and queue-full cleanup.
 // pendingDeadline returns the deadline to record for a pending request issued
 // under ctx. A context WITHOUT a deadline is clamped to
 // defaultPendingRequestTimeout from now rather than recorded as the zero time,
@@ -6520,6 +6517,10 @@ func nextRequestKey() uint64 {
 	}
 }
 
+// proposeEntry is the shared proposal pipeline used by Propose,
+// ProposeWithSession, and proposeSession. It handles rate limiting,
+// engine node validation, key generation, pending map registration,
+// delivery, and queue-full cleanup.
 func (h *Host) proposeEntry(ctx context.Context, ns *nodeState, shardID uint64, entry proto.Entry, session *Session) (rs *RequestState, err error) {
 	// The caller reserved entry.SeriesID on session (nil for a sessionless
 	// proposal) and this function owns releasing it on failure. Until the
@@ -10795,8 +10796,9 @@ func (h *Host) pendingSweepLoop() {
 // normally (stop channel closed). The interval parameter controls the
 // sweep ticker period.
 func (h *Host) pendingSweepLoopOnce(interval time.Duration) (panicked bool) {
+	normalReturn := false
 	defer func() {
-		if r := recover(); r != nil {
+		if r, abnormal := supervise.ClassifyExit(recover(), normalReturn); abnormal {
 			panicked = true
 			stack := debug.Stack()
 			panicErr := &LoopPanicError{
@@ -10821,6 +10823,7 @@ func (h *Host) pendingSweepLoopOnce(interval time.Duration) (panicked bool) {
 	for {
 		select {
 		case <-h.sweepStopC:
+			normalReturn = true
 			return false
 		case <-ticker.C:
 			h.sweepExpiredPending()
@@ -11004,6 +11007,9 @@ func (h *Host) ShardCount() int {
 //   - "sealed"    if a barrier is configured and sealed (HTTP 503)
 //   - "unhealthy" if no shards are loaded (HTTP 503)
 //   - "degraded"  if any shard has ShardError health (HTTP 503)
+//   - "not-ready" if no shard has ShardError health but a started,
+//     unpaused shard has had no leader for longer than its election
+//     window; NotReadyShards lists them (HTTP 503)
 //   - "ok"        if all shards are healthy (HTTP 200)
 func (h *Host) HealthCheck() *HealthStatus {
 	sealed := h.barrier != nil && h.barrier.IsSealed()
