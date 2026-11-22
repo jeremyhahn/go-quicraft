@@ -82,7 +82,6 @@ func sentinelTable() []sentinelClassification {
 		{"ErrShardFailed", ErrShardFailed, false},
 		{"ErrInvalidConfig", ErrInvalidConfig, false},
 		{"ErrInvalidOperation", ErrInvalidOperation, false},
-		{"ErrDataDirChanged", ErrDataDirChanged, false},
 		{"ErrReleased", ErrReleased, false},
 		{"ErrLogDBWrite", ErrLogDBWrite, false},
 		{"ErrRecoveredTermUnknown", ErrRecoveredTermUnknown, false},

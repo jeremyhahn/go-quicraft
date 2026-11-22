@@ -18,22 +18,22 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 )
 
-// TestDataDirChangedError_IsErrDataDirChanged pins that StartShard's
-// changed-DataDir refusal matches the exported ErrDataDirChanged sentinel,
+// TestDataDirChangedError_IsErrInvalidOperation pins that StartShard's
+// changed-DataDir refusal matches ErrInvalidOperation,
 // directly and through a %w wrap, so a caller need not read its message.
-func TestDataDirChangedError_IsErrDataDirChanged(t *testing.T) {
+func TestDataDirChangedError_IsErrInvalidOperation(t *testing.T) {
 	err := error(&dataDirChangedError{
 		ShardID:   7,
 		ReplicaID: 3,
 		Recorded:  "/data/a",
 		Requested: "/data/b",
 	})
-	if !errors.Is(err, ErrDataDirChanged) {
-		t.Fatalf("errors.Is(%v, ErrDataDirChanged) = false, want true", err)
+	if !errors.Is(err, ErrInvalidOperation) {
+		t.Fatalf("errors.Is(%v, ErrInvalidOperation) = false, want true", err)
 	}
 	wrapped := fmt.Errorf("start shard: %w", err)
-	if !errors.Is(wrapped, ErrDataDirChanged) {
-		t.Fatalf("errors.Is(%v, ErrDataDirChanged) = false, want true", wrapped)
+	if !errors.Is(wrapped, ErrInvalidOperation) {
+		t.Fatalf("errors.Is(%v, ErrInvalidOperation) = false, want true", wrapped)
 	}
 	if errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("errors.Is(%v, ErrInvalidConfig) = true, want false", err)

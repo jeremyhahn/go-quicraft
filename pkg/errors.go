@@ -223,12 +223,6 @@ var (
 	// for the current state, such as proposing to a witness replica.
 	ErrInvalidOperation = errors.New("quicraft: invalid operation")
 
-	// ErrDataDirChanged is matched by errors.Is on the error StartShard
-	// returns when it refuses to start a replica under a DataDir other
-	// than the one its bootstrap record (or, with none, its snapshot
-	// record) states. The error's message names both directories.
-	ErrDataDirChanged = errors.New("quicraft: data directory changed")
-
 	// ErrNotLeader is returned when a proposal or read-index request
 	// targets a node that is not the current leader.
 	ErrNotLeader = errors.New("quicraft: not leader")

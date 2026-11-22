@@ -51,10 +51,10 @@ func (e *dataDirChangedError) Error() string {
 		e.ShardID, e.ReplicaID, e.Recorded, e.Requested)
 }
 
-// Is reports whether target is ErrDataDirChanged, so a caller can match
-// StartShard's changed-DataDir refusal with errors.Is.
+// Is reports whether target is ErrInvalidOperation, so a caller matches
+// StartShard's changed-DataDir refusal with errors.Is as an invalid operation.
 func (e *dataDirChangedError) Is(target error) bool {
-	return target == ErrDataDirChanged
+	return target == ErrInvalidOperation
 }
 
 // refuseDataDirChange returns *dataDirChangedError when the replica's
