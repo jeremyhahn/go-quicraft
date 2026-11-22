@@ -10190,6 +10190,11 @@ func (h *Host) Close() error {
 			ns.openStopOnce.Do(func() { close(ns.openStopper) })
 			h.failPendingRequests(ns, ErrClosed)
 			stoppedNodes = append(stoppedNodes, ns)
+			// Mark the shard closing before its nodeState leaves nodes, as
+			// teardownShard does: a RemoveData admitted before h.closed was
+			// set keeps refusing the replica until its state machine has
+			// closed below (see closingShards).
+			h.closingShards.Store(shardID, ns)
 			h.nodes.Delete(shardID)
 			h.anchors.Delete(shardID)
 			h.activeNodes.Add(-1)
@@ -10234,6 +10239,8 @@ func (h *Host) Close() error {
 				// the SM is closed exactly once — nil-ing added nothing but
 				// the race. Readers gate on ns.stopped (set in sweep 1).
 			}
+			// The state machine has closed: RemoveData may now proceed.
+			h.closingShards.CompareAndDelete(ns.shardID, ns)
 		}
 
 		// Join every admitted RemoveData before the LogDB it retires replicas
