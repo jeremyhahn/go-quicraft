@@ -1163,6 +1163,8 @@ jobs:
                       return ref
                   if p in ("github.ref_name", "github.ref_type"):
                       return U
+                  if ev in PR and p in ("github.head_ref", "github.base_ref"):
+                      return U  # any pull request: its branch names are not known
                   ref = "refs/heads/other"  # the rest does not depend on the ref
               name = ref.split("/", 2)[-1]
               known = {"github.event_name": ev, "github.ref": ref, "github.event.ref": ref,
