@@ -227,3 +227,93 @@ func TestRemoveData_RefusedWhileHostCloseClosesStateMachine(t *testing.T) {
 		t.Fatal("closing marker left behind after Host.Close returned")
 	}
 }
+
+// TestRemoveData_ReplacementStartKeepsClosingFence: while StopShard is still
+// closing a replica's state machine, after its nodeState has left the node
+// map, a replacement start of the same shard is refused transiently. Were it
+// admitted, stopping it would overwrite and then clear the shard's closing
+// marker, and RemoveData of the first replica would delete its snapshots while
+// its Close still ran. The test drives that sequence and checks both: the
+// start is refused, and RemoveData of the first replica stays refused.
+func TestRemoveData_ReplacementStartKeepsClosingFence(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithLogDB(memdb.New()), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer func() { _ = h.Close() }()
+
+	sm := &closeBlockingSM{entered: make(chan struct{}), release: make(chan struct{})}
+	released := false
+	defer func() {
+		if !released {
+			close(sm.release)
+		}
+	}()
+	create := func(_, _ uint64) interface{} { return sm }
+	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
+		create, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard: %v", err)
+	}
+	snapDir, _, err := h.removeDataSnapshotDir(1, 1)
+	if err != nil {
+		t.Fatalf("removeDataSnapshotDir: %v", err)
+	}
+	marker := filepath.Join(snapDir, "snapshot-kept")
+	if err := os.MkdirAll(marker, 0o750); err != nil {
+		t.Fatalf("create snapshot directory: %v", err)
+	}
+
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- h.StopShard(1) }()
+	select {
+	case <-sm.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("StopShard did not reach the state machine's Close")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, loaded := h.nodes.Load(uint64(1)); !loaded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stopping shard still in the node map while Close runs")
+		}
+		runtime.Gosched()
+	}
+
+	replacement := func(_, _ uint64) interface{} { return &mockStateMachine{} }
+	startErr := h.StartShard(map[uint64]string{2: "127.0.0.1:5000"}, false,
+		replacement, testShardConfig(1, 2))
+	if startErr == nil {
+		// The replacement was admitted: stop it, as the defect needs, so the
+		// fence check below shows what that admission cost.
+		if err := h.StopShard(1); err != nil {
+			t.Fatalf("StopShard of the replacement: %v", err)
+		}
+	}
+	if err := h.RemoveData(1, 1); !errors.Is(err, ErrShardNotStopped) {
+		t.Errorf("RemoveData of the first replica after a replacement start = %v, want ErrShardNotStopped", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("snapshot directory removed while the first state machine was closing: %v", err)
+	}
+	if !errors.Is(startErr, ErrShardNotReady) {
+		t.Errorf("replacement StartShard while the first Close runs = %v, want ErrShardNotReady", startErr)
+	}
+
+	released = true
+	close(sm.release)
+	select {
+	case err := <-stopErr:
+		if err != nil {
+			t.Fatalf("StopShard: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("StopShard did not return after Close was released")
+	}
+	if err := h.StartShard(map[uint64]string{2: "127.0.0.1:5000"}, false,
+		replacement, testShardConfig(1, 2)); err != nil {
+		t.Fatalf("replacement StartShard after the stop finished: %v", err)
+	}
+}
