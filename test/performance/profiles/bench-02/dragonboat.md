@@ -1,4 +1,4 @@
-# QuicRaft vs Dragonboat — `omega` profile
+# QuicRaft vs Dragonboat — `bench-02` profile
 
 > **Generated file.** `perfcompare generate` deletes and rewrites this
 > document from `results/*.json`; edits made here are lost on the next
@@ -7,21 +7,21 @@
 
 | | |
 |---|---|
-| Profile | `omega` |
+| Profile | `bench-02` |
 | Hardware | Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz, 1 socket(s), 20 threads, 62.5 GiB, Linux Mint 22.1 (Xia), kernel 6.8.0-58-generic |
 | Specs captured | 2026-08-17T16:30:11Z |
 | QuicRaft run | 2026-08-17T10:02:39Z (version 0.0.0) |
 | Dragonboat run | 2026-08-17T10:35:03Z (version v4.0.0) |
-| Document generated | 2026-08-17 16:32:35 UTC |
+| Document generated | 2026-11-22 12:58:29 UTC |
 
 Numbers below were measured on this profile's machine only. Nothing here is
 comparable with a number from another profile; do not compute a ratio across two.
 
 ## Coverage on this profile
 
-This document compares quicraft against dragonboat. Systems measured on `omega`: quicraft, dragonboat, openraft.
+This document compares quicraft against dragonboat. Systems measured on `bench-02`: quicraft, dragonboat, openraft.
 
-**Not yet measured on `omega`: etcd.** No results file exists for it,
+**Not yet measured on `bench-02`: etcd.** No results file exists for it,
 so no document was generated for it. This is a gap in the data, not a result.
 
 ## Machine
@@ -30,8 +30,8 @@ Captured on the target at run time by `capture-env.sh`; never hand-edited.
 
 | Component | Value |
 |---|---|
-| Profile | omega |
-| Hostname | omega |
+| Profile | bench-02 |
+| Hostname | bench-02 |
 | CPU | Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz |
 | Sockets | 1 |
 | Physical cores | 10 |

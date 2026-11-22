@@ -15,8 +15,8 @@ to put a result, and no command will invent a profile for you.
 
 | Profile | Machine | State |
 |---|---|---|
-| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-10-04, all four systems | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
-| [`profiles/omega`](profiles/omega/) | Single-socket desktop-grade box | Measured 2026-08-17, etcd not measured | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
+| [`profiles/bench-01`](profiles/bench-01/) | Dual-socket server (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-10-04, all four systems |
+| [`profiles/bench-02`](profiles/bench-02/) | Single-socket desktop | Measured 2026-08-17, etcd not measured |
 | [`profiles/r640`](profiles/r640/) | Dual-socket server-grade box | Baseline of 2026-03-18, preserved as rendered tables |
 
 Each profile's hardware is recorded in its own `env.json`, captured on that
@@ -54,6 +54,21 @@ nothing can derive it. Everything else about the machine is captured by
 `capture-env.sh` on the target at run time, so the specification table beside
 a number cannot go stale or be hand-edited. A field the capture could not
 obtain is recorded empty and renders as **not captured**, never as a zero.
+
+Two fields are inputs rather than captures, because a machine's own name does
+not belong in a published profile and `capture-env.sh` never records it:
+
+| Variable | Recorded as | Default |
+|---|---|---|
+| `PERF_HOST_LABEL` | `hostname` | The profile name |
+| `PERF_HARDWARE_CLASS` | `hardware_class`, e.g. `dual-socket server` | Empty |
+
+```bash
+make perf-env PERF_PROFILE=<name> PERF_HARDWARE_CLASS="single-socket desktop"
+```
+
+`make perf-env` passes both to the capture, locally or over ssh with
+`PERF_HOST`. The `perf-remote` pipeline records the defaults.
 
 ## Running on this machine
 
@@ -97,7 +112,7 @@ run that rewrote its siblings. So:
   generated document is gone on the next run.
 - A system with no results gets **no document**, not a document of `N/A` rows.
   A file full of `N/A` is indistinguishable at a glance from a real result of
-  zero. `omega` currently has no `etcd.md` for exactly this reason, and both <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
+  zero. `bench-02` currently has no `etcd.md` for exactly this reason, and both
   documents it does have say so on their face.
 
 Generation refuses to run at all if any system it was asked to cover has no

@@ -5,14 +5,16 @@
 # the specification table beside a benchmark number describes the machine that
 # produced it, at the time it produced it.
 #
-# The profile name is the one thing not derived; the operator chooses it.
+# The profile name, the host label and the hardware class are not derived;
+# the operator chooses them. The machine's own hostname is never recorded.
 #
 # Anything this script cannot obtain is emitted as an empty string, never a
 # guess or a zero. Consumers render an empty field as "not captured", so an
 # uncaptured core count is distinct from a real zero.
 #
 # Usage:
-#   ./capture-env.sh <profile-name> > env.json
+#   [PERF_HOST_LABEL=<label>] [PERF_HARDWARE_CLASS=<class>] \
+#     ./capture-env.sh <profile-name> > env.json
 set -uo pipefail
 
 if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
@@ -75,7 +77,13 @@ if [ -r /etc/os-release ]; then
 fi
 
 kernel="$(try uname -r)"
-hostname="$(try uname -n)"
+
+# The host label and the hardware class are inputs, never read from the
+# machine: a machine's own name does not belong in a published profile.
+# PERF_HOST_LABEL defaults to the profile name; PERF_HARDWARE_CLASS (for
+# example "dual-socket server") defaults to empty.
+host_label="${PERF_HOST_LABEL:-$PROFILE}"
+hardware_class="${PERF_HARDWARE_CLASS:-}"
 
 docker_version="$(try docker version --format '{{.Server.Version}}')"
 if [ -z "$docker_version" ]; then
@@ -96,7 +104,8 @@ captured_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo '{'
   emit profile        "$PROFILE";        echo ','
   emit captured_at    "$captured_at";    echo ','
-  emit hostname       "$hostname";       echo ','
+  emit hostname       "$host_label";     echo ','
+  emit hardware_class "$hardware_class"; echo ','
   emit cpu_model      "$cpu_model";      echo ','
   emit sockets        "$sockets";        echo ','
   emit physical_cores "$physical_cores"; echo ','

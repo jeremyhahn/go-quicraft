@@ -1,7 +1,7 @@
 # quicraft benchmark run
 # generated:     2026-08-04T19:32:33Z
 # mode:          baseline
-# run-host:      omega  (PERF_HOST=user@bench-host.example)
+# run-host:      bench-02  (PERF_HOST=user@bench-host.example)
 # cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
 # cpu-count:     20
 # governor:      powersave
@@ -17,7 +17,7 @@
 #
 # Raw samples follow in Go benchmark format. Diff a future run against
 # this file with:
-#   benchstat test/performance/baselines/omega-64bc288-hotpath.txt build/bench-compare/<run>/current.txt
+#   benchstat test/performance/baselines/bench-02-64bc288-hotpath.txt build/bench-compare/<run>/current.txt
 #
 goos: linux
 goarch: amd64
