@@ -1094,11 +1094,24 @@ jobs:
               def __str__(self):
                   return "any other ref"
 
+              # For pull_request it is any refs/pull/<n>/merge.
+              def pr(self):
+                  return self.ev.lower() == "pull_request"
+
               def differs(self, s):  # s is provably not this ref
-                  return isinstance(s, str) and allowed(self.ev, s)
+                  if not isinstance(s, str):
+                      return False
+                  if self.pr():
+                      return not re.fullmatch(r"refs/pull/[^/]+/merge", s.lower())
+                  return allowed(self.ev, s)
 
               def never_starts(self, s):  # no ref starting with s is this ref
-                  return isinstance(s, str) and self.ev.lower() == "push" and s.lower().startswith("refs/tags/")
+                  if not isinstance(s, str):
+                      return False
+                  s = s.lower()
+                  if self.pr():
+                      return not (s.startswith("refs/pull/") or "refs/pull/".startswith(s))
+                  return self.ev.lower() == "push" and s.startswith("refs/tags/")
 
 
           def unk(v):
@@ -1134,7 +1147,7 @@ jobs:
                   name = v[len("refs/"):].split("/", 1)[-1] if v.lower().startswith("refs/") else v
                   refs += [v] if v.lower().startswith("refs/") else []
                   refs += ["refs/heads/" + name, "refs/tags/" + name, v + "x" if v.endswith("/") else v]
-              out = list(CTX) + [(ev, OtherRef(ev)) for ev in dict.fromkeys(evs) if ev != "pull_request"]
+              out = list(CTX) + [(ev, OtherRef(ev)) for ev in dict.fromkeys(evs)]
               for ev in dict.fromkeys(evs):
                   for ref in dict.fromkeys(refs):
                       # pull_request's ref is always refs/pull/N/merge: sampled in CTX.
