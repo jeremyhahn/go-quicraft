@@ -364,7 +364,7 @@ func runWithStubDocker(t *testing.T, script string, files, env map[string]string
 // config fails without being printed, a public-only image passes, and an
 // image docker cannot read fails.
 func TestCIImageHistoryRejectsPrivateAddresses(t *testing.T) {
-	const public = "/bin/sh -c apk add curl # fetched from 198.51.100.7\n"
+	const public = "/bin/sh -c apk add curl # fetched from 203.0.113.7\n"
 	const publicConfig = `{"Env":["PATH=/usr/bin","SRC=http://203.0.113.9/x"],"Labels":null}`
 	cases := []struct {
 		name, history, config, fail, secret string
