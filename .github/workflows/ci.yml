@@ -1226,7 +1226,26 @@ jobs:
                       s = [tostr(v) for v in a[1:]]
                       if U in s:
                           return U
-                      return re.sub(r"\{(\d+)\}", lambda m: s[int(m.group(1))] if int(m.group(1)) < len(s) else m.group(0), a[0])
+                      # LOCAL (security): GitHub's escaping: {{ and }} are literal braces, {N} is argument N;
+                      # a malformed or out-of-range placeholder is an error there, so it is unknown here
+                      t, out, i = a[0], [], 0
+                      while i < len(t):
+                          c = t[i]
+                          if c in "{}" and t[i + 1:i + 2] == c:
+                              out.append(c)
+                              i += 2
+                          elif c == "{":
+                              m = re.match(r"\{(\d+)\}", t[i:])
+                              if not m or int(m.group(1)) >= len(s):
+                                  return U
+                              out.append(s[int(m.group(1))])
+                              i += m.end()
+                          elif c == "}":
+                              return U
+                          else:
+                              out.append(c)
+                              i += 1
+                      return "".join(out)
                   return U  # success(), failure(), hashFiles(), ...: unknown
 
 
