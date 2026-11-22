@@ -1260,7 +1260,9 @@ jobs:
                       if f == "startswith" and isinstance(a[0], Cls) and isinstance(a[1], str):
                           return a[0].starts(a[1])
                       if f == "contains" and isinstance(a[0], list):
-                          return any(eq(x, a[1]) is True for x in a[0])
+                          # LOCAL (security): an unknown element comparison keeps the result unknown
+                          r = [eq(x, a[1]) for x in a[0]]
+                          return True if any(x is True for x in r) else (U if any(x is U for x in r) else False)
                       # LOCAL (security): operands convert to strings as GitHub does, else unknown
                       x, y = (tostr(s) for s in a)
                       if x is U or y is U:
