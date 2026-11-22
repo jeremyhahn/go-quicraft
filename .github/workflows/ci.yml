@@ -1160,6 +1160,8 @@ jobs:
 
           def ctx_get(ev, ref, path):
               p = path.lower()
+              if p == "github.event.ref" and ev.lower() not in ("push", "workflow_dispatch"):
+                  return U  # LOCAL: other payloads may lack ref or carry another
               if isinstance(ref, OtherRef):  # LOCAL
                   if p in ("github.ref", "github.event.ref"):
                       return ref
