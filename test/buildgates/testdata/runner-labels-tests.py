@@ -483,5 +483,12 @@ case("K3 an event the samples lack, named by the guard, fails (b)",
      {"r.yml": wf("on: [deployment]\n", job(REL, "${{ github.event_name == 'deployment' }}"))}, 1,
      ["r.yml:pub: (b)", "deployment ("])
 
+case("K4 a prefix and a suffix together still leave a non-main branch: (b)",
+     {"r.yml": wf("on: push\n", job(REL, "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/hotfix/') "
+                                         "&& endsWith(github.ref, '/deploy') }}"))}, 1, ["r.yml:pub: (b)", "push (any other ref)"])
+case("K5 a ref_type check alone does not prove a tag push for a dispatch: (b)",
+     {"r.yml": wf("on: [push, workflow_dispatch]\n", job(REL, "${{ github.ref_type == 'tag' }}"))}, 1,
+     ["r.yml:pub: (b)", "workflow_dispatch ("])
+
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
