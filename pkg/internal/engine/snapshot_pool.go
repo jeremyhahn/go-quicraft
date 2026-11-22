@@ -958,14 +958,14 @@ func recordedArtifactExists(rec logdb.Snapshot) bool {
 	return true
 }
 
-// saveSnapshot is saveSnapshotCompacting for callers that need only the
-// index: the tests that drive a save directly. The pool's own path uses the
-// full form so the compaction outcome reaches OnLogCompacted.
 // saveStageHook, when set by a test, runs on the save path just before the
 // save creates its staging parent and staging directory. Tests use it to
 // hold a save at that point while the node unloads.
 var saveStageHook atomic.Pointer[func(*Node)]
 
+// saveSnapshot is saveSnapshotCompacting for callers that need only the
+// index: the tests that drive a save directly. The pool's own path uses the
+// full form so the compaction outcome reaches OnLogCompacted.
 func (p *snapshotPool) saveSnapshot(req snapshotRequest) (uint64, error) {
 	index, _, err := p.saveSnapshotCompacting(req)
 	return index, err

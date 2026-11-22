@@ -7798,8 +7798,9 @@ func (h *Host) RequestLeaderTransfer(ctx context.Context, shardID, targetReplica
 //
 // PauseShard returns nil once none of the shard's log, apply or snapshot
 // work is in flight. If ctx ends first it returns ErrTimeout or ErrCanceled
-// wrapping ctx.Err() (see mapContextError) and the shard STAYS paused: the in-flight work settles on its own, and calling
-// PauseShard again waits for it. Pausing a paused shard is idempotent. A
+// wrapping ctx.Err() (see mapContextError) and the shard STAYS paused: the
+// in-flight work settles on its own, and calling PauseShard again waits for
+// it. Pausing a paused shard is idempotent. A
 // pause is not persisted: a restarted replica starts unpaused. An unknown
 // shard returns ErrShardNotFound; a shard that stops while the pause waits
 // returns ErrClosed.
