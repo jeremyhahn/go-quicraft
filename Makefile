@@ -714,6 +714,11 @@ PERF_PROFILE ?=
 PERF_SYSTEMS ?= all
 # ssh destination for the remote targets, e.g. PERF_HOST=user@bench-host.example.
 PERF_HOST ?=
+# What perf-env records as the profile's host label and hardware class. The
+# machine's own hostname is never recorded; the label defaults to the profile
+# name and the class to empty, e.g. PERF_HARDWARE_CLASS="dual-socket server".
+PERF_HOST_LABEL ?=
+PERF_HARDWARE_CLASS ?=
 
 PROFILE_DIR = profiles/$(PERF_PROFILE)
 
@@ -794,10 +799,12 @@ perf-env:
 	$(REQUIRE_PROFILE)
 	@mkdir -p $(PERF_DIR)/$(PROFILE_DIR)
 	@if [ -n "$(PERF_HOST)" ]; then \
-		ssh -o BatchMode=yes $(PERF_HOST) 'bash -s $(PERF_PROFILE)' \
+		ssh -o BatchMode=yes $(PERF_HOST) \
+			"PERF_HOST_LABEL='$(PERF_HOST_LABEL)' PERF_HARDWARE_CLASS='$(PERF_HARDWARE_CLASS)' bash -s $(PERF_PROFILE)" \
 			< $(PERF_DIR)/capture-env.sh > $(PERF_DIR)/$(PROFILE_DIR)/env.json; \
 	else \
-		$(PERF_DIR)/capture-env.sh $(PERF_PROFILE) > $(PERF_DIR)/$(PROFILE_DIR)/env.json; \
+		PERF_HOST_LABEL='$(PERF_HOST_LABEL)' PERF_HARDWARE_CLASS='$(PERF_HARDWARE_CLASS)' \
+			$(PERF_DIR)/capture-env.sh $(PERF_PROFILE) > $(PERF_DIR)/$(PROFILE_DIR)/env.json; \
 	fi
 	@cat $(PERF_DIR)/$(PROFILE_DIR)/env.json
 
@@ -1909,6 +1916,7 @@ help:
 	@echo "  perf-generate                Generate that profile's documents + charts"
 	@echo "  perf-all                     perf-run then perf-generate"
 	@echo "  perf-env                     Capture a machine's specs into the profile"
+	@echo "    (PERF_HOST_LABEL, default the profile name; PERF_HARDWARE_CLASS)"
 	@echo "  perf-remote                  Stage, capture, run, fetch and generate, on PERF_HOST"
 	@echo "  perf-remote-status           Tail a remote run already in flight"
 	@echo "    Flags: PERF_PROFILE=<profile> PERF_HOST=user@host PERF_SYSTEMS=all"
