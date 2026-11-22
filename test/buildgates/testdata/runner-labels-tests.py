@@ -260,6 +260,13 @@ case("C24 a guard that names every sampled event but one still runs on an unlist
                                          "\"workflow_dispatch\", \"schedule\", \"workflow_run\", \"merge_group\", \"release\", "
                                          "\"create\", \"issue_comment\", \"repository_dispatch\"]'), github.event_name) }}"))}, 1,
      ["r.yml:pub: (b)", "another event"])
+case("C25 contains over a parsed array still runs on a branch the samples do not name",
+     {"r.yml": wf("on: push\n", job(REL, "${{ contains(fromJSON('[\"develop\"]'), github.ref_name) }}"))}, 1,
+     ["r.yml:pub: (b)"])
+case("C26 a create event's github.event.ref is the short name, so it may be develop",
+     {"r.yml": wf("on: [push, create]\n",
+                  job(REL, "github.event_name == 'create' && github.event.ref == 'develop'"))}, 1,
+     ["r.yml:pub: (b)"])
 case("A9 a main-only push guard passes, with unlisted events in the triggers",
      {"r.yml": wf("on: [push, workflow_dispatch, deployment]\n",
                   job(REL, "github.ref == 'refs/heads/main' && github.event_name == 'push'"))}, 0, ["OK:"])
