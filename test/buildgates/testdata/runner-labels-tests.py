@@ -222,6 +222,12 @@ case("C9 two parsed arrays are never the same instance, so != is true on a pull 
      {"ci.yml": wf(PR_ON, job(REL, "${{ fromJSON('[]') != fromJSON('[]') }}"))}, 1, ["ci.yml:pub: (a)"])
 case("C10 two parsed objects are never the same instance, so != is true on a pull request",
      {"ci.yml": wf(PR_ON, job(REL, "${{ fromJSON('{}') != fromJSON('{}') }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C11 relational binds tighter than equality: !(0 == (1 < 2)) is true on a pull request",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ !(0 == 1 < 2) }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C12 a whole number converts to its digits: contains(1, '1.0') is false, so its negation is true",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ !contains(1, '1.0') }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C13 a relational guard is still evaluated: false == (1 < 2) and 1 < 2 == false are false, never runnable",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ false == 1 < 2 }}"), job(REL, "${{ 1 < 2 == false }}", name="pub2"))}, 0, ["OK:"])
 
 # D. hosted first (v1.43)
 ROUTE = ("${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || "
