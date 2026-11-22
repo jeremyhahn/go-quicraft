@@ -1369,14 +1369,16 @@ jobs:
                           return U
                       if f == "contains" and isinstance(a[0], list):
                           return any(eq(x, a[1]) is True for x in a[0])
-                      x, y = (str(s).lower() if s is not None else "" for s in a)
+                      if not all(s is None or isinstance(s, str) for s in a):
+                          return U  # LOCAL: Actions' number and boolean text is not Python's
+                      x, y = ((s or "").lower() for s in a)
                       return x.startswith(y) if f == "startswith" else x.endswith(y) if f == "endswith" else y in x
                   if f == "fromjson" and len(a) == 1 and isinstance(a[0], str):
                       try:
                           return json.loads(a[0])
                       except ValueError:
                           return U
-                  if f == "format" and a and not any(unk(x) for x in a) and isinstance(a[0], str):
+                  if f == "format" and a and all(isinstance(x, str) for x in a):  # LOCAL: strings only
                       return re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1)) + 1]) if int(m.group(1)) + 1 < len(a) else m.group(0), a[0])
                   return U  # success(), failure(), hashFiles(), ...: unknown
 
