@@ -490,5 +490,9 @@ case("K5 a ref_type check alone does not prove a tag push for a dispatch: (b)",
      {"r.yml": wf("on: [push, workflow_dispatch]\n", job(REL, "${{ github.ref_type == 'tag' }}"))}, 1,
      ["r.yml:pub: (b)", "workflow_dispatch ("])
 
+case("K6 a guard naming another pull request's ref fails (a)",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.ref == 'refs/pull/2/merge' }}"))}, 1,
+     ["ci.yml:pub: (a)"])
+
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
