@@ -1080,6 +1080,13 @@ jobs:
           # (vars, needs, secrets, server_url, ...) unknown; the job passes only when
           # the `if` is false in each of them whatever the unknowns hold.
           U = object()  # unknown value
+          # LOCAL: an unknown value known truthy (UT) or falsy (UF): `x || y`
+          # with x unknown and y truthy is truthy, but its value may be x's.
+          UT, UF = object(), object()
+
+
+          def unk(v):
+              return v is U or v is UT or v is UF
           OPEN = "$" "{{"  # split, so the runner does not read it as an expression
           ALLOWED = "push to refs/heads/main or refs/tags/*, or workflow_dispatch on main"
           PR = {"pull_request", "pull_request_target"}
@@ -1134,6 +1141,8 @@ jobs:
           def truthy(v):
               if v is U:
                   return U
+              if v is UT or v is UF:
+                  return v is UT
               if isinstance(v, float) and v != v:
                   return False
               return v not in (None, False, 0, "", 0.0)
@@ -1155,7 +1164,7 @@ jobs:
 
 
           def eq(a, b):
-              if a is U or b is U:
+              if unk(a) or unk(b):
                   return U
               if isinstance(a, str) and isinstance(b, str):
                   return a.lower() == b.lower()
@@ -1195,7 +1204,7 @@ jobs:
                       elif ta is False:
                           a = b
                       else:
-                          a = b if truthy(b) is True else U
+                          a = UT if truthy(b) is True else U  # LOCAL
                   return a
 
               def andx(self):
@@ -1209,7 +1218,7 @@ jobs:
                       elif ta is True:
                           a = b
                       else:
-                          a = b if truthy(b) is False else U
+                          a = UF if truthy(b) is False else U  # LOCAL
                   return a
 
               def cmp(self):
@@ -1222,7 +1231,7 @@ jobs:
                       elif op == "!=":
                           r = eq(a, b)
                           a = U if r is U else not r
-                      elif a is U or b is U:
+                      elif unk(a) or unk(b):
                           a = U
                       else:
                           x, y = (a.lower(), b.lower()) if isinstance(a, str) and isinstance(b, str) else (num(a), num(b))
@@ -1282,7 +1291,7 @@ jobs:
                   if f == "always":
                       return True
                   if f in ("startswith", "endswith", "contains") and len(a) == 2:
-                      if U in a:
+                      if any(unk(x) for x in a):
                           return U
                       if f == "contains" and isinstance(a[0], list):
                           return any(eq(x, a[1]) is True for x in a[0])
@@ -1293,7 +1302,7 @@ jobs:
                           return json.loads(a[0])
                       except ValueError:
                           return U
-                  if f == "format" and a and U not in a and isinstance(a[0], str):
+                  if f == "format" and a and not any(unk(x) for x in a) and isinstance(a[0], str):
                       return re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1)) + 1]) if int(m.group(1)) + 1 < len(a) else m.group(0), a[0])
                   return U  # success(), failure(), hashFiles(), ...: unknown
 
@@ -1437,7 +1446,7 @@ jobs:
 
           def labels(value):
               # A runs-on value's labels: a string, a list, or an expression's result.
-              if value is U or value is None:
+              if unk(value) or value is None:
                   return None
               if isinstance(value, list):
                   return [str(x) for x in value]

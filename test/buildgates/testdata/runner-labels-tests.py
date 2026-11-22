@@ -323,7 +323,8 @@ if PRE_TEXT.count(f"    runs-on: {PRE}   # v1.52\n") != 1:
 case("F1 ci.yml: preflight's runs-on passes, unset and set to the fallback",
      {"ci.yml": wf(PR_ON, job(PRE, name="preflight"))}, 0, ["OK:"])
 case("F2 the same runs-on on another ci.yml job fails (c): the variable is preflight's alone",
-     {"ci.yml": wf(PR_ON, job(PRE, name="lint"))}, 1, ["ci.yml:lint: (c)", "x64, bigdisk"], ["CI_PREFLIGHT_RUNS_ON"])
+     {"ci.yml": wf(PR_ON, job(PRE, name="lint"))}, 1, ["ci.yml:lint: (c)", "an unknown label"],  # LOCAL: the fallback is not
+     ["CI_PREFLIGHT_RUNS_ON"])  # the guaranteed value when the variable is unknown
 case("F3 the same runs-on outside ci.yml fails (c)",
      {"batch.yml": wf(PR_ON, job(PRE, name="preflight"))}, 1, ["batch.yml:preflight: (c)"])
 case("F4 a default to any other self-hosted label fails (c)",
