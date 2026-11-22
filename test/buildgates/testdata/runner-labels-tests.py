@@ -512,6 +512,12 @@ case("K11 format() of a number converts as Actions does, not as Python does: the
 case("K12 a string function given a number is unknown and fails",
      {"ci.yml": wf(PR_ON, job(REL, "${{ endsWith(1, '1') }}"))}, 1,
      ["ci.yml:pub: ("])
+case("K13 format() with escaped braces is unknown and fails",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ format('{{0}}', github.event_name) == '{0}' }}"))}, 1,
+     ["ci.yml:pub: ("])
+case("K14 a numeric string Actions does not parse is unknown and fails",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ '1_0' != 10 }}"))}, 1,
+     ["ci.yml:pub: ("])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
