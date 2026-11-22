@@ -1085,8 +1085,24 @@ jobs:
           UT, UF = object(), object()
 
 
+          class OtherRef:
+              # LOCAL: any ref outside the allow-list for event ev. Only what
+              # holds for every such ref is known; any other ref test is unknown.
+              def __init__(self, ev):
+                  self.ev = ev
+
+              def __str__(self):
+                  return "any other ref"
+
+              def differs(self, s):  # s is provably not this ref
+                  return isinstance(s, str) and allowed(self.ev, s)
+
+              def never_starts(self, s):  # no ref starting with s is this ref
+                  return isinstance(s, str) and self.ev.lower() == "push" and s.lower().startswith("refs/tags/")
+
+
           def unk(v):
-              return v is U or v is UT or v is UF
+              return v is U or v is UT or v is UF or isinstance(v, OtherRef)
           OPEN = "$" "{{"  # split, so the runner does not read it as an expression
           ALLOWED = "push to refs/heads/main or refs/tags/*, or workflow_dispatch on main"
           PR = {"pull_request", "pull_request_target"}
@@ -1118,7 +1134,7 @@ jobs:
                   name = v[len("refs/"):].split("/", 1)[-1] if v.lower().startswith("refs/") else v
                   refs += [v] if v.lower().startswith("refs/") else []
                   refs += ["refs/heads/" + name, "refs/tags/" + name, v + "x" if v.endswith("/") else v]
-              out = list(CTX)
+              out = list(CTX) + [(ev, OtherRef(ev)) for ev in dict.fromkeys(evs) if ev != "pull_request"]
               for ev in dict.fromkeys(evs):
                   for ref in dict.fromkeys(refs):
                       # pull_request's ref is always refs/pull/N/merge: sampled in CTX.
@@ -1129,6 +1145,12 @@ jobs:
 
           def ctx_get(ev, ref, path):
               p = path.lower()
+              if isinstance(ref, OtherRef):  # LOCAL
+                  if p in ("github.ref", "github.event.ref"):
+                      return ref
+                  if p in ("github.ref_name", "github.ref_type"):
+                      return U
+                  ref = "refs/heads/other"  # the rest does not depend on the ref
               name = ref.split("/", 2)[-1]
               known = {"github.event_name": ev, "github.ref": ref, "github.event.ref": ref,
                        "github.ref_name": name,
@@ -1191,6 +1213,10 @@ jobs:
 
 
           def eq(a, b):
+              if isinstance(b, OtherRef):
+                  a, b = b, a
+              if isinstance(a, OtherRef) and not unk(b):
+                  return False if a.differs(b) else U
               if unk(a) or unk(b):
                   return U
               if isinstance(a, str) and isinstance(b, str):
@@ -1318,6 +1344,8 @@ jobs:
                   if f == "always":
                       return True
                   if f in ("startswith", "endswith", "contains") and len(a) == 2:
+                      if f == "startswith" and isinstance(a[0], OtherRef) and a[0].never_starts(a[1]):
+                          return False
                       if any(unk(x) for x in a):
                           return U
                       if f == "contains" and isinstance(a[0], list):
