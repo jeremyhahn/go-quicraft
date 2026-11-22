@@ -1024,8 +1024,9 @@ jobs:
               r, name = ref_cls(ref)
               # A pull request's head and base branches are any branch.
               pr = Cls("") if ev in PR else ""
+              # LOCAL (security): github.event.ref is a payload field (short on create), so it stays unknown
               known = {"github.event_name": Cls("", EVENTS) if ev == OTHER_EV else ev,
-                       "github.ref": r, "github.event.ref": r, "github.ref_name": name,
+                       "github.ref": r, "github.ref_name": name,
                        "github.ref_type": "tag" if ref.startswith("refs/tags/") else "branch",
                        "github.head_ref": pr, "github.base_ref": pr}
               if p in known:
