@@ -1049,6 +1049,24 @@ jobs:
               return float("nan")
 
 
+          # LOCAL (security): a value as a GitHub expression string; U where the form is not certain
+          def tostr(v):
+              if v is U:
+                  return U
+              if v is None:
+                  return ""
+              if isinstance(v, bool):
+                  return "true" if v else "false"
+              if isinstance(v, str):
+                  return v
+              if isinstance(v, (int, float)):
+                  if v != v or v in (float("inf"), float("-inf")) or abs(v) >= 1e15:
+                      return U
+                  if v == int(v) and not (v == 0 and str(v).startswith("-")):
+                      return str(int(v))
+                  return U
+              return U
+
           def eq(a, b):
               if a is U or b is U:
                   return U
@@ -1115,16 +1133,20 @@ jobs:
                   return a
 
               def cmp(self):
+                  # LOCAL (security): equality sits below relational, as in GitHub expressions
+                  a = self.rel()
+                  while self.peek()[0] == "op" and self.peek()[1] in ("==", "!="):
+                      op = self.take()[1]
+                      r = eq(a, self.rel())
+                      a = r if op == "==" or r is U else not r
+                  return a
+
+              def rel(self):
                   a = self.unary()
-                  while self.peek()[0] == "op" and self.peek()[1] in ("==", "!=", "<", "<=", ">", ">="):
+                  while self.peek()[0] == "op" and self.peek()[1] in ("<", "<=", ">", ">="):
                       op = self.take()[1]
                       b = self.unary()
-                      if op == "==":
-                          a = eq(a, b)
-                      elif op == "!=":
-                          r = eq(a, b)
-                          a = U if r is U else not r
-                      elif a is U or b is U:
+                      if a is U or b is U:
                           a = U
                       else:
                           x, y = (a.lower(), b.lower()) if isinstance(a, str) and isinstance(b, str) else (num(a), num(b))
@@ -1188,15 +1210,23 @@ jobs:
                           return U
                       if f == "contains" and isinstance(a[0], list):
                           return any(eq(x, a[1]) is True for x in a[0])
-                      x, y = (str(s).lower() if s is not None else "" for s in a)
+                      # LOCAL (security): operands convert to strings as GitHub does, else unknown
+                      x, y = (tostr(s) for s in a)
+                      if x is U or y is U:
+                          return U
+                      x, y = x.lower(), y.lower()
                       return x.startswith(y) if f == "startswith" else x.endswith(y) if f == "endswith" else y in x
                   if f == "fromjson" and len(a) == 1 and isinstance(a[0], str):
                       try:
                           return json.loads(a[0])
                       except ValueError:
                           return U
+                  # LOCAL (security): format's arguments convert as GitHub does; one it cannot is unknown
                   if f == "format" and a and U not in a and isinstance(a[0], str):
-                      return re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1)) + 1]) if int(m.group(1)) + 1 < len(a) else m.group(0), a[0])
+                      s = [tostr(v) for v in a[1:]]
+                      if U in s:
+                          return U
+                      return re.sub(r"\{(\d+)\}", lambda m: s[int(m.group(1))] if int(m.group(1)) < len(s) else m.group(0), a[0])
                   return U  # success(), failure(), hashFiles(), ...: unknown
 
 
