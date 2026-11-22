@@ -199,7 +199,7 @@ case("B4 pull_request_target with a ref-only guard (its ref is the base branch)"
      ["t.yml:pub: (a) names `release` and a pull_request_target event can run it"])
 case("B5 triggers in a flow mapping",
      {"ci.yml": wf("on: {push: {branches: [main]}, pull_request: {}}\n", job(REL, "github.ref == 'refs/heads/main'"))}, 1,
-     ["ci.yml:pub: (b)"], ["(a)"])  # pull_request's ref is refs/pull/N/merge: only (b)
+     ["ci.yml:pub: (b)", "ci.yml:pub: (a)"])  # LOCAL: K9: a merged pull request runs on refs/heads/main
 
 # C. fails (b)
 case("C1 ref check with no event check: schedule on main runs it; no PR trigger, so no (a)",
@@ -499,6 +499,13 @@ case("K7 a guard naming a pull request's head branch fails (a)",
 case("K8 a guard naming a pull request's base branch fails (a)",
      {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.base_ref == 'release' }}"))}, 1,
      ["ci.yml:pub: (a)"])
+case("K9 a closed pull request's guard naming its base branch ref fails (a): a merged pull request runs on that ref",
+     {"ci.yml": wf("on:\n  pull_request:\n    types: [closed]\n",
+                   job(REL, "${{ github.event_name == 'pull_request' && github.ref == 'refs/heads/main' }}"))}, 1,
+     ["ci.yml:pub: (a)"])
+case("K10 arrays compare by identity, so two decoded arrays are never equal: the guard is unknown and fails",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ fromJSON('[]') != fromJSON('[]') }}"))}, 1,
+     ["ci.yml:pub: ("])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
