@@ -283,7 +283,7 @@ case("D23 a label that only contains codex is not the review label",
 case("D24 codex named in the reason text only is not the label",
      {"ci.yml": wf(PR_ON, job("[self-hosted, bigdisk]  # self-hosted: oversize: shares the codex host disk", name="c"))}, 0, [], ["(f)"])
 case("D14 a space before the category colon passes",
-     {"ci.yml": wf(PR_ON, job("[self-hosted, gpu-host]  # self-hosted: hardware : the GPU", name="gpu"))}, 0)
+     {"ci.yml": wf(PR_ON, job("[self-hosted, gpu-pool]  # self-hosted: hardware : the GPU", name="gpu"))}, 0)  # LOCAL: a pool label, not a host name
 case("D10 a release job is the release rule's, not (c)'s",
      {"release.yml": wf("on:\n  push:\n    tags: ['v*']\n",
                         job(REL, "startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'"))}, 0, [], ["(c)"])
