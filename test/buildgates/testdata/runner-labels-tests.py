@@ -165,7 +165,7 @@ case("A3 workflow_dispatch on main",
 case("A4 push-or-dispatch guard folded over lines, beside a PR trigger",
      {"ci.yml": wf(PR_ON, job(REL, ">-\n      ${{ (github.event_name == 'push' &&\n"
                                    "      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')))\n"
-                                   "      || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') }}"),
+                                   "      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}"),
                    job("ubuntu-latest", name="test"))}, 0)
 case("A5 runs-on mapping form, guarded, with RELEASE_RUNNER",
      {"ci.yml": wf(PR_ON, "  pub:\n    runs-on:\n      group: rel\n      labels: [self-hosted, release]\n"
@@ -266,6 +266,16 @@ case("C25 contains over a parsed array still runs on a branch the samples do not
 case("C26 a create event's github.event.ref is the short name, so it may be develop",
      {"r.yml": wf("on: [push, create]\n",
                   job(REL, "github.event_name == 'create' && github.event.ref == 'develop'"))}, 1,
+     ["r.yml:pub: (b)"])
+case("C27 runner labels are case-insensitive: a waived RELEASE scalar in a PR workflow is still release",
+     {"aux.yml": wf(PR_ON, job("RELEASE  # self-hosted: hardware: dedicated host"))}, 1,
+     ["aux.yml:pub: (a)"])
+case("C28 a mixed-case release label in a list is still release",
+     {"aux.yml": wf(PR_ON, job("[self-hosted, linux, x64, Release]  # self-hosted: hardware: dedicated host"))}, 1,
+     ["aux.yml:pub: (a)"])
+case("C29 a tag may be named main, so ref_name == 'main' on a dispatch does not prove the main branch",
+     {"r.yml": wf("on: [workflow_dispatch]\n",
+                  job(REL, "github.event_name == 'workflow_dispatch' && github.ref_name == 'main'"))}, 1,
      ["r.yml:pub: (b)"])
 case("A9 a main-only push guard passes, with unlisted events in the triggers",
      {"r.yml": wf("on: [push, workflow_dispatch, deployment]\n",

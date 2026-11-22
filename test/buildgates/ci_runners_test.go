@@ -338,6 +338,8 @@ func TestRunnerProblems(t *testing.T) {
 		{"a credential waiver with an empty reason", cr("review", "codex  "+selfHostedWaiver+"credential:"), "credential: waiver with an empty reason"},
 		{"a waiver on a hosted line", cr("scope", hostedRunner+"  "+selfHostedWaiver+"hardware: none"), "runs on ubuntu-latest but carries a self-hosted waiver"},
 		{"a ci.yml job sent to a self-hosted label", ci("coverage", "bigdisk"), "ci.yml job coverage runs on \"bigdisk\"; every ci.yml job"},
+		{"a waived upper-case release label", cr("scope", "RELEASE  "+selfHostedWaiver+"hardware: dedicated host"), "job scope runs on the release label"},
+		{"a waived mixed-case release label", cr("scope", "Release  "+selfHostedWaiver+"hardware: dedicated host"), "job scope runs on the release label"},
 		{"a waived ci.yml job", ci("coverage", "bigdisk  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), "ci.yml job coverage carries a self-hosted waiver"},
 		{"a ci.yml expression", ci("coverage", expr), "ci.yml job coverage runs on an expression"},
 		{"preflight's pool expression on another job", ci("coverage", preflightRunsOn), "ci.yml job coverage runs on an expression"},
