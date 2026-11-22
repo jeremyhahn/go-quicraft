@@ -1222,10 +1222,17 @@ jobs:
               if isinstance(v, (int, float)):
                   return float(v)
               if isinstance(v, str):
-                  try:
-                      return float(v.strip() or 0)
-                  except ValueError:
-                      return float("nan")
+                  t = v.strip()
+                  if not t:
+                      return 0.0
+                  # LOCAL: only plain decimals are known; Actions parses other
+                  # forms (hex, ...) its own way, and Python accepts '1_0'.
+                  if re.fullmatch(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", t):
+                      return float(t)
+                  w = t.lstrip("+-").lower()
+                  if re.fullmatch(r"[0-9a-z._]+", w) and (re.search(r"\d", w) or w in ("inf", "infinity", "nan")):
+                      return None  # number-like but not a plain decimal: unknown
+                  return float("nan")
               return float("nan")
 
 
@@ -1242,7 +1249,8 @@ jobs:
                   return a.lower() == b.lower()
               if type(a) is type(b) and not isinstance(a, (int, float)):
                   return a == b
-              return num(a) == num(b)
+              x, y = num(a), num(b)
+              return U if x is None or y is None else x == y
 
 
           class P:
@@ -1307,7 +1315,7 @@ jobs:
                           a = U
                       else:
                           x, y = (a.lower(), b.lower()) if isinstance(a, str) and isinstance(b, str) else (num(a), num(b))
-                          a = {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+                          a = U if x is None or y is None else {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
                   return a
 
               def unary(self):
@@ -1378,7 +1386,7 @@ jobs:
                           return json.loads(a[0])
                       except ValueError:
                           return U
-                  if f == "format" and a and all(isinstance(x, str) for x in a):  # LOCAL: strings only
+                  if f == "format" and a and all(isinstance(x, str) for x in a) and "{{" not in a[0] and "}}" not in a[0]:  # LOCAL: strings only, no escaped braces
                       return re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1)) + 1]) if int(m.group(1)) + 1 < len(a) else m.group(0), a[0])
                   return U  # success(), failure(), hashFiles(), ...: unknown
 
