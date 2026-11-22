@@ -59,6 +59,13 @@ var credentialJob = struct{ file, job string }{"code-review.yml", "review"}
 // hostedOnlyWorkflows are the workflows in which no job is waived.
 var hostedOnlyWorkflows = []string{"ci.yml", "release.yml"}
 
+// codeReviewTemplateRunsOn lists the runs-on expressions the code-review
+// template carries as written; any other expression is a problem.
+var codeReviewTemplateRunsOn = []string{
+	`${{ github.server_url == 'https://github.com' && 'ubuntu-latest' || 'bigdisk' }}`,
+	`${{ github.server_url == 'https://github.com' && (github.event.pull_request.head.repo.full_name == github.repository && fromJSON('["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest') || 'bigdisk' }}`,
+}
+
 // workflowJob is one job of a workflow and its runs-on node.
 type workflowJob struct {
 	name   string
@@ -142,6 +149,11 @@ func runnerProblems(file string, body []byte) []string {
 				problems = append(problems, where+" "+p)
 			}
 		case file == "ci.yml" && j.name == "preflight" && j.runsOn.Value == preflightRunsOn:
+			continue
+		case file == "code-review.yml" && slices.Contains(codeReviewTemplateRunsOn, j.runsOn.Value) && !hasWaiver(j.runsOn.LineComment):
+			// The template's server-conditional expressions: the hosted image on
+			// github.com (the pool only for a same-repository head under a pull
+			// request event, which the Runner labels step checks), bigdisk off it.
 			continue
 		case strings.Contains(j.runsOn.Value, "${{"):
 			problems = append(problems, where+" runs on an expression, which can pick a self-hosted label: "+strconv.Quote(j.runsOn.Value))
@@ -329,7 +341,8 @@ func TestRunnerProblems(t *testing.T) {
 	}{
 		{"a job sent to a self-hosted label", cr("scope", "bigdisk"), "job scope runs on \"bigdisk\" and carries no"},
 		{"a job sent to a label list", cr("scope", "[self-hosted, linux, x64, bigdisk]"), "job scope runs on a label list"},
-		{"the server-conditional expression put back", cr("gate", expr), "job gate runs on an expression"},
+		{"an expression the template does not carry", cr("gate", `${{ github.server_url == 'https://github.com' && 'bigdisk' || 'ubuntu-latest' }}`), "job gate runs on an expression"},
+		{"the template's expression is allowed", cr("scope", expr), ""},
 		{"an expression with a waiver", cr("gate", expr+"  "+selfHostedWaiver+"oversize: big"), "job gate runs on an expression"},
 		{"a bare waiver", cr("scope", "bigdisk  # self-hosted:"), "names no category"},
 		{"a waiver with no category", cr("scope", "bigdisk  "+selfHostedWaiver+"needs a big disk"), "names no category"},
