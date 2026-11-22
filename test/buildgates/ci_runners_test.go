@@ -45,6 +45,7 @@ import (
 // security divergence) for a pull request from a fork.
 const (
 	hostedRunner     = "ubuntu-latest"
+	releaseLabel     = "release"
 	selfHostedWaiver = "# self-hosted: "
 	preflightRunsOn  = `${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
 )
@@ -114,8 +115,6 @@ func waiverProblem(comment string, credentialOK bool) string {
 	return ""
 }
 
-// namesReleaseLabel reports whether a runs-on value names the release
-// runner, as a plain label or a quoted label in an expression.
 // runnerProblems lists every job of the workflow file (its base name) whose
 // runs-on breaks the hosted-first rule, given the workflow's text.
 func runnerProblems(file string, body []byte) []string {
@@ -150,6 +149,9 @@ func runnerProblems(file string, body []byte) []string {
 			if hasWaiver(j.runsOn.LineComment) {
 				problems = append(problems, where+" runs on "+hostedRunner+" but carries a self-hosted waiver")
 			}
+		case strings.EqualFold(strings.TrimSpace(j.runsOn.Value), releaseLabel):
+			// Runner labels match case-insensitively; a waiver never sends a job to the release runner.
+			problems = append(problems, where+" runs on the release label ("+strconv.Quote(j.runsOn.Value)+"); no waiver puts a job on it")
 		case hostedOnly:
 			problems = append(problems, where+" runs on "+strconv.Quote(j.runsOn.Value)+"; every "+file+" job runs on "+hostedRunner)
 		default:

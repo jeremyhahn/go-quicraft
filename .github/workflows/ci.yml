@@ -1495,7 +1495,8 @@ jobs:
 
 
           def names_release(text):
-              return re.search(r"(?<![\w.-])['\"]?release['\"]?(?![\w-])", text) is not None
+              # LOCAL (security): runner labels match case-insensitively, so RELEASE and Release are the release label
+              return re.search(r"(?<![\w.-])['\"]?release['\"]?(?![\w-])", text, re.I) is not None
 
 
           def condition(text):
