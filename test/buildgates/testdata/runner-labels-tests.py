@@ -506,6 +506,12 @@ case("K9 a closed pull request's guard naming its base branch ref fails (a): a m
 case("K10 arrays compare by identity, so two decoded arrays are never equal: the guard is unknown and fails",
      {"ci.yml": wf(PR_ON, job(REL, "${{ fromJSON('[]') != fromJSON('[]') }}"))}, 1,
      ["ci.yml:pub: ("])
+case("K11 format() of a number converts as Actions does, not as Python does: the guard is unknown and fails",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ format('{0}', 1) == '1' }}"))}, 1,
+     ["ci.yml:pub: ("])
+case("K12 a string function given a number is unknown and fails",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ endsWith(1, '1') }}"))}, 1,
+     ["ci.yml:pub: ("])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
