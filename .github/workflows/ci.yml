@@ -1094,7 +1094,8 @@ jobs:
               def __str__(self):
                   return "any other ref"
 
-              # For pull_request it is any refs/pull/<n>/merge.
+              # For pull_request it is any refs/pull/<n>/merge, or any branch
+              # ref: a closed (merged) pull request runs on its base branch.
               def pr(self):
                   return self.ev.lower() == "pull_request"
 
@@ -1102,7 +1103,8 @@ jobs:
                   if not isinstance(s, str):
                       return False
                   if self.pr():
-                      return not re.fullmatch(r"refs/pull/[^/]+/merge", s.lower())
+                      s = s.lower()
+                      return not (re.fullmatch(r"refs/pull/[^/]+/merge", s) or s.startswith("refs/heads/"))
                   return allowed(self.ev, s)
 
               def never_starts(self, s):  # no ref starting with s is this ref
@@ -1110,7 +1112,7 @@ jobs:
                       return False
                   s = s.lower()
                   if self.pr():
-                      return not (s.startswith("refs/pull/") or "refs/pull/".startswith(s))
+                      return not any(s.startswith(f) or f.startswith(s) for f in ("refs/pull/", "refs/heads/"))
                   return self.ev.lower() == "push" and s.startswith("refs/tags/")
 
 
@@ -1234,6 +1236,8 @@ jobs:
                   return False if a.differs(b) else U
               if unk(a) or unk(b):
                   return U
+              if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
+                  return U  # LOCAL: arrays and objects compare by identity
               if isinstance(a, str) and isinstance(b, str):
                   return a.lower() == b.lower()
               if type(a) is type(b) and not isinstance(a, (int, float)):
