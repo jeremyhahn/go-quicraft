@@ -518,6 +518,12 @@ case("K13 format() with escaped braces is unknown and fails",
 case("K14 a numeric string Actions does not parse is unknown and fails",
      {"ci.yml": wf(PR_ON, job(REL, "${{ '1_0' != 10 }}"))}, 1,
      ["ci.yml:pub: ("])
+case("K15 a pull_request payload has no ref: a guard on its absence fails (a)",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && !github.event.ref }}"))}, 1,
+     ["ci.yml:pub: (a)"])
+case("K16 a pull_request_target payload has no ref: a guard on its absence fails (a)",
+     {"ci.yml": wf("on: pull_request_target\n", job(REL, "${{ github.event_name == 'pull_request_target' && !github.event.ref }}"))}, 1,
+     ["ci.yml:pub: (a)"])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
