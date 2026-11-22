@@ -1010,10 +1010,12 @@ jobs:
 
           def ref_cls(ref):
               # (ref, ref_name) for the class a sampled ref stands for; refs/heads/main is itself.
-              # A tag named main is assumed not to exist, so ref_name 'main' is a branch.
               if ref == "refs/heads/main":
                   return ref, "main"
-              for p in ("refs/heads/gh-readonly-queue/", "refs/pull/", "refs/tags/"):
+              if ref.startswith("refs/tags/"):
+                  # LOCAL (security): Git permits a tag named main, so a tag's ref_name may be main; only github.ref proves the branch
+                  return Cls("refs/tags/"), Cls("")
+              for p in ("refs/heads/gh-readonly-queue/", "refs/pull/"):
                   if ref.startswith(p):
                       return Cls(p), Cls("", ["main"])
               return Cls("refs/heads/", ["refs/heads/main"]), Cls("", ["main"])
