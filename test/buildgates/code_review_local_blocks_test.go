@@ -9,7 +9,7 @@ import (
 
 // codeReviewTemplateHeader is the first line of the code-review template this
 // repository carries as written.
-const codeReviewTemplateHeader = "# code-review-template: v5.12.12 "
+const codeReviewTemplateHeader = "# code-review-template: v5.13.0 "
 
 // TestCodeReview_AdoptedAsWritten checks that .github/workflows/code-review.yml
 // is the code-review template as written: its header names the template

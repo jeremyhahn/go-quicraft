@@ -207,7 +207,7 @@ func runGateTwin(t *testing.T, s gateTwinScript, c gateTwinCase) (int, string) {
 func TestCodeReviewGateTwin(t *testing.T) {
 	s := extractGateTwin(t)
 	for _, c := range []gateTwinCase{
-		// The template (v5.12.12): a twin reviewing the head fails the gate
+		// The template (v5.13.0): a twin reviewing the head fails the gate
 		// closed, naming the twin, approval or not; with no twin an approved
 		// head passes.
 		{name: "approved head, queued twin", twinState: "queued", verdict: "APPROVED"},

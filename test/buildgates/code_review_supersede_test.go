@@ -262,7 +262,7 @@ func reviewTitle(pr, base, sha string) string {
 
 var supersedeStatuses = []string{"queued", "in_progress", "waiting", "pending", "requested"}
 
-// supersedeList is the first page of a status's run list (v5.12.12 reads
+// supersedeList is the first page of a status's run list (v5.13.0 reads
 // page after page; a page with fewer than 100 runs is the last).
 func supersedeList(st string) string {
 	return "GET /actions/workflows/" + stepWorkflow + "/runs?event=pull_request_target&status=" + st + "&per_page=100&page=1"

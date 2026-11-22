@@ -1,4 +1,4 @@
-# code-review-template: v5.12.12 -- the code review in Gitea or GitHub CI for a pull request
+# code-review-template: v5.13.0 -- the code review in Gitea or GitHub CI for a pull request
 # that carries `code-review` and `task:ready`, routed by its labels through
 # route-labels (labels.md §2). Codex on the `codex` runner reviews every such
 # PR; `agent:opencode` adds an advisory COMMENT review by the opencode job on
@@ -8,8 +8,12 @@
 # workflow, not the model, turns them into a review posted as the `codex` Gitea
 # user and pinned to the head commit:
 #
-#   any P0 or P1          -> REQUEST_CHANGES, listing the findings
-#   only P2/P3, or none   -> APPROVED, listing any P2/P3 as advisory
+#   any P0 or P1 on a     -> REQUEST_CHANGES, listing the findings
+#   changed line (v5.13.0)
+#   otherwise             -> APPROVED, listing P2/P3 on changed lines as
+#                            advisory (five at most, then a count) and
+#                            filing every finding on other lines in one
+#                            follow-up issue (v5.13.0)
 #   anything else         -> one issue comment marked
 #                            <!-- codex-review:error head=<sha> -->, no review,
 #                            and the job fails
@@ -28,6 +32,26 @@
 #   COORDINATOR_TURNS         the codex rounds the project coordinator has
 #                             on a `needs-coordinator` PR after the two-round
 #                             stop (v5.9.8, Tenant Agent m2185); default 3
+#   REVIEW.md                 optional, at the repository root: the review
+#                             passes (v5.13.0); copy the handbook's
+#                             software/templates/REVIEW.md. Read from the
+#                             base, never the PR head
+#   label review-followup     the label of the follow-up issue (v5.13.0)
+#
+# v5.13.0 (2026-11-22, Tenant Agent ruling 1142 (A)): THE IN-HUNK GATE.
+# Codex posts REQUEST_CHANGES only for a P0 or P1 finding whose file and line
+# fall inside the PR's changed hunks: the new-side ranges of the `@@ -a,b
+# +c,d @@` headers of `git diff -U0 -M` from the merge base to the head. A
+# P2 or P3 inside them is advisory; five advisory findings are posted, the
+# rest as a count. A finding of any priority outside them goes to ONE
+# follow-up issue per PR, found by the marker <!-- codex-review:followup
+# pr=<n> --> in its body and rewritten each round, labelled review-followup
+# and the PR's priority:* label, in the PR's milestone, filed with the same
+# reviewer token as the review; it never blocks the PR. Failing safe, a
+# finding with no file, on a deleted, renamed-away or binary file, or at
+# line 0 of a changed file is inside. The review passes are the base's
+# REVIEW.md when present, else bugs, security, and SPEC and plan
+# compliance. testdata/code-review-v5130-tests.py.
 #
 # v5.12.12 also (Codex's P1 on go-trusted-platform #2227 at c6c70f34): A
 # CANCELLED REVIEW IS NO REVIEW. The gate rejected an earlier approval only
@@ -2906,6 +2930,26 @@ jobs:
           files=$(as_codex git diff --name-only "$base" HEAD) || die "cannot diff $base..$EVENT_SHA"
           [ -n "$files" ] ||
             die "PR $PR_NUM changes no files against $base_ref; nothing to review"
+          # v5.13.0 (ruling 1142 (A)): THE CHANGED HUNKS, merge base to head,
+          # with no context lines and renames found, for the in-hunk gate in
+          # the posting step. The prefixes and quoting are set here, so no
+          # git config the checkout carries can change the headers it parses.
+          as_codex git -c core.quotePath=false diff -U0 -M --no-color --no-ext-diff --no-textconv \
+              --src-prefix=a/ --dst-prefix=b/ "$base" HEAD > "$WORK/diff.u0" ||
+            die "cannot diff the hunks of $base..$EVENT_SHA"
+          # v5.13.0: THE REVIEW PASSES. A REVIEW.md at the repository root of
+          # the event's base commit, never the head: the PR author cannot
+          # change the passes their own change is reviewed by. 16 KiB at most.
+          rm -f "$WORK/review-passes.md"
+          if [ "$(as_codex git cat-file -t "$BASE_SHA:REVIEW.md" 2>/dev/null)" = blob ]; then
+            as_codex git cat-file blob "$BASE_SHA:REVIEW.md" > "$WORK/review-passes.full" ||
+              die "cannot read REVIEW.md at $BASE_SHA"
+            head -c 16384 "$WORK/review-passes.full" > "$WORK/review-passes.md"
+            rm -f "$WORK/review-passes.full"
+            echo "The review passes are the base's REVIEW.md ($(stat -c %s "$WORK/review-passes.md") bytes)."
+          else
+            echo "No REVIEW.md at $BASE_SHA: the default passes (bugs, security, SPEC and plan compliance)."
+          fi
           # A LARGE HEAD (v5.6) gets the budget to be read in full: high effort
           # and 2700 s at LARGE changed files or more. An effort: label of high
           # stays high.
@@ -2926,6 +2970,27 @@ jobs:
             printf -- '- Base: %s, merge base %s\n' "$base_ref" "$base"
             printf -- '- Head: %s, checked out in the working directory\n' "$EVENT_SHA"
             printf -- '- The change: git diff %s %s\n\n' "$base" "$EVENT_SHA"
+            # v5.13.0 (ruling 1142 (A)): the passes, and where findings go.
+            printf '## The review passes\n\n'
+            if [ -s "$WORK/review-passes.md" ]; then
+              printf 'The repository maintainers define the passes in REVIEW.md, read from the base\n'
+              printf 'branch, not from this pull request. Make each pass it names over the change:\n\n'
+              printf 'BEGIN-REVIEW-%s\n' "$mark"
+              cat "$WORK/review-passes.md"
+              printf '\nEND-REVIEW-%s\n\n' "$mark"
+            else
+              printf 'Make three passes over the change, each in full:\n\n'
+              printf '1. Bugs: correctness, error handling, concurrency, data loss, resource leaks,\n'
+              printf '   and tests that do not test what they claim.\n'
+              printf '2. Security: authentication, authorization, tenant isolation, cryptography,\n'
+              printf '   secrets, input handling, and any check that fails open.\n'
+              printf '3. SPEC and plan compliance: the change against docs/SPEC.md, ROADMAP.md and\n'
+              printf '   the plan the pull request states. A SPEC-pass finding is P1.\n\n'
+            fi
+            printf 'Give every finding the file and the line in the head it is on. Only P0 and P1\n'
+            printf 'findings on lines this pull request changes request changes. Report findings on\n'
+            printf 'other lines too, at their true priority: they go to a follow-up issue and never\n'
+            printf 'block this pull request.\n\n'
             if [ "$nfiles" -ge "$large" ]; then
               printf '## A large change\n\n'
               printf 'This head changes %s files. This run has high reasoning effort and up to %s\n' "$nfiles" "$(( limit / 60 ))"
@@ -3073,11 +3138,79 @@ jobs:
             "$WORK/findings.json" >/dev/null 2>&1 ||
             die "codex's final message is not findings in the shape of findings.schema.json"
 
-          if jq -e 'any(.findings[]; .priority == "P0" or .priority == "P1")' "$WORK/findings.json" >/dev/null; then
+          # v5.13.0 in-hunk gate: begin
+          # (ruling 1142 (A)) Only a P0 or P1 on a line the PR changes
+          # requests changes. The hunks are the new-side ranges of each
+          # `@@ -a,b +c,d @@` header of the codex step's diff: lines c to
+          # c+d-1, and c to c+1 for a pure deletion (d=0). A finding is
+          # INSIDE when its file is empty, its file was deleted or renamed
+          # away, its file is binary (no hunks to place it in), its line is 0
+          # on a changed file, or its line falls in a hunk of its file; and,
+          # failing safe, when the diff has a quoted path and the finding's
+          # file matches no changed path. Inside: P0/P1 blocking, P2/P3
+          # advisory. Outside, any priority: the follow-up issue. No hunk
+          # list at all: every finding is inside, as before v5.13.0.
+          if [ -f "$WORK/diff.u0" ]; then
+            awk '
+                function p(s) { sub(/\t$/, "", s); if (s ~ /^"/) q = 1; return s }
+                /^diff --git / { hdr = 1; old = ""; cur = ""; next }
+                hdr && /^--- / { s = p(substr($0, 5)); old = (s == "/dev/null") ? "" : substr(s, 3); next }
+                hdr && /^\+\+\+ / {
+                  s = p(substr($0, 5))
+                  if (s == "/dev/null") { cur = ""; if (old != "") print "D\t" old }
+                  else { cur = substr(s, 3); print "C\t" cur; if (old != "" && old != cur) print "O\t" old }
+                  next
+                }
+                hdr && /^rename from / { print "O\t" p(substr($0, 13)); next }
+                hdr && /^rename to / { print "C\t" p(substr($0, 11)); next }
+                hdr && /^Binary files / {
+                  s = substr($0, 14); sub(/ differ$/, "", s); n = index(s, " and ")
+                  a = p(substr(s, 1, n - 1)); b = p(substr(s, n + 5))
+                  if (b == "/dev/null") print "D\t" substr(a, 3)
+                  else { print "W\t" substr(b, 3); if (a != "/dev/null" && substr(a, 3) != substr(b, 3)) print "O\t" substr(a, 3) }
+                  next
+                }
+                /^@@ / {
+                  hdr = 0
+                  if (cur == "") next
+                  split($3, r, ","); c = substr(r[1], 2) + 0; d = (2 in r) ? r[2] + 0 : 1
+                  print "R\t" cur "\t" c "\t" (d == 0 ? c + 1 : c + d - 1)
+                  next
+                }
+                END { if (q) print "Q" }' "$WORK/diff.u0" > "$WORK/hunks.tsv"
+          else
+            echo "::warning::the codex step left no hunk list; every finding counts as inside the change"
+            printf 'A\n' > "$WORK/hunks.tsv"
+          fi
+          jq --rawfile h "$WORK/hunks.tsv" '
+              ($h | split("\n") | map(select(length > 0) | split("\t"))) as $r
+              | any($r[]; .[0] == "A") as $all
+              | any($r[]; .[0] == "Q") as $quoted
+              | [$r[] | select(.[0] | IN("C", "W", "D", "O")) | .[1]] as $changed
+              | [$r[] | select(.[0] | IN("W", "D", "O")) | .[1]] as $whole
+              | [$r[] | select(.[0] == "R") | {f: .[1], s: (.[2] | tonumber), e: (.[3] | tonumber)}] as $ranges
+              | def inside:
+                  (.file | sub("^\\./"; "")) as $f | .line as $l
+                  | $all or $f == "" or any($whole[]; . == $f)
+                    or (any($changed[]; . == $f)
+                        and ($l == 0 or any($ranges[]; .f == $f and .s <= $l and $l <= .e)))
+                    or ($quoted and (any($changed[]; . == $f) | not));
+              (.findings | map(. + {in: inside})) as $x
+              | . + {blocking: [$x[] | select(.in and (.priority | IN("P0", "P1"))) | del(.in)],
+                     advisory: [$x[] | select(.in and (.priority | IN("P2", "P3"))) | del(.in)],
+                     outside:  [$x[] | select(.in | not) | del(.in)]}
+              | .blocking |= sort_by(.priority) | .advisory |= sort_by(.priority) | .outside |= sort_by(.priority)' \
+            "$WORK/findings.json" > "$WORK/gate.json" ||
+            die "cannot place the findings in the changed hunks"
+          mv -f "$WORK/gate.json" "$WORK/findings.json"
+          if jq -e '.blocking | length > 0' "$WORK/findings.json" >/dev/null; then
             event=REQUEST_CHANGES
           else
             event=APPROVED
           fi
+          jq -r '"In the changed hunks: \(.blocking | length) blocking, \(.advisory | length) advisory; outside them: \(.outside | length)."' \
+            "$WORK/findings.json"
+          # v5.13.0 in-hunk gate: end
           # The marker (v5.9.8) carries the review key and the round, which
           # the guard reads on the next head: head=<sha> patch=<patch-id>
           # ctx=<sha1> round=<n> (ctx= since v5.10.2), then resume=<id> on a
@@ -3102,16 +3235,115 @@ jobs:
             # v5.11.2 (ruling 673): the last round stays with the coordinator.
             stop=needs-coordinator
           fi
+          # v5.13.0 follow-up issue: begin
+          # (ruling 1142 (A)) The findings outside the changed lines go to
+          # ONE open issue per PR, found by the marker in its body and
+          # rewritten each round with that round's list, or filed when there
+          # is none: labels `review-followup` and the PR's priority:* label,
+          # the PR's milestone. The same reviewer token files it as files the
+          # review. It never blocks the PR: a failure is a warning, the
+          # verdict says the findings were not filed, and the pipeline-error
+          # log is left as it was.
+          # Its caller tests it, which turns `set -e` off inside it, so each
+          # step that can fail ends the function by hand: a failed read of the
+          # issue list must never file a second issue.
+          followup_issue() (
+            marker="<!-- codex-review:followup pr=$PR_NUM -->"
+            meta=$(api GET "/issues/$PR_NUM") || exit 1
+            prio=$(jq -r '[.labels[]?.name | select(startswith("priority:"))] | first // empty' <<<"$meta") || exit 1
+            ms=$(jq -r --arg f "$FORGE" '.milestone // empty | if $f == "github" then .number else .id end // empty' <<<"$meta") || exit 1
+            # shellcheck disable=SC2016 # a jq program: $m is jq's, not the shell's
+            mine='[.[] | select(.pull_request == null and ((.body // "") | contains($m)))] | sort_by(.number) | first | .number // empty'
+            list=$(api_all "/issues?state=open&type=issues&labels=review-followup&") || exit 1
+            num=$(jq -r --arg m "$marker" "$mine" <<<"$list") || exit 1
+            if [ -z "$num" ]; then
+              # A label taken off by hand: the reviewer's own open issues.
+              who=$(jq -rn --arg u "$REVIEWER" '$u | @uri') || exit 1
+              list=$(api_all "/issues?state=open&type=issues&creator=$who&created_by=$who&") || exit 1
+              num=$(jq -r --arg m "$marker" "$mine" <<<"$list") || exit 1
+            fi
+            jq -r --arg m "$marker" --arg n "$PR_NUM" --arg s "$EVENT_SHA" --arg r "$ROUND" --arg u "$RUN_URL" '
+                def where: if .line > 0 then " (`\(.file):\(.line)`)" else " (`\(.file)`)" end;
+                def item: "- **\(.priority)** \(.title)\(where)\n\n  \(.body | gsub("\n"; "\n  "))\n";
+                "\($m)\nCodex found these in the review of #\($n) on lines that pull request does not change. "
+                + "They never block it. Each round rewrites this list.\n\n"
+                + "Round \($r), head `\($s)`, [run](\($u)).\n\n### Findings\n\n"
+                + (.outside | map(item) | join("\n"))' \
+              "$WORK/findings.json" > "$WORK/followup.md" || exit 1
+            if leaks "$WORK/followup.md"; then
+              echo "::warning::the follow-up issue carries the Codex login; not filing it" >&2
+              exit 1
+            fi
+            title="Codex review follow-up: findings outside the changed lines of #$PR_NUM"
+            if [ -n "$num" ]; then
+              jq -n --rawfile b "$WORK/followup.md" --arg t "$title" '{title: $t, body: $b}' > "$WORK/followup.json" || exit 1
+              api PATCH "/issues/$num" "$WORK/followup.json" >/dev/null || exit 1
+            else
+              if [ "$FORGE" = github ]; then
+                labels=$(jq -cn --arg p "$prio" '["review-followup"] + (if $p == "" then [] else [$p] end)') || exit 1
+              else
+                id=$(label_id review-followup) || exit 1
+                labels="[$id]"
+                if [ -n "$prio" ]; then id=$(label_id "$prio") || exit 1; labels="[${labels:1:-1},$id]"; fi
+              fi
+              jq -n --rawfile b "$WORK/followup.md" --arg t "$title" --argjson l "$labels" --arg ms "$ms" \
+                '{title: $t, body: $b, labels: $l} + (if $ms == "" then {} else {milestone: ($ms | tonumber)} end)' \
+                > "$WORK/followup.json" || exit 1
+              made=$(api POST "/issues" "$WORK/followup.json") || exit 1
+              num=$(jq -r '.number // empty' <<<"$made") || exit 1
+              [[ $num =~ ^[0-9]+$ ]] || exit 1
+              # A filer without the label permission has its labels dropped
+              # with a 2xx: read them back.
+              got=$(api GET "/issues/$num") || got='{}'
+              jq -e 'any(.labels[]?; .name == "review-followup")' <<<"$got" >/dev/null ||
+                echo "::warning::follow-up issue #$num has no review-followup label; the reviewer may lack the label permission, or the repository the label" >&2
+            fi
+            printf '%s\n' "$num"
+          )
+          followup=""
+          if jq -e '.outside | length > 0' "$WORK/findings.json" >/dev/null; then
+            errs=$(stat -c %s "$WORK/error" 2>/dev/null) || errs=""
+            if followup=$(followup_issue) && [[ $followup =~ ^[0-9]+$ ]]; then
+              echo "The findings outside the changed lines are in issue #$followup."
+            else
+              followup=""
+              echo "::warning::could not file or update the follow-up issue for PR $PR_NUM; the verdict says its findings were not filed"
+            fi
+            if [ -n "$errs" ]; then truncate -s "$errs" "$WORK/error"; else rm -f "$WORK/error"; fi
+          fi
+          # v5.13.0 follow-up issue: end
+          export REVIEW_FOLLOWUP=$followup
           jq -r --arg e "$event" --arg s "$EVENT_SHA" --arg m "$MODEL" --arg f "$EFFORT" --arg u "$RUN_URL" \
                 --arg p "$PATCH_ID" --arg x "$HUNK_CTX" --arg r "$ROUND" --arg t "$stop" --arg o "$resume" '
               def where: if .file == "" then "" elif .line > 0 then " (`\(.file):\(.line)`)" else " (`\(.file)`)" end;
               def item: "- **\(.priority)** \(.title)\(where)\n\n  \(.body | gsub("\n"; "\n  "))\n";
-              (if $e == "APPROVED" then "Approve" else "Request changes" end) as $v
+              # v5.13.0: the lists the gate wrote; findings without them (no gate
+              # ran) are placed by priority alone, as before v5.13.0.
+              (.blocking // [.findings[] | select(.priority | IN("P0", "P1"))]) as $b
+              | (.advisory // [.findings[] | select(.priority | IN("P2", "P3"))]) as $a
+              | (.outside // []) as $out
+              | ($ENV.REVIEW_FOLLOWUP // "") as $i
+              | (($a | length) - 5) as $more
+              | (if $e == "APPROVED" then "Approve" else "Request changes" end) as $v
               | "<!-- codex-review:verdict head=\($s)\(if $p == "" then "" else " patch=\($p)" end)\(if $x == "" or $p == "" then "" else " ctx=\($x)" end) round=\($r)\(if $o == "" then "" else " resume=\($o)" end) -->\n## Codex review: \($v)\n\n"
                 + "Head `\($s)`, model `\($m)`, effort `\($f)`, round \($r), [run](\($u)).\n\n\(.summary)\n\n"
-                + (if (.findings | length) == 0 then "No findings.\n"
-                   else "### Findings\n\n" + (.findings | sort_by(.priority) | map(item) | join("\n")) end)
-                + "\nP0 and P1 request changes; P2 and P3 are advisory.\n"
+                + (if (.findings | length) == 0 then "No findings.\n" else
+                     (if ($b | length) == 0 then ""
+                      else "### Findings that request changes\n\n" + ($b | sort_by(.priority) | map(item) | join("\n")) + "\n" end)
+                     # v5.13.0 (ruling 1142 (A)): five advisory findings at most; the rest as a count.
+                     + (if ($a | length) == 0 then ""
+                        else "### Advisory\n\n" + ($a | sort_by(.priority) | .[:5] | map(item) | join("\n"))
+                             + (if $more == 1 then "\n1 more advisory finding is not shown.\n"
+                                elif $more > 1 then "\n\($more) more advisory findings are not shown.\n" else "" end)
+                             + "\n" end)
+                     + (if ($out | length) == 0 then ""
+                        else "### Outside the changed lines\n\n"
+                             + (if ($out | length) == 1 then "1 finding on a line this pull request does not change "
+                                else "\($out | length) findings on lines this pull request does not change " end)
+                             + (if $i == "" then "could not be filed in a follow-up issue; the run log says why. It never blocks this pull request.\n"
+                                else "\(if ($out | length) == 1 then "is" else "are" end) in #\($i). It never blocks this pull request.\n" end) end)
+                   end)
+                + "\nP0 and P1 findings on the changed lines request changes; P2 and P3 there are advisory; findings on other lines go to a follow-up issue.\n"
                 + (if $t == "" then "" else "\nRound \($r) is the round limit: this pull request goes to `\($t)` (sdlc.md §2b).\n" end)' \
             "$WORK/findings.json" > "$WORK/body.md"
           # LEAK CHECK: a review is public, and codex could read its login.
