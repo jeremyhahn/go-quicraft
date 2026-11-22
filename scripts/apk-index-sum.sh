@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# apk-index-sum: v3 (ci-template v1.29) — one
+# apk-index-sum: v4 (ci-template v1.29) — one
 # checksum of the Alpine package indexes the devcontainer build resolves
 # against.
 #
@@ -23,14 +23,13 @@
 #   replaces the FROM parse for a Dockerfile it cannot read.
 #
 # Prints a sha256 over each base image's name, repository list and index
-# checksums, or `none` when no base image has apk. v2: a pool build fetches its
-# packages through the LAN apk mirror (DEVCACHE_APK_MIRROR), so the
-# probe fetches the indexes through it too, with the build's own apk-mirror.sh
-# from beside this script; unset, as on a hosted runner, the
-# indexes come from the public repositories. apk names each index file after
-# its repository URL, so only the files' contents are hashed: a current mirror
-# gives the public sum, a stale one another, and the image is rebuilt once the
-# mirror catches up. v3: the script reaches the probe on its stdin, never as a
+# checksums, or `none` when no base image has apk. v4: the indexes always
+# come from the public repositories the image build itself uses
+# (build/docker/devcontainer/Dockerfile runs apk against them), never
+# through DEVCACHE_APK_MIRROR: a mirror that lags would keep the old sum, so
+# the image would be reused without the upgrade its build would pick up. apk
+# names each index file after its repository URL, so only the files'
+# contents are hashed. v3: the script reaches the probe on its stdin, never as a
 # bind mount: a pool's Docker daemon runs outside the job container and
 # resolves a -v source on its own host, where the checkout does not exist. Exits 1 when a base image
 # cannot be resolved, run or updated: a missing index is never a pass, since
@@ -115,7 +114,7 @@ alpine=0
 for img in "${bases[@]}"; do
   out=$(docker run -i --rm --pull missing --network bridge --user 0 \
           --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER \
-          --security-opt no-new-privileges -e APK_MIRROR="${DEVCACHE_APK_MIRROR:-}" \
+          --security-opt no-new-privileges -e APK_MIRROR= \
           --entrypoint /bin/sh "$img" -c "$probe" < "$mirror_script") ||
     fail "reading the Alpine package index of $img failed (exit $?)"
   [ "$out" = none ] || alpine=1
