@@ -15,8 +15,11 @@
 package buildgates
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -300,5 +303,122 @@ func TestIntegrationSuiteRunsOnlyOnACheckedImage(t *testing.T) {
 	}
 	if p := integrationSuiteProblems(old); len(p) < 3 {
 		t.Errorf("the lease-keyed form was not fully reported: %v", p)
+	}
+}
+
+// stubDocker is a docker first on PATH. `history` and `image inspect` print
+// the history and config files in dir (or fail when STUB_FAIL is set);
+// `run` prints dir/mirror when the probe is handed an APK_MIRROR and
+// dir/public otherwise, standing in for the indexes apk would fetch.
+const stubDocker = `#!/bin/sh
+case "$1" in
+history) [ -z "${STUB_FAIL:-}" ] || exit 1; cat "$STUB_DIR/history" ;;
+image) [ -z "${STUB_FAIL:-}" ] || exit 1; cat "$STUB_DIR/config" ;;
+run)
+	m=
+	for a in "$@"; do case $a in APK_MIRROR=*) m=${a#APK_MIRROR=} ;; esac; done
+	cat >/dev/null
+	if [ -n "$m" ]; then cat "$STUB_DIR/mirror"; else cat "$STUB_DIR/public"; fi ;;
+*) exit 9 ;;
+esac
+`
+
+// runWithStubDocker runs a repository script with stubDocker first on PATH,
+// files written into the stub's directory, and extra environment; it returns
+// the combined output and the exit code.
+func runWithStubDocker(t *testing.T, script string, files, env map[string]string, args ...string) (string, int) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(stubDocker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := filepath.Abs(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", append([]string{filepath.Join(root, "scripts", script)}, args...)...)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_DIR="+dir)
+	for k, v := range env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		var ee *exec.ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("run %s: %v", script, err)
+		}
+		code = ee.ExitCode()
+	}
+	return string(out), code
+}
+
+// TestCIImageHistoryRejectsPrivateAddresses runs scripts/ci-image-history.sh
+// against a stub docker: a private address in a history entry or in the
+// config fails without being printed, a public-only image passes, and an
+// image docker cannot read fails.
+func TestCIImageHistoryRejectsPrivateAddresses(t *testing.T) {
+	const public = "/bin/sh -c apk add curl # fetched from 198.51.100.7\n"
+	const publicConfig = `{"Env":["PATH=/usr/bin","SRC=http://203.0.113.9/x"],"Labels":null}`
+	cases := []struct {
+		name, history, config, fail, secret string
+		wantFail                            bool
+	}{
+		{"private address in a history entry", public + "/bin/sh -c curl http://10.20.30.40:3142/alpine \n", publicConfig, "", "10.20.30.40", true},
+		{"private address in the config", public, `{"Env":["APK_MIRROR=http://192.168.1.10:3142"]}`, "", "192.168.1.10", true},
+		{"private address in a label", public, `{"Labels":{"src":"172.16.5.4"}}`, "", "172.16.5.4", true},
+		{"public addresses only", public, publicConfig, "", "", false},
+		{"docker cannot read the image", public, publicConfig, "1", "", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := map[string]string{}
+			if c.fail != "" {
+				env["STUB_FAIL"] = c.fail
+			}
+			out, code := runWithStubDocker(t, "ci-image-history.sh",
+				map[string]string{"history": c.history, "config": c.config}, env, "example/image:tag")
+			if (code != 0) != c.wantFail {
+				t.Fatalf("exit %d, want failure=%v; output:\n%s", code, c.wantFail, out)
+			}
+			if c.secret != "" && strings.Contains(out, c.secret) {
+				t.Fatalf("the output prints the private address %s:\n%s", c.secret, out)
+			}
+		})
+	}
+}
+
+// TestAPKIndexSumHashesThePublicIndexes runs scripts/apk-index-sum.sh with a
+// mirror configured and a stub docker. The image build fetches its packages
+// from the public repositories, so the sum must follow the public indexes:
+// a public update changes it even while the mirror's indexes stay the same.
+func TestAPKIndexSumHashesThePublicIndexes(t *testing.T) {
+	mirror := strings.Repeat("c", 64) + "\n"
+	env := map[string]string{
+		"APK_BASE_IMAGES":     "alpine:3.20",
+		"DEVCACHE_APK_MIRROR": "http://mirror.example:3142/alpine",
+	}
+	sum := func(public string) string {
+		out, code := runWithStubDocker(t, "apk-index-sum.sh",
+			map[string]string{"public": "https://dl-cdn.alpinelinux.org/alpine/v3.20/main\n" + public, "mirror": mirror}, env)
+		if code != 0 {
+			t.Fatalf("apk-index-sum.sh exit %d:\n%s", code, out)
+		}
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		return lines[len(lines)-1]
+	}
+	before := sum(strings.Repeat("a", 64) + "\n")
+	after := sum(strings.Repeat("b", 64) + "\n")
+	if len(before) != 64 {
+		t.Fatalf("apk-index-sum.sh printed %q, want a sha256", before)
+	}
+	if before == after {
+		t.Fatalf("a public index update left APK_INDEX_SUM at %s: the probe hashes the mirror, not the repositories the image build uses", before)
 	}
 }
