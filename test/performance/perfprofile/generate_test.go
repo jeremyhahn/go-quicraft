@@ -29,39 +29,39 @@ import (
 // thing that changes between two otherwise identical runs.
 var generatedAt = time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
 
-// realOmegaProfile copies the repository's omega profile into a temporary
+// realBench02Profile copies the repository's bench-02 profile into a temporary
 // directory and returns the copy.
 //
-// The fixture is the real measured data on purpose. omega genuinely has
+// The fixture is the real measured data on purpose. bench-02 genuinely has
 // quicraft, dragonboat and openraft results and genuinely has no etcd result —
 // that run failed on a harness bug — so it is the honest input for the
 // missing-system path. The preconditions are asserted rather than assumed: if
-// somebody later measures etcd on omega, this test says so instead of quietly
+// somebody later measures etcd on bench-02, this test says so instead of quietly
 // testing a case that no longer exists.
-func realOmegaProfile(t *testing.T) *Profile {
+func realBench02Profile(t *testing.T) *Profile {
 	t.Helper()
 
-	src, err := filepath.Abs(filepath.Join("..", "profiles", "omega"))
+	src, err := filepath.Abs(filepath.Join("..", "profiles", "bench-02"))
 	if err != nil {
-		t.Fatalf("resolve omega profile: %v", err)
+		t.Fatalf("resolve bench-02 profile: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(src, resultsDirName)); err != nil {
-		t.Fatalf("omega profile results not found at %s: %v", src, err)
+		t.Fatalf("bench-02 profile results not found at %s: %v", src, err)
 	}
 
 	for _, sys := range []string{"quicraft", "dragonboat", "openraft"} {
 		if _, err := os.Stat(filepath.Join(src, resultsDirName, sys+".json")); err != nil {
-			t.Fatalf("fixture precondition failed: omega has no %s results (%v). "+
-				"This test drives the generator with the real omega dataset.", sys, err)
+			t.Fatalf("fixture precondition failed: bench-02 has no %s results (%v). "+
+				"This test drives the generator with the real bench-02 dataset.", sys, err)
 		}
 	}
 	if _, err := os.Stat(filepath.Join(src, resultsDirName, "etcd.json")); err == nil {
-		t.Fatal("fixture precondition failed: omega now HAS etcd results. " +
+		t.Fatal("fixture precondition failed: bench-02 now HAS etcd results. " +
 			"This test exists to cover a genuinely unmeasured system; pick another " +
 			"gap or drop the test rather than faking one.")
 	}
 
-	dst := filepath.Join(t.TempDir(), "omega")
+	dst := filepath.Join(t.TempDir(), "bench-02")
 	copyTree(t, src, dst)
 
 	p, err := Open(dst)
@@ -111,7 +111,7 @@ func copyTree(t *testing.T, src, dst string) {
 // with no results must produce no document, must be named as unmeasured in the
 // summary, and must be named inside every document that was written.
 func TestGenerateReportsUnmeasuredSystem(t *testing.T) {
-	p := realOmegaProfile(t)
+	p := realBench02Profile(t)
 
 	result, err := p.Generate(generatedAt)
 	if err != nil {
@@ -141,18 +141,18 @@ func TestGenerateReportsUnmeasuredSystem(t *testing.T) {
 
 	for _, name := range result.Generated {
 		body := readFile(t, filepath.Join(p.Dir(), name))
-		if !strings.Contains(body, "Not yet measured on `omega`: etcd") {
+		if !strings.Contains(body, "Not yet measured on `bench-02`: etcd") {
 			t.Fatalf("%s does not name etcd as unmeasured:\n%s", name, body)
 		}
 	}
 
 	// The documents must be rendered from the real JSON, not from defaults.
-	// 287.9 ops/s is QuicRaft's measured commit_latency_3n_wal on omega and
+	// 287.9 ops/s is QuicRaft's measured commit_latency_3n_wal on bench-02 and
 	// 100.0 is Dragonboat's; neither can appear unless the stored results were
 	// read and formatted.
 	dragonboat := readFile(t, p.DocPath("dragonboat"))
 	for _, want := range []string{
-		"# QuicRaft vs Dragonboat — `omega` profile",
+		"# QuicRaft vs Dragonboat — `bench-02` profile",
 		"Commit Latency 3N (WAL)",
 		"287.9 ops/s",
 		"100.0 ops/s",
@@ -174,9 +174,9 @@ func TestGenerateReportsUnmeasuredSystem(t *testing.T) {
 // afterwards. So the generator demonstrably wrote in this directory, and
 // analysis.md is demonstrably byte-identical anyway.
 func TestGenerateNeverWritesAnalysis(t *testing.T) {
-	p := realOmegaProfile(t)
+	p := realBench02Profile(t)
 
-	const analysisBody = "# omega analysis\n\nHand-written. 0xDEADBEEF-ANALYSIS-SENTINEL\n"
+	const analysisBody = "# bench-02 analysis\n\nHand-written. 0xDEADBEEF-ANALYSIS-SENTINEL\n"
 	const staleDoc = "0xDEADBEEF-STALE-SENTINEL: this must be overwritten\n"
 
 	if err := os.WriteFile(p.AnalysisPath(), []byte(analysisBody), 0644); err != nil {
@@ -218,15 +218,15 @@ func TestWriteDocRefusesAnalysisFile(t *testing.T) {
 }
 
 // TestGenerateLeavesOtherProfilesAlone asserts profile isolation: generating
-// omega must not read, rewrite, or delete anything belonging to another
+// bench-02 must not read, rewrite, or delete anything belonging to another
 // machine. r640 in particular holds the only surviving copy of a baseline that
 // cannot be re-measured until the hardware is repaired.
 func TestGenerateLeavesOtherProfilesAlone(t *testing.T) {
 	root := t.TempDir()
 
-	omegaSrc := realOmegaProfile(t)
-	omegaDir := filepath.Join(root, "omega")
-	copyTree(t, omegaSrc.Dir(), omegaDir)
+	bench02Src := realBench02Profile(t)
+	bench02Dir := filepath.Join(root, "bench-02")
+	copyTree(t, bench02Src.Dir(), bench02Dir)
 
 	// A stand-in r640 with the same shape as the real one: a hand-written
 	// analysis, its charts, and a nested file.
@@ -237,7 +237,7 @@ func TestGenerateLeavesOtherProfilesAlone(t *testing.T) {
 	mkfile(t, filepath.Join(r640, resultsDirName, ".keep"), "")
 	before := snapshot(t, r640)
 
-	p, err := Open(omegaDir)
+	p, err := Open(bench02Dir)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestGenerateLeavesOtherProfilesAlone(t *testing.T) {
 // rule: a document left behind from a run when the system did have results must
 // not survive beside freshly written siblings, where it reads as current.
 func TestGenerateRemovesStaleDocument(t *testing.T) {
-	p := realOmegaProfile(t)
+	p := realBench02Profile(t)
 	if err := os.WriteFile(p.DocPath("etcd"), []byte("# stale etcd numbers\n"), 0644); err != nil {
 		t.Fatalf("seed stale etcd.md: %v", err)
 	}
@@ -289,11 +289,11 @@ func TestGenerateRemovesStaleDocument(t *testing.T) {
 	}
 }
 
-// TestGenerateWithoutEnvSaysSo covers the omega case as it stands today: real
+// TestGenerateWithoutEnvSaysSo covers the bench-02 case as it stands today: real
 // results, no machine capture. The documents must state that rather than print
 // a hardware table nobody measured.
 func TestGenerateWithoutEnvSaysSo(t *testing.T) {
-	p := realOmegaProfile(t)
+	p := realBench02Profile(t)
 	if err := os.Remove(p.EnvPath()); err != nil && !os.IsNotExist(err) {
 		t.Fatalf("remove env: %v", err)
 	}
@@ -314,9 +314,9 @@ func TestGenerateWithoutEnvSaysSo(t *testing.T) {
 // TestGenerateWithEnvRendersHardwareInline asserts a reader of a generated
 // document is never a click away from knowing which machine produced a number.
 func TestGenerateWithEnvRendersHardwareInline(t *testing.T) {
-	p := realOmegaProfile(t)
+	p := realBench02Profile(t)
 	if err := os.WriteFile(p.EnvPath(),
-		[]byte(strings.Replace(partialEnvJSON, `"testbox"`, `"omega"`, 1)), 0644); err != nil {
+		[]byte(strings.Replace(partialEnvJSON, `"testbox"`, `"bench-02"`, 1)), 0644); err != nil {
 		t.Fatalf("write env: %v", err)
 	}
 
@@ -325,7 +325,7 @@ func TestGenerateWithEnvRendersHardwareInline(t *testing.T) {
 	}
 	body := readFile(t, p.DocPath("openraft"))
 	for _, want := range []string{
-		"| Profile | `omega` |",
+		"| Profile | `bench-02` |",
 		"8260",                      // the captured CPU, inline
 		"2026-08-17T09:00:00Z",      // the capture date
 		"| Docker | " + NotCaptured, // and the field the capture could not obtain
@@ -339,7 +339,7 @@ func TestGenerateWithEnvRendersHardwareInline(t *testing.T) {
 // TestGenerateRequiresBaseline asserts a profile with no QuicRaft results
 // produces no documents at all rather than a set of empty ones.
 func TestGenerateRequiresBaseline(t *testing.T) {
-	p := realOmegaProfile(t)
+	p := realBench02Profile(t)
 	if err := os.Remove(filepath.Join(p.ResultsDir(), "quicraft.json")); err != nil {
 		t.Fatalf("remove baseline: %v", err)
 	}
@@ -370,7 +370,7 @@ func TestGenerateRequiresBaseline(t *testing.T) {
 
 // TestPresentSystemsIsStable keeps map iteration order out of the output.
 func TestPresentSystemsIsStable(t *testing.T) {
-	p := realOmegaProfile(t)
+	p := realBench02Profile(t)
 	suites, err := p.LoadResults()
 	if err != nil {
 		t.Fatalf("LoadResults: %v", err)

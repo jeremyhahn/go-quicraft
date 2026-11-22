@@ -56,7 +56,7 @@ the same thing in both columns.
 
 Results are stored per machine under [`../profiles/`](../profiles/). The most
 recent full comparison is
-[`profiles/ci-node-2/dragonboat.md`](../profiles/ci-node-2/dragonboat.md), <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
+[`profiles/bench-01/dragonboat.md`](../profiles/bench-01/dragonboat.md),
 measured 2026-10-04. Numbers from different profiles are not comparable.
 
 ## Running

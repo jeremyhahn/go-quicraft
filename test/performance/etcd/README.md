@@ -61,7 +61,7 @@ the same thing in both columns.
 
 Results are stored per machine under [`../profiles/`](../profiles/). The most
 recent full comparison is
-[`profiles/ci-node-2/etcd.md`](../profiles/ci-node-2/etcd.md), measured <!-- lab-string-ok: benchmark provenance: the profile directory names the machine that measured the numbers -->
+[`profiles/bench-01/etcd.md`](../profiles/bench-01/etcd.md), measured
 2026-10-04. Numbers from different profiles are not comparable.
 
 ## Running

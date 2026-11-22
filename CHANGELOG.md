@@ -793,7 +793,7 @@ format is unchanged, so 0.17.0 data directories open as they are.
   over replica start and leader wait only, 1 ms leader polling and mutual TLS
   1.3. Host socket buffers are set once for every engine and no engine's
   container runs privileged. Where an engine cannot match a setting it is
-  listed in `test/performance/README.md`. The `ci-node-2` profile is
+  listed in `test/performance/README.md`. The `bench-01` profile is
   re-measured on 2026-10-04.
 
 ### Fixed
@@ -1099,7 +1099,7 @@ sites and any custom `Barrier` implementation.
 - The Dragonboat benchmark harness runs Dragonboat on its Tan LogDB instead of
   the default sharded Pebble store, and its election benchmarks rotate through
   a fixed ring of shard IDs so Tan's per-shard preallocated log files no longer
-  fill the disk. The `ci-node-2` profile is re-measured on 2026-10-02 with all
+  fill the disk. The `bench-01` profile is re-measured on 2026-10-02 with all
   four systems.
 
 ### Removed
@@ -1153,7 +1153,7 @@ changes to check:
   membership. A replica the membership lists as an observer behaves as one
   instead of latching a role mismatch.
 - **Makefile offload variables.** The remote-offload variables are renamed
-  `OMEGA_*` → `REMOTE_*`, and `REMOTE_HOST` is required.
+  from a machine-named prefix to `REMOTE_*`, and `REMOTE_HOST` is required.
 
 ### Added
 - **A promoted observer becomes a voter in place.** A replica's non-voting
@@ -1231,7 +1231,7 @@ changes to check:
   Shamir functions charge.
 - **The remote-offload targets have no default host.** `make remote-*` and
   `make remote-tools` require `REMOTE_HOST` and print usage without it.
-  `OMEGA_USER`, `OMEGA_HOST` and `OMEGA_DIR` are renamed `REMOTE_USER`
+  The machine-named `*_USER`, `*_HOST` and `*_DIR` are renamed `REMOTE_USER`
   (optional), `REMOTE_HOST` and `REMOTE_WORKDIR`. `remote-tools` seeds a
   forge host key only when `FORGE_SSH_HOST` (and `FORGE_SSH_PORT`, default 22)
   are set. Target names are unchanged. Lab addresses and hostnames are gone
@@ -1827,7 +1827,7 @@ in place.
   version their binary links.
 - **The dragonboat read benchmarks seed through the current leader**, retrying
   after a leader change. The first complete four-system capture,
-  `profiles/ci-node-2`, is on record.
+  `profiles/bench-01`, is on record.
 - **Releases tag the `test/performance` module alongside the root module**, so
   `github.com/jeremyhahn/go-quicraft/test/performance@vX.Y.Z` resolves.
 - **The internal transport `Config` gains `DialTimeout`** (default unchanged,
@@ -2694,13 +2694,13 @@ commit.
   captured on that machine.** `test/performance/profiles/<name>/` holds
   `env.json` (captured by `capture-env.sh` on the target), `results/*.json`,
   generated `charts/` and `<system>.md` documents, and a hand-written
-  `analysis.md`. Two profiles are tracked: `omega` (the single-socket bench
-  host) and `r640` (the dual-socket bench host). The profile name is a
+  `analysis.md`. Two profiles are tracked: `bench-02` (the single-socket desktop
+  bench host) and `r640` (the dual-socket bench host). The profile name is a
   required argument. A field the capture could not obtain renders as
   "not captured", never as zero.
 
 - **One command measures any machine:**
-  `make perf-remote PERF_HOST=user@host PERF_PROFILE=omega`. It stages the tree,
+  `make perf-remote PERF_HOST=user@host PERF_PROFILE=bench-02`. It stages the tree,
   captures `env.json`, runs the suite in Docker, fetches results and capture
   into the profile, and regenerates its documents. The phases remain available
   individually, and the remote run stays detached.
@@ -2711,7 +2711,7 @@ commit.
 - **A system with no results produces no document** rather than one full of
   `N/A` rows, and a stale document for an unmeasured system is deleted.
   Generation still refuses to run when a requested system is missing;
-  `PERF_SYSTEMS` narrows the set explicitly. `omega` has no `etcd.md` for this
+  `PERF_SYSTEMS` narrows the set explicitly. `bench-02` has no `etcd.md` for this
   reason.
 
 - **The R640 baseline is preserved verbatim** in `profiles/r640/analysis.md`

@@ -1,4 +1,4 @@
-# QuicRaft vs Dragonboat — `ci-node-2` profile
+# QuicRaft vs Dragonboat — `bench-01` profile
 
 > **Generated file.** `perfcompare generate` deletes and rewrites this
 > document from `results/*.json`; edits made here are lost on the next
@@ -7,19 +7,19 @@
 
 | | |
 |---|---|
-| Profile | `ci-node-2` |
+| Profile | `bench-01` |
 | Hardware | Intel(R) Xeon(R) Gold 6258R CPU @ 2.70GHz, 2 socket(s), 112 threads, 372.2 GiB, Ubuntu 26.04.1 LTS (Resolute Raccoon), kernel 7.0.0-31-generic |
 | Specs captured | 2026-10-04T20:00:07Z |
 | QuicRaft run | 2026-10-04T20:00:25Z (version 0.17.0) |
 | Dragonboat run | 2026-10-04T20:34:57Z (version v4.0.1) |
-| Document generated | 2026-10-04 20:57:58 UTC |
+| Document generated | 2026-11-22 12:58:28 UTC |
 
 Numbers below were measured on this profile's machine only. Nothing here is
 comparable with a number from another profile; do not compute a ratio across two.
 
 ## Coverage on this profile
 
-This document compares quicraft against dragonboat. Systems measured on `ci-node-2`: quicraft, etcd, dragonboat, openraft.
+This document compares quicraft against dragonboat. Systems measured on `bench-01`: quicraft, etcd, dragonboat, openraft.
 
 Every known system has results on this profile.
 
@@ -29,8 +29,8 @@ Captured on the target at run time by `capture-env.sh`; never hand-edited.
 
 | Component | Value |
 |---|---|
-| Profile | ci-node-2 |
-| Hostname | ci-node-2 |
+| Profile | bench-01 |
+| Hostname | bench-01 |
 | CPU | Intel(R) Xeon(R) Gold 6258R CPU @ 2.70GHz |
 | Sockets | 2 |
 | Physical cores | 56 |
