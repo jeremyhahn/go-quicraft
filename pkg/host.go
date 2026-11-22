@@ -3611,6 +3611,13 @@ type Host struct {
 	// transient ErrShardNotReady, and leaves ErrImportInProgress to imports.
 	startingShards sync.Map
 
+	// closingShards holds the shards whose teardown has removed their
+	// nodeState from nodes but has not yet finished closing the state
+	// machine and reporting the unload (map[uint64]*nodeState). RemoveData
+	// refuses a replica held here, as it does one still in nodes: Close can
+	// still be writing to the replica's directories.
+	closingShards sync.Map
+
 	// leaderExec holds the leader-executed request handlers, the requests
 	// this host has in flight to a remote leader, and the bound on the
 	// requests it is executing for remote callers. See ExecuteOnLeader.
@@ -5736,6 +5743,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 				h.logger.Warn("state machine close failed while aborting shard start",
 					"shard_id", cfg.ShardID, "error", cerr)
 			}
+			h.closingShards.CompareAndDelete(cfg.ShardID, ns)
 		} else {
 			h.engine.UnloadNode(cfg.ShardID)
 		}
@@ -5890,6 +5898,10 @@ func (h *Host) StopShard(shardID uint64) error {
 	// lost writes. Teardown itself is unconditional and complete either way —
 	// the shard is unloaded, its pending requests failed and its nodeState
 	// removed — so the error is carried out rather than aborting the rest.
+	// The closing marker teardownShard sets is cleared only on return, after
+	// the state machine has closed and OnNodeUnloaded has fired, so a
+	// RemoveData can never report OnNodeDeleted ahead of the unload.
+	defer h.closingShards.CompareAndDelete(shardID, ns)
 	closeErr := h.teardownShard(ns, shardID, ErrAborted)
 
 	// Fire OnNodeUnloaded event listener.
@@ -5959,7 +5971,10 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) er
 
 	// Remove nodeState last, after the engine is fully unloaded, all pending
 	// items have been resolved, and the registry/join state is cleaned up. No
-	// more callbacks will reference this shardID.
+	// more callbacks will reference this shardID. The closing marker is set
+	// first so RemoveData keeps refusing the replica until the caller clears
+	// it, after the state machine has closed (see closingShards).
+	h.closingShards.Store(shardID, ns)
 	h.nodes.Delete(shardID)
 	h.activeNodes.Add(-1)
 
@@ -11606,7 +11621,14 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	// node and waits out its write leases, and removes the nodeState only
 	// after that, so until then a snapshot save can still publish into the
 	// directory removed below — leaving a snapshot behind a removal that
-	// reported success. The caller retries once the stop has finished.
+	// reported success. The refusal then lasts until the state machine has
+	// closed: teardown removes the nodeState before the state machine's Close
+	// returns (Close may still be streaming a snapshot or flushing), and
+	// marks the shard in closingShards until Close and the unload event are
+	// done. The nodes check comes first: teardown sets the marker before it
+	// deletes the nodeState, so a replica found absent from nodes is
+	// already marked if its Close has not returned. The caller retries
+	// once the stop has finished.
 	if v, loaded := h.nodes.Load(shardID); loaded {
 		ns, ok := v.(*nodeState)
 		if !ok {
@@ -11618,6 +11640,11 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 					ActualValue:  v,
 				})
 		} else if ns.replicaID == replicaID {
+			return &ShardNotStoppedError{ShardID: shardID, ReplicaID: replicaID}
+		}
+	}
+	if v, closing := h.closingShards.Load(shardID); closing {
+		if ns, ok := v.(*nodeState); ok && ns.replicaID == replicaID {
 			return &ShardNotStoppedError{ShardID: shardID, ReplicaID: replicaID}
 		}
 	}
