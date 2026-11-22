@@ -460,5 +460,14 @@ case("I4 code-review.yml: another self-hosted label for a same-repository head f
      {"code-review.yml": wf(CR_ON, job(SAME.replace('"bigdisk"]', '"bigdisk-docker"]'), name="scope"))}, 1,
      ["code-review.yml:scope: (c)"])
 
+
+# J. an unknown left operand keeps the result unknown (LOCAL: a fallback is not the guaranteed value)
+case("J1 a release guard whose fallback compares false is unknown, not false: (b)",
+     {"r.yml": wf("on: push\n", job(REL, "${{ (vars.MODE || 'disabled') != 'disabled' }}"))}, 1, ["r.yml:pub: (b)"])
+case("J2 a variable with a hosted fallback is not hosted routing: (c)",
+     {"ci.yml": wf(PR_ON, job("${{ vars.RUNNER || 'ubuntu-latest' }}", name="lint"))}, 1, ["ci.yml:lint: (c)"])
+case("J3 an unknown left operand of && keeps a false right operand's falsiness",
+     {"r.yml": wf("on: push\n", job(REL, "${{ vars.MODE && false }}"))}, 0, ["OK:"])
+
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
