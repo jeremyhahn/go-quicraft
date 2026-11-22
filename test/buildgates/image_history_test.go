@@ -341,7 +341,7 @@ func runWithStubDocker(t *testing.T, script string, files, env map[string]string
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("bash", append([]string{filepath.Join(root, "scripts", script)}, args...)...)
+	cmd := exec.CommandContext(t.Context(), "bash", append([]string{filepath.Join(root, "scripts", script)}, args...)...)
 	cmd.Dir = root
 	cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"), "STUB_DIR="+dir)
 	for k, v := range env {
