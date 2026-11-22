@@ -1147,6 +1147,155 @@ func TestStartShard_DuplicateShard(t *testing.T) {
 	}
 }
 
+// TestStartShard_OverlappingStartKeepsClosingFence covers a start (A) that
+// passes the early node map check, then waits while another replica (B)
+// starts, and initialises while B is stopped and still closing its state
+// machine. A must be refused, so it can never be published and then stopped
+// in turn, clearing B's closing marker and letting RemoveData delete B's
+// snapshots before B's Close returns.
+func TestStartShard_OverlappingStartKeepsClosingFence(t *testing.T) {
+	cfg := testHostConfig(t)
+	h, err := NewHost(cfg, WithLogDB(memdb.New()), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer func() { _ = h.Close() }()
+
+	// Hold A between its node map check and its start claim.
+	atClaim := make(chan struct{})
+	resumeClaim := make(chan struct{})
+	var held atomic.Bool
+	hook := func() {
+		if held.CompareAndSwap(false, true) {
+			close(atClaim)
+			<-resumeClaim
+		}
+	}
+	startClaimHook.Store(&hook)
+	defer startClaimHook.Store(nil)
+	resumed := false
+	defer func() {
+		if !resumed {
+			close(resumeClaim)
+		}
+	}()
+
+	// Hold A again while it creates its state machine, if it gets that far.
+	aCreating := make(chan struct{})
+	aRelease := make(chan struct{})
+	var aCreateOnce sync.Once
+	createA := func(_, _ uint64) interface{} {
+		aCreateOnce.Do(func() { close(aCreating) })
+		<-aRelease
+		return &mockStateMachine{}
+	}
+	aReleased := false
+	defer func() {
+		if !aReleased {
+			close(aRelease)
+		}
+	}()
+	startA := make(chan error, 1)
+	go func() {
+		startA <- h.StartShard(map[uint64]string{2: "192.0.2.1:5000"}, false,
+			createA, testShardConfig(1, 2))
+	}()
+	select {
+	case <-atClaim:
+	case <-time.After(30 * time.Second):
+		t.Fatal("StartShard A did not reach its start claim")
+	}
+
+	smB := &closeBlockingSM{entered: make(chan struct{}), release: make(chan struct{})}
+	bReleased := false
+	defer func() {
+		if !bReleased {
+			close(smB.release)
+		}
+	}()
+	createB := func(_, _ uint64) interface{} { return smB }
+	if err := h.StartShard(map[uint64]string{1: "192.0.2.1:5000"}, false,
+		createB, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard B: %v", err)
+	}
+	snapDir, _, err := h.removeDataSnapshotDir(1, 1)
+	if err != nil {
+		t.Fatalf("removeDataSnapshotDir: %v", err)
+	}
+	marker := filepath.Join(snapDir, "snapshot-kept")
+	if err := os.MkdirAll(marker, 0o750); err != nil {
+		t.Fatalf("create snapshot directory: %v", err)
+	}
+
+	resumed = true
+	close(resumeClaim)
+	var aErr error
+	aDone := false
+	select {
+	case aErr = <-startA:
+		aDone = true
+	case <-aCreating:
+	case <-time.After(30 * time.Second):
+		t.Fatal("StartShard A neither returned nor created its state machine")
+	}
+
+	// Stop B while A, if it was admitted, is still initialising.
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- h.StopShard(1) }()
+	select {
+	case <-smB.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("StopShard B did not reach the state machine's Close")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, loaded := h.nodes.Load(uint64(1)); !loaded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stopping shard B still in the node map while Close runs")
+		}
+		runtime.Gosched()
+	}
+
+	if !aDone {
+		aReleased = true
+		close(aRelease)
+		select {
+		case aErr = <-startA:
+		case <-time.After(30 * time.Second):
+			t.Fatal("StartShard A did not return")
+		}
+	}
+	if aErr == nil {
+		// A was admitted: stop it, as the defect needs, so the fence check
+		// below shows what that admission cost.
+		if err := h.StopShard(1); err != nil {
+			t.Fatalf("StopShard A: %v", err)
+		}
+	}
+	if err := h.RemoveData(1, 1); !errors.Is(err, ErrShardNotStopped) {
+		t.Errorf("RemoveData of B while its Close runs = %v, want ErrShardNotStopped", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("B's snapshot directory removed while its state machine was closing: %v", err)
+	}
+	if !errors.Is(aErr, ErrShardAlreadyExists) && !errors.Is(aErr, ErrShardNotReady) {
+		t.Errorf("overlapping StartShard A = %v, want ErrShardAlreadyExists or ErrShardNotReady", aErr)
+	}
+
+	bReleased = true
+	close(smB.release)
+	select {
+	case err := <-stopErr:
+		if err != nil {
+			t.Fatalf("StopShard B: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("StopShard B did not return after Close was released")
+	}
+}
+
 func TestStartShard_ZeroShardID(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())

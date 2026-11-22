@@ -4828,6 +4828,7 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		}
 		return ErrShardAlreadyExists
 	}
+	runStartClaimHook()
 
 	// Hold the shard's import lock for the whole start, before its durable
 	// state is read. An import records a snapshot and removes the log beneath
@@ -6042,6 +6043,18 @@ var syncReadLookupHook atomic.Pointer[func()]
 // runSyncReadLookupHook runs syncReadLookupHook if one is set.
 func runSyncReadLookupHook() {
 	if hook := syncReadLookupHook.Load(); hook != nil {
+		(*hook)()
+	}
+}
+
+// startClaimHook, when set, runs in StartShard after its early node map
+// check and before it claims the start. Tests set it to hold a start in that
+// window; it is nil in production, costing one atomic load per start.
+var startClaimHook atomic.Pointer[func()]
+
+// runStartClaimHook runs startClaimHook if one is set.
+func runStartClaimHook() {
+	if hook := startClaimHook.Load(); hook != nil {
 		(*hook)()
 	}
 }
