@@ -709,7 +709,15 @@ jobs:
   # v1.23: a lint-class check, so it stays on the PR tier.
   preflight:
     name: Preflight [changed files, schedule guard, architecture gates]
-    runs-on: ubuntu-latest
+    # v1.49 (Tenant Agent ruling 1047 (3), (2)): on github.com the Dells'
+    # bigdisk pool, so no run waits in the hosted queue for its first ten
+    # seconds of work; the repository variable CI_PREFLIGHT_RUNS_ON, runs-on
+    # JSON, overrides it (Fleet Ops sets `"ubuntu-latest"`, quotes included,
+    # while the Dells are down). Off github.com the forge label, as before.
+    # v1.52 (Tenant Agent order): a pull request from a fork (its head
+    # repository is not this one) takes ubuntu-latest whatever the variable
+    # holds; a fork never reaches a self-hosted runner.
+    runs-on: ${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -723,6 +731,13 @@ jobs:
       lint_gates: ${{ steps.diff.outputs.lint_gates }}   # v1.30
       verdict: ${{ steps.guard.outputs.verdict }}
       proof: ${{ steps.guard.outputs.proof }}   # v1.30
+      # v1.48 (ruling 1024): runs-on JSON for the two hosted-capable classes,
+      # read as fromJSON(needs.preflight.outputs.runner_docker) by every job
+      # that builds or runs images and fromJSON(needs.preflight.outputs.runner)
+      # by CI Gate. `"ubuntu-latest"`, or the Dells' self-hosted label list
+      # (v1.54: whichever pool `Balanced runner pool (ruling 1137)` picks).
+      runner: ${{ steps.runner.outputs.runner }}
+      runner_docker: ${{ steps.runner.outputs.runner_docker }}
     steps:
       - name: Is a main push run of this workflow in flight?
         id: guard
@@ -835,12 +850,767 @@ jobs:
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           echo "proof=$PROOF" >> "$GITHUB_OUTPUT"
 
+      # v1.54 (Tenant Agent ruling 1137, owner order; it replaces the hosted
+      # first rule of rulings 999 and 1024, v1.48 to v1.53): the run goes to
+      # whichever of the two pools, GitHub-hosted or the Dells' self-hosted
+      # bigdisk pools, this repository uses less, so both run full. On
+      # github.com this step lists every queued and in-progress run of every
+      # workflow of this repository and their latest jobs, through the
+      # Actions API with the job token (actions: read), and counts, from that
+      # one listing, each in progress plus queued, H: hosted jobs (labels
+      # naming an ubuntu-* image and not self-hosted), S1: self-hosted jobs on
+      # bigdisk and not bigdisk-docker, and S2: jobs on bigdisk-docker. Jobs
+      # of this run are not counted: they wait on this decision. The limits
+      # are repository variables set by the Infra Department, plain decimal
+      # integers: HS = vars.CI_HOSTED_SHARE (this repository's share of the
+      # account's 40 hosted runners; unset, 0 or not a whole number gives a
+      # ::warning and HS=12, the v1.48 limit), C1 =
+      # vars.CI_SELF_HOSTED_BIGDISK and C2 = vars.CI_SELF_HOSTED_BIGDISK_DOCKER
+      # (the units of each label; either unset, 0 or not a whole number: the
+      # hosted default with a ::warning). Hosted use is H/HS; self-hosted use
+      # is the larger of S1/C1 and S2/C2. Then:
+      #   - both below their limit: the lower use wins, compared by
+      #     cross-multiplication (self-hosted wins only when S1*HS < H*C1 and
+      #     S2*HS < H*C2); a tie goes hosted;
+      #   - one pool full (H >= HS; or S1 >= C1 or S2 >= C2): the other pool;
+      #   - both full: the pool with fewer queued jobs (bigdisk and
+      #     bigdisk-docker together for the Dells); a tie goes hosted.
+      # The units are shared across repositories, so C1 and C2 can overstate
+      # this repository's free room: when they are busy elsewhere its jobs
+      # queue, S1 or S2 rises, and its runs go hosted.
+      # It outputs `runner` and `runner_docker` as runs-on JSON:
+      # `"ubuntu-latest"`, or `["self-hosted","linux","x64","bigdisk"]` and
+      # `["self-hosted","linux","x64","bigdisk-docker"]`. A count it cannot
+      # read (a reply that is not 200, a list short of its total_count, a
+      # field missing) picks nothing silently: a ::warning names why and the
+      # run takes the hosted default. One decision per run: every job of the
+      # run takes it, in every workflow that reads these outputs. Off
+      # github.com it makes no call, and each job's runs-on keeps its forge
+      # label (bigdisk, ci-gate). It runs before the checkout, beside no
+      # repository code.
+      # v1.52 (Tenant Agent order, kept): on a pull request whose head
+      # repository is not this repository (a fork, or a fork since deleted),
+      # it makes no call and outputs the hosted default with a ::notice: a
+      # fork never reaches a self-hosted runner. Its tests:
+      # test/buildgates/testdata/runner-select-tests.py.
+      - name: Balanced runner pool (ruling 1137)
+        id: runner
+        env:
+          SERVER: ${{ github.server_url }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
+          RUN_ID: ${{ github.run_id }}
+          JOB_TOKEN: ${{ github.token }}
+          HS: ${{ vars.CI_HOSTED_SHARE }}
+          C1: ${{ vars.CI_SELF_HOSTED_BIGDISK }}
+          C2: ${{ vars.CI_SELF_HOSTED_BIGDISK_DOCKER }}
+        run: |
+          set -uo pipefail
+          HOSTED='"ubuntu-latest"'
+          selfhosted() { printf '["self-hosted","linux","x64","%s"]' "$1"; }
+          emit() {
+            echo "runner: $1; runner_docker: $2"
+            { echo "runner=$1"; echo "runner_docker=$2"; } >> "$GITHUB_OUTPUT"
+          }
+          # hosted <why>: no count, so the default, with the reason shown.
+          hosted() {
+            echo "::warning::runner selection: $1; every job of this run takes the GitHub-hosted default, ubuntu-latest, and none runs on the Dells (ci-template v1.54, ruling 1137)"
+            emit "$HOSTED" "$HOSTED"
+            exit 0
+          }
+          if [ "$SERVER" != https://github.com ]; then
+            echo "not github.com: each job keeps its forge label (bigdisk, ci-gate); no selection"
+            emit "$HOSTED" "$HOSTED"
+            exit 0
+          fi
+          # v1.52: a fork's pull request runs every job on GitHub-hosted runners.
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              if [ "$HEAD_REPO" != "$REPO" ]; then
+                echo "::notice::runner selection: this pull request's head repository is not this repository (a fork); every job of this run takes the GitHub-hosted default, ubuntu-latest, and none reaches a self-hosted runner (ci-template v1.52)"
+                emit "$HOSTED" "$HOSTED"
+                exit 0
+              fi ;;
+          esac
+          # whole <value>: a whole number above 0, at most 6 digits.
+          whole() { [[ "$1" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$1))" -gt 0 ]; }
+          whole "$C1" || hosted "CI_SELF_HOSTED_BIGDISK='$C1' is unset, 0 or not a whole number, so no bigdisk job can be placed (the Infra Department sets it)"
+          whole "$C2" || hosted "CI_SELF_HOSTED_BIGDISK_DOCKER='$C2' is unset, 0 or not a whole number, so no bigdisk-docker job can be placed (the Infra Department sets it)"
+          C1=$((10#$C1)) C2=$((10#$C2))
+          if whole "$HS"; then
+            HS=$((10#$HS))
+          else
+            echo "::warning::runner selection: CI_HOSTED_SHARE='$HS' is unset, 0 or not a whole number; HS=12 until the Infra Department sets it (ci-template v1.54, ruling 1137)"
+            HS=12
+          fi
+          # get <url> <file>: 0 on a 200 reply, saved in <file>; the answer in
+          # CODE. The token reaches curl as a header from a file descriptor.
+          get() {
+            CODE=$(curl -sS --max-time 30 -o "$2" -w '%{http_code}' \
+              -H @<(printf 'Authorization: Bearer %s\n' "$JOB_TOKEN") \
+              -H 'Accept: application/vnd.github+json' "$1") || CODE="curl exit $?"
+            [ "$CODE" = 200 ]
+          }
+          # pages <url> <key> <out>: every page of a listing, its <key> items
+          # one JSON object per line in <out>. 1, with WHY set, when a reply is
+          # not 200 or the items fall short of total_count.
+          pages() {
+            local p=1 got=0 total n
+            : > "$3"
+            while :; do
+              get "$1&per_page=100&page=$p" "$RUNNER_TEMP/sel-page.json" || { WHY="$1: $CODE"; return 1; }
+              total=$(jq -er '.total_count | numbers' "$RUNNER_TEMP/sel-page.json") || { WHY="$1: 200 with no total_count"; return 1; }
+              n=$(jq -er --arg k "$2" '.[$k] | arrays | length' "$RUNNER_TEMP/sel-page.json") || { WHY="$1: 200 with no $2 list"; return 1; }
+              jq -c --arg k "$2" '.[$k][]' "$RUNNER_TEMP/sel-page.json" >> "$3"
+              got=$((got + n))
+              { [ "$got" -lt "$total" ] && [ "$n" -gt 0 ]; } || break
+              [ "$p" -lt 10 ] || { WHY="$1: more than 1000 entries"; return 1; }
+              p=$((p + 1))
+            done
+            [ "$got" -ge "$total" ] || { WHY="$1: $got of $total entries"; return 1; }
+          }
+          : > "$RUNNER_TEMP/sel-runs.jsonl"
+          for st in queued in_progress; do
+            pages "$API/runs?status=$st" workflow_runs "$RUNNER_TEMP/sel-r.jsonl" || hosted "the Actions API gave no complete run list ($WHY)"
+            cat "$RUNNER_TEMP/sel-r.jsonl" >> "$RUNNER_TEMP/sel-runs.jsonl"
+          done
+          : > "$RUNNER_TEMP/sel-jobs.jsonl"
+          for id in $(jq -r '.id' "$RUNNER_TEMP/sel-runs.jsonl" | sort -u); do
+            [ "$id" != "$RUN_ID" ] || continue
+            pages "$API/runs/$id/jobs?filter=latest" jobs "$RUNNER_TEMP/sel-j.jsonl" || hosted "the Actions API gave no complete job list ($WHY)"
+            cat "$RUNNER_TEMP/sel-j.jsonl" >> "$RUNNER_TEMP/sel-jobs.jsonl"
+          done
+          # H, S1, S2: hosted, bigdisk (not bigdisk-docker) and bigdisk-docker
+          # jobs in progress plus queued; HQ, SQ: the queued hosted and
+          # self-hosted (both kinds) ones. A job of this run is not counted.
+          read -r H S1 S2 HQ SQ < <(jq -rs --argjson run "$RUN_ID" '
+              [.[] | select(.run_id != $run and (.status == "queued" or .status == "in_progress"))
+                   | (.labels // []) as $l
+                   | {q: (.status == "queued"),
+                      p: (if ($l | any(. == "self-hosted")) then
+                            (if ($l | any(. == "bigdisk-docker")) then "s2"
+                             elif ($l | any(. == "bigdisk")) then "s1" else "x" end)
+                          elif ($l | any(startswith("ubuntu-"))) then "h"
+                          else "x" end)}] as $j
+              | def n(f): $j | map(select(f)) | length;
+              [n(.p == "h"), n(.p == "s1"), n(.p == "s2"), n(.p == "h" and .q),
+               n((.p == "s1" or .p == "s2") and .q)]
+              | map(tostring) | join(" ")' "$RUNNER_TEMP/sel-jobs.jsonl") || hosted "the job list could not be counted"
+          [ -n "${SQ:-}" ] || hosted "the job list could not be counted"
+          echo "this repository: hosted $H of CI_HOSTED_SHARE=$HS ($HQ queued); bigdisk $S1 of CI_SELF_HOSTED_BIGDISK=$C1, bigdisk-docker $S2 of CI_SELF_HOSTED_BIGDISK_DOCKER=$C2 ($SQ self-hosted queued)"
+          pick=hosted hfull=0 sfull=0
+          [ "$H" -lt "$HS" ] || hfull=1
+          { [ "$S1" -lt "$C1" ] && [ "$S2" -lt "$C2" ]; } || sfull=1
+          if [ "$hfull" = 1 ] && [ "$sfull" = 1 ]; then
+            [ "$SQ" -lt "$HQ" ] && pick=self
+            why="both pools full: hosted $HQ queued, self-hosted $SQ queued"
+          elif [ "$hfull" = 1 ]; then
+            pick=self; why="the hosted pool is full ($H of $HS)"
+          elif [ "$sfull" = 1 ]; then
+            why="the self-hosted pool is full (bigdisk $S1 of $C1, bigdisk-docker $S2 of $C2)"
+          else
+            # self-hosted use, max(S1/C1, S2/C2), below hosted use H/HS.
+            [ $((S1 * HS)) -lt $((H * C1)) ] && [ $((S2 * HS)) -lt $((H * C2)) ] && pick=self
+            why="use hosted $H/$HS, bigdisk $S1/$C1, bigdisk-docker $S2/$C2"
+          fi
+          if [ "$pick" = self ]; then
+            echo "::notice::runner selection: $why; this run's jobs run on the Dells (bigdisk, bigdisk-docker) (ci-template v1.54, ruling 1137)"
+            emit "$(selfhosted bigdisk)" "$(selfhosted bigdisk-docker)"
+          else
+            echo "::notice::runner selection: $why; this run's jobs take the GitHub-hosted default, ubuntu-latest (ci-template v1.54, ruling 1137)"
+            emit "$HOSTED" "$HOSTED"
+          fi
+
       # v1.34: the full history on a PR run for the changed-files diff, one
       # commit otherwise. No credential is left in the checkout.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: ${{ (github.event_name == 'pull_request' && env.CI_FULL_TIER != 'true') && '0' || '1' }}
           persist-credentials: false
+
+      # v1.38 (owner ruling 633, decision 219(d)): a job that names the
+      # `release` label runs only on a push to refs/heads/main or a tag, or a
+      # workflow_dispatch on main, and never for a pull request. This step
+      # reads every .github/workflows/*.yml and *.yaml of the repository as
+      # text, takes each job whose runs-on names `release` (plain, in a list,
+      # or as a quoted string inside an expression), and evaluates its `if:`
+      # under every other event: a pull_request or pull_request_target event
+      # in a workflow that has that trigger (a), and the push of another
+      # branch, a dispatch off main or on a tag, schedule, workflow_run,
+      # merge_group, release, create, issue_comment and repository_dispatch
+      # (b). A value it cannot know (vars, needs, secrets, the server) may
+      # hold anything, so the `if:` must be false whatever it holds; an `if:`
+      # it cannot read fails. It prints each file:job and the reason. A lint,
+      # not the gate: the runner side refuses such a job as well.
+      # v1.43 (ruling 833): on github.com every other job runs on a standard
+      # GitHub-hosted image on every event (c), or its runs-on line says why
+      # it cannot, `# self-hosted: <reason>`; a larger runner is refused (d).
+      # v1.46 (ruling 999): the reason names its category, hardware: or
+      # oversize: (credential: for the one Codex review job); a reason with
+      # no category is (e).
+      # v1.47 (ruling 1007): label and category are checked together. The
+      # review-only labels codex and qwen run only in code-review.yml, codex
+      # with credential: and qwen with hardware:, and credential: is only for
+      # codex; a waiver does not lift it (f).
+      # v1.48 (ruling 1024): in ci.yml, a runs-on that reads
+      # needs.preflight.outputs.runner or runner_docker is checked with the
+      # output at its default ("ubuntu-latest", which must give a standard
+      # image) and at its overflow, where exactly
+      # [self-hosted, linux, x64, bigdisk] or [..., bigdisk-docker] passes too.
+      # v1.49 (ruling 1047 (3)): the preflight job's own runs-on, which reads
+      # vars.CI_PREFLIGHT_RUNS_ON, is checked with the variable unset, where
+      # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to
+      # `"ubuntu-latest"`, where it must give a standard image.
+      # v1.52 (Tenant Agent order): a fork's head under pull_request, as under
+      # pull_request_target (v1.51), gets no unset-variable exemption, and the
+      # selection outputs read for it are the hosted default the step emits.
+      # Its tests: test/buildgates/testdata/runner-labels-tests.py.
+      - name: Runner labels (ruling 633)
+        run: |
+          python3 -I - <<'PY'
+          import glob, json, re, sys
+
+          # Reads .github/workflows/*.yml|yaml as text (no YAML library): the
+          # top-level `on:` keys, and each job's `runs-on` and `if`. A job names
+          # `release` when that label appears in its runs-on, plain, in a list or as a
+          # quoted string in an expression. Its `if` is evaluated under every event
+          # outside the release allow-list, with every value this step cannot know
+          # (vars, needs, secrets, server_url, ...) unknown; the job passes only when
+          # the `if` is false in each of them whatever the unknowns hold.
+          U = object()  # unknown value
+          OPEN = "$" "{{"  # split, so the runner does not read it as an expression
+          ALLOWED = "push to refs/heads/main or refs/tags/*, or workflow_dispatch on main"
+          PR = {"pull_request", "pull_request_target"}
+          CTX = [  # (event, ref) pairs a release job must never run on
+              ("pull_request", "refs/pull/1/merge"), ("pull_request_target", "refs/heads/main"),
+              ("push", "refs/heads/feature"), ("workflow_dispatch", "refs/heads/feature"),
+              ("workflow_dispatch", "refs/tags/v1.0.0"), ("schedule", "refs/heads/main"),
+              ("workflow_run", "refs/heads/main"), ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1"),
+              ("release", "refs/tags/v1.0.0"), ("create", "refs/tags/v1.0.0"),
+              ("issue_comment", "refs/heads/main"), ("repository_dispatch", "refs/heads/main"),
+          ]
+
+
+          def ctx_get(ev, ref, path):
+              p = path.lower()
+              name = ref.split("/", 2)[-1]
+              known = {"github.event_name": ev, "github.ref": ref, "github.event.ref": ref,
+                       "github.ref_name": name,
+                       "github.ref_type": "tag" if ref.startswith("refs/tags/") else "branch",
+                       "github.head_ref": "feature" if ev in PR else "",
+                       "github.base_ref": "main" if ev in PR else ""}
+              if p in known:
+                  return known[p]
+              if ev not in PR and (p == "github.event.pull_request" or p.startswith("github.event.pull_request.")):
+                  return None
+              return U
+
+
+          TOK = re.compile(r"\s*(?:(?P<s>'(?:[^']|'')*')|(?P<n>-?\d+(?:\.\d+)?)|(?P<op>&&|\|\||==|!=|<=|>=|[!<>()\[\],.])|(?P<id>[A-Za-z_][\w-]*|\*))")
+
+
+          def lex(s):
+              out, i = [], 0
+              while i < len(s):
+                  if s[i:].strip() == "":
+                      break
+                  m = TOK.match(s, i)
+                  if not m:
+                      raise ValueError(f"cannot read the expression at {s[i:i+20]!r}")
+                  i = m.end()
+                  if m.group("s"):
+                      out.append(("s", m.group("s")[1:-1].replace("''", "'")))
+                  elif m.group("n"):
+                      out.append(("v", float(m.group("n"))))
+                  elif m.group("op"):
+                      out.append(("op", m.group("op")))
+                  else:
+                      out.append(("id", m.group("id")))
+              return out
+
+
+          def truthy(v):
+              if v is U:
+                  return U
+              if isinstance(v, float) and v != v:
+                  return False
+              return v not in (None, False, 0, "", 0.0)
+
+
+          def num(v):
+              if v is None or v is False:
+                  return 0.0
+              if v is True:
+                  return 1.0
+              if isinstance(v, (int, float)):
+                  return float(v)
+              if isinstance(v, str):
+                  try:
+                      return float(v.strip() or 0)
+                  except ValueError:
+                      return float("nan")
+              return float("nan")
+
+
+          def eq(a, b):
+              if a is U or b is U:
+                  return U
+              if isinstance(a, str) and isinstance(b, str):
+                  return a.lower() == b.lower()
+              if type(a) is type(b) and not isinstance(a, (int, float)):
+                  return a == b
+              return num(a) == num(b)
+
+
+          class P:
+              def __init__(self, toks, get):
+                  self.t, self.i, self.get = toks, 0, get
+
+              def peek(self):
+                  return self.t[self.i] if self.i < len(self.t) else (None, None)
+
+              def take(self, want=None):
+                  k, v = self.peek()
+                  if want is not None and v != want:
+                      raise ValueError(f"expected {want!r}, found {v!r}")
+                  self.i += 1
+                  return k, v
+
+              def parse(self):
+                  v = self.orx()
+                  if self.i != len(self.t):
+                      raise ValueError(f"unexpected {self.peek()[1]!r}")
+                  return v
+
+              def orx(self):
+                  a = self.andx()
+                  while self.peek() == ("op", "||"):
+                      self.take()
+                      b = self.andx()
+                      ta = truthy(a)
+                      if ta is True:
+                          pass
+                      elif ta is False:
+                          a = b
+                      else:
+                          a = b if truthy(b) is True else U
+                  return a
+
+              def andx(self):
+                  a = self.cmp()
+                  while self.peek() == ("op", "&&"):
+                      self.take()
+                      b = self.cmp()
+                      ta = truthy(a)
+                      if ta is False:
+                          pass
+                      elif ta is True:
+                          a = b
+                      else:
+                          a = b if truthy(b) is False else U
+                  return a
+
+              def cmp(self):
+                  a = self.unary()
+                  while self.peek()[0] == "op" and self.peek()[1] in ("==", "!=", "<", "<=", ">", ">="):
+                      op = self.take()[1]
+                      b = self.unary()
+                      if op == "==":
+                          a = eq(a, b)
+                      elif op == "!=":
+                          r = eq(a, b)
+                          a = U if r is U else not r
+                      elif a is U or b is U:
+                          a = U
+                      else:
+                          x, y = (a.lower(), b.lower()) if isinstance(a, str) and isinstance(b, str) else (num(a), num(b))
+                          a = {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+                  return a
+
+              def unary(self):
+                  if self.peek() == ("op", "!"):
+                      self.take()
+                      t = truthy(self.unary())
+                      return U if t is U else not t
+                  return self.primary()
+
+              def primary(self):
+                  k, v = self.take()
+                  if k == "s" or k == "v":
+                      return v
+                  if (k, v) == ("op", "("):
+                      r = self.orx()
+                      self.take(")")
+                      return r
+                  if k != "id":
+                      raise ValueError(f"unexpected {v!r}")
+                  lv = v.lower()
+                  if lv in ("true", "false"):
+                      return lv == "true"
+                  if lv == "null":
+                      return None
+                  if self.peek() == ("op", "("):
+                      self.take()
+                      args = []
+                      if self.peek() != ("op", ")"):
+                          args.append(self.orx())
+                          while self.peek() == ("op", ","):
+                              self.take()
+                              args.append(self.orx())
+                      self.take(")")
+                      return self.call(lv, args)
+                  path, exact = v, True
+                  while self.peek() in (("op", "."), ("op", "[")):
+                      if self.take()[1] == ".":
+                          k2, v2 = self.take()
+                          if k2 != "id":
+                              raise ValueError(f"unexpected {v2!r} after '.'")
+                          path += "." + v2
+                          exact = exact and v2 != "*"
+                      else:
+                          idx = self.orx()
+                          self.take("]")
+                          if isinstance(idx, str):
+                              path += "." + idx
+                          else:
+                              exact = False
+                  return self.get(path) if exact else U
+
+              def call(self, f, a):
+                  if f == "always":
+                      return True
+                  if f in ("startswith", "endswith", "contains") and len(a) == 2:
+                      if U in a:
+                          return U
+                      if f == "contains" and isinstance(a[0], list):
+                          return any(eq(x, a[1]) is True for x in a[0])
+                      x, y = (str(s).lower() if s is not None else "" for s in a)
+                      return x.startswith(y) if f == "startswith" else x.endswith(y) if f == "endswith" else y in x
+                  if f == "fromjson" and len(a) == 1 and isinstance(a[0], str):
+                      try:
+                          return json.loads(a[0])
+                      except ValueError:
+                          return U
+                  if f == "format" and a and U not in a and isinstance(a[0], str):
+                      return re.sub(r"\{(\d+)\}", lambda m: str(a[int(m.group(1)) + 1]) if int(m.group(1)) + 1 < len(a) else m.group(0), a[0])
+                  return U  # success(), failure(), hashFiles(), ...: unknown
+
+
+          def unquote(s):
+              s = s.strip()
+              if len(s) >= 2 and s[0] == s[-1] == "'":
+                  return s[1:-1].replace("''", "'")
+              if len(s) >= 2 and s[0] == s[-1] == '"':
+                  return json.loads(s)
+              return s
+
+
+          def strip_comment(s):
+              q = None
+              for i, c in enumerate(s):
+                  if q:
+                      if c == q:
+                          q = None
+                  elif c in "'\"":
+                      q = c
+                  elif c == "#" and (i == 0 or s[i - 1] in " \t"):
+                      return s[:i].rstrip()
+              return s.rstrip()
+
+
+          def ind(line):
+              return len(line) - len(line.lstrip(" "))
+
+
+          def body(lines, i, inline):
+              """The value text of the key on line i: the inline part plus every deeper line."""
+              base, parts = ind(lines[i]), []
+              j = i + 1
+              while j < len(lines) and (not lines[j].strip() or ind(lines[j]) > base):
+                  if lines[j].strip() and not lines[j].lstrip().startswith("#"):
+                      parts.append(strip_comment(lines[j]).strip())
+                  j += 1
+              inline = strip_comment(inline).strip()
+              if inline[:1] in ("|", ">"):
+                  return (" " if inline[0] == ">" else "\n").join(parts)
+              return " ".join([inline] + parts).strip()
+
+
+          def keys_under(lines, i):
+              """(line, key) for each direct child key of the block opened on line i."""
+              base, out, child = ind(lines[i]), [], None
+              for j in range(i + 1, len(lines)):
+                  s = lines[j]
+                  if not s.strip() or s.lstrip().startswith("#"):
+                      continue
+                  if ind(s) <= base:
+                      break
+                  child = ind(s) if child is None else child
+                  if ind(s) == child:
+                      m = re.match(r"\s*(?:-\s+)?(['\"]?)([^'\":#]+)\1\s*(?::\s*(.*))?$", s)
+                      if m:
+                          out.append((j, m.group(2).strip(), m.group(3) or ""))
+              return out
+
+
+          def triggers(lines):
+              for i, s in enumerate(lines):
+                  m = re.match(r"(['\"]?)(on|true)\1\s*:\s*(.*)$", s)
+                  if m:
+                      v = strip_comment(m.group(3)).strip()
+                      if v.startswith("{"):  # a flow mapping: its keys, nested ones too
+                          return set(re.findall(r"([A-Za-z_]+)['\"]?\s*:", v))
+                      if v:
+                          return {unquote(x) for x in re.split(r"[\s,\[\]]+", v) if x}
+                      return {k for _, k, _ in keys_under(lines, i)}
+              return set()
+
+
+          # v1.43 (ruling 833): the standard GitHub-hosted images, free on a public
+          # repository; a larger runner (cores, large, xlarge, gpu) bills even there.
+          STANDARD = re.compile(r"(ubuntu-(latest|24\.04|22\.04)(-arm)?|ubuntu-slim)")
+          LARGER = re.compile(r"(cores|xlarge|large|gpu)", re.I)
+          WAIVER = re.compile(r"#\s*self-hosted:\s*(hardware|oversize|credential)\s*:\s*\S")
+          BARE = re.compile(r"#\s*self-hosted:")  # v1.46: a waiver whose reason names no category
+          # v1.47 (ruling 1007): a review-only label runs only in code-review.yml, and
+          # only with its own category; credential: is the codex job's alone.
+          REVIEW = {"codex": "credential", "qwen": "hardware"}
+          REVIEW_FILES = {"code-review.yml", "code-review.yaml"}
+          REVIEW_TOKEN = re.compile(r"(?<![\w.-])['\"]?(codex|qwen)['\"]?(?![\w-])", re.I)
+          GH = "https://github.com"
+          # v1.48 (ruling 1024): ci.yml's preflight runner selection (v1.54:
+          # `Balanced runner pool (ruling 1137)`) outputs runs-on JSON,
+          # "ubuntu-latest" or the Dells' self-hosted list ("overflow" below). In ci.yml only, a
+          # runs-on that reads exactly these outputs is checked under both: the
+          # default must be a standard image, as (c) asks of every job, and the
+          # overflow may also be exactly the list its output names. Any other
+          # self-hosted value still needs its waiver.
+          SEL_FILES = {"ci.yml", "ci.yaml"}
+          # v1.53 (Tenant Agent on trusted-firmware #821): code-review.yml's
+          # API-only guard jobs may take exactly [self-hosted, linux, x64,
+          # bigdisk] for a same-repository head under a PR event; a fork's
+          # head and every other event still take a standard image.
+          REVIEW_FILES = {"code-review.yml", "code-review.yaml"}
+          SEL_OUT = {"needs.preflight.outputs.runner": "bigdisk",
+                     "needs.preflight.outputs.runner_docker": "bigdisk-docker"}
+          OVERFLOW = [["self-hosted", "linux", "x64", v] for v in SEL_OUT.values()]
+          # v1.49 (ruling 1047 (3)): ci.yml's preflight job alone may read the
+          # repository variable CI_PREFLIGHT_RUNS_ON. Its runs-on is checked in
+          # two states of its own, in place of the selection's: unset, where
+          # exactly [self-hosted, linux, x64, bigdisk] passes too, and set to the
+          # fallback `"ubuntu-latest"`, where it must give a standard image on
+          # every event. Another job that reads the variable reads an unknown.
+          PRE_JOB = "preflight"
+          PRE_VAR = "vars.ci_preflight_runs_on"
+          PRE_READ = re.compile(r"(?<![\w.])vars\.CI_PREFLIGHT_RUNS_ON(?![\w-])", re.I)
+          HOSTED_CTX = [  # (event, ref, head repo) on github.com; o/r is this repository
+              ("push", "refs/heads/main", None), ("push", "refs/heads/feature", None),
+              ("pull_request", "refs/pull/1/merge", "o/r"), ("pull_request", "refs/pull/1/merge", "fork/r"),
+              ("workflow_dispatch", "refs/heads/main", None), ("schedule", "refs/heads/main", None),
+              # v1.51: the base-defined PR event code-review.yml and signatures.yml run on.
+              ("pull_request_target", "refs/heads/main", "o/r"), ("pull_request_target", "refs/heads/main", "fork/r"),
+          ]
+
+
+          def hosted_get(ev, ref, head, sel=None):
+              def get(path):
+                  p = path.lower()
+                  if sel and p in SEL_OUT:  # v1.48: the selection output, as JSON text
+                      # v1.52: the step outputs the hosted default for a fork's head under pull_request.
+                      fork_pr = ev == "pull_request" and head == "fork/r"
+                      return json.dumps("ubuntu-latest" if sel == "default" or fork_pr else ["self-hosted", "linux", "x64", SEL_OUT[p]])
+                  if sel in ("unset", "set") and p == PRE_VAR:  # v1.49: unset, or the fallback switch
+                      return None if sel == "unset" else json.dumps("ubuntu-latest")
+                  if p == "github.server_url":
+                      return GH
+                  if p == "github.repository":
+                      return "o/r"
+                  if p == "github.event.pull_request.head.repo.full_name":
+                      return head if ev in PR else None
+                  if p == "github.event.pull_request.draft":
+                      return False if ev in PR else None
+                  return ctx_get(ev, ref, path)
+              return get
+
+
+          def labels(value):
+              # A runs-on value's labels: a string, a list, or an expression's result.
+              if value is U or value is None:
+                  return None
+              if isinstance(value, list):
+                  return [str(x) for x in value]
+              return [str(value)]
+
+
+          def runs_on_labels(text, ev, ref, head, sel=None):
+              t = text.strip()
+              if t.startswith("group:") or t.startswith("labels:") or " labels:" in t:
+                  m = re.search(r"labels:\s*(\[[^\]]*\]|\S+)", t)
+                  t = m.group(1) if m else ""
+              m = re.fullmatch(r"\$\{\{(.*)\}\}", unquote(t), re.S)
+              if m:
+                  return labels(P(lex(m.group(1)), hosted_get(ev, ref, head, sel)).parse())
+              if t.startswith("["):
+                  return [unquote(x) for x in re.split(r"\s*,\s*", t.strip("[] ")) if x]
+              if t.startswith("- "):
+                  return [unquote(x) for x in re.split(r"\s*-\s+", " " + t) if x.strip()]
+              return [unquote(t)]
+
+
+          def review_labels(text):
+              # The review-only labels a runs-on names, in its text or in what an
+              # expression there yields on any github.com event.
+              found = {m.lower() for m in REVIEW_TOKEN.findall(text)}
+              for ev, ref, head in HOSTED_CTX:
+                  try:
+                      got = runs_on_labels(text, ev, ref, head)
+                  except ValueError:
+                      continue
+                  found |= {g.lower() for g in got or [] if g.lower() in REVIEW}
+              return sorted(found)
+
+
+          def review_finding(path, where, ro, ro_line):
+              # v1.47 (ruling 1007): label and category together, whatever the waiver says.
+              names = review_labels(ro)
+              m = WAIVER.search(ro_line)
+              cat = m.group(1) if m else None
+              base = path.replace("\\", "/").rsplit("/", 1)[-1]
+              if names and base not in REVIEW_FILES:
+                  return (f"{where}: (f) names the review-only label {', '.join(names)}; ruling 1007 reserves codex and "
+                          f"qwen to code-review.yml whatever the `# self-hosted:` waiver says")
+              if names:
+                  wrong = [n for n in names if cat != REVIEW[n]]
+                  if len(names) > 1 or wrong:
+                      return (f"{where}: (f) runs on {', '.join(names)} with the category {cat or 'none'}; ruling 1007 pairs "
+                              f"codex with `credential:` and qwen with `hardware:`, one review label per job")
+                  return None
+              if cat == "credential":
+                  return (f"{where}: (f) uses the `credential:` category without the codex label; ruling 1007 keeps it "
+                          f"for code-review.yml's Codex review job alone")
+              return None
+
+
+          def names_release(text):
+              return re.search(r"(?<![\w.-])['\"]?release['\"]?(?![\w-])", text) is not None
+
+
+          def condition(text):
+              t = unquote(text) if text else ""
+              m = re.fullmatch(r"\s*\$\{\{(.*)\}\}\s*", t, re.S)
+              if m and OPEN not in m.group(1):
+                  return m.group(1)
+              if OPEN in t:
+                  raise ValueError("text around the expression makes it a string, which is always true")
+              return t
+
+
+          def check(path):
+              lines = open(path, encoding="utf-8").read().splitlines()
+              on = triggers(lines)
+              bad = []
+              for i, s in enumerate(lines):
+                  if re.match(r"jobs\s*:\s*(#.*)?$", s):
+                      for j, job, _ in keys_under(lines, i):
+                          ro = cond = ro_line = None
+                          for k, key, inline in keys_under(lines, j):
+                              if key == "runs-on":
+                                  ro, ro_line = body(lines, k, inline), lines[k]
+                              elif key == "if":
+                                  cond = body(lines, k, inline)
+                          where = f"{path}:{job}"
+                          if ro is not None and not names_release(ro):
+                              # v1.43 (ruling 833): hosted first.
+                              if LARGER.search(ro) and re.search(r"ubuntu|windows|macos", ro):
+                                  bad.append(f"{where}: (d) names a larger GitHub-hosted runner ({ro}); it bills on a public repository")
+                                  continue
+                              rf = review_finding(path, where, ro, ro_line)
+                              if rf:
+                                  bad.append(rf)
+                                  continue
+                              if WAIVER.search(ro_line):
+                                  continue
+                              off = []
+                              sels = ("default", "overflow") if path.replace("\\", "/").rsplit("/", 1)[-1] in SEL_FILES else (None,)
+                              if sels[0] is not None and job == PRE_JOB and PRE_READ.search(ro):
+                                  sels = ("unset", "set")  # v1.49: its own two states, no selection output
+                              for ev, ref, head in HOSTED_CTX:
+                                  # v1.51: under pull_request_target, a fork's head never
+                                  # reaches a self-hosted runner, overflow or not.
+                                  # v1.52: under pull_request too.
+                                  fork_target = ev in PR and head == "fork/r" and ev in on
+                                  for sel in sels:
+                                      try:
+                                          got = runs_on_labels(ro, ev, ref, head, sel)
+                                      except ValueError as e:
+                                          off.append(f"{ev} ({ref}): cannot be read ({e})")
+                                          continue
+                                      if got is not None and sel == "overflow" and got in OVERFLOW and not fork_target:
+                                          continue
+                                      if sel == "unset" and got == OVERFLOW[0] and not fork_target:
+                                          continue
+                                      if (sel is None and got == OVERFLOW[0] and ev in PR and head == "o/r"
+                                              and path.replace("\\", "/").rsplit("/", 1)[-1] in REVIEW_FILES):
+                                          continue  # v1.53: a same-repository head's review guard
+                                      if got is None or len(got) != 1 or not STANDARD.fullmatch(got[0]):
+                                          what = "an unknown label" if got is None else ", ".join(got)
+                                          note = ", runner selection overflow" if sel == "overflow" else ""
+                                          if sel in ("unset", "set"):
+                                              note = ", CI_PREFLIGHT_RUNS_ON " + ("unset" if sel == "unset" else 'set to "ubuntu-latest"')
+                                          if fork_target and got is not None:
+                                              note += f", {ev}: a fork never reaches a self-hosted runner"
+                                          off.append(f"{ev} ({ref}{', fork' if head == 'fork/r' else ''}{note}): {what}")
+                              if off and BARE.search(ro_line):
+                                  bad.append(f"{where}: (e) its `# self-hosted:` reason names no category; ruling 999 allows a self-hosted job "
+                                             f"only as `# self-hosted: hardware: <reason>` or `# self-hosted: oversize: <reason>`; it runs on " + "; ".join(dict.fromkeys(off)))
+                              elif off:
+                                  bad.append(f"{where}: (c) does not run on a standard GitHub-hosted image on github.com and its runs-on "
+                                             f"line gives no `# self-hosted: hardware|oversize: <reason>`; it runs on " + "; ".join(dict.fromkeys(off)))
+                              continue
+                          if ro is None:
+                              continue
+                          if cond is None:
+                              if on & PR:
+                                  bad.append(f"{where}: (a) names `release` in a workflow with a pull_request trigger, and has no `if:`")
+                              bad.append(f"{where}: (b) names `release` and has no `if:` restricting it to {ALLOWED}")
+                              continue
+                          try:
+                              expr = condition(cond)
+                              toks = lex(expr)
+                              runs = []
+                              for ev, ref in CTX:
+                                  r = truthy(P(toks, lambda p: ctx_get(ev, ref, p)).parse())
+                                  if r is not False:
+                                      runs.append((ev, ref))
+                          except ValueError as e:
+                              bad.append(f"{where}: (b) names `release` and its `if:` cannot be read ({e})")
+                              continue
+                          pr = [c for c in runs if c[0] in PR and c[0] in on]
+                          if pr:
+                              bad.append(f"{where}: (a) names `release` and a {pr[0][0]} event can run it")
+                          rest = [c for c in runs if c not in pr]
+                          if rest:
+                              bad.append(f"{where}: (b) names `release` and its `if:` does not restrict it to {ALLOWED}; it can run on "
+                                         + ", ".join(dict.fromkeys(f"{ev} ({ref})" for ev, ref in rest)))
+              return bad
+
+
+          files = sorted(glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml"))
+          bad = []
+          for f in files:
+              try:
+                  bad += check(f)
+              except (OSError, UnicodeError) as e:
+                  bad.append(f"{f}: cannot be read ({e})")
+          for b in bad:
+              print(f"::error::{b}")
+          if bad:
+              print(f"{len(bad)} runner-label finding(s) in {len(files)} workflow file(s): a `release` job runs only on {ALLOWED}, never for a pull request (ruling 633); every other job runs on a standard GitHub-hosted image, or its runs-on line names a hardware or oversize reason (rulings 833, 999); codex and qwen run only in code-review.yml, with their own category (ruling 1007)")
+              sys.exit(1)
+          print(f"OK: {len(files)} workflow file(s); every job that names `release` runs only on {ALLOWED}, and every other job on a standard GitHub-hosted image or with a hardware or oversize reason")
+          PY
 
       - name: Is every changed file docs or markdown?
         id: diff
@@ -949,7 +1719,7 @@ jobs:
   # PR, and deps-check left this job, so every step reads only the tree.
   lint:
     name: Lint [lint, gosec, build tags]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     needs: [preflight]
     if: ${{ !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 60
@@ -1114,7 +1884,7 @@ jobs:
   # below, so no single job runs the whole -race suite on a 4-core runner.
   image:
     name: Devcontainer image [build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     needs: [preflight]   # v1.24 (CA m749, m751 (a)); v1.29.3
     # v1.29.3: on a schedule run, only on the schedule guard's `run`. v1.30:
     # on every event only on `run` (not `refused`, not `proven`), and never
@@ -1469,7 +2239,7 @@ jobs:
   # and the job; the gates after it run on the next push.
   lint-gates:
     name: Lint Gates [toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     needs: [preflight]     # v1.29.3; v1.30
     # v1.26: never on a draft. v1.29.3: on a schedule run, only on the
     # schedule guard's `run`. v1.30: only on `run` on every event, and on a PR
@@ -1579,7 +2349,7 @@ jobs:
     # only on the schedule guard's `run`. v1.30: only on `run` on every event
     # (a proven main push and a refused run skip it).
     if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the image job: it was the other multi-node QUIC load on a shared
     # runner host. Kept so a forge whose ubuntu-latest runners share a host
@@ -1690,7 +2460,7 @@ jobs:
     name: Soak [integration image]
     # v1.30: a dispatch off main is refused, so soak runs only on `run`.
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight.outputs.verdict == 'run' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the integration job, as integration is behind the image job: one
     # multi-node QUIC load at a time, and a red integration run is not soaked.
@@ -2549,7 +3319,7 @@ jobs:
   # devops.md §8a: the alpha regime).
   ci-gate:
     name: CI Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner || '"ubuntu-latest"') || 'ci-gate' }}   # v1.48
     # v1.29.3: on a schedule run the schedule guard decides. `busy` skips the
     # gate, so `CI / CI Gate (schedule)` posts `skipped` (Gitea 1.27.1 posts a
     # skipped job as `skipped`, not `success`), never a green nightly. Every
