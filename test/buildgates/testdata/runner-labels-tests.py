@@ -493,6 +493,12 @@ case("K5 a ref_type check alone does not prove a tag push for a dispatch: (b)",
 case("K6 a guard naming another pull request's ref fails (a)",
      {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.ref == 'refs/pull/2/merge' }}"))}, 1,
      ["ci.yml:pub: (a)"])
+case("K7 a guard naming a pull request's head branch fails (a)",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.head_ref == 'hotfix' }}"))}, 1,
+     ["ci.yml:pub: (a)"])
+case("K8 a guard naming a pull request's base branch fails (a)",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.base_ref == 'release' }}"))}, 1,
+     ["ci.yml:pub: (a)"])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
