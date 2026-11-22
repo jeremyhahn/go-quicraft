@@ -228,6 +228,12 @@ case("C12 a whole number converts to its digits: contains(1, '1.0') is false, so
      {"ci.yml": wf(PR_ON, job(REL, "${{ !contains(1, '1.0') }}"))}, 1, ["ci.yml:pub: (a)"])
 case("C13 a relational guard is still evaluated: false == (1 < 2) and 1 < 2 == false are false, never runnable",
      {"ci.yml": wf(PR_ON, job(REL, "${{ false == 1 < 2 }}"), job(REL, "${{ 1 < 2 == false }}", name="pub2"))}, 0, ["OK:"])
+case("C14 format's doubled braces are literal: format('{{0}}', 'x') is '{0}', so == '{0}' is true",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ format('{{0}}', 'x') == '{0}' }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C15 a format placeholder past the arguments is an error, never provably false",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ format('{1}', 'x') == 'y' }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C16 a stray format brace is an error, never provably false",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ format('{0', 'x') == 'y' }}"))}, 1, ["ci.yml:pub: (a)"])
 
 # D. hosted first (v1.43)
 ROUTE = ("${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || "
