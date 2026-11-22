@@ -234,6 +234,35 @@ case("C15 a format placeholder past the arguments is an error, never provably fa
      {"ci.yml": wf(PR_ON, job(REL, "${{ format('{1}', 'x') == 'y' }}"))}, 1, ["ci.yml:pub: (a)"])
 case("C16 a stray format brace is an error, never provably false",
      {"ci.yml": wf(PR_ON, job(REL, "${{ format('{0', 'x') == 'y' }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C17 a push to a branch the samples do not name still runs it",
+     {"r.yml": wf("on: push\n", job(REL, "github.event_name == 'push' && github.ref == 'refs/heads/develop'"))}, 1,
+     ["r.yml:pub: (b)", "push (refs/heads/feature)"])
+case("C18 a ref prefix the samples do not hit still runs it",
+     {"r.yml": wf("on: push\n", job(REL, "github.event_name == 'push' && startsWith(github.ref, 'refs/heads/rel')"))}, 1,
+     ["r.yml:pub: (b)"])
+case("C19 an event the samples do not list still runs it",
+     {"r.yml": wf("on: [push, deployment]\n", job(REL, "github.event_name == 'deployment'"))}, 1,
+     ["r.yml:pub: (b)", "another event"])
+case("C20 GitHub reads '1_0' as NaN, so '1_0' != 10 is true on a pull request",
+     {"ci.yml": wf(PR_ON, job(REL, "${{ '1_0' != 10 }}"))}, 1, ["ci.yml:pub: (a)"])
+case("C21 pull_request_target's ref is its base branch, which need not be main",
+     {"t.yml": wf("on:\n  pull_request_target:\n",
+                  job(REL, "github.event_name == 'pull_request_target' && github.ref != 'refs/heads/main'"))}, 1,
+     ["t.yml:pub: (a)"])
+case("C22 a pull request's base branch is not known",
+     {"ci.yml": wf(PR_ON, job(REL, "github.event_name == 'pull_request' && github.base_ref == 'develop'"))}, 1,
+     ["ci.yml:pub: (a)"])
+case("C23 a release on a branch named by its ref name only",
+     {"r.yml": wf("on: push\n", job(REL, "github.event_name == 'push' && github.ref_name == 'develop'"))}, 1,
+     ["r.yml:pub: (b)"])
+case("C24 a guard that names every sampled event but one still runs on an unlisted event",
+     {"r.yml": wf("on: push\n", job(REL, "${{ !contains(fromJSON('[\"push\", \"pull_request\", \"pull_request_target\", "
+                                         "\"workflow_dispatch\", \"schedule\", \"workflow_run\", \"merge_group\", \"release\", "
+                                         "\"create\", \"issue_comment\", \"repository_dispatch\"]'), github.event_name) }}"))}, 1,
+     ["r.yml:pub: (b)", "another event"])
+case("A9 a main-only push guard passes, with unlisted events in the triggers",
+     {"r.yml": wf("on: [push, workflow_dispatch, deployment]\n",
+                  job(REL, "github.ref == 'refs/heads/main' && github.event_name == 'push'"))}, 0, ["OK:"])
 
 # D. hosted first (v1.43)
 ROUTE = ("${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || "
