@@ -1100,6 +1100,33 @@ jobs:
           ]
 
 
+          # LOCAL: CTX is a sample, not every context. A guard is also tried on
+          # each string literal it holds, read as an event and as a ref (as is,
+          # and under refs/heads/ and refs/tags/), and every pair outside the
+          # allow-list must leave it false.
+          def allowed(ev, ref):
+              ev, ref = ev.lower(), ref.lower()
+              return (ev == "push" and (ref == "refs/heads/main" or ref.startswith("refs/tags/"))) or \
+                  (ev == "workflow_dispatch" and ref == "refs/heads/main")
+
+
+          def contexts(toks, on):
+              lits = [v for k, v in toks if k == "s" and isinstance(v, str)]
+              evs = [ev for ev, _ in CTX] + sorted(on) + [v.lower() for v in lits if re.fullmatch(r"[A-Za-z_]+", v)]
+              refs = [ref for _, ref in CTX]
+              for v in lits:
+                  name = v[len("refs/"):].split("/", 1)[-1] if v.lower().startswith("refs/") else v
+                  refs += [v] if v.lower().startswith("refs/") else []
+                  refs += ["refs/heads/" + name, "refs/tags/" + name, v + "x" if v.endswith("/") else v]
+              out = list(CTX)
+              for ev in dict.fromkeys(evs):
+                  for ref in dict.fromkeys(refs):
+                      # pull_request's ref is always refs/pull/N/merge: sampled in CTX.
+                      if ev != "pull_request" and not allowed(ev, ref) and (ev, ref) not in out:
+                          out.append((ev, ref))
+              return out
+
+
           def ctx_get(ev, ref, path):
               p = path.lower()
               name = ref.split("/", 2)[-1]
@@ -1589,7 +1616,7 @@ jobs:
                               expr = condition(cond)
                               toks = lex(expr)
                               runs = []
-                              for ev, ref in CTX:
+                              for ev, ref in contexts(toks, on):  # LOCAL
                                   r = truthy(P(toks, lambda p: ctx_get(ev, ref, p)).parse())
                                   if r is not False:
                                       runs.append((ev, ref))
