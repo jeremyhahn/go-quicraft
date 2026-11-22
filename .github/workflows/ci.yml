@@ -978,27 +978,59 @@ jobs:
           OPEN = "$" "{{"  # split, so the runner does not read it as an expression
           ALLOWED = "push to refs/heads/main or refs/tags/*, or workflow_dispatch on main"
           PR = {"pull_request", "pull_request_target"}
+          OTHER_EV = "another event"  # stands for every event CTX does not name
           CTX = [  # (event, ref) pairs a release job must never run on
               ("pull_request", "refs/pull/1/merge"), ("pull_request_target", "refs/heads/main"),
+              ("pull_request_target", "refs/heads/feature"),
               ("push", "refs/heads/feature"), ("workflow_dispatch", "refs/heads/feature"),
               ("workflow_dispatch", "refs/tags/v1.0.0"), ("schedule", "refs/heads/main"),
               ("workflow_run", "refs/heads/main"), ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1"),
-              ("release", "refs/tags/v1.0.0"), ("create", "refs/tags/v1.0.0"),
+              ("release", "refs/tags/v1.0.0"), ("create", "refs/tags/v1.0.0"), ("create", "refs/heads/feature"),
               ("issue_comment", "refs/heads/main"), ("repository_dispatch", "refs/heads/main"),
+              (OTHER_EV, "refs/heads/main"), (OTHER_EV, "refs/heads/feature"), (OTHER_EV, "refs/tags/v1.0.0"),
           ]
+          EVENTS = {ev for ev, _ in CTX if ev != OTHER_EV}
+
+
+          # LOCAL (security): a sampled ref, ref name or event other than main and a named event stands for a class; a literal decides it only when the whole class agrees, else unknown
+          class Cls:
+              def __init__(self, prefix, never=()):
+                  self.prefix, self.never = prefix, {n.lower() for n in never}
+
+              def eq(self, lit):
+                  l = lit.lower()
+                  return False if not l.startswith(self.prefix) or l in self.never else U
+
+              def starts(self, lit):
+                  l = lit.lower()
+                  if self.prefix.startswith(l):
+                      return True
+                  return U if l.startswith(self.prefix) else False
+
+
+          def ref_cls(ref):
+              # (ref, ref_name) for the class a sampled ref stands for; refs/heads/main is itself.
+              # A tag named main is assumed not to exist, so ref_name 'main' is a branch.
+              if ref == "refs/heads/main":
+                  return ref, "main"
+              for p in ("refs/heads/gh-readonly-queue/", "refs/pull/", "refs/tags/"):
+                  if ref.startswith(p):
+                      return Cls(p), Cls("", ["main"])
+              return Cls("refs/heads/", ["refs/heads/main"]), Cls("", ["main"])
 
 
           def ctx_get(ev, ref, path):
               p = path.lower()
-              name = ref.split("/", 2)[-1]
-              known = {"github.event_name": ev, "github.ref": ref, "github.event.ref": ref,
-                       "github.ref_name": name,
+              r, name = ref_cls(ref)
+              # A pull request's head and base branches are any branch.
+              pr = Cls("") if ev in PR else ""
+              known = {"github.event_name": Cls("", EVENTS) if ev == OTHER_EV else ev,
+                       "github.ref": r, "github.event.ref": r, "github.ref_name": name,
                        "github.ref_type": "tag" if ref.startswith("refs/tags/") else "branch",
-                       "github.head_ref": "feature" if ev in PR else "",
-                       "github.base_ref": "main" if ev in PR else ""}
+                       "github.head_ref": pr, "github.base_ref": pr}
               if p in known:
                   return known[p]
-              if ev not in PR and (p == "github.event.pull_request" or p.startswith("github.event.pull_request.")):
+              if ev in EVENTS and ev not in PR and (p == "github.event.pull_request" or p.startswith("github.event.pull_request.")):
                   return None
               return U
 
@@ -1051,7 +1083,7 @@ jobs:
 
           # LOCAL (security): a value as a GitHub expression string; U where the form is not certain
           def tostr(v):
-              if v is U:
+              if v is U or isinstance(v, Cls):
                   return U
               if v is None:
                   return ""
@@ -1070,6 +1102,9 @@ jobs:
           def eq(a, b):
               if a is U or b is U:
                   return U
+              if isinstance(a, Cls) or isinstance(b, Cls):
+                  c, o = (a, b) if isinstance(a, Cls) else (b, a)
+                  return c.eq(o) if isinstance(o, str) else U
               # LOCAL (security): arrays and objects compare by identity, as in GitHub expressions
               if isinstance(a, (list, dict)) or isinstance(b, (list, dict)):
                   return a is b
@@ -1146,7 +1181,7 @@ jobs:
                   while self.peek()[0] == "op" and self.peek()[1] in ("<", "<=", ">", ">="):
                       op = self.take()[1]
                       b = self.unary()
-                      if a is U or b is U:
+                      if a is U or b is U or isinstance(a, Cls) or isinstance(b, Cls):
                           a = U
                       else:
                           x, y = (a.lower(), b.lower()) if isinstance(a, str) and isinstance(b, str) else (num(a), num(b))
@@ -1208,6 +1243,8 @@ jobs:
                   if f in ("startswith", "endswith", "contains") and len(a) == 2:
                       if U in a:
                           return U
+                      if f == "startswith" and isinstance(a[0], Cls) and isinstance(a[1], str):
+                          return a[0].starts(a[1])
                       if f == "contains" and isinstance(a[0], list):
                           return any(eq(x, a[1]) is True for x in a[0])
                       # LOCAL (security): operands convert to strings as GitHub does, else unknown
@@ -1384,7 +1421,7 @@ jobs:
 
           def labels(value):
               # A runs-on value's labels: a string, a list, or an expression's result.
-              if value is U or value is None:
+              if value is U or value is None or isinstance(value, Cls):
                   return None
               if isinstance(value, list):
                   return [str(x) for x in value]
