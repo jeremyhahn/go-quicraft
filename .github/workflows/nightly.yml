@@ -8,14 +8,19 @@
 # scripts ci.yml ships (in-toolchain-image.sh, ci-image-cache.sh,
 # trim-ci-caches.sh). timeout-minutes is CUSTOMIZE, ceil(1.5 x the 72-hour p95).
 # >>> CUSTOMIZE (go-quicraft): this file adopts the v1.9 lint-sweeps job only.
-# Its schedule, its fips job and the template's trivy job are not taken: the
-# nightly is dispatch-only and FIPS runs in ci.yml's full tier, where CI Gate
-# checks it (#293).
+# Its fips job and the template's trivy job are not taken: FIPS runs in
+# ci.yml's full tier, where CI Gate checks it (#293). The schedule is taken
+# (#1198).
 # <<< CUSTOMIZE
 #
 # Nightly jobs that verify slow-moving properties: lint sweeps, Trivy and
-# dependency freshness. They gate no merge and run only when dispatched: the coordinator
-# dispatches the nightly by hand, and there is no schedule (#293).
+# dependency freshness. They gate no merge.
+#
+# Schedule (#1198): the owner's order of 2026-11-22, verbatim: "the nightlys
+# shouldnt require any manual executiion, it should be getting run
+# automatically!" It supersedes the 2026-10-11 dispatch-only rule (#293) for
+# this workflow only. The nightly runs daily at `5 5 * * *` (05:05 UTC) and
+# can still be dispatched by hand.
 #
 # The FIPS job moved to ci.yml's full tier (#293), where CI Gate checks it.
 
@@ -23,6 +28,8 @@ name: Nightly
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '5 5 * * *'
 
 env:
   # Must match ci.yml's pin.
