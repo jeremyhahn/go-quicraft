@@ -179,7 +179,7 @@ other replica as its anchor, and no identity may be bound to two replicas. See
 | `ErrClosed` | Host is closed, or closed while the start ran |
 | `ErrInvalidConfig` | `ShardID == 0`, `ReplicaID == 0`, or `cfg.Validate()` failed |
 | `ErrShardAlreadyExists` | Shard already running on this host |
-| `ErrShardNotReady` | A concurrent `StartShard` of the same shard is still in progress (transient) |
+| `ErrShardNotReady` | A concurrent `StartShard` of the same shard is still in progress, or a stop of the shard is still closing its state machine (transient) |
 | `ErrImportInProgress` | An `ImportSnapshot` of this shard is running (transient) |
 | `*ReplicaRetiredError` | `RemoveData` retired this replica ID on this host. Rejoin under a new ID |
 | `ErrDataDirChanged` (match with `errors.Is`; the message names the recorded and the requested `DataDir`) | `cfg.DataDir` differs from the `DataDir` this replica was first started with (its bootstrap record, or for a replica with none, a pending `RemoveData` removal intent or else its snapshot record). Its snapshots stay under the recorded tree: restart with the recorded `DataDir` |

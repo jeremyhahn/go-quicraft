@@ -648,7 +648,7 @@ limit, so a state machine that blocks in `Update` blocks shutdown.
 | an add returns `ErrDuplicateMemberAddress` or `ErrDuplicateMemberIdentity` | another active member already holds that address or key; remove it first, or use a different one |
 | `StartShard` fails with "was started with DataDir ..., refusing DataDir ..." | the replica's records place its data under another `Config.DataDir`; restart with the recorded one the error names |
 | `StartShard` returns `*ReplicaRetiredError` | `RemoveData` retired the ID; use a new replica ID |
-| `StartShard` returns `ErrImportInProgress` or `ErrShardNotReady` | an import or another start of the shard is running; retry |
+| `StartShard` returns `ErrImportInProgress` or `ErrShardNotReady` | an import, another start or a stop of the shard is running; retry |
 | `NewHost` fails opening the WAL with `ErrUnknownPayloadType` | usually an encrypted WAL opened without its barrier; otherwise data from an incompatible build, which must be wiped and re-synced |
 | new replica never catches up, `unknown_member` drops on it | its `MemberIdentities` anchor does not name the replica sending to it; name the leader |
 | `ErrSystemBusy` or `*BusyError` from `Propose` | memory limits reached; back off and retry |
