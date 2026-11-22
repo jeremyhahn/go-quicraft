@@ -1,4 +1,12 @@
-# ci-template: v1.53 (customized)
+# ci-template: v1.54 (customized)
+# v1.54: the template's preflight runner selection step balances the hosted
+# and self-hosted pools by the repository variables CI_HOSTED_SHARE,
+# CI_SELF_HOSTED_BIGDISK and CI_SELF_HOSTED_BIGDISK_DOCKER, and drops
+# HOSTED_JOBS_PER_REPO and HOSTED_QUEUE_GRACE_SECONDS. This repository does
+# not carry that step (see LOCAL below), so v1.54 changes comments only here.
+# v1.53 item (0) is now taken: the `Runner labels` step lets code-review.yml's
+# API-only jobs take exactly [self-hosted, linux, x64, bigdisk] for a
+# same-repository head under a PR event (code-review.yml is carried as written).
 # v1.53: main's concurrency group is `main-{event}`, so a newer main run
 # cancels the older one (the concurrency block below has the template's line).
 # v1.52: a pull request whose head repository is not this repository, a
@@ -1395,6 +1403,11 @@ jobs:
           # overflow may also be exactly the list its output names. Any other
           # self-hosted value still needs its waiver.
           SEL_FILES = {"ci.yml", "ci.yaml"}
+          # v1.53: code-review.yml's API-only guard jobs may take exactly
+          # [self-hosted, linux, x64, bigdisk] for a same-repository head under
+          # a PR event; a fork's head and every other event still take a
+          # standard image.
+          REVIEW_FILES = {"code-review.yml", "code-review.yaml"}
           SEL_OUT = {"needs.preflight.outputs.runner": "bigdisk",
                      "needs.preflight.outputs.runner_docker": "bigdisk-docker"}
           OVERFLOW = [["self-hosted", "linux", "x64", v] for v in SEL_OUT.values()]
@@ -1631,6 +1644,9 @@ jobs:
                                       if (sel == "unset" and got == OVERFLOW[0] and not fork_target
                                               and not (ev == "pull_request" and head == "fork/r")):
                                           continue  # a fork pull request's head never takes the pool
+                                      if (sel is None and got == OVERFLOW[0] and ev in PR and head == "o/r"
+                                              and path.replace("\\", "/").rsplit("/", 1)[-1] in REVIEW_FILES):
+                                          continue  # v1.53: a same-repository head's review guard
                                       if got is None or len(got) != 1 or not STANDARD.fullmatch(got[0]):
                                           what = "an unknown label" if got is None else ", ".join(got)
                                           note = ", runner selection overflow" if sel == "overflow" else ""
