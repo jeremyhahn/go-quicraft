@@ -4846,6 +4846,17 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return ErrShardNotReady
 	}
 	defer h.startingShards.Delete(cfg.ShardID)
+	// A teardown of this shard that has removed its nodeState may still be
+	// closing the state machine (see closingShards). A replacement started in
+	// that window could be stopped in turn and overwrite or clear the closing
+	// marker, letting RemoveData delete the earlier replica's snapshots while
+	// its Close still runs. Refuse the start, transiently, until the teardown
+	// has finished. The node map check above comes first and teardown marks
+	// the shard before deleting its nodeState, so a shard found absent there
+	// is already marked if its Close has not returned.
+	if _, closing := h.closingShards.Load(cfg.ShardID); closing {
+		return ErrShardNotReady
+	}
 	releaseImportLock, importIdle := h.tryAcquireImportLock(cfg.ShardID)
 	if !importIdle {
 		return ErrImportInProgress
