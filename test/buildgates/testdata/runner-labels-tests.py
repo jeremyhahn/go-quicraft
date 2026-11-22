@@ -169,7 +169,7 @@ case("A3 workflow_dispatch on main",
 case("A4 push-or-dispatch guard folded over lines, beside a PR trigger",
      {"ci.yml": wf(PR_ON, job(REL, ">-\n      ${{ (github.event_name == 'push' &&\n"
                                    "      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')))\n"
-                                   "      || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') }}"),
+                                   "      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}"),  # LOCAL: K2
                    job("ubuntu-latest", name="test"))}, 0)
 case("A5 runs-on mapping form, guarded, with RELEASE_RUNNER",
      {"ci.yml": wf(PR_ON, "  pub:\n    runs-on:\n      group: rel\n      labels: [self-hosted, release]\n"
@@ -469,6 +469,19 @@ case("J2 a variable with a hosted fallback is not hosted routing: (c)",
      {"ci.yml": wf(PR_ON, job("${{ vars.RUNNER || 'ubuntu-latest' }}", name="lint"))}, 1, ["ci.yml:lint: (c)"])
 case("J3 an unknown left operand of && keeps a false right operand's falsiness",
      {"r.yml": wf("on: push\n", job(REL, "${{ vars.MODE && false }}"))}, 0, ["OK:"])
+
+
+# K. the sampled contexts are not exhaustive (LOCAL): a guard's own literals are tried as refs and events
+case("K1 a push guard on another branch fails (b)",
+     {"r.yml": wf("on: push\n", job(REL, "${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}"))}, 1,
+     ["r.yml:pub: (b)", "push (refs/heads/dev)"])
+case("K2 workflow_dispatch checked by ref_name alone fails (b): a tag can carry the branch's name",
+     {"r.yml": wf("on: [workflow_dispatch]\n",
+                  job(REL, "${{ github.event_name == 'workflow_dispatch' && github.ref_name == 'main' }}"))}, 1,
+     ["r.yml:pub: (b)", "workflow_dispatch (refs/tags/main)"])
+case("K3 an event the samples lack, named by the guard, fails (b)",
+     {"r.yml": wf("on: [deployment]\n", job(REL, "${{ github.event_name == 'deployment' }}"))}, 1,
+     ["r.yml:pub: (b)", "deployment ("])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
