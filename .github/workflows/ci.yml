@@ -3364,7 +3364,9 @@ jobs:
   # added passes; when they cannot be read, the event's labels are used with
   # a ::warning. pull_request has no `labeled` type (v1.25.4), so a label
   # takes effect on the next push or a rerun of this job.
-  # testdata/row-job-tests.py holds the cases.
+  # LOCAL: a successful lookup replaces the event's labels, so a label
+  # removed since the event no longer exempts the pull request (R13).
+  # test/buildgates/testdata/row-job-tests.py holds the cases.
   row:
     name: Row [one SPEC row per pull request]
     needs: [preflight]
@@ -3410,7 +3412,7 @@ jobs:
                   req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok,
                                                              "Accept": "application/vnd.github+json"})
                   with urllib.request.urlopen(req, timeout=20) as r:
-                      labels |= {l["name"] for l in json.load(r)}
+                      labels = {l["name"] for l in json.load(r)}  # LOCAL (R13): the live set replaces the event's
               except Exception as e:
                   print(f"::warning::Row: the live labels could not be read ({type(e).__name__}); the event's labels are used")
           hit = sorted(labels & exempt)
