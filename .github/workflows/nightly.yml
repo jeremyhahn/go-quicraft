@@ -108,6 +108,12 @@ jobs:
     timeout-minutes: 60
     name: Trivy
     runs-on: ubuntu-latest
+    # The SARIF upload writes a code scanning analysis; the default token is
+    # read-only, so the first scheduled run failed the upload step with
+    # "Resource not accessible by integration".
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -177,6 +183,11 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: ${{ env.GO_VERSION }}
+
+      # deps-check runs govulncheck on every module, and GitHub-hosted runners
+      # bake none of the analysis tools. Same pin as scripts/tool-pins.sh.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
 
       # The same `make deps-check` a developer runs. It walks every go.mod in
       # the tree and exempts a lagging module only when its require line
