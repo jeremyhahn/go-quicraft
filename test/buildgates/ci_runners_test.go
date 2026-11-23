@@ -76,6 +76,7 @@ var ciRunnerSelection = map[string]string{
 	"lint-gates":  dockerRunsOn,
 	"integration": dockerRunsOn,
 	"soak":        dockerRunsOn,
+	"row":         gateRunsOn,
 	"ci-gate":     gateRunsOn,
 }
 

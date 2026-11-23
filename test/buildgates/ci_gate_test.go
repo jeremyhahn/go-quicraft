@@ -215,7 +215,7 @@ const guardRun = `needs.preflight.outputs.verdict == 'run'`
 
 // gateIf is ci-gate's condition (ci-template v1.29.3): always(), except that a
 // busy schedule run skips the gate so it never posts a green nightly.
-const gateIf = `${{ always() && (github.event_name != 'schedule' || needs.preflight.outputs.verdict != 'busy') }}`
+const gateIf = `${{ (startsWith(github.event_name, 'pull_request') && always() || !cancelled()) && (github.event_name != 'schedule' || needs.preflight.outputs.verdict != 'busy') }}`
 
 // outsideGate is the job ci-gate does not need (ci-template v1.30):
 // publish-images runs on a push to main alone, after the gate's verdict
