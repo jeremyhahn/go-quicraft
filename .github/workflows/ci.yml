@@ -3425,6 +3425,101 @@ jobs:
           done
           exit $BAD
 
+  # v1.55 (2026-11-22, the Tenant Agent's 12:47Z order, owner: every piece of
+  # work corresponds to a SPEC row, ruling 1136): the Row job. A pull request
+  # whose head branch is `row/<n>-*` passes when issue #n is named on the
+  # BASE commit, in a table row of docs/SPEC.md, and nowhere else (ruling
+  # 1143 (3): SPEC only; ROADMAP.md does not count) (`#n` not preceded by a word character or `/`, so `owner/repo#n` and
+  # `#123` for `#12` do not count). A pull request with a label in
+  # ROW_EXEMPT_LABELS (ci, main-fix, std), or from a branch that starts with
+  # one of ROW_EXEMPT_BRANCHES (merge-train/: a train carries row PRs that
+  # passed), passes too. Anything else is red with a ::error naming the rule.
+  # The base is checked out and read with `git show <base>:<path>`, so a
+  # pull request cannot add its own row and pass on it: the row lands first,
+  # through a docs PR. The job runs where CI Gate runs (the preflight
+  # selection's `runner` output: hosted for a fork's head, so a fork never
+  # reaches a self-hosted runner) and runs no code of the head. The labels are read live from
+  # the API with the job token (read-only), so a rerun after a label is
+  # added passes; when they cannot be read, the event's labels are used with
+  # a ::warning. pull_request has no `labeled` type (v1.25.4), so a label
+  # takes effect on the next push or a rerun of this job.
+  # testdata/row-job-tests.py holds the cases.
+  row:
+    name: Row [one SPEC row per pull request]
+    needs: [preflight]
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner || '"ubuntu-latest"') || 'ci-gate' }}   # v1.55: CI Gate's runner
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      ROW_EXEMPT_LABELS: 'ci main-fix std'   # space-separated; CUSTOMIZE only by Tenant Agent order
+      ROW_EXEMPT_BRANCHES: 'merge-train/'    # space-separated branch prefixes
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Row check (one SPEC row per pull request)
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          LABELS_URL: ${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100
+          JOB_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re, subprocess, sys, urllib.request
+          head = os.environ.get("HEAD_REF", "")
+          base = os.environ.get("BASE_SHA", "")
+          exempt = set(os.environ.get("ROW_EXEMPT_LABELS", "").split())
+          prefixes = os.environ.get("ROW_EXEMPT_BRANCHES", "").split()
+          rule = "every pull request corresponds to one SPEC row (ci-template v1.55, ruling 1136)"
+          labels = set()
+          try:
+              labels |= {str(x) for x in json.loads(os.environ.get("EVENT_LABELS") or "[]") or []}
+          except ValueError:
+              pass
+          url, tok = os.environ.get("LABELS_URL", ""), os.environ.get("JOB_TOKEN", "")
+          if url and tok:
+              try:
+                  req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok,
+                                                             "Accept": "application/vnd.github+json"})
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      labels |= {l["name"] for l in json.load(r)}
+              except Exception as e:
+                  print(f"::warning::Row: the live labels could not be read ({type(e).__name__}); the event's labels are used")
+          hit = sorted(labels & exempt)
+          if hit:
+              print(f"Row: exempt label '{hit[0]}'; no row is required")
+              sys.exit(0)
+          for p in prefixes:
+              if head.startswith(p):
+                  print(f"Row: exempt branch prefix '{p}'; no row is required")
+                  sys.exit(0)
+          m = re.match(r"row/(\d+)-", head)
+          if not m:
+              print(f"::error::Row: head branch '{head}' is not row/<n>-* and the pull request carries none of the labels {' '.join(sorted(exempt))}; {rule}")
+              sys.exit(1)
+          if not re.fullmatch(r"[0-9a-f]{40}", base):
+              print(f"::error::Row: no base commit to read ('{base}'); {rule}")
+              sys.exit(1)
+          n = m[1]
+          pat = re.compile(rf"(?<![\w/])#{n}(?!\d)")
+          r = subprocess.run(["git", "show", f"{base}:docs/SPEC.md"], capture_output=True, text=True)
+          if r.returncode != 0:
+              print(f"Row: docs/SPEC.md is absent on the base {base[:12]}")
+          rows = [l for l in r.stdout.splitlines() if l.lstrip().startswith("|")] if r.returncode == 0 else []
+          if any(pat.search(l) for l in rows):
+              print(f"Row: issue #{n} is named in a docs/SPEC.md table row on the base {base[:12]}")
+              sys.exit(0)
+          print(f"::error::Row: issue #{n} (head branch '{head}') is named in no docs/SPEC.md table row on the base {base[:12]} (ROADMAP.md does not count); land the row in SPEC through a docs PR first, or label the pull request {' or '.join(sorted(exempt))}; {rule}")
+          sys.exit(1)
+          PY
+
   # The single required check (devops.md §1). Every job above must appear in
   # BOTH the needs list and the results check — a gate that can pass vacuously
   # is worse than no gate. Do not use join(needs.*.result); it evaluates empty
@@ -3445,12 +3540,12 @@ jobs:
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
     # check line below; remove none of the template's jobs. v1.30: lint
     # joins; publish-images is the one job outside the gate (see its comment).
-    needs: [preflight, lint, image, unit, coverage, lint-gates, integration, soak, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips, signatures]
+    needs: [preflight, row, lint, image, unit, coverage, lint-gates, integration, soak, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips, signatures]
     steps:
       - name: Fail closed on any non-success
         env:
-          # The full tier is CI_FULL_TIER (v1.23): every event but a PR, and a
-          # PR labelled ci:full. A job marked `full` may be skipped below only
+          # The full tier is CI_FULL_TIER (v1.23); v1.41: every event, a PR
+          # included, but a refused dispatch. A job marked `full` may be skipped below only
           # when it is not selected; a `pr` job may never be skipped.
           FULL_TIER: ${{ env.CI_FULL_TIER }}
           # v1.24: a `nightly` job runs on schedule and workflow_dispatch only.
@@ -3466,6 +3561,8 @@ jobs:
           PROOF: ${{ needs.preflight.outputs.proof }}
           DOCS_ONLY: ${{ needs.preflight.outputs.docs_only == 'true' }}
           LINT_GATES_SEL: ${{ needs.preflight.outputs.lint_gates != 'false' }}
+          # v1.55: the Row job runs on pull_request only (a `pull` job).
+          PULL: ${{ github.event_name == 'pull_request' }}
         run: |
           if [ "${DRAFT}" = true ]; then
             echo "FAIL draft pull request: no CI runs on a draft. Mark it ready, then push an empty commit to start its run."
@@ -3473,7 +3570,7 @@ jobs:
           fi
           BAD=0
           echo "full tier selected: ${FULL_TIER}; nightly selected: ${NIGHTLY}"
-          check() { # <job> <result> <pr|code|scoped|full|nightly>
+          check() { # <job> <result> <pr|code|scoped|full|pull|nightly>
             case "$2" in
               success) echo "OK   $1";;
               skipped)
@@ -3485,6 +3582,8 @@ jobs:
                   echo "SKIP $1 (no changed file matches LINT_GATES_PATTERN)"
                 elif [ "$3" = full ] && [ "${FULL_TIER}" != true ]; then
                   echo "SKIP $1 (full tier not selected)"
+                elif [ "$3" = pull ] && [ "${PULL}" != true ]; then
+                  echo "SKIP $1 (pull request only)"
                 elif [ "$3" = nightly ] && [ "${NIGHTLY}" != true ]; then
                   echo "SKIP $1 (nightly and dispatch only)"
                 else
@@ -3507,7 +3606,9 @@ jobs:
           # full tier by its `if:` is marked full, one gated to schedule and
           # workflow_dispatch is nightly; every other job is pr. v1.30: a job
           # that skips on a docs-only PR is code, and lint-gates is scoped.
+          # v1.55: row runs on pull_request only, so it is pull.
           check preflight   "${{ needs.preflight.result }}" pr
+          check row         "${{ needs.row.result }}" pull
           check lint        "${{ needs.lint.result }}" pr
           check image       "${{ needs.image.result }}" code
           check unit        "${{ needs.unit.result }}" code

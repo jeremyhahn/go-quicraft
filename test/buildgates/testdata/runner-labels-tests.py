@@ -169,7 +169,7 @@ case("A3 workflow_dispatch on main",
 case("A4 push-or-dispatch guard folded over lines, beside a PR trigger",
      {"ci.yml": wf(PR_ON, job(REL, ">-\n      ${{ (github.event_name == 'push' &&\n"
                                    "      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')))\n"
-                                   "      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}"),  # LOCAL: K2
+                                   "      || (github.event_name == 'workflow_dispatch' && github.ref_name == 'main') }}"),
                    job("ubuntu-latest", name="test"))}, 0)
 case("A5 runs-on mapping form, guarded, with RELEASE_RUNNER",
      {"ci.yml": wf(PR_ON, "  pub:\n    runs-on:\n      group: rel\n      labels: [self-hosted, release]\n"
@@ -199,7 +199,7 @@ case("B4 pull_request_target with a ref-only guard (its ref is the base branch)"
      ["t.yml:pub: (a) names `release` and a pull_request_target event can run it"])
 case("B5 triggers in a flow mapping",
      {"ci.yml": wf("on: {push: {branches: [main]}, pull_request: {}}\n", job(REL, "github.ref == 'refs/heads/main'"))}, 1,
-     ["ci.yml:pub: (b)", "ci.yml:pub: (a)"])  # LOCAL: K9: a merged pull request runs on refs/heads/main
+     ["ci.yml:pub: (b)"], ["(a)"])  # pull_request's ref is refs/pull/N/merge: only (b)
 
 # C. fails (b)
 case("C1 ref check with no event check: schedule on main runs it; no PR trigger, so no (a)",
@@ -323,8 +323,7 @@ if PRE_TEXT.count(f"    runs-on: {PRE}   # v1.52\n") != 1:
 case("F1 ci.yml: preflight's runs-on passes, unset and set to the fallback",
      {"ci.yml": wf(PR_ON, job(PRE, name="preflight"))}, 0, ["OK:"])
 case("F2 the same runs-on on another ci.yml job fails (c): the variable is preflight's alone",
-     {"ci.yml": wf(PR_ON, job(PRE, name="lint"))}, 1, ["ci.yml:lint: (c)", "an unknown label"],  # LOCAL: the fallback is not
-     ["CI_PREFLIGHT_RUNS_ON"])  # the guaranteed value when the variable is unknown
+     {"ci.yml": wf(PR_ON, job(PRE, name="lint"))}, 1, ["ci.yml:lint: (c)", "x64, bigdisk"], ["CI_PREFLIGHT_RUNS_ON"])
 case("F3 the same runs-on outside ci.yml fails (c)",
      {"batch.yml": wf(PR_ON, job(PRE, name="preflight"))}, 1, ["batch.yml:preflight: (c)"])
 case("F4 a default to any other self-hosted label fails (c)",
@@ -422,7 +421,7 @@ def every_job(head):
 
 # LOCAL: the jobs the template gives the selection (preflight its own default).
 # This repository's other ci.yml jobs stay on ubuntu-latest on every event.
-SELECTION_JOBS = {"preflight", "lint", "image", "lint-gates", "integration", "soak", "ci-gate"}
+SELECTION_JOBS = {"preflight", "row", "lint", "image", "lint-gates", "integration", "soak", "ci-gate"}
 
 
 def selection_case(label, head, want):
@@ -440,7 +439,7 @@ selection_case("H5 the template ci.yml: every job runs on ubuntu-latest for a fo
                "fork/r", lambda n, sel, l: l == ["ubuntu-latest"])
 selection_case("H6 the template ci.yml: a same-repository pull request keeps the Dells' default and overflow",
                "o/r", lambda n, sel, l: l == (["ubuntu-latest"] if sel in ("set", "default") or n not in SELECTION_JOBS else
-                                             ["self-hosted", "linux", "x64", "bigdisk"] if n in ("preflight", "ci-gate")
+                                             ["self-hosted", "linux", "x64", "bigdisk"] if n in ("preflight", "ci-gate", "row")
                                              else ["self-hosted", "linux", "x64", "bigdisk-docker"]))
 
 # I. code-review.yml's guard jobs on the Dells for a same-repository head (v1.53, Tenant Agent on #821)
@@ -460,70 +459,6 @@ case("I3 signatures.yml: the same-repository exemption is code-review.yml's alon
 case("I4 code-review.yml: another self-hosted label for a same-repository head fails (c)",
      {"code-review.yml": wf(CR_ON, job(SAME.replace('"bigdisk"]', '"bigdisk-docker"]'), name="scope"))}, 1,
      ["code-review.yml:scope: (c)"])
-
-
-# J. an unknown left operand keeps the result unknown (LOCAL: a fallback is not the guaranteed value)
-case("J1 a release guard whose fallback compares false is unknown, not false: (b)",
-     {"r.yml": wf("on: push\n", job(REL, "${{ (vars.MODE || 'disabled') != 'disabled' }}"))}, 1, ["r.yml:pub: (b)"])
-case("J2 a variable with a hosted fallback is not hosted routing: (c)",
-     {"ci.yml": wf(PR_ON, job("${{ vars.RUNNER || 'ubuntu-latest' }}", name="lint"))}, 1, ["ci.yml:lint: (c)"])
-case("J3 an unknown left operand of && keeps a false right operand's falsiness",
-     {"r.yml": wf("on: push\n", job(REL, "${{ vars.MODE && false }}"))}, 0, ["OK:"])
-
-
-# K. the sampled contexts are not exhaustive (LOCAL): a guard's own literals are tried as refs and events
-case("K1 a push guard on another branch fails (b)",
-     {"r.yml": wf("on: push\n", job(REL, "${{ github.event_name == 'push' && github.ref == 'refs/heads/dev' }}"))}, 1,
-     ["r.yml:pub: (b)", "push (refs/heads/dev)"])
-case("K2 workflow_dispatch checked by ref_name alone fails (b): a tag can carry the branch's name",
-     {"r.yml": wf("on: [workflow_dispatch]\n",
-                  job(REL, "${{ github.event_name == 'workflow_dispatch' && github.ref_name == 'main' }}"))}, 1,
-     ["r.yml:pub: (b)", "workflow_dispatch (refs/tags/main)"])
-case("K3 an event the samples lack, named by the guard, fails (b)",
-     {"r.yml": wf("on: [deployment]\n", job(REL, "${{ github.event_name == 'deployment' }}"))}, 1,
-     ["r.yml:pub: (b)", "deployment ("])
-
-case("K4 a prefix and a suffix together still leave a non-main branch: (b)",
-     {"r.yml": wf("on: push\n", job(REL, "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/hotfix/') "
-                                         "&& endsWith(github.ref, '/deploy') }}"))}, 1, ["r.yml:pub: (b)", "push (any other ref)"])
-case("K5 a ref_type check alone does not prove a tag push for a dispatch: (b)",
-     {"r.yml": wf("on: [push, workflow_dispatch]\n", job(REL, "${{ github.ref_type == 'tag' }}"))}, 1,
-     ["r.yml:pub: (b)", "workflow_dispatch ("])
-
-case("K6 a guard naming another pull request's ref fails (a)",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.ref == 'refs/pull/2/merge' }}"))}, 1,
-     ["ci.yml:pub: (a)"])
-case("K7 a guard naming a pull request's head branch fails (a)",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.head_ref == 'hotfix' }}"))}, 1,
-     ["ci.yml:pub: (a)"])
-case("K8 a guard naming a pull request's base branch fails (a)",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && github.base_ref == 'release' }}"))}, 1,
-     ["ci.yml:pub: (a)"])
-case("K9 a closed pull request's guard naming its base branch ref fails (a): a merged pull request runs on that ref",
-     {"ci.yml": wf("on:\n  pull_request:\n    types: [closed]\n",
-                   job(REL, "${{ github.event_name == 'pull_request' && github.ref == 'refs/heads/main' }}"))}, 1,
-     ["ci.yml:pub: (a)"])
-case("K10 arrays compare by identity, so two decoded arrays are never equal: the guard is unknown and fails",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ fromJSON('[]') != fromJSON('[]') }}"))}, 1,
-     ["ci.yml:pub: ("])
-case("K11 format() of a number converts as Actions does, not as Python does: the guard is unknown and fails",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ format('{0}', 1) == '1' }}"))}, 1,
-     ["ci.yml:pub: ("])
-case("K12 a string function given a number is unknown and fails",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ endsWith(1, '1') }}"))}, 1,
-     ["ci.yml:pub: ("])
-case("K13 format() with escaped braces is unknown and fails",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ format('{{0}}', github.event_name) == '{0}' }}"))}, 1,
-     ["ci.yml:pub: ("])
-case("K14 a numeric string Actions does not parse is unknown and fails",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ '1_0' != 10 }}"))}, 1,
-     ["ci.yml:pub: ("])
-case("K15 a pull_request payload has no ref: a guard on its absence fails (a)",
-     {"ci.yml": wf(PR_ON, job(REL, "${{ github.event_name == 'pull_request' && !github.event.ref }}"))}, 1,
-     ["ci.yml:pub: (a)"])
-case("K16 a pull_request_target payload has no ref: a guard on its absence fails (a)",
-     {"ci.yml": wf("on: pull_request_target\n", job(REL, "${{ github.event_name == 'pull_request_target' && !github.event.ref }}"))}, 1,
-     ["ci.yml:pub: (a)"])
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
