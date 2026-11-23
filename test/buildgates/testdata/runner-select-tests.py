@@ -24,9 +24,11 @@ also fails a case whose curl command line carries the token.
      queues go hosted.
   C. No silent pick: C1 or C2 unset, 0 or not a whole number gives hosted
      with a ::warning and no call; HS unset, 0 or not a number gives a ::warning and
-     HS=12; a reply that is not 200, no total_count, a list short of its
-     total, or a job list that cannot be counted gives hosted with a
-     ::warning.
+     HS=12; a reply that is not 200, no total_count, more than 1000
+     entries, or a job list that cannot be counted gives hosted with a
+     ::warning. A list short of its total is a lower bound (v1.59): it is
+     counted and the choice still made, with a ::notice naming the
+     shortfall (C8, C9, C12, C13).
   D. Off github.com: no call, the default output, the forge labels kept.
   E. ci-template v1.52 (kept): a pull request whose head repository is not
      this repository (a fork, or one since deleted) gets the hosted default
@@ -260,16 +262,31 @@ case("C6 a 500 on a job list: hosted, with a warning",
      pool(h=1)[:2] + [["runs/101/jobs", 500, "{}"]], HOSTED, HOSTED, ["::warning::", "no complete job list", "500"])
 case("C7 a 200 with no total_count: hosted, with a warning",
      [["runs?status=queued", 200, '{"workflow_runs":[]}']], HOSTED, HOSTED, ["::warning::", "no total_count"])
-case("C8 a run list short of its total: hosted, with a warning",
+# C8, C9, C12, C13 (v1.59): a list short of its total_count is a lower
+# bound, counted and still chosen from, with a notice; never hosted for it.
+case("C8 a run list short of its total: a lower bound, still chosen (self-hosted), with a notice",
      [["runs?status=queued", 200, runs()],
       ["runs?status=in_progress&per_page=100&page=1", 200, runs(101, total=5)],
       ["runs?status=in_progress&per_page=100&page=2", 200, runs(total=5)],
       ["runs/101/jobs", 200, jobs(*[jobj(101, "in_progress", U) for _ in range(9)])]],
-     HOSTED, HOSTED, ["::warning::", "1 of 5 entries"])
-case("C9 a job list short of its total: hosted, with a warning",
+     SELF, SELF_D, ["::notice::", "1 of 5 entries", "lower bound", "hosted 9 of CI_HOSTED_SHARE=10"], ["::warning::"])
+case("C9 a job list short of its total: a lower bound, still chosen (self-hosted), with a notice",
      pool(h=1)[:2] + [["runs/101/jobs?filter=latest&per_page=100&page=1", 200, jobs(jobj(101, "in_progress", U), total=4)],
                       ["runs/101/jobs?filter=latest&per_page=100&page=2", 200, jobs(total=4)]],
-     HOSTED, HOSTED, ["::warning::", "1 of 4 entries"])
+     SELF, SELF_D, ["::notice::", "runs/101/jobs?filter=latest: 1 of 4 entries", "lower bound"], ["::warning::"])
+case("C12 go-qrdb #1680: runs?status=queued gives 1 of 2 entries, hosted full: self-hosted",
+     [["runs?status=queued&per_page=100&page=1", 200, runs(101, total=2)],
+      ["runs?status=queued&per_page=100&page=2", 200, runs(total=2)],
+      ["runs?status=in_progress", 200, runs(100)],
+      ["runs/101/jobs", 200, jobs(*[jobj(101, "queued", U) for _ in range(10)])]],
+     SELF, SELF_D, ["::notice::", "runs?status=queued: 1 of 2 entries", "the hosted pool is full (10 of 10)"],
+     ["::warning::", "no complete run list"])
+case("C13 a short list where hosted use is the lower: hosted, with the notice and no warning",
+     [["runs?status=queued&per_page=100&page=1", 200, runs(101, total=2)],
+      ["runs?status=queued&per_page=100&page=2", 200, runs(total=2)],
+      ["runs?status=in_progress", 200, runs(100)],
+      ["runs/101/jobs", 200, jobs(jobj(101, "in_progress", U), *[jobj(101, "in_progress", B1) for _ in range(5)])]],
+     HOSTED, HOSTED, ["::notice::", "1 of 2 entries", "hosted 1 of CI_HOSTED_SHARE=10"], ["::warning::"])
 case("C10 a job list that is not a list of objects: hosted, with a warning",
      pool(h=1)[:2] + [["runs/101/jobs", 200, '{"total_count":1,"jobs":[7]}']],
      HOSTED, HOSTED, ["::warning::", "could not be counted"])
