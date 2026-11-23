@@ -56,8 +56,9 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | contrib-dragonboat | shipped | A Dragonboat API compatibility layer over the `Host`, in its own module under `contrib/dragonboat/`. | [multi-group-host/](multi-group-host/) (architecture.md, Package structure) |
 | testing | shipped | The test infrastructure: suite organisation, build tags, fault injectors, fuzzing, linearizability verification, coverage gates and benchmark regression. [overview.md](testing/overview.md) | [testing/](testing/) |
 | release | shipped | Public releasability: what may be published from this tree, the development-tooling exclusion list and the `test/releasability` gate; the release recipe (`make release-candidate`, `make release-alpha`). [public-releasability.md](release/public-releasability.md) | [release/](release/) |
+| maintenance | in progress | A standing row (owner ruling 1234) for dependency updates and CI configuration: dependency bumps, automated and manual, and CI workflow changes, template adoptions included, are worked on one row branch and land as PRs from it. It stays open and gates no release. | [#1202](../../issues/1202) |
 
-Every feature is shipped; no feature is in progress, planned or future.
+Every feature is shipped except the standing `maintenance` row, which stays in progress; no feature is planned or future.
 
 ## Decisions
 
