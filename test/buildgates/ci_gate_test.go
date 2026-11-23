@@ -170,9 +170,19 @@ func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 
 // fullTierIf is the condition every full-tier job carries, and the
 // expression of the workflow's CI_FULL_TIER, which ci-gate reads into
-// FULL_TIER (#293; ci-template v1.23: every event but a PR, and a PR
-// labelled ci:full).
-const fullTierIf = `github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')`
+// FULL_TIER (ci-template v1.41, ruling 742 (2): PR/main parity. Every event,
+// a pull request included, but a workflow_dispatch off main and off
+// ci/deps-bump, which the schedule guard refuses).
+const fullTierIf = `github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump'`
+
+// fullLabelEnv is the workflow's CI_FULL_LABEL (ci-template v1.41): `ci:full`
+// on a pull request selects no tier; it only turns off the docs-only and
+// lint-gates path scopes.
+const fullLabelEnv = `contains(github.event.pull_request.labels.*.name, 'ci:full')`
+
+// pullIf is the Row job's condition (ci-template v1.55): a non-draft pull
+// request only. CI Gate checks it as `pull`.
+const pullIf = `github.event_name == 'pull_request' && !github.event.pull_request.draft`
 
 // nightlyIf is the condition every nightly job carries, and the expression
 // ci-gate reads into NIGHTLY (ci-template v1.24, Company Agent m751 (e): the
@@ -192,11 +202,11 @@ const draftFullTierIf = `(` + fullTierIf + `) && ` + notDraft
 // draft run reads as passed.
 const draftGateFail = `if [ "${DRAFT}" = true ]; then`
 
-// fullTierEnv is the workflow's CI_FULL_TIER (ci-template v1.30 fix 5): the
-// full tier is every event but a PR and a workflow_dispatch off main, and a
-// PR labelled ci:full. Jobs keep fullTierIf; a dispatch off main is refused
-// by the schedule guard, so its full-tier jobs skip on the verdict.
-const fullTierEnv = `(github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')) || contains(github.event.pull_request.labels.*.name, 'ci:full')`
+// fullTierEnv is the workflow's CI_FULL_TIER (ci-template v1.30 fix 5,
+// v1.41): the full tier is every event, a pull request included, but a
+// workflow_dispatch off main and off ci/deps-bump; the schedule guard refuses
+// such a dispatch, so its full-tier jobs skip on the verdict.
+const fullTierEnv = fullTierIf
 
 // guardRun is the schedule guard's verdict (ci-template v1.29.3, v1.30): every
 // bigdisk job ANDs it onto its condition, and ci-gate reads its skip as passed
@@ -244,6 +254,19 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 
 	if !strings.Contains(body, "\n  CI_FULL_TIER: ${{ "+fullTierEnv+" }}\n") {
 		t.Errorf("the workflow's CI_FULL_TIER is not the full-tier condition %q (ci-template v1.30)", fullTierEnv)
+	}
+	if !strings.Contains(body, "\n  CI_FULL_LABEL: ${{ "+fullLabelEnv+" }}\n") {
+		t.Errorf("the workflow's CI_FULL_LABEL is not %q (ci-template v1.41)", fullLabelEnv)
+	}
+	if !strings.Contains(body, `if [ "$EVENT" = pull_request ] && [ "$CI_FULL_LABEL" != true ]; then`) {
+		t.Errorf("the changed-files step does not turn the path scopes off on CI_FULL_LABEL (ci-template v1.41)")
+	}
+	// ci-template v1.41: ci:full selects no tier, so no job's `if:` reads it.
+	for _, j := range ciJobs(t, body) {
+		job := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(j) + `:\n(?:(?:    |      |\n).*\n)*`).FindString(body)
+		if cond, _ := jobCondition(job); strings.Contains(cond, "ci:full") {
+			t.Errorf("job %q's `if:` reads the ci:full label; a pull request runs the full tier without it (ci-template v1.41)", j)
+		}
 	}
 	if !strings.Contains(body, "FULL_TIER: ${{ env.CI_FULL_TIER }}") {
 		t.Errorf("%s's FULL_TIER is not ${{ env.CI_FULL_TIER }}", gateJobName)
@@ -298,6 +321,11 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 			if !strings.Contains(cond, "needs.preflight.outputs.lint_gates != 'false'") {
 				t.Errorf("job %q is tagged scoped in %s but its `if:` does not test lint_gates", j, gateJobName)
 			}
+		case "pull":
+			// ci-template v1.55: the Row job runs on a non-draft pull request only.
+			if cond != pullIf {
+				t.Errorf("job %q is tagged pull in %s but lacks `if: ${{ %s }}`", j, gateJobName, pullIf)
+			}
 		case "pr":
 			// The v1.26 draft guard, with the schedule guard's verdict, is the
 			// one `if:` a PR-tier job may carry.
@@ -306,7 +334,7 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 					"must run on every event, and %s fails it when skipped", j, gateJobName)
 			}
 		default:
-			t.Errorf("job %q's check line in %s has tier %q; want `pr`, `code`, `scoped`, `full` or `nightly`",
+			t.Errorf("job %q's check line in %s has tier %q; want `pr`, `code`, `scoped`, `full`, `pull` or `nightly`",
 				j, gateJobName, tiers[j])
 		}
 	}
