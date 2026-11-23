@@ -2359,7 +2359,8 @@ jobs:
   # compose stack on the runner host started by `make integration-test`. The
   # stack is named per run under the repo's prefix, the job reaps stale stacks
   # first (v1.18) and keeps its own teardown last under `if: always()`.
-  # v1.23: full tier only (CI_FULL_TIER's expression); never on a plain PR.
+  # v1.41 (ruling 742 (2)): every non-draft PR, as main; a docs-only PR
+  # skips it, and CI Gate reads it as `code`.
   #
   # Hosted runners: the suite is dealt over IT_SHARDS shards by test-file
   # size (`make it-shard-packages`), each its own compose stack (IT_PROJECT
@@ -2369,6 +2370,8 @@ jobs:
     # v1.26: never on a draft PR, ci:full or not. v1.29.3: on a schedule run,
     # only on the schedule guard's `run`. v1.30: only on `run` on every event
     # (a proven main push and a refused run skip it).
+    # v1.41 (ruling 742 (2)): every PR, as main; a docs-only PR skips it, as
+    # it skips build and make coverage, and CI Gate reads it as `code`.
     if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     # >>> CUSTOMIZE (go-quicraft)
@@ -2617,7 +2620,10 @@ jobs:
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump')$!1 && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     needs: [image, integration, preflight]
     timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
@@ -2688,8 +2694,9 @@ jobs:
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
     runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
     if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
@@ -2756,8 +2763,9 @@ jobs:
   zero-rtt:
     name: 0-RTT replay policy [no -race, toolchain image]
     runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
     if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
@@ -2897,8 +2905,9 @@ jobs:
   cross-arch:
     name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }}, toolchain image)
     runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
     if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the builds (6 h cap)
@@ -2981,8 +2990,9 @@ jobs:
   modules:
     name: Nested module build, vet and test [toolchain image]
     runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
     if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the modules (6 h cap)
@@ -3052,7 +3062,10 @@ jobs:
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration, toolchain image]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump')$!1 && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     needs: [integration, preflight]
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
@@ -3130,7 +3143,10 @@ jobs:
   fips:
     name: FIPS [toolchain image]
     runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump')$!1 && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     needs: [integration, preflight]
     timeout-minutes: 120     # hosted runner: a cold toolchain image build, then the unsharded fips140=only run (6 h cap)
     env:
