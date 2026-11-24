@@ -15,13 +15,13 @@ also fails a case whose curl command line carries the token.
      plus queued, this run's jobs not counted) against HS=CI_HOSTED_SHARE,
      C1=CI_SELF_HOSTED_BIGDISK and C2=CI_SELF_HOSTED_BIGDISK_DOCKER; hosted
      use H/HS against self-hosted use max(S1/C1, S2/C2), by
-     cross-multiplication, and a tie goes hosted. Completed jobs, jobs with
+     cross-multiplication, and a tie goes self-hosted. Completed jobs, jobs with
      no runner label and other self-hosted labels do not count; a hosted job
      never counts as self-hosted.
   B. Full pools: one full sends the run to the other (the self-hosted pool
      is full when S1 >= C1 or S2 >= C2, each alone); both full takes the
      shorter queue (bigdisk and bigdisk-docker queued together), and equal
-     queues go hosted.
+     queues go self-hosted.
   C. No silent pick: C1 or C2 unset, 0 or not a whole number gives hosted
      with a ::warning and no call; HS unset, 0 or not a number gives a ::warning and
      HS=12; a reply that is not 200, no total_count, more than 1000
@@ -189,18 +189,18 @@ case("A1 hosted use lower: hosted",
      ["hosted 2 of CI_HOSTED_SHARE=10", "bigdisk 5 of CI_SELF_HOSTED_BIGDISK=10", "bigdisk-docker 0 of CI_SELF_HOSTED_BIGDISK_DOCKER=10"], ["::warning::"])
 case("A2 self-hosted use lower: self-hosted",
      pool(h=5, s1=2, s2=2), SELF, SELF_D, ["::notice::", "run on the Dells"], ["::warning::"])
-case("A3 equal use: hosted",
-     pool(h=3, s2=3), HOSTED, HOSTED, ["use hosted 3/10, bigdisk 0/10, bigdisk-docker 3/10"])
-case("A4 equal use by cross-multiplication (2/10 against 4/20): hosted",
-     pool(h=2, s1=4), HOSTED, HOSTED, c1="20")
+case("A3 equal use: self-hosted",
+     pool(h=3, s2=3), SELF, SELF_D, ["use hosted 3/10, bigdisk 0/10, bigdisk-docker 3/10"])
+case("A4 equal use by cross-multiplication (2/10 against 4/20): self-hosted",
+     pool(h=2, s1=4), SELF, SELF_D, c1="20")
 case("A5 self-hosted use is the larger kind: S2/C2 3/6 against hosted 4/20 goes hosted",
      pool(h=4, s1=0, s2=3), HOSTED, HOSTED, hs="20", c2="6")
 case("A6 both kinds below hosted use: 9/20 hosted against 1/6 and 1/6 goes self-hosted",
      pool(h=9, s1=1, s2=1), SELF, SELF_D, hs="20", c1="6", c2="6")
-case("A7 one kind ties hosted use: hosted (1/10 hosted, bigdisk 1/10)",
-     pool(h=1, s1=1, s2=0), HOSTED, HOSTED)
-case("A8 nothing in flight: hosted (a tie at 0)",
-     pool(), HOSTED, HOSTED, ["hosted 0 of", "bigdisk 0 of", "bigdisk-docker 0 of"])
+case("A7 one kind ties hosted use: self-hosted (1/10 hosted, bigdisk 1/10)",
+     pool(h=1, s1=1, s2=0), SELF, SELF_D)
+case("A8 nothing in flight: self-hosted (a tie at 0)",
+     pool(), SELF, SELF_D, ["hosted 0 of", "bigdisk 0 of", "bigdisk-docker 0 of"])
 case("A9 queued jobs count with in-progress ones",
      pool(h=1, hq=3, s1=1, s1q=1, s2q=1), SELF, SELF_D, ["hosted 4 of", "(3 queued)", "bigdisk 2 of", "bigdisk-docker 1 of", "(2 self-hosted queued)"])
 case("A10 hosted jobs never count as self-hosted; completed, unlabelled and other self-hosted labels do not count",
@@ -239,9 +239,9 @@ case("B5 both full, self-hosted queue shorter: self-hosted",
 case("B6 both full, hosted queue shorter: hosted",
      pool(h=10, hq=1, s1=5, s2=8, s2q=2), HOSTED, HOSTED, ["both pools full: hosted 1 queued, self-hosted 2 queued"])
 case("B7 both full, the self-hosted queue counts both kinds",
-     pool(h=8, hq=2, s1=8, s1q=1, s2=9, s2q=1), HOSTED, HOSTED, ["self-hosted 2 queued"])
-case("B8 both full, equal queues: hosted",
-     pool(h=12, s1=12), HOSTED, HOSTED, ["both pools full: hosted 0 queued, self-hosted 0 queued"])
+     pool(h=9, hq=1, s1=8, s1q=1, s2=9, s2q=1), HOSTED, HOSTED, ["hosted 1 queued, self-hosted 2 queued"])
+case("B8 both full, equal queues: self-hosted",
+     pool(h=12, s1=12), SELF, SELF_D, ["both pools full: hosted 0 queued, self-hosted 0 queued"])
 
 # C. no silent pick
 for var, kw in (("CI_SELF_HOSTED_BIGDISK", "c1"), ("CI_SELF_HOSTED_BIGDISK_DOCKER", "c2")):

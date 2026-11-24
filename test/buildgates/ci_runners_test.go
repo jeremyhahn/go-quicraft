@@ -70,14 +70,23 @@ const (
 // selection to its runs-on expression; every other ci.yml job runs on
 // hostedRunner.
 var ciRunnerSelection = map[string]string{
-	"preflight":   preflightRunsOn,
-	"lint":        dockerRunsOn,
-	"image":       dockerRunsOn,
-	"lint-gates":  dockerRunsOn,
-	"integration": dockerRunsOn,
-	"soak":        dockerRunsOn,
-	"row":         gateRunsOn,
-	"ci-gate":     gateRunsOn,
+	"preflight":          preflightRunsOn,
+	"lint":               dockerRunsOn,
+	"image":              dockerRunsOn,
+	"unit":               dockerRunsOn,
+	"coverage":           dockerRunsOn,
+	"lint-gates":         dockerRunsOn,
+	"integration":        dockerRunsOn,
+	"soak":               dockerRunsOn,
+	"netfault":           dockerRunsOn,
+	"errfs":              dockerRunsOn,
+	"zero-rtt":           dockerRunsOn,
+	"cross-arch":         dockerRunsOn,
+	"modules":            dockerRunsOn,
+	"contrib-dragonboat": dockerRunsOn,
+	"fips":               dockerRunsOn,
+	"row":                gateRunsOn,
+	"ci-gate":            gateRunsOn,
 }
 
 // workflowJob is one job of a workflow and its runs-on node.
@@ -264,7 +273,7 @@ func TestRunnerProblems(t *testing.T) {
 		{"a ci.yml job sent to a self-hosted label", ci("coverage", "bigdisk"), "ci.yml job coverage runs on \"bigdisk\"; every ci.yml job"},
 		{"a waived ci.yml job", ci("coverage", "bigdisk  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), "ci.yml job coverage carries a self-hosted waiver"},
 		{"a ci.yml expression", ci("coverage", expr), "ci.yml job coverage runs on an expression"},
-		{"the runner selection on a job the template gives none", ci("coverage", dockerRunsOn), "ci.yml job coverage runs on an expression"},
+		{"the runner selection on a job the template gives none", ci("signatures", dockerRunsOn), "ci.yml job signatures runs on an expression"},
 		{"another job's selection", ci("lint", gateRunsOn), "ci.yml job lint runs on an expression"},
 		{"preflight's expression on another job", ci("ci-gate", preflightRunsOn), "ci.yml job ci-gate runs on an expression"},
 		{"a selection with another overflow label", ci("image", strings.Replace(dockerRunsOn, "'bigdisk'", "'release'", 1)), "ci.yml job image runs on an expression"},

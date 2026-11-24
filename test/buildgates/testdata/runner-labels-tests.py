@@ -419,9 +419,12 @@ def every_job(head):
     return got
 
 
-# LOCAL: the jobs the template gives the selection (preflight its own default).
-# This repository's other ci.yml jobs stay on ubuntu-latest on every event.
-SELECTION_JOBS = {"preflight", "row", "lint", "image", "lint-gates", "integration", "soak", "ci-gate"}
+# LOCAL: the jobs the template gives the selection (preflight its own default),
+# and this repository's toolchain-image legs that take it as integration does.
+# Its other ci.yml jobs stay on ubuntu-latest on every event.
+SELECTION_JOBS = {"preflight", "row", "lint", "image", "lint-gates", "integration", "soak", "ci-gate",
+                  "unit", "coverage", "netfault", "errfs", "zero-rtt", "cross-arch", "modules",
+                  "contrib-dragonboat", "fips"}
 
 
 def selection_case(label, head, want):
