@@ -22,6 +22,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -881,6 +882,52 @@ func TestReencryptDestinationClaim_SymlinkAliasSharesTheClaim(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the aliased call did not acquire after the real claim was released")
 	}
+}
+
+// TestReencryptDestinationClaim_DanglingAliasSharesTheClaim covers an alias
+// whose target directory does not exist yet. A call on the alias and a
+// concurrent call on the target path must take one claim: otherwise the
+// target's call creates the directory, the alias then resolves into it, and
+// both publish into one directory, leaving snapshot.meta describing the
+// snapshot.dat the other call replaced.
+func TestReencryptDestinationClaim_DanglingAliasSharesTheClaim(t *testing.T) {
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real")
+	aliasDir := filepath.Join(base, "alias")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Skipf("symlinks unsupported: %v", err)
+	}
+	// A relative alias, two hops, through the same dangling target.
+	relAlias := filepath.Join(base, "rel")
+	if err := os.Symlink("alias", relAlias); err != nil {
+		t.Fatal(err)
+	}
+
+	for alias, target := range map[string]string{
+		aliasDir:                       realDir,
+		relAlias:                       realDir,
+		filepath.Join(aliasDir, "sub"): filepath.Join(realDir, "sub"),
+	} {
+		if got, want := destinationClaimKey(alias), destinationClaimKey(target); got != want {
+			t.Fatalf("claim key for %q = %q, want %q (the dangling target's key)", alias, got, want)
+		}
+	}
+
+	release := reencryptDestinationClaims.acquire(realDir)
+	acquired := make(chan func(), 1)
+	go func() { acquired <- reencryptDestinationClaims.acquire(aliasDir) }()
+	for reencryptDestinationWaiters(realDir) == 0 {
+		select {
+		case r := <-acquired:
+			r()
+			release()
+			t.Fatal("the dangling alias acquired a separate claim while the target's was held")
+		default:
+			runtime.Gosched()
+		}
+	}
+	release()
+	(<-acquired)()
 }
 
 // EncryptWithEpochPinnedContext is the path every snapshot frame now takes:
