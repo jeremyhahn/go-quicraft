@@ -20,10 +20,13 @@ whose base commit holds the rows and whose head commit adds one more:
   R8  #12 does not match #123.
   R9  owner/repo#n does not count.
   R10 a merge-train/ branch: green.
-  R11 the labels API unreachable: a ::warning, the event's labels used.
+  R11 (LOCAL) the labels API unreachable: a ::warning, the event's labels
+      discarded, and a non-row branch is red (fail closed).
   R12 no base commit: red.
   R13 (LOCAL) the event's labels hold an exempt label the live labels API no
       longer returns: red (the live set replaces the event set).
+  R14 (LOCAL) the event's labels hold an exempt label, the live labels lookup
+      fails, and the row branch names no SPEC row: red (fail closed).
 
 Run: python3 -I test/buildgates/testdata/row-job-tests.py [ci.yml]
 """
@@ -127,12 +130,13 @@ def run(body, cwd, head, base, labels="[]", url=""):
 
 
 class Labels(http.server.BaseHTTPRequestHandler):
-    """LOCAL (R13): a labels API on localhost that answers with LIVE."""
+    """LOCAL (R13, R14): a labels API on localhost that answers STATUS with LIVE."""
     LIVE = []
+    STATUS = 200
 
     def do_GET(self):
         data = json.dumps([{"name": n} for n in self.LIVE]).encode()
-        self.send_response(200)
+        self.send_response(self.STATUS)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -142,8 +146,9 @@ class Labels(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def live_labels(names):
+def live_labels(names, status=200):
     Labels.LIVE = list(names)
+    Labels.STATUS = status
     srv = http.server.HTTPServer(("127.0.0.1", 0), Labels)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}/labels"
@@ -178,8 +183,9 @@ def main():
         rc, out = run(body, r, "merge-train/2026-11-22", base)
         check(rc == 0 and "exempt branch prefix" in out, f"R10 a merge-train/ branch: green (rc {rc})")
         rc, out = run(body, r, "chore/x", base, labels='["std"]', url="http://localhost:9/labels")
-        check(rc == 0 and "::warning::Row: the live labels could not be read" in out and "exempt label 'std'" in out,
-              f"R11 labels API unreachable: warning, event labels used (rc {rc})")
+        check(rc == 1 and "::warning::Row: the live labels could not be read" in out and "exempt label" not in out
+              and "::error::Row: head branch 'chore/x' is not row/<n>-*" in out,
+              f"R11 labels API unreachable: warning, event labels discarded, red (rc {rc})")
         rc, out = run(body, r, "row/41-store", "")
         check(rc == 1 and "::error::Row: no base commit" in out, f"R12 no base commit: red (rc {rc})")
         srv, url = live_labels(["bug"])
@@ -190,6 +196,15 @@ def main():
             srv.server_close()
         check(rc == 1 and "::warning::" not in out and "::error::Row: head branch 'fix/lint' is not row/<n>-*" in out,
               f"R13 an exempt label removed since the event: red, the live labels replace the event's (rc {rc})")
+        srv, url = live_labels([], status=500)
+        try:
+            rc, out = run(body, r, "row/5-missing", base, labels='["ci"]', url=url)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        check(rc == 1 and "::warning::Row: the live labels could not be read" in out and "exempt label" not in out
+              and "::error::Row: issue #5" in out,
+              f"R14 the live labels lookup fails: the event's exempt label is discarded, no SPEC row: red (rc {rc})")
     print(f"{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILED'}")
     sys.exit(1 if FAILS else 0)
 

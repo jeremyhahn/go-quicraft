@@ -20,7 +20,7 @@ import (
 )
 
 // rowJobTests is the Row job's own test, from the CI template plus the LOCAL
-// case R13: it reads the "Row check" step's python out of ci.yml and runs it
+// case R14: it reads the "Row check" step's python out of ci.yml and runs it
 // against a temporary git repository and a local labels API.
 const rowJobTests = "testdata/row-job-tests.py"
 
