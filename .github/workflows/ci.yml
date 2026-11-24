@@ -1,70 +1,15 @@
-# ci-template: v1.54 (customized)
-# v1.54: the template's preflight runner selection step balances the hosted
-# and self-hosted pools by the repository variables CI_HOSTED_SHARE,
-# CI_SELF_HOSTED_BIGDISK and CI_SELF_HOSTED_BIGDISK_DOCKER, and drops
-# HOSTED_JOBS_PER_REPO and HOSTED_QUEUE_GRACE_SECONDS. This repository does
-# not carry that step (see LOCAL below), so v1.54 changes comments only here.
-# v1.53 item (0) is now taken: the `Runner labels` step lets code-review.yml's
-# API-only jobs take exactly [self-hosted, linux, x64, bigdisk] for a
-# same-repository head under a PR event (code-review.yml is carried as written).
-# v1.53: main's concurrency group is `main-{event}`, so a newer main run
-# cancels the older one (the concurrency block below has the template's line).
-# v1.52: a pull request whose head repository is not this repository, a
-# deleted fork included, runs every job on ubuntu-latest. preflight's runs-on
-# reads `!startsWith(github.event_name, 'pull_request')`, so a fork's head
-# under pull_request or pull_request_target takes ubuntu-latest whatever
-# CI_PREFLIGHT_RUNS_ON holds (the stricter of v1.52's clause and the LOCAL
-# fork routing below, which tested pull_request alone). The `Runner labels`
-# step gives a fork's head under pull_request, as under pull_request_target
-# since v1.51, no overflow and no unset-variable exemption, and reads the
-# selection outputs for it at their hosted default. v1.52's hunks in the
-# preflight runner selection step are not taken (this repository does not
-# carry the step). test/buildgates/testdata/runner-labels-tests.py holds the
-# cases.
-# v1.51: the `Runner labels` step also reads every runs-on under
-# pull_request_target, for a same-repository and a fork head. In a workflow
-# with that trigger a fork's head gets no overflow and no unset-variable
-# exemption (a fork never reaches a self-hosted runner), and its finding
-# says so. test/buildgates/testdata/runner-labels-tests.py holds the cases.
-# v1.50: a runs?status=queued listing short of its total_count is a lower
-# bound in the preflight runner selection step, so the overflow still fires
-# under load. This repository does not carry that step (see LOCAL below), so
-# v1.50 changes nothing here.
-# v1.49: on github.com the preflight job runs on the self-hosted bigdisk
-# pool, `fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]')`,
-# so no run waits in the hosted queue for its ten seconds of work. The
-# repository variable CI_PREFLIGHT_RUNS_ON (runs-on JSON) is the fallback
-# switch: it is set to `"ubuntu-latest"` (quotes included; a value that is
-# not JSON fails the run) while that pool is down. Off github.com preflight
-# stays on `ubuntu-latest`. preflight sets up no Go, builds nothing and runs
-# none of the PR's tree; it reads the tree as text and checks out with
-# persist-credentials false. The schedule guard's AGENT_TOKEN is passed off
-# github.com only: on github.com the guard never reads it, so the secret
-# does not reach the self-hosted runner. The `Runner labels` step checks
-# preflight's runs-on with the variable unset and set to the fallback.
-# LOCAL against v1.53 (kept on purpose):
-# - CI_FULL_TIER keeps the v1.35.1 condition (a PR runs the full tier only
-#   with the ci:full label; test/buildgates/ci_gate_test.go asserts it), so
-#   v1.41's every-PR full tier is not taken and CI_FULL_LABEL is CI_FULL_TIER.
-# - Every job but preflight names ubuntu-latest directly (hosted first,
-#   below); v1.48's preflight runner selection step and the overflow runs-on
-#   JSON are still not taken, so v1.49's hunk in that step's "In progress:"
-#   comment and v1.50's short-list fix in that step are not taken either
-#   (this repository does not carry the step).
+# ci-template: v1.59 (customized)
+# LOCAL against v1.59 (kept on purpose):
 # - The `Runner labels` unset-variable exemption also skips a pull_request
 #   fork head (a fork pull request never reaches the pool), beside the
-#   `not fork_target` term (v1.51, pull_request under v1.52), even in a
-#   workflow without the pull_request trigger: the stricter of the two.
+#   `not fork_target` term, even in a workflow without the pull_request
+#   trigger: the stricter of the two.
 # - The `Runner labels` step fails closed, finding (g), on a workflow whose
 #   jobs it cannot read by lines (a quoted or flow-style jobs key, a job
 #   that is not a block mapping, an explicit or merge key, an alias, anchor
 #   or tag, no or two jobs keys), so such a workflow never gets its OK.
-# - The Signatures job stays here (v1.35.2 moved it to signatures.yml).
-# HOSTED FIRST: every job but preflight runs on ubuntu-latest. preflight's
-# v1.49 pool expression is the one exception, and
-# test/buildgates/ci_runners_test.go pins it exactly. Any other job leaves
-# ubuntu-latest only with a waiver on its runs-on line that names its
-# category and a reason:
+# HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
+# waiver on its runs-on line that names its category and a reason:
 # `# self-hosted: hardware: <reason>` (the job needs specific hardware), or
 # `# self-hosted: oversize: <reason>` (it needs more than a standard runner's
 # 4 vCPU, 16 GB memory, about 45 GB disk or 6 hours). No ci.yml job carries a
@@ -697,16 +642,19 @@ env:
   # while the gate still reports green (one repository had eight
   # such packages, including its whole WebAuthn implementation).
   GO_BUILD_TAGS: ""
-  # v1.23: the full tier (ci-standard.md §8). Every event but pull_request
-  # (push to main, schedule, workflow_dispatch), and a PR labelled ci:full.
-  # LOCAL: v1.41's every-PR full tier is not taken (test/buildgates
-  # ci_gate_test.go holds this condition), so the v1.35.1 form stays.
+  # v1.23: the full tier (ci-standard.md §8). v1.41: every
+  # event, a pull_request included, so a PR runs every stage main runs.
+  # v1.30 (fix 5): a workflow_dispatch off main is not the full tier (the
+  # schedule guard refuses it and CI Gate fails); v1.41: ci/deps-bump, which
+  # deps-bump.yml (v1.42: scans.yml) dispatches because its PR starts no
+  # pull_request run, is.
   # Steps read it as env.CI_FULL_TIER; a job-level `if:` cannot read env, so
   # the integration job repeats this expression. Keep them equal.
-  # v1.30 (fix 5): a workflow_dispatch off main is not the full tier (the
-  # schedule guard refuses it and CI Gate fails).
-  CI_FULL_TIER: ${{ (github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')) || contains(github.event.pull_request.labels.*.name, 'ci:full') }}
-  # v1.24 (Tenant Agent m749, m751 (a)): the files a docs-only PR may touch. CUSTOMIZE: narrow it
+  CI_FULL_TIER: ${{ github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump' }}
+  # v1.41: `ci:full` on a PR turns off the docs-only and lint-gates path
+  # scopes; it selects no tier.
+  CI_FULL_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'ci:full') }}
+  # v1.24: the files a docs-only PR may touch. CUSTOMIZE: narrow it
   # in a repo that embeds or generates from docs/ (go:embed, OpenAPI, protos).
   DOCS_ONLY_PATTERN: '(\.md$|^docs/)'
   # v1.30 (fix 3): a PR runs the lint-gates job only when a changed file
@@ -790,14 +738,11 @@ jobs:
     # variable CI_PREFLIGHT_RUNS_ON, runs-on JSON, overrides it (set to
     # `"ubuntu-latest"`, quotes included, while that pool is down). Off
     # github.com ubuntu-latest, as before.
-    # LOCAL (security): a pull request from a fork runs untrusted code, so
-    # it always gets ubuntu-latest and never the self-hosted pool, whatever
-    # the variable says; only pushes, schedules, dispatches and same-repository
-    # pull requests take the pool.
     # v1.52: a pull request from a fork (its head repository is not this
     # one) takes ubuntu-latest whatever the variable holds; a fork never
-    # reaches a self-hosted runner.
-    runs-on: ${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
+    # reaches a self-hosted runner. Only a push to main and a same-repository
+    # pull_request take the pool; every other event takes ubuntu-latest.
+    runs-on: ${{ github.server_url == 'https://github.com' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -811,6 +756,13 @@ jobs:
       lint_gates: ${{ steps.diff.outputs.lint_gates }}   # v1.30
       verdict: ${{ steps.guard.outputs.verdict }}
       proof: ${{ steps.guard.outputs.proof }}   # v1.30
+      # v1.48 (ruling 1024): runs-on JSON for the two hosted-capable classes,
+      # read as fromJSON(needs.preflight.outputs.runner_docker) by every job
+      # that builds or runs images and fromJSON(needs.preflight.outputs.runner)
+      # by CI Gate. `"ubuntu-latest"`, or the Dells' self-hosted label list
+      # (v1.54: whichever pool `Balanced runner pool (ruling 1137)` picks).
+      runner: ${{ steps.runner.outputs.runner }}
+      runner_docker: ${{ steps.runner.outputs.runner_docker }}
     steps:
       - name: Is a main push run of this workflow in flight?
         id: guard
@@ -926,6 +878,195 @@ jobs:
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           echo "proof=$PROOF" >> "$GITHUB_OUTPUT"
 
+      # v1.54 (Tenant Agent ruling 1137, owner order; it replaces the hosted
+      # first rule of rulings 999 and 1024, v1.48 to v1.53): the run goes to
+      # whichever of the two pools, GitHub-hosted or the Dells' self-hosted
+      # bigdisk pools, this repository uses less, so both run full. On
+      # github.com this step lists every queued and in-progress run of every
+      # workflow of this repository and their latest jobs, through the
+      # Actions API with the job token (actions: read), and counts, from that
+      # one listing, each in progress plus queued, H: hosted jobs (labels
+      # naming an ubuntu-* image and not self-hosted), S1: self-hosted jobs on
+      # bigdisk and not bigdisk-docker, and S2: jobs on bigdisk-docker. Jobs
+      # of this run are not counted: they wait on this decision. The limits
+      # are repository variables set by the Infra Department, plain decimal
+      # integers: HS = vars.CI_HOSTED_SHARE (this repository's share of the
+      # account's 40 hosted runners; unset, 0 or not a whole number gives a
+      # ::warning and HS=12, the v1.48 limit), C1 =
+      # vars.CI_SELF_HOSTED_BIGDISK and C2 = vars.CI_SELF_HOSTED_BIGDISK_DOCKER
+      # (the units of each label; either unset, 0 or not a whole number: the
+      # hosted default with a ::warning). Hosted use is H/HS; self-hosted use
+      # is the larger of S1/C1 and S2/C2. Then:
+      #   - both below their limit: the lower use wins, compared by
+      #     cross-multiplication (self-hosted wins when S1*HS <= H*C1 and
+      #     S2*HS <= H*C2); a tie goes self-hosted;
+      #   - one pool full (H >= HS; or S1 >= C1 or S2 >= C2): the other pool;
+      #   - both full: the pool with fewer queued jobs (bigdisk and
+      #     bigdisk-docker together for the Dells); a tie goes self-hosted.
+      # The units are shared across repositories, so C1 and C2 can overstate
+      # this repository's free room: when they are busy elsewhere its jobs
+      # queue, S1 or S2 rises, and its runs go hosted.
+      # It outputs `runner` and `runner_docker` as runs-on JSON:
+      # `"ubuntu-latest"`, or `["self-hosted","linux","x64","bigdisk"]` and
+      # `["self-hosted","linux","x64","bigdisk-docker"]`. A count it cannot
+      # read (a reply that is not 200, a list short of its total_count, a
+      # field missing) picks nothing silently: a ::warning names why and the
+      # run takes the hosted default. One decision per run: every job of the
+      # run takes it, in every workflow that reads these outputs. Off
+      # github.com it makes no call, and each job's runs-on keeps its forge
+      # label (bigdisk, ci-gate). It runs before the checkout, beside no
+      # repository code.
+      # v1.52 (Tenant Agent order, kept): on a pull request whose head
+      # repository is not this repository (a fork, or a fork since deleted),
+      # it makes no call and outputs the hosted default with a ::notice: a
+      # fork never reaches a self-hosted runner. Any event but a push to main or a pull request gets the hosted default.
+      # Its tests:
+      # test/buildgates/testdata/runner-select-tests.py.
+      - name: Balanced runner pool (ruling 1137)
+        id: runner
+        env:
+          SERVER: ${{ github.server_url }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
+          RUN_ID: ${{ github.run_id }}
+          JOB_TOKEN: ${{ github.token }}
+          HS: ${{ vars.CI_HOSTED_SHARE }}
+          C1: ${{ vars.CI_SELF_HOSTED_BIGDISK }}
+          C2: ${{ vars.CI_SELF_HOSTED_BIGDISK_DOCKER }}
+        run: |
+          set -uo pipefail
+          HOSTED='"ubuntu-latest"'
+          selfhosted() { printf '["self-hosted","linux","x64","%s"]' "$1"; }
+          emit() {
+            echo "runner: $1; runner_docker: $2"
+            { echo "runner=$1"; echo "runner_docker=$2"; } >> "$GITHUB_OUTPUT"
+          }
+          # hosted <why>: no count, so the default, with the reason shown.
+          hosted() {
+            echo "::warning::runner selection: $1; every job of this run takes the GitHub-hosted default, ubuntu-latest, and none runs on the Dells (ci-template v1.54, ruling 1137)"
+            emit "$HOSTED" "$HOSTED"
+            exit 0
+          }
+          if [ "$SERVER" != https://github.com ]; then
+            echo "not github.com: each job keeps its forge label (bigdisk, ci-gate); no selection"
+            emit "$HOSTED" "$HOSTED"
+            exit 0
+          fi
+          # v1.52: a fork's pull request runs every job on GitHub-hosted runners.
+          case "$EVENT" in
+            pull_request|pull_request_target)
+              if [ "$HEAD_REPO" != "$REPO" ]; then
+                echo "::notice::runner selection: this pull request's head repository is not this repository (a fork); every job of this run takes the GitHub-hosted default, ubuntu-latest, and none reaches a self-hosted runner (ci-template v1.52)"
+                emit "$HOSTED" "$HOSTED"
+                exit 0
+              fi ;;
+          esac
+          # The self-hosted runners refuse every event but a push to main and a pull request.
+          case "$EVENT:$REF" in
+            push:refs/heads/main | pull_request:*) ;;
+            *)
+              echo "::notice::runner selection: event $EVENT on $REF is not a push to main or a pull request, which the self-hosted runners refuse; every job of this run takes the GitHub-hosted default, ubuntu-latest"
+              emit "$HOSTED" "$HOSTED"
+              exit 0 ;;
+          esac
+          # whole <value>: a whole number above 0, at most 6 digits.
+          whole() { [[ "$1" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$1))" -gt 0 ]; }
+          whole "$C1" || hosted "CI_SELF_HOSTED_BIGDISK='$C1' is unset, 0 or not a whole number, so no bigdisk job can be placed (the Infra Department sets it)"
+          whole "$C2" || hosted "CI_SELF_HOSTED_BIGDISK_DOCKER='$C2' is unset, 0 or not a whole number, so no bigdisk-docker job can be placed (the Infra Department sets it)"
+          C1=$((10#$C1)) C2=$((10#$C2))
+          if whole "$HS"; then
+            HS=$((10#$HS))
+          else
+            echo "::warning::runner selection: CI_HOSTED_SHARE='$HS' is unset, 0 or not a whole number; HS=12 until the Infra Department sets it (ci-template v1.54, ruling 1137)"
+            HS=12
+          fi
+          # get <url> <file>: 0 on a 200 reply, saved in <file>; the answer in
+          # CODE. The token reaches curl as a header from a file descriptor.
+          get() {
+            CODE=$(curl -sS --max-time 30 -o "$2" -w '%{http_code}' \
+              -H @<(printf 'Authorization: Bearer %s\n' "$JOB_TOKEN") \
+              -H 'Accept: application/vnd.github+json' "$1") || CODE="curl exit $?"
+            [ "$CODE" = 200 ]
+          }
+          # pages <url> <key> <out>: every page of a listing, its <key> items
+          # one JSON object per line in <out>. 1, with WHY set, when a reply is
+          # not 200, has no total_count or list, or passes 1000 entries. A list
+          # short of its total_count (runs change state while it is read) is
+          # kept as a lower bound and named in SHORT (v1.59).
+          pages() {
+            local p=1 got=0 total n
+            : > "$3"
+            while :; do
+              get "$1&per_page=100&page=$p" "$RUNNER_TEMP/sel-page.json" || { WHY="$1: $CODE"; return 1; }
+              total=$(jq -er '.total_count | numbers' "$RUNNER_TEMP/sel-page.json") || { WHY="$1: 200 with no total_count"; return 1; }
+              n=$(jq -er --arg k "$2" '.[$k] | arrays | length' "$RUNNER_TEMP/sel-page.json") || { WHY="$1: 200 with no $2 list"; return 1; }
+              jq -c --arg k "$2" '.[$k][]' "$RUNNER_TEMP/sel-page.json" >> "$3"
+              got=$((got + n))
+              { [ "$got" -lt "$total" ] && [ "$n" -gt 0 ]; } || break
+              [ "$p" -lt 10 ] || { WHY="$1: more than 1000 entries"; return 1; }
+              p=$((p + 1))
+            done
+            [ "$got" -ge "$total" ] || SHORT="${SHORT:+$SHORT; }${1#"$API"/}: $got of $total entries"
+            return 0
+          }
+          SHORT=
+          : > "$RUNNER_TEMP/sel-runs.jsonl"
+          for st in queued in_progress; do
+            pages "$API/runs?status=$st" workflow_runs "$RUNNER_TEMP/sel-r.jsonl" || hosted "the Actions API gave no complete run list ($WHY)"
+            cat "$RUNNER_TEMP/sel-r.jsonl" >> "$RUNNER_TEMP/sel-runs.jsonl"
+          done
+          : > "$RUNNER_TEMP/sel-jobs.jsonl"
+          for id in $(jq -r '.id' "$RUNNER_TEMP/sel-runs.jsonl" | sort -u); do
+            [ "$id" != "$RUN_ID" ] || continue
+            pages "$API/runs/$id/jobs?filter=latest" jobs "$RUNNER_TEMP/sel-j.jsonl" || hosted "the Actions API gave no complete job list ($WHY)"
+            cat "$RUNNER_TEMP/sel-j.jsonl" >> "$RUNNER_TEMP/sel-jobs.jsonl"
+          done
+          # H, S1, S2: hosted, bigdisk (not bigdisk-docker) and bigdisk-docker
+          # jobs in progress plus queued; HQ, SQ: the queued hosted and
+          # self-hosted (both kinds) ones. A job of this run is not counted.
+          read -r H S1 S2 HQ SQ < <(jq -rs --argjson run "$RUN_ID" '
+              [.[] | select(.run_id != $run and (.status == "queued" or .status == "in_progress"))
+                   | (.labels // []) as $l
+                   | {q: (.status == "queued"),
+                      p: (if ($l | any(. == "self-hosted")) then
+                            (if ($l | any(. == "bigdisk-docker")) then "s2"
+                             elif ($l | any(. == "bigdisk")) then "s1" else "x" end)
+                          elif ($l | any(startswith("ubuntu-"))) then "h"
+                          else "x" end)}] as $j
+              | def n(f): $j | map(select(f)) | length;
+              [n(.p == "h"), n(.p == "s1"), n(.p == "s2"), n(.p == "h" and .q),
+               n((.p == "s1" or .p == "s2") and .q)]
+              | map(tostring) | join(" ")' "$RUNNER_TEMP/sel-jobs.jsonl") || hosted "the job list could not be counted"
+          [ -n "${SQ:-}" ] || hosted "the job list could not be counted"
+          echo "this repository: hosted $H of CI_HOSTED_SHARE=$HS ($HQ queued); bigdisk $S1 of CI_SELF_HOSTED_BIGDISK=$C1, bigdisk-docker $S2 of CI_SELF_HOSTED_BIGDISK_DOCKER=$C2 ($SQ self-hosted queued)"
+          # v1.59: a short listing is a lower bound; still choose.
+          [ -z "$SHORT" ] || echo "::notice::runner selection: the listing returned fewer entries than its total ($SHORT); the counts are a lower bound and the choice below uses them (ci-template v1.59)"
+          pick=hosted hfull=0 sfull=0
+          [ "$H" -lt "$HS" ] || hfull=1
+          { [ "$S1" -lt "$C1" ] && [ "$S2" -lt "$C2" ]; } || sfull=1
+          if [ "$hfull" = 1 ] && [ "$sfull" = 1 ]; then
+            [ "$SQ" -le "$HQ" ] && pick=self
+            why="both pools full: hosted $HQ queued, self-hosted $SQ queued"
+          elif [ "$hfull" = 1 ]; then
+            pick=self; why="the hosted pool is full ($H of $HS)"
+          elif [ "$sfull" = 1 ]; then
+            why="the self-hosted pool is full (bigdisk $S1 of $C1, bigdisk-docker $S2 of $C2)"
+          else
+            # self-hosted use, max(S1/C1, S2/C2), at or below hosted use H/HS.
+            [ $((S1 * HS)) -le $((H * C1)) ] && [ $((S2 * HS)) -le $((H * C2)) ] && pick=self
+            why="use hosted $H/$HS, bigdisk $S1/$C1, bigdisk-docker $S2/$C2"
+          fi
+          if [ "$pick" = self ]; then
+            echo "::notice::runner selection: $why; this run's jobs run on the Dells (bigdisk, bigdisk-docker) (ci-template v1.54, ruling 1137)"
+            emit "$(selfhosted bigdisk)" "$(selfhosted bigdisk-docker)"
+          else
+            echo "::notice::runner selection: $why; this run's jobs take the GitHub-hosted default, ubuntu-latest (ci-template v1.54, ruling 1137)"
+            emit "$HOSTED" "$HOSTED"
+          fi
+
       # v1.34: the full history on a PR run for the changed-files diff, one
       # commit otherwise. v1.41: every PR run, ci:full or not. No credential is left in the checkout.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -969,7 +1110,7 @@ jobs:
       # v1.52: a fork's head under pull_request, as under
       # pull_request_target (v1.51), gets no unset-variable exemption, and the
       # selection outputs read for it are the hosted default the step emits.
-      # Its tests: test/buildgates/testdata/runner-labels-tests.py (the lint-gates job runs them).
+      # Its tests: test/buildgates/testdata/runner-labels-tests.py (the Runner template tests step runs them).
       - name: Runner labels
         run: |
           python3 -I - <<'PY'
@@ -1705,6 +1846,22 @@ jobs:
           print(f"OK: {len(files)} workflow file(s); every job that names `release` runs only on {ALLOWED}, and every other job on a standard GitHub-hosted image or with a hardware or oversize reason")
           PY
 
+      # LOCAL: the template test scripts for the steps above run here on
+      # every CI run, with python3, so they are a required check. Their Go
+      # wrappers in test/buildgates skip where python3 is absent (the
+      # toolchain image has none).
+      - name: Runner template tests
+        run: |
+          set -euo pipefail
+          python3 -I test/buildgates/testdata/runner-labels-tests.py
+          python3 -I test/buildgates/testdata/runner-select-tests.py
+          # LOCAL: the Row job's cases (R0-R13) run here too; their Go
+          # wrapper skips in the toolchain image, which has no python3.
+          python3 -I test/buildgates/testdata/row-job-tests.py .github/workflows/ci.yml
+          python3 -I test/buildgates/testdata/code-review-v51213-tests.py .github/workflows/code-review.yml
+          python3 -I test/buildgates/testdata/code-review-v51214-tests.py .github/workflows/code-review.yml
+          python3 -I test/buildgates/testdata/code-review-v51215-tests.py .github/workflows/code-review.yml
+
       - name: Is every changed file docs or markdown?
         id: diff
         env:
@@ -1717,7 +1874,7 @@ jobs:
           # PR keeps both scopes off. LOCAL: the template's CI_FULL_LABEL is
           # CI_FULL_TIER here, which on a PR is exactly the ci:full label.
           docs_only=false lint_gates=true
-          if [ "$EVENT" = pull_request ] && [ "$CI_FULL_TIER" != true ]; then
+          if [ "$EVENT" = pull_request ] && [ "$CI_FULL_LABEL" != true ]; then
             if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
               if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN"; then
                 docs_only=true
@@ -1834,7 +1991,7 @@ jobs:
   # PR, and deps-check left this job, so every step reads only the tree.
   lint:
     name: Lint [lint, gosec, build tags]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     needs: [preflight]
     if: ${{ !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
     timeout-minutes: 60
@@ -2012,7 +2169,7 @@ jobs:
   # below, so no single job runs the whole -race suite on a 4-core runner.
   image:
     name: Devcontainer image [build]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     needs: [preflight]   # v1.24 (CA m749, m751 (a)); v1.29.3
     # v1.29.3: on a schedule run, only on the schedule guard's `run`. v1.30:
     # on every event only on `run` (not `refused`, not `proven`), and never
@@ -2196,7 +2353,7 @@ jobs:
   # entry, whose result is success only when every shard succeeded.
   unit:
     name: Unit tests [-race, coverage, shard ${{ matrix.shard }}/4]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     needs: [preflight]
     if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60
@@ -2301,7 +2458,7 @@ jobs:
   # shard. `code` tier, like the shards.
   coverage:
     name: Coverage [merge, threshold]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     needs: [preflight, unit]
     if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the merge (6 h cap)
@@ -2396,7 +2553,7 @@ jobs:
   # and the job; the gates after it run on the next push.
   lint-gates:
     name: Lint Gates [toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     needs: [preflight]     # v1.29.3; v1.30
     # v1.26: never on a draft. v1.29.3: on a schedule run, only on the
     # schedule guard's `run`. v1.30: only on `run` on every event, and on a PR
@@ -2439,10 +2596,6 @@ jobs:
       - name: Mask the LAN addresses
         run: scripts/ci-mask-lan.sh
 
-      # The Runner labels step's rejection cases, on the runner's python3
-      # (the toolchain image has none): stdlib only, no make recipe.
-      - name: Runner labels tests
-        run: python3 -I test/buildgates/testdata/runner-labels-tests.py
 
       # A source check on the runner's shell: no make recipe runs here.
       - name: Does the Makefile define lint-gates?
@@ -2511,7 +2664,8 @@ jobs:
   # compose stack on the runner host started by `make integration-test`. The
   # stack is named per run under the repo's prefix, the job reaps stale stacks
   # first (v1.18) and keeps its own teardown last under `if: always()`.
-  # v1.23: full tier only (CI_FULL_TIER's expression); never on a plain PR.
+  # v1.41 (ruling 742 (2)): every non-draft PR, as main; a docs-only PR
+  # skips it, and CI Gate reads it as `code`.
   #
   # Hosted runners: the suite is dealt over IT_SHARDS shards by test-file
   # size (`make it-shard-packages`), each its own compose stack (IT_PROJECT
@@ -2521,8 +2675,10 @@ jobs:
     # v1.26: never on a draft PR, ci:full or not. v1.29.3: on a schedule run,
     # only on the schedule guard's `run`. v1.30: only on `run` on every event
     # (a proven main push and a refused run skip it).
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
-    runs-on: ubuntu-latest
+    # v1.41 (ruling 742 (2)): every PR, as main; a docs-only PR skips it, as
+    # it skips build and make coverage, and CI Gate reads it as `code`.
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the image job: it was the other multi-node QUIC load on a shared
     # runner host. Kept so a forge whose ubuntu-latest runners share a host
@@ -2670,7 +2826,7 @@ jobs:
     name: Soak [integration image]
     # v1.30: a dispatch off main is refused, so soak runs only on `run`.
     if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight.outputs.verdict == 'run' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # v1.48
     # >>> CUSTOMIZE (go-quicraft)
     # Behind the integration job, as integration is behind the image job: one
     # multi-node QUIC load at a time, and a red integration run is not soaked.
@@ -2805,8 +2961,11 @@ jobs:
   # bounds the volumes on every host they reach.
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
-    runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.preflight.outputs.verdict == 'run' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     needs: [image, integration, preflight]
     timeout-minutes: 90      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
@@ -2876,11 +3035,12 @@ jobs:
   # The WAL under injected I/O failures.
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
-    runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -2944,11 +3104,12 @@ jobs:
   # The 0-RTT replay policy, the one suite run without -race.
   zero-rtt:
     name: 0-RTT replay policy [no -race, toolchain image]
-    runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -3085,11 +3246,12 @@ jobs:
   # FreeBSD runner exists and QEMU would multiply every test's wall clock.
   cross-arch:
     name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }}, toolchain image)
-    runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the builds (6 h cap)
     strategy:
       fail-fast: false
@@ -3169,11 +3331,12 @@ jobs:
   # Every module in the tree, discovered rather than declared.
   modules:
     name: Nested module build, vet and test [toolchain image]
-    runs-on: ubuntu-latest
-    # v1.26: never on a draft PR, ci:full or not. v1.29.3, v1.30: only on the
-    # schedule guard's `run`.
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
     needs: [preflight]
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' }}
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the modules (6 h cap)
     env:
       CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
@@ -3240,8 +3403,11 @@ jobs:
   # The Dragonboat-compatible API module, its own Go module.
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration, toolchain image]
-    runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.preflight.outputs.verdict == 'run' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     needs: [integration, preflight]
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the suite (6 h cap)
     env:
@@ -3318,8 +3484,11 @@ jobs:
   # The Makefile's two-tier FIPS verification (moved from nightly.yml in #293).
   fips:
     name: FIPS [toolchain image]
-    runs-on: ubuntu-latest
-    if: ${{ (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.preflight.outputs.verdict == 'run' }}
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
+    # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
+    # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
+    # PR skips it, and CI Gate reads it as `code`.
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     needs: [integration, preflight]
     timeout-minutes: 120     # hosted runner: a cold toolchain image build, then the unsharded fips140=only run (6 h cap)
     env:
@@ -3519,6 +3688,104 @@ jobs:
           done
           exit $BAD
 
+  # v1.55 (2026-11-22, the Tenant Agent's 12:47Z order, owner: every piece of
+  # work corresponds to a SPEC row, ruling 1136): the Row job. A pull request
+  # whose head branch is `row/<n>-*` passes when issue #n is named on the
+  # BASE commit, in a table row of docs/SPEC.md, and nowhere else (ruling
+  # 1143 (3): SPEC only; ROADMAP.md does not count) (`#n` not preceded by a word character or `/`, so `owner/repo#n` and
+  # `#123` for `#12` do not count). A pull request with a label in
+  # ROW_EXEMPT_LABELS (ci, main-fix, std), or from a branch that starts with
+  # one of ROW_EXEMPT_BRANCHES (merge-train/: a train carries row PRs that
+  # passed), passes too. Anything else is red with a ::error naming the rule.
+  # The base is checked out and read with `git show <base>:<path>`, so a
+  # pull request cannot add its own row and pass on it: the row lands first,
+  # through a docs PR. The job runs where CI Gate runs (the preflight
+  # selection's `runner` output: hosted for a fork's head, so a fork never
+  # reaches a self-hosted runner) and runs no code of the head. The labels are read live from
+  # the API with the job token (read-only), so a rerun after a label is
+  # added passes; when they cannot be read, the event's labels are used with
+  # a ::warning. pull_request has no `labeled` type (v1.25.4), so a label
+  # takes effect on the next push or a rerun of this job.
+  # LOCAL: a successful lookup replaces the event's labels, so a label
+  # removed since the event no longer exempts the pull request (R13).
+  # test/buildgates/testdata/row-job-tests.py holds the cases.
+  row:
+    name: Row [one SPEC row per pull request]
+    needs: [preflight]
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner || '"ubuntu-latest"') || 'ci-gate' }}   # v1.55: CI Gate's runner
+    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      ROW_EXEMPT_LABELS: 'ci main-fix std'   # space-separated; CUSTOMIZE only by Tenant Agent order
+      ROW_EXEMPT_BRANCHES: 'merge-train/'    # space-separated branch prefixes
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Row check (one SPEC row per pull request)
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          LABELS_URL: ${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100
+          JOB_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re, subprocess, sys, urllib.request
+          head = os.environ.get("HEAD_REF", "")
+          base = os.environ.get("BASE_SHA", "")
+          exempt = set(os.environ.get("ROW_EXEMPT_LABELS", "").split())
+          prefixes = os.environ.get("ROW_EXEMPT_BRANCHES", "").split()
+          rule = "every pull request corresponds to one SPEC row (ci-template v1.55, ruling 1136)"
+          labels = set()
+          try:
+              labels |= {str(x) for x in json.loads(os.environ.get("EVENT_LABELS") or "[]") or []}
+          except ValueError:
+              pass
+          url, tok = os.environ.get("LABELS_URL", ""), os.environ.get("JOB_TOKEN", "")
+          if url and tok:
+              try:
+                  req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok,
+                                                             "Accept": "application/vnd.github+json"})
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      labels = {l["name"] for l in json.load(r)}  # LOCAL (R13): the live set replaces the event's
+              except Exception as e:
+                  labels = set()  # LOCAL (R14): fail closed, no event-label exemption on a failed lookup
+                  print(f"::warning::Row: the live labels could not be read ({type(e).__name__}); the event's labels are discarded and the branch is checked against SPEC")
+          hit = sorted(labels & exempt)
+          if hit:
+              print(f"Row: exempt label '{hit[0]}'; no row is required")
+              sys.exit(0)
+          for p in prefixes:
+              if head.startswith(p):
+                  print(f"Row: exempt branch prefix '{p}'; no row is required")
+                  sys.exit(0)
+          m = re.match(r"row/(\d+)-", head)
+          if not m:
+              print(f"::error::Row: head branch '{head}' is not row/<n>-* and the pull request carries none of the labels {' '.join(sorted(exempt))}; {rule}")
+              sys.exit(1)
+          if not re.fullmatch(r"[0-9a-f]{40}", base):
+              print(f"::error::Row: no base commit to read ('{base}'); {rule}")
+              sys.exit(1)
+          n = m[1]
+          pat = re.compile(rf"(?<![\w/])#{n}(?!\d)")
+          r = subprocess.run(["git", "show", f"{base}:docs/SPEC.md"], capture_output=True, text=True)
+          if r.returncode != 0:
+              print(f"Row: docs/SPEC.md is absent on the base {base[:12]}")
+          rows = [l for l in r.stdout.splitlines() if l.lstrip().startswith("|")] if r.returncode == 0 else []
+          if any(pat.search(l) for l in rows):
+              print(f"Row: issue #{n} is named in a docs/SPEC.md table row on the base {base[:12]}")
+              sys.exit(0)
+          print(f"::error::Row: issue #{n} (head branch '{head}') is named in no docs/SPEC.md table row on the base {base[:12]} (ROADMAP.md does not count); land the row in SPEC through a docs PR first, or label the pull request {' or '.join(sorted(exempt))}; {rule}")
+          sys.exit(1)
+          PY
+
   # The single required check (devops.md §1). Every job above must appear in
   # BOTH the needs list and the results check — a gate that can pass vacuously
   # is worse than no gate. Do not use join(needs.*.result); it evaluates empty
@@ -3529,22 +3796,31 @@ jobs:
   # devops.md §8a: the alpha regime).
   ci-gate:
     name: CI Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner || '"ubuntu-latest"') || 'ci-gate' }}   # v1.48
     # v1.29.3: on a schedule run the schedule guard decides. `busy` skips the
     # gate, so `CI / CI Gate (schedule)` posts `skipped` (Gitea 1.27.1 posts a
     # skipped job as `skipped`, not `success`), never a green nightly. Every
     # other verdict, an empty one included, runs it.
-    if: ${{ always() && (github.event_name != 'schedule' || needs.preflight.outputs.verdict != 'busy') }}
+    # v1.53 (Tenant Agent on trusted-firmware #821): with main-{event} a newer
+    # push cancels the older main run, and an always() gate then read the
+    # cancelled needs and failed, so every superseded main commit showed a red
+    # gate. Off pull_request the gate runs on !cancelled(): a cancelled run
+    # posts no gate result (skipped), and a run that is not cancelled still
+    # fails closed on any need that failed. A pull request keeps always(): a
+    # skipped required check counts as passed, so a cancelled PR run must post
+    # a failing gate, never a skip; only an older head of the PR is cancelled
+    # by its group, and the head that merges has its own run.
+    if: ${{ (startsWith(github.event_name, 'pull_request') && always() || !cancelled()) && (github.event_name != 'schedule' || needs.preflight.outputs.verdict != 'busy') }}
     timeout-minutes: 5        # v1.30
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
     # check line below; remove none of the template's jobs. v1.30: lint
     # joins; publish-images is the one job outside the gate (see its comment).
-    needs: [preflight, lint, image, unit, coverage, lint-gates, integration, soak, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips, signatures]
+    needs: [preflight, row, lint, image, unit, coverage, lint-gates, integration, soak, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips, signatures]
     steps:
       - name: Fail closed on any non-success
         env:
-          # The full tier is CI_FULL_TIER (v1.23): every event but a PR, and a
-          # PR labelled ci:full. A job marked `full` may be skipped below only
+          # The full tier is CI_FULL_TIER (v1.23); v1.41: every event, a PR
+          # included, but a refused dispatch. A job marked `full` may be skipped below only
           # when it is not selected; a `pr` job may never be skipped.
           FULL_TIER: ${{ env.CI_FULL_TIER }}
           # v1.24: a `nightly` job runs on schedule and workflow_dispatch only.
@@ -3560,6 +3836,8 @@ jobs:
           PROOF: ${{ needs.preflight.outputs.proof }}
           DOCS_ONLY: ${{ needs.preflight.outputs.docs_only == 'true' }}
           LINT_GATES_SEL: ${{ needs.preflight.outputs.lint_gates != 'false' }}
+          # v1.55: the Row job runs on pull_request only (a `pull` job).
+          PULL: ${{ github.event_name == 'pull_request' }}
         run: |
           if [ "${DRAFT}" = true ]; then
             echo "FAIL draft pull request: no CI runs on a draft. Mark it ready, then push an empty commit to start its run."
@@ -3567,7 +3845,7 @@ jobs:
           fi
           BAD=0
           echo "full tier selected: ${FULL_TIER}; nightly selected: ${NIGHTLY}"
-          check() { # <job> <result> <pr|code|scoped|full|nightly>
+          check() { # <job> <result> <pr|code|scoped|full|pull|nightly>
             case "$2" in
               success) echo "OK   $1";;
               skipped)
@@ -3579,6 +3857,8 @@ jobs:
                   echo "SKIP $1 (no changed file matches LINT_GATES_PATTERN)"
                 elif [ "$3" = full ] && [ "${FULL_TIER}" != true ]; then
                   echo "SKIP $1 (full tier not selected)"
+                elif [ "$3" = pull ] && [ "${PULL}" != true ]; then
+                  echo "SKIP $1 (pull request only)"
                 elif [ "$3" = nightly ] && [ "${NIGHTLY}" != true ]; then
                   echo "SKIP $1 (nightly and dispatch only)"
                 else
@@ -3601,23 +3881,25 @@ jobs:
           # full tier by its `if:` is marked full, one gated to schedule and
           # workflow_dispatch is nightly; every other job is pr. v1.30: a job
           # that skips on a docs-only PR is code, and lint-gates is scoped.
+          # v1.55: row runs on pull_request only, so it is pull.
           check preflight   "${{ needs.preflight.result }}" pr
+          check row         "${{ needs.row.result }}" pull
           check lint        "${{ needs.lint.result }}" pr
           check image       "${{ needs.image.result }}" code
           check unit        "${{ needs.unit.result }}" code
           check coverage    "${{ needs.coverage.result }}" code
           check lint-gates  "${{ needs.lint-gates.result }}" scoped
-          check integration "${{ needs.integration.result }}" full
+          check integration "${{ needs.integration.result }}" code
           check soak        "${{ needs.soak.result }}" nightly
           check signatures  "${{ needs.signatures.result }}" pr
           # >>> CUSTOMIZE (go-quicraft)
-          check netfault    "${{ needs.netfault.result }}" full
-          check errfs       "${{ needs.errfs.result }}" full
-          check zero-rtt    "${{ needs.zero-rtt.result }}" full
+          check netfault    "${{ needs.netfault.result }}" code
+          check errfs       "${{ needs.errfs.result }}" code
+          check zero-rtt    "${{ needs.zero-rtt.result }}" code
           check fuzz-seeds  "${{ needs.fuzz-seeds.result }}" nightly
-          check cross-arch  "${{ needs.cross-arch.result }}" full
-          check modules     "${{ needs.modules.result }}" full
-          check contrib-dragonboat "${{ needs.contrib-dragonboat.result }}" full
-          check fips        "${{ needs.fips.result }}" full
+          check cross-arch  "${{ needs.cross-arch.result }}" code
+          check modules     "${{ needs.modules.result }}" code
+          check contrib-dragonboat "${{ needs.contrib-dragonboat.result }}" code
+          check fips        "${{ needs.fips.result }}" code
           # <<< CUSTOMIZE
           exit $BAD

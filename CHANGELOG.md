@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: ci-template v1.34.1. No Go module proxy list ends in `direct` (`ci.yml`, `nightly.yml`, the devcontainer Dockerfile, `scripts/in-toolchain-image.sh`), so a module the proxy cannot serve fails the build instead of being fetched from its origin.
 - Dependencies: go-enclave v0.11.0-alpha (was v0.10.0-alpha), in the root module, `contrib/dragonboat` and `test/performance/quicraft`. Its additions (a Linux `memfd_secret` backend and `Sealed.OpenIn`) need no change here.
 - Dependencies: go-enclave v0.11.1-alpha (was v0.11.0-alpha), in the same three modules. It is the v0.11.0-alpha commit tagged again, so no code changes; go.sum carries the checksums the public module proxy serves.
+- Dependencies: go-enclave v0.12.0-alpha (was v0.11.1-alpha), in the same three modules. No API this repository calls changed.
 
 ### Fixed
 
@@ -793,7 +794,7 @@ format is unchanged, so 0.17.0 data directories open as they are.
   over replica start and leader wait only, 1 ms leader polling and mutual TLS
   1.3. Host socket buffers are set once for every engine and no engine's
   container runs privileged. Where an engine cannot match a setting it is
-  listed in `test/performance/README.md`. The `ci-node-2` profile is
+  listed in `test/performance/README.md`. The `bench-01` profile is
   re-measured on 2026-10-04.
 
 ### Fixed
@@ -1099,7 +1100,7 @@ sites and any custom `Barrier` implementation.
 - The Dragonboat benchmark harness runs Dragonboat on its Tan LogDB instead of
   the default sharded Pebble store, and its election benchmarks rotate through
   a fixed ring of shard IDs so Tan's per-shard preallocated log files no longer
-  fill the disk. The `ci-node-2` profile is re-measured on 2026-10-02 with all
+  fill the disk. The `bench-01` profile is re-measured on 2026-10-02 with all
   four systems.
 
 ### Removed
@@ -1827,7 +1828,7 @@ in place.
   version their binary links.
 - **The dragonboat read benchmarks seed through the current leader**, retrying
   after a leader change. The first complete four-system capture,
-  `profiles/ci-node-2`, is on record.
+  `profiles/bench-01`, is on record.
 - **Releases tag the `test/performance` module alongside the root module**, so
   `github.com/jeremyhahn/go-quicraft/test/performance@vX.Y.Z` resolves.
 - **The internal transport `Config` gains `DialTimeout`** (default unchanged,

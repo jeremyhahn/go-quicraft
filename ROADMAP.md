@@ -48,7 +48,9 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 
 ## Now
 
-No feature in progress. Open: [#427](../../issues/427) only, in the `v1.0.0 bar` milestone; it pins the next go-enclave release once go-enclave publishes it.
+- **maintenance** — standing row (owner ruling 1234): dependency updates and CI configuration land from one row branch; it carries no milestone and gates no release — [#1202](../../issues/1202) — in progress
+
+No other feature in progress. Open in the `v1.0.0 bar` milestone: [#427](../../issues/427) only; it pins the next go-enclave release once go-enclave publishes it.
 
 ## Next
 

@@ -43,16 +43,30 @@ RUN apk add --no-cache curl tar
 COPY scripts/tool-pins.sh /tmp/tool-pins.sh
 # gosec builds in a throwaway module so x/tools can be raised to XTOOLS_VERSION
 # (see tool-pins.sh); the others build with the x/tools their go.mod names.
+# retry runs a module fetch up to three times, so one transient proxy error
+# does not fail the image build.
 RUN set -eu; \
+    retry() { \
+      n=1; \
+      while :; do \
+        rc=0; "$@" || rc=$?; \
+        [ "$rc" -eq 0 ] && return 0; \
+        [ "$n" -ge 3 ] && return "$rc"; \
+        if [ "$n" -eq 1 ]; then s=5; else s=15; fi; \
+        n=$((n + 1)); \
+        echo "==> retry $n/3: $*" >&2; \
+        sleep "$s"; \
+      done; \
+    }; \
     . /tmp/tool-pins.sh; \
-    go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}"; \
-    go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"; \
+    retry go install "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_VERSION}"; \
+    retry go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"; \
     ( d="$(mktemp -d)"; cd "$d"; \
       go mod init gosec-build; \
-      go get "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}" "golang.org/x/tools@${XTOOLS_VERSION}"; \
-      go install github.com/securego/gosec/v2/cmd/gosec; \
+      retry go get "github.com/securego/gosec/v2/cmd/gosec@${GOSEC_VERSION}" "golang.org/x/tools@${XTOOLS_VERSION}"; \
+      retry go install github.com/securego/gosec/v2/cmd/gosec; \
       cd /; rm -rf "$d" ); \
-    go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"; \
+    retry go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"; \
     case "${TARGETARCH:-amd64}" in \
       amd64) arch=64bit; sum="${TRIVY_SHA256_LINUX_AMD64}"; asset="${TRIVY_ASSET_ID_LINUX_AMD64}" ;; \
       arm64) arch=ARM64; sum="${TRIVY_SHA256_LINUX_ARM64}"; asset="${TRIVY_ASSET_ID_LINUX_ARM64}" ;; \

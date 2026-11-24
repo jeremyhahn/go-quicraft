@@ -80,6 +80,11 @@ the step does; nothing reaches the network.
      the lint's own reader, runs on ubuntu-latest for a fork's pull request
      on github.com, while a same-repository pull request keeps preflight's
      pool default.
+  K. ci-template v1.53: code-review.yml's guard jobs may take the
+     self-hosted pool for a same-repository head only; a fork's head, another
+     label and another workflow stay (c).
+  L. With the variable unset, preflight takes the pool only for a push to
+     main and a same-repository pull request; every other event is hosted.
 
 Run: python3 -I test/buildgates/testdata/runner-labels-tests.py
 """
@@ -90,7 +95,10 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-WORKFLOW = HERE.parents[2] / ".github" / "workflows" / "ci.yml"
+# LOCAL: this copy lives in test/buildgates/testdata; the workflows it reads are
+# the repository's own, in .github/workflows.
+WORKFLOWS = HERE.parents[2] / ".github" / "workflows"
+WORKFLOW = WORKFLOWS / "ci.yml"
 FAILS = 0
 
 
@@ -341,7 +349,7 @@ case("D23 a label that only contains codex is not the review label",
 case("D24 codex named in the reason text only is not the label",
      {"ci.yml": wf(PR_ON, job("[self-hosted, bigdisk]  # self-hosted: oversize: shares the codex host disk", name="c"))}, 0, [], ["(f)"])
 case("D14 a space before the category colon passes",
-     {"ci.yml": wf(PR_ON, job("[self-hosted, gpu]  # self-hosted: hardware : the GPU", name="gpu"))}, 0)
+     {"ci.yml": wf(PR_ON, job("[self-hosted, gpu-pool]  # self-hosted: hardware : the GPU", name="gpu"))}, 0)  # LOCAL: a pool label, not a host name
 case("D10 a release job is the release rule's, not (c)'s",
      {"release.yml": wf("on:\n  push:\n    tags: ['v*']\n",
                         job(REL, "startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'"))}, 0, [], ["(c)"])
@@ -372,10 +380,12 @@ case("E7 another job's output is not the selection: (c)",
 # F. preflight on the self-hosted bigdisk pool by default, the variable its fallback
 PRE_UNGUARDED = ("${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || "
                  "'[\"self-hosted\",\"linux\",\"x64\",\"bigdisk\"]') || 'ubuntu-latest' }}")
-# v1.52: the fork clause before the variable, for every pull_request event.
-PRE = PRE_UNGUARDED.replace("&& fromJSON(vars.", "&& (!startsWith(github.event_name, 'pull_request') || "
-                            "github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.")
-PRE_TEXT = WORKFLOW.read_text()
+# v1.52, as v1.59 writes it: the pool only for a push to main and a
+# same-repository pull_request, before the variable.
+PRE = PRE_UNGUARDED.replace("&& fromJSON(vars.", "&& ((github.event_name == 'push' && github.ref == 'refs/heads/main') || "
+                            "(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) "
+                            "&& fromJSON(vars.")
+PRE_TEXT = (WORKFLOWS / "ci.yml").read_text()
 if PRE_TEXT.count(f"    runs-on: {PRE}   # v1.52\n") != 1:
     fatal("ci.yml's preflight runs-on is not the form part F tests, exactly once")
 case("F1 ci.yml: preflight's runs-on passes, unset and set to the fallback",
@@ -425,6 +435,10 @@ case("G2 a label picked only under pull_request_target fails (c) on that event, 
 case("G3 the same text fails without the trigger too, as every event is read in every workflow; no fork note",
      {"signatures.yml": wf(PR_ON, job(PRT_ONLY, name="signatures"))}, 1,
      ["signatures.yml:signatures: (c)", "pull_request_target (refs/heads/main, fork): bigdisk"], [FORK_NOTE])
+case("F11 the off-github.com label is not checked: the forge keeps ubuntu-latest",
+     {"ci.yml": wf(PR_ON, job(PRE.replace("|| 'ubuntu-latest' }}",  # v1.52: that tail is also a fork's
+                                          "|| github.server_url != 'https://github.com' && 'bigdisk' || 'ubuntu-latest' }}"),
+                              name="preflight"))}, 0, ["OK:"])
 case("G4 a hard-coded self-hosted label under pull_request_target fails (c) on both heads",
      {"signatures.yml": wf(PRT_ON, job("[self-hosted, linux, x64, bigdisk]", name="signatures"))}, 1,
      ["signatures.yml:signatures: (c)", "pull_request_target (refs/heads/main):",
@@ -537,11 +551,19 @@ def every_job(head):
     return got
 
 
+# LOCAL: the jobs the template gives the selection (preflight its own default),
+# and this repository's toolchain-image legs that take it as integration does.
+# Its other ci.yml jobs stay on ubuntu-latest on every event.
+SELECTION_JOBS = {"preflight", "row", "lint", "image", "lint-gates", "integration", "soak", "ci-gate",
+                  "unit", "coverage", "netfault", "errfs", "zero-rtt", "cross-arch", "modules",
+                  "contrib-dragonboat", "fips"}
+
+
 def selection_case(label, head, want):
     global FAILS
     got = every_job(head)
     bad = {n: v for n, v in got.items() if any(want(n, sel, l) is False for sel, l in v.items())}
-    ok = len(got) >= 6 and not bad
+    ok = len(got) >= 6 and SELECTION_JOBS <= set(got) and not bad
     print(f"{'PASS' if ok else 'FAIL'}: {label}")
     if not ok:
         FAILS += 1
@@ -550,11 +572,49 @@ def selection_case(label, head, want):
 
 selection_case("J5 this repository's ci.yml: every job runs on ubuntu-latest for a fork's pull request on github.com",
                "fork/r", lambda n, sel, l: l == ["ubuntu-latest"])
-# LOCAL: every job but preflight names ubuntu-latest directly (hosted first),
-# so a same-repository pull request keeps only preflight's pool default.
-selection_case("J6 this repository's ci.yml: a same-repository pull request keeps preflight's pool default",
-               "o/r", lambda n, sel, l: l == (["self-hosted", "linux", "x64", "bigdisk"]
-                                             if n == "preflight" and sel == "unset" else ["ubuntu-latest"]))
+selection_case("J6 this repository's ci.yml: a same-repository pull request keeps the pool default and overflow",
+               "o/r", lambda n, sel, l: l == (["ubuntu-latest"] if sel in ("set", "default") or n not in SELECTION_JOBS else
+                                             ["self-hosted", "linux", "x64", "bigdisk"] if n in ("preflight", "ci-gate", "row")
+                                             else ["self-hosted", "linux", "x64", "bigdisk-docker"]))
+
+# K. code-review.yml's guard jobs on the self-hosted pool for a same-repository head (v1.53)
+CR_ON = "on:\n  pull_request_target:\n    branches: [main]\n    types: [opened, synchronize]\n"
+SAME = ("${{ github.server_url == 'https://github.com' && (github.event.pull_request.head.repo.full_name == github.repository "
+        "&& fromJSON('[\"self-hosted\",\"linux\",\"x64\",\"bigdisk\"]') || 'ubuntu-latest') || 'bigdisk' }}")
+ANYHEAD = ("${{ github.server_url == 'https://github.com' && (github.event_name == 'pull_request_target' "
+           "&& fromJSON('[\"self-hosted\",\"linux\",\"x64\",\"bigdisk\"]') || 'ubuntu-latest') || 'bigdisk' }}")
+case("K1 code-review.yml: a guard job on bigdisk for a same-repository head passes",
+     {"code-review.yml": wf(CR_ON, job(SAME, name="scope"))}, 0, ["OK:"])
+case("K2 code-review.yml: the same pool for a fork's head fails (c)",
+     {"code-review.yml": wf(CR_ON, job(ANYHEAD, name="scope"))}, 1,
+     ["code-review.yml:scope: (c)", "fork, pull_request_target: a fork never reaches a self-hosted runner"],
+     ["pull_request_target (refs/heads/main): self-hosted"])
+case("K3 signatures.yml: the same-repository exemption is code-review.yml's alone",
+     {"signatures.yml": wf(CR_ON, job(SAME, name="signatures"))}, 1, ["signatures.yml:signatures: (c)"])
+case("K4 code-review.yml: another self-hosted label for a same-repository head fails (c)",
+     {"code-review.yml": wf(CR_ON, job(SAME.replace('"bigdisk"]', '"bigdisk-docker"]'), name="scope"))}, 1,
+     ["code-review.yml:scope: (c)"])
+
+# L. preflight takes the self-hosted pool only for a push to main
+# and a same-repository pull request; with the variable unset every other event is hosted.
+def preflight_labels(event, ref, head):
+    ns = {}
+    exec(SCRIPT.split("\nfiles = sorted(", 1)[0], ns)
+    return ns["runs_on_labels"](PRE, event, ref, head, "unset")
+
+
+for label, event, ref, head, want in (
+        ("a push to main", "push", "refs/heads/main", "", ["self-hosted", "linux", "x64", "bigdisk"]),
+        ("a same-repository pull request", "pull_request", "refs/pull/1/merge", "o/r", ["self-hosted", "linux", "x64", "bigdisk"]),
+        ("a schedule", "schedule", "refs/heads/main", "", ["ubuntu-latest"]),
+        ("a workflow_dispatch on main", "workflow_dispatch", "refs/heads/main", "", ["ubuntu-latest"]),
+        ("a push of another branch", "push", "refs/heads/feature", "", ["ubuntu-latest"])):
+    got = preflight_labels(event, ref, head)
+    ok = got == want
+    print(f"{'PASS' if ok else 'FAIL'}: L1 preflight, CI_PREFLIGHT_RUNS_ON unset, {label}: {want}")
+    if not ok:
+        FAILS += 1
+        print(f"  got {got}")
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
