@@ -52,8 +52,8 @@ this one. Those links were left as written rather than rewritten, because the
 mandate was verbatim preservation.
 
 Two facts stated in the preserved README are now out of date and are corrected
-here rather than in the text below: the secondary omega dataset it points at
-(`omega.md`, `omega/`, `results-omega/`) never existed at those paths, and the
+here rather than in the text below: the secondary workstation dataset it points at
+(`workstation.md`, `workstation/`, `results-workstation/`) never existed at those paths, and the
 `Architecture` section's layout diagram describes the pre-profile tree. The
 current layout is in [../../README.md](../../README.md).
 
@@ -75,9 +75,9 @@ measured on **2026-03-18** at commit **3d92cd2**. That is the baseline of record
 The R640 is currently offline with a hardware failure; a fresh run is expected
 once it is repaired, and that run will replace the numbers here.
 
-A second, smaller dataset exists: [omega.md](omega.md), measured 2026-08-17 on a
+A second, smaller dataset exists: [workstation.md](workstation.md), measured 2026-08-17 on a
 single-socket Intel i9-9900X workstation. It is a secondary datapoint, not a
-refresh. **Do not compare a value in this file against a value in `omega.md`,
+refresh. **Do not compare a value in this file against a value in `workstation.md`,
 and do not compute a ratio across the two.** They are different machines, and
 they are also different builds of the engine (see below). Each file is
 internally consistent; nothing across them is.
@@ -134,7 +134,7 @@ generate a second dataset without touching the baseline, point it elsewhere:
 
 ```bash
 cd test/performance
-./perfcompare generate --results-dir=results-omega --output-dir=omega --chart-dir=charts/omega
+./perfcompare generate --results-dir=results-workstation --output-dir=workstation --chart-dir=charts/workstation
 ```
 
 ## Test Environment (R640 baseline, 2026-03-18)
@@ -168,14 +168,14 @@ overwritten wholesale on the next run.
 | QuicRaft vs Dragonboat | [dragonboat.md](dragonboat.md) |
 | QuicRaft vs OpenRaft | [openraft.md](openraft.md) |
 
-Secondary dataset, omega, 2026-08-17:
+Secondary dataset, workstation, 2026-08-17:
 
 | Comparison | Link |
 |------------|------|
-| Environment, all four result tables | [omega.md](omega.md) |
-| QuicRaft vs etcd | [omega/etcd.md](omega/etcd.md) |
-| QuicRaft vs Dragonboat | [omega/dragonboat.md](omega/dragonboat.md) |
-| QuicRaft vs OpenRaft | [omega/openraft.md](omega/openraft.md) |
+| Environment, all four result tables | [workstation.md](workstation.md) |
+| QuicRaft vs etcd | [workstation/etcd.md](workstation/etcd.md) |
+| QuicRaft vs Dragonboat | [workstation/dragonboat.md](workstation/dragonboat.md) |
+| QuicRaft vs OpenRaft | [workstation/openraft.md](workstation/openraft.md) |
 
 ## System Overview
 
@@ -493,9 +493,9 @@ test/performance/
   etcd.md                <- GENERATED. QuicRaft vs etcd-io/raft, R640 baseline
   dragonboat.md          <- GENERATED. QuicRaft vs Dragonboat, R640 baseline
   openraft.md            <- GENERATED. QuicRaft vs OpenRaft, R640 baseline
-  omega.md               <- HAND-MAINTAINED. Secondary dataset, environment + tables
-  omega/                 <- GENERATED. Pairwise markdown for the omega dataset
-  results-omega/         <- Stored JSON for the omega dataset
+  workstation.md         <- HAND-MAINTAINED. Secondary dataset, environment + tables
+  workstation/           <- GENERATED. Pairwise markdown for the workstation dataset
+  results-workstation/   <- Stored JSON for the workstation dataset
   perfresult/            <- Shared types, comparison engine, chart generation
   benchutil/             <- Shared warmup retry budget (Go harnesses only)
   cmd/perfcompare/       <- Go CLI orchestrator (Docker-based execution)
@@ -504,12 +504,12 @@ test/performance/
   dragonboat/            <- Dragonboat benchmarks (standalone module)
   openraft/              <- OpenRaft (Rust) benchmarks (standalone crate)
   baselines/             <- Committed bench-compare baselines (see docs/performance/benchmarking.md)
-  charts/                <- SVG charts. R640 charts at the top level, omega under charts/omega/
+  charts/                <- SVG charts. R640 charts at the top level, workstation under charts/workstation/
 ```
 
 The earlier version of this section described the README as auto-generated. It
 is not. `perfcompare generate` writes `<system>.md` for each non-QuicRaft system
-plus the charts, and nothing else; the README, `omega.md`, `PROFILING_ANALYSIS.md`
+plus the charts, and nothing else; the README, `workstation.md`, `PROFILING_ANALYSIS.md`
 and the prose under `docs/performance/` are all maintained by hand.
 <!-- END-VERBATIM test/performance/README.md -->
 
@@ -522,8 +522,8 @@ and the prose under `docs/performance/` are all maintained by hand.
 **BENCHTIME**: 30s
 **Hardware**: Dell EMC PowerEdge R640, 2x Xeon Platinum 8260 (96 threads), 384 GiB, NVMe, 2 NUMA nodes. See [README.md](README.md#test-environment-r640-baseline-2026-03-18).
 
-> Every number below is from the R640 baseline. The secondary omega dataset lives
-> in [omega/etcd.md](omega/etcd.md) and was measured on different hardware — do not
+> Every number below is from the R640 baseline. The secondary workstation dataset lives
+> in [workstation/etcd.md](workstation/etcd.md) and was measured on different hardware — do not
 > compare a value here against a value there.
 
 ## Charts
@@ -673,8 +673,8 @@ The following scenarios were only measured for QuicRaft (etcd does not expose eq
 **BENCHTIME**: 30s
 **Hardware**: Dell EMC PowerEdge R640, 2x Xeon Platinum 8260 (96 threads), 384 GiB, NVMe, 2 NUMA nodes. See [README.md](README.md#test-environment-r640-baseline-2026-03-18).
 
-> Every number below is from the R640 baseline. The secondary omega dataset lives
-> in [omega/dragonboat.md](omega/dragonboat.md) and was measured on different
+> Every number below is from the R640 baseline. The secondary workstation dataset lives
+> in [workstation/dragonboat.md](workstation/dragonboat.md) and was measured on different
 > hardware — do not compare a value here against a value there.
 
 ## Charts
@@ -821,8 +821,8 @@ The following scenarios were only measured for QuicRaft (Dragonboat does not exp
 **BENCHTIME**: 30s
 **Hardware**: Dell EMC PowerEdge R640, 2x Xeon Platinum 8260 (96 threads), 384 GiB, NVMe, 2 NUMA nodes. See [README.md](README.md#test-environment-r640-baseline-2026-03-18).
 
-> Every number below is from the R640 baseline. The secondary omega dataset lives
-> in [omega/openraft.md](omega/openraft.md) and was measured on different hardware
+> Every number below is from the R640 baseline. The secondary workstation dataset lives
+> in [workstation/openraft.md](workstation/openraft.md) and was measured on different hardware
 > — do not compare a value here against a value there.
 
 ## Charts
