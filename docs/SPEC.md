@@ -57,8 +57,10 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | testing | shipped | The test infrastructure: suite organisation, build tags, fault injectors, fuzzing, linearizability verification, coverage gates and benchmark regression. [overview.md](testing/overview.md) | [testing/](testing/) |
 | release | shipped | Public releasability: what may be published from this tree, the development-tooling exclusion list and the `test/releasability` gate; the release recipe (`make release-candidate`, `make release-alpha`). [public-releasability.md](release/public-releasability.md) | [release/](release/) |
 | maintenance | in progress | A standing row (owner ruling 1234) for dependency updates and CI configuration: dependency bumps, automated and manual, and CI workflow changes, template adoptions included, are worked on one row branch and land as PRs from it. It stays open and gates no release. | [#1202](../../issues/1202) |
+| v1.0.0-hardening | in progress | The remaining v1.0.0 hardening work as one row with one PR per module: review fixes on the multi-group host and on the Dragonboat compatibility layer, worked on the row branch. It closes when both land. | [#1150](../../issues/1150) |
+| handbook-conformance | in progress | Conformance to the shared engineering standards: the CI workflow template version, placeholder pins and one devcontainer, worked on one row branch. | [#1189](../../issues/1189) |
 
-Every feature is shipped except the standing `maintenance` row, which stays in progress; no feature is planned or future.
+Every feature is shipped except the standing `maintenance` row and the `v1.0.0-hardening` and `handbook-conformance` rows, which are in progress; no feature is planned or future.
 
 ## Decisions
 

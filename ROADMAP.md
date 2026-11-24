@@ -50,7 +50,10 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 
 - **maintenance** — standing row (owner ruling 1234): dependency updates and CI configuration land from one row branch; it carries no milestone and gates no release — [#1202](../../issues/1202) — in progress
 
-No other feature in progress. Open in the `v1.0.0 bar` milestone: [#427](../../issues/427) only; it pins the next go-enclave release once go-enclave publishes it.
+- **v1.0.0-hardening** — the remaining v1.0.0 hardening work, one PR per module from one row branch — [#1150](../../issues/1150) — in progress
+- **handbook-conformance** — conformance to the shared engineering standards (CI template version, placeholder pins, one devcontainer) — [#1189](../../issues/1189) — in progress
+
+No other feature in progress. Open in the `v1.0.0 bar` milestone: [#1150](../../issues/1150).
 
 ## Next
 
