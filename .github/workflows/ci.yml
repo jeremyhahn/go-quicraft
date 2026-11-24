@@ -896,7 +896,11 @@ jobs:
       # v1.52 (Tenant Agent order, kept): on a pull request whose head
       # repository is not this repository (a fork, or a fork since deleted),
       # it makes no call and outputs the hosted default with a ::notice: a
-      # fork never reaches a self-hosted runner. Its tests:
+      # fork never reaches a self-hosted runner. An event the self-hosted
+      # runners' job-started hook refuses (anything but a push to main and a
+      # pull request: a schedule, a workflow_dispatch, a push of another
+      # branch) makes no call and outputs the hosted default with a ::notice.
+      # Its tests:
       # test/buildgates/testdata/runner-select-tests.py.
       - name: Balanced runner pool (ruling 1137)
         id: runner
@@ -904,6 +908,7 @@ jobs:
           SERVER: ${{ github.server_url }}
           EVENT: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
           API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
           RUN_ID: ${{ github.run_id }}
@@ -938,6 +943,17 @@ jobs:
                 emit "$HOSTED" "$HOSTED"
                 exit 0
               fi ;;
+          esac
+          # The self-hosted runners take a push to main and a same-repository
+          # pull request only; their job-started hook refuses every other event
+          # (a schedule, a workflow_dispatch, a push of another branch), so such
+          # a run takes the hosted default.
+          case "$EVENT:$REF" in
+            push:refs/heads/main | pull_request:*) ;;
+            *)
+              echo "::notice::runner selection: event $EVENT on $REF is not a push to main or a pull request, which the self-hosted runners refuse; every job of this run takes the GitHub-hosted default, ubuntu-latest"
+              emit "$HOSTED" "$HOSTED"
+              exit 0 ;;
           esac
           # whole <value>: a whole number above 0, at most 6 digits.
           whole() { [[ "$1" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$1))" -gt 0 ]; }

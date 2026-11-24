@@ -34,6 +34,10 @@ also fails a case whose curl command line carries the token.
      this repository (a fork, or one since deleted) gets the hosted default
      with a ::notice and no call, even when self-hosted would win; a
      same-repository pull request and a push still balance.
+  G. An event the self-hosted runners refuse (a schedule, a
+     workflow_dispatch, a push of another branch, pull_request_target)
+     gets the hosted default with a ::notice and no call, a quiet
+     schedule run included; a push to main still balances.
 
 Run: python3 -I software/templates/github-actions/testdata/runner-select-tests.py
 """
@@ -123,7 +127,7 @@ def jobs(*js, total=None):
     return json.dumps({"total_count": len(js) if total is None else total, "jobs": list(js)})
 
 
-def run(resp, server="https://github.com", hs="10", c1="10", c2="10", event="push", head=""):
+def run(resp, server="https://github.com", hs="10", c1="10", c2="10", event="push", head="", ref="refs/heads/main"):
     with tempfile.TemporaryDirectory() as d:
         d = pathlib.Path(d)
         (d / "bin").mkdir()
@@ -141,7 +145,7 @@ def run(resp, server="https://github.com", hs="10", c1="10", c2="10", event="pus
             "GITHUB_OUTPUT": str(d / "out"), "RUNNER_TEMP": str(d / "tmp"),
             "SERVER": server, "API": "https://api.github.com/repos/o/r/actions", "RUN_ID": "100",
             "JOB_TOKEN": TOKEN, "HS": hs, "C1": c1, "C2": c2,
-            "EVENT": event, "HEAD_REPO": head, "REPO": "o/r",
+            "EVENT": event, "HEAD_REPO": head, "REPO": "o/r", "REF": ref,
         }
         p = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(d / "step.sh")],
                            env=env, capture_output=True, text=True, timeout=60)
@@ -314,6 +318,20 @@ case("E5 a push still balances",
      WIN, SELF, SELF_D, ["run on the Dells"], ["a fork"])
 case("E6 off github.com a fork keeps the forge labels: no call, no fork notice",
      [], HOSTED, HOSTED, ["not github.com"], ["a fork"], calls=0, server="gitea", event="pull_request", head="fork/r")
+
+# G. an event the self-hosted runners refuse (their job-started hook takes a
+# push to main and a same-repository pull request only): hosted, no call,
+# even where self-hosted would win.
+for label, event, ref in (("a schedule", "schedule", "refs/heads/main"),
+                          ("a workflow_dispatch on main", "workflow_dispatch", "refs/heads/main"),
+                          ("a push of another branch", "push", "refs/heads/feature"),
+                          ("a same-repository pull_request_target", "pull_request_target", "refs/heads/main")):
+    case(f"G1 {label}: hosted, no call", WIN, HOSTED, HOSTED,
+         ["::notice::", f"event {event} on {ref}", "which the self-hosted runners refuse"], ["::warning::"],
+         calls=0, event=event, ref=ref, head="o/r")
+case("G2 a quiet schedule run (a tie at 0) stays hosted", pool(), HOSTED, HOSTED,
+     ["self-hosted runners refuse"], calls=0, event="schedule")
+case("G3 a push to main still balances", WIN, SELF, SELF_D, ["run on the Dells"], ref="refs/heads/main")
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
