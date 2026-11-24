@@ -38,7 +38,9 @@ import (
 // hours. `credential:` is accepted only for code-review.yml's Codex review
 // job, whose reviewer token is mounted on one runner. ci.yml and release.yml
 // carry no waiver at all: every job in them runs on hostedRunner, a job that
-// names the `release` label included.
+// names the `release` label included, except that the ci.yml jobs in
+// ciRunnerSelection run on the template's runner selection expression
+// (ci-template v1.54), exactly, whose hosted default is hostedRunner.
 const (
 	hostedRunner     = "ubuntu-latest"
 	selfHostedWaiver = "# self-hosted: "
@@ -52,6 +54,31 @@ var credentialJob = struct{ file, job string }{"code-review.yml", "review"}
 
 // hostedOnlyWorkflows are the workflows in which no job is waived.
 var hostedOnlyWorkflows = []string{"ci.yml", "release.yml"}
+
+// The ci-template v1.54 runs-on expressions. Preflight reads the repository
+// variable CI_PREFLIGHT_RUNS_ON and keeps a fork's head on hostedRunner; the
+// image jobs and CI Gate read the runs-on JSON that preflight's runner
+// selection step writes, hostedRunner unless it picks the self-hosted pool.
+// The preflight step `Runner labels (ruling 633)` checks what each can pick.
+const (
+	preflightRunsOn = `${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
+	dockerRunsOn    = `${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}`
+	gateRunsOn      = `${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner || '"ubuntu-latest"') || 'ci-gate' }}`
+)
+
+// ciRunnerSelection maps each ci.yml job the template gives a runner
+// selection to its runs-on expression; every other ci.yml job runs on
+// hostedRunner.
+var ciRunnerSelection = map[string]string{
+	"preflight":   preflightRunsOn,
+	"lint":        dockerRunsOn,
+	"image":       dockerRunsOn,
+	"lint-gates":  dockerRunsOn,
+	"integration": dockerRunsOn,
+	"soak":        dockerRunsOn,
+	"row":         gateRunsOn,
+	"ci-gate":     gateRunsOn,
+}
 
 // workflowJob is one job of a workflow and its runs-on node.
 type workflowJob struct {
@@ -137,6 +164,9 @@ func runnerProblems(file string, body []byte) []string {
 			if p := waiverProblem(j.runsOn.LineComment, credentialOK); p != "" {
 				problems = append(problems, where+" "+p)
 			}
+		case file == "ci.yml" && j.runsOn.Kind == yaml.ScalarNode && ciRunnerSelection[j.name] != "" &&
+			j.runsOn.Value == ciRunnerSelection[j.name]:
+			continue
 		case strings.Contains(j.runsOn.Value, "${{"):
 			problems = append(problems, where+" runs on an expression, which can pick a self-hosted label: "+strconv.Quote(j.runsOn.Value))
 		case j.runsOn.Value == hostedRunner:
@@ -234,6 +264,13 @@ func TestRunnerProblems(t *testing.T) {
 		{"a ci.yml job sent to a self-hosted label", ci("coverage", "bigdisk"), "ci.yml job coverage runs on \"bigdisk\"; every ci.yml job"},
 		{"a waived ci.yml job", ci("coverage", "bigdisk  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), "ci.yml job coverage carries a self-hosted waiver"},
 		{"a ci.yml expression", ci("coverage", expr), "ci.yml job coverage runs on an expression"},
+		{"the runner selection on a job the template gives none", ci("coverage", dockerRunsOn), "ci.yml job coverage runs on an expression"},
+		{"another job's selection", ci("lint", gateRunsOn), "ci.yml job lint runs on an expression"},
+		{"preflight's expression on another job", ci("ci-gate", preflightRunsOn), "ci.yml job ci-gate runs on an expression"},
+		{"a selection with another overflow label", ci("image", strings.Replace(dockerRunsOn, "'bigdisk'", "'release'", 1)), "ci.yml job image runs on an expression"},
+		{"preflight's fork clause dropped", ci("preflight", strings.Replace(preflightRunsOn, "(!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && ", "", 1)), "ci.yml job preflight runs on an expression"},
+		{"a waived selection", ci("lint", dockerRunsOn+"  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), "ci.yml job lint carries a self-hosted waiver"},
+		{"a selection job put back on the hosted runner is allowed", ci("lint", hostedRunner), ""},
 		{"a hardware waiver is allowed", cr("scope", "bigdisk  "+selfHostedWaiver+"hardware: needs the attached device"), ""},
 		{"an oversize waiver is allowed", cr("scope", "bigdisk  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), ""},
 		{"a waiver after another comment is allowed", cr("review-opencode", "qwen  # CUSTOMIZE: the label "+selfHostedWaiver+"hardware: the model host"), ""},
