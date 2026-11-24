@@ -789,9 +789,7 @@ jobs:
   # CI_FILE and GATE_JOB inside the step, per repository.
   scope:
     name: Review scope (InfoSec guard)
-    # Template v5.12.9 draft clause: a PR is reviewed once, when it is
-    # ready for merge, never as a draft; marking it ready fires
-    # ready_for_review, which starts the review.
+    # Drafts are not reviewed.
     if: >-
       github.event.pull_request.draft != true
       && github.event.pull_request.state == 'open'
@@ -1242,9 +1240,7 @@ jobs:
     # v5.10.6 (Tenant Agent m2331 (2)): a head in this repository only; a
     # fork's head never takes a codex runner.
     # LOCAL (security): never on `edited` (only the gate job runs on it).
-    # Template v5.12.9 draft clause: a PR is reviewed once, when it is
-    # ready for merge, never as a draft; marking it ready fires
-    # ready_for_review, which starts the review.
+    # Drafts are not reviewed.
     if: >-
       github.event.pull_request.draft != true
       && github.event.action != 'edited'
@@ -3260,9 +3256,7 @@ jobs:
     needs: review
     # Gitea only (v5.9.0): its token check and permission read are Gitea's.
     # LOCAL (security): never on `edited` (only the gate job runs on it).
-    # Template v5.12.9 draft clause: a PR is reviewed once, when it is
-    # ready for merge, never as a draft; marking it ready fires
-    # ready_for_review, which starts the review.
+    # Drafts are not reviewed.
     if: >-
       github.event.pull_request.draft != true
       && github.event.action != 'edited' && needs.review.outputs.agent == 'opencode' && github.server_url != 'https://github.com'
