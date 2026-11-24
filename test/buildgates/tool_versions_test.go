@@ -30,9 +30,9 @@ import (
 // The golangci-lint pin gate
 //
 // GOLANGCI_VERSION in scripts/tool-pins.sh, which the Makefile includes, is
-// the single source of truth, but
-// .github/workflows/quality.yml and the two devcontainer Dockerfiles cannot
-// read a make variable and each carry a literal pin. They had drifted to THREE
+// the single source of truth. The devcontainer Dockerfile sources that file,
+// but the workflows under .github cannot read a make variable and each carry
+// a literal pin. The pins once drifted to THREE
 // versions at once, which is worse than having no analyser: each one gates on a
 // different rule set while reporting that it passed the same gate.
 //
@@ -56,7 +56,7 @@ import (
 // pinSearchRoots are the paths the recipe searches. They are asserted against
 // the recipe text rather than trusted, so a root added to or dropped from the
 // recipe fails here instead of quietly narrowing what is checked.
-var pinSearchRoots = []string{".github", ".devcontainer", "Makefile"}
+var pinSearchRoots = []string{".github", "build/docker/devcontainer", "Makefile"}
 
 // noPinsFoundError reports that discovery matched nothing at all. It is the
 // floor the recipe calls out: a version gate over an empty set passes forever,
@@ -240,8 +240,8 @@ func collectPins(t *testing.T, base string, roots []string,
 }
 
 // TestGolangciPinsAgreeWithTheMakefileVariable is the gate applied to the real
-// tree: every literal pin under .github, .devcontainer and the Makefile must
-// equal GOLANGCI_VERSION, and there must be at least one.
+// tree: every literal pin under .github, build/docker/devcontainer and the
+// Makefile must equal GOLANGCI_VERSION, and there must be at least one.
 func TestGolangciPinsAgreeWithTheMakefileVariable(t *testing.T) {
 	pin, version := recipeRegexes(t)
 	want := declaredGolangciVersion(t)
@@ -256,8 +256,8 @@ func TestGolangciPinsAgreeWithTheMakefileVariable(t *testing.T) {
 
 // writePinFixture creates a fixture tree under a temp dir. It is never written
 // into the repository: a fixture holding a deliberately wrong pin inside
-// .github or .devcontainer would be discovered by the real gate and would fail
-// `make ci`.
+// .github or build/docker/devcontainer would be discovered by the real gate
+// and would fail `make ci`.
 func writePinFixture(t *testing.T, files map[string]string) string {
 	t.Helper()
 
@@ -293,9 +293,9 @@ func TestPinCheckFailsWhenDiscoveryFindsNothing(t *testing.T) {
 	// A tree with the right shape and no pins in it at all -- what a renamed
 	// or moved file leaves behind.
 	base := writePinFixture(t, map[string]string{
-		".devcontainer/Dockerfile":      "FROM golang:1.26\nRUN go install example.com/x@latest\n",
-		".github/workflows/quality.yml": "jobs:\n  lint:\n    steps:\n      - run: echo hi\n",
-		"Makefile":                      "all:\n\techo hi\n",
+		"build/docker/devcontainer/Dockerfile": "FROM golang:1.26\nRUN go install example.com/x@latest\n",
+		".github/workflows/quality.yml":        "jobs:\n  lint:\n    steps:\n      - run: echo hi\n",
+		"Makefile":                             "all:\n\techo hi\n",
 	})
 
 	found := collectPins(t, base, pinSearchRoots, pin, version)
@@ -315,8 +315,8 @@ func TestPinCheckFailsWhenAPinDiverges(t *testing.T) {
 	pin, version := recipeRegexes(t)
 
 	base := writePinFixture(t, map[string]string{
-		".devcontainer/Dockerfile":      fmt.Sprintf(dockerfilePin, "v1.2.3"),
-		".github/workflows/quality.yml": fmt.Sprintf(workflowPin, "v9.9.9"),
+		"build/docker/devcontainer/Dockerfile": fmt.Sprintf(dockerfilePin, "v1.2.3"),
+		".github/workflows/quality.yml":        fmt.Sprintf(workflowPin, "v9.9.9"),
 	})
 
 	found := collectPins(t, base, pinSearchRoots, pin, version)
@@ -337,10 +337,10 @@ func TestPinCheckPassesWhenEveryPinAgrees(t *testing.T) {
 	pin, version := recipeRegexes(t)
 
 	base := writePinFixture(t, map[string]string{
-		".devcontainer/Dockerfile":      fmt.Sprintf(dockerfilePin, "v1.2.3"),
-		".devcontainer/Dockerfile.dev":  fmt.Sprintf(dockerfilePin, "v1.2.3"),
-		".github/workflows/quality.yml": fmt.Sprintf(workflowPin, "v1.2.3"),
-		"Makefile":                      fmt.Sprintf(spacedPin, "v1.2.3"),
+		"build/docker/devcontainer/Dockerfile":       fmt.Sprintf(dockerfilePin, "v1.2.3"),
+		"build/docker/devcontainer/Dockerfile.extra": fmt.Sprintf(dockerfilePin, "v1.2.3"),
+		".github/workflows/quality.yml":              fmt.Sprintf(workflowPin, "v1.2.3"),
+		"Makefile":                                   fmt.Sprintf(spacedPin, "v1.2.3"),
 	})
 
 	found := collectPins(t, base, pinSearchRoots, pin, version)

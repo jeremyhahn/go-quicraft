@@ -16,6 +16,7 @@ package buildgates
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -48,7 +49,7 @@ import (
 // referenceDownloadDockerfile holds the module download RUN instruction every
 // other private-module image must repeat verbatim. Dockerfiles cannot include
 // one another, so identity is enforced here instead.
-const referenceDownloadDockerfile = ".devcontainer/Dockerfile.dev"
+const referenceDownloadDockerfile = "build/docker/devcontainer/Dockerfile"
 
 // forgeOnlyModule is the first-party module that is served from the project
 // forge and not from the public proxy. A build list that holds it cannot be
@@ -61,9 +62,6 @@ const forgeOnlyModule = "github.com/jeremyhahn/go-enclave"
 // listed here, so whether it needs the credential block is decided from its
 // go.sum rather than left to whoever adds it.
 var moduleDownloadDockerfiles = map[string]string{
-	".devcontainer/Dockerfile":               ".",
-	".devcontainer/Dockerfile.dev":           ".",
-	".devcontainer/Dockerfile.integration":   ".",
 	"build/docker/devcontainer/Dockerfile":   ".",
 	"test/performance/quicraft/Dockerfile":   "test/performance/quicraft",
 	"test/performance/etcd/Dockerfile":       "test/performance/etcd",
@@ -363,52 +361,248 @@ type composeFile struct {
 }
 
 func TestComposeServicesTakeCredentialsFromTheEnvFile(t *testing.T) {
-	for _, tc := range []struct {
-		file     string
-		services []string
-	}{
-		{".devcontainer/docker-compose.yml", []string{"devcontainer", "integration"}},
-		{".devcontainer/docker-compose.integration.yml", []string{"test-runner"}},
-	} {
-		var cf composeFile
-		if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join(repoRoot, tc.file))), &cf); err != nil {
-			t.Fatalf("parse %s: %v", tc.file, err)
+	// The devcontainer images are built by the Makefile, which passes the
+	// credential file as the gomodauth BuildKit secret; compose.yaml only
+	// runs them, with the modules baked in. So no service may build an image
+	// itself (a build here would bypass the secret) or set a credential
+	// inline. The integration and toolchain services, which CI runs, fetch no
+	// module at run time (GOPROXY=off). The shell service, a workstation
+	// shell CI never runs, serves the baked cache first and then the public
+	// proxy into a writable cache under /tmp: no direct fetch, no credentials.
+	const file = "build/docker/devcontainer/compose.yaml"
+	var cf composeFile
+	if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join(repoRoot, file))), &cf); err != nil {
+		t.Fatalf("parse %s: %v", file, err)
+	}
+	for _, name := range []string{"integration", "toolchain", "shell"} {
+		svc, ok := cf.Services[name]
+		if !ok {
+			t.Errorf("%s: no service %q", file, name)
+			continue
 		}
-		if got := cf.Secrets["gomodauth"].File; got != ".env" {
-			t.Errorf("%s: secret gomodauth comes from %q, want .env (the single "+
-				"credential file, beside the compose file)", tc.file, got)
+		if svc.Build.Dockerfile != "" || len(svc.Build.Secrets) > 0 {
+			t.Errorf("%s: service %s builds its image; the Makefile builds it "+
+				"with the gomodauth secret", file, name)
 		}
-		for _, name := range tc.services {
-			svc, ok := cf.Services[name]
-			if !ok {
-				t.Errorf("%s: no service %q", tc.file, name)
-				continue
+		env := nodeText(&svc.Environment)
+		for _, k := range moduleCredentialVars {
+			if strings.Contains(env, k) {
+				t.Errorf("%s: service %s sets %s inline; credentials live only in "+
+					"the credential file", file, name, k)
 			}
-			if !strings.Contains(strings.Join(svc.Build.Secrets, ","), "gomodauth") {
-				t.Errorf("%s: service %s does not pass the gomodauth secret to its build", tc.file, name)
+		}
+		vars := composeEnv(&svc.Environment)
+		if name == "shell" {
+			if got := vars["GOPROXY"]; got != devGoproxy {
+				t.Errorf("%s: service shell sets GOPROXY %q, want %q (the baked cache, "+
+					"then the public proxy; never direct, never off)", file, got, devGoproxy)
 			}
-			// The runner stage of Dockerfile.integration holds a compiled
-			// binary and no toolchain, so it fetches nothing at run time.
-			if name == "test-runner" {
-				continue
+			if got := vars["GOMODCACHE"]; !strings.HasPrefix(got, "/tmp/") {
+				t.Errorf("%s: service shell sets GOMODCACHE %q, want a writable "+
+					"directory under /tmp", file, got)
 			}
-			found := false
-			for _, ef := range svc.EnvFile {
-				if ef.Path == ".env" && ef.Required != nil && !*ef.Required {
-					found = true
-				}
-			}
-			if !found {
-				t.Errorf("%s: service %s does not load .env (required: false) at run time; "+
-					"go inside the container could not reach the forge", tc.file, name)
-			}
-			for _, k := range moduleCredentialVars {
-				if strings.Contains(nodeText(&svc.Environment), k) {
-					t.Errorf("%s: service %s sets %s inline; credentials live only in .env", tc.file, name, k)
-				}
-			}
+		} else if got := vars["GOPROXY"]; got != "off" {
+			t.Errorf("%s: service %s sets GOPROXY %q, not off; go inside the "+
+				"container could fetch a module at run time (environment: %q)", file, name, got, env)
+		}
+		for _, ef := range svc.EnvFile {
+			t.Errorf("%s: service %s loads %s; the credential file stays out of "+
+				"the running container", file, name, ef.Path)
 		}
 	}
+}
+
+// devGoproxy is the GOPROXY of the editor's dev stage and the compose shell
+// service: the module cache baked into the image first, offline, then the
+// public proxy. No direct entry and no credentials.
+const devGoproxy = "file:///gomodcache/cache/download,https://proxy.golang.org"
+
+// composeEnv returns a compose service's environment mapping as key/value
+// pairs.
+func composeEnv(n *yaml.Node) map[string]string {
+	out := map[string]string{}
+	if n == nil || n.Kind != yaml.MappingNode {
+		return out
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		out[n.Content[i].Value] = n.Content[i+1].Value
+	}
+	return out
+}
+
+func TestDevcontainerDevStage(t *testing.T) {
+	// The editor builds the dev stage: toolchain plus gopls, with modules
+	// from the baked cache and then the public proxy into a writable cache.
+	// Every other shipped stage keeps GOPROXY=off.
+	const djson = ".devcontainer/devcontainer.json"
+	var dc struct {
+		Build struct {
+			Target string `json:"target"`
+		} `json:"build"`
+	}
+	if err := json.Unmarshal([]byte(readFile(t, filepath.Join(repoRoot, djson))), &dc); err != nil {
+		t.Fatalf("parse %s: %v", djson, err)
+	}
+	if dc.Build.Target != "dev" {
+		t.Errorf("%s: build target %q, want dev", djson, dc.Build.Target)
+	}
+
+	const file = "build/docker/devcontainer/Dockerfile"
+	stages := dockerfileStageLines(readFile(t, filepath.Join(repoRoot, file)))
+	dev, ok := stages["dev"]
+	if !ok {
+		t.Fatalf("%s: no dev stage", file)
+	}
+	if dev.from != "toolchain" {
+		t.Errorf("%s: dev stage is FROM %q, want FROM toolchain", file, dev.from)
+	}
+	body := strings.Join(dev.lines, "\n")
+	if !strings.Contains(body, "GOPROXY="+devGoproxy) {
+		t.Errorf("%s: dev stage does not set GOPROXY=%s", file, devGoproxy)
+	}
+	if !strings.Contains(body, "GOMODCACHE=/home/dev/") {
+		t.Errorf("%s: dev stage does not set a GOMODCACHE under /home/dev", file)
+	}
+	if !strings.Contains(body, "/out/gopls") {
+		t.Errorf("%s: dev stage does not copy gopls", file)
+	}
+	for _, name := range []string{"base", "toolchain", "integration"} {
+		st, ok := stages[name]
+		if !ok {
+			t.Errorf("%s: no %s stage", file, name)
+			continue
+		}
+		seenOff := name != "base"
+		for _, l := range st.lines {
+			if !strings.HasPrefix(l, "ENV ") || !strings.Contains(l, "GOPROXY=") {
+				continue
+			}
+			if name == "base" && !seenOff && l == "ENV GOPROXY=off" {
+				seenOff = true
+				continue
+			}
+			t.Errorf("%s: stage %s sets %q; only the dev stage fetches modules "+
+				"at run time", file, name, l)
+		}
+		if !seenOff {
+			t.Errorf("%s: base stage does not set ENV GOPROXY=off", file)
+		}
+	}
+}
+
+func TestDockerMakeRunsNetworked(t *testing.T) {
+	// `make docker-make` defaults to the ci target, which lints the nested
+	// modules (dependencies outside the baked cache) and runs govulncheck
+	// and Trivy (advisory downloads). It runs on a bridge network by
+	// default, and a bridge run reopens GOPROXY to the public proxy with a
+	// writable module cache; DOCKER_MAKE_NETWORK=none keeps an offline run.
+	mk := readFile(t, filepath.Join(repoRoot, "Makefile"))
+	for _, want := range []string{
+		"DOCKER_MAKE_NETWORK ?= bridge",
+		"IN_IMAGE_NETWORK='$(DOCKER_MAKE_NETWORK)' scripts/in-toolchain-image.sh",
+	} {
+		if !strings.Contains(mk, want) {
+			t.Errorf("Makefile: missing %q", want)
+		}
+	}
+	const script = "scripts/in-toolchain-image.sh"
+	sh := readFile(t, filepath.Join(repoRoot, script))
+	for _, want := range []string{
+		`"GOPROXY=${DEVCACHE_GOPROXY:+$DEVCACHE_GOPROXY|}https://proxy.golang.org"`,
+		`"GOMODCACHE=$modcache"`,
+	} {
+		if !strings.Contains(sh, want) {
+			t.Errorf("%s: a bridge run does not set %s", script, want)
+		}
+	}
+}
+
+func TestContribCoverageGateFailsClosed(t *testing.T) {
+	// contrib/dragonboat's check-coverage must fail below COVER_MIN and
+	// when it cannot read or compare the total, whatever tools the image
+	// carries: the toolchain image has no bc, and a comparison that errors
+	// must not let the recipe succeed. The run uses a fake go and a PATH
+	// holding only the text tools the recipe names.
+	mk, err := exec.LookPath("make")
+	if err != nil {
+		t.Skip("make not found")
+	}
+	tmp := t.TempDir()
+	bin := filepath.Join(tmp, "bin")
+	cov := filepath.Join(tmp, "cov")
+	for _, d := range []string{bin, cov} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tool := range []string{"grep", "awk", "sed", "mkdir"} {
+		p, err := exec.LookPath(tool)
+		if err != nil {
+			t.Skipf("%s not found", tool)
+		}
+		if err := os.Symlink(p, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeGo := filepath.Join(bin, "go")
+	const script = "#!/bin/sh\n" +
+		"if [ \"$1\" = tool ] && [ -n \"$FAKE_COVER\" ]; then\n" +
+		"  printf 'total:\\t(statements)\\t%s%%\\n' \"$FAKE_COVER\"\n" +
+		"fi\n" +
+		"exit 0\n"
+	if err := os.WriteFile(fakeGo, []byte(script), 0o755); err != nil { //nolint:gosec // an executable test script
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		cover string
+		pass  bool
+	}{
+		{"95.0", true},
+		{"90.0", true},
+		{"50.0", false},
+		{"", false},
+	} {
+		cmd := exec.CommandContext(t.Context(), mk, "-s", "-C", filepath.Join(repoRoot, "contrib/dragonboat"),
+			"coverage-client", "GO="+fakeGo, "COVER_DIR="+cov)
+		cmd.Env = []string{"PATH=" + bin, "HOME=" + tmp, "FAKE_COVER=" + tc.cover}
+		out, err := cmd.CombinedOutput()
+		if tc.pass && err != nil {
+			t.Errorf("coverage %q: make failed (%v), want success; output:\n%s", tc.cover, err, out)
+		}
+		if !tc.pass && err == nil {
+			t.Errorf("coverage %q: make succeeded, want failure below COVER_MIN or on an unreadable total; output:\n%s", tc.cover, out)
+		}
+	}
+}
+
+type dockerStage struct {
+	from  string
+	lines []string
+}
+
+// dockerfileStageLines splits a Dockerfile into its named stages, each with
+// its FROM image and its other lines, comments dropped.
+func dockerfileStageLines(src string) map[string]dockerStage {
+	stages := map[string]dockerStage{}
+	cur := ""
+	for _, raw := range strings.Split(src, "\n") {
+		l := strings.TrimSpace(raw)
+		if l == "" || strings.HasPrefix(l, "#") {
+			continue
+		}
+		if f := strings.Fields(l); len(f) == 4 && strings.EqualFold(f[0], "FROM") && strings.EqualFold(f[2], "AS") {
+			cur = f[3]
+			stages[cur] = dockerStage{from: f[1]}
+			continue
+		}
+		if cur == "" {
+			continue
+		}
+		st := stages[cur]
+		st.lines = append(st.lines, l)
+		stages[cur] = st
+	}
+	return stages
 }
 
 // nodeText flattens a YAML node's scalar content for a containment check.

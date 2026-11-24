@@ -12,8 +12,13 @@
 #                For a workstation: on a CI runner the bind mount would resolve
 #                on the daemon's host, so CI copies the checkout in instead
 #                (scripts/in-toolchain-image.sh).
+#   shell        `make docker-shell`: an interactive workstation shell in the
+#                toolchain image with the network on, the checkout
+#                bind-mounted. The only service that fetches modules: the
+#                baked cache first, then the public proxy into /tmp; no
+#                credentials, no direct fetch. CI never runs it.
 #
-# SECURITY POSTURE (x-posture, both services):
+# SECURITY POSTURE (x-posture, every service):
 #
 #   cap_drop ALL, no cap_add: the suites bind loopback ports above 1024, write
 #     only their own temp directories and need no privilege.
@@ -24,7 +29,8 @@
 #     cannot be written. Writable: /tmp (tmpfs, `exec` because `go test` runs
 #     its binary from there) and the build-cache volume.
 #   network_mode none: the clusters talk QUIC over loopback only, and the
-#     modules are baked into the image with GOPROXY=off.
+#     modules are baked into the image with GOPROXY=off. The shell service
+#     alone overrides it with bridge, to fetch modules the cache lacks.
 #   init: a real PID 1 reaps children and forwards signals.
 #   pids_limit / mem_limit: bounds, so a runaway test cannot starve a shared
 #     runner host. No cpus cap: -race clusters are CPU-bound and their
@@ -90,6 +96,24 @@ services:
       GOTOOLCHAIN: local
       GOFLAGS: -mod=readonly
       GOPROXY: "off"
+      HOME: /tmp
+
+  shell:
+    <<: *posture
+    network_mode: bridge
+    image: go-quicraft-toolchain:${GO_QUICRAFT_TOOLCHAIN_TAG:-latest}
+    pull_policy: never
+    user: "${GO_QUICRAFT_UID:-10001}:${GO_QUICRAFT_GID:-10001}"
+    tmpfs:
+      - /tmp:rw,exec,nosuid,nodev,size=6g,mode=1777
+    volumes:
+      - ../../..:/src
+      - toolchain-gocache:/gocache
+    environment:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+      GOPROXY: file:///gomodcache/cache/download,https://proxy.golang.org
+      GOMODCACHE: /tmp/gomodcache
       HOME: /tmp
 
 volumes:

@@ -3,8 +3,8 @@ module github.com/jeremyhahn/go-quicraft/test/performance/quicraft
 go 1.27.4
 
 require (
-	github.com/jeremyhahn/go-quicraft v0.0.0
-	github.com/jeremyhahn/go-quicraft/test/performance v0.0.0
+	github.com/jeremyhahn/go-quicraft v0.24.3-alpha
+	github.com/jeremyhahn/go-quicraft/test/performance v0.24.3-alpha
 )
 
 require (

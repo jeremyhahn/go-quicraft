@@ -1,4 +1,9 @@
-# nightly-template: v1.9 (customized)
+# nightly-template: v1.12 (customized)
+# v1.12: a timeout-minutes on the trivy job, so a hung run ends itself.
+# v1.11: the GO_BUILD_PROXY chain has no trailing `direct` (no direct fetch,
+# anywhere).
+# v1.10: CI_IMAGE_NAMESPACE is the repository Actions variable of that name;
+# no namespace is written here.
 # v1.9 (2026-10-31, Company Agent m1804, ci-template v1.30 fix 2): a
 # `lint-sweeps` job runs the repository's `make -k lint-sweeps` in its
 # toolchain image, nightly and on dispatch only, when the Makefile (or a

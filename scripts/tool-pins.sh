@@ -24,6 +24,8 @@ GOSEC_VERSION=v2.29.0
 # the export data (version 5) Go 1.27 writes, so every import fails to type-check.
 XTOOLS_VERSION=v0.52.0
 GOVULNCHECK_VERSION=v1.8.0
+# The editor's language server: only the devcontainer's dev stage installs it.
+GOPLS_VERSION=v0.24.0
 
 # trivy: a release archive, checked against these digests (upstream's
 # trivy_<version>_checksums.txt) before it is unpacked.

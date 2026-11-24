@@ -4,7 +4,7 @@
 #   usage: scripts/trim-ci-caches.sh <prefix> <image> [max-gib]
 #   e.g.   scripts/trim-ci-caches.sh go-quicraft-ci- "$TOOLCHAIN_IMAGE"
 #
-# v1 (ci-template v1.22, Company Agent m616 item 2). in-toolchain-image.sh v2
+# v1 (ci-template v1.22). in-toolchain-image.sh v2
 # keeps the build, golangci-lint and module caches in named volumes,
 # <prefix>cache-<class>-{gobuild,golangci,gomod}, on the Docker host the job
 # talks to (ci-standard.md §6). Go trims its build cache of entries unused for

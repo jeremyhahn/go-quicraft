@@ -46,14 +46,14 @@ The package table and the reasoning behind `-p 1` and the timeouts are in
 | `integration-test-raft` | `test/integration/raft/` | devcontainer |
 | `integration-test-host` | `test/integration/host/` | devcontainer |
 | `integration-test-linearizability` | `test/integration/linearizability/`, 600s | devcontainer |
-| `integration-test-e2e` | `test/integration/e2e/` as a compiled binary | Docker Compose test-runner container |
+| `integration-test-e2e` | `test/integration/e2e/` | devcontainer integration image (compose service `integration`) |
 | `ci-integration` | all four packages, `-p 1`, 1800s | host; same command as the `integration` job in ci.yml |
 | `ci-netfault` | `test/integration/e2e/` and `test/integration/host/` with `quicraft_netfault` | host |
 
-`make integration-test-e2e` brings up
-`.devcontainer/docker-compose.integration.yml`, a single `test-runner`
-container. The e2e tests build their own loopback clusters, so the container
-contributes the pinned toolchain and tuned UDP buffers, not topology.
+`make integration-test-e2e` runs in the integration image under the
+`integration` service of `build/docker/devcontainer/compose.yaml`. The e2e tests
+build their own loopback clusters, so the container contributes the pinned
+toolchain, not topology.
 
 ### Benchmarks
 
@@ -319,18 +319,16 @@ meet the per-package coverage floor. `make coverage` measures
 | `docker-run CMD=…` | `CMD` in the toolchain image as the invoking user, checkout bind-mounted (compose service `toolchain`) |
 | `toolchain-image` | prints the toolchain image tag, hashed from the Dockerfile, the pin file, `go.mod` and `go.sum` |
 | `integration-test` | the integration suites under `-race` in the integration image (compose service `integration`: read-only, no network, no capabilities) |
-| `docker-build-dev` | builds the legacy dev image (`Dockerfile.dev`), tagged for this checkout |
-| `docker-build-integration` | builds the legacy integration image (`.devcontainer/Dockerfile`) |
-| `docker-make` | `make $(DOCKER_MAKE_TARGET)` (default `ci`) in a fresh dev image; nothing is bind-mounted, so it honours `DOCKER_HOST` |
+| `docker-make` | `make $(DOCKER_MAKE_TARGET)` (default `ci`) in the toolchain image against a copy of the checkout; nothing is bind-mounted, so it honours `DOCKER_HOST` |
 | `docker-clean` | removes this checkout's `docker-build*` images |
-| `docker-shell` | a legacy devcontainer shell |
-| `docker-test` | `make test` in the devcontainer |
-| `docker-integration-down` | stops and removes the integration compose stack |
+| `docker-shell` | a shell in the toolchain image (compose service `toolchain`) |
+| `docker-test` | `make test` in the toolchain image |
+| `docker-integration-down` | removes what an interrupted `integration-test*` run left of its compose project |
 
 Module credentials for the forge come from `.devcontainer/.env` (format:
 `.devcontainer/.env.example`): the builds mount it as the `gomodauth` BuildKit
-secret, and `docker-make` and the compose services load it as the container
-environment. See [Contributing](../../CONTRIBUTING.md#running-the-suites-in-the-dev-container).
+secret; the containers run offline on the modules baked into the image. See
+[Contributing](../../CONTRIBUTING.md#running-the-suites-in-the-devcontainer).
 
 ## Cross-references
 

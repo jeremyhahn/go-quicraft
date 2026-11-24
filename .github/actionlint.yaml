@@ -1,8 +1,14 @@
+# actionlint-template: v8 (customized) — runner labels for actionlint.
+# Without this file actionlint reports every self-hosted label as an unknown
+# runner; with it, a misspelled label is still caught. Adding a self-hosted
+# label to a workflow means adding it here in the same change.
 self-hosted-runner:
   labels:
     # Only the code-review workflow's runners are self-hosted
     # (workflows/code-review.yml): Codex reviews on `codex`, the advisory
-    # opencode review on `qwen` (CUSTOMIZE). Every other job runs on
-    # GitHub-hosted ubuntu-latest.
+    # opencode review on `qwen` (CUSTOMIZE). Only ci.yml's preflight job names
+    # `bigdisk`, the self-hosted bigdisk pool, and only on github.com
+    # (ci-template v1.49). Every other job runs on GitHub-hosted ubuntu-latest.
     - codex
     - qwen
+    - bigdisk

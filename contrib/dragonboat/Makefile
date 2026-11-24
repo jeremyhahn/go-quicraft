@@ -27,9 +27,6 @@ GOSEC_EXCLUDE := G103,G104,G115,G301,G304,G306,G404
 COVER_MIN     := 90
 COVER_FLAGS   := -coverprofile
 
-# Docker (relative to project root)
-COMPOSE_FILE  := ../../.devcontainer/docker-compose.yml
-
 # Package paths
 PKG_CLIENT       := ./client/...
 PKG_CONFIG       := ./config/...
@@ -83,16 +80,15 @@ test-statemachine:
 # Integration tests (always run in devcontainer)
 # ============================================================================
 
+# The root Makefile's docker-make builds the devcontainer toolchain image
+# (build/docker/devcontainer/Dockerfile), copies the checkout into a container
+# of it and runs ci-integration below there, as the CI job does. The
+# integration image carries only the root module's pkg and test trees, so this
+# module's suite runs in the toolchain image.
 .PHONY: integration-test
 integration-test:
-	@echo "==> Building integration container..."
-	@docker compose -f $(COMPOSE_FILE) build --quiet integration
-	@echo "==> Running contrib/dragonboat integration tests..."
-	docker compose -f $(COMPOSE_FILE) run --rm integration bash -c "cd contrib/dragonboat && make _integration-test"
-
-.PHONY: _integration-test
-_integration-test:
-	$(GOTEST) -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+	@echo "==> Running contrib/dragonboat integration tests in the toolchain image..."
+	$(MAKE) -C ../.. docker-make DOCKER_MAKE_TARGET='-C contrib/dragonboat ci-integration'
 
 # ============================================================================
 # CI entry points
@@ -100,8 +96,8 @@ _integration-test:
 # These are what .github/workflows/ci.yml invokes, and they run on the HOST
 # rather than in the devcontainer because that is what a CI runner does. The
 # `test` and `integration-test` targets above stay as they are: the former is
-# the verbose dev loop, the latter the devcontainer path with tuned UDP
-# buffers.
+# the verbose dev loop, the latter the same suite in the
+# devcontainer toolchain image.
 #
 # The differences from those targets are deliberate and must not be
 # "harmonised" away, and they match the same reasoning as the root Makefile's
@@ -168,11 +164,13 @@ bench-statemachine:
 
 # check-coverage: extract percentage from coverage profile and fail if below threshold
 # Usage: $(call check-coverage,profile.out,package-name)
+# The comparison fails closed: a total that is not a number, or an awk that
+# cannot run, fails the recipe like a total below COVER_MIN.
 define check-coverage
 	@COVERAGE=$$($(GO) tool cover -func=$(1) | grep total | awk '{print $$3}' | sed 's/%//'); \
 	echo "$(2) coverage: $${COVERAGE}%"; \
-	if [ $$(echo "$${COVERAGE} < $(COVER_MIN)" | bc -l) -eq 1 ]; then \
-		echo "FAIL: $(2) coverage $${COVERAGE}% is below minimum $(COVER_MIN)%"; \
+	if ! awk -v c="$${COVERAGE}" -v m="$(COVER_MIN)" 'BEGIN { exit !(c ~ /^[0-9]+(\.[0-9]+)?$$/ && c + 0 >= m + 0) }'; then \
+		echo "FAIL: $(2) coverage $${COVERAGE}% is below minimum $(COVER_MIN)% or could not be read"; \
 		exit 1; \
 	fi
 endef

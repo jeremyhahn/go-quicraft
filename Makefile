@@ -7,7 +7,6 @@
 MODULE        := github.com/jeremyhahn/go-quicraft
 BINARY        := go-quicraft
 BUILD_DIR     := build
-DOCKER_DIR    := .devcontainer
 COVER_DIR     := $(BUILD_DIR)/coverage
 
 # Version injection.
@@ -135,17 +134,13 @@ COVERAGE_THRESHOLD ?= 91
 COVER_MIN     := $(COVERAGE_THRESHOLD)
 
 # Docker
-DOCKER_IMAGE  := go-quicraft-dev
-DOCKER_INT_IMAGE := go-quicraft-integration
 # The docker-* images are tagged per checkout (host and directory), so two
 # checkouts sharing a daemon -- including a remote one reached through
 # DOCKER_HOST -- never build over each other's images. Derived, hence override.
 override DOCKER_TAG := checkout-$(shell printf '%s:%s' "$$(uname -n)" "$$(pwd)" | cksum | cut -d' ' -f1)
 # The one file that holds module credentials for the project forge (format:
 # .devcontainer/.env.example). Gitignored and excluded from every build context.
-MODULE_ENV_FILE := $(CURDIR)/$(DOCKER_DIR)/.env
-COMPOSE_FILE  := $(DOCKER_DIR)/docker-compose.yml
-INT_COMPOSE   := $(DOCKER_DIR)/docker-compose.integration.yml
+MODULE_ENV_FILE := $(CURDIR)/.devcontainer/.env
 
 # Package paths
 PKG_PROTO       := ./pkg/proto/...
@@ -333,23 +328,19 @@ integration-test: docker-build-it
 	exit $$status
 
 .PHONY: integration-test-raft
-integration-test-raft:
-	@echo "==> Building integration container..."
-	@docker compose -f $(COMPOSE_FILE) build --quiet integration
-	@echo "==> Running raft integration tests..."
-	docker compose -f $(COMPOSE_FILE) run --rm integration make _integration-test-raft
+integration-test-raft: docker-build-it
+	@echo "==> Running raft integration tests in $(IT_IMAGE)..."
+	@$(call IT_SUITE_RUN,600s,$(INT_TEST_DIR)/raft/...)
 
 .PHONY: integration-test-host
-integration-test-host:
-	@echo "==> Building integration container..."
-	@docker compose -f $(COMPOSE_FILE) build --quiet integration
-	@echo "==> Running host integration tests..."
-	docker compose -f $(COMPOSE_FILE) run --rm integration make _integration-test-host
+integration-test-host: docker-build-it
+	@echo "==> Running host integration tests in $(IT_IMAGE)..."
+	@$(call IT_SUITE_RUN,600s,$(INT_TEST_DIR)/host/...)
 
 .PHONY: integration-test-e2e
-integration-test-e2e:
-	docker compose -f $(INT_COMPOSE) up --build --abort-on-container-exit --exit-code-from test-runner
-	docker compose -f $(INT_COMPOSE) down -v
+integration-test-e2e: docker-build-it
+	@echo "==> Running e2e integration tests in $(IT_IMAGE)..."
+	@$(call IT_SUITE_RUN,600s,$(INT_TEST_DIR)/e2e/...)
 
 # Internal targets, run inside the devcontainer.
 
@@ -373,11 +364,9 @@ _integration-test-e2e:
 	$(GOTEST) -tags=integration $(INT_TEST_DIR)/e2e/...
 
 .PHONY: integration-test-linearizability
-integration-test-linearizability:
-	@echo "==> Building integration container..."
-	@docker compose -f $(COMPOSE_FILE) build --quiet integration
-	@echo "==> Running linearizability tests..."
-	docker compose -f $(COMPOSE_FILE) run --rm integration make _integration-test-linearizability
+integration-test-linearizability: docker-build-it
+	@echo "==> Running linearizability tests in $(IT_IMAGE)..."
+	@$(call IT_SUITE_RUN,600s,$(INT_TEST_DIR)/linearizability/...)
 
 .PHONY: _integration-test-linearizability
 _integration-test-linearizability:
@@ -1115,7 +1104,7 @@ ci: fmt no-mutants check-tool-versions vet lint lint-gates security build test
 .PHONY: check-tool-versions
 check-tool-versions: check-lint-toolchain
 	@pins=$$(git grep -hoE 'golangci-lint(@|.* )v[0-9]+\.[0-9]+\.[0-9]+' -- \
-		.github .devcontainer Makefile | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u); \
+		.github build/docker/devcontainer Makefile | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u); \
 	count=$$(printf '%s\n' "$$pins" | grep -c . || true); \
 	if [ "$$count" -lt 1 ]; then \
 		echo "FAIL: found no golangci-lint version pins at all."; \
@@ -1125,7 +1114,7 @@ check-tool-versions: check-lint-toolchain
 	if [ "$$pins" != "$(GOLANGCI_VERSION)" ]; then \
 		echo "FAIL: golangci-lint pins disagree with GOLANGCI_VERSION=$(GOLANGCI_VERSION):"; \
 		git grep -nE 'golangci-lint(@|.* )v[0-9]+\.[0-9]+\.[0-9]+' -- \
-			.github .devcontainer Makefile; \
+			.github build/docker/devcontainer Makefile; \
 		echo ""; \
 		echo "Every literal pin must equal GOLANGCI_VERSION. A developer or a"; \
 		echo "container linting on a different version gates on a different rule"; \
@@ -1500,7 +1489,7 @@ modverify:
 # the PR base or the push's before) a lag fails only on a go.mod line the
 # change adds or bumps; -vuln fails a vulnerable version of a go.mod
 # requirement. deps-bump moves every failing requirement to latest; the
-# daily deps-bump.yml PR carries it.
+# daily bump PR from scans.yml carries it.
 DEPS_CHECK_MODULES ?= . contrib/dragonboat test/performance test/performance/dragonboat test/performance/etcd test/performance/quicraft
 
 deps-check:
@@ -1658,8 +1647,6 @@ install-lint:
 # the build.
 comma := ,
 DOCKER_SECRET_ARGS = $(if $(wildcard $(MODULE_ENV_FILE)),--secret id=gomodauth$(comma)src=$(MODULE_ENV_FILE))
-# Internal: the same file as the container's run-time environment.
-DOCKER_ENV_ARGS = $(if $(wildcard $(MODULE_ENV_FILE)),--env-file $(MODULE_ENV_FILE))
 # Internal: the secret mount needs BuildKit; the legacy builder rejects it.
 REQUIRE_BUILDX = @docker buildx version >/dev/null 2>&1 || { \
 	echo "docker buildx is required: the devcontainer Dockerfiles mount module"; \
@@ -1700,6 +1687,15 @@ IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 # (`make it-shard-packages`).
 IT_PKGS    ?= $(INT_TEST_DIR)/...
 IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(IT_PKGS)
+# One suite in the integration image (integration-test-raft and friends): the
+# image carries no make, so the target passes the go test command itself.
+# $(call IT_SUITE_RUN,<timeout>,<packages>) runs it under the hardened compose
+# service and tears the project down with its volumes however the run ends.
+IT_SUITE_COMPOSE = GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)'
+IT_SUITE_RUN = status=0; \
+	$(IT_SUITE_COMPOSE) run --rm integration go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=$(1) $(2) || status=$$?; \
+	$(IT_SUITE_COMPOSE) down --volumes >/dev/null 2>&1 || true; \
+	exit $$status
 # WAL-sync mode (#1164): the linearizability suite and the e2e Partition
 # cases again with QUICRAFT_IT_WAL_SYNC=1, so every host fdatasyncs its WAL
 # before an ack as production does (the harnesses' default skips it). Only the
@@ -1736,8 +1732,11 @@ DEVCONTAINER_BUILD = docker buildx build --load $(DOCKER_SECRET_ARGS) \
 	$(if $(GO_BUILD_PROXY),--build-arg "GO_BUILD_PROXY=$(GO_BUILD_PROXY)") \
 	-f $(DEVCONTAINER_DIR)/Dockerfile
 
-# The make target docker-make runs inside the dev image.
+# The make target docker-make runs inside the toolchain image, and the
+# container network it runs on (bridge: the default ci target downloads
+# modules and advisories; none: an offline run such as DOCKER_MAKE_TARGET=test).
 DOCKER_MAKE_TARGET ?= ci
+DOCKER_MAKE_NETWORK ?= bridge
 
 # Builds both devcontainer images: toolchain, tagged by content, and integration.
 .PHONY: docker-build
@@ -1785,28 +1784,21 @@ toolchain-image:
 it-image:
 	@echo go-quicraft-ci-it:$(IT_TAG)
 
-# The legacy dev image (.devcontainer/Dockerfile.dev), which docker-make runs.
-.PHONY: docker-build-dev
-docker-build-dev:
-	$(REQUIRE_BUILDX)
-	docker buildx build --load $(DOCKER_SECRET_ARGS) -t $(DOCKER_IMAGE):$(DOCKER_TAG) -f $(DOCKER_DIR)/Dockerfile.dev .
-
-.PHONY: docker-build-integration
-docker-build-integration:
-	$(REQUIRE_BUILDX)
-	docker buildx build --load $(DOCKER_SECRET_ARGS) -t $(DOCKER_INT_IMAGE):$(DOCKER_TAG) -f $(DOCKER_DIR)/Dockerfile .
-
-# Runs `make $(DOCKER_MAKE_TARGET)` in a freshly built dev image:
-#   make docker-make DOCKER_MAKE_TARGET=test
+# Runs `make $(DOCKER_MAKE_TARGET)` in the toolchain image against a copy of
+# the checkout (scripts/in-toolchain-image.sh), so nothing is bind-mounted and
+# it honours DOCKER_HOST. The container runs on DOCKER_MAKE_NETWORK (default
+# bridge, which the ci target's lint and security downloads need); pass
+# DOCKER_MAKE_NETWORK=none for an offline run.
+#   make docker-make DOCKER_MAKE_NETWORK=none DOCKER_MAKE_TARGET=test
 #   DOCKER_HOST=ssh://user@bench-host.example make docker-make
 .PHONY: docker-make
-docker-make: docker-build-dev
-	docker run --rm --network host --cap-add NET_ADMIN $(DOCKER_ENV_ARGS) $(DOCKER_IMAGE):$(DOCKER_TAG) make $(DOCKER_MAKE_TARGET)
+docker-make: docker-build-toolchain
+	IN_IMAGE_NETWORK='$(DOCKER_MAKE_NETWORK)' scripts/in-toolchain-image.sh '$(TOOLCHAIN_IMAGE)' make $(DOCKER_MAKE_TARGET)
 
 # Removes the images the docker-build* targets made for this checkout.
 .PHONY: docker-clean
 docker-clean:
-	@for image in $(TOOLCHAIN_IMAGE) $(IT_IMAGE) $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_INT_IMAGE):$(DOCKER_TAG); do \
+	@for image in $(TOOLCHAIN_IMAGE) $(IT_IMAGE); do \
 		if docker image inspect "$$image" >/dev/null 2>&1; then docker image rm "$$image"; fi; \
 	done
 
@@ -1821,18 +1813,24 @@ docker-run: docker-build-toolchain
 		docker compose -f $(DEVCONTAINER_COMPOSE) -p go-quicraft-tc-$(DOCKER_TAG) \
 		run --rm toolchain sh -c '$(CMD)'
 
-# The legacy devcontainer shell (.devcontainer/docker-compose.yml).
+# An interactive shell in the toolchain image (compose service `shell`, the
+# checkout bind-mounted, the network on): modules come from the baked cache,
+# then the public proxy into /tmp, so `make lint` works across the nested
+# modules. CI never runs it.
 .PHONY: docker-shell
-docker-shell:
-	docker compose -f $(COMPOSE_FILE) run --rm devcontainer
+docker-shell: docker-build-toolchain
+	GO_QUICRAFT_TOOLCHAIN_TAG=$(TOOLCHAIN_TAG) GO_QUICRAFT_UID=$$(id -u) GO_QUICRAFT_GID=$$(id -g) \
+		docker compose -f $(DEVCONTAINER_COMPOSE) -p go-quicraft-tc-$(DOCKER_TAG) \
+		run --rm shell sh
 
 .PHONY: docker-test
 docker-test:
-	docker compose -f $(COMPOSE_FILE) run --rm devcontainer make test
+	$(MAKE) docker-run CMD='make test'
 
+# Removes what an interrupted integration-test* run left of its compose project.
 .PHONY: docker-integration-down
 docker-integration-down:
-	docker compose -f $(INT_COMPOSE) down -v
+	GO_QUICRAFT_IT_IMAGE='$(IT_IMAGE)' docker compose -f $(DEVCONTAINER_COMPOSE) -p '$(IT_PROJECT)' down --volumes
 
 # ============================================================================
 # Help
@@ -1860,7 +1858,7 @@ help:
 	@echo "  integration-test-walsync    Linearizability + e2e Partition with WAL fsync on"
 	@echo "  integration-test-raft       Run raft integration tests in devcontainer"
 	@echo "  integration-test-host       Run Host API tests in devcontainer"
-	@echo "  integration-test-e2e        Run E2E multi-node cluster tests (Docker Compose)"
+	@echo "  integration-test-e2e        Run E2E multi-node cluster tests in devcontainer"
 	@echo "  integration-test-linearizability  Run porcupine linearizability tests in devcontainer"
 	@echo ""
 	@echo "Fuzz Testing:"
@@ -1970,13 +1968,12 @@ help:
 	@echo "  docker-build                   Build the devcontainer toolchain and integration images"
 	@echo "  docker-run CMD='make lint'     Run CMD in the toolchain image, checkout bind-mounted"
 	@echo "  toolchain-image                Print the toolchain image tag (content-hashed)"
-	@echo "  docker-build-dev               Build the legacy dev image (Dockerfile.dev)"
-	@echo "  docker-build-integration       Build the legacy integration image (.devcontainer/Dockerfile)"
-	@echo "  docker-make                    Run make DOCKER_MAKE_TARGET (default ci) in a fresh"
-	@echo "                                 dev image; honours DOCKER_HOST for a remote daemon"
+	@echo "  docker-make                    Run make DOCKER_MAKE_TARGET (default ci) in the"
+	@echo "                                 toolchain image; honours DOCKER_HOST for a remote daemon;"
+	@echo "                                 DOCKER_MAKE_NETWORK=none (default bridge) runs it offline"
 	@echo "  docker-clean                   Remove this checkout's docker-build* images"
-	@echo "  docker-shell                   Run the legacy devcontainer shell"
-	@echo "  docker-test                    Run unit tests in devcontainer"
+	@echo "  docker-shell                   Open a networked shell in the toolchain image (modules via the public proxy)"
+	@echo "  docker-test                    Run make test in the toolchain image"
 	@echo "  docker-integration-down        Stop and clean integration containers"
 
 # Builds never resolve through a workspace; this ignores stray go.work files.
