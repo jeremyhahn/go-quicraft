@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -222,13 +223,31 @@ func destinationClaimKey(dir string) string {
 	// filepath.Abs is lexical: resolve the symlinks of the longest existing
 	// ancestor, so /alias/new and /real/new (alias -> real) share one claim
 	// even before new exists. The missing tail is rejoined lexically.
+	//
+	// A component that exists as a symlink whose target does not (a dangling
+	// alias) is followed by hand, so the alias keys on its target's path: a
+	// concurrent call on the target would otherwise create the directory
+	// under a different claim and both would publish into it. The hop limit
+	// bounds a symlink loop; past it the rest of the path is kept lexically.
+	const maxDanglingHops = 40
 	existing, tail := abs, ""
-	for {
+	for hops := 0; ; {
 		if resolved, err := filepath.EvalSymlinks(existing); err == nil {
 			if tail == "" {
 				return resolved
 			}
 			return filepath.Join(resolved, tail)
+		}
+		if fi, err := os.Lstat(existing); err == nil && fi.Mode()&fs.ModeSymlink != 0 && hops < maxDanglingHops {
+			if target, err := os.Readlink(existing); err == nil {
+				hops++
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(existing), target)
+				}
+				existing = filepath.Join(target, tail)
+				tail = ""
+				continue
+			}
 		}
 		parent := filepath.Dir(existing)
 		if parent == existing {
