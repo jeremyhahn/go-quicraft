@@ -79,7 +79,7 @@ func TestPreflightRunsTheRunnerTemplateTests(t *testing.T) {
 	if strings.Contains(block, "if:") || strings.Contains(block, "continue-on-error") {
 		t.Errorf("the Runner template tests step must run unconditionally; got:\n%s", block)
 	}
-	for _, script := range []string{runnerLabelsTests, runnerSelectTests} {
+	for _, script := range []string{runnerLabelsTests, runnerSelectTests, rowJobTests} {
 		want := "python3 -I test/buildgates/" + script
 		if !strings.Contains(block, want) {
 			t.Errorf("the Runner template tests step does not run %q", want)
