@@ -1,12 +1,6 @@
 version: 2
 
-# Dependabot runs on github.com only. Elsewhere, `make deps-check`
-# (scripts/deps-check.sh, run nightly by .github/workflows/nightly.yml) is what
-# watches dependencies.
-#
-# The shipped library is the repository root. The other modules are the
-# dragonboat compatibility adapter and the benchmark harnesses; they are not
-# released but are tracked so none accrues known-vulnerable dependencies.
+# Dependabot covers the root library, the dragonboat adapter and the benchmark modules; make deps-check covers the rest.
 updates:
   # --- Go modules ---
   - package-ecosystem: gomod

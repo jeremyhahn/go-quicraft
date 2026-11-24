@@ -91,20 +91,12 @@ func (e *NilProposerError) Is(target error) bool {
 	return target == ErrNilProposer
 }
 
-// FlushError wraps a flush failure with shard context for diagnostics.
-// The ShardID identifies which shard's batch failed to flush, and the
-// underlying Err contains the proposer's error, which Unwrap exposes so
-// callers can match the proposer's own sentinels with errors.Is.
+// FlushError wraps a shard's flush failure; Unwrap exposes the proposer's error.
 type FlushError struct {
 	ShardID uint64
 	Err     error
 
-	// Indeterminate reports that the outcome of the proposal is UNKNOWN
-	// rather than a definite rejection: the proposer timed out or was
-	// canceled, so the batch may already be replicated and may still apply.
-	// A caller that retries an indeterminate flush must be prepared for the
-	// batch to be applied twice — the aggregator has no session/at-most-once
-	// path (see the Aggregator doc comment).
+	// Indeterminate reports the proposal outcome is unknown (timeout or cancel); a retry may apply the batch twice.
 	Indeterminate bool
 }
 

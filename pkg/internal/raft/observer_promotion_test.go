@@ -22,16 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// In-place observer promotion
-//
-// A replica's observer role follows the COMMITTED membership. config.IsObserver
-// is only the initial hint, consulted while the configuration does not mention
-// the replica. An observer whose own AddNode commits becomes a voter in place:
-// it campaigns, can be elected, promises vote windows and serves ReadIndex,
-// with no restart — etcd's learner promotion. The witness role is NOT derived:
-// a witness holds no state machine, so a disagreement there is still latched.
-// ---------------------------------------------------------------------------
+// In-place observer promotion: the observer role follows the committed membership, config.IsObserver is only the initial hint; witness roles are not derived.
 
 // selfObserverMembership lists replica 1 as a non-voting observer beside two
 // voters: the configuration an observer started with IsObserver=true agrees
@@ -160,9 +151,7 @@ func TestPromotion_PromotedReplicaAcceptsTimeoutNow(t *testing.T) {
 	}
 }
 
-// TestPromotion_JoinerKeepsTheHintUntilListed pins config.IsObserver as the
-// INITIAL hint: a replica the configuration does not mention keeps whatever it
-// was started as, in both directions.
+// TestPromotion_JoinerKeepsTheHintUntilListed checks an unlisted replica keeps its starting role.
 func TestPromotion_JoinerKeepsTheHintUntilListed(t *testing.T) {
 	quietLogs(t)
 	joining := proto.Membership{
@@ -299,16 +288,7 @@ func TestPromotion_WitnessRoleIsStillLatched(t *testing.T) {
 	}
 }
 
-// TestPromotion_LeaseReadPromiseIsRecordedBeforeAnyAck pins the vote-window
-// obligation promotion creates. An observer promises nothing in its heartbeat
-// acks; a voter running LeaseRead promises a window, and that promise must be
-// in the hard state (VoteWindow) before any ack carries it, or a restart right
-// after the promotion forgets it and votes inside a lease that still counts
-// the ack.
-//
-// It also pins the hold-down: a LeaseRead observer's post-restart hold-down
-// is sized from a zero promise, which holds votes down indefinitely. Promotion
-// must re-size it, or the promoted replica can never vote or campaign.
+// TestPromotion_LeaseReadPromiseIsRecordedBeforeAnyAck checks a promoted LeaseRead voter persists its vote window before acking and re-sizes its hold-down.
 func TestPromotion_LeaseReadPromiseIsRecordedBeforeAnyAck(t *testing.T) {
 	quietLogs(t)
 	cfg := raftTestCfgPreVote(1, 1, false)
@@ -352,12 +332,7 @@ func TestPromotion_LeaseReadPromiseIsRecordedBeforeAnyAck(t *testing.T) {
 	}
 }
 
-// TestPromotion_RestartedPromotedObserverFoldsTailBeforeCampaign: a replica
-// restarted after its promotion committed, from a base (snapshot) that still
-// lists it as an observer, must fold the committed tail when its election
-// timer fires — and then campaign as the voter it is. The observer test used
-// to run BEFORE the fold, so such a replica refused every campaign until the
-// commit pipeline happened to replay the tail.
+// TestPromotion_RestartedPromotedObserverFoldsTailBeforeCampaign checks a restarted promoted observer folds the committed tail, then campaigns as a voter.
 func TestPromotion_RestartedPromotedObserverFoldsTailBeforeCampaign(t *testing.T) {
 	quietLogs(t)
 	bootstrap, err := BuildInitialMembershipEntry(proto.Membership{

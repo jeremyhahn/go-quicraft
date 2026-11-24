@@ -29,13 +29,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// FileSize integrity: a snapshot record's FileSize must describe the file at
-// its Filepath. A zero FileSize beside a non-empty Filepath is what makes a
-// later leader stream a metadata-only (EMPTY) snapshot, which the receiving
-// follower recovers from and then marks every index <= snapshotIndex applied:
-// silent, permanent state loss.
-// ---------------------------------------------------------------------------
+// A snapshot record's FileSize must describe the file at its Filepath; 0 beside a non-empty file would stream an empty snapshot.
 
 // onDiskSnapshotSize returns the size of snapshot.dat inside a snapshot
 // directory.
@@ -48,11 +42,7 @@ func onDiskSnapshotSize(t *testing.T, dir string) uint64 {
 	return uint64(fi.Size())
 }
 
-// TestHandleSnapshot_PersistsOnDiskFileSize verifies the receive path records
-// the size of the artifact it just wrote. The encrypted case is the one that
-// matters most: the on-disk file is LARGER than the plaintext wire bytes, so
-// recording either 0 or the wire total makes FileSize disagree with the file
-// the send path will later read.
+// TestHandleSnapshot_PersistsOnDiskFileSize checks the receive records the on-disk artifact size, including encrypted.
 func TestHandleSnapshot_PersistsOnDiskFileSize(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -98,15 +88,7 @@ func TestHandleSnapshot_PersistsOnDiskFileSize(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot is the end-to-end
-// test of the FileSize chain. The leader re-sends a snapshot this replica
-// already holds, so the receive takes the DEDUP branch, which rebuilds the
-// install from the persisted record. (Under the two-phase receive a record
-// exists only once raft adopted the snapshot, so the first receive here is a
-// successful one.) A record with FileSize 0 beside a non-empty file would yield
-// a LogReader snapshot ({Filepath: set, FileSize: 0}) that makes this node
-// stream a single metadata-only chunk once it becomes leader, erasing the
-// receiving follower's state.
+// TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot checks a dedup re-delivery keeps FileSize right, so this node never streams an empty snapshot.
 func TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	h.barrier = createTestBarrier(t)
@@ -171,11 +153,7 @@ func TestHandleSnapshot_DedupReDeliveryCannotSendEmptySnapshot(t *testing.T) {
 	}
 }
 
-// TestForEachSnapshotChunk_DeclaredZeroSizeWithDataFails pins that a
-// declared size of zero beside a NON-EMPTY file is a metadata/artifact
-// disagreement, not an empty snapshot. Shipping a metadata-only chunk for it
-// is what amplifies a bad FileSize into follower state erasure, so the send
-// must fail with ErrSnapshotSizeMismatch instead.
+// TestForEachSnapshotChunk_DeclaredZeroSizeWithDataFails checks a zero declared size beside a non-empty file fails with ErrSnapshotSizeMismatch.
 func TestForEachSnapshotChunk_DeclaredZeroSizeWithDataFails(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.dat")
@@ -213,9 +191,7 @@ func TestForEachSnapshotChunk_DeclaredZeroSizeWithDataFails(t *testing.T) {
 	}
 }
 
-// TestForEachSnapshotChunk_GenuinelyEmptyFile is the negative of the test
-// above: when the declared size and the file AGREE at zero there is nothing to
-// stream, and the metadata-only chunk is correct.
+// TestForEachSnapshotChunk_GenuinelyEmptyFile checks a zero size and empty file send the metadata-only chunk.
 func TestForEachSnapshotChunk_GenuinelyEmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.dat")
@@ -244,16 +220,9 @@ func TestForEachSnapshotChunk_GenuinelyEmptyFile(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Compression is a property of the ARTIFACT
-// ---------------------------------------------------------------------------
+// Compression is a property of the artifact.
 
-// TestExportImportSnapshot_CrossCompressionConfig pins the artifact's encoding
-// across hosts. The exported artifact is decrypted but NEVER decompressed, so
-// the header must carry how it is encoded. Deriving that from the
-// destination's own SnapshotCompressionType would feed the state
-// machine Snappy frames (or, in reverse, tries to decompress plain bytes) on
-// every restore between hosts configured differently.
+// TestExportImportSnapshot_CrossCompressionConfig checks the artifact header carries its compression across differently configured hosts.
 func TestExportImportSnapshot_CrossCompressionConfig(t *testing.T) {
 	cases := []struct {
 		name string
@@ -328,9 +297,7 @@ func TestExportImportSnapshot_CrossCompressionConfig(t *testing.T) {
 	}
 }
 
-// TestSnapshotArtifactHeader_RejectsLegacyVersion verifies an artifact
-// produced before the Compression field is rejected LOUDLY rather than
-// assumed uncompressed.
+// TestSnapshotArtifactHeader_RejectsLegacyVersion checks an artifact without the Compression field is rejected.
 func TestSnapshotArtifactHeader_RejectsLegacyVersion(t *testing.T) {
 	hdr, err := marshalSnapshotArtifactHeader(snapshotArtifactHeader{Index: 5, Term: 2})
 	if err != nil {

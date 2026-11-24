@@ -25,13 +25,7 @@ import (
 	"testing"
 )
 
-// plainListen binds a TCP listener with no socket options of its own, which is
-// how the harnesses in test/performance bind and the strongest holder TCP has:
-// Go sets SO_REUSEADDR on a listener by default, and SO_REUSEADDR never permits
-// binding over a LIVE listener.
-//
-// It spells the bind through a ListenConfig rather than net.Listen only because
-// noctx requires it; the zero value adds nothing.
+// plainListen binds a TCP listener with no extra socket options.
 func plainListen(addr string) (net.Listener, error) {
 	var lc net.ListenConfig
 	return lc.Listen(context.Background(), "tcp", addr)
@@ -61,12 +55,7 @@ func forget(port int) {
 	state.recent = kept
 }
 
-// rewindTo points the scan cursor at a specific port, so the next reservation
-// probes that port first.
-//
-// Without this a test cannot reach a chosen port: the cursor advances past
-// every port it hands out and only returns after lapping the whole window,
-// which for the real window is thousands of reservations away.
+// rewindTo points the scan cursor at port so the next reservation probes it first.
 func rewindTo(port int) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -103,18 +92,7 @@ func portOf(t *testing.T, addr string) int {
 	return p
 }
 
-// TestReserveUDPAvoidsTheKernelEphemeralRange is the load-bearing property, and
-// the one that separates this package from the helper it replaces.
-//
-// A port inside ip_local_port_range is a port the kernel may hand to somebody
-// else — the next reservation, or the local end of any outbound connection —
-// between the moment it is reserved and the moment the host binds it. A port
-// outside the range cannot be assigned by the kernel to anything,
-// so the interval stops mattering.
-//
-// The check is deterministic: a close-then-return helper draws every port
-// from inside the range and fails here on the first reservation, not on an
-// unlucky one.
+// TestReserveUDPAvoidsTheKernelEphemeralRange checks reserved ports lie outside ip_local_port_range.
 func TestReserveUDPAvoidsTheKernelEphemeralRange(t *testing.T) {
 	lo, hi := kernelEphemeralRange(t)
 
@@ -181,13 +159,7 @@ func TestReserveUDPNeverRepeatsAPort(t *testing.T) {
 	}
 }
 
-// TestReserveUDPSkipsPortsHeldByALiveListener covers the cross-process case:
-// another test binary's host already holds a port in the window, and the probe
-// must refuse it.
-//
-// The listener here is bound the way the QUIC transport binds, with a plain
-// UDP socket (see plainListenPacket); the probe in scanWindow makes the same
-// plain bind, and this is the test that says a live holder refuses it.
+// TestReserveUDPSkipsPortsHeldByALiveListener checks the probe refuses a port a live UDP listener holds.
 func TestReserveUDPSkipsPortsHeldByALiveListener(t *testing.T) {
 	held, err := ReserveUDP()
 	if err != nil {
@@ -200,12 +172,7 @@ func TestReserveUDPSkipsPortsHeldByALiveListener(t *testing.T) {
 	}
 	defer pc.Close()
 
-	// Forget the reservation, so only the live listener stands between the scan
-	// and that port, and rewind the cursor onto it so the very next scan probes
-	// it first. Both are needed: the taken-set would shadow the probe, and the
-	// cursor would otherwise not return to this port for a full lap of the
-	// window — which is how this test once passed against a probe that bound
-	// straight through the holder.
+	// Forget the reservation and rewind onto the port so only the live listener refuses it.
 	forget(heldPort)
 	rewindTo(heldPort)
 
@@ -227,17 +194,7 @@ func TestReserveUDPSkipsPortsHeldByALiveListener(t *testing.T) {
 	}
 }
 
-// TestReserveTCPSkipsPortsHeldByALiveListener is
-// TestReserveUDPSkipsPortsHeldByALiveListener for the TCP form, and it is the
-// test that says the TCP probe is a real probe rather than an unconditional
-// yes.
-//
-// It matters because the two networks bind through different calls — Listen
-// against ListenPacket — so a probe that dispatched on network and got the TCP
-// arm wrong would hand out a live port while every UDP test stayed green.
-//
-// The holder is plainListen, the strongest holder TCP has — see its comment —
-// so the probe must be refused by it.
+// TestReserveTCPSkipsPortsHeldByALiveListener checks the TCP probe refuses a port a live listener holds.
 func TestReserveTCPSkipsPortsHeldByALiveListener(t *testing.T) {
 	held, err := ReserveTCP()
 	if err != nil {
@@ -268,13 +225,7 @@ func TestReserveTCPSkipsPortsHeldByALiveListener(t *testing.T) {
 	}
 }
 
-// TestReserveTCPAndUDPShareOneWindow pins the choice reserve documents: one
-// window and one taken set across both networks.
-//
-// The kernel would allow 40000/tcp and 40000/udp to be issued to two callers,
-// and this package deliberately does not. The property is worth a test because
-// the alternative — per-network state — is the obvious refactor, and it would
-// silently reintroduce two recycle policies and two cursors to keep in step.
+// TestReserveTCPAndUDPShareOneWindow checks TCP and UDP share one window and taken set.
 func TestReserveTCPAndUDPShareOneWindow(t *testing.T) {
 	lo, hi := 61300, 61363
 	withWindow(t, lo, hi)
@@ -282,12 +233,7 @@ func TestReserveTCPAndUDPShareOneWindow(t *testing.T) {
 	seen := make(map[string]string)
 	const reservations = 40
 	for i := range reservations {
-		// Rewind before every reservation. Without this the scan cursor alone
-		// keeps the addresses distinct — it advances past each port it hands
-		// out and never laps a 64-port window in 40 reservations — and the test
-		// would pass against per-network taken sets, asserting nothing. Pinned
-		// to the bottom of the window, the taken set is the ONLY thing that can
-		// stop the next reservation returning the port just issued.
+		// Rewind before every reservation so only the taken set prevents reissue.
 		rewindTo(lo)
 
 		network, reserve := "udp", ReserveUDP
@@ -306,16 +252,7 @@ func TestReserveTCPAndUDPShareOneWindow(t *testing.T) {
 	}
 }
 
-// TestReserveTCPAddressesAreBindable asserts a reservation is actually usable:
-// every address handed out for a five-node cluster must still bind after all
-// five have been reserved.
-//
-// It is the sequence that failed in the benchmark smoke run this window was
-// built for — five ports reserved up front, then five servers started, the last
-// binding long after the first was handed out — and it comes over from
-// test/performance/benchutil, which uses this window rather than its own.
-// A skip test proves the probe REFUSES a held port; only this proves it does
-// not also refuse, or hand out, a port that cannot be bound.
+// TestReserveTCPAddressesAreBindable checks five reserved addresses all bind after reservation.
 func TestReserveTCPAddressesAreBindable(t *testing.T) {
 	const nodes = 5
 
@@ -343,18 +280,7 @@ func TestReserveTCPAddressesAreBindable(t *testing.T) {
 	}
 }
 
-// TestWindowRecyclesOnceReservationsAreNoLongerInFlight is the positive half of
-// TestSaturatedWindowFailsRatherThanReissuingAnInFlightPort.
-//
-// That test pins the refusal: a window whose ports are all live must fail
-// rather than reissue one. This pins the other half — a run that asks for far
-// more ports than the window holds, with nothing still in flight, must keep
-// being served. The election benchmarks build and tear down a whole cluster per
-// b.N iteration, so an allocator that never reused a port would turn the
-// EADDRINUSE flake it replaced into a guaranteed failure late in a long run.
-//
-// Both halves are needed: retention alone starves, recycling alone reissues a
-// port a caller is still holding.
+// TestWindowRecyclesOnceReservationsAreNoLongerInFlight checks the window keeps serving once reservations are no longer in flight.
 func TestWindowRecyclesOnceReservationsAreNoLongerInFlight(t *testing.T) {
 	const lo, hi = 61400, 61403
 	const span = hi - lo + 1
@@ -513,15 +439,7 @@ func withWindow(t *testing.T, lo, hi int) {
 	state.lockDir = ""
 }
 
-// holdAllBut fills the installed window with live UDP listeners bound as the
-// transport binds them, leaving at most free ports unheld, and reports how many
-// it left. It stands in for the condition duplicate ports appear under: a
-// loaded host where most of the window is already bound by other test
-// binaries' nodes.
-//
-// The ports are discovered by binding rather than assumed free, so a port some
-// unrelated process on the host already holds simply counts towards the held
-// set instead of failing the test.
+// holdAllBut binds live UDP listeners on all but free ports of the window and returns how many it left.
 func holdAllBut(t *testing.T, lo, hi, free int) int {
 	t.Helper()
 
@@ -557,29 +475,7 @@ func holdAllBut(t *testing.T, lo, hi, free int) int {
 	return free
 }
 
-// TestSaturatedWindowFailsRatherThanReissuingAnInFlightPort covers the one
-// piece of state machinery whose failure would reissue an in-flight port.
-//
-// A window is finite and a long integration run allocates far more ports than
-// it holds, so reservations must eventually be forgotten and the window reused.
-// The reservation a caller is still holding must not be among them: a five-node
-// cluster reserves five addresses and only then constructs five hosts, so a
-// port handed out moments ago may not yet be bound. Reissuing that port hands
-// two nodes one address — the defect, reached by a different route.
-//
-// Over a mostly-free window the scan cursor hides this: it advances past each
-// port it hands out, so a port cannot come back until the cursor has lapped the
-// whole span, and the retain horizon is never consulted. The horizon only
-// carries weight when the window is SATURATED — most of it held by live hosts,
-// which is a loaded runner. There a lap is as short as
-// the number of free ports, and the only thing standing between the caller and
-// a duplicate is the record of what is still in flight.
-//
-// The contract in that state is to fail loudly here. A reissued address fails
-// too, but later and elsewhere: the second host to bind it fails to start with
-// EADDRINUSE (see the package comment), in whichever test happened to start
-// second. A test that cannot get a distinct port must be told at the
-// reservation, not handed a used one.
+// TestSaturatedWindowFailsRatherThanReissuingAnInFlightPort checks a saturated window fails rather than reissue an in-flight port.
 func TestSaturatedWindowFailsRatherThanReissuingAnInFlightPort(t *testing.T) {
 	// Small enough to saturate quickly, and free (8) well below the retain
 	// horizon (span/2 = 32) so exhaustion is reached while every reservation

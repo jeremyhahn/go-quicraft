@@ -12,19 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package fsutil makes directory changes durable: it fsyncs a directory, and
-// creates a directory tree so that every directory it adds survives a crash.
-//
-// A file that has been fsynced is only reachable after a crash if the entry
-// naming it in its parent directory is durable too, and that entry is the
-// parent directory's metadata. Each directory os.MkdirAll creates therefore
-// needs its parent fsynced, up to and including the deepest directory that
-// already existed. MkdirAllSynced does that for a new tree. A caller that
-// creates the tree itself and publishes into it before syncing records
-// DeepestExistingAncestor first, then calls SyncDirChain afterwards.
-//
-// Every operation has a With form that takes the filesystem calls as
-// parameters. A caller that routes its file I/O through its own filesystem
-// abstraction, for fault injection or crash modelling, passes that
-// abstraction in and gets the same walk without copying it.
+// Package fsutil fsyncs directories and creates directory trees whose every new directory survives a crash; With forms take the filesystem calls as parameters.
 package fsutil

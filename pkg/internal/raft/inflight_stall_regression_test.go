@@ -24,15 +24,7 @@ import (
 // A restarted replica must be able to resume replication
 // ---------------------------------------------------------------------------
 
-// wedgeRemoteBehindFullWindow reproduces the leader-side state observed when a
-// replica restarts underneath a saturated replication pipeline:
-//
-//	r5[match=8752 next=9083 state=replicate paused=true active=true inflights=256]
-//
-// The peer is in replicate state, its in-flight window is FULL, and every
-// record in that window sits strictly above the peer's match — those messages
-// were delivered to the incarnation of the peer that died, so no ack for them
-// can ever arrive. Returns the peer's match index.
+// wedgeRemoteBehindFullWindow puts a peer in replicate state with a full in-flight window above its match, and returns the match index.
 func wedgeRemoteBehindFullWindow(t *testing.T, r *raft, peer uint64) uint64 {
 	t.Helper()
 
@@ -89,22 +81,7 @@ func replicateTo(msgs []proto.Message, peer uint64) *proto.Message {
 	return nil
 }
 
-// TestRestartedReplicaResumesReplicationAfterFullWindow is the unit-level
-// reproduction of a replication deadlock: a replica that restarts underneath a
-// saturated pipeline was never sent another entry, with the leader alive and
-// committing.
-//
-// The in-flight window only drains from ABOVE — freeTo frees records at or
-// below an acknowledged index — while every ack a restarted replica can still
-// send reports a position BELOW the window. So the window stayed full, a full
-// window means isPaused, and sendAppend skipped the peer on every path.
-// Nothing in the steady state could break the cycle: the leader never sent
-// match+1, so the replica never advanced, so it never acked anything that
-// would free a slot.
-//
-// The escape is the heartbeat response: it proves the peer is alive, so one
-// slot is released and one message gets through. The peer rejects it, and the
-// rejection drives the normal backtracking that repairs its position.
+// TestRestartedReplicaResumesReplicationAfterFullWindow checks a heartbeat response frees one slot so a restarted replica resumes replication.
 func TestRestartedReplicaResumesReplicationAfterFullWindow(t *testing.T) {
 	const peer = uint64(2)
 	r := newTestRaft(1)
@@ -188,18 +165,7 @@ func TestRestartedReplicaResumesReplicationAfterFullWindow(t *testing.T) {
 	}
 }
 
-// TestHealthyPipelineSurvivesFullInflightWindow is the guard on the recovery
-// above. The stall is not distinguishable from healthy pipelining by state
-// alone: a peer that is merely BUSY also sits at a full window with every
-// record above its match, and its next legitimately runs hundreds of entries
-// ahead of match. Any condition that reads "behind" as "broken" — the naive
-// match < next-1, for instance — fires on every healthy peer at saturation and
-// resets the pipeline continuously, which costs far more throughput than the
-// bug it is trying to fix.
-//
-// So this asserts the recovery costs a healthy peer nothing: in-order acks
-// keep it in replicate state, keep the window full and rotating, and never
-// rewind next to match+1. Heartbeat responses in between must not change that.
+// TestHealthyPipelineSurvivesFullInflightWindow checks a busy healthy peer stays in replicate with its window full and next unrewound.
 func TestHealthyPipelineSurvivesFullInflightWindow(t *testing.T) {
 	const peer = uint64(2)
 	r := newTestRaft(1)

@@ -16,9 +16,5 @@
 
 package seal
 
-// softwareFallbackAlgorithm returns AES-256-GCM. A FIPS build has no
-// non-approved AEAD compiled in (see algorithm_chacha.go), so there is no
-// ChaCha20 fallback to take on a CPU without AES-NI: such a host runs the
-// software AES-GCM implementation, more slowly, rather than running an
-// algorithm this build is not permitted to execute.
+// softwareFallbackAlgorithm returns AES-256-GCM; a FIPS build has no ChaCha20 fallback.
 func softwareFallbackAlgorithm() SymmetricAlgorithm { return AlgAES256GCM }

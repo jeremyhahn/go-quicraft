@@ -20,15 +20,7 @@ import (
 	"testing"
 )
 
-// TestConfigChangeAddressTooLong pins the address bound at BOTH ends.
-//
-// The write half is what makes the two agree: a ConfigChange is marshaled into
-// an Entry.Cmd and COMMITTED, so if MarshalTo emitted this payload, an
-// over-length operator-supplied address would produce a committed entry every
-// replica then faulted on
-// (peer.applyMembershipEntry -> ErrCorruptConfigEntry). The buffer for the read
-// half is therefore built by hand rather than by marshaling, because the encoder
-// refuses to produce it — which is the point.
+// TestConfigChangeAddressTooLong verifies the address bound on write and on read.
 func TestConfigChangeAddressTooLong(t *testing.T) {
 	longAddr := strings.Repeat("x", MaxAddressLength+1)
 	cc := ConfigChange{
@@ -101,10 +93,7 @@ func TestConfigChangeSize(t *testing.T) {
 	}
 }
 
-// TestConfigChangeUnmarshalInvalidType pins the type bound at BOTH ends: the
-// encoder refuses an unknown type, and a buffer that carries one anyway — which
-// is only reachable by patching the bytes, i.e. by corruption or tampering,
-// exactly the case the decoder check exists for — is refused on read.
+// TestConfigChangeUnmarshalInvalidType verifies an unknown type is refused on write and on read.
 func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -124,8 +113,7 @@ func TestConfigChangeUnmarshalInvalidType(t *testing.T) {
 				t.Fatalf("MarshalTo: got %v, want ErrInvalidConfigChangeType", err)
 			}
 
-			// Marshal a VALID type, then patch the type field, so the rest of the
-			// payload is well formed and the decoder is judged on the type alone.
+			// Marshal a valid type, then patch the type field.
 			cc.Type = AddNode
 			if _, err := cc.MarshalTo(buf); err != nil {
 				t.Fatalf("MarshalTo(valid): %v", err)

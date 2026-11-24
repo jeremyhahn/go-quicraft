@@ -23,22 +23,7 @@ import (
 	"time"
 )
 
-// TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass forces each
-// outcome class the concurrent-propose workload loop files a SyncPropose
-// under (proposeOutcomes.record) at a known point, instead of waiting for a
-// leader change to happen by chance:
-//   - refused: replica 1 runs the shard alone, so no leader can be elected
-//     and Host.Propose refuses before submission;
-//   - acked: proposals at the elected leader;
-//   - maybe: the leader's apply is held at a gate and proposals queue
-//     behind it (a host whose apply is held replicates no new entries);
-//     both followers are stopped, the leader steps down on CheckQuorum,
-//     and cancelling the held calls fails them MaybeApplied.
-//
-// The cluster is then drained and checked with the same bounds as the
-// workload test: the gate key, whose apply was reached, is applied exactly
-// once on every replica, and every other held proposal at most once, the
-// same number of times on every replica.
+// TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass forces refused, acked and maybe-applied proposals, then checks each applies at most once and identically on every replica.
 func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 	c := newConcurrentProposeCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -58,11 +43,7 @@ func TestConcurrentPropose_LeaderChangeHitsEveryOutcomeClass(t *testing.T) {
 		t.Fatalf("ShardInfo: %v", err)
 	}
 	leaderID := info.ReplicaID
-	// The gate holds the LEADER's apply. A host whose apply is held keeps
-	// heartbeating but replicates no new entry and never gets a TimeoutNow
-	// out, so neither an election nor a transfer moves leadership; losing
-	// the quorum does. The held calls wait at the old leader and can only
-	// learn that their outcome is unknown.
+	// Hold the leader's apply; losing quorum, not an election, moves leadership.
 	proposer := leader
 
 	for i := range 4 {
@@ -184,15 +165,7 @@ func concurrentProposeSameCount(t *testing.T, c *concurrentProposeCluster, keys 
 	}
 }
 
-// TestConcurrentPropose_ProposalToStoppedFormerLeader is the regression for
-// a proposal forwarded to a leader that is gone by the time the replicas are
-// compared (#928 review, finding 1). No test hook delays a single forwarded
-// message (the only hook is testHookTryRecycle, pkg/requeststate.go; HostOptions
-// inject no transport), so the leader's host is stopped instead: a follower
-// that still names it forwards the proposals to it, the survivors elect a new
-// leader, and the drain's restart brings the stopped host back from its WAL.
-// Each orphaned proposal is then applied at most once, the same number of
-// times on every replica.
+// TestConcurrentPropose_ProposalToStoppedFormerLeader verifies proposals forwarded to a stopped leader apply at most once, identically on every replica.
 func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	c := newConcurrentProposeCluster(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

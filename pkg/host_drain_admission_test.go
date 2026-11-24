@@ -20,13 +20,7 @@ import (
 	"time"
 )
 
-// TestHost_Drain_AdmissionAfterDrainIsRefused reproduces the check-then-count
-// window of #1084 deterministically. A proposer passes Propose's draining
-// check, is preempted, and Drain runs to completion: it raises the flag, sees
-// no pending operation and returns nil. The proposer then resumes and reaches
-// the registration that counts the operation. That registration must refuse
-// with ErrDraining and leave pendingOps at 0; admitting it would make Drain's
-// nil a lie, because an operation is pending after Drain said none was.
+// TestHost_Drain_AdmissionAfterDrainIsRefused checks that a proposer admitted past the draining check but registered after Drain returns is refused with ErrDraining.
 func TestHost_Drain_AdmissionAfterDrainIsRefused(t *testing.T) {
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {

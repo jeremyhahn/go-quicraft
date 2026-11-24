@@ -544,10 +544,7 @@ func TestInMemory_AppliedLogTo_NoCompactionBelowThreshold(t *testing.T) {
 	if im.shrunk != true {
 		t.Fatal("expected shrunk to be true (deferred)")
 	}
-	// No reallocation occurred: the slice was resliced forward inside the
-	// ORIGINAL backing array, so its first element is the original array's
-	// 100th. A compaction would have copied the live entries into a fresh
-	// allocation and this identity would not hold.
+	// No reallocation: the slice was resliced inside the original backing array.
 	if &im.entries[0] != &initial[100] {
 		t.Fatal("entries were reallocated; appliedLogTo compacted below the threshold")
 	}
@@ -559,12 +556,7 @@ func TestInMemory_AppliedLogTo_NoCompactionBelowThreshold(t *testing.T) {
 	}
 }
 
-// TestInMemory_AppliedLogTo_CompactsAtAbsoluteThreshold verifies that
-// compaction triggers when both the absolute threshold (wastedPrefix >=
-// entrySliceSize) and the proportional gate (wastedPrefix >= 2*live)
-// are satisfied. With 1024 entries, the proportional gate fires when
-// wastedPrefix >= 2 * (1024 - applied), i.e., applied >= ceil(1024*2/3)
-// = 683. At that point wastedPrefix=683 >= entrySliceSize=512.
+// TestInMemory_AppliedLogTo_CompactsAtAbsoluteThreshold verifies compaction needs wastedPrefix >= entrySliceSize and >= 2*live (applied >= 683 of 1024).
 func TestInMemory_AppliedLogTo_CompactsAtAbsoluteThreshold(t *testing.T) {
 	im := newInMemory(0)
 	total := uint64(2 * entrySliceSize)
@@ -751,12 +743,7 @@ func TestInMemory_WastedPrefix_ResetOnMergeOverlap(t *testing.T) {
 	}
 }
 
-// TestInMemory_Merge_AfterRestoreGap verifies that merge Case 3 does not
-// panic when entries is nil (after snapshot restore) and leader sends entries
-// starting beyond markerIndex. Also verifies savedTo is updated so
-// entriesToSave() returns the new entries (a savedTo left at the snapshot
-// index causes a uint64 underflow in
-// entriesToSave offset calculation).
+// TestInMemory_Merge_AfterRestoreGap verifies merge case 3 after a snapshot restore does not panic and updates savedTo.
 func TestInMemory_Merge_AfterRestoreGap(t *testing.T) {
 	im := newInMemory(0)
 	im.restore(proto.Snapshot{Index: 100, Term: 5})

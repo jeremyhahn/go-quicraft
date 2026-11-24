@@ -52,12 +52,7 @@ const connDialTimeout = 2 * time.Second
 // frame (length prefix + protobuf payload).
 const connWriteDeadline = 1 * time.Second
 
-// raftTransport provides TCP+TLS message delivery between etcd/raft nodes.
-// Messages are length-prefixed protobuf frames over persistent TLS connections.
-// Outbound connections are lazily dialed and cached by peer address, so they
-// survive a change of the raft ids served at those addresses (setPeers).
-// Inbound connections are accepted and each served by a dedicated goroutine
-// that reads frames and delivers them via the recvFn callback.
+// raftTransport delivers length-prefixed protobuf frames between etcd/raft nodes over cached TCP+TLS connections.
 type raftTransport struct {
 	mu        sync.Mutex
 	addr      string
@@ -247,13 +242,7 @@ func (t *raftTransport) handleConn(conn net.Conn) {
 	// close fails; there is no caller to report it to.
 	defer func() { _ = conn.Close() }()
 
-	// Complete the TLS handshake under its own timeout before applying the
-	// short per-frame read deadline below. A handshake that times out leaves
-	// crypto/tls with a sticky error, and every later Read would return that
-	// timeout again: the loop would spin forever without reading, while the
-	// sender's cached connection kept accepting writes, silently losing that
-	// direction of the link. On failure the connection is closed instead, so
-	// the sender's next write fails and it redials.
+	// Complete the TLS handshake under its own timeout before the per-frame read deadline.
 	if tc, ok := conn.(*tls.Conn); ok {
 		ctx, cancel := context.WithTimeout(context.Background(), connDialTimeout)
 		err := tc.HandshakeContext(ctx)

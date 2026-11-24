@@ -86,10 +86,7 @@ func TestRecovering_ClearedAfterRecoveryCompletes(t *testing.T) {
 		t.Fatalf("requestSnapshot failed: %v", err)
 	}
 
-	// completedC is written AFTER the worker clears the recovering and
-	// snapshotting flags and notifies the work signal. Polling the flags
-	// directly would race: both are false before the worker picks the
-	// request up.
+	// completedC is written after the worker clears the flags.
 	awaitSnapshotResult(t, p, "recovery")
 
 	if node.IsRecovering() {
@@ -194,17 +191,7 @@ func TestRecovering_EntriesAppliedAfterRecovery(t *testing.T) {
 	close(stopC)
 }
 
-// TestRecovering_StepWorkerSuppressesOnlyCommittedEntries pins the
-// recovering contract: the step worker keeps the node in the Raft protocol
-// (it still drains the inbox, produces updates, and persists hard state so
-// ordered responses can be sent) and suppresses EXACTLY ONE thing — the
-// extraction of committed entries, the only part of an update that reaches
-// the state machine the snapshot pool is replacing.
-//
-// Skipping the node entirely would make it invisible to consensus for the
-// whole unbounded duration of user RecoverFromSnapshot code: two replicas
-// recovering at once would dissolve a five-replica shard's quorum with every
-// node still up.
+// TestRecovering_StepWorkerSuppressesOnlyCommittedEntries checks a recovering node stays in the protocol and only committed-entry extraction is suppressed.
 func TestRecovering_StepWorkerSuppressesOnlyCommittedEntries(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -301,11 +288,7 @@ func TestRecovering_StepWorkerSuppressesOnlyCommittedEntries(t *testing.T) {
 	}
 }
 
-// TestRecovering_FlagOnlySetsForRecoveryNotSave verifies that the
-// recovering flag is ONLY set for recovery requests (save=false),
-// not for save requests (save=true). Snapshot save does not conflict
-// with the apply pipeline because it reads from the SM under
-// commitPending protection, whereas recovery replaces SM state.
+// TestRecovering_FlagOnlySetsForRecoveryNotSave checks only recovery requests set the recovering flag.
 func TestRecovering_FlagOnlySetsForRecoveryNotSave(t *testing.T) {
 	stopC := make(chan struct{})
 	ws := NewWorkSignal(1)
@@ -347,14 +330,7 @@ func TestRecovering_FlagOnlySetsForRecoveryNotSave(t *testing.T) {
 	wg.Wait()
 }
 
-// TestRecovering_ApplyWorkerDoesNotParkEmptyBatch verifies that a batch
-// with NO committed entries is released immediately instead of waiting on
-// the recovering gate. An empty batch never touches the state machine, so
-// parking it buys nothing and costs everything: commitPending stays set for
-// the entire unbounded duration of user RecoverFromSnapshot code, which in
-// memory mode (where every update reaches the apply worker, including a
-// bare hard-state change) silences the shard's ordered responses — vote
-// grants included — for exactly as long as the recovery runs.
+// TestRecovering_ApplyWorkerDoesNotParkEmptyBatch checks an empty batch is released without waiting on the recovering gate.
 func TestRecovering_ApplyWorkerDoesNotParkEmptyBatch(t *testing.T) {
 	applyC := make(chan *applyItem, 8)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -392,13 +368,7 @@ func TestRecovering_ApplyWorkerDoesNotParkEmptyBatch(t *testing.T) {
 	}
 }
 
-// TestRecovering_CommitWorkerSkipsPiggyback verifies that the commit
-// worker does not extract piggyback committed entries for a recovering
-// node. Extracting them advances raft's processed marker and hands the
-// batch to an apply worker that must park it on the recovering gate,
-// holding commitPending — and with it every ordered response, vote grants
-// included — for the whole recovery. The entries stay in the log and are
-// re-offered once the gate clears.
+// TestRecovering_CommitWorkerSkipsPiggyback checks the commit worker extracts no committed entries for a recovering node.
 func TestRecovering_CommitWorkerSkipsPiggyback(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()

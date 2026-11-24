@@ -24,13 +24,7 @@ import (
 	"testing"
 )
 
-// benchBarrier creates a barrier initialized with fast Argon2id params.
-//
-// Logging is silenced for the duration. This is not cosmetic: go test
-// republishes the test binary's stderr on its own stdout, so a barrier's setup
-// logs land BETWEEN a benchmark's name and its result line and corrupt the
-// machine-readable output that every A/B comparison of this hot path depends
-// on. Nothing on the measured path logs, so no measurement is affected.
+// benchBarrier creates a barrier with fast Argon2id params, silencing logs so benchmark output stays parseable.
 func benchBarrier(b *testing.B) *Barrier {
 	b.Helper()
 	prevLogger := slog.Default()

@@ -20,8 +20,7 @@ import (
 	"time"
 )
 
-// recordingCollector records which method was called, so a forward to the
-// WRONG inner method is detectable rather than merely non-panicking.
+// recordingCollector records which method was called.
 type recordingCollector struct {
 	NoOpMetricsCollector
 	mu     sync.Mutex
@@ -103,14 +102,7 @@ func (r *recordingCollector) IncUnauthorizedSnapshotDropped(uint64, uint64) {
 func (r *recordingCollector) RegisterShard(uint64)   { r.note("RegisterShard") }
 func (r *recordingCollector) UnregisterShard(uint64) { r.note("UnregisterShard") }
 
-// TestSafeMetricsCollector_ForwardsEveryMethod pins that each of the 25
-// forwarding methods reaches its OWN inner method.
-//
-// The wrapper is 25 near-identical hand-written bodies, which is exactly the
-// shape a copy-paste error survives in: forwarding ObserveCommitLatency to
-// ObserveProposalLatency would keep compiling, keep the panic barrier intact,
-// and silently mis-report two metrics forever. Recording the call by name is
-// what makes that detectable.
+// TestSafeMetricsCollector_ForwardsEveryMethod: each of the 25 forwarding methods reaches its own inner method.
 func TestSafeMetricsCollector_ForwardsEveryMethod(t *testing.T) {
 	rec := &recordingCollector{}
 	c := newSafeMetricsCollector(rec)

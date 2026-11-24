@@ -21,24 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// The startup fold must REPORT a corrupt committed config entry
-//
-// Three paths fold committed config changes, and they disagreed about what an
-// UNDECODABLE one means:
-//
-//   - the commit pipeline (processConfigChanges) faults the shard;
-//   - recovery (ReconstructMembership) aborts StartShard;
-//   - the startup fold (SetProcessedIndex) logged an ERROR, armed the staleness
-//     watermark and started the shard anyway.
-//
-// The third is the one that failed OPEN. Refusing to campaign is a LIVENESS
-// answer to a SAFETY fact: the replica came up on a configuration it knows is
-// unreconstructable and then served reads and acked the leader from it. Its
-// caller took only the clamped uint64, so it could not do better; widening the
-// signature is what lets Host.StartShard reach the same verdict as the other
-// two.
-// ---------------------------------------------------------------------------
+// The startup fold reports a corrupt committed config entry, like the commit pipeline and recovery.
 
 // corruptTailFixture builds a replica whose committed log holds an
 // EntryConfigChange at index 31 that cannot be decoded, above a readable
@@ -71,16 +54,7 @@ func corruptTailFixture(t *testing.T) *Peer {
 	return p
 }
 
-// TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry is the regression.
-// The error must reach the caller; the watermark must ALSO still be armed, so a
-// caller that ignores the error keeps the old fail-closed campaigning behaviour
-// rather than getting nothing.
-//
-// The controls over the same fixture with the tail intact are in
-// processed_fold_divergence_regression_test.go: a readable tail folds and
-// reports no error (TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign),
-// and an unreadable but not corrupt one arms the watermark and reports no error
-// either (TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign).
+// TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry checks the error reaches the caller and the watermark is still armed.
 func TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry(t *testing.T) {
 	quietLogs(t)
 

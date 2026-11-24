@@ -21,28 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// The removal deny-list must be answerable against the AUTHENTICATED identity
-//
-// IsRemoved inspects the CLAIMED msg.From. A removed replica still holds its
-// private key, so it authenticates normally and evades its own tombstone by
-// naming a different replica ID. TestHandleMessage_RemovedReplicaCannotBypass-
-// ItsTombstoneWithAForgedFrom covers the case where the forged ID names a LIVE
-// member — the sender binding refuses that on the identity mismatch.
-//
-// What NOTHING refused, before proto.Membership.RemovedIdentities existed, is a
-// forged ID the configuration does not name AT ALL. That verdict
-// (dropUnknownMember) is deliberately DOWNGRADED for the leader-originated
-// class, because a replica whose configuration lags cannot yet name the leader
-// that would bring it up to date, and refusing there wedges the shard (round
-// 10). So a removed replica sending Replicate{From: <unnamed ID>} under its own
-// real certificate was accepted, made this replica adopt a higher term, and made
-// it name the attacker leader for an election timeout — from a host the shard
-// had explicitly ejected.
-//
-// The tests below drive that exact shape. The attacker holds a REAL certificate
-// and a REAL identity; the only thing it changes is which replica ID it claims.
-// ---------------------------------------------------------------------------
+// A removed replica with its real certificate claiming an unnamed replica ID must be refused by its authenticated identity.
 
 const (
 	// removedIdentity is the identity the shard committed for replica 9 before
@@ -52,9 +31,7 @@ const (
 	liveIdentity = "spki:" + "2222222222222222222222222222222222222222222222222222222222222222"
 )
 
-// tombstonedShardMembership is the committed configuration these tests
-// authorize against: two live voters (one of which carries an identity) and one
-// replica the shard has REMOVED, whose identity is retained in the tombstone.
+// tombstonedShardMembership has two live voters, one with an identity, and one removed replica whose identity is retained.
 func tombstonedShardMembership() proto.Membership {
 	return proto.Membership{
 		Addresses: map[uint64]string{
@@ -74,7 +51,7 @@ func tombstonedShardMembership() proto.Membership {
 // the leader-originated class admits. Every such message must be dropped.
 func TestHandleMessage_RemovedIdentityCannotEvadeItsTombstoneByRenamingItself(t *testing.T) {
 	const removedAddr = "127.0.0.1:5009"
-	// The attacker's REAL credentials: its own address, its own keypair.
+	// The attacker's real address and keypair.
 	attacker := certCoveringAs(removedIdentity, removedAddr)
 
 	// Every claimed ID it could pick. 9 is its own (the claimed-From check
@@ -110,11 +87,7 @@ func TestHandleMessage_RemovedIdentityCannotEvadeItsTombstoneByRenamingItself(t 
 	}
 }
 
-// TestHandleMessage_LiveMemberIsStillAcceptedOnATombstonedShard is the POSITIVE
-// CONTROL, and it is what stops the test above from passing on a gate that
-// simply drops everything. The shard holds a tombstone; a legitimate member
-// speaking under its own identity must still be delivered, for both the
-// quorum-bearing and the leader-originated class.
+// TestHandleMessage_LiveMemberIsStillAcceptedOnATombstonedShard checks a legitimate member is still delivered.
 func TestHandleMessage_LiveMemberIsStillAcceptedOnATombstonedShard(t *testing.T) {
 	const memberAddr = "127.0.0.1:5002"
 	member := certCoveringAs(liveIdentity, memberAddr)
@@ -143,16 +116,7 @@ func TestHandleMessage_LiveMemberIsStillAcceptedOnATombstonedShard(t *testing.T)
 	}
 }
 
-// TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone pins that
-// an empty authenticated identity is never matched against a tombstone.
-//
-// A connection whose peer certificate yields NO identity cannot be told apart
-// from any other such connection, so an empty-matches-empty rule would classify
-// every identity-less peer as a removed one on any shard that had ever removed
-// a member. Such a peer is refused anyway — a member is authorized by its
-// committed identity and by nothing else — but it must be refused for
-// the reason that is TRUE (missing_identity), not reported as a removed member
-// trying to sneak back, which is the label an operator alerts on.
+// TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone checks an empty identity is refused as missing_identity, not as removed.
 func TestHandleMessage_EmptyPeerIdentityIsNotMatchedAgainstTheTombstone(t *testing.T) {
 	const memberAddr = "127.0.0.1:5002"
 	ms := tombstonedShardMembership()

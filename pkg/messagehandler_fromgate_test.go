@@ -25,35 +25,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// msg.From must be bound to the AUTHENTICATED sender before raft acts on it
-//
-// The gate these tests pin is authorizeInbound's sender binding for
-// QUORUM-BEARING message types: the connection's verified peer certificate must
-// cover the address the shard's COMMITTED MEMBERSHIP assigns to msg.From.
-//
-// Three earlier shapes of this check were wrong, and the tests below cover all
-// of them. The first resolved the address registry AFTER learnSourceAddress had
-// overwritten registry[shard, From] with the sender's own address, so it
-// compared the attacker's address to itself. The second fixed that ordering but
-// still read the registry, which inbound traffic writes — so a non-quorum-bearing
-// message could re-point the entry and a follow-up would match it. The third
-// read committed membership but compared it to batch.SourceAddress by string
-// equality, which the sender chooses and which is independently sourced from the
-// committed address, so it partitioned healthy members instead of stopping
-// forgery.
-// ---------------------------------------------------------------------------
+// msg.From is bound to the authenticated sender: authorizeInbound requires the verified peer certificate to cover the address committed membership assigns to msg.From.
 
-// certCovering models the transport's per-connection certificate binding: the
-// senderAuthorized closure passed to HandleMessage answers for ONE inbound
-// connection's verified leaf certificate, so it covers that peer's own SANs and
-// nothing else.
-//
-// This is the fixture detail that decides whether these tests prove anything. A
-// closure that answers true for every address (authorizeAllSenders) models an
-// attacker holding every node's private key, which is not the threat: an
-// attacker holding a valid CLUSTER certificate has its OWN identity and is
-// trying to speak as another replica.
+// certCovering models one connection's verified certificate: it covers that peer's own SANs only.
 func certCovering(addresses ...string) transport.PeerAuth {
 	covered := make(map[string]struct{}, len(addresses))
 	for _, addr := range addresses {
@@ -67,14 +41,7 @@ func certCovering(addresses ...string) transport.PeerAuth {
 	}
 }
 
-// certCoveringAs is certCovering with an authenticated NODE IDENTITY attached:
-// the peer this connection carries is provably the holder of that keypair, and
-// its certificate additionally covers the listed addresses.
-//
-// The two are separate arguments because they are separate facts, and the whole
-// point of the identity binding is that the second one stops mattering. A
-// promiscuous certificate is modelled by passing the victim's address here
-// while passing the ATTACKER's identity.
+// certCoveringAs is certCovering with an authenticated node identity; a promiscuous certificate is the victim's address with the attacker's identity.
 func certCoveringAs(identity string, addresses ...string) transport.PeerAuth {
 	peer := certCovering(addresses...)
 	peer.Identity = identity
@@ -97,11 +64,7 @@ func fromGateRig(t *testing.T, ms proto.Membership, registered map[uint64]string
 	return eng, &hostMessageHandler{engine: eng, host: &Host{registry: reg}}
 }
 
-// quorumBearingTypes are the message types that hand the sender a quorum
-// outcome. Each one is a complete forgery primitive on its own, so every test
-// below drives all six. ReadIndexResp and TimeoutNow are here because accepting
-// one is accepting the RESULT of a quorum round that was never run — see
-// TestIsQuorumBearing_EveryKnownMessageTypeIsClassified.
+// quorumBearingTypes are the message types that hand the sender a quorum outcome (see TestIsQuorumBearing_EveryKnownMessageTypeIsClassified).
 var quorumBearingTypes = []uint64{
 	proto.ReplicateResp,
 	proto.HeartbeatResp,
@@ -111,16 +74,7 @@ var quorumBearingTypes = []uint64{
 	proto.TimeoutNow,
 }
 
-// TestHandleMessage_AuthenticatedPeerCannotForgeAnotherMembersFrom is the core
-// regression. Replica 3 is a genuine, authenticated member of shard 1 speaking
-// under its OWN certificate, and it claims to be replica 2. Nothing about the
-// certificate is wrong; only the replica ID is. Every such message must be
-// dropped before it reaches the inbox — one accepted ReplicateResp advances the
-// leader's match index for a follower that never received the entries, one
-// accepted RequestVoteResp is a vote from a replica that never granted it, one
-// accepted ReadIndexResp resolves a linearizable read with no heartbeat quorum
-// behind it, and one accepted TimeoutNow starts an election that bypasses both
-// PreVote and the leader lease.
+// TestHandleMessage_AuthenticatedPeerCannotForgeAnotherMembersFrom: a member claiming another replica's ID is dropped before the inbox, for every quorum-bearing type.
 func TestHandleMessage_AuthenticatedPeerCannotForgeAnotherMembersFrom(t *testing.T) {
 	const victimAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5003"
 	ms := proto.Membership{Addresses: map[uint64]string{
@@ -158,11 +112,7 @@ func TestHandleMessage_AuthenticatedPeerCannotForgeAnotherMembersFrom(t *testing
 	}
 }
 
-// TestHandleMessage_RemovedReplicaCannotBypassItsTombstoneWithAForgedFrom pins
-// the deny-list's blind spot. IsRemoved inspects the CLAIMED From, so a replica
-// the shard has committed a removal for simply stops claiming its own ID and
-// asserts a live member's instead. The tombstone alone is no defence; the
-// sender binding is what refuses it.
+// TestHandleMessage_RemovedReplicaCannotBypassItsTombstoneWithAForgedFrom: the sender binding refuses a removed replica claiming a live member's ID.
 func TestHandleMessage_RemovedReplicaCannotBypassItsTombstoneWithAForgedFrom(t *testing.T) {
 	const victimAddr, removedAddr = "127.0.0.1:5002", "127.0.0.1:5009"
 	ms := proto.Membership{
@@ -210,21 +160,7 @@ func TestHandleMessage_RemovedReplicaCannotBypassItsTombstoneWithAForgedFrom(t *
 	}
 }
 
-// TestHandleMessage_MemberAdvertisingAnEquivalentAddressIsNotPartitioned is the
-// regression for a LIVENESS defect the first version of this gate introduced.
-//
-// batch.SourceAddress is the peer's ADVERTISED address (AdvertiseAddress, else
-// the bound local address, else ListenAddress); the committed address is what
-// the operator handed StartShard or RequestAddNode. They are independently
-// sourced strings for one host, and a certificate legitimately carries several
-// SANs — so the DNS spelling and the IP spelling of one node can both be
-// cert-valid and unequal.
-//
-// Comparing them by string equality dropped every quorum-bearing message from
-// that member forever: the shard could not commit or elect, and it presented as
-// a network partition over a completely healthy network. The old (forgeable)
-// code self-healed this because address learning made the comparison reflexive.
-// The binding is on the certificate, so both spellings work.
+// TestHandleMessage_MemberAdvertisingAnEquivalentAddressIsNotPartitioned: a member whose advertised address differs in spelling from its committed one is still accepted.
 func TestHandleMessage_MemberAdvertisingAnEquivalentAddressIsNotPartitioned(t *testing.T) {
 	const committedAddr = "node5.example.com:5001"
 	const advertisedAddr = "10.0.0.5:5001"
@@ -261,15 +197,7 @@ func TestHandleMessage_MemberAdvertisingAnEquivalentAddressIsNotPartitioned(t *t
 	}
 }
 
-// TestHandleMessage_MemberAtANewAddressIsStillCounted pins the liveness WIN the
-// identity binding buys, so it is not lost to a later "tightening".
-//
-// A member that comes back at an address its certificate does not cover — a
-// genuinely new host — keeps its keypair, so its identity is unchanged and its
-// quorum-bearing traffic keeps being counted with no config change at all. The
-// address binding this replaced refused it until a config change carrying the
-// new address COMMITTED, and during quorum loss no config change can commit,
-// so such a shard did not self-heal. Routing relearns from the same traffic.
+// TestHandleMessage_MemberAtANewAddressIsStillCounted: a member at a new address keeps its identity and is counted with no config change.
 func TestHandleMessage_MemberAtANewAddressIsStillCounted(t *testing.T) {
 	const committedAddr, movedAddr = "10.0.0.5:5001", "10.0.0.9:6001"
 	const memberID = "spki:5555555555555555555555555555555555555555555555555555555555555555"
@@ -304,15 +232,7 @@ func TestHandleMessage_MemberAtANewAddressIsStillCounted(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_JoiningReplicaStillLearnsAndAcks is the other liveness
-// half, and the reason the gate is scoped to quorum-bearing types only.
-//
-// A replica joining a shard starts with an EMPTY configuration and an empty
-// registry: it knows no members, so a binding on the committed configuration
-// alone would drop the very message the join depends on. The join anchor the
-// operator started the shard with names the leader and its identity, and on
-// that the joiner records the leader's address AND steps the message, which is
-// what makes the ack possible.
+// TestHandleMessage_JoiningReplicaStillLearnsAndAcks: a joiner with an empty configuration accepts the leader named by its join anchor.
 func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 	const leaderAddr = "127.0.0.1:5001"
 	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"
@@ -339,13 +259,7 @@ func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 		t.Fatalf("HandleMessage: %v", err)
 	}
 
-	// Delivery is the half that matters: an address learned for a message
-	// that never reached raft buys the join nothing. rec.DeliveredCount, not
-	// a DiagState().InboxLen re-read, because authorizationRig's engine runs
-	// a real background worker that can drain the message out of the live
-	// queue before a delayed read ever samples the increase -- the
-	// recording wrapper instead observes delivery synchronously at the
-	// DeliverMessage call itself.
+	// Delivery is checked with rec.DeliveredCount, observed synchronously, since the engine's worker may drain the inbox first.
 	if rec.DeliveredCount() == 0 {
 		t.Fatal("the leader's Replicate never reached the raft inbox: the joining " +
 			"replica has nothing to append and nothing to ack, so the join never " +
@@ -358,14 +272,7 @@ func TestHandleMessage_JoiningReplicaStillLearnsAndAcks(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_LearnCannotAuthorizeItsOwnMessage pins the single-message
-// form of the escalation. A quorum-bearing message from an unknown source used
-// to have its address learned first and then be checked against the entry it
-// had just written. Neither half may happen now: the claimed From is a
-// configured member, but the sender's certificate does not cover that member's
-// committed address, so the message is refused — and because the decision
-// precedes learning, it also teaches the routing registry nothing on its way
-// out.
+// TestHandleMessage_LearnCannotAuthorizeItsOwnMessage: the decision precedes address learning, so a refused message teaches the registry nothing.
 func TestHandleMessage_LearnCannotAuthorizeItsOwnMessage(t *testing.T) {
 	const attackerAddr = "127.0.0.1:5099"
 	ms := proto.Membership{Addresses: map[uint64]string{
@@ -376,7 +283,7 @@ func TestHandleMessage_LearnCannotAuthorizeItsOwnMessage(t *testing.T) {
 
 	for _, msgType := range quorumBearingTypes {
 		t.Run(proto.MessageTypeName(msgType), func(t *testing.T) {
-			// Registry is EMPTY: replica 2 has no mapping yet.
+			// The registry is empty: replica 2 has no mapping.
 			eng, handler := fromGateRig(t, ms, nil)
 
 			batch := proto.MessageBatch{
@@ -401,19 +308,7 @@ func TestHandleMessage_LearnCannotAuthorizeItsOwnMessage(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_RegistryPoisoningCannotUnlockTheQuorumGate is the
-// regression for the two-message escalation, and the reason authorization reads
-// the COMMITTED MEMBERSHIP rather than the address registry.
-//
-// While the gate compared against the registry, the escalation was two messages
-// long: send any exempt message claiming another member's From, and address
-// learning re-points registry[shard, From] at you; the quorum-bearing follow-up
-// then matches the entry you just wrote. The thing being checked was the thing
-// inbound traffic writes.
-//
-// The registry is still learnable — routing has to be, so a peer that moved
-// stays reachable — so this test lets the poisoning SUCCEED and asserts it buys
-// nothing. Committed membership changes only through consensus.
+// TestHandleMessage_RegistryPoisoningCannotUnlockTheQuorumGate: a poisoned routing registry buys nothing, since authorization reads committed membership.
 func TestHandleMessage_RegistryPoisoningCannotUnlockTheQuorumGate(t *testing.T) {
 	const victimAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5099"
 	const victimID = "spki:2222222222222222222222222222222222222222222222222222222222222222"
@@ -499,27 +394,7 @@ func TestHandleMessage_QuorumBearingRefusedForUnloadedShard(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_RegistryPoisoningCannotAuthorizeASnapshot is the
-// regression for the escalation the message-path fix left open on the snapshot
-// channel, and it drives BOTH paths because that is the shape of the attack.
-//
-// The snapshot path resolved its sender from the routing registry while the
-// message path had already been moved onto committed membership. Two messages
-// were then enough to replace a replica wholesale:
-//
-//  1. Send an exempt message (RequestVote) claiming the LEADER's From. Address
-//     learning re-points registry[shard, leader] at the attacker.
-//  2. Stream a snapshot with From = leader and a Membership of the attacker's
-//     choosing. Resolve returned the attacker's own address, the attacker's own
-//     certificate covers it, and the snapshot was accepted.
-//
-// What made it worse than a message forgery: the snapshot is delivered
-// OriginLocal, so raft.Peer.Handle's wire-origin refusal does not apply and the
-// carried Membership is ADOPTED. That replaces the state machine and rewrites
-// the committed addresses the message-path gate reads — the attacker ends up
-// having written the table that authorizes it.
-//
-// Both paths now resolve the sender through committedSenderAddress.
+// TestHandleSnapshot_RegistryPoisoningCannotAuthorizeASnapshot: a poisoned registry cannot authorize a snapshot; both paths resolve the sender through committedSenderAddress.
 func TestHandleSnapshot_RegistryPoisoningCannotAuthorizeASnapshot(t *testing.T) {
 	const leaderAddr, attackerAddr = "127.0.0.1:5001", "127.0.0.1:5099"
 	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"
@@ -594,17 +469,7 @@ func TestHandleSnapshot_RegistryPoisoningCannotAuthorizeASnapshot(t *testing.T) 
 	}
 }
 
-// TestHandleMessage_SharedCommittedAddressFailsClosed pins the defence against
-// a configuration that gives ONE address to two active replicas.
-//
-// Nothing is forged here and no certificate is abused: the host at that address
-// legitimately authenticates as itself. But the authorization chain is replica
-// ID -> committed address -> certificate, so that one host is authorized to
-// speak as BOTH replicas — two votes in an election and two match indices in a
-// commit quorum that believes they are independent. Config-change validation
-// refuses to create this (see raft.membership.addressHolder), but a shard seeded
-// through StartShard or restored from an older snapshot can already be in it, so
-// the receive path must fail closed rather than assume validation ran.
+// TestHandleMessage_SharedCommittedAddressFailsClosed: one committed address shared by two active replicas is refused on receive.
 func TestHandleMessage_SharedCommittedAddressFailsClosed(t *testing.T) {
 	const sharedAddr = "10.0.0.5:5001"
 	ms := proto.Membership{Addresses: map[uint64]string{
@@ -635,18 +500,7 @@ func TestHandleMessage_SharedCommittedAddressFailsClosed(t *testing.T) {
 	}
 }
 
-// TestHandleMessage_EveryMessageTypeIsBoundToASender drives the sender binding
-// off proto's OWN type space rather than off any list in the handler, so it
-// cannot pass by testing the author's answer against itself.
-//
-// There is no exempt list — types whose acceptance "could not hand the sender a
-// quorum outcome" — because such a list is exactly the set a certificate holder
-// could use to move a shard's term (RequestVote), install itself as leader
-// (Heartbeat), and have commands appended (a forwarded Propose). Every type is
-// bound: a sender the committed configuration, the pending
-// configuration and the join anchor all fail to name is refused whatever it
-// sends, and an unrecognised type is refused with the rest. The positive
-// control is the same message from a configured member on its own connection.
+// TestHandleMessage_EveryMessageTypeIsBoundToASender: across proto's whole type space, a sender no configuration or join anchor names is refused; a configured member is the positive control.
 func TestHandleMessage_EveryMessageTypeIsBoundToASender(t *testing.T) {
 	const memberAddr, strangerAddr = "127.0.0.1:5002", "127.0.0.1:5099"
 	const memberID = "spki:2222222222222222222222222222222222222222222222222222222222222222"
@@ -698,7 +552,7 @@ func TestHandleMessage_EveryMessageTypeIsBoundToASender(t *testing.T) {
 				t.Fatalf("a %s claiming member 2's From was delivered from a connection "+
 					"that does not hold member 2's identity", name)
 			}
-			// POSITIVE CONTROL: the member itself.
+			// Positive control: the member itself.
 			genuine := proto.MessageBatch{
 				SourceAddress: memberAddr,
 				Requests:      []proto.Message{{ShardID: 1, From: 2, To: 1, Type: msgType, Term: 5}},
@@ -724,15 +578,7 @@ func TestHandleMessage_EveryMessageTypeIsBoundToASender(t *testing.T) {
 	}
 }
 
-// TestRegisterIfAbsent_ConcurrentEstablishHasExactlyOneWinner covers the atomic
-// primitive the no-overwrite learning path is built on.
-//
-// The invariant is "establish, never replace". As a Resolve followed by a
-// Register it held only when receives were SERIALIZED — which is why a
-// sequential test proves nothing about it: two concurrent receives for the same
-// (shard, replica) both observe no entry and both store, so the loser's address
-// silently replaces the winner's, the exact hijack the check exists to deny.
-// Run under -race, N goroutines contend for one key and exactly one must win.
+// TestRegisterIfAbsent_ConcurrentEstablishHasExactlyOneWinner: under -race, exactly one of N concurrent registrations for a key wins.
 func TestRegisterIfAbsent_ConcurrentEstablishHasExactlyOneWinner(t *testing.T) {
 	// One contended key is a single coin flip and passes against a
 	// Resolve-then-Register roughly as often as not, which is worse than no test

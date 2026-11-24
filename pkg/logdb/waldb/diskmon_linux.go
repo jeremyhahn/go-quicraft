@@ -18,10 +18,7 @@ package waldb
 
 import "syscall"
 
-// platformDiskUsage returns the number of bytes used on the filesystem
-// containing dir, using the Linux statfs syscall. This measures
-// filesystem-level usage (total - available), not just the WAL
-// directory, which provides accurate ENOSPC prevention.
+// platformDiskUsage returns the bytes used (total - available) on dir's filesystem via statfs.
 func platformDiskUsage(dir string) (uint64, error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(dir, &stat); err != nil {

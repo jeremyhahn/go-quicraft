@@ -212,11 +212,7 @@ func TestCombineBytes_TamperedShareYieldsGarbageNotError(t *testing.T) {
 	}
 }
 
-// TestCombineBytes_ForgedLowThreshold documents that claiming a lower
-// threshold than the split used is not self-detected (no digest): it yields
-// garbage that the caller must reject via out-of-band authentication. A SILENT
-// correct reconstruction of the real secret from a sub-threshold set would be
-// a failure.
+// TestCombineBytes_ForgedLowThreshold documents that a forged lower threshold yields garbage, not the secret.
 func TestCombineBytes_ForgedLowThreshold(t *testing.T) {
 	secret := []byte("forged threshold test secret")
 	values := splitValues(t, secret, 4, 7)
@@ -257,12 +253,7 @@ func BenchmarkCombineBytes(b *testing.B) {
 	}
 }
 
-// TestSplitBytes_CoefficientsUsedVerbatim asserts that SplitBytes uses the raw
-// crypto/rand coefficient bytes verbatim, without resampling zero top
-// coefficients. Excluding c_{t-1}=0 would let a t-1 coalition eliminate one
-// candidate secret per byte, so a zero top coefficient MUST be accepted.
-// With an all-zeros randReader every sharing polynomial degenerates to its
-// constant term, so each share's y-payload must equal the secret exactly.
+// TestSplitBytes_CoefficientsUsedVerbatim asserts SplitBytes uses crypto/rand coefficients verbatim, zero top coefficients included.
 func TestSplitBytes_CoefficientsUsedVerbatim(t *testing.T) {
 	secret := []byte{0x00, 0x01, 0x7F, 0xFF}
 	threshold, total := 3, 5

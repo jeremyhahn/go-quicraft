@@ -33,10 +33,7 @@ func (h *Host) wireSwitchEnabled() bool {
 	return h.wire.Proto.Current != h.wire.Proto.Previous
 }
 
-// notePeerWireVersion records the MaxBinVer replica from advertised for
-// shardID on its latest batch, then gives the shard's leader the chance to
-// propose the switch. The latest value is kept, not the highest: a member
-// rolled back to an older build must stop counting as upgraded.
+// notePeerWireVersion records replica's latest advertised MaxBinVer for shardID and lets the leader propose the switch.
 func (h *Host) notePeerWireVersion(shardID, from, maxBinVer uint64) {
 	ns, err := h.getNode(shardID)
 	if err != nil {
@@ -51,12 +48,7 @@ func (h *Host) notePeerWireVersion(shardID, from, maxBinVer uint64) {
 	h.maybeProposeWireSwitch(ns)
 }
 
-// maybeProposeWireSwitch proposes UpdateWireVersion to this build's current
-// version when this replica leads the shard, the shard has not switched to
-// it, and every other voter, non-voting member and witness last advertised
-// a MaxBinVer at or above it. A member never heard from counts as previous.
-// The proposal passes the same validation as any config change, so a value
-// the committed version already reached is refused there.
+// maybeProposeWireSwitch proposes UpdateWireVersion when this replica leads and every other member advertised at least this build's version.
 func (h *Host) maybeProposeWireSwitch(ns *nodeState) {
 	if !ns.isLeader.Load() || h.engine == nil {
 		return
@@ -104,14 +96,7 @@ func (h *Host) maybeProposeWireSwitch(ns *nodeState) {
 		"shard_id", ns.shardID, "wire_version", target)
 }
 
-// retryWireSwitch gives a shard this replica leads in term its own attempts
-// at the switch, one per wireSwitchRetryInterval. A shard with no other
-// member receives no batch to prompt one, so without it a refusal on the
-// first attempt (a busy or paused shard, a membership that changed under
-// the check) would leave the shard on the previous version for the term. It
-// stops once the shard has switched or gained a member, whose batches then
-// prompt the leader, when this replica stops leading it in term, and when
-// the shard or host stops. Close joins it through wireSwitchWG.
+// retryWireSwitch retries the switch for a led shard every wireSwitchRetryInterval until it switches, gains a member, loses leadership or stops.
 func (h *Host) retryWireSwitch(ns *nodeState, term uint64) {
 	defer h.wireSwitchWG.Done()
 	timer := time.NewTimer(0)

@@ -1,31 +1,5 @@
 #!/bin/sh
-# api-check.sh -- compare the exported API of every public package against
-# the last release tag, and fail on an incompatible change once v1.0.0 has
-# shipped unless this release is a new MAJOR.
-#
-# The public packages are every non-main package of each module in
-# API_MODULES (default: the root module and contrib/dragonboat) outside an
-# internal/ or test/ directory. For each one, the package at the base tag and
-# the package in the working tree are written to export data with apidiff
-# (golang.org/x/exp/cmd/apidiff, pinned by the root go.mod's tool directive)
-# and compared. A public package present at the base and gone now is an
-# incompatible change; a new package is a compatible one.
-#
-# The verdict follows docs/compatibility/engineering.md:
-#   - no release tag yet:          nothing to compare; reported, pass.
-#   - base tag before v1.0.0:      every incompatible change is printed; pass.
-#   - base tag v1.0.0 or later:    an incompatible change fails, unless the
-#                                  major in VERSION is above the base's major.
-#
-# The base is the newest tag reachable from HEAD matching v[0-9]*, or
-# API_BASE when set. It is read with git archive, so no worktree is created
-# and the clone is not touched. API_DIFF_BIN names a prebuilt apidiff; without
-# it the pinned tool is built from the root module into a temporary directory,
-# so nothing is installed on the host.
-#
-# Exit 0 = compatible, or incompatible where the policy allows it. Exit 1 =
-# an incompatible change the version does not permit. Exit 2 = the check
-# could not run, which is not a pass.
+# api-check.sh -- compare each public package's exported API with apidiff against the last release tag (or API_BASE); exit 0 compatible or allowed, 1 incompatible, 2 could not run.
 
 set -eu
 

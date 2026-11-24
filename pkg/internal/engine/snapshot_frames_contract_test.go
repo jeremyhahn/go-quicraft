@@ -82,8 +82,7 @@ func TestSealSnapshotFrames_SealErrorReleasesPins(t *testing.T) {
 	barrier.assertBalanced(t, "SealSnapshotFrames seal error")
 }
 
-// TestSnapshotFrameWriter_CloseReturnsTheLatchedFailure pins that a Close
-// after a failed Write reports the FIRST failure rather than sealing anything.
+// TestSnapshotFrameWriter_CloseReturnsTheLatchedFailure pins that Close after a failed Write reports the first failure.
 func TestSnapshotFrameWriter_CloseReturnsTheLatchedFailure(t *testing.T) {
 	barrier := newPinCountBarrier(&failAfterNBarrier{testBarrier: newTestBarrier(7), failAfter: 0})
 	w := newSnapshotFrameWriter(io.Discard, barrier, 2, 1, 42)
@@ -135,11 +134,7 @@ func TestOpenSnapshotFrames_OversizedLengthIsCorrupt(t *testing.T) {
 	}
 }
 
-// TestNode_NilPeerConventions pins the documented answer every identity and
-// removal accessor gives before the node has a peer. They are NOT uniform on
-// purpose: MemberBinding is a GATE and fails closed — nothing committed can
-// authorize a sender — while the deny-list and view accessors report nothing
-// known, leaving the raft layer's own rules to apply.
+// TestNode_NilPeerConventions pins the nil-peer answers: MemberBinding fails closed, the other accessors report nothing.
 func TestNode_NilPeerConventions(t *testing.T) {
 	cfg := config.Config{ShardID: 1, ReplicaID: 1}
 	cfg.SetDefaults()

@@ -12,80 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package proposer submits test proposals and linearizable reads to whichever
-// replica leads a shard AT THE MOMENT OF THE CALL.
-//
-// # Why this exists
-//
-// Observing a leader does not pin it. A test that writes
-//
-//	leaderIdx := cluster.waitForClusterLeader(shardID, timeout)
-//	leaderHost := cluster.hosts[leaderIdx]
-//	...
-//	_, err := leaderHost.SyncPropose(ctx, shardID, cmd)
-//
-// has read a value that was true when it looked and treated it as fixed. Raft
-// is free to hold an election in the gap, and the proposal is then refused
-// CORRECTLY while the test reports a failure the cluster never had.
-//
-// The refusal is narrow, which is why the pattern survives most runs and fails
-// a loaded one. Host.Propose FORWARDS to the leader whenever the local replica
-// knows who that is; it fails fast only when leadership has moved and the
-// addressed replica does not yet know the successor. That is the
-// "not leader for shard N, leader unknown" seen in CI runs 10735 and 10801.
-//
-// # Why it is one package and not one copy per suite
-//
-// The e2e, raft, host and linearizability suites each define their own
-// testCluster, so without this package the helper would be copied into each of
-// them. Four copies of a retry loop is four places a fix has to land. The suites share nothing
-// but a way to name the current leader, so that is all this package asks for:
-// a Resolver.
-//
-// # Reads share the loop, and for the same reason
-//
-// A linearizable read is bound to the leader exactly as a proposal is. SyncRead
-// is a ReadIndex followed by a local lookup, and handleFollowerReadIndex
-// forwards a ReadIndex whenever the follower knows the leader and refuses it
-// with the same "not leader ... leader unknown" when it does not. A pending
-// read on a leader that loses the shard is failed the same way a pending
-// proposal is. So a read that pins a leaderHost binding fails on the same
-// election a pinned proposal fails on, and the same loop serves both: Read /
-// TryRead and ReadIndex / TryReadIndex
-// re-resolve before every attempt.
-//
-// What they retry differs from a proposal in exactly one error. A read has a
-// refusal a proposal never sees: a leader elected a moment ago refuses ReadIndex
-// with ErrReadIndexNotReady until it has committed an entry of its own term
-// (Raft PhD 6.4), and the resolver names it the instant it wins, before that
-// commit. Between attempts the loop waits and re-resolves, and both clear this
-// refusal: the wait lets the new leader commit its no-op within a heartbeat,
-// and if it is superseded instead, the re-resolve finds its successor. So the
-// read loops retry the not-leader rejection AND ErrReadIndexNotReady — the set
-// readRefusal names — and nothing else. A read loop that stopped at the first
-// such refusal reported an ordinary election as a failed read
-// (go-quicraft#275).
-//
-// Re-issuing a refused read is safe unconditionally — a read that was refused
-// was never answered, so there is no "applied twice" to reason about — but the
-// retry set stays narrow all the same. A timeout or a busy pipeline comes from
-// the replica that genuinely leads the shard and has already committed in its
-// term; neither a wait of retryInterval nor a fresh resolve changes it, so it
-// is a real result that must reach the test. A leader that NEVER commits in
-// its term still reaches the test, too: the loop spends its budget and returns
-// ErrReadIndexNotReady as the cause.
-//
-// The loops retry the refusal rather than wait for Host.ShardReadReady before
-// each attempt. Readiness observed before a read is the cached-leader pattern
-// again, one step down: an election in the gap leaves the read refused all the
-// same, so a pre-check would still need the retry, and it would be a second
-// polling loop beside drive.
-//
-// # The pinned callers share the same loop
-//
-// Some suite helpers deliberately do NOT re-resolve, because the test is about
-// the replica it addressed. They use the same loop through Pinned rather than a
-// copy of their own, differing only in the Retryable they pass; TryWith documents why that one difference is real.
+// Package proposer submits test proposals and linearizable reads to whichever replica leads a shard at the moment of the call, re-resolving before every attempt through a Resolver, since an observed leader can change; reads also retry ErrReadIndexNotReady (thesis 6.4), and pinned callers share the same loop through Pinned.
 package proposer
 
 import (
@@ -97,21 +24,10 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// Resolver returns the Host that leads shardID right now, or nil when no live
-// replica reports leadership.
-//
-// It is a function rather than an interface because that is the entire surface
-// the suites have in common, and because it forces the caller to hand over a
-// way to ask AGAIN rather than an answer taken once.
+// Resolver returns the Host that leads shardID now, or nil when no live replica leads; a function so callers can ask again.
 type Resolver func(shardID uint64) *quicraft.Host
 
-// Pinned is the Resolver for a caller that has already chosen its target and
-// means THAT replica: it returns h for every shard, every time.
-//
-// It exists so the pinned callers share one retry loop with the re-resolving
-// ones instead of keeping a second copy of it. Re-resolution and retry are
-// separate remedies; Pinned gives up the first and keeps the second, and
-// TryWith explains which errors each remedy can actually fix.
+// Pinned is the Resolver for a caller that means one replica: it always returns h, so pinned callers share the retry loop (see TryWith).
 func Pinned(h *quicraft.Host) Resolver {
 	return func(uint64) *quicraft.Host { return h }
 }
@@ -132,15 +48,7 @@ const retryInterval = 20 * time.Millisecond
 // ErrTimeout, reporting leadership churn as a slow shard.
 const minAttempt = 200 * time.Millisecond
 
-// ToLeader proposes cmd to whichever replica leads shardID at the moment of the
-// call, waits for the entry to commit, and fails the test on any error.
-//
-// Callers that mean "the current leader" use this. Callers that mean one
-// SPECIFIC replica — the deposed incumbent on the minority side of a partition,
-// the follower in a proposal-forwarding test — must NOT: for them the addressed
-// node is the subject of the assertion, and re-resolving would test something
-// else. Those sites keep their own direct call and say so with a
-// quicraft:direct-propose marker (see test/buildgates).
+// ToLeader proposes cmd to shardID's current leader, waits for the commit and fails the test on error; a site that means one specific replica keeps a direct call with a quicraft:direct-propose marker (see test/buildgates).
 func ToLeader(
 	t *testing.T,
 	resolve Resolver,
@@ -157,23 +65,7 @@ func ToLeader(
 	return result
 }
 
-// Try is ToLeader's error-returning form, for callers that layer their own
-// retry on top and for goroutines, which must not touch a *testing.T.
-//
-// ONLY the not-leader rejection is retried, and it is retried by RE-RESOLVING
-// the leader rather than by re-sending to the same replica. Every other error —
-// a timeout, a busy pipeline, a rejected entry, a state machine failure — is
-// returned unchanged on its first occurrence. A blanket retry-on-any-error
-// would mask exactly the defects these suites exist to catch.
-//
-// Re-proposal is safe for the commands these suites write. A not-leader error
-// can arrive after the entry already reached the log
-// (quicraft.MaybeApplied), so a retry may apply the command twice; every
-// command here is a last-write-wins KV put, which is idempotent under
-// re-proposal.
-//
-// A caller that addresses ONE replica on purpose wants TryWith with Pinned and
-// quicraft.Temporary instead; TryWith says why the two retry sets differ.
+// Try is ToLeader's error-returning form: it retries only the not-leader rejection, re-resolving the leader, and returns every other error at once. Re-proposal may apply twice, which is safe for these idempotent puts; pinned callers use TryWith with Pinned and quicraft.Temporary.
 func Try(
 	resolve Resolver,
 	shardID uint64,
@@ -183,40 +75,7 @@ func Try(
 	return TryWith(resolve, shardID, cmd, timeout, IsNotLeaderRejection)
 }
 
-// TryWith is Try's general form: it re-resolves the target before every
-// attempt and retries exactly the errors retryable reports true for.
-//
-// # Why there are two policies and not one
-//
-// The suites need two retry sets, and the difference is NOT that one loop is
-// stricter for its own sake. A loop should retry an error when, and only when,
-// the thing it does between attempts can change that error's answer. The two
-// loops do different things between attempts, so they retry different sets:
-//
-//   - Try re-resolves the leader. Its remedy is "ask a DIFFERENT replica", and
-//     the only error that remedy fixes is the not-leader rejection. A timeout,
-//     a busy pipeline or a rejected entry came from the replica that genuinely
-//     leads the shard; asking it again through a fresh resolve changes nothing,
-//     so those are real results and must reach the test.
-//
-//   - A pinned caller (Pinned) has already chosen its replica because the test
-//     is ABOUT that replica. Its remedy is "wait, and ask the SAME replica
-//     again", which fixes the conditions that clear on their own: a shard still
-//     coming up, a momentarily full pipeline, an election in flight. That is
-//     exactly the set quicraft.Temporary names, and a pinned caller passes it.
-//
-// ErrNotLeader is in quicraft.Temporary, so the pinned set contains the
-// re-resolving one. That is not an inconsistency, it is the reason a pinned
-// caller keeps working: Host.Propose FORWARDS to the leader whenever the local
-// replica knows who that is, and ErrNotLeader is only the window before it
-// learns — a window that closes without any help from the caller.
-//
-// Neither policy is a blanket retry on every error. That policy reports
-// ErrDiskFull,
-// ErrInvalidOperation or a state machine failure as "timed out", and burns the
-// whole budget to say so.
-//
-// retryable must not be nil.
+// TryWith re-resolves the target before every attempt and retries exactly the errors retryable accepts: re-resolving callers retry not-leader only, pinned callers retry quicraft.Temporary. retryable must not be nil.
 func TryWith(
 	resolve Resolver,
 	shardID uint64,
@@ -230,15 +89,7 @@ func TryWith(
 		})
 }
 
-// drive is the ONE retry loop in this package. Every exported form — proposal
-// or read, fatal or error-returning, re-resolving or pinned — is drive with a
-// different attempt and a different retryable, so the resolve-before-every-
-// attempt rule, the minimum attempt budget and the deadline arithmetic cannot
-// drift between them.
-//
-// attempt is handed the Host resolved for THIS attempt and the budget left for
-// it. drive never calls attempt with a nil Host and never starts an attempt
-// with less than minAttempt.
+// drive is the package's one retry loop: attempt receives the Host resolved for this attempt (never nil) and its remaining budget (at least minAttempt).
 func drive[T any](
 	resolve Resolver,
 	shardID uint64,
@@ -318,14 +169,7 @@ func Once(
 	return result, nil
 }
 
-// Read issues a linearizable read of query against whichever replica leads
-// shardID at the moment of the call and fails the test on any error.
-//
-// The same rule as ToLeader decides who may use it: a caller that means "the
-// current leader" does; a caller that means one SPECIFIC replica — a deposed
-// incumbent whose refusal is the assertion, a follower whose forwarding is the
-// subject, the target of a leadership transfer whose own lease is under test
-// — keeps its direct call and says so with a quicraft:direct-read marker.
+// Read reads query linearizably from shardID's current leader and fails the test on error; a site that means one specific replica keeps a direct call with a quicraft:direct-read marker.
 func Read(
 	t *testing.T,
 	resolve Resolver,
@@ -342,14 +186,7 @@ func Read(
 	return result
 }
 
-// TryRead is Read's error-returning form, for callers that layer their own
-// retry on top and for goroutines, which must not touch a *testing.T.
-//
-// It retries the not-leader rejection and a new leader's ErrReadIndexNotReady,
-// re-resolving the leader before each attempt; see readRefusal. A read that was
-// refused was never answered, so re-issuing it cannot violate
-// linearizability; a read that was answered returns on the spot and is never
-// re-issued.
+// TryRead is Read's error-returning form, retrying readRefusal errors with a re-resolve before each attempt; a refused read was never answered, so re-issuing it is safe.
 func TryRead(
 	resolve Resolver,
 	shardID uint64,
@@ -362,22 +199,7 @@ func TryRead(
 		})
 }
 
-// TryReadWith is TryRead's general form, and the read twin of TryWith: it
-// resolves the target before every attempt and retries exactly the errors
-// retryable reports true for.
-//
-// It exists for the PINNED read, the same caller TryWith's second policy
-// serves. A test that hands one replica on purpose — because the assertion is
-// about that replica's own applied state, as Leader Completeness is — passes
-// Pinned(h) and quicraft.Temporary: its remedy is "wait, and ask the SAME
-// replica again", which fixes the conditions that clear on their own.
-//
-// Without it such a caller would write the loop out by hand, a copy of the retry
-// machinery drive already implements. Try, TryRead, TryWith and TryReadWith are
-// the four corners of one table —
-// proposal or read, re-resolving or pinned — over a single loop.
-//
-// retryable must not be nil.
+// TryReadWith is TryRead's general form: it resolves the target before every attempt and retries exactly what retryable accepts, for pinned reads (Pinned(h), quicraft.Temporary). retryable must not be nil.
 func TryReadWith(
 	resolve Resolver,
 	shardID uint64,
@@ -404,14 +226,7 @@ func readOnce(
 	return h.SyncRead(ctx, shardID, query) //quicraft:direct-read the single attempt TryRead is built from
 }
 
-// ReadIndex obtains a confirmed read index from whichever replica leads
-// shardID at the moment of the call, waits for it to resolve, and fails the
-// test on any error. It returns the confirmed index.
-//
-// It exists for the tests whose subject is the ReadIndex API itself. Submitting
-// a ReadIndex to a pinned host and releasing the RequestState without reading
-// it asserts only that a request was accepted; a not-leader outcome would
-// surface in the result nobody read.
+// ReadIndex obtains a confirmed read index from the current leader of shardID, waits for it, fails the test on error and returns the index.
 func ReadIndex(
 	t *testing.T,
 	resolve Resolver,
@@ -461,29 +276,13 @@ func readIndexOnce(
 	return result.Value, nil
 }
 
-// IsNotLeaderRejection reports whether err is the not-leader rejection and
-// nothing else. It is the ONLY error Try retries, and one of the two TryRead
-// and TryReadIndex retry (see readRefusal).
-//
-// quicraft.NotLeader matches both the bare ErrNotLeader sentinel and a
-// *quicraft.NotLeaderError, wrapped or not — including one wrapped in
-// *quicraft.MaybeAppliedError, which is the form Result returns when leadership
-// moves out from under an entry that is already in the log.
-//
-// Deliberately NARROW: a timeout, a busy pipeline or a closed shard is a real
-// result here and must fail the test.
+// IsNotLeaderRejection reports whether err is the not-leader rejection (quicraft.NotLeader, wrapped or in *quicraft.MaybeAppliedError) and nothing else.
 func IsNotLeaderRejection(err error) bool {
 	_, ok := quicraft.NotLeader(err)
 	return ok
 }
 
-// readRefusal is the Retryable of the re-resolving read loops, TryRead and
-// TryReadIndex: the not-leader rejection, or ErrReadIndexNotReady from a leader
-// that has not yet committed in its term. The package doc says why a read
-// retries the second and a proposal has no use for it.
-//
-// Still NARROW, and narrower than quicraft.Temporary: a timeout or a busy
-// pipeline from the leader is a real result here and must fail the test.
+// readRefusal is the Retryable of TryRead and TryReadIndex: the not-leader rejection or ErrReadIndexNotReady, narrower than quicraft.Temporary.
 func readRefusal(err error) bool {
 	return IsNotLeaderRejection(err) || errors.Is(err, quicraft.ErrReadIndexNotReady)
 }

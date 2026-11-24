@@ -22,22 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// StartShard must refuse a members map it cannot make durable
-//
-// members is copied verbatim into proto.Membership.Addresses,
-// raft.BuildInitialMembershipEntry marshals it, and the result is COMMITTED as
-// the EntryInitialMembership at log index 1. With the limits enforced on read
-// only, an over-length address bootstrapped the shard successfully and made
-// every subsequent start fail — reconstructShardMembership decodes that entry
-// and propagates ErrAddressTooLong, so StartShard aborted forever on data the
-// shard itself wrote, with no remedy but deleting the data directory.
-//
-// proto.Membership.MarshalTo now refuses to produce those bytes, which turns
-// the permanent brick into an error. Checking at the API boundary as well is
-// what turns that error into one naming the replica and the reason, at the call
-// the operator actually made, before anything is persisted.
-// ---------------------------------------------------------------------------
+// StartShard must refuse a members map that would make the committed initial membership entry unreadable.
 
 func TestStartShard_RejectsAnAddressTheFormatCannotCarry(t *testing.T) {
 	h := newTestHost(t)
@@ -65,11 +50,7 @@ func TestStartShard_RejectsAnAddressTheFormatCannotCarry(t *testing.T) {
 	}
 }
 
-// TestStartShard_RejectsAnIdentityTheFormatCannotCarry covers the other map
-// StartShard seeds from caller input. cfg.MemberIdentities travels the same
-// route into the same committed entry, and is bounded by the ENCODER's limit
-// (MaxAddressLength, which every string map in a Membership shares through
-// putMap/getMap) rather than by MaxNodeIdentityLength.
+// TestStartShard_RejectsAnIdentityTheFormatCannotCarry checks MemberIdentities against the encoder's MaxAddressLength.
 func TestStartShard_RejectsAnIdentityTheFormatCannotCarry(t *testing.T) {
 	h := newTestHost(t)
 

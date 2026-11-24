@@ -24,17 +24,7 @@ import (
 	"testing"
 )
 
-// vmLockedBytes reports this process's currently mlock'd memory, read from
-// /proc/self/status.
-//
-// It is the KERNEL's accounting, not the library's, and that is the entire point
-// of the tests below. Every other witness available here — a count of the
-// enclaves handed out, a sum of the sizes asked for, splitLockedBytes itself —
-// is derived from the same code the accounting under test lives in, so it agrees
-// with a wrong answer as readily as a right one. VmLck cannot be fooled by it.
-//
-// It skips rather than failing where the interface is unavailable, matching how
-// pkg/seal's locked-memory tests degrade.
+// vmLockedBytes reports the kernel's VmLck for this process; it skips where /proc/self/status is unavailable.
 func vmLockedBytes(t *testing.T) int {
 	t.Helper()
 	b, err := os.ReadFile("/proc/self/status")
@@ -74,33 +64,10 @@ func warmLockedMemory(t *testing.T) {
 	}
 }
 
-// slackBytes is the allowance for locked allocations this process makes for
-// reasons unrelated to the call being measured. VmLck is process-wide, and these
-// tests share a binary with everything else in the package.
-//
-// It is 64 KiB — sixteen pages, well above any incidental allocation and two
-// orders of magnitude below the ~1 MiB gap that the defect these tests exist for
-// produced. It buys robustness without buying the bug back.
+// slackBytes allows 64 KiB of unrelated process-wide locked allocations.
 const slackBytes = 64 << 10
 
-// TestSplitProtected_BudgetIsATrueUpperBound is the witness that splitLockedBytes
-// prices what the KERNEL charges.
-//
-// A test that asserts this property from the accounting under test cannot
-// detect a gap: byte-summed pricing says 1,536 bytes where the kernel charges
-// 1,044,480, and nothing in such an assertion can tell the difference. go-enclave rounds every allocation up to a whole page
-// (mapping.go), a 255-share split takes 255 SEPARATE allocations, and the
-// per-share rounding — not the secret — is then the whole figure.
-//
-// So the assertion is against VmLck. It is read either side of a split whose
-// parameters the budget ADMITS, which is the case that matters: an admitted call
-// is one the guard has promised fits, and the promise is only worth having if
-// what the kernel charges is no more than what was priced.
-//
-// MUTATION CHECK. Drop the page rounding from splitLockedBytes — price the terms
-// in requested bytes — and the 255-share case
-// prices at 1,536 against a measured 1,044,480, and this fails. Restore it and it
-// passes. That is the property; the count of regions handed out is not.
+// TestSplitProtected_BudgetIsATrueUpperBound checks the kernel's VmLck charge for an admitted split stays within splitLockedBytes.
 func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 	warmLockedMemory(t)
 
@@ -147,13 +114,7 @@ func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 				t.Skip("VmLck did not move across a successful split: this host is " +
 					"not charging locked memory, so there is nothing to witness")
 			}
-			// Every returned share is its own allocation and every allocation is
-			// at least a page, so this is what the kernel must have charged. It
-			// also refuses to let the test pass on a measurement that did not
-			// happen.
-			// os.Getpagesize(), NOT lockedBytes(1): a floor phrased in the helper
-			// under test collapses along with it under the very mutation this
-			// test exists to survive.
+			// Each share is at least one page; use os.Getpagesize, not the helper under test.
 			if want := tc.total * os.Getpagesize(); measured < want {
 				t.Fatalf("VmLck moved %d bytes across a %d-share split, below the "+
 					"%d bytes %d separate allocations must cost: the measurement "+
@@ -181,20 +142,7 @@ func TestSplitProtected_BudgetIsATrueUpperBound(t *testing.T) {
 	}
 }
 
-// TestUnmarshalShareSet_BudgetIsATrueUpperBound is the same witness on the
-// ingestion path, which is the one an unauthenticated submission reaches.
-//
-// UnmarshalShareSet builds one enclave per element, so a 255-share document of
-// small shares locks 255 PAGES while its JSON is around 25 KiB. Bounding the raw
-// document length therefore let a submission take about forty times what the
-// bound named, on the path whose whole reason for existing is that the submitter
-// cannot be authenticated.
-//
-// MUTATION CHECK. Drop the page rounding from elementLockedBytes and this
-// fails: the priced figure drops to ~25 KiB against a measured ~1 MiB. The
-// priced figure comes from shareSetLockedBytes, the function admission itself
-// called — not from a sum this test recomputes, which would agree with a wrong
-// guard as readily as a right one.
+// TestUnmarshalShareSet_BudgetIsATrueUpperBound checks the same bound on the unauthenticated ingestion path.
 func TestUnmarshalShareSet_BudgetIsATrueUpperBound(t *testing.T) {
 	warmLockedMemory(t)
 
@@ -210,10 +158,7 @@ func TestUnmarshalShareSet_BudgetIsATrueUpperBound(t *testing.T) {
 		t.Fatalf("Marshal: %v", err)
 	}
 
-	// The figure the guard ITSELF computes — shareSetLockedBytes is the single
-	// copy of that arithmetic, and admission called this same function. Summing
-	// it again here instead would track the correct answer no matter what the
-	// guard did, and the mutation below would pass.
+	// The figure admission itself computed, not a recomputed sum.
 	var raw []json.RawMessage
 	if err := json.Unmarshal(doc, &raw); err != nil {
 		t.Fatalf("Unmarshal into elements: %v", err)

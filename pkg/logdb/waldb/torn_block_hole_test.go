@@ -21,34 +21,11 @@ import (
 	"testing"
 )
 
-// TestSegment_ZeroPaddingBoundaryIsExact pins the CONSTANT in the zero-region
-// guard, which TestSegment_ZeroHoleInsideOneGenerationStillTruncates does not:
-// that test
-// zeroes a whole block, so it only ever exercises the `pos == 0` half of
-// `pos == 0 || len(block)-pos > recordHeaderSize`. The comparison itself was
-// unpinned -- weakening `>` to `>=` left the entire waldb suite green, and a
-// segment written by a perfectly healthy writer would then be diagnosed as
-// holed and truncated at its first fully-packed block.
-//
-// The boundary is not arbitrary. segment.Write pads and moves to the next block
-// when `avail < recordHeaderSize+1`, so the LARGEST zero run padAndFlushBlock
-// can leave inside a block is exactly recordHeaderSize bytes. Therefore:
-//
-//   - a run of exactly recordHeaderSize zeros with data above it is legal
-//     padding and must recover in full, and
-//   - a run of recordHeaderSize+1 zeros with data above it is a write hole
-//     no writer of this segment could have produced.
-//
-// Both sides are asserted here, one byte apart, so neither loosening nor
-// tightening the constant can pass.
+// TestSegment_ZeroPaddingBoundaryIsExact: exactly recordHeaderSize zeros below data is legal padding, recordHeaderSize+1 is a hole; both sides are asserted.
 func TestSegment_ZeroPaddingBoundaryIsExact(t *testing.T) {
 	const blockSize = 1024
 
-	// The legal side is produced by the REAL writer rather than by hand: that
-	// is what makes recordHeaderSize the right constant instead of a number the
-	// test and the code happen to agree on. A payload of blockSize-2*header
-	// bytes frames to blockSize-header bytes, leaving avail == header, which is
-	// below the header+1 the writer needs and so triggers maximal padding.
+	// The legal side comes from the real writer: a payload of blockSize-2*header leaves avail == header and maximal padding.
 	t.Run("exact_max_padding_recovers_in_full", func(t *testing.T) {
 		dir := t.TempDir()
 		seg, _, err := createSegment(defaultFS(), dir, 1, blockSize, 1024*1024)
@@ -166,22 +143,7 @@ func TestSegment_ZeroPaddingBoundaryIsExact(t *testing.T) {
 	})
 }
 
-// TestSegment_RepairOffsetIsTheFirstHoleNotTheLast pins the first-wins rule in
-// ReadAll's hole tracking (`if holeOffset < 0`).
-//
-// The rule decides WHERE the segment is cut, not which records come back: a
-// block that still holds data ends the scan the moment the first byte after a
-// hole is reached, so the recovered prefix is the same either way. What changes
-// is whether the repair removes the damage or blesses it.
-//
-// With last-wins, a wholly-zero block LOWER in the file overwrites the earlier
-// hole, and the segment is cut ABOVE the first zero run. That run is then a
-// permanent interior hole in a file recovery has just declared repaired: the
-// shard appends above it, and the NEXT recovery finds zeros with data above
-// them all over again, cuts back to the first run, and destroys everything
-// written since. The loop repeats on every boot.
-//
-// Flipping the guard to last-wins left the entire waldb suite green.
+// TestSegment_RepairOffsetIsTheFirstHoleNotTheLast: ReadAll cuts the segment at the first hole, so the repair leaves no interior hole.
 func TestSegment_RepairOffsetIsTheFirstHoleNotTheLast(t *testing.T) {
 	dir := t.TempDir()
 	const blockSize = 1024
@@ -261,26 +223,10 @@ func TestSegment_RepairOffsetIsTheFirstHoleNotTheLast(t *testing.T) {
 	}
 }
 
-// TestSegment_ShortNonZeroRemainderIsDamageNotPadding pins what a remainder too
-// small to hold a header actually means, which follows from the writer rather
-// than from taste.
-//
-// segment.Write starts a chunk only when recordHeaderSize+1 bytes are free, and
-// a chunk fills every byte it claims. The walk can therefore reach a remainder
-// of 1..recordHeaderSize-1 bytes only because padAndFlushBlock put it there —
-// and it pads with ZEROS. So an all-zero short remainder is legal padding, and a
-// short remainder containing any non-zero byte is a shape this writer cannot
-// produce: a torn final flush, or damage to the padding of an interior block.
-//
-// A recovery that merely `break`s on it would be wrong in the interior case:
-// the scan would stride to the next block with no hole recorded and replay
-// every record above the damage, manufacturing exactly the Raft log gap the
-// prefix rule exists to prevent.
+// TestSegment_ShortNonZeroRemainderIsDamageNotPadding: a remainder too short for a header is padding only if all zero; otherwise it is damage and recorded as a hole.
 func TestSegment_ShortNonZeroRemainderIsDamageNotPadding(t *testing.T) {
 	const blockSize = 1024
-	// A record that leaves a 5-byte remainder in its block: too small for a
-	// header, and below the maximum legal padding, so only its CONTENT can
-	// distinguish padding from damage.
+	// A record leaving a 5-byte remainder: only its content distinguishes padding from damage.
 	const remainder = 5
 	payload := bytes.Repeat([]byte{0x3C}, blockSize-remainder-recordHeaderSize)
 

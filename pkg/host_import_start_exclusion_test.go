@@ -25,11 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// These pin the mutual exclusion between ImportSnapshot and StartShard. An
-// import checked that the shard was stopped BEFORE taking the shard's import
-// lock, and StartShard only TRIED that lock for its staging sweep and carried
-// on without it — so a start could build a live node from the old log while an
-// import recorded a snapshot and compacted that log underneath it.
+// These pin that ImportSnapshot and StartShard exclude each other through the shard's import lock.
 
 // TestStartShard_RefusedWhileAnImportIsInProgress: the start holds the import
 // lock for its whole length, so while an import holds it the start is refused
@@ -72,12 +68,7 @@ func TestStartShard_ConcurrentDuplicateIsNotReady(t *testing.T) {
 	}
 }
 
-// TestStartShard_DuplicateOfAPublishedButUnfinishedStartIsNotReady: the
-// first start publishes its node before its bootstrap save, and a failed save
-// withdraws it. A second start in that window found the node and was told
-// ErrShardAlreadyExists — a caller reading that as "running" would never
-// retry, and the shard would stay stopped. While the first start holds its
-// claim, the answer is the transient ErrShardNotReady.
+// TestStartShard_DuplicateOfAPublishedButUnfinishedStartIsNotReady: a second start while the first holds its claim gets ErrShardNotReady, not ErrShardAlreadyExists.
 func TestStartShard_DuplicateOfAPublishedButUnfinishedStartIsNotReady(t *testing.T) {
 	f := newImportFixture(t)
 	f.host.startingShards.Store(f.shardID, struct{}{})

@@ -29,12 +29,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
-// The SealHold.IsSealed contract against the real stack: real WALs under real
-// barriers, the classifier the host installs (isSealedLogWrite is
-// waldb.IsCleanRefusal bound to ErrBarrierSealed), and a two-shard batch on
-// one commit worker. holdSealedBatch re-writes each member alone, so the
-// single-update refusals must classify exactly as the batch refusal did: the
-// sealed shard is held, never latched, and no retry backoff runs for it.
+// Tests SealHold.IsSealed against real WALs under real barriers.
 
 // realBarrier is an initialized, unsealed seal.Barrier and its strategy.
 type realBarrier struct {

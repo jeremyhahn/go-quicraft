@@ -27,36 +27,7 @@ import (
 	"slices"
 )
 
-// The durable compaction floors.
-//
-// A compaction marker is a WAL record, so it is exactly as durable as the
-// block it lands in, while the segment unlink it licenses is irreversible.
-// Tear the marker's block after the unlink and replay comes back with a lower
-// floor over a prefix that is gone: reads below the real floor then report
-// ErrLogGapDetected instead of ErrCompacted, and raft never falls back to
-// InstallSnapshot.
-//
-// Each shard directory therefore keeps a second, independent copy of its
-// floors in COMPACTED, published by temp-fsync-rename-dirsync like the
-// retired registry, and every segment unlink (Compact, and the reclaim after
-// a node is removed) waits for that publication. The ordering is the whole
-// argument:
-//
-//   - The file only ever holds floors that RemoveEntriesTo already made
-//     durable as markers, so it never claims more than the WAL acknowledged.
-//   - A segment is unlinked only after the file covering its entries is
-//     durable, so a crash between the two leaves the segment on disk under a
-//     floor that already covers it, and a crash before the rename leaves the
-//     old file and every segment.
-//   - Recovery takes the higher of the file's floor and the replayed one, so
-//     losing either copy alone cannot lower the floor.
-//
-// A file that exists but does not parse refuses the open: the floors it held
-// cannot be reconstructed, and guessing low would fail open.
-//
-// Layout (little-endian): magic "QRFLOORS" | count u64 | count x
-// (shardID u64, replicaID u64, floor u64) sorted by key | CRC32C of all
-// preceding bytes.
+// The durable compaction floors: the COMPACTED file records each shard's floor before a segment below it is unlinked.
 const (
 	floorsFilename     = "COMPACTED"
 	floorsTempFilename = "COMPACTED.tmp"
@@ -66,13 +37,10 @@ const (
 	floorsTrailerSize  = 4
 )
 
-// ErrCompactionFloorsMalformed reports a COMPACTED file that does not parse:
-// a bad magic, a count that disagrees with the length, or a checksum
-// mismatch. The open is refused, since the floors it held are unknown.
+// ErrCompactionFloorsMalformed reports a COMPACTED file that does not parse; the open is refused.
 var ErrCompactionFloorsMalformed = errors.New("waldb: compaction floor file is malformed")
 
-// loadCompactionFloors reads dir's COMPACTED file. An absent file is an empty
-// set: no segment of this directory was ever unlinked below a floor.
+// loadCompactionFloors reads dir's COMPACTED file; an absent file is an empty set.
 func loadCompactionFloors(filesystem FS, dir string) (map[nodeKey]uint64, error) {
 	floors := make(map[nodeKey]uint64)
 	f, err := filesystem.Open(filepath.Join(dir, floorsFilename))
@@ -141,12 +109,7 @@ func marshalCompactionFloors(floors map[nodeKey]uint64) []byte {
 	return buf
 }
 
-// publishCompactionFloorsLocked makes the shard's current floors durable in
-// COMPACTED before a segment is unlinked. It writes nothing when the file
-// already holds them, so a compaction that raised no floor costs no I/O. On
-// error nothing may be unlinked: the caller skips garbage collection.
-//
-// Caller holds s.mu, which every mutator of compactedTo holds as well.
+// publishCompactionFloorsLocked makes the shard's floors durable before a segment is unlinked, writing nothing when unchanged.
 func (s *walShard) publishCompactionFloorsLocked() error {
 	if maps.Equal(s.compactedTo, s.durableFloors) {
 		return nil
@@ -171,12 +134,7 @@ func (s *walShard) publishCompactionFloorsLocked() error {
 	return nil
 }
 
-// applyDurableFloors raises every replayed floor the COMPACTED file holds
-// higher, and drops the entries the raised floor covers so none is served.
-// A higher durable floor means the marker carrying it was lost (a torn
-// block): the file was published only after that marker was acknowledged.
-//
-// Called from recovery, before any reader exists.
+// applyDurableFloors raises replayed floors to the COMPACTED file's and drops the entries they cover.
 func (s *walShard) applyDurableFloors() {
 	for key, durable := range s.durableFloors {
 		replayed := s.compactedTo[key]

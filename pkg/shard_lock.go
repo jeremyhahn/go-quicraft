@@ -19,19 +19,7 @@ import (
 	"sync"
 )
 
-// shardLocks is a set of exclusive per-shard locks whose bookkeeping lives
-// only while a shard's lock is held or waited on. The zero value is ready to
-// use.
-//
-// Each lock is a buffered channel of capacity one: it admits exactly one
-// holder and, unlike a sync.Mutex, lets a caller abandon the wait when its
-// context is cancelled.
-//
-// A shard's record carries a count of the callers that hold or wait on its
-// channel, and is deleted only when that count reaches zero. Deleting it on
-// unlock instead would be an ABA bug: callers still waiting on the old
-// channel and a newcomer that installed a fresh one would both "hold" the
-// shard's lock at once.
+// shardLocks is a set of per-shard exclusive locks (capacity-one channels, abandonable on context cancel); a record is deleted only when no caller holds or waits on it. The zero value is ready to use.
 type shardLocks struct {
 	mu    sync.Mutex
 	locks map[uint64]*shardLock

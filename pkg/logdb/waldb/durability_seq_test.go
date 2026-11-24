@@ -26,41 +26,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// The durability sequence exists to separate two kinds of damage that are
-// byte-for-byte identical without it:
-//
-//   - A torn multi-block write. One batch issues one WriteAt per block before a
-//     single fdatasync, and writeback may persist any subset of those pages.
-//     Losing an interior page leaves decodable records ABOVE a CRC failure, and
-//     none of them was ever acknowledged.
-//   - Rot inside a segment whose later records WERE acknowledged. The same
-//     shape on disk, and truncating destroys committed entries.
-//
-// The tests below use ONE fixture for both and move only the damage: a synced
-// prefix (one fdatasync per record, so each carries its own generation) followed
-// by a single multi-record batch that shares one generation. Damage inside the
-// batch must self-heal; the identical damage inside the prefix must fail closed.
-// Anything that made the two behave alike would break one of the pair.
+// The durability sequence tells a torn multi-block write (self-heals) from rot under acknowledged records (fails closed); one fixture, only the damage moves.
 
 const (
 	// seqTestBlockSize is the block size these fixtures are written on.
 	seqTestBlockSize = 4096
 
-	// seqTestPageSize stands for the filesystem page a torn write loses. It is
-	// an eighth of the block, the same ratio production runs at (4 KiB pages
-	// inside 32 KiB blocks), which is what makes the loss land INSIDE a block
-	// and straddle records rather than align to the block grid.
+	// seqTestPageSize is an eighth of the block, the production page-to-block ratio.
 	seqTestPageSize = 512
 )
 
-// losePage zeroes one page-sized region of a segment, modelling a page that
-// never reached the medium in a file that was pre-allocated (so unwritten
-// content reads back as zeros).
-//
-// It is deliberately not block-aligned and not record-aligned. A record
-// straddling the start of the lost region has its head on disk and its tail
-// zeroed, so it fails CRC — the damage presents as corruption, not as the clean
-// zero hole the older guard already handles.
+// losePage zeroes one unaligned page-sized region of a segment, as a page that never reached the medium.
 func losePage(t *testing.T, path string, off int64) {
 	t.Helper()
 	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
@@ -78,18 +54,7 @@ func losePage(t *testing.T, path string, off int64) {
 	}
 }
 
-// dropSyncMark zeroes the sync mark that ends a segment, turning a segment
-// whose final batch WAS fdatasynced into the file a batch still in flight
-// leaves behind. A torn write is the shape of a batch whose fdatasync never
-// returned, and the mark is written only after it returns, so the file of
-// such a batch is exactly the synced file minus its mark. Every fixture that
-// models an interrupted write goes through here rather than pretending the
-// two shapes are the same on disk — since writeSyncMark, they are not.
-//
-// The mark's page reverts to its pre-allocated content, zeros, so the bytes
-// are zeroed rather than truncated away. The helper fails if the segment does
-// not end in a mark: a fixture that claims to model a torn write must be
-// removing real evidence, not silently changing nothing.
+// dropSyncMark zeroes a segment's final sync mark, turning a synced batch into one whose fdatasync never returned; fails if there is no mark.
 func dropSyncMark(t *testing.T, path string, blockSize int) {
 	t.Helper()
 	off, typ := lastChunk(t, path, blockSize)
@@ -165,16 +130,7 @@ func lastChunk(t *testing.T, path string, blockSize int) (off int64, typ byte) {
 	return last.off, last.typ
 }
 
-// TestRecovery_RotInFinalSyncedGenerationFailsClosed pins what the sync mark
-// buys. A segment's final generation was acknowledged — its fdatasync
-// returned — and nothing was written after it: an idle node, or one that shut
-// down cleanly. Damage inside that generation must not be read as a torn
-// tail, which is what the generations alone would say (every survivor
-// carries the segment's highest generation). The mark the completing Sync
-// appended is the higher-generation witness, and it takes the damage to the
-// same fail-closed verdicts interior damage gets. With the mark gone — the
-// crash inside the writeback window after that last fdatasync — the same
-// bytes ARE an interrupted write, and recovery truncates and boots.
+// TestRecovery_RotInFinalSyncedGenerationFailsClosed: damage in a final synced generation fails closed, but truncates once the sync mark is gone.
 func TestRecovery_RotInFinalSyncedGenerationFailsClosed(t *testing.T) {
 	const (
 		blockSize = 1024
@@ -299,18 +255,7 @@ type seqFixture struct {
 	fileSize int64
 }
 
-// writeSeqFixture builds that WAL.
-//
-// The prefix is written one record per SaveEntries call, and SaveEntries fsyncs
-// before returning, so every prefix record sits in its own durability
-// generation and each is PROVED acknowledged by the existence of the next.
-//
-// The batch is a single SaveState carrying several updates. They land in one WAL
-// shard (shard IDs congruent modulo DefaultShardCount share a shard), are
-// written back to back, and are covered by ONE fdatasync at the end, so all of
-// them carry the same generation — the highest in the file. That is precisely
-// the state a crash mid-batch leaves behind, and the reason a torn multi-block
-// write is a suffix in generation terms.
+// writeSeqFixture writes a prefix of one fsynced record per generation, then one multi-update SaveState sharing a single generation.
 func writeSeqFixture(t *testing.T) seqFixture {
 	t.Helper()
 	dir := t.TempDir()
@@ -336,9 +281,7 @@ func writeSeqFixture(t *testing.T) seqFixture {
 		t.Fatalf("SaveNodeState: %v", err)
 	}
 	segPath := segmentPath(db, 1, 0)
-	// The LOGICAL write position, not the file size: segments are pre-allocated
-	// to maxFileSize, so Stat reports the reservation rather than what has been
-	// written into it.
+	// The logical write position, since segments are pre-allocated.
 	batchAt := db.getShard(1).activeSegment.Size()
 
 	// The final batch: four records, one fdatasync, spanning several blocks.
@@ -378,25 +321,7 @@ func writeSeqFixture(t *testing.T) seqFixture {
 	return seqFixture{dir: dir, segment: segPath, batchAt: batchAt, fileSize: size}
 }
 
-// TestRecovery_TornMultiBlockWriteSelfHeals is the point of the whole scheme.
-//
-// A batch spanning several blocks issues one WriteAt per block before a single
-// fdatasync, so an ordinary power loss can persist an arbitrary SUBSET of those
-// pages. Losing an interior page leaves records that still pass CRC sitting
-// above the damage. Reading them as proof that acknowledged data lay above it
-// would refuse to start, permanently, on every subsequent boot after a routine
-// crash, and on a single-node deployment there would be no way out except an
-// operator-authorized Repair.
-//
-// The durability generations say what the framing cannot: every record above the
-// damage belongs to the ONE batch that was still in flight, with no completed
-// fdatasync behind any of them, so nothing there was ever acknowledged. Recovery
-// truncates to the clean prefix and the node boots.
-//
-// The fixture's batch was actually synced before the page was zeroed, and the
-// sync mark that completion appended is removed (dropSyncMark): the generations
-// the records carry are identical either way, and the mark is the ONLY thing
-// on disk that tells a completed fdatasync from one that never returned.
+// TestRecovery_TornMultiBlockWriteSelfHeals: a lost interior page in the unacknowledged final batch truncates to the clean prefix and boots.
 func TestRecovery_TornMultiBlockWriteSelfHeals(t *testing.T) {
 	fx := writeSeqFixture(t)
 
@@ -438,15 +363,7 @@ func TestRecovery_TornMultiBlockWriteSelfHeals(t *testing.T) {
 	}
 }
 
-// TestRecovery_RotBelowAcknowledgedDataStillFailsClosed is the counterweight,
-// and shares the fixture exactly: only the damage moves.
-//
-// Damage inside the acknowledged PREFIX has records of several later
-// generations above it. Each of those generations proves an fdatasync completed
-// after the one below it, which proves those records were acknowledged.
-// Truncating to the clean prefix would discard committed entries and roll
-// term/vote backwards, so recovery must refuse — and must leave the evidence on
-// disk for the operator.
+// TestRecovery_RotBelowAcknowledgedDataStillFailsClosed: the same fixture with damage in the acknowledged prefix fails closed and leaves the evidence.
 func TestRecovery_RotBelowAcknowledgedDataStillFailsClosed(t *testing.T) {
 	fx := writeSeqFixture(t)
 
@@ -479,16 +396,7 @@ func TestRecovery_RotBelowAcknowledgedDataStillFailsClosed(t *testing.T) {
 	}
 }
 
-// TestReadAll_SequenceRegressionIsNotATornTail covers the gap the sequence makes
-// visible: a record above the damage whose generation is BELOW one already
-// replayed underneath it.
-//
-// The counter only ever rises within a segment, so no writer of this WAL
-// produced that layout. The bytes are a misdirected write from elsewhere on the
-// device, a partial restore of an older file over a newer one, or tampering.
-// Recovery cannot classify the damage — truncating might destroy acknowledged
-// records, replaying might admit records this node never wrote — so it refuses
-// on a sentinel of its own rather than filing the case under either.
+// TestReadAll_SequenceRegressionIsNotATornTail: a lower generation above the damage is refused on its own sentinel.
 func TestReadAll_SequenceRegressionIsNotATornTail(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -541,16 +449,7 @@ func TestReadAll_SequenceRegressionIsNotATornTail(t *testing.T) {
 	}
 }
 
-// TestRecovery_SequenceRegressionFailsOpenWithItsOwnError is the DB-level half,
-// and it is deliberately the SELF-HEALING fixture with one thing added: a record
-// above the damage that this WAL cannot have written.
-//
-// Without it, the same damage truncates and the node boots
-// (TestRecovery_TornMultiBlockWriteSelfHeals). With it, recovery has bytes it
-// cannot account for — a generation below what the clean prefix already
-// replayed — and must stop, under a sentinel that says what was observed rather
-// than folding the case into the acknowledged-data one, whose diagnosis and
-// remedy differ.
+// TestRecovery_SequenceRegressionFailsOpenWithItsOwnError: the self-healing fixture plus one foreign lower-generation record fails with its own error.
 func TestRecovery_SequenceRegressionFailsOpenWithItsOwnError(t *testing.T) {
 	fx := writeSeqFixture(t)
 	losePage(t, fx.segment, fx.batchAt+300)
@@ -608,21 +507,7 @@ func firstDecodableAt(t *testing.T, path string, from int64) (int64, int) {
 	return 0, 0
 }
 
-// TestWALFormatVersionIsPinnedAtOne pins the VALUE, separately from the gate
-// that enforces it.
-//
-// Every wire and persisted format in this repository is held at 1 for the whole
-// pre-release period; a layout change is made in place and the dev directories
-// that hold the old bytes are wiped. A bump here is therefore never the right
-// response to a framing change before 1.0, and this is what says so at the one
-// place a bump would be typed.
-//
-// That policy needs each layout change to stay detectable, and detection lives
-// at the RECORD level: a format whose layout changes retires its payload-type
-// byte and takes a new one, so the old byte is refused by name on replay (see
-// payloadTypeEntriesV2 and payloadTypeSnapshotV4). A 0.4.x directory passes the
-// marker gate — both builds record 1 — and is refused at its first legacy
-// record. Reaching for this constant instead is what this test exists to stop.
+// TestWALFormatVersionIsPinnedAtOne pins walFormatVersion at 1 until release; layout changes take a new payload-type byte instead.
 func TestWALFormatVersionIsPinnedAtOne(t *testing.T) {
 	if walFormatVersion != 1 {
 		t.Fatalf("walFormatVersion = %d, want 1: every format is pinned at 1 until "+
@@ -633,21 +518,7 @@ func TestWALFormatVersionIsPinnedAtOne(t *testing.T) {
 	}
 }
 
-// TestOpen_ForeignFormatVersionIsRefusedByName pins the version gate.
-//
-// The on-disk format is PINNED at walFormatVersion for the whole pre-release
-// period, and the gate is EXACT equality in both directions: a marker recording
-// a LOWER number came from a build whose chunk headers were four bytes shorter,
-// and one recording a HIGHER number from a build this one cannot anticipate at
-// all. Either way every chunk fails CRC from the first byte, the clean prefix
-// comes back empty, and — with nothing decodable above the damage — the
-// torn-tail repair would truncate the whole log to zero. So the version is
-// checked before any segment byte is read, and the error says which version was
-// found rather than reporting the directory as damaged.
-//
-// The sweep is what makes this an equality assertion rather than a floor or a
-// ceiling. A gate written as a range would pass a one-sided test while silently
-// admitting the other side.
+// TestOpen_ForeignFormatVersionIsRefusedByName: any marker version other than walFormatVersion, above or below, is refused by name before a segment is read.
 func TestOpen_ForeignFormatVersionIsRefusedByName(t *testing.T) {
 	// 1 leads the sweep: it is the version 0.4.x stamped, so it is the one
 	// foreign value a real operator will actually present to this build.
@@ -765,12 +636,7 @@ func TestRecord_DurabilitySequenceRoundTripsAndIsChecksummed(t *testing.T) {
 	}
 }
 
-// TestSegment_DurabilitySequenceAdvancesOnlyOnCompletedSync pins the meaning of
-// the counter, which is the whole basis of the acknowledgement proof: a record
-// carrying generation g+1 exists only because Sync #(g+1) RETURNED — and a
-// Sync that acknowledged nothing new (rotateSegment's closing Sync after a
-// batch's own) neither advances it nor appends a mark, so the one mark
-// CanFit reserved for is the one that lands.
+// TestSegment_DurabilitySequenceAdvancesOnlyOnCompletedSync: the generation advances, and a mark is appended, only when a Sync acknowledges new records.
 func TestSegment_DurabilitySequenceAdvancesOnlyOnCompletedSync(t *testing.T) {
 	dir := t.TempDir()
 	seg, _, err := createSegment(defaultFS(), dir, 1, 1024, 64*1024)

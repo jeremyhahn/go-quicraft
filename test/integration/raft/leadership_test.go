@@ -27,18 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/electionbudget"
 )
 
-// ---------------------------------------------------------------------------
-// Leadership stability, transfer, and step-down
-// ---------------------------------------------------------------------------
-//
-// That three nodes agree on a leader ID after an election is the shallowest
-// thing a leadership suite can assert. It says nothing about whether the leader STAYS the leader while it is healthy,
-// whether leadership can be moved on request, or whether a replica that has
-// lost leadership stops behaving like a leader — and each of those is a defect
-// class with real consequences: a cluster that re-elects under its own write
-// traffic makes no progress, a transfer that silently does nothing turns every
-// rolling restart into an unplanned failover, and a replica that keeps
-// answering as leader after stepping down is the front half of split brain.
+// Leadership stability, transfer and step-down tests.
 
 // leaderView is one node's answer about who leads the shard and in what term.
 // The pair is read through Host.LeaderIDAndTerm rather than through two
@@ -88,66 +77,16 @@ func waitForUnanimousLeader(t *testing.T, c *testCluster, shardID uint64, timeou
 	return leaderID, term
 }
 
-// TestIntegration_LeaderStaysLeaderUnderSustainedLoad asserts that a healthy
-// leader is not superseded while it is doing its job.
-//
-// Nothing in this suite covered the negative: that no election happens. An
-// election is not free — every replica stops serving for the duration, every
-// in-flight proposal is refused or delayed, and the new leader has to commit a
-// no-op before it can answer a read. A cluster that re-elects under its own
-// write traffic is functionally down while looking perfectly healthy in any
-// test that only ever waits for "a" leader to exist.
-//
-// The assertion is on the TERM, not just the leader ID. Term is the only
-// direct evidence that no election was attempted: a shard can churn through
-// elections and come back to the same replica, which a leader-ID-only check
-// reads as stability. Every node is sampled, not just the leader, because a
-// follower whose election timer fires bumps the term everywhere it can reach.
-//
-// The write floor at the end is what stops this from passing vacuously: with
-// no traffic at all, a leader trivially remains leader, and this test would be
-// asserting nothing about behaviour under load.
-//
-// The property has a precondition: Raft keeps a healthy leader only while
-// heartbeats arrive well inside the election timeout, and a follower cannot
-// tell a leader the host is not scheduling from a dead one. The suite's
-// 500ms-1s timeout is shorter than goroutine freezes recorded on loaded CI
-// hosts, so this test runs its shard on stableElectionRTT, whose 4s floor
-// outlasts two back-to-back worst freezes (see its comment). With that margin
-// a follower that forgets the leader, a term that advances or a missed write
-// floor is a verdict on the engine and fails the test; two replicas leading
-// one term is a safety violation and fails it too. The second subtest is the
-// control that keeps the first honest: it runs the same observation loop and
-// closes the leader's host partway through the window, and fails unless the
-// loop sees the term advance.
+// TestIntegration_LeaderStaysLeaderUnderSustainedLoad checks the term never advances under load on stableElectionRTT, with a control that closes the leader and must see it advance.
 func TestIntegration_LeaderStaysLeaderUnderSustainedLoad(t *testing.T) {
 	t.Run("HoldsTermUnderLoad", testLeaderHoldsTermUnderLoad)
 	t.Run("Control_ClosedLeaderAdvancesTerm", testClosedLeaderAdvancesTerm)
 }
 
-// settledShard is a three-node shard whose every node names the same leader
-// in the same term, after an entry committed in that term.
-// worstRecordedFreeze is the longest a running goroutine of this suite has
-// been seen frozen by the host's scheduler: per-send and per-receive
-// timestamps on a 24-core box at load ~200 recorded freezes of 0.37s to 1.6s,
-// the longest with the leader's step worker `runnable` mid-iteration, holding
-// no lock, with no I/O in its path. Nothing in the engine stopped; the kernel
-// stopped running it.
+// settledShard is a three-node shard agreeing on leader and term after a commit. worstRecordedFreeze is the longest scheduler freeze observed on a loaded host.
 const worstRecordedFreeze = 1600 * time.Millisecond
 
-// stableElectionRTT is the ElectionRTT the leader-stability shard runs with,
-// derived from worstRecordedFreeze rather than chosen.
-//
-// A heartbeat needs one wake-up on the leader's side to be sent and one on
-// the follower's side to be delivered, so two freezes back to back, one per
-// side of the wire, are 2 x 1.6s = 3.2s of silence from a leader that never
-// stopped sending. The shortest election timeout a follower can draw is
-// ElectionRTT ticks, so it is set to two and a half worst freezes, 4s: 0.8s
-// above the worst two-sided silence. At the suite's 50ms tick that is
-// ElectionRTT 80. The suite-wide ElectionRTT 10 (a 500ms floor) sits below a
-// single recorded freeze, which is why this test, the one test whose subject
-// is that NO election happens, runs on its own timing: with this margin a
-// lost leader, an advanced term or a missed floor is a verdict on the engine.
+// stableElectionRTT is 2.5 worst freezes (4s, ElectionRTT 80 at a 50ms tick), above a two-sided freeze.
 const stableElectionRTT = uint64(5 * worstRecordedFreeze / 2 / raftTick)
 
 // stableElectionRound is the longest randomised election timeout the
@@ -247,12 +186,7 @@ type leadershipWatch struct {
 	secondLeader *leaderView
 }
 
-// watchLeadership samples every node's view of shardID across window,
-// against the baseline leader and term. It runs the whole window unless it
-// sees a term change or a second leader, either of which ends it at once.
-// tick, when non-nil, is called before each round of samples with the time
-// elapsed since the watch began, so a caller can inject a fault at a known
-// point of the window.
+// watchLeadership samples every node's view of shardID over window, stopping on a term change or second leader; tick, if set, runs before each round.
 func watchLeadership(c *testCluster, shardID, baselineLeader, baselineTerm uint64,
 	window time.Duration, tick func(elapsed time.Duration)) leadershipWatch {
 	const samplePause = 10 * time.Millisecond
@@ -413,17 +347,7 @@ func testClosedLeaderAdvancesTerm(t *testing.T) {
 		w.termAdvanced.index, w.termAdvanced.term, s.term, w.termAdvancedAt, s.leader, closeAfter)
 }
 
-// requestTransferUntilLeader asks the current leader to hand leadership to
-// targetReplica and waits for the target to actually hold it.
-//
-// The request is repeated rather than issued once. RequestLeaderTransfer is
-// fire-and-forget by contract: it returns as soon as the message is delivered
-// to the raft state machine, it is refused outright while another transfer is
-// pending, and a transfer whose target is behind is completed only after the
-// leader has caught it up. A single call followed by a wait would therefore be
-// testing timing as much as the transfer itself. Retrying does not weaken the
-// assertion — leadership must still end up on the requested replica, and the
-// deadline is a hard failure.
+// requestTransferUntilLeader repeats the transfer request until targetReplica leads, failing at the deadline.
 func requestTransferUntilLeader(t *testing.T, c *testCluster, shardID, targetReplica uint64, timeout time.Duration) {
 	t.Helper()
 
@@ -452,18 +376,7 @@ func requestTransferUntilLeader(t *testing.T, c *testCluster, shardID, targetRep
 	})
 }
 
-// TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica asserts
-// that a requested handover completes, on the requested replica, and leaves a
-// working cluster behind.
-//
-// A leadership transfer is the only mechanism by which leadership moves without
-// an outage: the outgoing leader stops accepting proposals, catches the target
-// up, and sends it TimeoutNow so it campaigns immediately instead of waiting
-// out an election timeout. Every graceful operation in production depends on it
-// — draining a node, rolling a release, moving load off a host about to be
-// rebooted. Nothing in this suite exercised it at all, so a transfer that
-// quietly did nothing would have been invisible: the cluster still has a
-// leader, just not the one that was asked for.
+// TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica checks a transfer lands on the requested replica and the cluster keeps working.
 func TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica(t *testing.T) {
 	const shardID = uint64(1)
 
@@ -511,20 +424,7 @@ func TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica(t *tes
 		fmt.Sprintf("node[%d]", targetIdx), "pre-transfer", "before")
 }
 
-// TestIntegration_SteppedDownLeader_StopsActingAsLeader asserts that the
-// replica that GAVE UP leadership stops behaving as leader.
-//
-// This is the other half of a handover and the dangerous half. A replica that
-// still reports IsLeader after stepping down will be selected as leader by
-// every client, dashboard and test helper that asks it; if it also still
-// accepts leader-only operations, it is issuing decisions for a term that
-// belongs to someone else. The suite had no assertion anywhere that leadership
-// is ever RELINQUISHED — only that it is acquired.
-//
-// The stepped-down replica must remain a fully working follower: it knows who
-// leads now, it holds the data, and it refuses only the operations that require
-// leadership. "Broken" is not the same as "not leader", and asserting the first
-// would let a regression that kills the replica outright pass.
+// TestIntegration_SteppedDownLeader_StopsActingAsLeader checks the old leader stops claiming leadership and remains a working follower.
 func TestIntegration_SteppedDownLeader_StopsActingAsLeader(t *testing.T) {
 	const shardID = uint64(1)
 

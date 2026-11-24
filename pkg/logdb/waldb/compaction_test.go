@@ -267,9 +267,7 @@ func TestRemoveNodeDataPreservesSharedSegment(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// Replica 2's State and Snapshot land in the early segment FIRST so both
-	// share the early segment files with replica 1's about-to-be-compacted
-	// entries.
+	// Replica 2's State and Snapshot land in the early segment beside replica 1's entries.
 	if err := db.SaveNodeState(1, 2, logdb.State{Term: 9, Vote: 2, Commit: 11}); err != nil {
 		t.Fatalf("SaveNodeState(replica 2): %v", err)
 	}
@@ -344,16 +342,7 @@ func TestRemoveNodeDataPreservesSharedSegment(t *testing.T) {
 	}
 }
 
-// TestCompactRespectsCommittedHWM verifies the guard: a Compact must never
-// delete a segment that is durably written but not yet reflected in the
-// in-memory index or meta pins. SaveState releases shard.mu between its durable
-// WAL write (Phase 1) and its in-memory commit (Phase 3); a concurrent Compact
-// running in that window would otherwise GC the just-written segment.
-//
-// The window is reproduced deterministically (no goroutines) by writing a
-// record directly through the shard — which is durable and may rotate to a new
-// segment — WITHOUT advancing the commit high-water mark, then invoking Compact
-// and confirming the new segment and its record survive a reopen.
+// TestCompactRespectsCommittedHWM checks Compact never deletes a durable segment above the commit high-water mark.
 func TestCompactRespectsCommittedHWM(t *testing.T) {
 	dir := t.TempDir()
 
@@ -375,11 +364,7 @@ func TestCompactRespectsCommittedHWM(t *testing.T) {
 
 	shard := db.getShard(1)
 
-	// Simulate the Phase-1/Phase-3 window: write a state record durably WITHOUT
-	// advancing the HWM and WITHOUT updating the in-memory index/pins. The
-	// record must sit ALONE in a fresh segment (no live index entry, no pin) so
-	// only the HWM guard can protect it, so we rotate before AND after the
-	// write.
+	// Write a state record alone in a fresh segment without advancing the HWM, so only the HWM guard protects it.
 	shard.mu.Lock()
 	hwmBefore := shard.committedSegmentHWM
 	// Rotate first so the state record lands in a brand-new, otherwise-empty
@@ -540,9 +525,7 @@ func TestCompactPreservesSnapshotSegment(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// Write a snapshot record FIRST so it lands in the early segment, along
-	// with a small batch of entries (1-5). The snapshot carries membership so
-	// recovery loss would be observable.
+	// Write a snapshot with membership and entries 1-5 into the early segment.
 	ss := logdb.Snapshot{
 		Index:       5,
 		Term:        2,

@@ -1,10 +1,4 @@
-# Dockerfile for building and running the QuicRaft vs Dragonboat benchmark.
-#
-# Build context must be the go-quicraft repository root. The dragonboat fork
-# (github.com/jeremyhahn/dragonboat/v4) is an ordinary versioned dependency.
-#
-# Usage (via Makefile):
-#   make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,dragonboat
+# Builds and runs the QuicRaft vs Dragonboat benchmark from the repository root, e.g. make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,dragonboat.
 
 FROM golang:1.27.4 AS builder
 

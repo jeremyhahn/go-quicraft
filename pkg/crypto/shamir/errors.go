@@ -36,18 +36,7 @@ func (e *CombineError) Error() string {
 	return fmt.Sprintf("quicraft/shamir: combine failed: %s", e.Reason)
 }
 
-// ProtectedMemoryError is returned when locked memory could not be allocated —
-// the kernel refused an mlock, typically because RLIMIT_MEMLOCK is exhausted.
-//
-// It is deliberately NOT a ValidationError. The distinction is an ownership
-// contract, not cosmetics: a ValidationError from NewProtectedShare leaves the
-// caller's value untouched, whereas by the time this can be returned the value
-// has already been WIPED — go-enclave's constructor wipes its source before it
-// reports a refused lock. A caller that could not tell them apart would retry a
-// legitimate-looking failure with a buffer that is now zeroes.
-//
-// It is also the actionable one for an operator: it says the host or container
-// is out of locked memory, not that the input was wrong.
+// ProtectedMemoryError reports a refused mlock (RLIMIT_MEMLOCK); unlike a ValidationError, the caller's value has already been wiped.
 type ProtectedMemoryError struct {
 	// Op names the allocation that was refused, for diagnosis.
 	Op string

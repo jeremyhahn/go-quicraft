@@ -21,12 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestBuildInitialMembershipEntry_Deterministic is the load-bearing property:
-// two replicas building the bootstrap entry from the SAME configuration must
-// produce byte-identical entries, or the entry at index 1 differs between
-// replicas and Log Matching is violated on first contact. The maps are
-// populated in different literal orders to make map-iteration nondeterminism,
-// if any leaked in, observable.
+// TestBuildInitialMembershipEntry_Deterministic verifies the same configuration yields byte-identical entries.
 func TestBuildInitialMembershipEntry_Deterministic(t *testing.T) {
 	a := proto.Membership{
 		Addresses:                  map[uint64]string{3: "c", 1: "a", 2: "b"},
@@ -66,14 +61,7 @@ func TestBuildInitialMembershipEntry_Deterministic(t *testing.T) {
 	}
 }
 
-// TestBuildInitialMembershipEntry_WitnessPolicyIsPartOfTheInput pins the
-// determinism CONTRACT: the witness policy (MaxWitnesses /
-// RequireFullReplicaMajority) is part of the bootstrap input, not only the
-// address map. Two founders with an IDENTICAL members map but DIFFERENT local
-// witness policy produce byte-DIFFERENT entries at the same (index=1, term=1),
-// which AppendEntries (matching on index+term only) would never reconcile. This
-// test documents that every founding member must be configured with an identical
-// witness policy, exactly as it must pass an identical member list.
+// TestBuildInitialMembershipEntry_WitnessPolicyIsPartOfTheInput verifies different witness policy yields different entries.
 func TestBuildInitialMembershipEntry_WitnessPolicyIsPartOfTheInput(t *testing.T) {
 	base := map[uint64]string{1: "a", 2: "b", 3: "c"}
 
@@ -140,17 +128,7 @@ func TestInitialMembershipRoundTrip(t *testing.T) {
 	}
 }
 
-// TestJoiningClearsWhenBootstrapEntryApplied is the Stage-4 property: a joiner
-// that started with empty membership ends its joining window the moment it
-// applies the bootstrap membership entry the leader replicates to it. Before
-// config-in-log the window could only be closed by a snapshot, so a joiner
-// caught up by replication alone stayed joining permanently.
-//
-// The window gates CAMPAIGNING (a replica holding an incomplete configuration
-// must not self-elect on a quorum of one) and the configuration test in
-// handleVoteRequest. It is no longer an authorization bypass: per-shard
-// authorization is a removed-tombstone deny-list that needs no bypass. See
-// Peer.IsRemoved.
+// TestJoiningClearsWhenBootstrapEntryApplied verifies a joiner's window closes when it applies the bootstrap entry.
 func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 	// Replica 4 joins a {1,2,3} cluster: it starts knowing no members.
 	p := newTestPeer(t, testConfigWithID(1, 4), proto.State{}, proto.Membership{})
@@ -159,8 +137,7 @@ func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 		t.Fatal("fixture: joining flag must be set")
 	}
 
-	// The joiner is following leader 1 (a founding member). The bypass clears
-	// only once it knows THIS leader is a member.
+	// The joiner follows founding member 1 and clears once it knows that leader is a member.
 	p.r.leaderID = 1
 
 	// The leader replicates the committed bootstrap entry (index 1) carrying the
@@ -191,14 +168,9 @@ func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 	}
 }
 
-// TestJoiningDoesNotClearBeforeLeaderIsKnown pins that a joiner following a leader that was ADDED AFTER the initial bootstrap must NOT
-// clear the auth bypass merely from learning the founding membership. If
-// replication delivers the bootstrap entry in an earlier batch than that
-// leader's AddNode, clearing on "knows any member" would then reject the current
-// leader's next append and strand the joiner forever.
+// TestJoiningDoesNotClearBeforeLeaderIsKnown verifies a joiner whose leader was added later stays joining after the bootstrap entry.
 func TestJoiningDoesNotClearBeforeLeaderIsKnown(t *testing.T) {
-	// Replica 6 joins a cluster whose founding members are {1,2,3}. The CURRENT
-	// leader is replica 5 — added after bootstrap, so NOT in the index-1 entry.
+	// Founders are {1,2,3}; the current leader 5 was added later.
 	p := newTestPeer(t, testConfigWithID(1, 6), proto.State{}, proto.Membership{})
 	p.MarkJoining()
 	p.r.leaderID = 5 // following leader 5, which the bootstrap entry does not name
@@ -244,12 +216,7 @@ func TestJoiningDoesNotClearBeforeLeaderIsKnown(t *testing.T) {
 	}
 }
 
-// TestJoiningClearsOnRestartReplayWithoutLeader is the residual-fix regression:
-// on the RESTART path, replayConfigChangesTo (SetProcessedIndex) runs BEFORE the
-// first Tick, so leaderID is noLeader and the leader-based clear cannot fire. A
-// replica restarted with join=true whose durable log already holds the full
-// membership must still clear the bypass — via the "self is a member" signal —
-// rather than keep per-shard authorization disabled until the next snapshot.
+// TestJoiningClearsOnRestartReplayWithoutLeader verifies a restarted joiner clears on the self-is-member signal.
 func TestJoiningClearsOnRestartReplayWithoutLeader(t *testing.T) {
 	// Replica 4 comes up joining, with NO leader contact yet (leaderID == noLeader,
 	// the pre-first-Tick restart-replay state).
@@ -288,13 +255,7 @@ func TestJoiningClearsOnRestartReplayWithoutLeader(t *testing.T) {
 	}
 }
 
-// TestJoiningClearsWhenReplayRemovesSelf is the third terminal state of the
-// joining window: a join=true replica that replays a committed RemoveNode for
-// ITSELF before any leader is known is neither a member (so the self signal is
-// false) nor following a leader (so the leader signal is false). Without an
-// explicit tombstone signal the auth bypass would persist for the whole process
-// — and because clearJoiningIfKnown only runs on membership changes, no later
-// heartbeat would ever clear it.
+// TestJoiningClearsWhenReplayRemovesSelf verifies a joiner that replays its own RemoveNode leaves the joining window.
 func TestJoiningClearsWhenReplayRemovesSelf(t *testing.T) {
 	// Replica 4 comes up joining with no leader contact (restart-replay state).
 	p := newTestPeer(t, testConfigWithID(1, 4), proto.State{}, proto.Membership{})
@@ -349,13 +310,7 @@ func configChangeEntry(t *testing.T, index uint64, cc proto.ConfigChange) proto.
 	return proto.Entry{Index: index, Term: 1, Type: proto.EntryConfigChange, Cmd: buf}
 }
 
-// TestJoiningDoesNotClearOnSelfOnlyMembership covers the other end of the same
-// hazard as TestJoiningDoesNotClearBeforeLeaderIsKnown: a joiner that applies an
-// AddNode for ITSELF without yet holding the entry that names the rest of the
-// shard. Self-membership alone is not knowledge of the cluster. Clearing on it
-// would leave the replica with a configuration of exactly {self}, which
-// authorizes nobody — so it would reject the leader's next append and could
-// never learn more. Permanent, and self-inflicted.
+// TestJoiningDoesNotClearOnSelfOnlyMembership verifies self-membership alone does not end the joining window.
 func TestJoiningDoesNotClearOnSelfOnlyMembership(t *testing.T) {
 	p := newTestPeer(t, testConfigWithID(1, 6), proto.State{}, proto.Membership{})
 	p.MarkJoining()
@@ -396,13 +351,7 @@ func TestJoiningDoesNotClearOnSelfOnlyMembership(t *testing.T) {
 	}
 }
 
-// TestMarkJoiningClearsWhenMembershipIsAlreadyKnown pins the restart hole.
-// join=true is a STARTUP FLAG, not durable state: an operator restarting an
-// established replica keeps it set. NewPeer has already seeded the membership
-// from the persisted NodeState, so this replica knows the whole shard — but if
-// MarkJoining only ever set the flag, nothing would reconsider it. In a
-// quiescent shard (no config change, no snapshot) the bypass would then
-// authorize every replica ID for the entire lifetime of the process.
+// TestMarkJoiningClearsWhenMembershipIsAlreadyKnown verifies MarkJoining clears at once when the membership is already known.
 func TestMarkJoiningClearsWhenMembershipIsAlreadyKnown(t *testing.T) {
 	known := proto.Membership{
 		Addresses:      map[uint64]string{1: "a", 2: "b", 3: "c"},
@@ -425,14 +374,7 @@ func TestMarkJoiningClearsWhenMembershipIsAlreadyKnown(t *testing.T) {
 	}
 }
 
-// TestInitialMembershipOutsideBootstrapIndexIsRefused pins the index check on
-// the founding configuration.
-//
-// Applying an EntryInitialMembership REPLACES the membership wholesale rather
-// than amending it, so one accepted at any index above bootstrap would discard
-// every config change committed since — rolling the voting set back to the
-// founding members, a configuration no live replica shares, while this replica
-// went on computing quorum over it.
+// TestInitialMembershipOutsideBootstrapIndexIsRefused verifies an initial-membership entry above index 1 is refused.
 func TestInitialMembershipOutsideBootstrapIndexIsRefused(t *testing.T) {
 	// An established shard: founded as {1,2,3}, replicas 4 and 5 added since.
 	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, proto.Membership{

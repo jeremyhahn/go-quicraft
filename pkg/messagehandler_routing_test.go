@@ -180,12 +180,7 @@ func TestReplicaIdentity_IsTheIdentityASenderIsHeldTo(t *testing.T) {
 // Concurrent same-index snapshot receives must be serialized
 // ---------------------------------------------------------------------------
 
-// TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn is the deterministic
-// half of the regression: while a receive for (shard, replica, index)
-// is claimed, a second HandleSnapshot for the same key must take the same
-// early-return path as the LogDB dedup — return nil WITHOUT touching the
-// snapshot directory or LogDB. After the claim is released, the receive
-// proceeds normally.
+// TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn verifies a second receive of a claimed (shard, replica, index) returns early.
 func TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn(t *testing.T) {
 	eng, h, handler := newRoutingHandlerFixture(t)
 
@@ -241,26 +236,13 @@ func TestHandleSnapshot_DuplicateInFlightTakesEarlyReturn(t *testing.T) {
 		t.Fatalf("persisted snapshot index = %d, want %d", ss.Index, snapIndex)
 	}
 
-	// The claim must have been released on exit: a fresh receive of a NEWER
-	// index for the same replica must not be blocked.
+	// The claim is released: a newer index for the same replica is not blocked.
 	if _, loaded := handler.inflightSnapshotRecv.Load(key); loaded {
 		t.Fatal("in-flight claim was not released after HandleSnapshot returned")
 	}
 }
 
-// TestHandleSnapshot_ConcurrentSameIndexReceives is the concurrency half of
-// the regression: many simultaneous deliveries of the same snapshot
-// must produce exactly one intact on-disk snapshot and a consistent LogDB
-// record — no interleaved snapshot.dat writes, and no loser cleanup
-// removing the directory the winner recorded in LogDB.
-//
-// Every receiver must return nil. Authorization runs BEFORE the serialization
-// claim, so a loser is refused only if the winner changed the committed
-// membership out from under it — and these eight deliveries carry ONE
-// membership, the shard's own, so there is nothing for the restore to change.
-// See snapshotPathMembership for why the chunk must carry it, and
-// TestHandleSnapshot_RestoredMembershipGovernsLaterReceives for what a snapshot
-// that genuinely drops the sender does instead.
+// TestHandleSnapshot_ConcurrentSameIndexReceives verifies concurrent same-snapshot deliveries leave one intact snapshot and a consistent record.
 func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	eng, h, handler := newRoutingHandlerFixture(t)
 
@@ -300,13 +282,7 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	const receivers = 8
 	var wg sync.WaitGroup
 	errs := make([]error, receivers)
-	// `i` is captured directly, with no `i := i` shadow. That is correct here
-	// and deliberately not "fixed": since Go 1.22 the for-clause variable is
-	// PER-ITERATION, and this module declares go 1.27.1, so each goroutine
-	// closes over its own copy. Under pre-1.22 semantics the same code writes
-	// through a shared variable and can panic on errs[8]; that is the footgun
-	// the language change removed, and it is why a reader out of version
-	// context may flag it.
+	// i is per-iteration since Go 1.22, so no shadow copy is needed.
 	for i := 0; i < receivers; i++ {
 		wg.Add(1)
 		go func() {
@@ -354,26 +330,7 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_RestoredMembershipGovernsLaterReceives pins the contract
-// the test above depends on, and states the half of it that is NOT a bug: a
-// snapshot REPLACES the committed membership, and the replacement — not the
-// configuration that authorized the snapshot carrying it — is what every later
-// receive is judged against.
-//
-// So a sender that ships a configuration no longer naming itself has, by that
-// act, given up its own admission. Refusing it afterwards is the documented
-// fail-closed rule (committedSenderBinding: a replica the configuration does
-// not name at all is a drop), not an ordering defect: the snapshot channel is
-// the one inbound path that rewrites the authorization source, which is exactly
-// why HandleSnapshot re-reads committed membership per receive instead of
-// caching a verdict.
-//
-// The adoption is asynchronous — HandleSnapshot queues the InstallSnapshot to
-// the engine worker and returns — so this waits for it rather than assuming it
-// has landed. That asynchrony is the flake's timing element: a concurrent
-// receive authorized before the adoption passes and one authorized after does
-// not, which is why a same-snapshot fixture must not change the configuration
-// at all.
+// TestHandleSnapshot_RestoredMembershipGovernsLaterReceives verifies a restored snapshot's membership authorizes later receives.
 func TestHandleSnapshot_RestoredMembershipGovernsLaterReceives(t *testing.T) {
 	eng, h, handler := newRoutingHandlerFixture(t)
 
@@ -388,8 +345,7 @@ func TestHandleSnapshot_RestoredMembershipGovernsLaterReceives(t *testing.T) {
 		t.Fatalf("precondition: replica %d must be a committed member before the receive", fromReplicaID)
 	}
 
-	// A configuration that keeps this replica and DROPS the sender — the shape
-	// a snapshot taken after the sender was removed carries.
+	// A configuration that keeps this replica and drops the sender.
 	withoutSender := proto.Membership{
 		Addresses: map[uint64]string{localReplicaID: snapshotPathLocalAddr},
 	}
@@ -429,8 +385,7 @@ func TestHandleSnapshot_RestoredMembershipGovernsLaterReceives(t *testing.T) {
 		t.Fatalf("refusal names shard %d from %d, want shard %d from %d",
 			unauthorized.ShardID, unauthorized.From, shardID, fromReplicaID)
 	}
-	// Refused BEFORE anything is persisted: the durable record still names the
-	// snapshot that was authorized.
+	// Refused before anything is persisted.
 	ss, err := h.logdb.GetSnapshot(shardID, localReplicaID)
 	if err != nil {
 		t.Fatalf("GetSnapshot: %v", err)

@@ -24,20 +24,7 @@ import (
 
 // --- in-flight epoch pin accounting ---
 
-// TestDeregisterInFlightEpochReportsUnbalancedRelease pins the DECIDABLE half
-// of the in-flight pin contract.
-//
-// What is decidable: a release for an epoch holding no reference is a caller
-// bug, and the barrier can say so. What is NOT decidable, and this test does
-// not pretend otherwise: a duplicate release that arrives while the count is
-// still positive is byte-for-byte indistinguishable from the legitimate one, so
-// no reference-counted API can refuse it. Preventing that needs a single-use
-// release handle, which is a public API change and not made here.
-//
-// The old body decremented unconditionally and deleted the entry at `<= 0`, so
-// the underflow it produced was erased in the same critical section and the
-// caller bug left no trace at all — the failure surfaced later, somewhere else,
-// as an artifact whose DEK had been purged.
+// TestDeregisterInFlightEpochReportsUnbalancedRelease verifies an unbalanced in-flight epoch release is reported.
 func TestDeregisterInFlightEpochReportsUnbalancedRelease(t *testing.T) {
 	logs := captureLogs(t)
 	b, _ := testInitializedBarrier(t)
@@ -97,14 +84,7 @@ func TestPinnedEpochSurvivesPurgeAfterStrayReleases(t *testing.T) {
 
 // --- KnownEpochs structural bounds ---
 
-// TestSetSealedRootKeyRejectsZeroKnownEpoch pins that epoch 0 cannot enter the
-// derivation set. Epochs start at 1 and only increment, so no data was ever
-// sealed under epoch 0. Accepting it was not inert: Unseal derived and
-// installed a full epoch-0 DEK, AEAD and mlock'd enclave, the forced rotation
-// re-persisted it, and no purge floor can retire it (PurgeEpochsBefore drops
-// epochs strictly BELOW its floor, and nothing is below 0). It also left
-// b.ciphers[0] populated — the one epoch a zero-filled ciphertext header
-// decodes to.
+// TestSetSealedRootKeyRejectsZeroKnownEpoch verifies epoch 0 cannot enter the derivation set.
 func TestSetSealedRootKeyRejectsZeroKnownEpoch(t *testing.T) {
 	src := MustNewBarrier(testBarrierConfig(31))
 	if err := src.Initialize(context.Background(), testStrategy(t), Credentials{}); err != nil {
@@ -152,15 +132,7 @@ func TestMaxPlaintextSizePerAlgorithm(t *testing.T) {
 	}
 }
 
-// TestEncryptRejectsOversizedPlaintext pins that the barrier refuses a frame
-// its cipher would PANIC on. Neither crypto/cipher nor x/crypto returns an
-// error for an over-long message, so without this bound an oversized frame
-// takes the embedding process down from inside Seal — a library killing its
-// host over an input it could have rejected.
-//
-// The barrier's ceiling is lowered for the test because the real one is ~64 GiB
-// (AES-GCM); the bound under test is the comparison in encryptLocked, not the
-// constant, which TestMaxPlaintextSizePerAlgorithm pins separately.
+// TestEncryptRejectsOversizedPlaintext verifies the barrier refuses a plaintext its cipher would panic on.
 func TestEncryptRejectsOversizedPlaintext(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
 	b.maxPlaintext = 64
@@ -192,11 +164,7 @@ func TestEncryptRejectsOversizedPlaintext(t *testing.T) {
 	}
 }
 
-// TestDecryptRejectsOversizedCiphertext pins the same bound on the read path,
-// where it matters more: the input comes off disk or the wire, and x/crypto's
-// ChaCha20-Poly1305 Open PANICS on an over-long ciphertext rather than failing
-// authentication. The rejection uses the generic ErrDecryptionFailed so the
-// length is not an oracle.
+// TestDecryptRejectsOversizedCiphertext verifies the barrier refuses an oversized ciphertext before Open.
 func TestDecryptRejectsOversizedCiphertext(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
 
@@ -221,28 +189,14 @@ func TestDecryptRejectsOversizedCiphertext(t *testing.T) {
 
 // --- duplicate-writer hazard (documented, not defended) ---
 
-// TestDoubleLoadedBlobStillSharesTheEpochDEK pins the HAZARD the load-generation
-// fence exists to make visible, and the exact boundary of the fence's reach.
-//
-// Two barriers loaded from one blob still derive the SAME epoch DEK — the fence
-// does not and cannot prevent that. Both rotate on unseal (the loaded epoch's
-// spent invocation budget is unknowable) to the same epoch+1 from the same root
-// key, salt and deployment ID, each with a zeroed invocation counter and an
-// empty nonce tracker; given the same nonce they produce byte-identical
-// ciphertext. What the fence changes is that the second loader leaves a claim
-// behind, so the condition becomes DETECTABLE at the next load instead of
-// silent — see TestLoadGenerationFenceSupersedesEarlierLoader.
-//
-// Keeping this test is deliberate. If someone later believes the fence prevents
-// DEK sharing rather than exposing it, this is the test that says otherwise.
+// TestDoubleLoadedBlobStillSharesTheEpochDEK shows two barriers loaded from one blob share the epoch DEK, which the fence exposes.
 func TestDoubleLoadedBlobStillSharesTheEpochDEK(t *testing.T) {
 	captureLogs(t)
 	src := MustNewBarrier(testBarrierConfig(77))
 	if err := src.Initialize(context.Background(), testStrategy(t), Credentials{}); err != nil {
 		t.Fatalf("Initialize: %v", err)
 	}
-	// Both loaders read the SAME on-disk state, before either writes its claim
-	// — the one interleaving the fence cannot separate.
+	// Both loaders read the same state before either writes its claim.
 	blob := src.SealedRootKeyData()
 
 	load := func() *Barrier {
@@ -272,17 +226,7 @@ func TestDoubleLoadedBlobStillSharesTheEpochDEK(t *testing.T) {
 			"must not claim a detection it did not make")
 	}
 
-	// Same key: each barrier opens the other's frames. That is the shared-DEK
-	// condition the invocation cap and the nonce tracker exist to bound, and
-	// exactly what the fence exposes rather than prevents — two writers each
-	// spending a full SP 800-38D budget against one key, neither able to see
-	// the other's nonces.
-	//
-	// It cannot be shown by pinning both barriers' randReader to a constant
-	// and comparing ciphertexts byte for byte: the AES-GCM nonce is generated
-	// inside the FIPS module boundary
-	// (cipher.NewGCMWithRandomNonce), so no test can force two encryptions to
-	// collide. Cross-decryption proves the same shared DEK without needing to.
+	// Same key: each barrier opens the other's frames.
 	a, err := first.Encrypt(nil, []byte("duplicate writer"))
 	if err != nil {
 		t.Fatalf("first Encrypt: %v", err)

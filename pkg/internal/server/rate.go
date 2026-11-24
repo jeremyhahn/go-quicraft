@@ -46,10 +46,7 @@ func (r *RateLimiter) Enabled() bool {
 	return r.maxSize > 0
 }
 
-// Increase atomically adds sz to the tracked size, saturating at the
-// uint64 maximum instead of wrapping. A wrap would reset the tracked
-// size to a tiny value and silently disable backpressure exactly when
-// the in-memory log is largest. Saturation keeps the limiter tripped.
+// Increase atomically adds sz to the tracked size, saturating at the uint64 maximum so the limiter stays tripped.
 func (r *RateLimiter) Increase(sz uint64) {
 	for {
 		current := r.size.Load()
@@ -109,20 +106,7 @@ type followerState struct {
 	inMemLogSize uint64
 }
 
-// InMemRateLimiter provides per-shard in-memory log rate limiting with
-// hysteresis and follower feedback. The mutable state (limited,
-// tickLimited, followerSizes) is owned by the single raft state machine
-// goroutine and must only be mutated through RateLimited(), Tick(),
-// SetFollowerState(), and Reset().
-//
-// Client goroutines that need to check the rate-limited state must call
-// IsLimited(), which reads an atomic cache updated by the owning raft
-// goroutine each time RateLimited() is evaluated.
-//
-// Hysteresis prevents thrashing: the rate limiter becomes limited when
-// any tracked size exceeds 100% of maxSize, and becomes unlimited only
-// when all tracked sizes drop below 70% of maxSize. State transitions
-// are debounced by ChangeTickThreshold ticks.
+// InMemRateLimiter limits a shard's in-memory log with hysteresis (limit above 100%, release below 70%, debounced by ChangeTickThreshold); state is owned by the raft goroutine, and IsLimited reads an atomic cache.
 type InMemRateLimiter struct {
 	rl            RateLimiter
 	followerSizes map[uint64]followerState
@@ -186,11 +170,7 @@ func (r *InMemRateLimiter) GetTick() uint64 {
 	return r.tick
 }
 
-// Reset clears all follower states and resets the rate limit state.
-// Called on leadership transitions. The local tracked in-memory log size
-// is also zeroed: the matching Decrease calls were made under the previous
-// term, so a stale local size must not carry over and trip the limiter (or
-// prevent it from decaying) after the node re-becomes leader.
+// Reset clears follower states, the limit state and the local tracked size; called on leadership transitions.
 func (r *InMemRateLimiter) Reset() {
 	r.followerSizes = make(map[uint64]followerState)
 	r.rl.Set(0)
@@ -208,12 +188,7 @@ func (r *InMemRateLimiter) SetFollowerState(replicaID, sz uint64) {
 	}
 }
 
-// RateLimited returns whether proposals should be rate-limited. Uses
-// hysteresis with tick-based debouncing to prevent thrashing.
-//
-// This method is NOT safe for concurrent access. It must only be called
-// by the single owning raft goroutine. Client goroutines should call
-// IsLimited() instead.
+// RateLimited reports whether proposals are rate-limited, with debounced hysteresis; only the owning raft goroutine may call it.
 func (r *InMemRateLimiter) RateLimited() bool {
 	if !r.Enabled() {
 		return false
@@ -229,10 +204,7 @@ func (r *InMemRateLimiter) RateLimited() bool {
 	return r.limited
 }
 
-// IsLimited returns the cached rate-limited state. Safe for concurrent
-// access from multiple goroutines. The cached state is updated by
-// RateLimited() which must be called periodically by the owning
-// (single-writer) raft goroutine.
+// IsLimited returns the cached rate-limited state; safe for concurrent use.
 func (r *InMemRateLimiter) IsLimited() bool {
 	return r.cachedLimited.Load()
 }

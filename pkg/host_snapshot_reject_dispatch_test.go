@@ -25,22 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// TestNewHost_InboundSnapshotRejectionIsDispatched proves, end to end, that
-// NewHost installs the host's listener dispatcher on the transport.
-//
-// The snapshot receiver fires OnSnapshotRejected from the goroutine that owns
-// the inbound stream. Without the dispatcher that call is inline, so a listener
-// that blocks — or calls a synchronous Host API — holds the receive goroutine,
-// its snapshot receive slot and the transport's shutdown with it. The receiver
-// falls back to inline delivery when no dispatcher is installed, so nothing
-// short of a real host receiving a real transfer shows the wiring is there.
-//
-// Host A runs shard 1 with B as a member, which gives A the route and identity
-// binding to send B a snapshot. B never starts shard 1, so it refuses the
-// transfer from its header ("shard not loaded") and reports the rejection. The
-// listener blocks until the test releases it; while it is blocked, B's
-// transport must be able to stop, which it does only once every receive
-// goroutine has returned.
+// TestNewHost_InboundSnapshotRejectionIsDispatched verifies NewHost installs the listener dispatcher on the transport.
 func TestNewHost_InboundSnapshotRejectionIsDispatched(t *testing.T) {
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, 2)

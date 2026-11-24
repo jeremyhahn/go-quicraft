@@ -114,12 +114,7 @@ func TestMsgRecvBudget_ConcurrentNeverOverCommits(t *testing.T) {
 // budget is processed normally, and both the compressed-length reservation and
 // the decompression delta are released afterward, restoring the baseline.
 func TestMsgRecvBudget_CompressedDeltaReleasedOnSuccess(t *testing.T) {
-	// Scaled by the decode factor deliberately. The budget charges what a frame
-	// can occupy while being DECODED, not its wire length, so "a frame that
-	// fits" is a frame whose decode fits. Writing the multiplier out rather
-	// than hard-coding a larger number keeps this fixture correct if the factor
-	// ever changes, instead of silently becoming an out-of-budget test that
-	// asserts the in-budget path.
+	// Scaled by the decode factor: the budget charges a frame's decoded size.
 	const budget = 64 * 1024 * proto.MaxDecodeMemoryFactor
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
@@ -239,20 +234,7 @@ func (f *firstReadReader) Read(p []byte) (int, error) {
 	return f.r.Read(p)
 }
 
-// TestMsgRecvBudget_MaxFramePeerDoesNotStallOthers is the regression test for
-// one peer wedging the whole receive path under the DEFAULT configuration.
-//
-// Peer A opens as many streams as the default aggregate budget has maximum-size
-// frames, declares a maximum-size frame on each, and withholds every body.
-// Before the budget was derived from the frame charge, and while the per-peer
-// sub-budget was charged in wire bytes against an aggregate charged at the
-// decode factor, two such frames reserved the entire 256 MB default and every
-// other peer's frames were dropped until A's read deadline. A refused frame
-// also kept its aggregate reservation while its body drained, so the per-peer
-// cap could not help even when it fired.
-//
-// Now the per-peer cap admits A's first maximum-size frame, refuses the rest
-// without holding anything, and peer B's ordinary frame is processed.
+// TestMsgRecvBudget_MaxFramePeerDoesNotStallOthers verifies one peer sending max-size frames cannot stall the receive path under the default configuration.
 func TestMsgRecvBudget_MaxFramePeerDoesNotStallOthers(t *testing.T) {
 	tr, peer, handler, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -334,11 +316,7 @@ func TestMsgRecvBudget_MaxFramePeerDoesNotStallOthers(t *testing.T) {
 	}
 }
 
-// TestMsgRecvBudget_RefusedFrameHoldsNothingWhileDraining pins the other half
-// of the reservation order: the per-peer sub-budget is reserved first, so a
-// frame the aggregate then refuses must hand its per-peer reservation back
-// BEFORE draining its body. A peer whose bodies never arrive would otherwise
-// hold its sub-budget through every drain.
+// TestMsgRecvBudget_RefusedFrameHoldsNothingWhileDraining verifies a frame the aggregate refuses returns its per-peer reservation.
 func TestMsgRecvBudget_RefusedFrameHoldsNothingWhileDraining(t *testing.T) {
 	tr, conn := liveConn(t)
 	tr.msgRecvBudget.Store(0) // aggregate exhausted by other peers

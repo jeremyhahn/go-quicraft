@@ -21,11 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// hashingStateMachine is a mockStateMachine that also implements sm.Hasher,
-// hashing an ORDER-INDEPENDENT digest of its applied entries. Order
-// independence is the property that matters: a hash that depends on iteration
-// order reports divergence that does not exist, which is worse than having no
-// detector at all.
+// hashingStateMachine is a mockStateMachine implementing sm.Hasher with an order-independent digest of its applied entries.
 type hashingStateMachine struct {
 	mockStateMachine
 	sum uint64
@@ -49,14 +45,7 @@ func hashingCreateFunc(shardID, replicaID uint64) interface{} {
 	return &hashingStateMachine{}
 }
 
-// TestStateMachineHash_DetectsDivergentState pins the facility that detects
-// the one failure Raft cannot: a state machine that is not a deterministic
-// function of the log.
-//
-// GetHash existed at every layer — sm.Hasher, rsm.StateMachine.GetHash, all
-// three wrappers, and both reference stores implement it order-independently —
-// but NO public API exposed it and nothing in the engine called it. The
-// mechanism that would catch replica divergence was dead code.
+// TestStateMachineHash_DetectsDivergentState verifies the state machine hash exposes replicas whose state is not a deterministic function of the log.
 func TestStateMachineHash_DetectsDivergentState(t *testing.T) {
 	h := newTestHost(t)
 
@@ -85,8 +74,7 @@ func TestStateMachineHash_DetectsDivergentState(t *testing.T) {
 			"a comparison across replicas would be meaningless without it")
 	}
 
-	// The same state must hash the same way. An order-DEPENDENT hash would
-	// report divergence that does not exist, which is worse than no detector.
+	// The same state hashes the same way regardless of order.
 	hash2, idx2, _, err := h.StateMachineHash(1)
 	if err != nil {
 		t.Fatalf("StateMachineHash (second): %v", err)

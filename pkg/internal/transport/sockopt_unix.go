@@ -22,15 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// setListenerSockopts configures the UDP listener socket fd before it is
-// bound: SO_RCVBUF/SO_SNDBUF when recvBuf/sendBuf are positive. A failure is
-// logged rather than returned: the socket still works with the kernel's
-// defaults, and Linux caps a buffer request at net.core.rmem_max/wmem_max.
-//
-// SO_REUSEADDR is deliberately not set. UDP has no TIME_WAIT, so it buys
-// nothing on restart, and on Linux it lets two UDP sockets that both set it
-// share one address and silently split its datagrams. Without it a second bind
-// of a live listener's address fails with EADDRINUSE.
+// setListenerSockopts sets SO_RCVBUF and SO_SNDBUF on the UDP listener fd before bind when positive, logging a failure.
 func setListenerSockopts(fd uintptr, recvBuf, sendBuf int) {
 	if recvBuf > 0 {
 		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, recvBuf); err != nil {

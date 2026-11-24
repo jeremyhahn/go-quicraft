@@ -42,26 +42,14 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// tlsTransportState holds TLS transport resources created for the etcd/raft
-// election benchmark. This simulates the production TLS transport overhead
-// that etcd has in real deployments (gRPC with TLS), making the comparison
-// with QuicRaft's mandatory QUIC/mTLS transport apples-to-apples.
-//
-// The TLS setup matches QuicRaft's self-signed certificate generation:
-// ECDSA P-256 key, self-signed X.509 cert, TLS 1.3, listener + accept loop.
+// tlsTransportState holds the TLS listener resources that give the etcd/raft benchmark transport overhead comparable to QuicRaft's mTLS.
 type tlsTransportState struct {
 	listener net.Listener
 	stopCh   chan struct{}
 	done     sync.WaitGroup
 }
 
-// setupTLSTransport generates a self-signed ECDSA P-256 certificate and
-// starts a TLS listener with an accept loop. This matches the transport
-// initialization overhead in QuicRaft's NewQUICTransport:
-//   - ECDSA P-256 key generation
-//   - Self-signed X.509 certificate creation
-//   - TLS listener binding (TCP, matching QUIC's UDP bind)
-//   - Background accept loop goroutine
+// setupTLSTransport creates a self-signed ECDSA P-256 certificate and starts a TLS 1.3 listener with an accept loop.
 func setupTLSTransport() (*tlsTransportState, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
 	if err != nil {
@@ -164,11 +152,7 @@ func reportClose(tb testing.TB, what string, err error) {
 	}
 }
 
-// saveToStorage records a Ready's hard state and entries in the node's
-// MemoryStorage, which raft reads its log back from. An error means raft's
-// view of its log is no longer what it persisted, so the caller's event loop
-// stops, as it does when the WAL write fails; the benchmark then fails on its
-// own proposal or election timeout.
+// saveToStorage records a Ready's hard state and entries in MemoryStorage; an error stops the event loop.
 func saveToStorage(storage *raft.MemoryStorage, hs *raftpb.HardState, entries []*raftpb.Entry) error {
 	if !raft.IsEmptyHardState(hs) {
 		if err := storage.SetHardState(hs); err != nil {
@@ -309,13 +293,7 @@ const proposalApplyTimeout = 10 * time.Second
 // issued.
 var nextRequestID atomic.Uint64
 
-// waiters routes completion of one request, identified by its id, to the one
-// goroutine waiting for it. The apply loop completes proposal waiters with the
-// applied entry's index; the Ready loop completes read waiters with a
-// ReadState's index. This is the per-proposal acknowledgement raw etcd/raft
-// does not provide, so a proposer's latency ends when ITS entry applies, not
-// when the node's applied count reaches some number another proposer's entry
-// could satisfy.
+// waiters routes completion of each request id to its waiting goroutine.
 type waiters struct {
 	mu sync.Mutex
 	m  map[uint64]chan uint64
@@ -577,12 +555,7 @@ func setupEtcdRaftNodeMemory(b *testing.B) *etcdRaftTestNode {
 	return newEtcdRaftTestNode(b, nil)
 }
 
-// newEtcdRaftTestNode starts a single-node etcd/raft cluster persisting to
-// wal (nil for memory mode). It starts the event-loop goroutine that persists
-// entries, applies committed entries through a state machine and advances the
-// raft node, and the 1 ms ticker. Leadership comes from the randomized
-// election timeout, as in every harness (no Campaign shortcut). It then runs
-// the setup warmup. The node is stopped by b.Cleanup.
+// newEtcdRaftTestNode starts a single-node etcd/raft cluster persisting to wal (nil for memory), with its event loop and 1ms ticker, and runs the warmup.
 func newEtcdRaftTestNode(b *testing.B, wal *walWriter) *etcdRaftTestNode {
 	b.Helper()
 
@@ -692,16 +665,7 @@ func (tn *etcdRaftTestNode) waitForConfChange(timeout time.Duration) bool {
 	return tn.confTracker.wait(timeout)
 }
 
-// eventLoop processes Ready structs from the etcd/raft node. For each
-// Ready batch it:
-//  1. Persists entries and hard state to WAL with single fsync -- skipped when wal is nil
-//  2. Appends entries to MemoryStorage (raft internal requirement)
-//  3. Applies committed entries through the state machine
-//  4. Signals the waiter of each proposal whose entry was applied
-//  5. Advances the raft node
-//
-// When wal is nil (memory mode), step 1 is skipped to benchmark
-// pure in-memory raft performance.
+// eventLoop persists each Ready (unless wal is nil), appends to MemoryStorage, applies committed entries, signals waiters and advances the node.
 func (tn *etcdRaftTestNode) eventLoop() {
 	for {
 		select {
@@ -854,12 +818,7 @@ func benchEtcdRaftConcurrentPropose(b *testing.B, tn *etcdRaftTestNode, payloadS
 	}
 }
 
-// benchEtcdRaftElection measures the time from node creation to leader
-// election via natural randomized election timeout (no Campaign shortcut).
-// Each iteration opens a fresh WAL file before the timer starts; the timer
-// covers StartNode, the durable writes of the election itself, and the wait
-// for a leader. A ticker goroutine drives node.Tick() at 1ms intervals
-// matching QuicRaft's RTTMillisecond.
+// benchEtcdRaftElection times node start to leader election with a fresh WAL per iteration and a 1ms ticker.
 func benchEtcdRaftElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
@@ -1017,15 +976,7 @@ func benchEtcdRaftCommitLatency(b *testing.B, tn *etcdRaftTestNode, payloadSize 
 // Multi-Node Cluster Benchmark Functions
 // ---------------------------------------------------------------------------
 
-// benchEtcdRaftElectionCluster measures multi-node election time. The
-// cluster infrastructure (TLS material, reserved addresses, transport
-// listeners) is created once outside the timed loop, as QuicRaft and
-// Dragonboat create their hosts once. Each iteration prepares a fresh set
-// of nodes (storage, WAL files) outside the timer, then times only starting
-// every node and waiting until a leader is known, then stops the nodes.
-// Each round uses new raft ids so traffic left over from the previous round
-// is dropped by the transport instead of reaching the new nodes, the way
-// Dragonboat gives each round its own shard ID.
+// benchEtcdRaftElectionCluster times starting a fresh multi-node cluster until a leader is known, reusing the transport and using new raft ids each round.
 func benchEtcdRaftElectionCluster(b *testing.B, numNodes int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 

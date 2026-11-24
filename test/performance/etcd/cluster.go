@@ -318,17 +318,7 @@ func (cn *etcdClusterNode) clusterEventLoop() {
 				isLeader = rd.RaftState == raft.StateLeader
 			}
 
-			// A leader sends its messages in parallel with persisting, as
-			// the raft package documents (go.etcd.io/raft/v3 doc.go and
-			// README, "Usage" step 2: "an optimization can be applied to
-			// make leader write to disk in parallel with its followers (as
-			// explained at section 10.2.1 in Raft thesis)") and as the etcd
-			// server's raftNode does. A follower persists first, because its
-			// messages (append and vote responses) promise durable state.
-			// Either way an entry is applied, and so acknowledged, only after
-			// this Ready's single fsync below, and the send finishes before
-			// Advance so no message is marshalled while the next Ready's
-			// entries are persisted.
+			// A leader sends messages in parallel with persisting, as the etcd raft package documents.
 			var leaderSend sync.WaitGroup
 			if isLeader && len(rd.Messages) > 0 {
 				leaderSend.Add(1)

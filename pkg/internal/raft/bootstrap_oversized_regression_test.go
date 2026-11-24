@@ -24,22 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// The bootstrap entry must never be DURABLE BUT UNREADABLE
-//
-// BuildInitialMembershipEntry marshals the membership Host.StartShard assembled
-// from the caller's members map and Config.MemberIdentities, and the result is
-// committed at log index 1. A limit enforced on READ only would let an
-// over-length address marshal happily and the shard bootstrap, and then the
-// NEXT start of that shard could not decode its own index-1 entry:
-// reconstructShardMembership -> ReconstructMembership -> Membership.UnmarshalFrom
-// -> getMap returns ErrAddressTooLong, and StartShard propagates it. The shard
-// would be permanently unstartable, with no remedy but deleting its data
-// directory. The encoder therefore enforces every limit on WRITE as well.
-//
-// These tests drive the durable path itself — build the entry, then decode it
-// the way recovery does — rather than the codec in isolation.
-// ---------------------------------------------------------------------------
+// The encoder enforces read limits on write, so a bootstrap entry is never durable but unreadable.
 
 // oversizedBootstrapMembership is the shape Host.StartShard produces when the
 // operator hands it an over-length address: the members map copied verbatim into
@@ -65,11 +50,7 @@ func TestBuildInitialMembershipEntry_RefusesAnUnreadableMembership(t *testing.T)
 	}
 }
 
-// TestBuildInitialMembershipEntry_TheRoundTripIsWhatBreaks demonstrates the
-// durable consequence directly: encode the oversized membership the way the old
-// encoder did, then run the RECOVERY decode over it and show that is the half
-// that fails. Without this the test above could be satisfied by an encoder that
-// refused something the decoder would happily have read.
+// TestBuildInitialMembershipEntry_TheRoundTripIsWhatBreaks shows an unchecked oversized entry fails the recovery decode.
 func TestBuildInitialMembershipEntry_TheRoundTripIsWhatBreaks(t *testing.T) {
 	ms := oversizedBootstrapMembership()
 
@@ -127,24 +108,7 @@ func TestBuildInitialMembershipEntry_LegalMembershipStillRoundTrips(t *testing.T
 	}
 }
 
-// encodeMembershipUnchecked writes the current Membership layout for a value
-// whose only maps are Addresses, with the per-value length bound BYPASSED. It
-// reproduces exactly what proto.Membership.MarshalTo emitted before the
-// write-side limits were added, which is the only way to obtain these bytes now.
-//
-// Layout, spelled out because that is half the point of the test:
-//
-//	[Version:1][ConfigChangeID:8][MaxWitnesses:8][RequireFullReplicaMajority:8]
-//	[SessionExpiryEntries:8][MaxTotalSessions:8][MaxResponsesPerSession:8]
-//	[Addresses][Observers][Witnesses][Removed][Identities][RemovedIdentities]
-//
-// with each map encoded as [count:4] followed by [key:8][len:4][value] per entry
-// in ascending key order.
-//
-// The version byte must be the one proto writes, not a hard-coded historical
-// number: the decoder gates on EXACT equality, so a stale value here would make
-// the assertion below pass for the wrong reason — ErrUnsupportedVersion instead
-// of the ErrAddressTooLong this test is about.
+// encodeMembershipUnchecked writes the Membership layout for an Addresses-only value without the per-value length bound, using proto's current version byte.
 func encodeMembershipUnchecked(ms proto.Membership) []byte {
 	const membershipVersionByte = 1
 	const fixedSize = 1 + 3*8 + 4*8 + 8 // 65: header, session policy, WireVersion

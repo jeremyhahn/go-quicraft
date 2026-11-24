@@ -133,10 +133,7 @@ func TestStepWorker_ProposalBatching(t *testing.T) {
 	default:
 	}
 
-	// Deliver 4 proposals via the MPSC queue and 1 Heartbeat via inbox.
-	// Each DeliverProposal simulates a concurrent goroutine proposing
-	// independently. The Heartbeat is a transport message and uses the
-	// channel-based inbox.
+	// Deliver 4 proposals through the proposal queue and 1 Heartbeat through the inbox.
 	for i := range 4 {
 		node.DeliverProposal([]proto.Entry{{Cmd: []byte{byte(i + 1)}}})
 	}
@@ -377,12 +374,7 @@ func newMultiNodeLeaderTestPeer(t *testing.T, shardID, replicaID uint64) (*raft.
 	return peer, lr
 }
 
-// TestStepWorker_CommitPendingInbox_ReadIndexResolution verifies that
-// the commitPending fast path drains inbox messages and delivers
-// ReadIndex results via the OnReadyToRead callback, even while the
-// commit/apply pipeline is in-flight. This is the core optimization:
-// HeartbeatResp messages that satisfy ReadIndex quorum are processed
-// without waiting for commitPending to clear.
+// TestStepWorker_CommitPendingInbox_ReadIndexResolution verifies ReadIndex resolves through the commitPending path while the pipeline is busy.
 func TestStepWorker_CommitPendingInbox_ReadIndexResolution(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -414,9 +406,7 @@ func TestStepWorker_CommitPendingInbox_ReadIndexResolution(t *testing.T) {
 	default:
 	}
 
-	// Issue a ReadIndex request via the MPSC ReadIndex queue. For a
-	// 3-node cluster without LeaseRead, this requires heartbeat quorum
-	// confirmation.
+	// Issue a ReadIndex; without LeaseRead a 3-node cluster needs heartbeat quorum.
 	node.DeliverReadIndex(42)
 
 	// Process the ReadIndex: FlushReadIndex broadcasts heartbeats.
@@ -448,10 +438,7 @@ func TestStepWorker_CommitPendingInbox_ReadIndexResolution(t *testing.T) {
 		Type: proto.HeartbeatResp,
 		From: 2,
 		Term: hbTerm,
-		// The context the leader ACTUALLY issued. Exactly one ReadIndex was
-		// delivered above, and handleLeaderReadIndex assigns contexts by
-		// incrementing from zero at becomeLeader, so it is 1. A larger value is a
-		// message no honest follower could send, and the leader now refuses it.
+		// The context the leader issued: the first ReadIndex after becomeLeader is 1.
 		Hint: 1,
 	})
 	node.Deliver(proto.Message{
@@ -499,9 +486,7 @@ func TestStepWorker_CommitPendingInbox_NilPeerSkipped(t *testing.T) {
 	sw.processReady()
 }
 
-// TestStepWorker_ReadIndexBatching_SingleKey verifies that a single
-// ReadIndex key is submitted through the MPSC queue and processed by
-// the step worker without triggering OnReadIndexBatched (no aliases).
+// TestStepWorker_ReadIndexBatching_SingleKey verifies a single key is processed without OnReadIndexBatched.
 func TestStepWorker_ReadIndexBatching_SingleKey(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -531,7 +516,7 @@ func TestStepWorker_ReadIndexBatching_SingleKey(t *testing.T) {
 	default:
 	}
 
-	// Deliver a single ReadIndex key via the MPSC queue.
+	// Deliver a single ReadIndex key.
 	if !node.DeliverReadIndex(42) {
 		t.Fatal("DeliverReadIndex should succeed")
 	}
@@ -597,10 +582,7 @@ func TestStepWorker_ReadIndexBatching_NilCallback(t *testing.T) {
 	}
 }
 
-// orderingCallback records the order in which OnReadIndexBatched and
-// OnReadyToRead fire, allowing tests to verify that aliases are
-// registered BEFORE the raft layer produces readStates. Each call
-// appends an event to a shared sequence slice under a mutex.
+// orderingCallback records the order of OnReadIndexBatched and OnReadyToRead calls.
 type orderingCallback struct {
 	testCallback
 	seqMu  sync.Mutex
@@ -666,13 +648,7 @@ func (o *orderingCallback) getEvents() []orderingEvent {
 
 var _ Callback = (*orderingCallback)(nil)
 
-// TestStepWorker_ReadIndexBatching_AliasesRegisteredBeforeHandle verifies
-// that OnReadIndexBatched fires BEFORE OnReadyToRead in the normal
-// processReady path. In a single-node cluster, Handle(ReadIndex)
-// resolves immediately, so GetUpdate returns ReadyToRead in the same
-// cycle. If aliases were registered after Handle, OnReadyToRead would
-// complete the batchKey without resolving the aliases, leaving alias
-// callers blocked until context deadline.
+// TestStepWorker_ReadIndexBatching_AliasesRegisteredBeforeHandle verifies OnReadIndexBatched fires before OnReadyToRead in processReady.
 func TestStepWorker_ReadIndexBatching_AliasesRegisteredBeforeHandle(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -797,12 +773,7 @@ func TestStepWorker_ReadIndexBatching_AliasesRegisteredBeforeHandle(t *testing.T
 	}
 }
 
-// TestStepWorker_ReadIndexBatching_AliasesBeforeHandle_CommitPending
-// verifies the same ordering guarantee as the test above, but for the
-// commitPending fast path (processCommitPendingInbox). When the
-// commit pipeline is in-flight, ReadIndex keys are still drained and
-// submitted under raftMu. The aliases must be registered before
-// Handle(ReadIndex) to prevent the race.
+// TestStepWorker_ReadIndexBatching_AliasesBeforeHandle_CommitPending is the same ordering check on the commitPending path.
 func TestStepWorker_ReadIndexBatching_AliasesBeforeHandle_CommitPending(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -902,18 +873,7 @@ func TestStepWorker_ReadIndexBatching_AliasesBeforeHandle_CommitPending(t *testi
 
 // --- GAP-1: Message Ordering Relative to WAL Persistence Tests ---
 
-// TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim pins the window
-// that Peer.InvalidatePersistedState exists to close.
-//
-// OnReadyToRead is invoked inline on the step worker, before the update reaches
-// any persistence path, and GetUpdate has ALREADY advanced prevState by then. A
-// panic there destroys the update while the peer still believes its hard state
-// is durable — after which every subsequent update is classified ReadOnly and
-// skips SaveState, so a granted vote is answered but never written.
-//
-// The engine's restart loop calls discardExtractedUpdate on the unwind; this
-// asserts the worker has recorded which node needs that treatment, and that
-// applying it re-arms the peer.
+// TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim: a panic in OnReadyToRead leads to InvalidatePersistedState on the node.
 func TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -1000,20 +960,7 @@ func TestProcessReady_PanicInReadyToRead_ReclaimsDurabilityClaim(t *testing.T) {
 	}
 }
 
-// persistBeforeRespondFixture is the message set both split sites are driven
-// with below. The classification is written out as LITERAL message types on
-// purpose.
-//
-// Every pre-existing test of this property partitioned its observations with
-// proto.IsFreeOrderMessage — the same predicate the production code branches
-// on — so the test's expectation moved in lockstep with the behaviour it was
-// meant to pin. Inverting the split in enqueueForCommit sent every
-// RequestVoteResp before its fsync and the entire package still passed. That
-// mutation is two-leaders-in-one-term: a follower that answers a vote request
-// before the grant is durable can crash, forget the vote, and grant it again
-// to a different candidate in the same term.
-//
-// Nothing in this file may ask proto.IsFreeOrderMessage what the answer is.
+// persistBeforeRespondFixture classifies messages as literal types; never derive it from proto.IsFreeOrderMessage.
 var persistBeforeRespondFixture = struct {
 	messages []proto.Message
 	// freeOrder may go out before the state behind them is durable.
@@ -1054,18 +1001,11 @@ func containsType(msgs []proto.Message, t uint64) bool {
 	return false
 }
 
-// TestEnqueueForCommit_OrderedMessagesWithheldUntilPersist drives the real
-// WAL-mode split site with a synthetic update carrying both classes, and
-// asserts the outcome against the literal fixture above.
-//
-// This is the test that fails when the split predicate in enqueueForCommit is
-// inverted, and it is the only one in the package that does.
+// TestEnqueueForCommit_OrderedMessagesWithheldUntilPersist drives the WAL-mode split site against the literal fixture.
 func TestEnqueueForCommit_OrderedMessagesWithheldUntilPersist(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
-	// Buffered by one: enqueueForCommit hands the item over and returns, so
-	// everything observed on the sender afterwards was transmitted BEFORE the
-	// commit worker could possibly have called SaveState.
+	// Buffered by one, so anything sent afterwards went out before SaveState could run.
 	commitC := make(chan *commitItem, 1)
 	stopC := make(chan struct{})
 	cb := newTestCallback()
@@ -1119,13 +1059,7 @@ func TestEnqueueForCommit_OrderedMessagesWithheldUntilPersist(t *testing.T) {
 	}
 }
 
-// TestCommitMemoryMode_OrderedMessagesSentAfterCommit is the memory-mode twin.
-//
-// Memory mode has no fsync, so the split is observable as two distinct SEND
-// BATCHES either side of peer.Commit: batch 0 before, batch 1 after. The
-// existing coverage of this site checked batch membership with
-// proto.IsFreeOrderMessage, so inverting the split moved test and code
-// together; this compares each batch against the literal fixture instead.
+// TestCommitMemoryMode_OrderedMessagesSentAfterCommit checks the memory-mode send batches against the literal fixture.
 func TestCommitMemoryMode_OrderedMessagesSentAfterCommit(t *testing.T) {
 	sender := newSequenceSender()
 	ws := NewWorkSignal(1)
@@ -1841,12 +1775,7 @@ func TestStepWorker_RedeliverDeferredSnapshots_RetainsUndelivered(t *testing.T) 
 	}
 }
 
-// TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll verifies
-// that when the inbox contains ONLY InstallSnapshot messages during
-// commitPending, they are deferred and processCommitPendingInbox returns
-// early without acquiring raftMu. Only the highest-index snapshot is kept:
-// older ones are strictly superseded, and retaining every leader
-// retransmission would grow the buffer without bound.
+// TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll verifies an InstallSnapshot-only inbox is deferred, keeping only the highest index.
 func TestStepWorker_CommitPendingInbox_OnlyInstallSnapshotDefersAll(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -2352,12 +2281,7 @@ func TestProcessCallbacks_CampaignDetection(t *testing.T) {
 // processReady keeps recovering nodes in the protocol
 // ---------------------------------------------------------------------------
 
-// TestProcessReady_RecoveringNodeDrainsInbox verifies that processReady
-// still drains and steps the inbox of a recovering node. Raft message
-// handling touches only raft state and the log, never the state machine
-// the snapshot pool is replacing, so a recovering replica must keep
-// answering RequestVote and Heartbeat. When it does not, a shard with two
-// replicas recovering at once loses quorum with every node still up.
+// TestProcessReady_RecoveringNodeDrainsInbox verifies a recovering node still steps its inbox.
 func TestProcessReady_RecoveringNodeDrainsInbox(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -2607,12 +2531,7 @@ func TestExecutePiggyback_WithFreeOrderMessages(t *testing.T) {
 // processReady with commitPending inbox processing (merged from coverage_step_test.go)
 // ---------------------------------------------------------------------------
 
-// TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop verifies
-// that an InstallSnapshot message deferred during commitPending is NOT
-// re-delivered on every subsequent processReady cycle. The step worker
-// buffers deferred InstallSnapshot messages in deferredSnapshots and
-// re-injects them into the inbox when commitPending clears, preventing
-// the CPU-burning drain-redeliver loop.
+// TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop verifies a deferred InstallSnapshot is not redelivered every cycle.
 func TestStepWorker_CommitPendingInbox_InstallSnapshotNoRedeliveryLoop(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -2789,14 +2708,7 @@ func TestCommitMemoryMode_CommitError_FailsShard(t *testing.T) {
 // commitC backpressure must not silence the shard
 // ---------------------------------------------------------------------------
 
-// TestProcessReady_CommitCFull_FlushesFreeOrderMessages verifies that the
-// commitC-full backpressure skip still flushes the peer's free-order
-// messages (heartbeats, Replicate). GetUpdate is the only other drain of
-// those messages on this path and commitPending is false here, so tick()'s
-// drain does not run either: skipping without a flush leaves a leader's
-// heartbeats sitting in the peer for as long as the commit worker is
-// behind. A single SaveState retry backoff (up to ~1.76s) is enough for
-// followers to time out and campaign against a live leader.
+// TestProcessReady_CommitCFull_FlushesFreeOrderMessages verifies the commitC-full skip still flushes heartbeats and Replicate.
 func TestProcessReady_CommitCFull_FlushesFreeOrderMessages(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)

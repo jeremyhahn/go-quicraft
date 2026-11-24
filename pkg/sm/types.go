@@ -12,32 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package sm defines the state machine interfaces and supporting types
-// for user-implemented state machines in QuicRaft. Users implement one
-// of the three state machine interfaces (StateMachine, ConcurrentStateMachine,
-// or DiskStateMachine) and provide a factory function to create instances.
-// QuicRaft handles consensus, replication, snapshotting, and recovery.
+// Package sm defines the StateMachine, ConcurrentStateMachine and DiskStateMachine interfaces users implement for QuicRaft.
 package sm
 
-// Reserved Result.Value constants used internally by the RSM layer to
-// signal session-related conditions back through the apply pipeline.
-// These values occupy the high end of the uint64 range (alongside the
-// session series ID sentinels) and must not be used by application code.
+// Result.Value constants reserved by the RSM layer; applications must not use them.
 const (
-	// ResultSessionExpired is the reserved Result.Value set by the RSM
-	// when a session-managed entry references an unregistered clientID.
-	// This happens after session expiry or snapshot restore that did not
-	// include the session. The host translates this into ErrSessionExpired
-	// on the RequestResult so the client can distinguish it from a
-	// legitimate zero-value result (Raft PhD Figure 6.1, step 3).
+	// ResultSessionExpired marks an entry for an unregistered client; the host reports ErrSessionExpired.
 	ResultSessionExpired uint64 = 1<<64 - 3 // math.MaxUint64 - 2
 
-	// ResultInvalidCommand is the reserved Result.Value set by a state
-	// machine when a committed entry's payload cannot be decoded. A
-	// committed entry MUST be applied deterministically on every replica:
-	// returning an Update error would mark the shard failed and permanently
-	// wedge it on replay, so a malformed payload instead yields this
-	// per-entry result and the store state is left unchanged for that entry.
+	// ResultInvalidCommand marks a committed entry whose payload cannot be decoded; the state is left unchanged.
 	ResultInvalidCommand uint64 = 1<<64 - 4 // math.MaxUint64 - 3
 )
 
@@ -49,14 +32,7 @@ type Result struct {
 	Data  []byte
 }
 
-// Entry represents a committed log entry applied to the state machine.
-// This is a simplified view of the internal proto.Entry -- users do not
-// see Raft-internal fields (Term, Key, ClientID, etc.). Term is excluded
-// because state machines should be term-agnostic.
-//
-// By default, Cmd is an owned copy. When Config.ZeroCopyEntryCmd is true,
-// Cmd aliases an internal buffer that is reused after Update() returns.
-// The state machine must copy Cmd if it needs the data to outlive the call.
+// Entry is a committed log entry as the state machine sees it; Cmd aliases an internal buffer when Config.ZeroCopyEntryCmd is set.
 type Entry struct {
 	// Index is the Raft log index of this entry.
 	Index uint64

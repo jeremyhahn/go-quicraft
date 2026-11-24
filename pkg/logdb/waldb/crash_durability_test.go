@@ -48,13 +48,7 @@ const (
 // spans four segment files and a crash can land between two shards' writes.
 var crashDurShardIDs = []uint64{1, 2, 3, 4}
 
-// crashDurEntriesPerBatch keeps each shard's per-batch payload above one block
-// so a block seal (segment.WriteAt) is guaranteed.
-//
-// It is a var, not a const, so crashPhaseMidBatchRotation can widen a single
-// batch far enough to rotate INSIDE itself. At the default of 2 every rotation
-// falls between batches, which is precisely why the suite could not see the
-// one flush a mid-batch rotation depends on.
+// crashDurEntriesPerBatch keeps each batch above one block; a var so crashPhaseMidBatchRotation can widen it.
 var crashDurEntriesPerBatch = 2
 
 // crashDurEntry regenerates the entry a writer stores at the given position.
@@ -77,9 +71,7 @@ func crashDurEntry(shardID, index, term uint64) logdb.Entry {
 	}
 }
 
-// crashDurWriter drives SaveState batches and remembers exactly what the
-// caller was TOLD is durable. Only a batch that returned nil is recorded: that
-// is the acknowledgement whose loss the durability contract forbids.
+// crashDurWriter drives SaveState batches and records only those acknowledged durable.
 type crashDurWriter struct {
 	db    *DB
 	next  map[uint64]uint64
@@ -308,23 +300,7 @@ func (h *crashDurHarness) shardDir(shardID uint64) string {
 	return filepath.Join(h.dir, shardDirName(int(shardID%DefaultShardCount)))
 }
 
-// TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss is the durability
-// regression test the error-injection doubles cannot express. crashFS keeps a
-// durable image that only File.Sync advances, so a write the WAL acked without
-// flushing is GONE after Crash — the exact and only symptom of a missing
-// fsync, which neither error injection (no failing call exists) nor a SIGKILL
-// crash test (page-cache data survives process death) can detect.
-//
-// MODELLED is not a hedge, it is the boundary. Power loss here is a property
-// of crashFS, which is entirely in memory and defines durability as "File.Sync
-// returned": no disk is written, no fsync(2) is issued, and the test is
-// therefore blind to whether the production osFile.Sync issues one either.
-// Stub osFile.Sync to return nil and every case below still passes. What it
-// does prove — that the WAL calls Sync on the right file before it
-// acknowledges, and that recovery keeps every acknowledgement afterwards — is
-// the half of durability that lives in this package. The other half, that the
-// call reaches the medium, is asserted by TestOSFileSyncIssuesRealSyscall in
-// fs_sync_test.go, and neither test is sufficient without the other.
+// TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss checks acked writes survive crashFS power loss; TestOSFileSyncIssuesRealSyscall covers the syscall.
 func TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -403,20 +379,7 @@ func crashPhaseMidBatch(t *testing.T, h *crashDurHarness) {
 	}
 }
 
-// crashPhaseMidBatchRotation acks ONE batch large enough to rotate INSIDE
-// itself, then cuts power.
-//
-// This is the state no other phase in this suite produces, and it is the only
-// one in which rotateSegment's fsync is load-bearing. SaveState sets batchMode,
-// which suppresses writeRecord's inline sync (db.go), and syncSegment flushes
-// only s.activeSegment — so when a batch rotates part-way through, the fsync in
-// rotateSegment is the ONLY flush the OUTGOING segment ever receives.
-// segment.Close does flushBlock + Truncate + Close and does not fsync.
-//
-// With the default 2 entries per batch every rotation falls BETWEEN batches, so
-// deleting that fsync left both the waldb suite and the errfs suite fully
-// green while a crash lost entries the WAL had already acknowledged — and Raft
-// had already told peers were committed.
+// crashPhaseMidBatchRotation acks one batch that rotates inside itself, then cuts power, exercising rotateSegment's fsync.
 func crashPhaseMidBatchRotation(t *testing.T, h *crashDurHarness) {
 	t.Helper()
 	h.w.mustSave(t, 2)
@@ -653,46 +616,7 @@ func TestCrashFS_RemovalDurability(t *testing.T) {
 	}
 }
 
-// TestWALCrashDurability_PartialWritebackLeavesDataAboveAHole is the crash the
-// durability-sequence scheme (record.go) exists to classify, driven end to end
-// through the real WAL rather than by editing bytes in a file.
-//
-// A crash model that loses an unsynced file wholesale can only produce one
-// shape of power loss: the log ends early at a clean record boundary. That
-// shape needs no discriminator — there is no damage under acknowledged data to
-// judge. The shape that DOES need one is the other one, and it is the common
-// one: a batch spanning several blocks issues one WriteAt per block before a
-// single fdatasync, so writeback is free to persist page N+1 and drop page N.
-// What is left on the medium is a zero-filled hole with perfectly decodable
-// records above it — byte-for-byte what interior bit rot under acknowledged
-// data looks like, and what a recovery that ignored the generations would
-// refuse to open after an ordinary power loss.
-//
-// crashWriteback models that shape, and this test exercises it. It drops
-// exactly one page of one in-flight batch, asserts the post-crash image really
-// has decodable data above a zero-filled hole (otherwise the case is vacuous),
-// and then requires the WAL to open, repair itself, and keep every
-// acknowledged entry. WHICH page is dropped selects between the two
-// classifications the generation evidence can reach:
-//
-//   - Drop a page INSIDE the batch. The page below it holds the batch's head,
-//     so the clean prefix already carries the in-flight generation and the
-//     survivors carry the same one. Nothing above the damage has a completed
-//     fdatasync behind it: an ordinary interrupted write, repaired silently.
-//   - Drop the batch's FIRST page — the one straddling the boundary between
-//     acknowledged bytes and the batch. The clean prefix then ends in the
-//     acknowledged generation while the survivors carry the next one, so an
-//     fdatasync completed somewhere inside the destroyed bytes. The survivors'
-//     GENERATION START says exactly where: at the hole, because the lost page
-//     reverted to its durable content and the acknowledged bytes on it are
-//     intact. Recovery truncates, provably, with nothing left for the
-//     operator to reconcile by hand.
-//
-// The companion direction — the SAME hole shape, but with survivors whose
-// generations prove a completed fdatasync ABOVE the damage, which must refuse
-// to open — is TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable; and
-// damage that begins BELOW the acknowledged end the survivors name is
-// TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed.
+// TestWALCrashDurability_PartialWritebackLeavesDataAboveAHole checks the WAL opens, repairs and keeps every acked entry after one page of a batch is lost.
 func TestWALCrashDurability_PartialWritebackLeavesDataAboveAHole(t *testing.T) {
 	cases := []struct {
 		name string
@@ -804,8 +728,7 @@ func partialWritebackCase(t *testing.T, pageOffset int) {
 		return
 	}
 
-	// The model must actually have produced the failure mode, or everything
-	// below is vacuous: a zero-filled hole with decodable data ABOVE it.
+	// The image must have a zero-filled hole with decodable data above it.
 	image := readWholeFile(t, cfs, segPath)
 	hiOff := (lostPage + 1) * blockSize
 	if hiOff+blockSize > len(image) {
@@ -863,16 +786,7 @@ func partialWritebackCase(t *testing.T, pageOffset int) {
 	}
 }
 
-// TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed is the case the
-// generation start exists to catch: the same single-generation
-// survivors as an ordinary interrupted write, but the damage begins BELOW the
-// acknowledged end those survivors name, so the fdatasync that opened their
-// generation had acknowledged bytes the damage destroyed. No crash produces
-// this — a lost writeback leaves an fsynced page at its persisted content — so
-// it is written directly into the segment image as media damage would be: the
-// last acknowledged record's tail is zeroed, leaving the in-flight batch's
-// survivors intact above it. Recovery must refuse to open with
-// ErrAcknowledgedDataLost rather than come up shorter than the log it promised.
+// TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed checks damage below the acknowledged end refuses to open with ErrAcknowledgedDataLost.
 func TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed(t *testing.T) {
 	const (
 		root      = "/mnt/acked-damage"
@@ -900,9 +814,7 @@ func TestWALCrashDurability_DamageBelowAcknowledgedEndFailsClosed(t *testing.T) 
 			Entries:   entries,
 		}})
 	}
-	// Several acknowledged generations, then one in-flight batch that is cut
-	// at its fdatasync with EVERY page retained: the image is a complete,
-	// undamaged log whose tail is one unsynced generation.
+	// Several acked generations, then one in-flight batch cut at its fdatasync with every page kept.
 	var acked uint64
 	for b := 0; b < 6; b++ {
 		if err := save(db, acked+1, 2); err != nil {
@@ -1068,23 +980,7 @@ func allZero(b []byte) bool {
 	return true
 }
 
-// TestWALCrashDurability_RecoveryTruncationSurvivesTheNextCrash pins the fsync
-// inside truncateCorruptSegment, which nothing else in this repository held:
-// deleting it left the whole waldb suite, and the errfs fault-injection suite,
-// green.
-//
-// Recovery repairs a torn segment by cutting it back to the clean prefix. That
-// cut is a WRITE, and a write is not a repair until it is durable. Without the
-// flush the next power loss brings the corrupt tail straight back — and it
-// comes back UNDERNEATH the segments written since, which is what makes the
-// consequence permanent rather than merely repeated work: a corruption in a
-// NON-FINAL segment cannot be a torn tail (rotation fsyncs a segment in full
-// before any higher one is created), so recovery correctly refuses to open the
-// database at all. A node that repaired itself, acknowledged more entries and
-// then lost power comes back dead.
-//
-// The whole sequence runs against crashFS, so "durable" means exactly "Sync
-// returned" and nothing else.
+// TestWALCrashDurability_RecoveryTruncationSurvivesTheNextCrash checks truncateCorruptSegment's repair is fsynced.
 func TestWALCrashDurability_RecoveryTruncationSurvivesTheNextCrash(t *testing.T) {
 	const (
 		root      = "/mnt/repair-durability"
@@ -1168,9 +1064,7 @@ func TestWALCrashDurability_RecoveryTruncationSurvivesTheNextCrash(t *testing.T)
 		return
 	}
 
-	// Recovery repairs the torn segment, and the repaired node then
-	// acknowledges more entries. Those land in a FRESH segment: recover()
-	// advances nextSegmentID past every observed segment before replay.
+	// The repaired node acks more entries into a fresh segment.
 	repaired := mustOpen()
 	if err := save(repaired, acked+1, 2); err != nil {
 		t.Fatalf("SaveState after the repair: %v", err)
@@ -1229,22 +1123,7 @@ func TestWALCrashDurability_RecoveryTruncationSurvivesTheNextCrash(t *testing.T)
 	}
 }
 
-// TestWALCrashDurability_RolledBackBatchStaysRolledBack pins the fsync inside
-// segment.DiscardPending, which no test held: deleting it left the whole
-// waldb suite and the errfs suite green.
-//
-// When one shard of a SaveState batch fails, every shard that already wrote is
-// rolled back by truncating its segment to the pre-batch checkpoint. The
-// truncation alone is not enough. Nothing says the discarded bytes are still
-// only in the page cache — writeback flushes dirty pages on its own schedule,
-// with no fsync involved — so they may already be on the medium when the
-// rollback happens. Truncating the live image does not unwrite them; only
-// flushing the truncation does. Without that flush a crash restores the file
-// as writeback left it, and recovery replays records from a batch the caller
-// was explicitly told had FAILED, as committed entries.
-//
-// crashFS.Writeback supplies the missing event: the batch's bytes reach the
-// medium BEFORE the failure, exactly as a real page-cache flush would.
+// TestWALCrashDurability_RolledBackBatchStaysRolledBack checks DiscardPending's truncation is fsynced, so a failed batch is not replayed.
 func TestWALCrashDurability_RolledBackBatchStaysRolledBack(t *testing.T) {
 	const (
 		root      = "/mnt/rollback-durability"
@@ -1289,30 +1168,14 @@ func TestWALCrashDurability_RolledBackBatchStaysRolledBack(t *testing.T) {
 
 	segA := onlySegmentPath(t, cfs, filepath.Join(dir, shardDirName(int(shardA%DefaultShardCount))))
 
-	// Writeback flushes shard A's dirty pages the moment the batch below writes
-	// them — before the batch fails, and with no fsync involved.
-	// crashOpWriteAtDone, not crashOpWriteAt: the flush has to capture what the
-	// write just put in the page cache, and every other hook fires BEFORE its
-	// operation applies.
+	// Writeback flushes shard A's pages as the batch writes them, before it fails; crashOpWriteAtDone fires after the write applies.
 	cfs.setHook(func(op crashOp, path string) {
 		if op == crashOpWriteAtDone && path == segA {
 			cfs.Writeback(segA)
 		}
 	})
 
-	// Shard A is listed FIRST and writes successfully; shard B then fails
-	// permanently, because a record whose framed size exceeds the whole segment
-	// can never fit. The batch is rolled back, shard A included.
-	//
-	// Shard A gets TWO updates, and that is load-bearing. A batch never flushes
-	// a partial block, so the LAST record it writes always keeps its final
-	// chunk in the block buffer and never reaches the medium; recovery discards
-	// an unassembled First/Middle run without a word, so a single-record batch
-	// looks correctly rolled back whether or not the rollback was ever made
-	// durable. The second update's writes seal the blocks holding the first
-	// update's record, which is what puts a COMPLETE, replayable record from a
-	// failed batch on the disk — the only thing the rollback's flush can be
-	// tested against.
+	// Shard A writes two updates and shard B fails permanently, rolling the batch back; the second update seals a complete record from the failed batch on disk.
 	err := db.SaveState([]logdb.Update{
 		{ShardID: shardA, ReplicaID: replicaID,
 			Entries: []logdb.Entry{entry(shardA, 2, 2000)}},
@@ -1367,18 +1230,7 @@ func TestWALCrashDurability_RolledBackBatchStaysRolledBack(t *testing.T) {
 	}
 }
 
-// TestWALCrashDurability_ClosingMarkIsDurable pins that a segment closed by
-// rotation or by a clean shutdown carries nothing unsynced. Sync appends its
-// mark AFTER its fdatasync, so the mark closing a segment's last generation is
-// the one unsynced thing such a segment would hold; a later power loss tearing
-// it in its writeback window would fail its CRC, and once the segment is
-// non-final — rotation makes it so at once, a restart that writes a new
-// segment makes it so later — recovery refuses damage in it
-// (ErrNonFinalSegmentCorruption) precisely because a non-final segment is
-// durable end to end. Rotation's idle Sync fdatasyncs the mark; segment.Close
-// fdatasyncs once more for the clean shutdown that never rotates. Either way:
-// crash with every unsynced page dropped, and the closed segment must still
-// end in its mark and the WAL must open on both acknowledged batches.
+// TestWALCrashDurability_ClosingMarkIsDurable checks a segment closed by rotation or shutdown ends in its fsynced mark after a crash.
 func TestWALCrashDurability_ClosingMarkIsDurable(t *testing.T) {
 	const (
 		blockSize = 1024
@@ -1470,15 +1322,7 @@ func TestWALCrashDurability_ClosingMarkIsDurable(t *testing.T) {
 	}
 }
 
-// TestWALCrashDurability_RecoveryMakesTheFinalMarkDurable pins the third
-// path by which a segment becomes non-final: not rotation, not a clean
-// shutdown, but a PROCESS crash and restart. Sync writes its mark after its
-// fdatasync, so after the last acknowledged batch the mark sits in the page
-// cache; a SIGKILL keeps it there, the restart replays it read-only, and the
-// next write creates a higher segment — making the old one non-final while
-// its mark was never fsynced. A later power loss tearing that mark would
-// then be refused as non-final damage with nothing acknowledged lost.
-// recover fdatasyncs the highest surviving segment before that can happen.
+// TestWALCrashDurability_RecoveryMakesTheFinalMarkDurable checks recovery fdatasyncs the highest segment before a later write makes it non-final.
 func TestWALCrashDurability_RecoveryMakesTheFinalMarkDurable(t *testing.T) {
 	const (
 		root      = "/mnt/recovery-mark"

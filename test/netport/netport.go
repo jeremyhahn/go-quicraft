@@ -12,136 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package netport reserves loopback UDP ports for tests that must name a
-// listen address before the host that binds it exists.
-//
-// # The race this exists to remove
-//
-// The obvious way to spell the reservation is:
-//
-//	pc, _ := net.ListenPacket("udp", "127.0.0.1:0")
-//	addr := pc.LocalAddr().String()
-//	pc.Close()
-//	return addr
-//
-// The port is free at the instant it is read and nothing holds it afterwards,
-// so between the Close and the host's later bind the kernel may hand the same
-// number to somebody else. "Somebody else" is not exotic: 127.0.0.1:0 draws
-// from the kernel's ephemeral range,
-//
-//	$ cat /proc/sys/net/ipv4/ip_local_port_range
-//	32768	60999
-//
-// which is the identical pool the kernel draws from for the local port of an
-// OUTBOUND connection, and the identical pool the NEXT call to this helper
-// draws from. The second of those is the common failure: a four-node cluster
-// asks for four ports and is handed the same one twice, and the engine's
-// membership validation refuses the shard before the test has asserted
-// anything.
-//
-//	lease_read_test.go:716: StartShard[0] shard=1 failed: quicraft: invalid
-//	member in shard 1: replica 2 address "127.0.0.1:36761": address is already
-//	assigned to replica 1
-//
-// # Why a duplicate address is worse than that failure suggests
-//
-// The engine caught it only because both replicas were members of one shard.
-// Two hosts in different shards, or in different packages of a parallel `go
-// test` run, are not compared to each other by anything. What stops them
-// sharing a port is the bind itself: the QUIC transport sets no SO_REUSEADDR
-// (pkg/internal/transport/sockopt_unix.go, sockopt_windows.go), so whichever
-// host binds second fails to start with EADDRINUSE. A duplicate port is a loud
-// failure, but it lands on whichever test happened to start second, far from
-// the reservation that caused it, which is why narrowing the window was not an
-// acceptable fix.
-//
-// It was not always loud. The transport used to set SO_REUSEADDR, and Linux
-// lets two UDP sockets that both set it share one address, delivering to
-// whichever bound last. Measured on the CI host:
-//
-//	two SO_REUSEADDR binds on 127.0.0.1:39651 BOTH SUCCEEDED
-//	datagram delivered to: second
-//
-// That silent split is why the transport no longer sets it.
-//
-// # Measured
-//
-// Modelling newTestCluster — reserve five addresses, then bind all five with
-// SO_REUSEADDR, as the transport then did — against 24 goroutines churning the
-// ephemeral pool, 360,000 reservations each way on a 24-core host:
-//
-//	old freePort : 42 duplicate addresses within a cluster, 150 EADDRINUSE binds
-//	netport      :  0                                   ,   0
-//
-// That is roughly one duplicate per 6,900 adjacent reservations, which is why
-// it reads as an occasional CI failure rather than a reproducible one: a full
-// suite makes a few thousand adjacent pairs, so it loses this coin every few
-// runs. The 150 failed binds are the same race caught one step later, and are
-// the EADDRINUSE documented in test/performance/benchutil.
-//
-// Reservation costs 10-20us at suite volume (52ms for 5,000), so the window
-// scan is not a cost the suite notices.
-//
-// # The fix
-//
-// Reserve from a window OUTSIDE ip_local_port_range. The kernel never
-// auto-assigns a port from outside that range — not to a bind(:0), not to an
-// outbound connect() — so nothing but this package can be handed a port it has
-// handed out, and the interval between reservation and bind stops mattering.
-//
-// The same reasoning places dummy member addresses on a distinct loopback host
-// rather than on a higher port, so they cannot collide with live nodes: "high
-// enough" is a guess that a differently-configured runner invalidates while a
-// space the kernel cannot choose from is not. The window here is derived from
-// the running kernel's own sysctl for the same reason.
-//
-// Three collision sources, and what happens to each:
-//
-//   - Kernel re-assignment between reservation and bind — the duplicate-port
-//     failure and the EADDRINUSE documented in test/performance/benchutil. REMOVED: the
-//     window is disjoint from the pool the kernel assigns from.
-//   - Two reservations in one process — the case a cluster hits. REMOVED:
-//     a port handed out is recorded, and never handed out again while it may
-//     still be in flight.
-//   - Two reservations in different processes, which `go test ./...` creates by
-//     running packages in parallel. REMOVED on unix, NARROWED elsewhere.
-//
-// The PID-derived start offset and the probe were the whole cross-process
-// guard until #309, and they did not hold. Each process scans upward from its
-// own offset, but as soon as one scan reaches ports the other has reserved and
-// not yet bound, the probe passes, because a reservation is not a socket:
-// the probe binds and releases before the reserving process binds. Both
-// processes then take the same port, both advance their cursor to the next
-// one, and from there they march together, colliding on every adjacent port
-// until one of them binds first. Recycling the window and wrapping the scan
-// make that convergence a matter of time. It was measured as bursts of
-// EADDRINUSE on runs of adjacent ports in two concurrent integration
-// processes: ten in about seventy iterations.
-//
-// So a reservation now claims its port across processes as well: an
-// exclusive, non-blocking flock on <os.TempDir()>/quicraft-netport/<port>.lock,
-// taken before the probe and held by the reserving process. A port another
-// process has claimed is skipped exactly like one that fails its probe. The
-// kernel drops the lock when its holder exits, however it exits, so a crashed
-// test leaks nothing; the zero-byte files are left in place. One lock covers a
-// port for both networks, as the in-process record does. A process keeps only
-// its most recent inFlightRetain claims, since a claim covers the interval up
-// to the bind and the probe covers the bound port after it.
-//
-// What remains:
-//
-//   - On platforms without flock (windows, among the cross-builds), or when
-//     the lock directory cannot be created, the probe and the start offset
-//     are the only cross-process guard, as before.
-//   - A process unrelated to this package may still bind a reserved port in
-//     the interval before the reserving host binds it. Nothing but tests
-//     binds in this window, so that needs a misbehaving neighbour, not a
-//     race. Closing it needs the transport to accept a pre-bound
-//     net.PacketConn, so the socket the test holds is the socket the host
-//     uses. quic-go supports exactly that (quic.Transport{Conn: ...}), but
-//     QUICTransport.Start binds from Config.ListenAddress, a string, and no
-//     PacketConn appears anywhere in pkg/. Adding one is a change to the
-//     engine's public configuration, which is outside this package's scope.
+// Package netport reserves loopback ports outside the kernel's ip_local_port_range, recorded in-process and claimed across processes by flock under <os.TempDir()>/quicraft-netport, so nothing else is handed them before the host binds.
 package netport
 
 import (
@@ -166,14 +37,7 @@ const (
 	defaultEphemeralHi = 60999
 )
 
-// inFlightRetain is how many of the most recent reservations stay pinned when
-// the window is recycled.
-//
-// A caller may hold a reservation for a moment before binding it — a five-node
-// cluster reserves five addresses, then constructs five hosts — and those must
-// not be handed out again in the meantime. A long integration run allocates far
-// more ports than the window holds, so recycling is necessary; anything older
-// than this many reservations has long since been bound or abandoned.
+// inFlightRetain is how many recent reservations stay pinned when the window is recycled.
 const inFlightRetain = 512
 
 // probeConfig binds the candidate port. It is deliberately the zero value: see
@@ -201,44 +65,17 @@ var state struct {
 	heldOrder []int
 }
 
-// ReserveUDP returns a loopback address ("127.0.0.1:port") that no other caller
-// in this process has been given, that no live listener currently holds, and
-// that the kernel will not assign to anything on its own. The caller is
-// expected to bind it shortly afterwards.
-//
-// The socket used to prove the port bindable is not kept open, because the
-// engines these tests drive bind by address and cannot inherit a descriptor.
-// The window makes that safe: see the package comment.
+// ReserveUDP returns a 127.0.0.1 address no caller in this process holds, nothing is bound to, and the kernel will not assign; bind it soon.
 func ReserveUDP() (string, error) {
 	return reserve("udp")
 }
 
-// ReserveTCP is ReserveUDP for a TCP listener. Everything the package comment
-// says applies unchanged: the class it removes is a port drawn from the
-// kernel's ephemeral range being reassigned between the probe and the bind, and
-// nothing about that is specific to UDP. It is here rather than in a second
-// copy of this package because a copy is how the two drift — the window, the
-// recycle policy and the PID offset all have to agree or the guarantee is only
-// as good as whichever copy a caller reached for.
-//
-// This engine speaks QUIC and reserves UDP; the TCP form exists for the
-// comparison harnesses in test/performance, whose baselines (etcd/raft,
-// Dragonboat) are TCP and which hit the identical EADDRINUSE class.
+// ReserveTCP is ReserveUDP for a TCP listener, used by the test/performance baselines.
 func ReserveTCP() (string, error) {
 	return reserve("tcp")
 }
 
-// reserve hands out one port from the window, proven bindable on network.
-//
-// # One window for both networks
-//
-// TCP and UDP port spaces are independent in the kernel, so 40000/tcp and
-// 40000/udp could safely be issued to two callers. They are not: one window,
-// one taken set, one cursor. Sharing is strictly MORE conservative than the
-// kernel requires, costs nothing a test can observe — the window is thousands
-// of ports wide and a process reserves tens — and it is what keeps the recycle
-// policy and the PID start offset single. Two sets would be two policies to
-// keep in step, which is the defect this package was folded together to end.
+// reserve hands out one port from the shared TCP/UDP window, proven bindable on network.
 func reserve(network string) (string, error) {
 	state.once.Do(initWindow)
 
@@ -357,12 +194,7 @@ func unclaim(p int) {
 	}
 }
 
-// trimClaims drops the oldest claims beyond the most recent inFlightRetain.
-//
-// A claim covers the interval between reservation and bind, and the probe
-// covers a port once it is bound, so a claim that old has done its work.
-// Holding every claim until exit would instead cost a descriptor per port
-// reserved, and a long run reserves more ports than the window holds.
+// trimClaims drops claims older than the most recent inFlightRetain.
 func trimClaims() {
 	for len(state.heldOrder) > inFlightRetain {
 		p := state.heldOrder[0]
@@ -374,24 +206,7 @@ func trimClaims() {
 	}
 }
 
-// probe reports whether addr can be bound on network right now. It opens the
-// socket and closes it again; the caller gets the address, not the descriptor.
-//
-// A ZERO ListenConfig, deliberately: no Control hook, so the probe carries no
-// socket options of its own. For UDP that is the bind the QUIC transport makes,
-// which a live holder refuses, and that refusal is how a host another process
-// already started is detected. A reuse option on the probe would only widen
-// what it can bind through (on Windows, SO_REUSEADDR binds over a live holder).
-// For TCP, Go sets SO_REUSEADDR on a listener by default, and SO_REUSEADDR
-// permits binding over a socket in TIME_WAIT, never over a LIVE listener; two
-// live listeners on one address need SO_REUSEPORT, which nothing here sets.
-//
-// A failed Close is treated as "not free" rather than ignored: the port's state
-// is then unknown, and handing out an address whose probe socket may still be
-// open is exactly the race this package exists to remove.
-//
-// (net.ListenPacket and net.Listen would be the same binds, but noctx requires
-// the ListenConfig spelling.)
+// probe reports whether addr can be bound on network now, with no socket options; a failed Close counts as not free.
 func probe(network, addr string) bool {
 	if network == "udp" {
 		pc, err := probeConfig.ListenPacket(context.Background(), network, addr)
@@ -464,14 +279,7 @@ func lockDirectory() string {
 	return dir
 }
 
-// startOffset spreads concurrently running test binaries across the window.
-//
-// `go test ./...` runs packages in parallel, so several processes reserve from
-// this window at once. If they all began at the bottom they would probe the
-// same ports in the same order and differ only by who won each probe, which is
-// the collision this package exists to avoid. Seeding from the PID is enough:
-// it is distinct for every live process, needs no shared state, and the probe
-// bind still catches the case where two offsets converge.
+// startOffset seeds each process's window start from its PID.
 func startOffset(pid, span int) int {
 	if span <= 0 {
 		return 0

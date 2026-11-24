@@ -22,15 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestStep_RefusesTermInTheReservedCeiling covers a remotely reachable term
-// REGRESSION.
-//
-// Term is a plain uint64 on the wire with nothing bounding it, and step()
-// adopts a higher term verbatim. A peer naming a term at the top of the range
-// therefore drives this replica to it, and becomeCandidate's r.term++ then
-// wraps to 0 on the next campaign. A replica whose term went backwards can
-// vote a second time in a term it has already voted in, which is an Election
-// Safety violation reachable from one message.
+// TestStep_RefusesTermInTheReservedCeiling: a wire term near the uint64 ceiling is refused, so becomeCandidate can never wrap the term.
 func TestStep_RefusesTermInTheReservedCeiling(t *testing.T) {
 	for _, msgType := range []uint64{
 		proto.Heartbeat, proto.Replicate, proto.RequestVote, proto.TimeoutNow,
@@ -57,10 +49,7 @@ func TestStep_RefusesTermInTheReservedCeiling(t *testing.T) {
 	}
 }
 
-// TestBecomeCandidate_NeverWrapsTheTerm guards the increment itself, so the
-// wrap is impossible even if some future path sets a ceiling term without
-// going through step(). It asserts the term does not go BACKWARDS, which is
-// the invariant that matters; refusing to advance is the acceptable outcome.
+// TestBecomeCandidate_NeverWrapsTheTerm: the increment never moves the term backwards; refusing to advance is acceptable.
 func TestBecomeCandidate_NeverWrapsTheTerm(t *testing.T) {
 	r := newTestRaft(2)
 	r.term = math.MaxUint64

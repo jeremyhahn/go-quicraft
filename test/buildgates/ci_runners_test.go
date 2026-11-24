@@ -25,22 +25,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// The hosted-first runner rule (ci-template v1.46, code-review-template
-// v5.12.4): every workflow job runs on hostedRunner, the standard
-// GitHub-hosted runner. A job leaves it only with a waiver on its runs-on
-// line that names the category of its reason:
-//
-//	runs-on: <label>  # self-hosted: hardware: <reason>
-//	runs-on: <label>  # self-hosted: oversize: <reason>
-//
-// hardware is a device, GPU or dedicated host the job needs; oversize is
-// more than a standard runner's 4 vCPU, 16 GB, about 45 GB of disk or 6
-// hours. `credential:` is accepted only for code-review.yml's Codex review
-// job, whose reviewer token is mounted on one runner. ci.yml and release.yml
-// carry no waiver at all: every job in them runs on hostedRunner, a job that
-// names the `release` label included, except that the ci.yml jobs in
-// ciRunnerSelection run on the template's runner selection expression
-// (ci-template v1.54), exactly, whose hosted default is hostedRunner.
+// Every workflow job runs on hostedRunner unless its runs-on line carries a self-hosted: hardware or oversize waiver; ci.yml and release.yml carry none, except ciRunnerSelection jobs.
 const (
 	hostedRunner     = "ubuntu-latest"
 	selfHostedWaiver = "# self-hosted: "
@@ -55,11 +40,7 @@ var credentialJob = struct{ file, job string }{"code-review.yml", "review"}
 // hostedOnlyWorkflows are the workflows in which no job is waived.
 var hostedOnlyWorkflows = []string{"ci.yml", "release.yml"}
 
-// The ci-template v1.54 runs-on expressions. Preflight reads the repository
-// variable CI_PREFLIGHT_RUNS_ON and keeps a fork's head on hostedRunner; the
-// image jobs and CI Gate read the runs-on JSON that preflight's runner
-// selection step writes, hostedRunner unless it picks the self-hosted pool.
-// The preflight step `Runner labels (ruling 633)` checks what each can pick.
+// The template's runs-on expressions: preflight reads CI_PREFLIGHT_RUNS_ON, the image jobs and CI Gate read preflight's runner selection.
 const (
 	preflightRunsOn = `${{ github.server_url == 'https://github.com' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
 	dockerRunsOn    = `${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}`

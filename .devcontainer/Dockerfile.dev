@@ -17,13 +17,7 @@ RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0 &&
 
 WORKDIR /app
 
-# Download the module cache in its own layer. Credentials for the project
-# forge arrive as the optional gomodauth BuildKit secret (the K=V lines of
-# .devcontainer/.env), mounted for this RUN only: sourced, never written to a
-# layer or a command line. With no secret, modules resolve from the public
-# proxy, so a module only the forge serves (go-enclave) fails the build here,
-# loudly. This RUN is byte-identical in every image that downloads such a
-# module (test/buildgates/module_download_test.go). Requires BuildKit.
+# Module cache layer; forge credentials come only from the optional gomodauth BuildKit secret, never a layer. Requires BuildKit.
 COPY go.mod go.sum* ./
 RUN --mount=type=secret,id=gomodauth \
     set -eu; \

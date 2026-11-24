@@ -163,27 +163,10 @@ func transportPair(t testing.TB, deploymentID uint64) (
 	return t1, t2, handler1, handler2, cleanup
 }
 
-// transportPairWith is the general form of transportPair: it accepts the two
-// MessageHandler implementations and optional Config mutators applied to BOTH
-// endpoints before construction, so callers that need custom handlers or
-// non-default transport tuning (benchmarks, in particular) reuse the same
-// loopback + mTLS + registry setup instead of building their own.
-// Returns (sender, receiver, cleanup).
-// testDialTimeout is the dial budget the transport pair fixture runs with.
-// Production's 5s is a liveness budget backed by Raft retransmission; a test
-// that dials directly has no retransmission, so a handshake slowed past 5s by
-// CI saturation fails the test rather than the batch (handshakes of 4.3s and
-// 5.01s have been observed on loaded runners). The
-// budget here is wide enough that only a broken transport reaches it. Tests
-// that need the production figure -- the first-contact bound, the shutdown
-// promptness check -- build their own Config and get the default.
+// testDialTimeout is the fixture's dial budget, wide so only a broken transport reaches it on a loaded runner.
 const testDialTimeout = 60 * time.Second
 
-// withProductionDialBudget is the fixture option for a test whose subject is a
-// dial that must FAIL -- a stopped peer, a port nothing listens on. Such a test
-// waits for the handshake to give up, and it should give up on production's
-// terms: 60s would turn a five-second failure path into a minute. Two tests
-// use it; a test that dials a live peer never should.
+// withProductionDialBudget uses the production dial timeout, for tests whose dial must fail.
 func withProductionDialBudget(c *Config) { c.DialTimeout = dialTimeout }
 
 func transportPairWith(
@@ -1097,9 +1080,7 @@ func TestQUICTransport_ReconnectAfterFailure(t *testing.T) {
 	<-evictTimer.C
 	evictTimer.Stop()
 
-	// Step 3: Restart the receiver on the SAME address. We create a new
-	// transport but bind to the same address so the sender's cached
-	// connection becomes stale.
+	// Step 3: restart the receiver on the same address, so the sender's cached connection is stale.
 	handler2b := newTestHandler()
 	reg2b := registry.NewRegistry()
 	cfg2b := Config{
@@ -2667,12 +2648,7 @@ func fillSendQueue(t *testing.T, sq *sendQueue, shardID, to uint64) int {
 	return 0
 }
 
-// requireQueueFullDrop calls Send until the transport counts a queue-full drop,
-// then asserts the drop carries the expected shard and target. Retrying is what
-// makes this deterministic: the per-target worker drains in batches of up to
-// 256, so a single Send issued just after the queue filled can still be
-// accepted. Send must never block on a full queue, so a hang here is a failure
-// in its own right.
+// requireQueueFullDrop sends until a queue-full drop is counted, then checks its shard and target; Send must never block.
 func requireQueueFullDrop(t *testing.T, tr *QUICTransport, rec *dropRecorder, shardID, to uint64) {
 	t.Helper()
 	const sends = 8 * defaultSendQueueLen
@@ -3415,16 +3391,7 @@ func poolRoundTrips(put func(), observe func() bool) bool {
 // Send drop observability (quic.go Send)
 // ---------------------------------------------------------------------------
 
-// syncBuffer is a bytes.Buffer safe for concurrent use.
-//
-// slog.SetDefault installs a sink for the whole process, not for the calling
-// test, so every goroutine alive at that moment logs into it -- including
-// transport goroutines still serving connections started by earlier tests. A
-// bare bytes.Buffer there is a data race, and the detector caught it in CI:
-// a snapshot receiver's rejectSnapshot write against this test's String()
-// read. The other two tests in this package that redirect the default logger
-// (adversarial_test.go, failpath_test.go) send it to io.Discard, which is
-// already safe; this is the one that needed to keep the output.
+// syncBuffer is a bytes.Buffer safe for concurrent use, needed because slog.SetDefault captures every goroutine's logs.
 type syncBuffer struct {
 	mu  sync.Mutex
 	buf bytes.Buffer
@@ -3764,13 +3731,7 @@ func TestSend_AMovedRouteNeitherReceivesNorChurnsAnotherReplicasTraffic(t *testi
 	}
 }
 
-// TestSend_EachMessageIsPinnedToItsDestination: connections are keyed by
-// address and shared by every replica the registry routes there, and address
-// learning lets a member of ANY shard point its own route at another replica's
-// address. A dial-time check of the peer against every identity routed there
-// then accepted that member for the other replica's traffic. Each message is
-// held to its own destination: the member receives its own shard's traffic
-// and none of the victim's.
+// TestSend_EachMessageIsPinnedToItsDestination verifies a shared connection carries each message only to its own destination's identity.
 func TestSend_EachMessageIsPinnedToItsDestination(t *testing.T) {
 	ids := &replicaIdentities{}
 	rec := &dropRecorder{}
@@ -3807,12 +3768,7 @@ func TestSend_EachMessageIsPinnedToItsDestination(t *testing.T) {
 	}
 }
 
-// TestSend_ClosesAConnectionWhosePeerIsNoLongerBound: the pin was checked only
-// at dial time, so a connection cached before membership rebound a replica to
-// a new keypair at the same address kept carrying that replica's traffic to
-// the old key's holder. A send whose destination the peer no longer is drops
-// the message and, when the peer is bound to no replica at the address any
-// more, closes the connection so the next send dials whoever is bound now.
+// TestSend_ClosesAConnectionWhosePeerIsNoLongerBound verifies a send drops a message for a rebound replica and closes a connection bound to none.
 func TestSend_ClosesAConnectionWhosePeerIsNoLongerBound(t *testing.T) {
 	ids := &replicaIdentities{}
 	t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), newTestHandler(), func(c *Config) {

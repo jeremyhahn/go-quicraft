@@ -49,8 +49,7 @@ func destroyOnCleanup(t testing.TB, e enclave.ByteAccess) {
 	})
 }
 
-// mustFromBytes moves data into a locked, FROZEN enclave, failing the test if
-// the kernel refuses the lock.
+// mustFromBytes moves data into a locked, frozen enclave or fails the test.
 func mustFromBytes(t testing.TB, data []byte) enclave.ByteAccess {
 	t.Helper()
 	e, err := enclave.NewMemory(data)
@@ -60,11 +59,7 @@ func mustFromBytes(t testing.TB, data []byte) enclave.ByteAccess {
 	return e
 }
 
-// mustCreds builds Credentials over a passphrase, failing the test if the
-// sealing is refused. It exists because Credentials.Secret is protected
-// memory, so a `Credentials{Secret: []byte("pw")}` literal does not compile —
-// and because NewCredentials CONSUMES its argument, so each call site needs its own copy of
-// the string rather than a shared slice.
+// mustCreds builds Credentials over a fresh copy of passphrase or fails the test.
 func mustCreds(t testing.TB, passphrase string) Credentials {
 	t.Helper()
 	c, err := NewCredentials(context.Background(), []byte(passphrase))

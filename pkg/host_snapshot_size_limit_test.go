@@ -152,12 +152,7 @@ func (r *sizeLimitRecorder) createdIndices() []uint64 {
 	return append([]uint64(nil), r.created...)
 }
 
-// TestSnapshotSizeLimit_OversizedSnapshotFailsAndShardKeepsServing pins the
-// documented MaxSnapshotSize contract (docs/snapshots/user.md "Size limit"):
-// a snapshot whose output exceeds the limit is discarded with
-// *SnapshotTooLargeError, the log and the previous snapshot stay in place,
-// the shard is not failed and keeps serving, and a later snapshot under the
-// default limit succeeds.
+// TestSnapshotSizeLimit_OversizedSnapshotFailsAndShardKeepsServing pins the MaxSnapshotSize contract (docs/snapshots/user.md).
 func TestSnapshotSizeLimit_OversizedSnapshotFailsAndShardKeepsServing(t *testing.T) {
 	const (
 		shardID   = uint64(1)

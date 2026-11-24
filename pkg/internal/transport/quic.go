@@ -46,51 +46,16 @@ const streamShardCount = 16
 // from peer restarts, avoiding prolonged stalls that block replication.
 const sendWriteDeadline = 2 * time.Second
 
-// sendQueueIdleTimeout is how long a per-target send queue worker waits
-// with no messages before cleaning itself up. It only retires the idle
-// GOROUTINE and channel; the next Send to this target lazily re-creates them.
-//
-// It does NOT idle-close the underlying QUIC connection. KeepAlivePeriod (10s)
-// is below MaxIdleTimeout (30s), so quic-go PINGs the connection indefinitely
-// and it never idle-closes on its own — a cached outbound to a peer that has
-// gone quiet (including one removed from membership but still running) is kept
-// alive by keep-alive traffic until it is torn down explicitly (a peer restart
-// via evictStaleOutboundOnRecv, a dead-context sweep in cleanStaleConnections,
-// a committed membership removal via CloseTarget, or transport Stop). The 60s
-// value simply frees the idle worker promptly.
+// sendQueueIdleTimeout retires an idle per-target send worker; the QUIC connection stays open (keep-alive) until torn down explicitly.
 const sendQueueIdleTimeout = 60 * time.Second
 
-// snapshotChunkWriteDeadline is the maximum time for a single chunk write
-// on the snapshot send path. A chunk carries far more bytes than a Raft
-// message -- the sender emits 2MiB chunks and the receiver accepts up to
-// proto.MaxSnapshotChunkDataLen (8MB) -- so this deadline is much larger
-// than sendWriteDeadline. If the receiver is slow or the network stalls,
-// the deadline prevents indefinite blocking
-// that would hold a snapshotTracker slot and make Stop() hang forever.
+// snapshotChunkWriteDeadline bounds one snapshot chunk write, so a stalled receiver cannot hold a snapshotTracker slot and hang Stop.
 const snapshotChunkWriteDeadline = 30 * time.Second
 
-// defaultSendQueueLen is the per-target send queue capacity. Each target
-// (remote host address) gets its own buffered channel and sender goroutine.
-// Messages are enqueued non-blocking (dropped if full -- Raft retransmits).
-// 2048 matches dragonboat's SendQueueLength default, sized to absorb burst
-// traffic from multiple shards targeting the same host without dropping
-// Replicate/ReplicateResp messages that are critical for commit progress.
+// defaultSendQueueLen is the per-target send queue capacity; a full queue drops and Raft retransmits.
 const defaultSendQueueLen = 2048
 
-// streamShard is a bucket in the sharded stream pool. Each shard has its
-// own mutex to reduce contention across concurrent senders.
-//
-// owners records, for each pooled stream, the *quic.Conn it was opened on.
-// A stream's liveness is judged against its OWN connection, not whatever
-// connection is currently cached for the target: in the peer-restart window a
-// delayed pre-open can store a stream opened on a now-closed conn while a fresh
-// conn is cached for the same target. Comparing only against the cached conn
-// would return that dead stream, the write would fail, and the failure path
-// would then tear down the HEALTHY cached conn. owners is kept in exact
-// lockstep with streams under mu (put/drop mutate both). A key present in
-// streams but absent from owners is treated as "owner unknown" and falls back
-// to the currently-cached-conn liveness check (only manually-constructed test
-// transports inject a raw stream without an owner).
+// streamShard is a mutex-guarded bucket of the stream pool; owners records each stream's own connection for liveness checks, kept in lockstep with streams.
 type streamShard struct {
 	mu      sync.RWMutex
 	streams map[streamKey]*quic.Stream
@@ -107,8 +72,7 @@ func (sh *streamShard) put(key streamKey, stream *quic.Stream, conn *quic.Conn) 
 	}
 }
 
-// drop removes key from both the stream pool and the owner map. The caller must
-// hold sh.mu. delete on a nil map is a no-op, so no owners guard is needed.
+// drop removes key from the stream pool and the owner map; the caller holds sh.mu.
 func (sh *streamShard) drop(key streamKey) {
 	delete(sh.streams, key)
 	delete(sh.owners, key)
@@ -120,53 +84,19 @@ type streamKey struct {
 	idx    uint64
 }
 
-// sendQueue is a per-target async send queue. Each remote host address gets
-// its own channel and sender goroutine. Messages are enqueued non-blocking
-// by Send() and delivered by the background worker. This decouples the
-// step worker from transport latency (QUIC dial, stream open, write with
-// sendWriteDeadline), preventing heartbeat starvation and multi-node stalls.
-//
-// Heartbeat messages are routed to a separate high-priority channel (hbCh)
-// so they are never blocked behind a backlog of data messages. The worker
-// always drains hbCh before processing the regular data channel, ensuring
-// leader liveness even under heavy replication load.
-//
-// The pattern matches dragonboat's per-target send queue architecture.
-//
-// closed is set true by the worker (under sendQueuesMu) immediately before
-// it removes itself from the sendQueues map and exits on idle timeout. The
-// enqueue path in Send checks this flag after a successful channel send: a
-// producer may have obtained this *sendQueue from getOrCreateSendQueue and
-// then enqueued into a channel that no longer has a drainer (the worker
-// already pruned the map entry and returned). On observing closed, the
-// producer re-acquires a fresh queue via getOrCreateSendQueue and re-enqueues
-// once, so the message is delivered by the newly started worker instead of
-// being orphaned.
+// sendQueue is a per-target async send queue with a priority heartbeat channel (hbCh); closed tells a producer the worker exited, so it re-enqueues once on a fresh queue.
 type sendQueue struct {
 	ch     chan proto.Message
 	hbCh   chan proto.Message // high-priority heartbeat channel
 	closed atomic.Bool        // set by worker before idle-prune delete+return
 }
 
-// QUICTransport provides QUIC-based message delivery for the Raft engine.
-// It manages connection pooling, stream multiplexing, and frame-level I/O
-// for both regular Raft messages and snapshot transfers.
-//
-// Send() is non-blocking: messages are enqueued into per-target send queues
-// (one per remote host address). Each queue has a dedicated sender goroutine
-// that batches messages and performs the actual QUIC I/O. This ensures the
-// step worker never blocks on transport operations.
-//
-// QUICTransport is safe for concurrent use by multiple goroutines.
+// QUICTransport delivers Raft messages and snapshots over QUIC; Send is non-blocking via per-target send queues. Safe for concurrent use.
 type QUICTransport struct {
 	cfg     Config
 	handler MessageHandler
 	reg     *registry.Registry
-	// tlsState is the current certificate, CA pool and derived
-	// verification state, swapped whole by ReloadMTLS. Every new handshake
-	// reads it (listenerTLS, dial), so a reload reaches the next handshake
-	// without touching an established connection. Read it through
-	// currentTLS.
+	// tlsState is the current certificate, CA pool and verification state, swapped whole by ReloadMTLS; read it through currentTLS.
 	tlsState atomic.Pointer[tlsPair]
 	// reloadMu serializes ReloadMTLS, so the checker's issuer set and the
 	// stored pair are always replaced together.
@@ -178,38 +108,13 @@ type QUICTransport struct {
 
 	connMu sync.RWMutex
 	conns  map[string]*quic.Conn
-	// connPeer holds, for each pooled outbound connection, the node identity
-	// its peer presented, so the identity pin (getConnection, connServes) does
-	// not re-derive it — a TLS state copy and a hash — on every send. Maintained
-	// under connMu with conns: set where a connection is pooled, deleted
-	// wherever one is removed.
+	// connPeer caches the node identity each pooled outbound's peer presented; maintained with conns under connMu.
 	connPeer map[*quic.Conn]string
 
-	// connEpoch records, for each cached outbound in conns, the peer boot
-	// epoch this node believed the target to be running when that outbound
-	// was dialed (0 when the peer had never been heard from). It is written
-	// and deleted under connMu at exactly the sites that write and delete
-	// conns, so the two maps never diverge.
-	//
-	// It is what makes restart detection COMPLETE. peerEpoch alone only
-	// records incarnations we have HEARD FROM, and an outbound can easily
-	// exist for a target whose epoch we have never recorded (we dial before
-	// the peer's first batch reaches us, or a teardown dropped the record
-	// while a later re-dial repopulated conns). In that state a restart is
-	// indistinguishable from first contact, so without this map the
-	// black-holed outbound would survive until MaxIdleTimeout -- 30s of
-	// one-way silence.
-	// Comparing the RECEIVED epoch against the epoch the outbound was dialed
-	// under decides the question without needing to remember history.
+	// connEpoch records the peer boot epoch each cached outbound was dialed under (0 if unknown), written with conns under connMu; comparing it to a received epoch detects restarts.
 	connEpoch map[string]uint64
 
-	// draining holds the outbounds evictStaleOutboundOnRecv has taken out of
-	// conns but not yet closed: each is closed when its
-	// staleOutboundDrainGrace expires, or by stop if that comes first. The
-	// entry is the close obligation; whoever deletes it closes the
-	// connection. The value is the target the outbound was dialed to, so
-	// CloseTarget can close a removed peer's draining outbounds at once
-	// rather than leave them to the grace timer. Guarded by connMu.
+	// draining holds evicted outbounds awaiting close after staleOutboundDrainGrace, keyed to their target; whoever deletes an entry closes it. Guarded by connMu.
 	draining map[*quic.Conn]string
 
 	dialGroup singleflight.Group
@@ -223,18 +128,7 @@ type QUICTransport struct {
 	// restarts.
 	bootEpoch uint64
 
-	// peerEpoch tracks what is known about each peer address's process
-	// incarnations. Its epoch field is the value a new outbound is stamped
-	// with in connEpoch, so that a later batch can tell whether the cached
-	// outbound belongs to the incarnation that sent it. Keying on the epoch
-	// (not the inbound *quic.Conn identity) avoids the eviction cascade that
-	// benign re-dials caused, because a re-dial from the same process carries
-	// the SAME epoch.
-	//
-	// Entries are created only for addresses an authenticated peer certificate
-	// covers, and reaped by reapPeerIncarnations once the address has neither a
-	// cached outbound nor recent traffic, so the map cannot grow without bound
-	// across membership churn.
+	// peerEpoch tracks each authenticated peer address's incarnations; reaped by reapPeerIncarnations once the address is idle and unconnected.
 	peerEpochMu sync.Mutex
 	peerEpoch   map[string]*peerIncarnation
 
@@ -252,70 +146,27 @@ type QUICTransport struct {
 
 	snapshotRecv *snapshotReceiver
 
-	// msgRecvBudget is the remaining aggregate memory budget (bytes) for inbound
-	// message-frame payload buffers across all connections/streams. A frame
-	// reserves its decode charge here BEFORE allocating its receive buffer and
-	// releases it once dispatched, bounding total in-flight message memory to
-	// MaxMessageReceiveMemory. Mirrors snapshotReceiver.memoryBudget for the
-	// regular message path, which otherwise has no aggregate cap (OOM DoS).
+	// msgRecvBudget is the remaining aggregate budget for inbound frame buffers, reserved before allocation and released after dispatch.
 	msgRecvBudget atomic.Int64
 
 	stopC   chan struct{}
 	stopped atomic.Bool
 
-	// cleanupInterval is how often connectionCleanupOnce sweeps stale, revoked
-	// and idle connections. It defaults to connectionCleanupInterval and is a
-	// FIELD rather than a bare use of that constant so a test can drive the
-	// sweep without waiting for a real tick.
-	//
-	// It is per-instance for the reason this codebase gives elsewhere (see
-	// seal.Barrier.randReader): a mutable package global is reachable from
-	// production code and from every other test in the binary, and a field is
-	// reachable from neither. It keeps the panic-path unit test from waiting
-	// a full 30-second tick, which would slow an otherwise fast package and
-	// widen the window for load-induced test timeouts.
+	// cleanupInterval is the cleanup sweep period (connectionCleanupInterval); a field so tests can shorten it.
 	cleanupInterval time.Duration
 
-	// stopOnce guards the teardown so exactly one caller runs it, and
-	// stopDone is closed when that teardown has finished. Stop documents that
-	// every goroutine has finished when it returns, so a second or concurrent
-	// caller must block on stopDone rather than returning into a transport
-	// that is still mid-teardown. stopDone is closed from a defer inside the
-	// once: sync.Once treats a PANICKING f as done, and without the defer a
-	// panicking teardown would strand every later caller forever.
+	// stopOnce runs the teardown once and stopDone, closed by a defer, releases every other caller when it finishes.
 	stopOnce sync.Once
 	stopDone chan struct{}
 
-	// acceptWG tracks the accept loop ALONE, separately from t.wg, so stop()
-	// can join it at a point where t.wg cannot yet be joined.
-	//
-	// t.wg covers the accept loop AND every connection handler, and those
-	// handlers only return once their connections are closed — so waiting on
-	// t.wg before closing anything would deadlock. The accept loop has no such
-	// dependency: the listener close and shutdownCancel are enough to end it.
-	//
-	// Joining it is what makes the inbound shutdown sweep COMPLETE rather than
-	// best-effort. Listener.Close does not discard the connections already
-	// queued inside quic-go (baseServer.accept drains connQueue after
-	// stopAccepting is closed), so the loop can still admit one after the
-	// shutdown has begun. Because acceptLoopIteration publishes into
-	// inboundConns synchronously, "the accept loop has returned" means "every
-	// connection it admitted is in the map", and a sweep after this join can no
-	// longer miss one and let quicTr.Close() destroy it unannounced.
+	// acceptWG tracks only the accept loop, so stop can join it before t.wg and then sweep every admitted inbound connection.
 	acceptWG sync.WaitGroup
 
-	// acceptSem and acceptIPs are the accept loop's admission accounting:
-	// the global connection semaphore (MaxIncomingConnections) and the per-IP
-	// tracker (MaxConnectionsPerIP). They are created once, by
-	// startAcceptLoop, so a supervised restart of the loop keeps the counts
-	// of the connections already admitted.
+	// acceptSem and acceptIPs are the accept loop's admission counts, created once so a supervised restart keeps them.
 	acceptSem chan struct{}
 	acceptIPs *ipConnTracker
 
-	// inboundRefusalForTest, when set, replaces refuseInboundPromiscuousCert
-	// in admission. The co-location exemption makes that refusal unreachable
-	// between two loopback transports, so tests of its rejection branch need
-	// a seam.
+	// inboundRefusalForTest, when set, replaces refuseInboundPromiscuousCert in admission.
 	inboundRefusalForTest func(conn *quic.Conn) error
 
 	// queuedCloseForTest, when set, runs before closeQueuedOnShutdown closes
@@ -341,11 +192,7 @@ type QUICTransport struct {
 	// on every sendBatch invocation.
 	localAddrStr string
 
-	// hbPrefix is the pre-serialized MessageBatch header for heartbeat
-	// frames: [BinVer:8][DeploymentID:8][SourceAddrLen:4][SourceAddr:N].
-	// Computed once in Start() after the local address is known. Used by
-	// sendHeartbeatBatch to avoid repeated serialization of invariant
-	// fields on the ReadIndex critical path.
+	// hbPrefix is the pre-serialized MessageBatch header for heartbeat frames, computed in Start.
 	hbPrefix []byte
 
 	// wireLookup returns a shard's committed WireVersion; outbound batches
@@ -365,60 +212,13 @@ type QUICTransport struct {
 	// when Config.RevocationConfig is non-nil.
 	revocationChecker *revocation.Checker
 
-	// srcAddrAuth caches, per inbound *quic.Conn, the result of validating a
-	// batch's claimed SourceAddress against that connection's verified peer
-	// certificate. inboundAuthorizedFor calls ConnectionState()+VerifyHostname,
-	// which is too costly to run on every batch (heartbeats are frequent); a
-	// peer's certificate and advertised address are stable for a connection's
-	// lifetime, so the decision is computed once per (conn, claimed-address)
-	// and reused. Entries are removed when the inbound connection's handler
-	// returns (handleConnection). Keyed by *quic.Conn, value *srcAddrAuthEntry.
+	// srcAddrAuth caches, per inbound connection, the result of checking a claimed SourceAddress against the peer certificate; removed when the handler returns.
 	srcAddrAuth sync.Map
 
-	// inboundConns tracks live INBOUND connections. Inbound connections were
-	// held only as locals
-	// inside handleConnection, so nothing could reach them after admission —
-	// and revocation runs only in VerifyConnection, i.e. only at handshake.
-	// A peer whose certificate was revoked, or whose replica the shard
-	// committed a removal for, therefore kept its session for the lifetime of
-	// the process: quic-go's keep-alive (10s) sits below MaxIdleTimeout (30s),
-	// so the connection never idle-closes, and CloseTarget only reaches the
-	// OUTBOUND half. Revocation stopped a compromised node reconnecting and
-	// nothing else.
-	//
-	// Tracking is only half of it: the RECLAIM POLICIES are what act on this
-	// map, and there are three, none of which owns a goroutine.
-	// revokeCheckConnections and reapIdleInboundConns run on the existing 30s
-	// cleanup tick — revocation re-checks, and an idle bound that is the only
-	// thing able to reclaim a connection whose peer completes a handshake and
-	// then says nothing. closeInboundFromPeer is event-driven from CloseTarget,
-	// so a committed membership removal reaches the half the removed member
-	// controls.
-	//
-	// Entries are added once the handshake has completed, keyed by *quic.Conn
-	// with an *inboundConnState value, and removed by forgetInboundConnState,
-	// which runs after every stream goroutine on the connection has finished.
+	// inboundConns tracks live inbound connections so revocation, idle reaping and CloseTarget can close them; entries are removed by forgetInboundConnState.
 	inboundConns sync.Map
 
-	// connMsgBudget holds the per-PEER message-receive reservation, keyed by
-	// the peer's authenticated identity (msgBudgetKey) with value
-	// *peerMsgBudget. The global msgRecvBudget alone lets one peer occupy the
-	// entire budget and force every other peer's frames into the exhaustion
-	// path; this sub-budget caps any single peer at maxConnMsgRecv.
-	//
-	// It was keyed by *quic.Conn, which did not achieve that: MaxConnectionsPerIP
-	// is 16, so one peer opened four connections, saturated four separate
-	// sub-budgets of MaxMessageReceiveMemory/4 each, and drove the global
-	// budget to zero — after which every other peer's frames were silently
-	// dropped. Reproduced with 16 streams and 128 bytes of traffic: the frame
-	// header alone reserves its declared length before the body is read, so
-	// the attacker never has to send one.
-	//
-	// Keying on identity rather than the connection is what makes the cap mean
-	// what its name says. The identity is already derived on this path for
-	// authorization, so this costs one map lookup, not a new mechanism.
-	// Entries are refcounted by live connection and removed when the last one
-	// closes.
+	// connMsgBudget holds per-peer message-receive reservations keyed by authenticated identity, capping one peer at maxConnMsgRecv; refcounted by live connection.
 	connMsgBudget sync.Map
 
 	// maxConnMsgRecv is the per-peer ceiling on in-flight message-frame
@@ -426,20 +226,10 @@ type QUICTransport struct {
 	// MaxMessageReceiveMemory.
 	maxConnMsgRecv int64
 
-	// lastProtocolViolationLog is the Unix-nanosecond timestamp of the most
-	// recent protocol-violation warning this transport emitted. Per-instance,
-	// not package-global: a shared limiter lets one transport's log flood
-	// suppress every other transport's first diagnostic, and in-process
-	// multi-node deployments (and the test suite) run many transports at once.
+	// lastProtocolViolationLog is the per-transport rate-limit stamp of the last protocol-violation warning.
 	lastProtocolViolationLog atomic.Int64
 
-	// Rate-limit stamps for the remaining peer-driven diagnostics on the
-	// inbound hot path. Every one of these lines is triggerable at the frame
-	// rate by one authenticated peer, and slog's default handler writes
-	// synchronously to stderr under a single mutex — so an unsampled line here
-	// puts a write syscall on the raft receive path AND serialises every other
-	// log call in the process behind it. The counters beside them are
-	// unconditional, so the sampled line can carry the true total.
+	// Rate-limit stamps for peer-driven diagnostics on the inbound hot path; the counters beside them count every event.
 	lastRecvBudgetLog     atomic.Int64
 	lastZeroShardLog      atomic.Int64
 	lastSpoofedSourceLog  atomic.Int64
@@ -452,12 +242,7 @@ type QUICTransport struct {
 	snapshotStreamDrops atomic.Uint64
 	zeroRTTRefusals     atomic.Uint64
 
-	// peerFrameRejections counts every frame a peer's decoder refused
-	// (QUICStreamErrFrameRejected). The warning below it is rate-limited, and
-	// the receiver's own diagnostic is rate-limited to 10s, so a storm of
-	// rejections — the signature of a producer emitting a batch no peer can
-	// accept — is otherwise nearly invisible in logs. The counter is
-	// incremented on every rejection, never sampled.
+	// peerFrameRejections counts every frame a peer's decoder refused (QUICStreamErrFrameRejected).
 	peerFrameRejections atomic.Uint64
 
 	// lastPeerRejectionLog is the Unix-nanosecond timestamp of the most recent
@@ -468,24 +253,14 @@ type QUICTransport struct {
 	// lastIdentityMismatchLog rate-limits dropIdentityMismatch's warning.
 	lastIdentityMismatchLog atomic.Int64
 
-	// dialRefusals holds, per dialRefusalKey, the last dial refused by the
-	// identity pin (dialRefusal), so it is not re-dialed within
-	// dialRefusalCooldown. Expired entries are swept on the cleanup tick
-	// (sweepDialRefusals) and an address's entries are dropped by CloseTarget.
+	// dialRefusals holds the last identity-pin dial refusal per key, suppressing re-dials for dialRefusalCooldown.
 	dialRefusals sync.Map
 }
 
-// srcAddrAuthSlots is the number of distinct claimed SourceAddresses cached
-// per inbound connection. A legitimate peer advertises exactly one, but a
-// single slot is defeated by a peer alternating two claimed addresses, which
-// forces a full ConnectionState()+VerifyHostname on every batch while holding
-// the entry mutex and so serializes that connection's receive path.
+// srcAddrAuthSlots is how many distinct claimed SourceAddresses are cached per inbound connection.
 const srcAddrAuthSlots = 4
 
-// srcAddrAuthMaxDistinct bounds how many distinct claimed SourceAddresses one
-// connection may have verified against its certificate. Past this bound the
-// negative result is assumed without re-verifying: a peer cycling addresses is
-// abusive, and failing closed only clears the (unauthenticated) SourceAddress.
+// srcAddrAuthMaxDistinct bounds the distinct claimed SourceAddresses verified per connection; beyond it the result is negative.
 const srcAddrAuthMaxDistinct = 16
 
 // srcAddrAuthSlot is one cached (claimed address, decision) pair.
@@ -505,14 +280,7 @@ type srcAddrAuthEntry struct {
 	distinct int
 }
 
-// newBootEpoch returns a per-process boot epoch used to detect peer restarts
-// (evictStaleOutboundOnRecv compares the SourceEpoch carried on inbound
-// batches and evicts the cached outbound connection when it changes). It mixes
-// the wall clock with a random salt so two processes that start within the
-// same nanosecond — or after a backward clock step — still receive distinct
-// epochs. Restart detection keys on any *change* in this value, not ordering,
-// so the salt cannot weaken correctness; it only closes the same-nanosecond
-// collision window that would otherwise fall back to the 30s QUIC idle timeout.
+// newBootEpoch returns a per-process boot epoch (wall clock mixed with a random salt); restart detection keys on any change in it.
 func newBootEpoch() uint64 {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err == nil {
@@ -538,16 +306,7 @@ func NewQUICTransport(
 		return nil, ErrMTLSConfigRequired
 	}
 
-	// Create the revocation checker when configured. The checker is
-	// passed to buildMTLSTLS to wire VerifyConnection (not
-	// VerifyPeerCertificate, which resumed sessions skip) on both
-	// server and client TLS configs. The WHOLE CA bundle is parsed and
-	// handed to the checker, which selects the actual issuer per leaf and
-	// per CRL: TLS verifies against every block in the bundle
-	// (AppendCertsFromPEM), so wiring revocation to only the first block
-	// would build OCSP requests naming the wrong issuer and reject every
-	// intermediate-signed CRL. Parse errors are fatal: a missing issuer
-	// would silently disable OCSP checks at runtime.
+	// Build the revocation checker from the whole CA bundle and wire it into VerifyConnection; parse errors are fatal.
 	var checker *revocation.Checker
 	if cfg.RevocationConfig != nil {
 		revCfg := *cfg.RevocationConfig
@@ -567,17 +326,7 @@ func NewQUICTransport(
 		return nil, err
 	}
 
-	// Align the QUIC-level incoming-stream limit with the number of streams
-	// we will actually service concurrently. handleConnection sizes its
-	// data-stream semaphore to MaxStreamsPerConnection and a SEPARATE snapshot
-	// semaphore to MaxConcurrentSnapshotRecv; snapshot streams are accounted
-	// against the latter for the duration of their (slow) transfer so they
-	// never displace data streams. The incoming-stream budget therefore
-	// reserves MaxConcurrentSnapshotRecv slots on top of the data-stream pool,
-	// so QUIC flow-control backpressure kicks in exactly when our combined
-	// processing capacity (data + snapshot) is reached. Advertising a much
-	// larger limit (the old hardcoded 4096) let a peer open streams that then
-	// sat accepted-but-unserviced.
+	// QUIC incoming-stream limit: MaxStreamsPerConnection data streams plus MaxConcurrentSnapshotRecv snapshot streams.
 	maxIncomingStreams := cfg.MaxStreamsPerConnection
 	if maxIncomingStreams < 1 {
 		maxIncomingStreams = defaultMaxStreamsPerConnection
@@ -587,23 +336,14 @@ func NewQUICTransport(
 		snapStreams = defaultMaxConcurrentSnapRecv
 	}
 	maxIncomingStreams += snapStreams
-	// Guarantee the incoming-stream budget always leaves room for a peer's
-	// full outbound ordered-stream pool (StreamPoolSize) plus its dedicated
-	// snapshot/ephemeral streams. Without this floor an operator who raises
-	// StreamPoolSize toward MaxStreamsPerConnection could starve snapshot
-	// delivery: the peer's snapshot OpenStreamSync would block on QUIC
-	// flow control until its dial deadline expired.
+	// Floor the incoming-stream limit at a peer's StreamPoolSize plus its snapshot and ephemeral streams.
 	if minStreams := cfg.StreamPoolSize + snapshotStreamHeadroom; maxIncomingStreams < minStreams {
 		maxIncomingStreams = minStreams
 	}
 
 	qcfg := &quic.Config{
 		MaxIdleTimeout: 30 * time.Second,
-		// The handshake idle limit follows the dial budget: quic-go abandons
-		// a handshake that idles this long and caps the whole handshake at
-		// twice it, so a dial context wider than this could never be
-		// reached. Production's DialTimeout is 5s; the test fixture's wider
-		// budget widens both together.
+		// The handshake idle limit follows DialTimeout.
 		HandshakeIdleTimeout:       cfg.DialTimeout,
 		MaxIncomingStreams:         int64(maxIncomingStreams),
 		MaxIncomingUniStreams:      -1,
@@ -611,12 +351,7 @@ func NewQUICTransport(
 		InitialStreamReceiveWindow: initialStreamReceiveWindow,
 		MaxStreamReceiveWindow:     maxStreamReceiveWindow,
 		MaxConnectionReceiveWindow: connectionReceiveWindow(cfg.MaxMessageReceiveMemory, cfg.MaxIncomingConnections),
-		// 0-RTT is replayable per RFC 9001 Section 8. Raft's internal
-		// idempotency (duplicate message detection, term checks, log
-		// index checks) causes replayed RPCs to be harmlessly discarded.
-		// Session deduplication further protects client proposals.
-		// Config.Validate() ensures MTLSConfig is set when Enable0RTT
-		// is true (returns ErrInsecure0RTT otherwise).
+		// 0-RTT is replayable (RFC 9001 section 8); Raft discards replayed RPCs and Config.Validate requires MTLSConfig.
 		Allow0RTT: cfg.Enable0RTT,
 	}
 
@@ -673,12 +408,7 @@ func NewQUICTransport(
 	t.snapshotRecv.wire = cfg.Wire
 	t.snapshotRecv.SetSnapshotTracker(&t.snapshotTracker)
 	t.msgRecvBudget.Store(cfg.MaxMessageReceiveMemory)
-	// Cap any single peer at a quarter of the aggregate budget, but never
-	// below one maximum-size frame's charge, so a legitimate peer's largest
-	// legal frame always fits. The cap is in the aggregate's unit
-	// (proto.DecodeCharge): a cap counted in wire bytes against an aggregate
-	// counted at the decode factor bounded one peer at twice the aggregate,
-	// which bounded nothing.
+	// Cap one peer at a quarter of the aggregate budget, in proto.DecodeCharge units, but never below one maximum-frame charge.
 	t.maxConnMsgRecv = max(cfg.MaxMessageReceiveMemory/4, maxFrameCharge(cfg.MaxDecompressedSize))
 
 	t.eventListener = cfg.EventListener
@@ -771,43 +501,17 @@ func (t *QUICTransport) SetEpochTracker(tracker EpochTracker) {
 	t.snapshotRecv.SetEpochTracker(tracker)
 }
 
-// SetShardEpochTrackers configures a per-shard epoch tracker resolver on the
-// snapshot receiver, used when each Raft shard is sealed under its OWN barrier
-// (per-tenant WAL/snapshot encryption). When set, a received snapshot pins its
-// in-flight epoch on the barrier mapped to the snapshot's shardID instead of a
-// single host-wide tracker. This is additive: SetEpochTracker continues to work
-// for the single-barrier case, and a non-nil per-shard resolver takes
-// precedence. Must be called before Start.
+// SetShardEpochTrackers sets a per-shard epoch tracker resolver for per-shard barriers, taking precedence over SetEpochTracker. Call before Start.
 func (t *QUICTransport) SetShardEpochTrackers(fn func(shardID uint64) EpochTracker) {
 	t.snapshotRecv.SetShardEpochTrackers(fn)
 }
 
-// SetListenerDispatcher installs the host's listener dispatcher, which
-// delivers OnSnapshotRejected for a transfer the snapshot receiver rejected off
-// the receive goroutine, the same way the engine delivers that event, so a
-// listener may call any Host API from it, including StopShard. dispatch
-// reports whether it accepted fn; a refused notification is dropped and logged.
-// Every other EventListener callback the transport fires stays inline.
-//
-// The host calls it before Start whenever it builds a transport. Leaving it
-// unset is supported only for a transport built standalone by this package's
-// tests, where the listener then runs inline.
+// SetListenerDispatcher installs the host's listener dispatcher, which delivers OnSnapshotRejected off the receive goroutine; other callbacks stay inline. Call before Start.
 func (t *QUICTransport) SetListenerDispatcher(dispatch func(fn func()) bool) {
 	t.snapshotRecv.setListenerDispatcher(dispatch)
 }
 
-// Stop gracefully shuts down the transport. It signals all per-target
-// sender goroutines to exit via stopC, waits for them to drain, stops
-// the accept loop, waits for in-flight snapshot transfers, closes all
-// connections — BOTH the ones this transport dialed and the ones it accepted,
-// so the shutdown is announced to every peer rather than only to half of
-// them — and waits for all goroutines to finish.
-//
-// Stop is idempotent and safe to call concurrently: exactly one caller runs
-// the teardown and every other caller BLOCKS until it has completed. Returning
-// early on the second call would contradict the guarantee above — the caller
-// would be told every goroutine had finished while the first Stop was still
-// closing connections and draining the WaitGroup.
+// Stop shuts the transport down: drains send workers, stops accepting, waits for snapshot transfers, announces the close on outbound and inbound connections and joins every goroutine. Idempotent; concurrent callers block until it completes.
 func (t *QUICTransport) Stop() error {
 	t.stopOnce.Do(t.stop)
 	<-t.stopDone
@@ -828,59 +532,25 @@ func (t *QUICTransport) stop() {
 		t.revocationChecker.Stop()
 	}
 
-	// Acquire sendQueuesMu to synchronize with any in-progress
-	// getOrCreateSendQueue call. This creates a happens-before edge: any
-	// wg.Add(1) that was in progress (inside the write lock with
-	// stopped=false) must complete before we proceed. After this point,
-	// all future getOrCreateSendQueue calls see stopped=true and return
-	// nil without calling wg.Add(1). The read of t.stopped under the lock
-	// is the observable work that makes the barrier explicit (and not an
-	// empty critical section).
+	// Barrier with getOrCreateSendQueue: after this, no new wg.Add(1) happens.
 	t.sendQueuesMu.Lock()
 	_ = t.stopped.Load()
 	t.sendQueuesMu.Unlock()
 
-	// Set the snapshot shutdown flag and wait for all in-flight
-	// snapshot sends and receives to complete before tearing down
-	// connections. After this, TryAdd returns false so no new
-	// snapshot operations can begin.
+	// Stop new snapshot operations and wait for in-flight ones before tearing connections down.
 	t.snapshotTracker.ShutdownAndWait()
 
-	// Every diagnostic below is contained (supervise.LogContained): stop is
-	// a sequence of teardown steps, several under locks, and a log handler
-	// that panicked or called runtime.Goexit in one of them left the rest
-	// undone — connMu or a stream shard lock held for good, the listener
-	// socket bound, the goroutines unjoined.
+	// Every diagnostic below goes through supervise.LogContained so a log handler cannot abort the teardown.
 	if t.listener != nil {
 		if err := t.listener.Close(); err != nil {
 			supervise.LogContained(func() { slog.Debug("QUIC listener close failed", "error", err) })
 		}
 	}
 
-	// Wait for the accept loop to return before touching any connection map.
-	// The listener close alone does not stop admissions: quic-go's
-	// baseServer.accept drains its connection queue after stopAccepting is
-	// closed, so a connection can still be handed to the loop here. Joining the
-	// loop is what makes the inbound sweep below COMPLETE — after this point no
-	// further connection can be admitted, and every one that was is already
-	// published in t.inboundConns (acceptLoopIteration publishes synchronously,
-	// before launching the handler). Without this join the sweep could miss a
-	// just-admitted connection, quicTr.Close() would destroy it locally, and
-	// the peer would be left holding it unannounced.
-	//
-	// This is not t.wg: that also covers the connection handlers, which cannot
-	// return until their connections are closed, so joining it here would
-	// deadlock. The accept loop has no such dependency — the listener close and
-	// shutdownCancel above are enough to end it.
+	// Join the accept loop (not t.wg, which would deadlock) so every admitted connection is in t.inboundConns before the sweep.
 	t.acceptWG.Wait()
 
-	// The join covers what the loop ADMITTED, not what the listener QUEUED.
-	// The loop exits as soon as it sees stopped, and its Accept runs on
-	// shutdownCtx, cancelled above, which can win over a queued connection;
-	// a connection whose handshake completed but which the loop never took is
-	// still in the listener's queue, unpublished, so the inbound sweep below
-	// cannot reach it and quicTr.Close would destroy it unannounced. Drain the
-	// queue and announce on each one here.
+	// Drain connections still queued in the listener and announce the shutdown on each.
 	if n := t.closeQueuedOnShutdown(); n > 0 {
 		supervise.LogContained(func() { slog.Debug("announced shutdown on queued inbound connections", "connections", n) })
 	}
@@ -894,10 +564,7 @@ func (t *QUICTransport) stop() {
 		delete(t.conns, addr)
 		delete(t.connEpoch, addr)
 	}
-	// Outbounds evicted by evictStaleOutboundOnRecv and still inside their
-	// drain grace are out of t.conns but not yet closed. Their drain
-	// goroutines return on stopC without closing, so the close is here, on
-	// the same side of quicTr.Close as the pooled ones.
+	// Close outbounds still inside their drain grace.
 	for conn := range t.draining {
 		if err := conn.CloseWithError(QUICErrShutdown, "transport shutdown"); err != nil {
 			supervise.LogContained(func() { slog.Debug("QUIC draining connection close failed", "error", err) })
@@ -906,25 +573,7 @@ func (t *QUICTransport) stop() {
 	}
 	t.connMu.Unlock()
 
-	// Announce the shutdown on the INBOUND half too. Closing only t.conns
-	// tells the peers this node DIALED that it is going away and leaves every
-	// peer that dialed US holding a connection it still believes is live:
-	// quic-go's Transport.Close below destroys those connections locally
-	// without emitting a CONNECTION_CLOSE, so the peer learns nothing until
-	// MaxIdleTimeout expires or one of its own writes fails. A leader keeps
-	// enqueuing to a dead follower for that whole window, and its
-	// cleanStaleConnections cannot evict a connection it never sees as stale.
-	//
-	// A crash cannot be announced; a planned shutdown can, and this is the one
-	// frame that says so. Ordering is load-bearing in BOTH directions — it must
-	// run after the listener close (so the set of connections to chase has
-	// stopped growing from the listener's side) and before t.quicTr.Close(),
-	// which destroys the connections locally and tears the socket down, making
-	// any close issued after it a silent no-op.
-	//
-	// It is complete rather than best-effort because of the acceptWG join
-	// above: no connection can be admitted after it, and every one that was is
-	// already in the map.
+	// Announce the shutdown on inbound connections too, after the listener close and before quicTr.Close, which would destroy them silently.
 	if n := t.closeInboundOnShutdown(); n > 0 {
 		supervise.LogContained(func() { slog.Debug("announced shutdown on inbound connections", "connections", n) })
 	}
@@ -957,10 +606,7 @@ func (t *QUICTransport) stop() {
 
 	t.wg.Wait()
 
-	// quic.Transport closes only a socket it created itself, never the Conn
-	// it was handed, so the listener socket is closed here. Without this the
-	// address stays bound after Stop and a restart on it fails with
-	// EADDRINUSE.
+	// quic.Transport does not close a socket it was handed; close the listener socket so the address is released.
 	if t.udpConn != nil {
 		if err := t.udpConn.Close(); err != nil {
 			supervise.LogContained(func() { slog.Debug("UDP listener close failed", "error", err) })
@@ -968,19 +614,7 @@ func (t *QUICTransport) stop() {
 	}
 }
 
-// closeQueuedOnShutdown takes every connection left in the closed listener's
-// accept queue and closes it with QUICErrShutdown, so its dialer learns of the
-// shutdown at once instead of after MaxIdleTimeout. It must run after the
-// listener close (a closed listener's Accept returns the queued connections and
-// then ErrServerClosed, never blocking) and after the accept loop has returned
-// (so nothing else takes from the queue), and before quicTr.Close.
-//
-// Accept runs on an uncancelled context, and the drain ends only on the
-// listener's close error (ErrServerClosed). A deadline would cover every
-// synchronous CloseWithError below: once it expired, quic-go's Accept could
-// pick ctx.Done() over a nonempty queue, and quicTr.Close would destroy the
-// rest of the queue unannounced. The closed listener cannot block Accept once
-// the queue is empty, so no deadline is needed.
+// closeQueuedOnShutdown closes every connection left in the closed listener's accept queue with QUICErrShutdown; it runs after the accept loop returns and before quicTr.Close, without a deadline.
 func (t *QUICTransport) closeQueuedOnShutdown() int {
 	if t.listener == nil {
 		return 0
@@ -1036,25 +670,7 @@ func (t *QUICTransport) resolveAdvertisedPort() {
 	t.cfg.AdvertiseAddress = net.JoinHostPort(host, bound)
 }
 
-// Send delivers Raft messages to their target replicas via non-blocking
-// per-target send queues. Each unique target address gets a dedicated
-// buffered channel (capacity 2048) and a background sender goroutine.
-// Messages are resolved to target addresses and enqueued without blocking.
-//
-// If a target's queue is full (sender goroutine backed up by slow QUIC),
-// the message is silently dropped. This is safe because Raft handles
-// retransmission via heartbeat and replicate cycles. The large queue
-// capacity (2048) absorbs normal burst traffic without drops.
-//
-// This non-blocking design ensures the step worker's tick/processReady
-// loop is never stalled by transport operations (QUIC dial, stream open,
-// stream write with the 2s sendWriteDeadline), preventing heartbeat
-// starvation and cascading multi-node stalls.
-//
-// Each message is deep-copied (entries and their Cmd payloads, and the
-// snapshot metadata's membership maps and checksum) before enqueueing into
-// the per-target channel. The caller may reuse or modify the msgs slice and
-// its contents after Send returns.
+// Send enqueues messages on per-target send queues without blocking, dropping when a queue is full (Raft retransmits); each message is deep-copied, so the caller may reuse msgs.
 func (t *QUICTransport) Send(msgs []proto.Message) {
 	if t.stopped.Load() {
 		return
@@ -1063,28 +679,16 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 		return
 	}
 
-	// Hoisted once per Send: the drop sites below fire on every message to an
-	// unresolved target during membership churn, and the variadic slog form
-	// builds and boxes its []any at the call site regardless of whether Debug
-	// is enabled.
+	// Evaluated once per Send so drop paths do not build slog arguments.
 	debugOn := debugEnabled()
 
 	for i := range msgs {
 		msg := msgs[i] // copy the message value (shallow)
-		// Injected network fault (integration builds only). Placed before the
-		// deep copies below so a dropped message costs nothing, and modelled as
-		// a silent drop: the connection stays up and no error is reported,
-		// exactly as a partitioned network behaves. In a normal build
-		// netFaultEnabled is a false constant and this whole branch is
-		// compiled away.
+		// Injected network fault (integration builds only): a silent drop, compiled away otherwise.
 		if netFaultEnabled && netFaultDrop(msg.ShardID, msg.From, msg.To) {
 			continue
 		}
-		// Deep-copy entries to break the alias with the step worker's
-		// reusable proposeBuf. The EntryQueue.Swap double-buffering
-		// reuses backing arrays across drain cycles, so without this
-		// copy, the sendQueueWorker may read entry fields while a
-		// concurrent Add overwrites the same backing array.
+		// Deep-copy entries: they alias the step worker's reusable proposeBuf.
 		if len(msg.Entries) > 0 {
 			entries := make([]proto.Entry, len(msg.Entries))
 			for j := range msg.Entries {
@@ -1097,13 +701,7 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 			}
 			msg.Entries = entries
 		}
-		// Snapshot is copied by VALUE with the message, but proto.Snapshot
-		// embeds Membership's six maps and a Checksum slice, all still
-		// aliasing the caller's structures. Membership.MarshalTo ranges over
-		// those maps on the async send path, so an in-place mutation by the
-		// caller would be an unrecoverable "concurrent map iteration and map
-		// write" fatal error that the worker's recover cannot catch. Deep-copy
-		// them so the documented reuse contract actually holds.
+		// Deep-copy the snapshot's membership maps and checksum, which the async marshal ranges over.
 		if !msg.Snapshot.IsEmpty() {
 			copySnapshotRefs(&msg.Snapshot)
 		}
@@ -1130,21 +728,12 @@ func (t *QUICTransport) Send(msgs []proto.Message) {
 	}
 }
 
-// debugEnabled reports whether the default logger would emit a Debug record.
-// The variadic slog.Debug form builds its []any and boxes every value at the
-// call site before the handler's Enabled check runs, so high-frequency drop
-// paths must gate on this instead of calling slog.Debug unconditionally.
+// debugEnabled reports whether the default logger emits Debug; hot drop paths gate on it.
 func debugEnabled() bool {
 	return slog.Default().Enabled(context.Background(), slog.LevelDebug)
 }
 
-// copySnapshotRefs replaces every reference-typed field reachable from a
-// snapshot's metadata with an owned copy, so the transport's asynchronous
-// marshal never races a caller mutating the original.
-// Every map on the membership is covered, including the two authorization maps:
-// Identities was missed when it was added, and a snapshot whose identity map is
-// mutated between the enqueue and the marshal would ship a configuration that
-// authorizes a different set of replicas than the one the caller submitted.
+// copySnapshotRefs replaces every reference field of a snapshot's metadata, every membership map included, with an owned copy.
 func copySnapshotRefs(s *proto.Snapshot) {
 	s.Membership.Addresses = copyAddrMap(s.Membership.Addresses)
 	s.Membership.Observers = copyAddrMap(s.Membership.Observers)
@@ -1173,17 +762,7 @@ func copyAddrMap(src map[uint64]string) map[uint64]string {
 	return dst
 }
 
-// enqueueToTarget resolves the per-target send queue and enqueues msg on the
-// appropriate channel (heartbeat-priority or data). It returns false only when
-// the transport is stopped (the queue could not be created).
-//
-// After a successful channel send it checks sq.closed: if the worker pruned
-// this queue on idle timeout between getOrCreateSendQueue and the send, the
-// message landed in an orphaned channel with no drainer. In that case it
-// re-acquires a fresh queue (which starts a new worker) and re-enqueues once.
-// The retry is bounded to a single attempt because the freshly created queue
-// returned by getOrCreateSendQueue cannot have been pruned yet (its worker has
-// not run its idle timer), so a second orphaning is impossible.
+// enqueueToTarget enqueues msg on its target's heartbeat or data channel, re-enqueueing once if the queue was pruned meanwhile; false only when stopped.
 func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message, debugOn bool) bool {
 	for attempt := 0; attempt < 2; attempt++ {
 		sq := t.getOrCreateSendQueue(addr)
@@ -1233,10 +812,7 @@ func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message, debugOn 
 				return true
 			}
 		}
-		// The send succeeded. If the worker pruned this queue on idle
-		// timeout concurrently, the message is orphaned: re-acquire a fresh
-		// queue and re-enqueue. A non-closed queue means the message will be
-		// drained, so we are done.
+		// If the queue was pruned concurrently, re-enqueue on a fresh one.
 		if !sq.closed.Load() {
 			return true
 		}
@@ -1244,10 +820,7 @@ func (t *QUICTransport) enqueueToTarget(addr string, msg proto.Message, debugOn 
 	return true
 }
 
-// getOrCreateSendQueue returns the send queue for the given target address,
-// creating one (with a background sender goroutine) if it does not exist.
-// Returns nil if the transport is stopped. The fast path uses RLock for
-// minimal contention on repeated sends to the same set of targets.
+// getOrCreateSendQueue returns target's send queue, creating it and its worker if needed; nil when stopped.
 func (t *QUICTransport) getOrCreateSendQueue(target string) *sendQueue {
 	if t.stopped.Load() {
 		return nil
@@ -1267,10 +840,7 @@ func (t *QUICTransport) getOrCreateSendQueue(target string) *sendQueue {
 		t.sendQueuesMu.Unlock()
 		return nil
 	}
-	// Double-check after acquiring write lock. A queue that has been marked
-	// closed by an idle-pruning worker is treated as absent: the worker sets
-	// closed=true and deletes the map entry under this same lock, so any
-	// entry we observe here as closed is mid-prune and must be replaced.
+	// Re-check under the write lock; a closed queue is mid-prune and is replaced.
 	sq, ok = t.sendQueues[target]
 	if ok && !sq.closed.Load() {
 		t.sendQueuesMu.Unlock()
@@ -1286,17 +856,7 @@ func (t *QUICTransport) getOrCreateSendQueue(target string) *sendQueue {
 	return sq
 }
 
-// retireSendQueue removes the per-target send queue for target, following the
-// worker's own prune protocol exactly: mark the queue closed and delete the map
-// entry under sendQueuesMu, so a producer that already holds this *sendQueue
-// observes closed=true after its channel send and re-enqueues into a fresh
-// queue instead of orphaning the message.
-//
-// The worker goroutine is NOT stopped here — its channels may still hold
-// messages, and closing a channel a producer may be sending on would panic. It
-// drains what is buffered, finds the queue idle, and retires itself; the
-// identity check on its own prune keeps it from deleting a queue created after
-// this one was retired.
+// retireSendQueue marks target's queue closed and removes it under sendQueuesMu; the worker drains what is buffered and retires itself.
 func (t *QUICTransport) retireSendQueue(target string) {
 	t.sendQueuesMu.Lock()
 	if sq, ok := t.sendQueues[target]; ok {
@@ -1306,25 +866,7 @@ func (t *QUICTransport) retireSendQueue(target string) {
 	t.sendQueuesMu.Unlock()
 }
 
-// sendQueueWorker is the per-target sender goroutine. It drains the send
-// queue channels, batches messages, and delivers them via sendToTarget.
-// The goroutine exits when stopC is closed or after sendQueueIdleTimeout
-// of inactivity. Idle pruning prevents goroutine and memory leaks when
-// cluster membership changes over time: removed nodes' send queues are
-// cleaned up automatically instead of persisting until transport shutdown.
-//
-// Priority: heartbeat messages (in hbCh) are always drained before data
-// messages (in ch). This prevents leader election instability under heavy
-// replication load, where data messages could otherwise fill the queue and
-// delay heartbeats past the election timeout.
-//
-// Batching strategy: after reading the first message, drain all remaining
-// buffered messages (up to 256 for data, 16 for heartbeats) into a batch
-// before sending. This amortizes QUIC frame overhead and reduces the number
-// of stream writes per batch.
-//
-// It runs under supervise.Supervise, which counts it in t.wg and starts it
-// again on a fresh goroutine if a runtime.Goexit ends it.
+// sendQueueWorker drains a target's queue in batches (heartbeats first) and sends them; it exits on stopC or after sendQueueIdleTimeout, supervised by supervise.Supervise.
 func (t *QUICTransport) sendQueueWorker(target string, sq *sendQueue) {
 	for t.sendQueueWorkerOnce(target, sq) {
 		if !supervise.AwaitRestart(t.stopC) {
@@ -1410,33 +952,14 @@ func (t *QUICTransport) drainSendQueue(target string, sq *sendQueue) {
 			}
 			t.sendToTarget(target, batch)
 		case <-idleTimer.C:
-			// No messages sent for sendQueueIdleTimeout. Remove
-			// ourselves from the map and exit. The next Send to
-			// this target will re-create the queue.
-			//
-			// Between the select picking the idle timer case and
-			// acquiring the lock, a concurrent Send() may have
-			// enqueued a message. Check under the lock whether the
-			// channels are non-empty; if so, keep the entry alive.
+			// Idle: remove this queue and exit, unless a message arrived meanwhile.
 			t.sendQueuesMu.Lock()
 			if len(sq.ch) > 0 || len(sq.hbCh) > 0 {
 				t.sendQueuesMu.Unlock()
 				resetIdleTimer()
 				continue
 			}
-			// Mark the queue closed before removing it from the map so a
-			// producer that already holds this *sendQueue and enqueues after
-			// the delete observes closed=true and re-enqueues into a fresh
-			// queue. Both the flag set and the map delete happen under
-			// sendQueuesMu, and the producer's closed-check runs after its
-			// channel send, establishing the happens-before edge.
-			//
-			// Delete only while the map still points at OUR queue: an explicit
-			// retirement (retireSendQueue, on a committed member removal) may
-			// already have removed this entry and a later Send created a fresh
-			// queue and worker at the same key. Deleting unconditionally would
-			// evict that live queue from the map without marking it closed,
-			// leaving two workers draining two channels for one target.
+			// Mark closed, then delete the map entry only if it is still this queue.
 			sq.closed.Store(true)
 			if cur, ok := t.sendQueues[target]; ok && cur == sq {
 				delete(t.sendQueues, target)
@@ -1466,19 +989,7 @@ func (t *QUICTransport) drainSendQueue(target string, sq *sendQueue) {
 	}
 }
 
-// sendToTarget dispatches a batch of messages to a single target, routing
-// heartbeat-only batches through the fast path. Extracted from Send() to
-// share logic between the single-target and parallel multi-target paths.
-//
-// Every message is pinned to its destination: it is written only over a
-// connection whose peer presents the identity membership binds to the replica
-// it is for (Config.ReplicaIdentity). Connections are keyed by address and
-// shared by every replica routed there, and address learning lets a member of
-// any shard move its own route onto another replica's address, so the batch
-// is split by destination identity — nearly always a single group, since every
-// replica a node hosts presents that node's identity — and each group carries
-// its identity down to the connection it takes (getStream, getConnection),
-// through any re-dial or retry on the way.
+// sendToTarget sends a batch to one target, split by destination identity so each group is written only over a connection presenting it (Config.ReplicaIdentity).
 func (t *QUICTransport) sendToTarget(target string, batch []proto.Message) {
 	if t.cfg.ReplicaIdentity == nil || len(batch) == 0 {
 		t.sendGroup(target, "", batch)
@@ -1558,23 +1069,7 @@ func (t *QUICTransport) incBatchDropped(msgs []proto.Message, reason string) {
 	}
 }
 
-// sendBatch delivers a batch of messages to target, splitting it into as many
-// frames as it takes. A batch is a coalescing artifact of the send queue, not a
-// unit the peer sees, so it must never be all-or-nothing:
-//
-//   - Messages whose combined marshaled size exceeds MaxFrameSize are split
-//     across consecutive frames on the same (ordered) stream, instead of being
-//     dropped together on a MarshalFrame failure.
-//   - A message no peer can accept — more entries than
-//     proto.MaxEntriesPerMessage, or bigger on its own than a frame — is
-//     dropped here, BEFORE it is written. Writing it makes the peer's decoder
-//     reject the frame and reset the stream, which the sender can only read as
-//     an I/O failure; the batch is then retried unchanged and the loop is
-//     unbounded. Dropping it also stops one unsendable message from taking the
-//     rest of its batch (heartbeats included) down with it.
-//
-// want is the identity every message's destination is bound to (see
-// sendToTarget); each frame is written only over a connection serving it.
+// sendBatch writes a batch as as many frames as needed and drops, before writing, any message no peer can accept; want is the destination identity.
 func (t *QUICTransport) sendBatch(target, want string, msgs []proto.Message) {
 	headerSize := batchHeaderSize(t.localAddr())
 	for len(msgs) > 0 {
@@ -1589,12 +1084,7 @@ func (t *QUICTransport) sendBatch(target, want string, msgs []proto.Message) {
 	}
 }
 
-// dropUnsendable records and reports a message the transport refuses to write.
-// It is logged at Error because it is a producer defect — raft must bound both
-// the byte size (Config.MaxApplyEntrySize) and the entry count
-// (proto.MaxEntriesPerMessage) of every message it builds — and because the
-// data in it is never delivered: the peer waiting on those entries stalls
-// until the producer stops emitting the same message.
+// dropUnsendable records and logs at Error a message the transport refuses to write, a producer defect.
 func (t *QUICTransport) dropUnsendable(target string, msg *proto.Message, headerSize int, reason error) {
 	slog.Error("transport: dropping message that cannot be framed; the peer will not receive it until the producer bounds this message",
 		"target", target,
@@ -1648,11 +1138,7 @@ func (t *QUICTransport) PeerFrameRejections() uint64 {
 	return t.peerFrameRejections.Load()
 }
 
-// sendFrame marshals msgs as one MessageBatch and writes it as a single framed
-// payload to the appropriate stream for the target. payloadSize is the size
-// sendBatch already measured the group at, which it has verified fits a frame;
-// a stale value can only under-size the buffer, which MarshalTo reports as
-// ErrBufferTooSmall on the drop path below. Errors are logged and dropped.
+// sendFrame marshals msgs as one MessageBatch frame of payloadSize and writes it to the target's stream; errors are logged and dropped.
 func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, payloadSize int) { //nolint:gocognit // metrics instrumentation adds branches
 	debugOn := debugEnabled()
 	var sendStart time.Time
@@ -1696,12 +1182,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 		isHeartbeat = isHeartbeatMessage(msgs[0].Type)
 	}
 
-	// Apply Snappy compression to the serialized payload. Only use
-	// compression if it reduces size (incompressible data is sent raw).
-	// Heartbeat messages are tiny (<200 bytes) where Snappy overhead
-	// exceeds savings; skip compression to reduce latency on the
-	// ReadIndex critical path. DisableCompression bypasses Snappy
-	// entirely for all message types.
+	// Snappy-compress unless it does not shrink the payload, for heartbeats, or when DisableCompression is set.
 	payload := payloadBuf[:n]
 	flags := FlagNone
 	var snappyBuf []byte     // tracks the pooled encode buffer for deferred return
@@ -1722,11 +1203,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 		}
 	}
 
-	// Ensure the buffer is large enough for the compressed frame. The pooled
-	// buffer must NOT be returned before MarshalFrame runs: payload may alias
-	// it (uncompressed sends marshal straight into it), so pooling it first
-	// would let a concurrent Get hand that backing array to another sender
-	// while it is still being copied from.
+	// Grow the buffer for the frame; keep the pooled buffer until MarshalFrame runs, since payload may alias it.
 	totalSize := FrameHeaderSize + len(payload)
 	grewBuf := cap(buf) < totalSize
 	oldBufPtr := bufPtr
@@ -1743,14 +1220,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 		t.putBuf(oldBufPtr)
 	}
 
-	// Return the Snappy encode buffer now that the payload has been
-	// copied into the frame buffer. The compressed slice aliases
-	// snappyBuf, so it must not be used after this point.
-	//
-	// We return the original *[]byte pointer from Get rather than
-	// creating a pointer to a local slice header. This avoids a
-	// subtle escape-analysis dependency where &localSlice would
-	// only be heap-allocated due to the Pool.Put interface{} box.
+	// Return the Snappy buffer (the original pointer from Get); compressed is invalid after this.
 	if snappyBufPtr != nil {
 		*snappyBufPtr = snappyBuf[:0] // reset length but keep capacity
 		// Apply the standard pool cap: an encode buffer sized for a large
@@ -1763,12 +1233,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 	snappyBuf = nil //nolint:wastedassign // defensive nil to prevent use-after-pool-return
 
 	if err != nil {
-		// Unreachable in normal operation: sendBatch sizes every group against
-		// MaxFrameSize before this point, so a failure here means the marshaled
-		// size disagreed with MessageBatch.Size() — an internal sizing defect.
-		// Dropping (rather than writing an unacceptable frame) is still the
-		// correct response: retrying it unchanged can never succeed, and
-		// emitting it would cost the connection.
+		// Unreachable: sendBatch sized the group. Drop rather than write an unacceptable frame.
 		t.putBuf(bufPtr)
 		slog.Error("transport: dropping frame that failed to marshal despite passing the pre-write size check",
 			"target", target,
@@ -1785,12 +1250,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 
 	frameSize := totalSize
 
-	// Every failure branch below settles first — the frame buffer returned,
-	// a dead connection and its streams evicted — and only then runs user
-	// code (the drop metrics and diagnostics): a MetricsCollector or log
-	// handler that panicked or called runtime.Goexit before the eviction
-	// left the dead connection pooled, so every later send hung on it for
-	// the full write deadline.
+	// Each failure branch settles state (buffer, eviction) before metrics and diagnostics.
 	stream, err := t.getStream(target, shardID, isHeartbeat, want)
 	if err != nil {
 		t.putBuf(bufPtr)
@@ -1819,24 +1279,14 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 	_, err = stream.Write(buf[:frameSize])
 	t.putBuf(bufPtr)
 	if err != nil {
-		// The peer's decoder rejected a frame on this stream and reset it.
-		// That is a statement about the FRAME, not about the connection — the
-		// connection is provably alive, since the peer had to receive and parse
-		// a frame on it to reject one. Treating it as a dead connection is what
-		// turns a single unacceptable batch into a dial storm: close, re-dial,
-		// re-send the same batch, repeat. Drop the batch and replace only the
-		// stream; the connection, and every other stream on it, survives.
+		// The peer rejected the frame: drop the batch and replace only the stream; the connection is alive.
 		if isPeerFrameRejection(err) {
 			t.evictStream(target, shardID, isHeartbeat, stream)
 			t.incBatchDropped(msgs, dropReasonPeerRejected)
 			t.recordPeerFrameRejection(target, shardID, len(msgs), err)
 			return
 		}
-		// Stream write failed — likely a dead connection. Close and evict
-		// the connection and all its streams so the next send attempt dials
-		// fresh. Without this, other cached streams on the same dead
-		// connection would each hang for the full write deadline before
-		// failing, compounding latency on every message type.
+		// Write failed: evict the connection and all its streams so the next send dials fresh.
 		t.removeAndCloseConnection(target, "stream write failure")
 		t.evictStreamsForTarget(target)
 		// Debug level: a dead peer fails every in-flight batch until eviction
@@ -1868,17 +1318,7 @@ func (t *QUICTransport) sendFrame(target, want string, msgs []proto.Message, pay
 	}
 }
 
-// writeSnapshotHeader writes the framed SnapshotHeader that opens a snapshot
-// stream, which is what tells the receiver this stream carries a snapshot
-// rather than a message batch (FlagSnapshot).
-//
-// Extracted from SendSnapshot so that function stays under the cyclomatic
-// limit: it sits right at the threshold, and the three error branches here
-// were enough to push it over when the network-fault guard was added.
-//
-// The write deadline is set here rather than by the caller because a header
-// write to a stalled receiver would otherwise block indefinitely, holding a
-// snapshotTracker slot and with it Stop().
+// writeSnapshotHeader writes the framed SnapshotHeader (FlagSnapshot) that opens a snapshot stream, under a write deadline.
 func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk, ver byte) error {
 	if err := stream.SetWriteDeadline(time.Now().Add(snapshotChunkWriteDeadline)); err != nil {
 		return err
@@ -1899,27 +1339,13 @@ func writeSnapshotHeader(stream *quic.Stream, first *proto.SnapshotChunk, ver by
 	return writeFrameAt(stream, hdrBuf[:], FlagSnapshot, ver)
 }
 
-// SendSnapshot sends snapshot chunks over a dedicated QUIC stream.
-// Each snapshot transfer uses a fresh bidirectional stream to avoid
-// interference with the regular message stream pool. The snapshotTracker
-// is used to track in-flight sends so Stop() can wait for completion.
-//
-// Security note: Snapshot confidentiality and integrity in transit are provided
-// by QUIC's mandatory TLS 1.3 encryption layer. All snapshot chunk data flows
-// over a TLS-protected QUIC connection with mutual TLS (mTLS) authentication.
-// Application-layer encryption of snapshot payloads (double encryption) is not
-// currently implemented. This is a potential future defense-in-depth enhancement
-// for deployments where the TLS termination point is untrusted, but for
-// standard deployments the QUIC TLS layer provides sufficient protection.
-// At-rest snapshot encryption is handled by the seal.Barrier when configured.
+// SendSnapshot sends snapshot chunks on a dedicated QUIC stream tracked by snapshotTracker; transit protection is QUIC TLS 1.3 with mTLS, at rest the seal.Barrier.
 func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	if len(chunks) == 0 {
 		return nil
 	}
 
-	// Atomically register this send operation. TryAdd returns false if
-	// Stop() has already initiated shutdown, eliminating the TOCTOU race
-	// between the old stopped.Load() check and WaitGroup.Add(1).
+	// Register the send; TryAdd returns false once Stop has begun.
 	if !t.snapshotTracker.TryAdd() {
 		return ErrStreamClosed
 	}
@@ -1928,11 +1354,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	snapStart := time.Now()
 
 	first := &chunks[0]
-	// A partition that let snapshots through would not be a partition: a
-	// follower cut off from its leader must fall behind, which is the whole
-	// point of the catch-up tests. Reported as a stream error rather than a
-	// silent success so the sender retries, which is what an interrupted
-	// transfer looks like. Compiled away in a normal build.
+	// Injected partition: fail the transfer as a stream error so the sender retries. Compiled away otherwise.
 	if netFaultEnabled && netFaultDrop(first.ShardID, first.From, first.ReplicaID) {
 		return ErrStreamClosed
 	}
@@ -1952,10 +1374,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		return err
 	}
 
-	// Derive the stream-open context from shutdownCtx so that when
-	// Stop() cancels shutdownCtx, the OpenStreamSync call is unblocked
-	// and the stream is automatically torn down. The 60s timeout
-	// covers the handshake; per-chunk deadlines handle data transfer.
+	// Open the stream on a context derived from shutdownCtx, so Stop unblocks it.
 	openCtx, openCancel := context.WithTimeout(t.shutdownCtx, 60*time.Second)
 	defer openCancel()
 
@@ -1972,12 +1391,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 		return err
 	}
 
-	// Fire OnSnapshotSendStarted after the header is written successfully.
-	// If the send fails after this point, OnSnapshotSendAborted is fired
-	// via the deferred closure below, which is in place before Started
-	// runs. Every listener call is isolated (deliverEvent): one that
-	// panicked or called runtime.Goexit used to end the send, or turn a
-	// delivered snapshot into a failed one.
+	// OnSnapshotSendStarted fires after the header; the deferred closure fires OnSnapshotSendAborted on failure. Listener calls are isolated (deliverEvent).
 	snapInfo := config.SnapshotInfo{
 		ShardID:   first.ShardID,
 		ReplicaID: first.ReplicaID,
@@ -1992,19 +1406,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	}()
 	deliverEvent(t.snapshotEvent(onSnapshotSendStarted, snapInfo))
 
-	// Write each chunk as a framed payload. Stamp the deployment ID on
-	// each chunk so the receiver can validate it matches (analogous to
-	// how sendBatch stamps DeploymentID on the MessageBatch header).
-	//
-	// Each chunk gets a fresh write deadline to prevent indefinite blocking
-	// if the receiver is slow or the network stalls. Without this, a
-	// stalled WriteFrame holds the snapshotTracker slot forever, making
-	// Stop() -> ShutdownAndWait() block indefinitely.
-	// Arm the shutdown watcher so a chunk write blocked on a stalled receiver
-	// cannot hold Stop() for the full 30s per-chunk deadline. It is disarmed
-	// explicitly once the last chunk is written (see below) so a concurrent
-	// Stop cannot reset a stream that already carried the whole snapshot; the
-	// defer is the backstop for the error returns inside the loop.
+	// Write each chunk with the deployment ID and a fresh write deadline; the shutdown watcher is released explicitly after the last chunk, with the defer as backstop.
 	releaseWriteWatch := t.cancelSnapshotWriteOnStop(stream)
 	defer releaseWriteWatch()
 
@@ -2058,11 +1460,7 @@ func (t *QUICTransport) SendSnapshot(chunks []proto.SnapshotChunk) error {
 	return nil
 }
 
-// closeSnapshotStream closes an outbound snapshot stream when its send
-// returns. A close failure's diagnostic is contained: this runs from a defer
-// of a send whose result is already settled, and a log handler must not
-// replace that result with a panic or end the goroutine before the send's
-// remaining defers (the snapshot tracker) run.
+// closeSnapshotStream closes an outbound snapshot stream, logging a failure through LogContained.
 func (t *QUICTransport) closeSnapshotStream(stream *quic.Stream, shardID, replicaID uint64) {
 	if closeErr := stream.Close(); closeErr != nil {
 		supervise.LogContained(func() {
@@ -2072,22 +1470,7 @@ func (t *QUICTransport) closeSnapshotStream(stream *quic.Stream, shardID, replic
 	}
 }
 
-// cancelSnapshotWriteOnStop arms a watcher that resets the snapshot stream's
-// write side when the transport begins shutting down mid-transfer. Each chunk
-// write may block for up to snapshotChunkWriteDeadline (30s); without the
-// watcher, Stop()'s ShutdownAndWait stalls behind every in-flight chunk write.
-// CancelWrite unblocks a blocked Write immediately, failing the transfer with
-// a stream error that the per-chunk error handling already surfaces. The
-// returned release func must be called (deferred) when the transfer finishes.
-//
-// The release func is idempotent and disarms the watcher under a mutex, which
-// closes the success race: without it, a close(stopC) landing between the last
-// successful chunk write and the release call lets the watcher RESET a stream
-// that already carried the whole snapshot, discarding the peer's
-// buffered-but-unread data while the sender reports success (OnSnapshotSent,
-// IncSnapshotsSent). Callers therefore release explicitly once the final chunk
-// is written, before any success bookkeeping, and defer the same func as a
-// backstop for the error paths.
+// cancelSnapshotWriteOnStop resets the stream's write side if the transport stops mid-transfer; release it explicitly after the last chunk, and defer it as backstop.
 func (t *QUICTransport) cancelSnapshotWriteOnStop(stream *quic.Stream) func() {
 	done := make(chan struct{})
 	var mu sync.Mutex
@@ -2114,30 +1497,12 @@ func (t *QUICTransport) cancelSnapshotWriteOnStop(stream *quic.Stream) func() {
 	}
 }
 
-// SnapshotChunkProducer is a function that streams snapshot chunks to an
-// emit callback one at a time. The producer reads chunk data from disk and
-// calls emit for each chunk; emit writes the chunk to the wire. If emit
-// returns an error (e.g., network write failure), the producer stops
-// immediately and returns that error.
-//
-// This design keeps at most one chunk's worth of data (typically 2MB) in
-// memory at any time, preventing OOM on large snapshots.
+// SnapshotChunkProducer streams chunks to emit one at a time and stops on emit's first error, so at most one chunk is in memory.
 type SnapshotChunkProducer func(emit func(proto.SnapshotChunk) error) error
 
-// SendSnapshotStreaming sends snapshot chunks over a dedicated QUIC stream
-// using a streaming producer that emits chunks one at a time. Unlike
-// SendSnapshot which requires all chunks in memory at once, this method
-// holds at most one chunk in memory at any point, making it safe for large
-// snapshots (up to 4GB).
-//
-// The meta parameter provides snapshot metadata for the stream header.
-// The produce function is called with an emit callback; it must call emit
-// for each chunk in order. Each chunk is serialized and written to the
-// wire immediately upon emission.
+// SendSnapshotStreaming sends snapshot chunks from produce on a dedicated QUIC stream, holding one chunk in memory at a time.
 func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce SnapshotChunkProducer) error {
-	// Atomically register this send operation. TryAdd returns false if
-	// Stop() has already initiated shutdown, eliminating the TOCTOU race
-	// between the old stopped.Load() check and WaitGroup.Add(1).
+	// Register the send; TryAdd returns false once Stop has begun.
 	if !t.snapshotTracker.TryAdd() {
 		return ErrStreamClosed
 	}
@@ -2161,10 +1526,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 		return err
 	}
 
-	// Derive the stream-open context from shutdownCtx so that when
-	// Stop() cancels shutdownCtx, the OpenStreamSync call is unblocked
-	// and the stream is automatically torn down. The 60s timeout
-	// covers the handshake; per-chunk deadlines handle data transfer.
+	// Open the stream on a context derived from shutdownCtx, so Stop unblocks it.
 	openCtx, openCancel := context.WithTimeout(t.shutdownCtx, 60*time.Second)
 	defer openCancel()
 
@@ -2205,13 +1567,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	}()
 	deliverEvent(t.snapshotEvent(onSnapshotSendStarted, snapInfo))
 
-	// Stream chunks from the producer. Each chunk is serialized and
-	// written to the wire immediately, then its data buffer can be GC'd
-	// before the next chunk is read from disk.
-	// Arm the shutdown watcher so a chunk write blocked on a stalled receiver
-	// cannot hold Stop() for the full 30s per-chunk deadline. It is disarmed
-	// explicitly once the producer finishes so a concurrent Stop cannot reset
-	// a stream that already carried the whole snapshot.
+	// Write chunks as the producer emits them; release the shutdown watcher explicitly once the producer finishes.
 	releaseWriteWatch := t.cancelSnapshotWriteOnStop(stream)
 	defer releaseWriteWatch()
 
@@ -2262,11 +1618,7 @@ func (t *QUICTransport) SendSnapshotStreaming(meta SnapshotHeader, produce Snaps
 	return nil
 }
 
-// localAddr returns the address this node advertises to peers as its
-// reachable Raft transport address. When AdvertiseAddress is set in the
-// config it takes priority over the OS-reported local socket address so
-// that nodes behind NAT or in Docker containers advertise their external
-// hostname/IP rather than 0.0.0.0 or [::].
+// localAddr returns the address advertised to peers: AdvertiseAddress if set, else the socket's local address.
 func (t *QUICTransport) localAddr() string {
 	if t.cfg.AdvertiseAddress != "" {
 		return t.cfg.AdvertiseAddress
@@ -2277,11 +1629,7 @@ func (t *QUICTransport) localAddr() string {
 	return t.cfg.ListenAddress
 }
 
-// getBuf retrieves a buffer from the pool, ensuring it has at least minCap
-// capacity. When the pooled buffer is too small it is returned to the pool
-// before the replacement is allocated (as getRecvBuf does); dropping it would
-// discard a live pooled buffer on every oversized send and steadily drain the
-// pool.
+// getBuf returns a pooled buffer of at least minCap, putting a too-small one back before allocating.
 func (t *QUICTransport) getBuf(minCap int) *[]byte {
 	bufPtr := t.bufPool.Get().(*[]byte)
 	if cap(*bufPtr) < minCap {

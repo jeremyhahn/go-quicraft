@@ -64,21 +64,7 @@ func (c *raftMuProbeCallback) OnProposalRejected(shardID uint64, entries []proto
 	c.testCallback.OnProposalRejected(shardID, entries, err)
 }
 
-// TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu is the regression test
-// for engine callbacks invoked under node.raftMu.
-//
-// processCommitPendingInbox already hoists publishLeaderChange out of the lock,
-// with the rationale written forty lines above the offending calls: running a
-// host callback under raftMu "stalls the commit worker's node.raftMu.Lock() for
-// every shard that worker owns, for however long the user's listener takes".
-// Three callbacks were nonetheless invoked INSIDE the two critical sections —
-// OnReadIndexBatched, OnReadIndexFailed and OnProposalFailed — and the last of
-// those is hot rather than exotic: peer.Handle(Propose) on a leaderless follower
-// returns NotLeaderError, which is exactly what drives it.
-//
-// The shard here is a leaderless follower in a three-voter membership, so both
-// the batched ReadIndex and the batched Propose are rejected by raft and all
-// three callbacks fire in one pass.
+// TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu pins that engine callbacks are not invoked under node.raftMu.
 func TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu(t *testing.T) {
 	const shardID, replicaID = 1, 1
 
@@ -136,9 +122,7 @@ func TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu(t *testing.T) {
 			"path, driven by NotLeaderError on every leaderless follower")
 	}
 
-	// The hoist must not have changed WHAT is reported: the alias registration
-	// still precedes the raft submission, and every stranded read key is still
-	// completed with the submit error.
+	// The alias registration still precedes the raft submission, and every stranded read is completed with the submit error.
 	if got := cb.batchCount.Load(); got != 1 {
 		t.Fatalf("expected exactly one ReadIndex batch registration, got %d", got)
 	}
@@ -152,15 +136,7 @@ func TestProcessCommitPendingInbox_CallbacksRunOutsideRaftMu(t *testing.T) {
 
 var _ Callback = (*raftMuProbeCallback)(nil)
 
-// TestNotePiggybackFailure_CountsAndRateLimits covers the reporting of a
-// GetPiggybackUpdate error, which must be more than a bare repeated
-// slog.Warn. It is not terminal for the shard —
-// the commit worker falls back to the skip-apply path — but it PERMANENTLY
-// degrades the multi-node fast path for as long as the condition persists,
-// turning every two-phase proposal back into a full extra pipeline cycle. A
-// repeated warning is not something an operator can alert on, so the condition
-// is counted; the log record is rate-limited because the call site runs on every
-// commit cycle while the condition does not change between them.
+// TestNotePiggybackFailure_CountsAndRateLimits pins that a GetPiggybackUpdate error is counted and its log rate-limited.
 func TestNotePiggybackFailure_CountsAndRateLimits(t *testing.T) {
 	// captureLogOutput filters at ERROR; the degradation record is a WARN, so
 	// this test installs its own handler.

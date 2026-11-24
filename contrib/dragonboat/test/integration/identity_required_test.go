@@ -82,13 +82,7 @@ func requireAsyncIdentityRefusal(ctx context.Context, t *testing.T, desc string,
 	requireIdentityRefusal(ctx, t, desc, err)
 }
 
-// TestIntegration_DB_IdentityRequired verifies that a dragonboat NodeHost
-// with a transport refuses every add call that commits no node identity
-// (SyncRequestAddReplica, SyncRequestAddNonVoting, SyncRequestAddWitness
-// and the async RequestAdd* forms) with quicraft.ErrMemberIdentityRequired,
-// that the refusals leave the membership and its ConfigChangeID unchanged,
-// and that they leave no pending config change behind: the WithIdentity add
-// of the same non-voting ID lands afterwards.
+// TestIntegration_DB_IdentityRequired verifies every add without a node identity is refused with ErrMemberIdentityRequired and leaves membership unchanged.
 func TestIntegration_DB_IdentityRequired(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*membershipTimeout)
 	defer cancel()

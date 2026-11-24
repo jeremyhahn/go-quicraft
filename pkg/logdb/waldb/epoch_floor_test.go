@@ -52,17 +52,7 @@ func rotateBarrierTo(t *testing.T, db *DB, want uint64) {
 	}
 }
 
-// TestSaveState_RolledBackBatchDoesNotLowerEpochFloor pins the epoch floor to
-// DURABLE records only.
-//
-// Applying the floor (minWriteEpoch / segmentEpochs) inside writeRecord, in
-// SaveState's Phase 1 — before the fsync and before the batch is known to
-// commit — would leave a rolled-back batch's epoch behind permanently:
-// rollbackShard drops segmentEpochs only for the intermediate segments it
-// unlinks, and never restores minWriteEpoch or recomputes the checkpoint
-// segment's entry. MinLiveEpoch would then report a floor pinned to an epoch
-// no live record was ever encrypted under, and the engine could never purge
-// that DEK.
+// TestSaveState_RolledBackBatchDoesNotLowerEpochFloor checks the epoch floor reflects only durable records.
 func TestSaveState_RolledBackBatchDoesNotLowerEpochFloor(t *testing.T) {
 	barrier := newTestBarrier(t)
 	dir := t.TempDir()
@@ -83,9 +73,7 @@ func TestSaveState_RolledBackBatchDoesNotLowerEpochFloor(t *testing.T) {
 	const shardID, replicaID = uint64(1), uint64(1)
 	shard := db.getShard(shardID)
 
-	// Materialize the segment WITHOUT committing a record, so the shard's
-	// epoch floor is still 0 and any epoch observed afterwards can only have
-	// come from the batch below.
+	// Create the segment without a record so the floor is still 0.
 	shard.mu.Lock()
 	ensErr := shard.ensureActiveSegment()
 	shard.mu.Unlock()
@@ -199,9 +187,7 @@ func TestSaveState_RolledBackBatchDoesNotLowerEpochFloor(t *testing.T) {
 func TestEpochFloorTracksCommittedWrites(t *testing.T) {
 	const shardID, replicaID = uint64(1), uint64(1)
 
-	// Each case runs against a fresh DB whose barrier has been rotated to
-	// epoch 3 BEFORE any write, so the observed floor can only come from the
-	// records the operation itself wrote.
+	// Each case uses a fresh DB rotated to epoch 3 before any write.
 	cases := []struct {
 		name string
 		op   func(*testing.T, *DB)

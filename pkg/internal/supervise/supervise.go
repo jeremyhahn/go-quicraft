@@ -12,36 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package supervise keeps long-lived goroutines running when code they call
-// ends them abnormally, and keeps the diagnostics of that from doing harm.
-//
-// A goroutine that runs user code — a state machine, a callback, a metrics
-// collector, a slog handler, a user LogDB — or a library that may panic can
-// be ended two ways besides a normal return: a panic, which recover stops, and
-// runtime.Goexit, which nothing stops and for which recover returns nil. The
-// package gives every recovery and supervision path in the library the same
-// four tools for both:
-//
-//   - ClassifyExit tells a deferred check how a run ended, reporting a Goexit
-//     as ErrGoexit so the recovery treats it exactly as a panic.
-//   - Supervise runs a worker's restart loop and starts it again on a fresh
-//     goroutine when a Goexit ends it, with the caller's WaitGroup accounting
-//     and the restart wait (AwaitRestart, RestartDelay) a panic restart takes.
-//   - RunResilient runs a shutdown or cleanup path to completion on helper
-//     goroutines, so no abnormal exit inside it can leave its caller waiting;
-//     RunEach runs a sequence of callbacks the same way, each one isolated
-//     from the others and from the caller.
-//   - LogContained emits a diagnostic on the contained-diagnostics worker,
-//     a single goroutine behind a bounded queue, never on the caller's.
-//
-// The rule they serve is settle first, log last: a recovery settles
-// everything structural, and publishes every completion signal, from defers
-// user code cannot skip, before any diagnostic is emitted, and the diagnostic
-// goes through LogContained, because the slog handler and the String or Error
-// method of a recovered panic value are user code too.
-//
-// The package depends on the standard library only, so every layer that runs
-// such code — the engine, the transport and the host — can import it.
+// Package supervise keeps goroutines that run user code alive through panics and runtime.Goexit (ClassifyExit, Supervise, RunResilient, RunEach) and logs diagnostics off the caller (LogContained); standard library only.
 package supervise
 
 import (
@@ -81,15 +52,7 @@ func AwaitRestart(stopC <-chan struct{}) bool {
 	}
 }
 
-// ClassifyExit classifies how a worker run ended, from its deferred check.
-// recovered must be recover()'s result, called directly by that deferred
-// function; normalReturn is set by the run's last statement. abnormal is false
-// for a normal return. Otherwise the run ended in a panic, whose value is
-// returned, or in runtime.Goexit — the run did not return normally, yet
-// recover returns nil — reported as ErrGoexit so the recovery treats it
-// exactly as a panic. A Goexit cannot be stopped: it ends the goroutine once
-// the deferred calls have run, and Supervise restarts the loop on a
-// fresh one.
+// ClassifyExit classifies how a run ended from its deferred check: normal, a panic (value returned) or a runtime.Goexit (ErrGoexit).
 func ClassifyExit(recovered any, normalReturn bool) (value any, abnormal bool) {
 	if recovered != nil {
 		return recovered, true
@@ -100,23 +63,7 @@ func ClassifyExit(recovered any, normalReturn bool) (value any, abnormal bool) {
 	return nil, false
 }
 
-// Supervise runs loop — a worker's restart-on-panic loop — on a
-// goroutine counted by wg. A panic in the worker is recovered inside loop,
-// which restarts it; a runtime.Goexit cannot be recovered and ends the
-// goroutine, loop included, so this restarts loop on a fresh goroutine, after
-// the same wait a panic restart takes and with the same wg accounting: the
-// replacement is counted before the exiting goroutine is released. stopped,
-// when not nil, runs instead of the restart if stopC closes meanwhile; a loop
-// that signals its own completion (a done channel, say) must signal it there
-// too, and only on its normal return otherwise — never from a deferred call,
-// which also runs on the Goexit being restarted. wg may be nil.
-//
-// It supervises every long-lived goroutine that runs user code or callbacks:
-// the engine's apply, commit and step workers, each per-shard apply
-// goroutine, the snapshot pool workers and the listener dispatcher, the
-// host's key-rotation loop, and the transport's send-queue workers,
-// connection cleanup and accept loop, and the contained-diagnostics worker
-// (LogContained).
+// Supervise runs loop on a goroutine counted by wg and restarts it on a fresh goroutine after a runtime.Goexit; stopped runs instead if stopC closes. wg may be nil.
 func Supervise(wg *sync.WaitGroup, stopC <-chan struct{}, loop, stopped func()) {
 	add, done := func() {}, func() {}
 	if wg != nil {
@@ -146,14 +93,7 @@ func Supervise(wg *sync.WaitGroup, stopC <-chan struct{}, loop, stopped func()) 
 	}()
 }
 
-// RunResilient runs fn to completion on helper goroutines, starting a fresh
-// one whenever user code inside fn ends one with a panic or runtime.Goexit,
-// and returns once fn has returned normally. The calling goroutine never runs
-// fn itself, so no user code can end it. fn must consume what it has handled
-// before running user code on it, so that a rerun resumes where the last run
-// stopped instead of repeating it. It is for paths that must finish — a
-// shutdown drain whose callers then close a done channel, or a sequence of
-// callbacks every one of which must run (RunEach).
+// RunResilient runs fn to completion on helper goroutines, restarting after a panic or Goexit; fn must consume work before running user code on it.
 func RunResilient(fn func()) {
 	for {
 		normal := make(chan bool, 1)
@@ -180,17 +120,7 @@ func RunResilient(fn func()) {
 	}
 }
 
-// RunEach makes the calls call(0) … call(n-1), in order and synchronously:
-// it returns once every call has ended. Each call is user code — a listener
-// callback, a revocation notification — and is consumed before it runs, so a
-// call that panics or calls runtime.Goexit ends only itself: the calls after
-// it still run, none runs twice, and the caller is never ended (RunResilient).
-// A panic's diagnostic is contained (LogContained).
-//
-// The calls run on a helper goroutine while the caller waits, so a callback
-// documented to run synchronously, in order, on the goroutine of the
-// operation that produced it keeps that contract in every respect but the
-// goroutine's identity.
+// RunEach calls call(0) through call(n-1) in order on a helper goroutine; a call that panics or exits ends only itself and none runs twice.
 func RunEach(n int, call func(i int)) {
 	if n <= 0 {
 		return
@@ -210,41 +140,15 @@ func RunEach(n int, call func(i int)) {
 // full is dropped and counted in DiagnosticsDropped.
 const DiagnosticQueueCapacity = 256
 
-// contained is the process's contained-diagnostics worker. It is
-// process-wide because what it guards is: the slog default handler is one per
-// process, shared by every host, engine and transport in it, so a handler that
-// blocks stalls them all alike, and one bounded queue in front of it is the
-// whole bound.
+// contained is the process-wide contained-diagnostics worker, one bounded queue in front of the slog default handler.
 var contained = newDiagnosticWorker(DiagnosticQueueCapacity)
 
-// LogContained emits a diagnostic off the calling goroutine, so the slog
-// handler — user code, through slog.SetDefault — and the String or Error
-// method of a recovered panic value cannot reach the caller. It never blocks
-// and never delays its caller: emit is queued for the contained-diagnostics
-// worker, or dropped and counted in DiagnosticsDropped when the queue is full.
-// emit must capture everything it logs — a stack, the attributes — before it
-// is submitted; it runs later, on the worker.
-//
-// The worker runs one record at a time, in submission order. A record whose
-// handler panics is recovered and the worker goes on; one whose handler calls
-// runtime.Goexit ends the worker, which Supervise restarts. A handler that
-// never returns holds the worker and one record, and nothing more: the queue
-// is bounded, and no goroutine is started per record. The worker exits when
-// its queue is empty and the next submission starts it again, so it holds no
-// goroutine while there is nothing to log and needs no shutdown.
-//
-// Every recovery and supervision path uses it, and only after it has settled
-// everything structural and published every completion signal: logging is
-// never allowed to stand between an abnormal exit and its settlement.
+// LogContained queues emit for the contained-diagnostics worker without blocking, or drops and counts it when the queue is full; emit must capture everything it logs.
 func LogContained(emit func()) {
 	contained.submit(emit)
 }
 
-// DiagnosticsDropped returns the number of contained diagnostics dropped since
-// the process started because DiagnosticQueueCapacity records were already
-// waiting for the slog handler (LogContained). A count that keeps rising means
-// the handler installed through slog.SetDefault is blocking or far slower than
-// the process logs.
+// DiagnosticsDropped returns how many contained diagnostics were dropped because the queue was full; a rising count means a slow slog handler.
 func DiagnosticsDropped() uint64 {
 	return contained.dropped.Load()
 }
@@ -276,10 +180,7 @@ func (w *diagnosticWorker) submit(emit func()) {
 	}
 }
 
-// drain runs queued records until the queue is empty and then gives up the
-// worker. A record queued between the empty receive and the hand-back saw the
-// worker still running and started none, so drain takes the worker back for
-// it unless that record's own submit already has.
+// drain runs queued records until the queue is empty, then releases the worker, retaking it for a record queued in between.
 func (w *diagnosticWorker) drain() {
 	for {
 		select {

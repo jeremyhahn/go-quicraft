@@ -35,17 +35,7 @@ func snapshotLoadShardConfig(shardID, replicaID uint64) config.Config {
 	return testShardConfigWithSnapshot(shardID, replicaID, 50, 10)
 }
 
-// TestHostAPI_SnapshotUnderLoad_ConcurrentWriters verifies that automatic
-// snapshots complete correctly while the cluster is under sustained write
-// load from multiple concurrent writers. The test confirms that no data
-// is lost and all nodes converge to the same state.
-//
-// The test exercises:
-// - Automatic snapshot triggering under high write throughput
-// - Concurrent proposal handling during snapshot creation
-// - Log compaction without data loss
-// - Data consistency across all nodes after snapshot and compaction
-// - Linearizable reads (SyncRead) for final verification
+// TestHostAPI_SnapshotUnderLoad_ConcurrentWriters: automatic snapshots and compaction under concurrent write load lose nothing, and all nodes converge (checked with SyncRead).
 func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -199,16 +189,7 @@ func TestHostAPI_SnapshotUnderLoad_ConcurrentWriters(t *testing.T) {
 	t.Logf("all %d entries verified via SyncRead after snapshot-under-load test", len(expected))
 }
 
-// TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred confirms that with
-// SnapshotEntries=50, writing 200+ entries actually triggers snapshots. The
-// test verifies this by requiring a snapshot artifact on disk for every node,
-// and by requesting an explicit snapshot and requiring it to resolve at an
-// index that covers the entries written.
-//
-// The test exercises:
-// - Snapshot triggering threshold enforcement
-// - Manual snapshot request after automatic snapshots
-// - LastApplied advancement consistency across nodes
+// TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred: with SnapshotEntries=50, 200+ writes leave a snapshot artifact on every node, and an explicit snapshot resolves at an index covering them.
 func TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -248,11 +229,7 @@ func TestHostAPI_SnapshotUnderLoad_VerifySnapshotOccurred(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, shardID, "snap-marker", "ok")
 	expected["snap-marker"] = "ok"
 
-	// Request an explicit snapshot to prove the snapshot machinery works.
-	// This also confirms that the SM can serialize its state correctly
-	// after being modified by many entries and compactions. requestSnapshotIndex
-	// waits for the snapshot to COMPLETE — the request only being accepted
-	// proves nothing, because the save runs asynchronously.
+	// Request an explicit snapshot and wait for it to complete (requestSnapshotIndex).
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	leaderHost := cluster.hosts[leaderIdx]
 	snapIndex := requestSnapshotIndex(t, leaderHost, shardID)

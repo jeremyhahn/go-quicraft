@@ -24,22 +24,7 @@ import (
 	"testing"
 )
 
-// The last unobservable step in the durability chain.
-//
-// Every other durability test in this package watches the File interface: the
-// crash model advances its durable image on Sync, and syncAccountingFS counts
-// the Sync and SyncMetadata calls per path. All of them sit ABOVE osFile, so
-// all of them stay green if osFile.Sync and osFile.SyncMetadata are replaced
-// with `return nil` — the calls still happen, they just stop reaching the
-// disk. That single edit deletes the durability of the entire WAL and, before
-// these tests existed, the whole repository still passed.
-//
-// A userspace test cannot see an fdatasync(2) succeed. It can see one FAIL:
-// the syscall is defined only for file descriptors with something to flush, so
-// on a pipe it returns EINVAL. A Sync that returns nil there did not issue the
-// syscall, which is precisely the stub. The assertion is therefore about the
-// error a real syscall produces, not about a side effect, and it is exact —
-// EINVAL from a pipe has no other source.
+// These tests prove osFile issues the real sync syscall: fdatasync on a pipe returns EINVAL, which a stubbed Sync would not.
 
 // TestOSFileSyncIssuesRealSyscall fails if osFile.Sync stops calling
 // fdatasync/fsync on the underlying descriptor.
@@ -55,10 +40,7 @@ func TestOSFileSyncIssuesRealSyscall(t *testing.T) {
 	assertEINVAL(t, "osFile.Sync", err)
 }
 
-// TestOSFileSyncMetadataIssuesRealSyscall fails if osFile.SyncMetadata stops
-// calling fsync on the underlying descriptor. It is the call every DIRECTORY
-// flush goes through, so a stub here silently un-publishes every rename,
-// create and unlink the WAL depends on.
+// TestOSFileSyncMetadataIssuesRealSyscall fails if osFile.SyncMetadata stops calling fsync, which every directory flush uses.
 func TestOSFileSyncMetadataIssuesRealSyscall(t *testing.T) {
 	r, w := mustPipe(t)
 	defer closeBoth(t, r, w)

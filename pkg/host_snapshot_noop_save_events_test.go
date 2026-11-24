@@ -23,12 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestSnapshotNoOpSave_FiresNoSnapshotEvents: a save that has nothing new to
-// snapshot — here, a second request at an index already captured — completes
-// without error and writes nothing. It must not be reported as a snapshot
-// created, and it is certainly not a recovery: OnSnapshotRecovered tells an
-// embedder the state machine was replaced from a snapshot, which never
-// happened.
+// TestSnapshotNoOpSave_FiresNoSnapshotEvents: a save with nothing new completes and fires no snapshot events.
 func TestSnapshotNoOpSave_FiresNoSnapshotEvents(t *testing.T) {
 	var created, compacted, recovered atomic.Int32
 	cfg := testHostConfig(t)

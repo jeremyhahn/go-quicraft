@@ -358,16 +358,7 @@ func (c *rejectingCallback) OnSnapshotRejected(shardID, replicaID uint64, err er
 	c.onRejected()
 }
 
-// TestRecoveryRedrive_FastRejectionIsNotDisarmed: a re-drive's attempt is
-// claimed before the request is published, so a rejection that lands after the
-// publish but before the submitting step worker resumes arms the next re-drive,
-// and the submitter cannot wipe it. Were the claim made after the publish, the
-// node would hold entries with no re-drive owed, forever.
-//
-// The interleaving is made deterministic through submit's own shutdown drain:
-// with the pool stopped, the submitter itself pulls the request it just
-// published back out and reports it rejected, between the publish and its
-// return, and the report records the rejection the worker would have.
+// TestRecoveryRedrive_FastRejectionIsNotDisarmed: a rejection landing right after the publish still arms the next re-drive.
 func TestRecoveryRedrive_FastRejectionIsNotDisarmed(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)

@@ -86,9 +86,7 @@ func TestIntegration_DB_ConcurrentStateMachine(t *testing.T) {
 		}
 	}
 
-	// Verify via a linearizable read through the adapter. Each key is read
-	// from whichever replica leads at that moment: the assertion is on the
-	// VALUE, and this loop is long enough for an election to fall inside it.
+	// Verify each key by a linearizable read through whichever replica leads at that moment.
 	for key, expectedVal := range expected {
 		result := cluster.readFromLeader(t, 1, encodeKVGet(key), defaultTimeout)
 		val, ok := result.(string)
@@ -166,9 +164,7 @@ func TestIntegration_DB_OnDiskStateMachine(t *testing.T) {
 		}
 	}
 
-	// Verify via a linearizable read through the adapter. Each key is read
-	// from whichever replica leads at that moment: the assertion is on the
-	// VALUE, and this loop is long enough for an election to fall inside it.
+	// Verify each key by a linearizable read through whichever replica leads at that moment.
 	for key, expectedVal := range expected {
 		result := cluster.readFromLeader(t, 1, encodeKVGet(key), defaultTimeout)
 		val, ok := result.(string)

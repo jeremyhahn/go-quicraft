@@ -320,18 +320,7 @@ func TestSafety_DuelingCandidatesWithPreVote(t *testing.T) {
 		t.Fatalf("expected r1 term incremented to %d, got %d", initialTerm1+1, r1.term)
 	}
 
-	// r2 gets rejected in pre-vote. PreVote responses echo the prospective
-	// term (initialTerm2 + 1). A rejected PreVoteResp with msg.Term > r.term
-	// triggers becomeFollower (term advancement). So we must use r2's current
-	// term for the response term to test the pre-vote rejection path without
-	// term advancement. In practice, peers at the same term respond with the
-	// same prospective term.
-	//
-	// However, a rejected PreVoteResp at higher term DOES cause step-down
-	// per the Raft spec (the responder is at a higher term). Let's verify
-	// that r2's pre-vote failure does not disrupt the cluster by checking
-	// that after rejection, r2 is follower and the term reflects the
-	// rejection semantics.
+	// r2 is rejected in pre-vote; a rejection with a higher term would make it a follower, so use r2's current term.
 	_ = r2.step(proto.Message{
 		Type:   proto.RequestPreVoteResp,
 		From:   3,
@@ -1065,10 +1054,7 @@ func TestSafety_ReadIndexRequiresLeaderQuorum(t *testing.T) {
 	}
 }
 
-// TestSafety_ReadIndexResetOnStateChange verifies that pending ReadIndex
-// requests are cleared when the node transitions to follower (e.g., due
-// to a higher term). This prevents stale read states from being resolved
-// after the node is no longer leader.
+// TestSafety_ReadIndexResetOnStateChange verifies pending ReadIndex requests are cleared on becoming a follower.
 func TestSafety_ReadIndexResetOnStateChange(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -1267,12 +1253,7 @@ func TestSafety_LeaderTransferInvalidatesLease(t *testing.T) {
 	}
 }
 
-// ===========================================================================
-// Helper used by lease tests: newTestRaftLeaseRead is in raft_test.go
-// No need to declare it here. Helpers like commitNoOp, grantLease,
-// electLeader, advanceElection, collectMessages, etc. are all defined
-// in raft_test.go and accessible within the same package.
-// ===========================================================================
+// Lease-test helpers such as newTestRaftLeaseRead live in raft_test.go.
 
 // Compile-time check: ensure config.BoolPtr is used correctly.
 var _ = config.BoolPtr

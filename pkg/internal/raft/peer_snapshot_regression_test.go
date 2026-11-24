@@ -22,15 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// installSnapshotMsg builds an InstallSnapshot message from leader 2 to
-// replica 1 carrying the given snapshot at the snapshot's term.
-//
-// It is stamped proto.OriginLocal because that is the only way an
-// InstallSnapshot ever reaches raft: the transport streams a snapshot as
-// chunks and the receiving host rebuilds this message itself once the
-// artifact is persisted and verified (hostMessageHandler.HandleSnapshot ->
-// deliverSnapshotControl -> Engine.DeliverLocal). A test that built it
-// without the stamp would be modelling a message the system cannot produce.
+// installSnapshotMsg builds a local-origin InstallSnapshot from leader 2 to replica 1, the only way one reaches raft.
 func installSnapshotMsg(ss proto.Snapshot) proto.Message {
 	return proto.Message{
 		Type:     proto.InstallSnapshot,
@@ -51,23 +43,7 @@ func localInstallSnapshotMsg(ss proto.Snapshot) proto.Message {
 	return msg
 }
 
-// TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded verifies that a
-// second InstallSnapshot processed in the SAME step-worker batch as a restore
-// never leaves the log holding an obsolete pending snapshot.
-//
-// The step worker drains the whole inbox through Peer.Handle before it calls
-// GetUpdate once, so a restore (snapshot A), the leader's follow-up entries,
-// and a newer snapshot (snapshot B) can all be stepped before the engine ever
-// sees snapshot A. Snapshot B then matches the log at its index, and the
-// matching-log branch fast-forwards committed AND processed past snapshot A —
-// while inmem still holds snapshot A, because the pending snapshot is cleared
-// only by the engine's persistence ack (commitUpdate -> savedSnapshot).
-//
-// GetUpdate would then ship the superseded snapshot A: LogReader.ApplySnapshot
-// rewinds the tracked range behind the apply frontier (or rejects it outright
-// with ErrSnapshotOutOfDate, which fails the shard in Peer.Commit), and the
-// entries in (A.Index, B.Index] are never emitted for apply because processed
-// already moved past them.
+// TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded verifies a second snapshot in the same batch never leaves an obsolete pending snapshot.
 func TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -111,8 +87,7 @@ func TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded(t *testing.T) {
 		t.Fatalf("Replicate: %v", err)
 	}
 
-	// 3. Snapshot B at index 10 now MATCHES the log (index 10 is at term 9),
-	// still before the engine has been handed snapshot A.
+	// Snapshot B at index 10 matches the log before the engine has snapshot A.
 	snapB := proto.Snapshot{
 		Index: 10,
 		Term:  9,
@@ -147,17 +122,7 @@ func TestPeer_InstallSnapshot_PendingSnapshotIsNeverSuperseded(t *testing.T) {
 	}
 }
 
-// TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership verifies that an
-// InstallSnapshot rejected by handleSnapshot (its index is at or below the
-// committed index) never overwrites the local membership, even when an
-// unrelated snapshot is still pending persistence.
-//
-// Peer.Handle adopts the snapshot's membership unconditionally when the log
-// was restored, because a restore fast-forwards the processed marker past the
-// config changes the snapshot subsumes. Deriving "restored" from a merely
-// non-nil pending snapshot makes a REJECTED retransmission of an older
-// snapshot inherit the newer snapshot's restore and roll the membership (and
-// the raft remotes derived from it) backwards.
+// TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership verifies a rejected snapshot never overwrites membership while another is pending.
 func TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -187,9 +152,7 @@ func TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership(t *testing.T) {
 		t.Fatal("precondition: the restored snapshot must still be pending")
 	}
 
-	// A retransmission of the leader's PREVIOUS snapshot arrives in the same
-	// batch. It is at or below the committed index, so handleSnapshot rejects
-	// it and the log keeps everything the newer snapshot installed.
+	// A retransmitted older snapshot in the same batch is rejected.
 	stale := proto.Snapshot{
 		Index: 5,
 		Term:  9,
@@ -215,19 +178,7 @@ func TestPeer_InstallSnapshot_RejectedSnapshotKeepsMembership(t *testing.T) {
 	}
 }
 
-// TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership pins that a
-// stale-term InstallSnapshot does not rewrite the membership.
-//
-// raft.step DROPS a message whose term is behind the local term and returns
-// nil. If Peer.Handle gated membership adoption on `err == nil` alone, a
-// stale-term InstallSnapshot — one raft refused to act on — would still
-// rewrite the membership: the set quorum() is computed over, replaced with no
-// term check, no log proof and no committed entry behind it. The only guard
-// left would be the ConfigChangeID carried in the message itself, which the
-// sender chooses.
-//
-// Any authenticated member of the shard could then hand a peer an arbitrary
-// configuration — for example one in which it is the sole voter.
+// TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership verifies a stale-term InstallSnapshot does not change membership.
 func TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -271,11 +222,7 @@ func TestPeer_InstallSnapshot_StaleTermDoesNotRewriteMembership(t *testing.T) {
 	}
 }
 
-// The LOCAL snapshot-receive path builds its InstallSnapshot exactly as
-// hostMessageHandler.HandleSnapshot does — no term at all — and injects it
-// through the local delivery API. That message must still install its
-// membership: it is the ONLY thing that can repair a joining node's
-// incomplete membership (the bootstrap confState is not in the log).
+// A local term-less InstallSnapshot must still install its membership.
 func TestPeer_InstallSnapshot_LocalInjectionAdoptsMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -302,20 +249,7 @@ func TestPeer_InstallSnapshot_LocalInjectionAdoptsMembership(t *testing.T) {
 	}
 }
 
-// The same message arriving from the WIRE must be refused outright.
-//
-// InstallSnapshot never travels as a message between replicas — a snapshot is
-// streamed as a SnapshotHeader plus chunks and the RECEIVER rebuilds the
-// message locally after persisting and verifying the artifact — so an
-// InstallSnapshot in a MessageBatch is always forged. It is also unconstrained
-// by anything the protocol checks: it carries a full Membership (the set
-// quorum() is computed over) and its own ConfigChangeID, both chosen by the
-// sender, with no term, no log match and no committed entry behind them.
-//
-// The forgery below is the published attack: Term 0 so step's term-transition
-// block is skipped entirely, and an Index deliberately BELOW committed so
-// handleSnapshot "rejects" it and returns nil — the nil that the previous
-// guard read as "raft acted on this".
+// A wire-origin InstallSnapshot is always forged and must be refused; this one has Term 0 and an index below committed.
 func TestPeer_InstallSnapshot_WireDeliveredIsRefused(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -365,18 +299,11 @@ func TestPeer_InstallSnapshot_WireDeliveredIsRefused(t *testing.T) {
 	}
 }
 
-// Joining-node variant. A joining node adopts membership UNCONDITIONALLY
-// (its own ConfigChangeID equals the snapshot's, so the strictly-newer test
-// cannot protect it), which makes it the softest target for the forgery. Its
-// adoption must be gated on the delivery path just the same.
+// Joining-node variant: a joiner's adoption is gated on the delivery path too.
 func TestPeer_InstallSnapshot_JoiningNodeRefusesWireDelivery(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
-	// The seeded configuration names only this replica, which is the state in
-	// which a node is genuinely still joining: knowing itself ALONGSIDE another
-	// member ends the joining window (clearJoiningIfKnown), so seeding the full
-	// {1,2,3} configuration here would assert an unreachable state and the
-	// joining assertion below would fail for a reason unrelated to the forgery.
+	// Seed only this replica, the genuinely joining state.
 	p := newTestPeer(t, cfg, proto.State{},
 		proto.Membership{Addresses: map[uint64]string{1: "addr1"}})
 	p.MarkJoining()
@@ -412,17 +339,9 @@ func TestPeer_InstallSnapshot_JoiningNodeRefusesWireDelivery(t *testing.T) {
 	}
 }
 
-// TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership pins the
-// gate on raft's snapshot REJECTION path. handleSnapshot refuses a snapshot at
-// or below the committed index and returns nil, so a nil error from step never
-// meant the snapshot was installed. Membership was adopted anyway.
-//
-// A rejected snapshot's configuration is by definition older than what this
-// replica has already committed, so adopting it rolls the voting set backwards.
+// TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership verifies a snapshot raft rejects does not change membership.
 func TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership(t *testing.T) {
-	// The joining path is the sharp one: it deliberately bypasses the
-	// ConfigChangeID staleness test, so it adopted EVERY rejected
-	// retransmission — including configurations that do not name this replica.
+	// The joining path bypasses the ConfigChangeID check, so it is tested too.
 	t.Run("joining replica", func(t *testing.T) {
 		p := newTestPeerWithLog(t, testConfigWithID(1, 6), contiguousEntries(10),
 			proto.State{Term: 5, Commit: 10},
@@ -432,8 +351,7 @@ func TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership(t *testi
 			t.Fatal("fixture: the replica must actually be joining")
 		}
 
-		// Index 3 is far below committed=10, so handleSnapshot rejects it.
-		// Delivered LOCALLY, so the wire-origin gate is not what stops it.
+		// Index 3 is below committed 10, delivered locally.
 		err := p.Handle(proto.Message{
 			Type: proto.InstallSnapshot, From: 2, To: 6, ShardID: 1, Term: 5,
 			Origin: proto.OriginLocal,
@@ -495,16 +413,7 @@ func TestPeer_InstallSnapshot_RejectedSnapshotDoesNotRedefineMembership(t *testi
 	})
 }
 
-// TestPeer_InstallSnapshot_LeaderDoesNotAdoptUnprocessedMembership covers the
-// second way raft.step returns nil without installing a snapshot: stepLeader has
-// NO InstallSnapshot case at all, so on a leader the message is silently
-// dropped. The wire-origin and stale-term gates both pass for a locally injected
-// snapshot above the committed index, so the adopt branch ran on a snapshot raft
-// never touched -- letting a leader compute quorum over a configuration no
-// committed entry ever established, and one that need not even contain itself.
-//
-// The gate is a POSITIVE test that raft took the snapshot (the committed index
-// advanced), which covers this and the rejection path together.
+// TestPeer_InstallSnapshot_LeaderDoesNotAdoptUnprocessedMembership verifies a leader, which drops InstallSnapshot, adopts no membership from it.
 func TestPeer_InstallSnapshot_LeaderDoesNotAdoptUnprocessedMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)

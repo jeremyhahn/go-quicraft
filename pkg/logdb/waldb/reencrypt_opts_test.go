@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This file is an EXTERNAL test package so it can import test/errfs, which
-// itself imports waldb. Everything here therefore goes through waldb's public
-// surface, which is also what a migration tool has.
+// External test package, so it can import test/errfs; it uses waldb's public API only.
 package waldb_test
 
 import (
@@ -68,12 +66,7 @@ func seedWAL(t *testing.T, dir string, entryCount int, opts ...waldb.Option) []l
 	return entries
 }
 
-// TestReencrypt_NonDefaultBlockSizeIsMigratable is the regression test for a
-// WAL that could not be migrated AT ALL. Reencrypt opened both databases with
-// no option seam, so both got the DEFAULT block size: a directory written with
-// WithBlockSize was refused by Open's WALFORMAT geometry check before a single
-// record was read, and a rekey — the one operation the encryption design
-// depends on being available — was impossible for that deployment.
+// TestReencrypt_NonDefaultBlockSizeIsMigratable verifies Reencrypt migrates a WAL written with a non-default block size.
 func TestReencrypt_NonDefaultBlockSizeIsMigratable(t *testing.T) {
 	root := t.TempDir()
 	srcDir := filepath.Join(root, "src")
@@ -90,9 +83,7 @@ func TestReencrypt_NonDefaultBlockSizeIsMigratable(t *testing.T) {
 		t.Fatalf("Reencrypt copied %d nodes, want 1", count)
 	}
 
-	// Opening the destination with the DEFAULT geometry must be refused: that
-	// refusal is the proof that the destination recorded the source's block
-	// size rather than the default.
+	// Opening the destination with the default geometry must be refused.
 	defaultDB, err := waldb.Open(dstDir)
 	if err == nil {
 		_ = defaultDB.Close()
@@ -168,10 +159,7 @@ func TestReencrypt_MismatchedBlockSizeFailsClosed(t *testing.T) {
 	}
 }
 
-// newTestNoneBarrier returns an initialized barrier running the none strategy.
-// It performs no encryption, which is all these tests need: what matters is
-// that a barrier is INVOLVED, since that is what makes Reencrypt fail closed
-// on a snapshot it cannot re-encrypt.
+// newTestNoneBarrier returns an initialized barrier using the none strategy.
 func newTestNoneBarrier(t *testing.T) *seal.Barrier {
 	t.Helper()
 	b := seal.MustNewBarrier(seal.DefaultBarrierConfig(1))
@@ -185,18 +173,7 @@ func newTestNoneBarrier(t *testing.T) *seal.Barrier {
 // the destination's segments are being completed.
 var errCloseDest = errors.New("injected: destination truncate failed")
 
-// TestReencrypt_CloseDestErrorIsReported proves the destination's Close error
-// is reported rather than swallowed. DB.Close flushes, truncates and closes
-// every shard's active segment, so a discarded error here returns (count, nil)
-// — "the migration succeeded" — for a rekey whose newly written WAL was never
-// completed on disk, and the caller's very next act is to swap that directory
-// into place.
-//
-// It is constructible only because Reencrypt takes options: the fault is
-// injected through WithFS. The first File.Truncate of the run belongs to the
-// destination's first shard segment as DB.Close completes it — the copy itself
-// only writes and syncs — so the migration succeeds in full and fails at
-// exactly the step under test.
+// TestReencrypt_CloseDestErrorIsReported verifies Reencrypt reports the destination's Close error, injected through WithFS.
 func TestReencrypt_CloseDestErrorIsReported(t *testing.T) {
 	root := t.TempDir()
 	srcDir := filepath.Join(root, "src")

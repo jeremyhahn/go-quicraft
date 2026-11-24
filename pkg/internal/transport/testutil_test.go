@@ -88,16 +88,7 @@ func countRequests(h *testHandler) int {
 	return total
 }
 
-// waitConnDown blocks until tr's cached connection to target reports itself
-// torn down. The signal is the connection's own context, not the size of
-// tr.conns: quic-go cancels the context on close, but the map entry survives
-// until a later send or the cleanup sweep evicts it, so polling for an empty
-// pool waits for a different event that may never happen within the test.
-//
-// It is usable for a connection closed on EITHER side: Stop announces itself on
-// the connections it ACCEPTED as well as its own outbound ones, so a
-// CONNECTION_CLOSE reaches the sender and a peer's Stop is a condition a test
-// can wait on instead of guessing at with a fixed sleep.
+// waitConnDown blocks until tr's cached connection to target is torn down, by its context; it works for a close from either side.
 func waitConnDown(t *testing.T, tr *QUICTransport, target string, timeout time.Duration) {
 	t.Helper()
 	pollUntil(t, timeout, 2*time.Millisecond,
@@ -125,25 +116,7 @@ func waitForChan(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg st
 // First contact: what a cold Send is allowed to take
 // ---------------------------------------------------------------------------
 
-// firstContactBound is the longest a single Send to a target with no live
-// connection can legitimately take, and the point past which waiting is
-// pointless.
-//
-// A cold Send passes through three bounds the transport applies to ITSELF:
-// the dial (dialTimeout, covering the QUIC handshake), the stream open
-// (streamOpenTimeout) and the frame write (sendWriteDeadline). The moment any
-// of them expires the batch is DROPPED, by contract — "Raft retransmission
-// will resend it" — so no wait, however long, delivers that particular Send.
-// The bound is their sum, read from the transport's own constants rather than
-// restated, so it follows a change to any of them.
-//
-// A fixed literal below this bound is not enough. Under CI saturation (load
-// 150-200 on 24 cores, -race and coverage instrumentation, 24 packages in
-// parallel) a cold handshake has been traced at 4.3s against the 5s dial
-// deadline and delivery at 5.35s, with the whole process descheduled for
-// seconds at a time; the batcher itself flushes on dequeue with no timer. A
-// literal below the transport's own ceiling could neither outlast a
-// slow-but-legal handshake nor survive an abandoned one.
+// firstContactBound is the longest a cold Send can take: the sum of the transport's dial, stream-open and write bounds.
 const firstContactBound = dialTimeout + streamOpenTimeout + sendWriteDeadline
 
 // firstContactAttempts is how many cold Sends sendFirstContact makes before
@@ -163,15 +136,7 @@ func (e *firstContactError) Error() string {
 		e.attempts, e.wait)
 }
 
-// sendFirstContact delivers msgs to a target the sender has no connection to
-// yet and returns once h has seen a batch. After each firstContactBound with
-// nothing delivered it sends again, as Raft does on its next tick, so a cold
-// dial the transport abandons under saturation does not strand the test on a
-// message nothing would ever retransmit.
-//
-// h may therefore see MORE than one batch, and a later waitBatch on h may be
-// satisfied by the duplicate. Use it only for the first contact of a test that
-// asserts on batch content rather than batch count.
+// sendFirstContact sends msgs to an unconnected target, resending after each firstContactBound until h sees a batch; h may see duplicates.
 func sendFirstContact(t testing.TB, tr *QUICTransport, h *testHandler, msgs []proto.Message) {
 	t.Helper()
 	if err := sendUntilDelivered(tr, h, msgs, firstContactAttempts, firstContactBound); err != nil {

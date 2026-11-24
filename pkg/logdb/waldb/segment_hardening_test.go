@@ -275,18 +275,7 @@ func (w *writeRecordingFile) WriteAt(p []byte, off int64) (int, error) {
 	return w.File.WriteAt(p, off)
 }
 
-// TestSegment_FlushWritesOnlyNewBytes pins the flush watermark.
-//
-// A flushBlock that wrote the open block FROM BYTE 0 on every Sync would be a
-// durability defect before a performance one: bytes an earlier fdatasync
-// already made durable — a HardState carrying a vote grant, say — would be put
-// back in flight inside the next batch's write, so a power loss during that
-// rewrite could destroy a record the caller had already been told was durable.
-// It would also be quadratic: filling one block over n syncs would write
-// ~n^2*recSize/2 bytes.
-//
-// The assertion is the durability one: no byte is ever written twice. The
-// amplification bound follows from it.
+// TestSegment_FlushWritesOnlyNewBytes checks no byte is written twice by flushBlock.
 func TestSegment_FlushWritesOnlyNewBytes(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -376,14 +365,7 @@ func TestSegment_DiscardPendingResetsFlushWatermark(t *testing.T) {
 	cleanFileOffset, cleanBlockOffset := seg.fileOffset, seg.blockOffset
 	cleanCount := seg.RecordCount()
 
-	// A failed batch appends into the open block, FLUSHES (so the watermark
-	// genuinely advances past the checkpoint), and is rolled back.
-	//
-	// The flush is what gives this test its teeth. Without it the batch's bytes
-	// never leave blockBuf, so flushed is still sitting at cleanBlockOffset when
-	// DiscardPending runs and the rewind it is supposed to prove has nothing to
-	// undo — the assertion below then holds whether or not the code rewinds
-	// anything at all.
+	// A failed batch appends, flushes past the checkpoint, and is rolled back.
 	if _, err := seg.Write(bytes.Repeat([]byte{0xb2}, 100)); err != nil {
 		t.Fatalf("Write (batch): %v", err)
 	}
@@ -421,17 +403,7 @@ func TestSegment_DiscardPendingResetsFlushWatermark(t *testing.T) {
 	}
 }
 
-// writeHoleFixture builds a segment whose records are written one per Sync
-// (syncPerRecord) or with no Sync at all — the batch whose fdatasync never
-// returned — zeroes one whole block in the middle of it, and returns the
-// pristine record set alongside the reopened segment's scan.
-//
-// syncPerRecord is the whole variable under test. Every completed Sync closes a
-// durability generation, appends a sync mark and stamps the next record with a
-// higher generation, so syncPerRecord=true produces a segment where recovery
-// can PROVE each record was acknowledged, and syncPerRecord=false one where it
-// can prove none of them was. The identical byte damage means opposite things
-// in the two, and the returned segment carries the verdict in its flags.
+// writeHoleFixture writes records with or without a Sync each, zeroes a middle block, and returns the records and the reopened scan.
 func writeHoleFixture(t *testing.T, dir string, id uint64, blockSize, records, holeBlock int, syncPerRecord bool) (want [][]byte, got [][]byte, cleanEnd int64, rs *segment) {
 	t.Helper()
 	seg, _, err := createSegment(defaultFS(), dir, id, blockSize, 8*1024*1024)
@@ -501,22 +473,7 @@ func writeHoleFixture(t *testing.T, dir string, id uint64, blockSize, records, h
 	return want, got, cleanEnd, rs
 }
 
-// TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable is the segment-level
-// test that ReadAll's two damage classifiers agree.
-//
-// A failed CRC sweeps the rest of the file, finds that the surviving records
-// span a completed fdatasync, and refuses to truncate. A zero-filled hole must
-// reach the same verdict. If it returned on the spot, with
-// ackedDataAfterCorruption and sequenceRegression both left false,
-// replaySegment would report an ordinary torn tail, recovery would truncate the
-// file to the clean prefix and delete every segment above it, and acknowledged
-// committed entries would be destroyed while Open returned nil.
-//
-// A crash cannot produce this layout. Writes are strictly ascending in file
-// offset, so a block sitting below a later generation was covered by that
-// generation's fdatasync and its pages cannot revert to zeros. A zeroed sector
-// under acknowledged data is a medium failure, a partially restored file or
-// tampering, and the only safe verdict is the one the CRC path already gave.
+// TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable checks a zero hole under acknowledged data is refused like a CRC failure.
 func TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable(t *testing.T) {
 	const (
 		blockSize = 1024
@@ -545,10 +502,7 @@ func TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable(t *testing.T) {
 		t.Fatalf("clean end = %d, want the hole offset %d", cleanEnd, holeBlock*blockSize)
 	}
 
-	// The prefix ReadAll returns must be the ORIGINAL records, byte for byte,
-	// with nothing missing below the hole and nothing resurrected above it. A
-	// count-only assertion would accept a recovery that dropped acknowledged
-	// records BELOW the damage.
+	// The returned prefix must be the original records byte for byte.
 	if len(got) == 0 {
 		t.Fatal("no clean prefix survived; the hole is above several full blocks")
 	}
@@ -572,16 +526,7 @@ func TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable(t *testing.T) {
 	}
 }
 
-// TestSegment_ZeroHoleInsideOneGenerationStillTruncates is the other half of the
-// same property, and the guard against over-tightening it.
-//
-// A batch spanning several blocks issues one WriteAt per block before a single
-// fdatasync, and writeback may persist any subset of those pages. Losing an
-// interior page while a later one survives leaves exactly a zero hole with
-// decodable records above it — but every one of those records carries the
-// segment's in-flight generation, so no completed fdatasync sits above the
-// damage and nothing there was ever acknowledged. That is an ordinary
-// interrupted write, and recovery must still truncate and boot.
+// TestSegment_ZeroHoleInsideOneGenerationStillTruncates checks a zero hole inside the in-flight generation still truncates.
 func TestSegment_ZeroHoleInsideOneGenerationStillTruncates(t *testing.T) {
 	const (
 		blockSize = 1024

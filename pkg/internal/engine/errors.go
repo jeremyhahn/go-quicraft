@@ -19,152 +19,70 @@ import (
 	"fmt"
 )
 
-// Engine-specific sentinel errors. These are independent of the quicraft
-// package to avoid import cycles (quicraft imports engine, engine must
-// not import quicraft). The quicraft package defines equivalent errors
-// for the public API; these are the engine-internal variants.
+// Engine-internal sentinel errors; the quicraft package defines the public equivalents.
 var (
-	// ErrShardFailed is the identity of a shard whose failure latch has
-	// tripped. It is never returned directly: *SMPanicError matches it through
-	// its own Is method, which is how the condition reaches a caller.
-	//
-	// The quicraft package re-exports it as its public ErrShardFailed, so a
-	// *SMPanicError in config.ShardFailedInfo.Err matches the public sentinel;
-	// hence the public prefix.
+	// ErrShardFailed identifies a shard whose failure latch tripped; matched through *SMPanicError, re-exported publicly.
 	ErrShardFailed = errors.New("quicraft: shard failed (SM circuit breaker tripped)")
 
-	// ErrDropped reports a request a worker took out of a node and could not
-	// hand on, because user code it ran in between exited abnormally (a
-	// panic or runtime.Goexit), or because the node stopped or failed first:
-	// a proposal batch that never reached Peer.Handle, a ReadIndex key that
-	// never reached raft, a read state never delivered. The public
-	// quicraft.ErrDropped is this error, so it also covers a full proposal
-	// queue.
+	// ErrDropped reports a request a worker could not hand on; re-exported as quicraft.ErrDropped.
 	ErrDropped = errors.New("quicraft: proposal dropped")
 
-	// ErrShardPaused reports work refused because the replica is paused
-	// (Engine.PauseNode): a snapshot save requested of a paused shard, or a
-	// snapshot transfer to or from it. The public quicraft.ErrShardPaused is
-	// this error. It clears when the replica is resumed.
+	// ErrShardPaused reports work refused because the replica is paused; re-exported publicly.
 	ErrShardPaused = errors.New("quicraft: shard paused")
 
 	// ErrStopped is returned when an operation is interrupted because
 	// the stopper channel was closed.
 	ErrStopped = errors.New("engine: operation stopped")
 
-	// ErrSnapshotCorrupt is returned when a snapshot data file has an
-	// invalid frame structure during decryption, and matched by
-	// *SnapshotMetaInvalidError. The quicraft package re-exports it as its
-	// public ErrSnapshotCorrupt so the startup and recovery integrity checks
-	// fail with one identity; hence the public prefix.
+	// ErrSnapshotCorrupt reports an invalid snapshot frame structure; re-exported publicly.
 	ErrSnapshotCorrupt = errors.New("quicraft: snapshot frame corrupt")
 
 	// ErrSnapshotTooLarge is returned when a snapshot data file exceeds
 	// the configured Config.MaxSnapshotSize limit.
 	ErrSnapshotTooLarge = errors.New("engine: snapshot exceeds MaxSnapshotSize")
 
-	// ErrSnapshotFrameWriterClosed is returned when a snapshot is written to
-	// after its trailing frame has been emitted. It is a caller bug, not a
-	// runtime condition: the artifact is already sealed and complete, and
-	// accepting more bytes would produce one the decrypt side cannot account
-	// for.
+	// ErrSnapshotFrameWriterClosed reports a write after the trailing frame: a caller bug.
 	ErrSnapshotFrameWriterClosed = errors.New("engine: snapshot frame writer is closed")
 
-	// ErrSnapshotMetaCorrupt is returned by ParseSnapshotMeta when a
-	// snapshot.meta image is not a versioned record this build reads. It means "these bytes say nothing about
-	// the artifact beside them", NOT "the artifact is unencrypted": the DEK
-	// purge floor must treat the directory as unevaluable.
+	// ErrSnapshotMetaCorrupt reports an unreadable snapshot.meta; the purge floor treats the directory as unevaluable.
 	ErrSnapshotMetaCorrupt = errors.New("engine: snapshot metadata record is corrupt or foreign")
 
-	// ErrSnapshotEncryptedBarrierUnavailable is returned when a snapshot
-	// recorded with Epoch > 0 cannot be read because the barrier required to
-	// decrypt it is absent or sealed. Recovery fails so the leader re-sends
-	// rather than handing ciphertext to RecoverFromSnapshot.
-	//
-	// This sentinel is declared here — not in the quicraft package — because
-	// both the runtime recovery path (snapshotPool.recoverSnapshot) and the
-	// startup path (Host.StartShard) must fail with the SAME error identity,
-	// and quicraft imports engine. The quicraft package re-exports it, which
-	// is why the message keeps the public "quicraft:" prefix.
+	// ErrSnapshotEncryptedBarrierUnavailable reports an encrypted snapshot whose barrier is absent or sealed; re-exported publicly.
 	ErrSnapshotEncryptedBarrierUnavailable = errors.New(
 		"quicraft: snapshot is encrypted but barrier is unavailable for decryption")
 
-	// ErrSnapshotBarrierSealed is returned when a snapshot must be written
-	// (saved locally or re-encrypted after a receive) while the shard's
-	// barrier is CONFIGURED but SEALED. It is the write-side counterpart of
-	// ErrSnapshotEncryptedBarrierUnavailable and exists to keep the two
-	// barrier states distinct: a nil barrier means encryption is DISABLED for
-	// the shard (plaintext is the configured outcome), whereas a sealed
-	// barrier means encryption is temporarily UNAVAILABLE. Producing a
-	// plaintext artifact in the second case would durably downgrade a shard
-	// whose data is required to be encrypted at rest.
-	//
-	// Declared here, like ErrSnapshotEncryptedBarrierUnavailable, so the
-	// engine save path and the quicraft receive path fail with the SAME error
-	// identity; the quicraft package re-exports it, hence the public prefix.
+	// ErrSnapshotBarrierSealed reports a snapshot write while the configured barrier is sealed; re-exported publicly.
 	ErrSnapshotBarrierSealed = errors.New(
 		"quicraft: snapshot encryption unavailable: barrier is sealed")
 
-	// ErrShardBarrierUnresolved is returned when per-shard barriers are
-	// configured, the resolver returns nil for a shard, and there is no
-	// process-wide barrier to fall back to. Writing the shard's snapshot in
-	// plaintext would downgrade exactly one tenant in a deployment that asked
-	// for per-shard encryption, so the operation fails closed instead.
-	//
-	// Declared here, like the other snapshot barrier sentinels, so the engine
-	// save/recover paths and the quicraft host paths fail with the SAME error
-	// identity; the quicraft package re-exports it, hence the public prefix.
+	// ErrShardBarrierUnresolved reports a shard with no per-shard or process-wide barrier; re-exported publicly.
 	ErrShardBarrierUnresolved = errors.New(
 		"quicraft: per-shard barriers resolved no barrier for this shard and no " +
 			"host-wide barrier is configured; refusing to write it in plaintext")
 
-	// ErrUnsupportedSnapshotCompression is returned when a snapshot record
-	// declares a compression algorithm this binary cannot decompress. The
-	// artifact is unreadable, so recovery fails instead of feeding the state
-	// machine bytes in an unknown encoding.
+	// ErrUnsupportedSnapshotCompression reports a snapshot compression this binary cannot decompress.
 	ErrUnsupportedSnapshotCompression = errors.New(
 		"quicraft: snapshot declares an unsupported compression algorithm")
 
-	// ErrSnapshotIndexNotAdvanced is returned when a snapshot EXPORT is
-	// requested at an index the durable snapshot already covers. The save is a
-	// no-op — re-saving would truncate the artifact LogDB records — but an
-	// export caller asked for a directory that the no-op cannot produce, so the
-	// request fails instead of reporting a success with nothing exported.
+	// ErrSnapshotIndexNotAdvanced reports an export requested at an index the durable snapshot already covers.
 	ErrSnapshotIndexNotAdvanced = errors.New(
 		"engine: snapshot index has not advanced since the last snapshot")
 
-	// ErrSnapshotSizeMismatch is returned when a snapshot data file's size on
-	// disk does not match the FileSize its LogDB record claims. It is the
-	// sentinel form of *SnapshotSizeMismatchError. The quicraft package
-	// re-exports it as its public ErrSnapshotSizeMismatch; hence the public
-	// prefix.
+	// ErrSnapshotSizeMismatch reports a data file whose size differs from its LogDB record; re-exported publicly.
 	ErrSnapshotSizeMismatch = errors.New("quicraft: snapshot file size mismatch")
 
-	// ErrSnapshotMembershipAhead is returned when a snapshot save is asked to
-	// record a membership that folded a config change ABOVE the snapshot's own
-	// index. It is the sentinel form of *SnapshotMembershipAheadError.
+	// ErrSnapshotMembershipAhead reports a save whose membership folded a change above the snapshot index.
 	ErrSnapshotMembershipAhead = errors.New(
 		"engine: snapshot membership is ahead of the snapshot index")
 
-	// ErrScratchNotUnlinked is returned when a snapshot decrypt scratch file
-	// could not be unlinked the moment it was created. It is the sentinel form
-	// of *ScratchUnlinkError. The recovery or send that asked for the scratch
-	// fails rather than decrypt plaintext into a file that still has a name,
-	// and is retried later.
+	// ErrScratchNotUnlinked reports a decrypt scratch file that could not be unlinked on creation; the operation fails and is retried.
 	ErrScratchNotUnlinked = errors.New(
 		"engine: snapshot decrypt scratch could not be unlinked")
 
-	// ErrApplyGap is returned when a committed batch does not start at
-	// lastApplied+1. The missing range can never be re-offered (Raft's
-	// processed marker already advanced past it), so the shard is failed
-	// instead of applying a batch that would leave a hole in the state
-	// machine.
+	// ErrApplyGap reports a committed batch not starting at lastApplied+1; the shard is failed.
 	ErrApplyGap = errors.New("engine: committed entry gap detected before apply")
 
-	// errBarrierWithoutIdentity is returned when a shard's barrier has no
-	// pointer identity (logdb.SameBarrier), so whether it shares another
-	// barrier's keyring cannot be decided. It never leaves the package: the
-	// per-barrier purge floor declines on it.
+	// errBarrierWithoutIdentity reports a barrier with no pointer identity; the per-barrier purge floor declines on it.
 	errBarrierWithoutIdentity = errors.New("engine: barrier has no pointer identity")
 )
 
@@ -216,11 +134,7 @@ func (e *SnapshotDuplicateError) Error() string {
 	return fmt.Sprintf("engine: snapshot already in-flight for shard %d", e.ShardID)
 }
 
-// SnapshotPoolBusyError is returned when a snapshot request cannot be
-// enqueued because the snapshot pool's request channel is full. Unlike
-// SnapshotDuplicateError, this does not indicate a duplicate request —
-// it means all snapshot workers are occupied and the request should be
-// retried after a backoff.
+// SnapshotPoolBusyError reports a full snapshot request channel; retry after a backoff.
 type SnapshotPoolBusyError struct {
 	ShardID uint64
 }
@@ -272,16 +186,7 @@ func (e *CommitError) Unwrap() error {
 	return e.Err
 }
 
-// SnapshotRecoveryBehindError is returned when a state machine recovery is
-// requested for a snapshot index the Raft log has not yet committed AND
-// processed. Advancing the node's apply markers to that index would make the
-// next Update carry a LastApplied greater than the raft log's
-// committed/processed markers, which the commit path asserts against.
-//
-// The condition is TRANSIENT by construction: the InstallSnapshot that moves
-// the markers is queued on the node inbox and installed by the step worker,
-// which runs concurrently with the recovery request. The state machine is
-// left untouched, so the caller may retry once the markers catch up.
+// SnapshotRecoveryBehindError reports a recovery requested above the raft log's committed and processed markers; transient and retryable.
 type SnapshotRecoveryBehindError struct {
 	ShardID       uint64
 	ReplicaID     uint64
@@ -297,31 +202,10 @@ func (e *SnapshotRecoveryBehindError) Error() string {
 		e.ShardID, e.ReplicaID, e.SnapshotIndex, e.Committed, e.Processed)
 }
 
-// Retryable reports that the recovery may be re-requested unchanged. It is
-// always true: the snapshot is durable and the state machine was not touched,
-// so the same request succeeds as soon as the step worker installs the
-// snapshot into the raft log.
+// Retryable reports that the recovery may be re-requested unchanged; always true.
 func (e *SnapshotRecoveryBehindError) Retryable() bool { return true }
 
-// SnapshotRecoveryStaleError is returned when a state machine recovery is
-// requested for a snapshot that is NOT strictly ahead of the state machine's
-// apply frontier. Recovering it would REPLACE the state machine with older
-// state and REGRESS lastApplied, discarding every entry applied between the
-// snapshot index and the current frontier; the next committed batch would then
-// start past lastApplied+1 and fail the shard with ErrApplyGap.
-//
-// It is reachable whenever a leader ships an InstallSnapshot below the
-// follower's real progress (a leader change or rejection walk-down that drives
-// remote.next backwards). Raft itself rejects such a snapshot, so the engine
-// must refuse it too rather than recover behind raft's back.
-//
-// It does NOT fail the shard. The refusal is produced by recoveryBlockedByLog
-// before the recovering gate is raised and before RecoverFromSnapshot runs, so
-// the state machine is untouched and is already at or past the snapshot index —
-// there is nothing to restore and nothing to repair. It reports a race the
-// protocol resolves on its own: raft answers the rejected InstallSnapshot with
-// the follower's real committed index and the leader stops sending it. Treating
-// it as terminal would kill shards under load.
+// SnapshotRecoveryStaleError reports a recovery not ahead of the apply frontier; refused before restore, the shard keeps running.
 type SnapshotRecoveryStaleError struct {
 	ShardID       uint64
 	ReplicaID     uint64
@@ -336,10 +220,7 @@ func (e *SnapshotRecoveryStaleError) Error() string {
 		e.ShardID, e.ReplicaID, e.SnapshotIndex, e.LastApplied)
 }
 
-// recoveryRejectedError marks a recovery that failed before the state
-// machine's RecoverFromSnapshot was invoked (see rejectBeforeRestore). The
-// state machine is untouched, so the pool rejects the recovery instead of
-// failing the shard. It wraps the step's own error unchanged.
+// recoveryRejectedError marks a recovery that failed before RecoverFromSnapshot; it wraps the step's error.
 type recoveryRejectedError struct {
 	err error
 }
@@ -410,21 +291,7 @@ func (e *SnapshotTooLargeError) Is(target error) bool {
 	return target == ErrSnapshotTooLarge
 }
 
-// SnapshotMembershipAheadError reports a snapshot save whose captured
-// membership had already folded a config change committed ABOVE the snapshot's
-// index.
-//
-// The snapshot's index is the APPLY frontier and its membership is folded at
-// COMMIT time, and commit runs ahead of apply, so the two can disagree.
-// Recording the pair anyway produces a snapshot claiming a configuration that
-// did not exist at its own index: a follower installing it adopts the later
-// membership, sets its fold marker to the snapshot's index, and re-folds every
-// config change in between — while computing quorums, until it catches up, from
-// a voting set the log at that index does not justify.
-//
-// It is TRANSIENT by construction: it lasts only until the apply frontier
-// passes the config change, which returning this error permits by releasing the
-// save's apply gate. The next snapshot trigger takes it.
+// SnapshotMembershipAheadError reports a save whose membership folded a change above the snapshot index; transient until apply passes it.
 type SnapshotMembershipAheadError struct {
 	ShardID       uint64
 	ReplicaID     uint64
@@ -452,11 +319,7 @@ func (e *SnapshotMembershipAheadError) Is(target error) bool {
 // change as soon as this error releases the save's apply gate.
 func (e *SnapshotMembershipAheadError) Retryable() bool { return true }
 
-// SnapshotSizeMismatchError reports a snapshot data file whose size on disk
-// disagrees with the FileSize its LogDB record claims. It carries both sizes,
-// because the direction is diagnostic: a SHORTER file is a truncation (a full
-// volume, a torn copy, a partial restore) and a LONGER one means the record
-// describes a different artifact than the directory holds.
+// SnapshotSizeMismatchError reports a data file whose size differs from its LogDB record, with both sizes.
 type SnapshotSizeMismatchError struct {
 	Path     string
 	Recorded uint64
@@ -498,18 +361,7 @@ func (e *ScratchUnlinkError) Is(target error) bool {
 	return target == ErrScratchNotUnlinked
 }
 
-// SnapshotMetaInvalidError reports a recorded snapshot whose snapshot.meta
-// cannot vouch for the data file beside it: the record is missing,
-// unreadable, malformed, or lacks the DataLen/DataHash integrity fields.
-//
-// Every writer of a snapshot directory stamps those fields through
-// MarshalSnapshotMeta before the directory is published, so a recorded
-// artifact without them was not produced by this format. Treating it as
-// "nothing to check" would let a partial restore that dropped or damaged
-// snapshot.meta, paired with a same-length alteration of snapshot.dat, be
-// recovered as divergent state. It therefore matches ErrSnapshotCorrupt, the
-// sentinel every recovery consumer already fails closed on, and
-// ErrSnapshotMetaCorrupt; Err carries the underlying cause, when there is one.
+// SnapshotMetaInvalidError reports a snapshot.meta that cannot vouch for its data file; it matches ErrSnapshotCorrupt and ErrSnapshotMetaCorrupt.
 type SnapshotMetaInvalidError struct {
 	Dir string
 	Err error
@@ -557,13 +409,7 @@ func (e *SMPanicError) Is(target error) bool {
 	return target == ErrShardFailed
 }
 
-// SnapshotSavePanicError reports a state machine whose SaveSnapshot panicked.
-// Value is the recovered panic value and Stack the goroutine stack. Unlike
-// SMPanicError it does NOT match ErrShardFailed, and that is the point of a
-// separate type: a save only reads the state machine, so a panicking save
-// leaves it intact and the shard is not failed — it keeps applying and
-// serving, and the next save is attempted as usual. It reaches the requester
-// wrapped in a save SnapshotError, like any other failed save.
+// SnapshotSavePanicError reports a panicking SaveSnapshot; the shard is not failed.
 type SnapshotSavePanicError struct {
 	ShardID   uint64
 	ReplicaID uint64
@@ -578,14 +424,7 @@ func (e *SnapshotSavePanicError) Error() string {
 		e.ShardID, e.ReplicaID, e.Value)
 }
 
-// SnapshotRecoveryPanicError reports a snapshot recovery that panicked in a
-// step before the state machine's RecoverFromSnapshot was invoked (LogDB
-// access, artifact verification, barrier resolution). Value is the recovered
-// panic value and Stack the goroutine stack. The state machine was not
-// touched, so like SnapshotSavePanicError it does NOT match ErrShardFailed:
-// the recovery is rejected and re-driven. It is the rejection's cause in
-// OnSnapshotRejected, and the cause inside a SnapshotRecoveryExhaustedError
-// when it was the last of the attempts.
+// SnapshotRecoveryPanicError reports a recovery panic before RecoverFromSnapshot; the recovery is rejected, the shard is not failed.
 type SnapshotRecoveryPanicError struct {
 	ShardID   uint64
 	ReplicaID uint64
@@ -600,14 +439,7 @@ func (e *SnapshotRecoveryPanicError) Error() string {
 		e.ShardID, e.ReplicaID, e.Value)
 }
 
-// SnapshotRecoveryExhaustedError reports a shard failed because every attempt
-// to recover a snapshot its Raft log adopted was rejected before the state
-// machine restore began, over one continuous episode of holding entries for
-// it. Attempts is how many were made, whatever snapshot each was made against
-// (a newer snapshot adopted mid-episode does not restart the count);
-// SnapshotIndex is the snapshot the last attempt was made against, and Err
-// that attempt's cause, which errors.Is and errors.As reach through Unwrap. It
-// is config.ShardFailedInfo.Err.
+// SnapshotRecoveryExhaustedError reports a shard failed after every recovery attempt for an adopted snapshot was rejected.
 type SnapshotRecoveryExhaustedError struct {
 	ShardID       uint64
 	ReplicaID     uint64
@@ -639,10 +471,7 @@ func (e *NodeNotLoadedError) Error() string {
 	return fmt.Sprintf("engine: node not loaded for shard %d", e.ShardID)
 }
 
-// MessageHandleError is returned when Peer.Handle fails to process an
-// incoming Raft message. This error is non-fatal and logged at warn
-// level for observability. It typically indicates a message from a
-// stale term, an unknown sender, or a corrupted message.
+// MessageHandleError reports a Raft message Peer.Handle could not process; non-fatal.
 type MessageHandleError struct {
 	ShardID   uint64
 	ReplicaID uint64
@@ -662,11 +491,7 @@ func (e *MessageHandleError) Unwrap() error {
 	return e.Err
 }
 
-// WorkerPanicError is returned when a step or commit worker goroutine
-// panics. The worker ID and type identify which goroutine failed. The
-// stack trace captures the panic origin for debugging. Unlike SM panics
-// (SMPanicError), worker panics affect all shards in the worker partition,
-// not just a single shard.
+// WorkerPanicError reports a panicking step or commit worker, which affects every shard in its partition.
 type WorkerPanicError struct {
 	WorkerID   int
 	WorkerType string // "step" or "commit"
@@ -681,10 +506,7 @@ func (e *WorkerPanicError) Error() string {
 		e.WorkerType, e.WorkerID, e.Value)
 }
 
-// TypeAssertionError is returned when a type assertion fails on data
-// retrieved from sync.Map or other interface{} sources. This indicates
-// an internal programming error where the stored type does not match
-// the expected type.
+// TypeAssertionError reports an internal type assertion failure on stored data.
 type TypeAssertionError struct {
 	Context      string // description of where the assertion occurred
 	ExpectedType string // the type that was expected

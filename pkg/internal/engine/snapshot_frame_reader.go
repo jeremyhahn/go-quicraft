@@ -27,27 +27,7 @@ type snapshotFrameDecrypter interface {
 	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
 }
 
-// OpenSnapshotFrames authenticates and decrypts a sealed snapshot artifact
-// from src into dst, and returns how many plaintext bytes it wrote. It is the
-// one reader of the format snapshotFrameWriter produces; every decrypt path
-// goes through it, so the two sides cannot drift apart.
-//
-// Frames are read strictly sequentially from offset 0, so a frame's ordinal
-// is the count of frames before it. Whether a frame is the TERMINAL one is
-// decided by reading one frame ahead: the frame after which src is exhausted
-// is authenticated as terminal, every other as not. So an artifact whose tail
-// was dropped fails authentication on the frame it now ends with, which was
-// sealed as non-terminal; and one with a frame appended after its terminal
-// frame fails on that frame's predecessor.
-//
-// An artifact with no frames at all is refused as ErrSnapshotCorrupt: the
-// writer always emits a terminal frame, so an empty sealed artifact can only
-// be one truncated to nothing. A frame that authenticates only under another
-// ordinal, another artifact identity or the other terminal flag is rejected
-// and never retried with a different context.
-//
-// dst receives plaintext as frames authenticate, so on failure it holds a
-// prefix of the artifact; callers write to a temporary they discard.
+// OpenSnapshotFrames authenticates and decrypts a sealed snapshot from src into dst, returning plaintext bytes written; truncation, appended frames and empty artifacts fail.
 func OpenSnapshotFrames(barrier snapshotFrameDecrypter, shardID, replicaID, index uint64,
 	src io.Reader, dst io.Writer) (uint64, error) {
 	aad := NewSnapshotAAD(shardID, replicaID, index, barrier)
@@ -83,14 +63,7 @@ func OpenSnapshotFrames(barrier snapshotFrameDecrypter, shardID, replicaID, inde
 	}
 }
 
-// readSnapshotFrame reads one `[4-byte LE length][AEAD frame]` record. end is
-// true, with no error, when src is exhausted exactly at a frame boundary.
-//
-// A length prefix or frame body cut short is ErrSnapshotCorrupt, as is a
-// length beyond one chunk plus the AEAD framing overhead, checked before
-// allocating so a damaged prefix cannot trigger a multi-gigabyte allocation.
-// Any other read error is the source's, and is reported as such rather than
-// as damage to the artifact.
+// readSnapshotFrame reads one [4-byte LE length][AEAD frame] record; end is true at a clean boundary, and an oversized or short frame is ErrSnapshotCorrupt.
 func readSnapshotFrame(src io.Reader) (frame []byte, end bool, err error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(src, lenBuf[:]); err != nil {

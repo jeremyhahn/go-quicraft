@@ -26,11 +26,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestEngine_GlobalSafePurgeFloor_SpansEveryLoadedShard pins the DEK-purge
-// safety contract at the Engine boundary. The barrier is shared by all shards,
-// so the floor must be the minimum over EVERY loaded shard's retained
-// snapshots. If the node enumerator missed a shard, the caller would purge a
-// DEK that shard's retained snapshot still needs and brick it.
+// TestEngine_GlobalSafePurgeFloor_SpansEveryLoadedShard checks the DEK purge floor is the minimum over every loaded shard.
 func TestEngine_GlobalSafePurgeFloor_SpansEveryLoadedShard(t *testing.T) {
 	base := t.TempDir()
 	cfg := newTestHostConfig()
@@ -103,16 +99,7 @@ func TestEngine_SetShardBarriers_RoutesPerShard(t *testing.T) {
 	}
 }
 
-// TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed pins the fail-closed
-// half of the resolver contract: with per-shard barriers configured and NO
-// process-wide barrier, a shard the resolver does not know is refused rather
-// than written in plaintext.
-//
-// The asymmetry this removes is the whole point. A SEALED barrier already fails
-// closed on every path; an ABSENT one failing OPEN would make the one tenant
-// whose shard the resolver missed — an async-provisioned tenant, a remapped
-// shard ID, any map miss — the only shard on the host written in cleartext, while
-// every other tenant's snapshot directory still showed encryption working.
+// TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed checks an unresolved shard is refused, not written in plaintext, without a process-wide barrier.
 func TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed(t *testing.T) {
 	cfg := newTestHostConfig()
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
@@ -145,10 +132,7 @@ func TestEngine_ShardBarrierUnresolvedWithoutGlobalFailsClosed(t *testing.T) {
 	}
 }
 
-// TestEngine_ShardBarrierUnresolvedUsesDeclaredPlaintextRoute verifies that a
-// host which DECLARED a plaintext host-wide route (WithoutEncryption) routes an
-// unresolved shard to it, while a resolved shard keeps its own barrier. The
-// declaration is what makes the nil a decision rather than a resolver miss.
+// TestEngine_ShardBarrierUnresolvedUsesDeclaredPlaintextRoute checks a declared WithoutEncryption route takes unresolved shards while resolved ones keep their barrier.
 func TestEngine_ShardBarrierUnresolvedUsesDeclaredPlaintextRoute(t *testing.T) {
 	cfg := newTestHostConfig()
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
@@ -173,9 +157,7 @@ func TestEngine_ShardBarrierUnresolvedUsesDeclaredPlaintextRoute(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_UnresolvedShardBarrierWritesNothing asserts the CONSEQUENCE
-// of the refusal above: no snapshot directory, no artifact, and no LogDB record
-// are produced for a shard whose barrier does not resolve.
+// TestSaveSnapshot_UnresolvedShardBarrierWritesNothing checks no directory, artifact or LogDB record is written for an unresolved shard.
 func TestSaveSnapshot_UnresolvedShardBarrierWritesNothing(t *testing.T) {
 	base := t.TempDir()
 	stopC := make(chan struct{})
@@ -214,19 +196,12 @@ func TestSaveSnapshot_UnresolvedShardBarrierWritesNothing(t *testing.T) {
 	}
 }
 
-// grepTreeForBytes returns the path of the first file under root whose contents
-// contain want, or "" when no file does. It is how the barrier tests assert the
-// CONSEQUENCE — bytes on disk — rather than merely that a call returned an
-// error.
+// grepTreeForBytes returns the first file under root containing want, or "".
 func grepTreeForBytes(t *testing.T, root string, want []byte) string {
 	t.Helper()
 	var hit string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		// Every error here is fatal to the assertion, never a reason to move
-		// on: this helper backs a claim that a secret is NOWHERE under root,
-		// and a file the test could not read is a file it could not clear.
-		// Swallowing the error would turn an I/O or permissions problem into a
-		// silent pass of an at-rest-secrecy test.
+		// Every error is fatal: an unreadable file cannot be cleared of the secret.
 		if err != nil {
 			return err
 		}
@@ -275,9 +250,7 @@ func TestNode_SnapshotSaveDir_MatchesPoolLayout(t *testing.T) {
 	}
 }
 
-// TestUnloadedSet_EvictsOldestWhenFull pins the bound on the retired-shard set.
-// Without the FIFO eviction the set grows for the process lifetime under shard
-// churn (an entry is removed only when the SAME shard ID is loaded again).
+// TestUnloadedSet_EvictsOldestWhenFull pins the FIFO bound on the retired-shard set.
 func TestUnloadedSet_EvictsOldestWhenFull(t *testing.T) {
 	s := newUnloadedSet()
 	for i := range uint64(maxUnloadedShards) {
@@ -290,7 +263,7 @@ func TestUnloadedSet_EvictsOldestWhenFull(t *testing.T) {
 		t.Fatal("shard 0 missing before the set overflowed")
 	}
 
-	// One past the bound: the OLDEST entry must be retired, not the newest.
+	// One past the bound: the oldest entry must be retired, not the newest.
 	s.add(uint64(maxUnloadedShards))
 	if len(s.m) != maxUnloadedShards || len(s.order) != maxUnloadedShards {
 		t.Fatalf("set grew past the bound: sizes = (%d, %d)", len(s.m), len(s.order))
@@ -315,12 +288,7 @@ func TestUnloadedSet_EvictsOldestWhenFull(t *testing.T) {
 	}
 }
 
-// TestStepWorker_DrainTick_ConsumesPendingTick pins the tick anti-starvation
-// path. Under sustained proposal/transport load the work-signal case wins the
-// select every time, so drainTick is the ONLY thing that keeps the raft logical
-// clock advancing; without it the leader misses heartbeats and steps down via
-// checkQuorum. The ticker channel is driven explicitly so the assertion does
-// not depend on wall-clock timing.
+// TestStepWorker_DrainTick_ConsumesPendingTick pins that drainTick advances the raft clock under sustained load.
 func TestStepWorker_DrainTick_ConsumesPendingTick(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)

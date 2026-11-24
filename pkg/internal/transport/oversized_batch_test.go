@@ -117,18 +117,7 @@ func entriesOfSize(t *testing.T, n int, payload int, firstIndex uint64) []proto.
 	return entries
 }
 
-// compressibleEntriesOfSize builds entries exactly as entriesOfSize does but
-// fills each command with zeros instead of random bytes.
-//
-// A batch only splits across frames when its members total more than
-// MaxFrameSize, so a test of the split has to build 16MB+ of messages — there
-// is no smaller shape that reaches the branch. What that costs on the wire is
-// a free choice, because sendableGroup sizes the group on the UNCOMPRESSED
-// marshaled size (see frame.go) while sendFrame Snappy-compresses what it
-// writes. Zero-filled commands therefore produce byte-for-byte the same
-// grouping and the same number of frames as random ones, for a fraction of the
-// QUIC and race-detector work. Use entriesOfSize where the point is that the
-// payload is incompressible.
+// compressibleEntriesOfSize is entriesOfSize with zero-filled commands: the same frame grouping (sized uncompressed) for less work.
 func compressibleEntriesOfSize(t *testing.T, n int, payload int, firstIndex uint64) []proto.Entry {
 	t.Helper()
 	entries := entriesOfSize(t, n, 0, firstIndex)
@@ -208,18 +197,7 @@ func BenchmarkSendAdmission(b *testing.B) {
 	}
 }
 
-// TestOversizedReplicateDoesNotStormDials is the regression test for the
-// leader/follower dial storm: a Replicate message carrying more entries than
-// the decoder accepts (proto.MaxEntriesPerMessage) is rejected by the RECEIVER,
-// which resets the stream. A sender that reads that reset as a generic write
-// failure tears the whole connection down and re-dials, then retries the
-// identical message — an unbounded dial loop that also starves the
-// follower, because every attempt to ship it the entries it needs destroys
-// the connection.
-//
-// The batch is unsendable by construction, so the fix is not that it is
-// delivered (raft must not build it: see raft.sendAppend's entry-count bound)
-// but that it is dropped at the sender WITHOUT touching the connection.
+// TestOversizedReplicateDoesNotStormDials: a batch the receiver must reject is dropped at the sender without touching the connection.
 func TestOversizedReplicateDoesNotStormDials(t *testing.T) {
 	p := newDialCounterPair(t)
 
@@ -275,18 +253,11 @@ func TestOversizedReplicateDoesNotStormDials(t *testing.T) {
 	}
 }
 
-// TestPeerRejectedFrameKeepsConnection covers the other half of the loop: a
-// frame the sender considers well-formed but the RECEIVER refuses (here a
-// DeploymentID mismatch, but equally a wire-version skew or a decompression
-// failure). The peer resets the stream with QUICStreamErrFrameRejected, which
-// the sender must read as "that frame was unacceptable", not "this connection
-// is dead" — otherwise every rejected frame costs a connection teardown and a
-// re-dial, forever.
+// TestPeerRejectedFrameKeepsConnection: a QUICStreamErrFrameRejected reset is a frame failure and keeps the connection.
 func TestPeerRejectedFrameKeepsConnection(t *testing.T) {
 	mtls := testMTLSConfig(t)
 
-	// Receiver in a DIFFERENT deployment: it authenticates the sender at the
-	// TLS layer, then rejects every batch it decodes.
+	// The receiver is in a different deployment: it authenticates the sender, then rejects every batch.
 	recvHandler := newTestHandler()
 	receiver, err := NewQUICTransport(Config{
 		ListenAddress: "127.0.0.1:0",
@@ -350,14 +321,7 @@ func TestPeerRejectedFrameKeepsConnection(t *testing.T) {
 	}
 }
 
-// TestCoalescedBatchSplitsAcrossFrames verifies the sender splits a coalesced
-// batch that does not fit one frame into several frames instead of dropping
-// it: every message must still be delivered, over a single connection.
-//
-// This is the "payload_bytes=18415406 max_frame_size=16777216" case from the
-// field: individually sendable messages that the send queue coalesced into a
-// batch no frame can carry. sendBatch is called directly because the
-// coalescing depends on the worker's drain timing, which a test cannot force.
+// TestCoalescedBatchSplitsAcrossFrames: a coalesced batch larger than one frame is split and fully delivered over one connection.
 func TestCoalescedBatchSplitsAcrossFrames(t *testing.T) {
 	p := newDialCounterPair(t)
 

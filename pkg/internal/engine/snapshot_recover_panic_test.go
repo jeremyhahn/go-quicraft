@@ -73,12 +73,7 @@ func newRecoverableSnapshotLogDB(t *testing.T, baseDir string, index, term uint6
 	return ldb
 }
 
-// TestHandleRequest_RecoverPanicLatchesShard: a panic inside
-// RecoverFromSnapshot leaves a state machine the engine cannot roll back, so
-// resuming applies on it would apply committed entries onto an undefined base.
-// It must fail the shard exactly like a recovery that returned an error: the
-// latch trips, OnShardFailed fires once carrying an *SMPanicError, and no
-// OnSnapshotRejected invites a retry against the damaged state machine.
+// TestHandleRequest_RecoverPanicLatchesShard checks a panic in RecoverFromSnapshot fails the shard once with *SMPanicError and no OnSnapshotRejected.
 func TestHandleRequest_RecoverPanicLatchesShard(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	defer restore()
@@ -173,12 +168,7 @@ func (db *panickingSnapshotLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.
 	return db.snapshotTestLogDB.GetSnapshot(shardID, replicaID)
 }
 
-// TestHandleRequest_PreRestorePanicDoesNotLatch: a recovery that panics in a
-// step before the state machine's RecoverFromSnapshot is invoked — LogDB access
-// before or under the recovering gate, or barrier resolution — has not touched
-// the state machine. It must not trip the failure latch: the recovery is
-// rejected, the recovering gate comes down, the slots are released, and the
-// shard keeps serving, so the next recovery of the same snapshot succeeds.
+// TestHandleRequest_PreRestorePanicDoesNotLatch checks a panic before RecoverFromSnapshot rejects the recovery without tripping the latch.
 func TestHandleRequest_PreRestorePanicDoesNotLatch(t *testing.T) {
 	const index, term = uint64(100), uint64(3)
 	cases := []struct {

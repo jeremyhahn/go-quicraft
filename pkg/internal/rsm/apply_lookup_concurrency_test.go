@@ -161,15 +161,7 @@ func await(done <-chan error) (bool, error) {
 	}
 }
 
-// TestLookupDoesNotBlockApplyOnConcurrentTiers pins that Apply does not
-// exclude Lookup on the concurrent tiers. ConcurrentStateMachine and
-// DiskStateMachine both document Lookup as "May be called concurrently with
-// Update"; if Apply took readGuard for writing on every tier, one read held
-// open inside the user SM would park the shard's Apply — and, through
-// sync.RWMutex's writer preference, every read that arrived after it.
-//
-// Observed with Apply holding readGuard.Lock on every tier: both the Apply and
-// the second Lookup below time out.
+// TestLookupDoesNotBlockApplyOnConcurrentTiers verifies Apply does not exclude Lookup on the concurrent tiers.
 func TestLookupDoesNotBlockApplyOnConcurrentTiers(t *testing.T) {
 	concurrentTiers(t, func(t *testing.T, s *StateMachine, g *gateSM) {
 		slow := newPark()

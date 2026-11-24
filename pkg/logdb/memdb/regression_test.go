@@ -160,13 +160,7 @@ func TestIterateEntriesRejectsInteriorHole(t *testing.T) {
 	}
 }
 
-// TestIterateEntriesReportsCompactedAfterFullCompaction is the regression test
-// for the missing persistent compaction floor. RemoveEntriesTo sliced the
-// entries and set them to nil when empty, recording no floor, so IterateEntries
-// fell through to the empty-slice branch and returned ErrUnavailable. waldb
-// keeps a durable compactedTo and checks it FIRST, returning ErrCompacted even
-// with an empty index. The divergence matters to raft: ErrCompacted switches
-// the leader to InstallSnapshot, ErrUnavailable makes it retry forever.
+// TestIterateEntriesReportsCompactedAfterFullCompaction verifies a fully compacted log reports ErrCompacted.
 func TestIterateEntriesReportsCompactedAfterFullCompaction(t *testing.T) {
 	db := New()
 	defer db.Close()
@@ -289,10 +283,7 @@ func TestIterateEntriesReportsHeadGap(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshotUpdatesMembership is a regression test. SaveSnapshot
-// stored the snapshot but left nd.membership untouched and kept the caller's
-// maps, so ReadState reported an EMPTY membership where waldb reports the
-// snapshot's real one, and a later caller mutation rewrote the stored copy.
+// TestSaveSnapshotUpdatesMembership verifies SaveSnapshot updates the stored membership with copied maps.
 func TestSaveSnapshotUpdatesMembership(t *testing.T) {
 	db := New()
 	defer db.Close()
@@ -342,16 +333,7 @@ func TestSaveSnapshotUpdatesMembership(t *testing.T) {
 	}
 }
 
-// TestSaveBootstrapDoesNotAliasCallerAddresses closes the last aliasing hole in
-// this package.
-//
-// Every other write path deep-copies what the caller hands it — Entry.Cmd in
-// appendCopied, all six Membership maps in copyMembership — because the caller
-// owns those buffers and reuses them. SaveBootstrap took the Addresses map by
-// reference, so a caller that recycled its map (or simply kept editing it while
-// bringing more shards up) rewrote the stored INITIAL MEMBERSHIP after the fact:
-// the address set a recovering replica dials, and the identity set it authorizes
-// joins against.
+// TestSaveBootstrapDoesNotAliasCallerAddresses verifies SaveBootstrap copies the caller's address map.
 func TestSaveBootstrapDoesNotAliasCallerAddresses(t *testing.T) {
 	db := New()
 
@@ -386,15 +368,7 @@ func TestSaveBootstrapDoesNotAliasCallerAddresses(t *testing.T) {
 	}
 }
 
-// TestMergeEntriesReleasesTruncatedPayloads pins the memory behaviour of a
-// leader overwrite that SHORTENS the log.
-//
-// mergeEntries reuses the existing backing array, so replacing a long
-// uncommitted suffix with a short one leaves the difference sitting past len —
-// each abandoned element still holding a live pointer to its Cmd payload.
-// Nothing ever reads those elements again, which is exactly why the retention
-// is invisible: the log looks correct at every index. Under repeated leader
-// churn it is unbounded.
+// TestMergeEntriesReleasesTruncatedPayloads verifies an overwrite that shortens the log releases truncated payloads.
 func TestMergeEntriesReleasesTruncatedPayloads(t *testing.T) {
 	db := New()
 
@@ -440,16 +414,7 @@ func TestMergeEntriesReleasesTruncatedPayloads(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshotRejectsIndexZero pins the fresh-node hole in the staleness
-// rule.
-//
-// Index 0 is the empty log: a snapshot there covers nothing and can never be
-// newer than anything. The staleness check rejects it whenever a snapshot is
-// already stored, but on a node that has none there was nothing to compare
-// against, so it was accepted — and GetSnapshot then reported a snapshot
-// existing at no index, which a caller reads as "this replica has a snapshot to
-// recover from". The SaveState path has always required Index > 0; this is the
-// same rule on the other door.
+// TestSaveSnapshotRejectsIndexZero verifies a snapshot at index 0 is refused on a fresh node.
 func TestSaveSnapshotRejectsIndexZero(t *testing.T) {
 	db := New()
 
@@ -471,21 +436,7 @@ func TestSaveSnapshotRejectsIndexZero(t *testing.T) {
 	}
 }
 
-// TestRemoveNodeDataWaitsForAnInFlightBatch pins that a removal never splits a
-// SaveState batch. If a batch for replicas A and B were applied one update at
-// a time with nothing ordering it against RemoveNodeData, removing B between
-// the two would store A and then refuse B: SaveState would return an error for
-// a batch it had half applied, and a caller told the batch failed would retry
-// or abandon writes that were in fact kept. RemoveNodeData waits for every
-// in-flight write (removalMu), so the batch is applied whole and the
-// removal follows it.
-//
-// The window is HELD OPEN rather than raced for: the test holds B's node lock,
-// so the batch applies A and parks on B. The fixture asserts both the batch
-// and the removal really are blocked there, so a change that closed the
-// window some other way cannot make this vacuous.
-// waitForRemovalLock waits until cond holds, failing the test with what
-// after five seconds.
+// TestRemoveNodeDataWaitsForAnInFlightBatch verifies a removal never splits a SaveState batch.
 func waitForRemovalLock(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -609,12 +560,7 @@ func TestCloseWaitsForAnInFlightBatch(t *testing.T) {
 	}
 }
 
-// TestCloseReleasesNodeData pins Close's only real job in an in-memory store.
-//
-// Every byte this backend holds is on the heap. A Close that just flipped a flag
-// kept the entire Raft log of every shard alive for as long as the caller held
-// the handle, which in a host that closes one store and opens another is the
-// whole log twice.
+// TestCloseReleasesNodeData verifies Close releases the held node data.
 func TestCloseReleasesNodeData(t *testing.T) {
 	db := New()
 	if err := db.SaveState([]logdb.Update{{ShardID: 1, ReplicaID: 1,

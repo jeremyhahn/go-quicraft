@@ -344,22 +344,7 @@ func TestSnapshotReceive_CrashDuringReceiveLeavesNoPartialSnapshot(t *testing.T)
 	}
 }
 
-// TestSnapshotReceive_NeverWritesPlaintextAtRest asserts the at-rest claim of
-// the receive path in the only terms that matter: for a shard with a barrier,
-// the reassembled state machine must never exist in cleartext in any file, at
-// any point of the receive, including every point a SIGKILL can land on.
-//
-// A receive path that wrote the plaintext chunks into the canonical
-// snapshot-<index>/snapshot.dat, fsynced them, and re-encrypted in place
-// afterwards would let a kill between the fsync and the re-encryption leave a
-// COMPLETE PLAINTEXT STATE MACHINE durably under the canonical name. The deferred
-// RemoveAll covers error returns, not a kill, and snapshot GC only reclaims a
-// directory once maxSnapshotsRetained NEWER snapshots exist — on a follower
-// that catches up once and never snapshots again, never.
-//
-// Two halves, both required. The success path proves the steady state; the
-// crash sweep proves there is no window, and it is the crash sweep that fails
-// against the two-step write.
+// TestSnapshotReceive_NeverWritesPlaintextAtRest checks a barrier shard's received state machine is never in cleartext in any file, including at every crash point.
 func TestSnapshotReceive_NeverWritesPlaintextAtRest(t *testing.T) {
 	// A payload no encryption of it can contain verbatim.
 	payload := bytes.Repeat([]byte("SECRET-USER-COMMAND-PLAINTEXT!!"), 300)
@@ -385,9 +370,7 @@ func TestSnapshotReceive_NeverWritesPlaintextAtRest(t *testing.T) {
 		}
 	})
 
-	// Every filesystem operation the receive performs is a point a SIGKILL can
-	// land on. Walk them all: at each one, the process stops dead with whatever
-	// is in the live image, and none of it may be the plaintext.
+	// Crash at every filesystem operation; no live file may hold the plaintext.
 	for _, stage := range []struct {
 		name  string
 		op    crashOp
@@ -417,18 +400,7 @@ func TestSnapshotReceive_NeverWritesPlaintextAtRest(t *testing.T) {
 	}
 }
 
-// TestSnapshotReceive_PinsInFlightEpoch is the regression test.
-//
-// The receive path chooses the at-rest epoch it seals under RIGHT HERE: the
-// sender decrypts before streaming (doSendSnapshot sets Epoch=0), so hdr.Epoch
-// is always 0 on this path and the transport's pin protects nothing. Without a
-// pin of its own, a Rotate plus a concurrent purgeOldEpochs landing between the
-// first frame and the LogDB record can retire the very epoch this artifact was
-// sealed under, leaving a record that names ciphertext nothing can ever open —
-// a follower permanently unable to recover, from a snapshot it acknowledged.
-//
-// Two properties, and the second is the one a naive pin misses: the epoch
-// actually RECORDED must be pinned, not merely the epoch read before the write.
+// TestSnapshotReceive_PinsInFlightEpoch checks the epoch recorded for a received snapshot stays pinned until recorded.
 func TestSnapshotReceive_PinsInFlightEpoch(t *testing.T) {
 	inner := createTestBarrier(t)
 	pin := &pinRecordingBarrier{Barrier: inner}
@@ -500,11 +472,7 @@ func TestSnapshotReceive_FailurePropagation(t *testing.T) {
 		{name: "create_fails", op: opOpenFile, match: "snapshot.dat", wants: "create"},
 		{name: "write_fails", op: opWrite, match: "snapshot.dat", wants: "write"},
 		{name: "data_fsync_fails", op: opSync, match: "snapshot.dat", wants: "sync"},
-		// The receive encrypts INLINE, so the artifact is written exactly once:
-		// there is no plaintext file to re-encrypt, no scratch sibling, and no
-		// rename. The failure modes the two-step write had (a failed re-encrypt
-		// rename, a failed scratch fsync) are covered by write_fails and
-		// data_fsync_fails above, which are now the encrypting write itself.
+		// The artifact is written once, encrypted inline.
 		{name: "metadata_write_fails", op: opWrite, match: "snapshot.meta", wants: "metadata"},
 		{name: "metadata_fsync_fails", op: opSync, match: "snapshot.meta", wants: "metadata"},
 		// The publishing rename is the step that makes the canonical name
@@ -542,11 +510,7 @@ func TestSnapshotReceive_FailurePropagation(t *testing.T) {
 	}
 }
 
-// TestReencryptSnapshotFile_CrashAtEachStage exercises the temp -> fsync ->
-// rename -> directory-fsync sequence under power loss at every stage. The
-// destination must always come back as one COMPLETE image — the original or
-// the fully re-encrypted replacement — never a partial file under the final
-// name, and never missing.
+// TestReencryptSnapshotFile_CrashAtEachStage checks a crash at each stage leaves the original or the complete replacement.
 func TestReencryptSnapshotFile_CrashAtEachStage(t *testing.T) {
 	original := []byte("the-original-destination-snapshot-content")
 	updated := bytes.Repeat([]byte("re-encrypted-replacement-content"), 200)
@@ -758,12 +722,7 @@ func (d *flakyGetSnapshotDB) GetSnapshot(shardID, replicaID uint64) (logdb.Snaps
 	return d.LogDB.GetSnapshot(shardID, replicaID)
 }
 
-// TestSnapshotReceive_CleanupDoesNotDestroyCommittedSnapshot asserts that a
-// receive which does NOT commit never deletes a snapshot directory LogDB
-// already durably references. The cleanup path removes the whole snapshot
-// directory, and the directory name is a pure function of the snapshot index,
-// so any second receive of an index already recorded in LogDB is aimed at
-// committed state.
+// TestSnapshotReceive_CleanupDoesNotDestroyCommittedSnapshot checks a failed receive never deletes a directory LogDB references.
 func TestSnapshotReceive_CleanupDoesNotDestroyCommittedSnapshot(t *testing.T) {
 	payload := []byte("committed-snapshot-content-that-must-survive")
 	const index, term = uint64(2100), uint64(6)

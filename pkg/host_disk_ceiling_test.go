@@ -250,12 +250,7 @@ func TestDiskCeiling_RefusesProposalsFiresOnceAndKeepsAcknowledgedEntries(t *tes
 	}
 }
 
-// TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth pins that once the
-// proposal gate has tripped and usage drops, proposals racing the recovery
-// cannot leave the Host refusing: a refusal sampled before the recovery must
-// not be republished after it. Each round trips the gate, starts concurrent
-// proposalDiskFull callers, drops usage while they run, and checks that the
-// Host then admits proposals and HealthCheck reports DiskOK true.
+// TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth pins that proposals racing recovery cannot leave the host refusing.
 func TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth(t *testing.T) {
 	const (
 		maxBytes = uint64(1000)
@@ -317,10 +312,7 @@ func TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth(t *testing.T) {
 	}
 }
 
-// TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery pins finding 1 of
-// the #911 round 2 review: the proposal gate and the WAL monitor publish into
-// one flag. A WAL sample at 96% that pauses before it publishes must not set
-// the flag after a newer proposal-gate sample below 90% has cleared it.
+// TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery: a stale WAL sample must not set the flag after a newer clear.
 func TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery(t *testing.T) {
 	const maxBytes = uint64(1000)
 	cfg := config.HostConfig{WALDir: t.TempDir(), MaxWALDiskSize: maxBytes}

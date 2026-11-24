@@ -14,14 +14,7 @@
 
 package sm
 
-// CreateFunc is the factory function type for creating state machine instances.
-// It returns one of StateMachine, ConcurrentStateMachine, or DiskStateMachine.
-// The engine inspects the concrete type at startup to determine the state machine
-// variant. This avoids three separate Start methods on Host in favor of one
-// StartShard method.
-//
-// The returned interface{} must implement exactly one of the three state machine
-// interfaces. If none match, StartShard returns an error.
+// CreateFunc creates a state machine instance: exactly one of StateMachine, ConcurrentStateMachine or DiskStateMachine, which the engine detects at startup; otherwise StartShard fails.
 type CreateFunc func(shardID, replicaID uint64) interface{}
 
 // CreateStateMachineFunc creates an in-memory StateMachine instance.

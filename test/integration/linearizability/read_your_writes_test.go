@@ -50,26 +50,7 @@ func (s staleRead) String() string {
 		s.client, s.host, s.replica, s.key, s.wrote, s.readIndex, s.smApplied, s.hostApplied, s.observed, s.value, s.leader)
 }
 
-// TestSoak_RollingRestart_ReadYourWrites reproduces the stale-read shape a
-// rolling-restart soak can return as porcupine Illegal: a SyncRead serving a
-// value two acknowledged writes old, one of them the reading client's own,
-// right after a restarted replica caught up. The soak can say that much and
-// no more -- its history does not record which host served a read, what read
-// index the leader confirmed, or whether the serving state machine had
-// applied the write when the read was released.
-//
-// This test asks the narrowest question that history raises, and records
-// every one of those facts for each answer. Each client writes and then
-// reads ITS OWN key, so every read is a read-your-writes check with maximal
-// sensitivity: a stale value has nowhere to hide behind another client's
-// concurrent write. The put result carries the entry index; the read is
-// taken apart into ReadIndex -> sample markers -> indexed Lookup, exactly the
-// sequence SyncRead performs, so the diagnosis is of SyncRead's own path.
-//
-// Even clients go leader-first (the soak's choice); odd clients are pinned to
-// one host each and keep knocking through its restarts, because the window of
-// interest is the replay a restarted replica performs before it is caught
-// up, and only a client standing at that replica during it can be lied to.
+// TestSoak_RollingRestart_ReadYourWrites checks each client reads its own writes through a rolling restart, recording the serving host and read index.
 func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 	const (
 		numNodes   = 5
@@ -103,14 +84,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 		stalesMu.Unlock()
 	}
 
-	// pickHost returns the host a read or write goes to and its index. An
-	// even client goes leader-first, the soak's choice, falling back to the
-	// live host after `turn` in rotation. An odd client is PINNED to one host
-	// and keeps knocking while it is down or restarting: a restarted replica
-	// replays its whole log before it is caught up, and the proposals it
-	// accepts during that replay are the ones a previous incarnation's keys
-	// could collide with. A client that wanders off to another host at
-	// the first refusal never stands in that window.
+	// pickHost returns the host and index for an operation: leader-first for even clients, a pinned host for odd ones.
 	pickHost := func(clientID, turn int) (*quicraft.Host, int) {
 		cluster.hostsMu.RLock()
 		defer cluster.hostsMu.RUnlock()
@@ -158,12 +132,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 					continue
 				}
 
-				// Write. The leader's applied marker BEFORE the write begins
-				// bounds every entry that existed then: an acknowledgement
-				// carrying an index at or below it is another entry's result
-				// handed to this caller -- a false acknowledgement --
-				// and is recorded as such, since the value's provenance alone
-				// cannot see it (the old entry's index arrives in res.Data too).
+				// An acknowledgement whose index is at or below the leader's applied marker before the write is a false acknowledgement.
 				var appliedBefore uint64
 				if leader := cluster.leaderHost(shardID); leader != nil {
 					if info, infoErr := leader.ShardInfo(shardID); infoErr == nil {
@@ -262,12 +231,7 @@ func TestSoak_RollingRestart_ReadYourWrites(t *testing.T) {
 				}
 				reads.Add(1)
 
-				// A value written by an EARLIER turn can legitimately appear here
-				// with a HIGHER index: that turn's proposal timed out, the client
-				// moved on, and the entry landed afterwards -- the indeterminate
-				// outcome porcupine models explicitly. So the value itself is
-				// not compared; provenance is, against the write just
-				// acknowledged and against everything this client has seen.
+				// Compare provenance, not the value: an earlier timed-out write may land later.
 				if iv.Index < lastWrote || iv.Index < lastObserved {
 					record(staleRead{
 						client: clientID, host: hostIdx, replica: replica, key: key,

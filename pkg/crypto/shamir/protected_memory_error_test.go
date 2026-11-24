@@ -28,20 +28,13 @@ import (
 // errLockRefused stands in for the kernel refusing an mlock.
 var errLockRefused = errors.New("mlock refused")
 
-// refuseProtectedMemory mimics go-enclave's failure contract exactly: it WIPES
-// the source before reporting the refusal. A stub that skipped the wipe would
-// make the test pass against an implementation that leaks the caller's bytes.
+// refuseProtectedMemory mimics go-enclave's failure contract: it wipes the source before refusing.
 func refuseProtectedMemory(data []byte) (enclave.ByteAccess, error) {
 	enclave.Wipe(data)
 	return nil, errLockRefused
 }
 
-// TestNewProtectedShare_AllocationFailureIsNotValidation pins the ownership
-// contract the two error types encode. It is a regression test: this branch used
-// to report a locked-memory refusal as a *ValidationError, whose documented
-// meaning is "the source is left untouched for the caller to wipe" — while the
-// source had in fact already been wiped. A caller distinguishing the two the way
-// the docs tell it to would have retried with a buffer of zeroes.
+// TestNewProtectedShare_AllocationFailureIsNotValidation pins that a locked-memory refusal is not a *ValidationError.
 func TestNewProtectedShare_AllocationFailureIsNotValidation(t *testing.T) {
 	restore := testOnlyProtectedMemory(refuseProtectedMemory)
 	defer restore()
@@ -84,10 +77,7 @@ func TestSplitProtected_AllocationFailureDestroysPartialShares(t *testing.T) {
 	var built []enclave.ByteAccess
 	calls := 0
 
-	// The SIZED seam, not the from-bytes one: a share's value is encoded
-	// straight into locked pages and frozen there, so newProtectedMemory is not
-	// on this path at all. Injecting on that seam would refuse nothing and the
-	// test would pass by never exercising the teardown.
+	// Inject on the sized seam: share values are encoded straight into locked pages.
 	restore := testOnlySizedProtectedMemory(func(n int) (enclave.ByteAccess, error) {
 		calls++
 		if calls > 1 {
@@ -121,14 +111,7 @@ func TestSplitProtected_AllocationFailureDestroysPartialShares(t *testing.T) {
 	}
 }
 
-// TestTestOnlyProtectedMemory_RestoresPrevious pins the seam itself. A restore
-// that did not restore would leave every later test in the package running
-// against a stubbed allocator, which is the kind of failure that looks like a
-// bug in whatever test happens to run next.
-//
-// The panic gate is not exercised: testing.Testing() is true by construction
-// inside a test binary, so the production-refusal path is unreachable from here.
-// It is the same gate, with the same limit, as testOnlyRandReader's.
+// TestTestOnlyProtectedMemory_RestoresPrevious pins that the seam restores the previous allocator.
 func TestTestOnlyProtectedMemory_RestoresPrevious(t *testing.T) {
 	restore := testOnlyProtectedMemory(refuseProtectedMemory)
 	if _, err := newProtectedMemory([]byte("x")); !errors.Is(err, errLockRefused) {
@@ -144,29 +127,7 @@ func TestTestOnlyProtectedMemory_RestoresPrevious(t *testing.T) {
 	e.Destroy()
 }
 
-// TestSplitProtected_BudgetCountsEveryLiveRegion pins the arithmetic of
-// splitLockedBytes term by term, and pins that every region the seam hands out
-// is still alive when the split returns.
-//
-// It does not claim a "true upper bound": this test counts REGIONS, and a budget
-// can count regions correctly while pricing them wrong by a factor of 680. That
-// claim needs a measurement of what the kernel charged, and lives in the VmLck
-// test in protected_share_lockedmem_linux_test.go.
-//
-// A share value is encoded directly into the region it will keep and frozen
-// there, so there is no reused writable encoding scratch, and splitLockedBytes
-// has no term for one. A scratch that a frozen value was copied OUT of would be
-// live alongside it during the copy, and therefore part of the PEAK.
-//
-// Under page rounding these dimensions cost
-// 774,144 + 4,096 + 65,536 + 13x90,112 = 2,015,232, and the fixture straddles
-// the cap in the direction that matters: it is ADMITTED, and one more
-// page-rounded encoded value (90,112) — the price of reintroducing a scratch —
-// would carry it to 2,105,344 and a refusal.
-//
-// The parameters and the expected figures are deliberately hard-coded rather
-// than derived: a test that recomputed the bound from the helper it is checking
-// would agree with any accounting, including a wrong one.
+// TestSplitProtected_BudgetCountsEveryLiveRegion pins splitLockedBytes term by term against hard-coded figures and counts every live region.
 func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 	// The figures below are derived for a 4 KiB page, exactly as in the tests
 	// that follow. Read from the OS, never from lockedBytes: a guard phrased in
@@ -189,11 +150,7 @@ func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 		t.Fatalf("splitLockedBytes(%d,%d,%d) = %d, want %d",
 			secretLen, threshold, total, got, peakWithoutScratch)
 	}
-	// One PAGE-ROUNDED encoded value is the difference, and saying so here means a
-	// change that reintroduces a scratch — or drops a term it should keep — fails
-	// with a readable reason rather than an unexplained number. Page-rounded
-	// because that is the unit the region is charged in: a scratch would be a
-	// whole enclave, costing a whole number of pages, not 86,020 bytes.
+	// One page-rounded encoded value is the margin; a reintroduced scratch fails here.
 	encoded := lockedBytes(base64.StdEncoding.EncodedLen(rawShareOverhead + secretLen))
 	if peakWithScratch-got != encoded {
 		t.Fatalf("the retired scratch term is %d, want one page-rounded encoded value (%d)",
@@ -204,25 +161,7 @@ func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 			"longer straddles the old boundary, so it proves nothing", got, MaxShareSetBytes)
 	}
 
-	// EVERY REGION THE SEAM HANDS OUT IS ACCOUNTED FOR — which is the half the
-	// arithmetic above cannot check, because an allocation missing from
-	// splitLockedBytes is still live at the peak and still counts against
-	// RLIMIT_MEMLOCK.
-	//
-	// The seam sees all of them, in allocation order: SplitProtected's three
-	// pre-loop buffers — the coefficient pool, the coefficient vector and the
-	// raw share payload — then one region per share. A buffer allocated around
-	// the seam would be invisible here, and its refusal path untestable.
-	//
-	// The three ARE transient — each is deferred-Destroy'd — and each is PRICED,
-	// as `coefficients + scratch` in splitLockedBytes.
-	//
-	// So the assertion is the SUM, not the count. Every byte the seam hands out
-	// is added up and compared against splitLockedBytes for the same dimensions:
-	// an allocation that is unpriced, priced twice, or priced at the wrong size
-	// breaks it, and a count alone breaks for none of those. (A headcount plus a
-	// comment naming the buffers would prove only that three of something were
-	// allocated — the names would live in the comment and nowhere else.)
+	// The sum of every region the seam hands out must equal splitLockedBytes for the same dimensions.
 	const preLoopRegions = 3
 
 	var (
@@ -253,15 +192,7 @@ func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 			"an unpriced region is live at the peak, or a priced one no longer "+
 			"goes through the seam", len(handed), len(shares), preLoopRegions, len(shares))
 	}
-	// THE ACCOUNTING PROOF. 32-byte secret, 2-of-3 is six regions -- coefficient
-	// pool (32), coefficient vector (2), raw payload (34) and three encoded
-	// values (48 each) -- and the kernel charges each one a whole page, so the
-	// price is 6 pages, not 212 bytes. The left side applies the same
-	// per-region rounding to the sizes the allocator was ACTUALLY asked for;
-	// the right side is the helper under test. Both round, neither shares the
-	// other's arithmetic, so agreement is a real check rather than a tautology:
-	// an allocation that is unpriced, double-priced, or priced at the wrong size
-	// still moves one side and not the other.
+	// A 32-byte 2-of-3 split is six page-rounded regions; both sides round independently.
 	if want := splitLockedBytes(len(secret), 2, 3); handedSum != want {
 		t.Fatalf("the seam was asked for %d bytes but splitLockedBytes prices %d: "+
 			"an allocation is unpriced, double-priced, or priced at the wrong size",
@@ -282,14 +213,7 @@ func TestSplitProtected_BudgetCountsEveryLiveRegion(t *testing.T) {
 	}
 }
 
-// TestSplitProtected_PreLoopAllocationRefusalsAreClean covers the refusal paths
-// of SplitProtected's three setup allocations. Each can be refused by the
-// kernel, and routing them through newSizedProtectedMemory is what makes those
-// paths reachable from a test.
-//
-// The property is that a refusal at ANY of them is a *ProtectedMemoryError
-// naming the buffer — not a *SplitError, and not a partially built share set the
-// caller has to guess the ownership of.
+// TestSplitProtected_PreLoopAllocationRefusalsAreClean verifies a refused setup allocation is a *ProtectedMemoryError naming the buffer.
 func TestSplitProtected_PreLoopAllocationRefusalsAreClean(t *testing.T) {
 	// One case per pre-loop allocation, identified by the index of the seam call
 	// to refuse: 0 the coefficient pool, 1 the coefficient vector, 2 the raw
@@ -336,15 +260,7 @@ func TestSplitProtected_PreLoopAllocationRefusalsAreClean(t *testing.T) {
 	}
 }
 
-// TestCombineProtected_AllocationRefusalsAreClean is the same coverage on the
-// reconstruction side: both of CombineProtected's regions — the base64 decode
-// scratch and the enclave holding the reconstructed secret — go through the
-// sized seam.
-//
-// The secret buffer is the one that matters. It is not a scratch: it is what the
-// function RETURNS, so a refusal there must leave nothing for the caller to own
-// and must not surface as a *CombineError, which would read as "these shares do
-// not reconstruct" over a kernel that would not give out a page.
+// TestCombineProtected_AllocationRefusalsAreClean verifies refused decode or secret allocations are *ProtectedMemoryError, not *CombineError.
 func TestCombineProtected_AllocationRefusalsAreClean(t *testing.T) {
 	secret := []byte("a-secret-worth-splitting-32-byte")
 	shares, err := SplitProtected(secret, 2, 3)
@@ -396,18 +312,7 @@ func TestCombineProtected_AllocationRefusalsAreClean(t *testing.T) {
 	}
 }
 
-// TestSplitProtected_OverBudgetIsRefusedBeforeAllocating pins the other half of
-// the bound: a request whose priced footprint exceeds MaxShareSetBytes is a
-// rejected REQUEST, refused before a single locked page is taken.
-//
-// secretLen is the first length at these dimensions whose peak crosses the cap
-// under page-rounded accounting. At 3,071 bytes the encoded share does not fit
-// one page, so all 255 values take a second one and the peak jumps to
-// 2,879,488, over the 2,097,152 cap — while 3,070 is admitted at 1,835,008. The
-// pair is meaningful because it is the same shape, admitted on one side of the
-// line and refused on the other. TestSplitProtected_AdmissionBoundaryIsPageRounded
-// pins both sides and the size of the step; this pins that the refusal costs no
-// locked memory.
+// TestSplitProtected_OverBudgetIsRefusedBeforeAllocating pins that a request priced over MaxShareSetBytes is refused before any page is locked.
 func TestSplitProtected_OverBudgetIsRefusedBeforeAllocating(t *testing.T) {
 	const (
 		secretLen = 3071
@@ -442,19 +347,7 @@ func TestSplitProtected_OverBudgetIsRefusedBeforeAllocating(t *testing.T) {
 	}
 }
 
-// TestSplitLockedBytes_PricesEveryRegionInPages pins the page-rounded accounting
-// term by term, against figures worked out by hand rather than recomputed from
-// the helper under test.
-//
-// The regions SplitProtected locks are separate enclaves, and the kernel charges
-// each a whole page. Pricing the SUM of the requested sizes and rounding once —
-// or not rounding at all — under-counts by nearly a page per share, which for a
-// 255-share set is the entire figure: a one-byte secret split 255 ways priced
-// that way comes to 1,536 bytes and locks 1,044,480.
-//
-// The at-rest column is what a caller holds after the split returns (the four
-// transient regions are destroyed on the way out), so it is exactly one page per
-// share and is what the measured witness in the _linux test compares against.
+// TestSplitLockedBytes_PricesEveryRegionInPages pins page-rounded accounting per region against hand-worked figures.
 func TestSplitLockedBytes_PricesEveryRegionInPages(t *testing.T) {
 	// The skip guard reads the page size from the OS, NOT from lockedBytes:
 	// a guard phrased in terms of the helper under test skips itself the moment
@@ -520,18 +413,7 @@ func TestSplitLockedBytes_PricesEveryRegionInPages(t *testing.T) {
 	}
 }
 
-// TestSplitProtected_AdmissionBoundaryIsPageRounded pins where the cap now
-// falls, and pins that the step is the PAGE and not the byte.
-//
-// A 3070-byte secret is the largest whose encoded share still fits one page.
-// One byte more and every one of the 255 values needs a second page, so the
-// footprint jumps by 255 pages at a stroke — from 1,835,008 to 2,879,488 — and
-// crosses the cap. Byte-summed accounting sees the same step as 1,279 bytes and
-// admits both, which is the whole byte-summing defect stated as a boundary.
-//
-// The refusal-allocates-nothing half lives in
-// TestSplitProtected_OverBudgetIsRefusedBeforeAllocating, which shares this
-// fixture; this test owns the arithmetic of both sides and the size of the step.
+// TestSplitProtected_AdmissionBoundaryIsPageRounded pins that 3070 bytes is admitted and 3071 refused, a step of 255 pages.
 func TestSplitProtected_AdmissionBoundaryIsPageRounded(t *testing.T) {
 	// From the OS, not from lockedBytes — see the note in
 	// TestSplitLockedBytes_PricesEveryRegionInPages.
@@ -568,18 +450,7 @@ func TestSplitProtected_AdmissionBoundaryIsPageRounded(t *testing.T) {
 	// this same fixture, rather than a second copy here.
 }
 
-// TestUnmarshalShareSet_BoundIsPageRoundedPerShareValue pins the ingestion
-// path's bound to the same unit, and the same object, as SplitProtected's.
-//
-// A share set arriving as JSON is one enclave per element, so 255 small shares
-// lock 255 PAGES — around 1 MiB — while their document is about 25 KiB. Bounding
-// the raw document length would therefore price an unauthenticated submission
-// at a fortieth of what it takes.
-//
-// The unit is the page; the OBJECT is the share's value, not its element. That
-// second half is what keeps this bound and splitLockedBytes' comparable, and
-// TestShareSet_RoundTripsAtTheAdmissionBoundary is where it is exercised
-// end to end.
+// TestUnmarshalShareSet_BoundIsPageRoundedPerShareValue pins the ingestion bound to page-rounded share values, as in SplitProtected.
 func TestUnmarshalShareSet_BoundIsPageRoundedPerShareValue(t *testing.T) {
 	// From the OS, not from lockedBytes — see the note in
 	// TestSplitLockedBytes_PricesEveryRegionInPages.
@@ -634,16 +505,7 @@ func TestUnmarshalShareSet_BoundIsPageRoundedPerShareValue(t *testing.T) {
 		s.Destroy()
 	}
 
-	// And the mutation the bound has to survive: a set whose page-rounded cost
-	// is over the cap while its RAW length is under it. Each value is sized one
-	// token past two pages, so it costs three, and 171 of them are 2,101,248
-	// locked bytes against 1,409,040 raw — admitted by raw-length accounting,
-	// refused by page-rounded accounting.
-	//
-	// 171 rather than 255: pricing the VALUE leaves only the rounding slack to
-	// separate the two sums, and at 255 elements a value big enough to need a
-	// third page already carries the raw sum past the cap on its own, which
-	// would prove nothing.
+	// 171 values each one token past two pages: under the cap by raw length, over it page-rounded.
 	const (
 		elems    = 171
 		valueLen = 8196 // 2*4096 + 4, a whole number of base64 quanta
@@ -668,53 +530,7 @@ func TestUnmarshalShareSet_BoundIsPageRoundedPerShareValue(t *testing.T) {
 	}
 }
 
-// TestShareSet_RoundTripsWhateverTheSplitAdmits pins the invariant a ceremony
-// depends on: anything SplitProtected admits, UnmarshalShareSet admits.
-//
-// The two guards price different operations — a split's peak includes the
-// coefficients and the two reused scratches, a decode's is one enclave per share
-// — so nothing about the two arithmetics forces them to agree. A disagreement
-// does not look like a bug from outside; it looks like a legitimate recovery
-// being refused, on a set the library itself produced, at a ceremony.
-//
-// Pricing a decode by the ELEMENT breaks it. A share's element carries ~48
-// bytes of JSON header, and when the encoded value lands on an exact page
-// multiple that header pushes every element into a further page: 171 shares of
-// a 6142-byte secret would split at 1,429,504 and decode at 2,101,248, so the
-// split would be admitted and the decode refused. Pricing the VALUE makes the
-// decode sum exactly splitLockedBytes' per-share term, which that function then
-// adds four positive terms to — so the invariant is structural rather than
-// lucky, and this walks the space to say so rather than pinning one point.
-//
-// # Why the sweep is shaped the way it is
-//
-// A split costs secretLen x threshold x total byte operations, and `CI / Test`
-// runs `go test -race -count=1 -timeout=900s -coverprofile=...`. Race and
-// coverage instrumentation together are worth one to two orders of magnitude, so
-// the first cut of this sweep — every secret length against threshold=total as
-// well as threshold=2 — took ~40s bare and blew the 900s package budget in CI,
-// timing out inside a single (3068, 255, 255) split.
-//
-// The trim is chosen so it cannot cost a witness rather than to hit a number.
-// A HIGH threshold makes a split MORE expensive to admit, because
-// splitLockedBytes charges pageRound(secretLen*(threshold-1)) for the
-// coefficients — so the combinations at risk of being admitted here and refused
-// on ingest are the LOW-threshold ones, and those are exactly what the expensive
-// half was not contributing. Checked rather than assumed: sweeping
-// secretLen 1..13000 against eight share counts and four thresholds finds 417
-// combinations an element-priced decode would refuse, 150 of them at
-// threshold=2, and NONE at any secret length at or below 64 bytes. So the sweep
-// runs every secret length at threshold=2, and threshold=total only for the
-// small secrets where the 255-share root-key case lives and where no witness
-// exists to lose. Three witnesses survive the trim — (6140, 2, 171),
-// (6142, 2, 171) and (9214, 2, 129) — the first being the one the regression was
-// found on, and the mutation is verified to still fail there.
-//
-// The share COUNTS are trimmed on the same principle. A combination's cost is
-// dominated by the number of enclaves it maps, not by the GF(256) arithmetic, so
-// dropping two of the seven totals halved the run without touching a witness:
-// measured under the CI invocation, this test went 152s -> 82s and the package
-// 285s -> ~204s against a 900s budget.
+// TestShareSet_RoundTripsWhateverTheSplitAdmits pins that UnmarshalShareSet admits anything SplitProtected admits, sweeping every length at threshold 2 within the CI time budget.
 func TestShareSet_RoundTripsWhateverTheSplitAdmits(t *testing.T) {
 	// Sizes that bracket every page boundary an encoded share can land on,
 	// including the exact multiples that produced the regression.

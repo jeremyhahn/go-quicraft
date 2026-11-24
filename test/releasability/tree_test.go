@@ -26,12 +26,7 @@ import (
 	"testing"
 )
 
-// gitattributesEntries are the .gitattributes entries that keep the private
-// forge's own workflows and the private release trust anchor
-// (privateWorkflowFiles) out of every archive of the tree; nothing else is
-// export-ignored. dockerignoreEntries keep the agent files and those files out
-// of every image build context: an image runs the code, so it carries no
-// development tooling, published or not.
+// gitattributesEntries keep privateWorkflowFiles out of archives; dockerignoreEntries keep agent files and those files out of image build contexts.
 var (
 	gitattributesEntries = []string{
 		".github/workflows/revert-red-main.yml export-ignore",
@@ -140,18 +135,14 @@ func TestTheAllowListDoesNotReachTheValuesThisChangeRemoved(t *testing.T) {
 			t.Errorf("%s is allow-listed for %v; it must be clean or waived line by line", name, accepted)
 		}
 	}
-	// The baselines are allowed fleet HOST names as provenance, never the
-	// address or the account the old run-host header carried.
+	// Baselines may name hosts as provenance, never an address or account.
 	accepted := acceptedClasses(allowList, "test/performance/baselines/x.txt")
 	if accepted[classLabAddress] || accepted[classOwnerAccount] {
 		t.Errorf("baselines accept %v; only %s is provenance", accepted, classLabHost)
 	}
 }
 
-// agentFilesAndWorkflows are tracked files this repository publishes: the
-// Serena project file and the CI template's workflows, neutralised like the
-// rest of the tree. The other agent files (AGENTS.md, CLAUDE.md, .claude/) are
-// no longer tracked, so the manifest cannot hold them.
+// agentFilesAndWorkflows are the tracked agent file and CI workflows this repository publishes.
 var agentFilesAndWorkflows = []string{
 	".serena/project.yml",
 	".github/workflows/batch.yml",

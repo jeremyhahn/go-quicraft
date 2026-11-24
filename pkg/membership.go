@@ -49,80 +49,27 @@ type Membership struct {
 	// Host.RequestUpdateWitnessPolicy.
 	RequireFullReplicaMajority bool
 
-	// SessionExpiryEntries, MaxTotalSessions, MaxResponsesPerSession and
-	// MaxSessionsPerOwner are the shard's replicated SESSION POLICY: the four
-	// limits the deterministic apply path reads. They are seeded at bootstrap
-	// from the founder's Config (Config.SessionExpiryEntries,
-	// Config.MaxTotalSessions, Config.MaxResponsesPerSession,
-	// Config.MaxSessionsPerOwner) and are replicated because a replica that
-	// evaluated them from its own configuration would expire different
-	// sessions at different log indexes and diverge its state machine
-	// silently.
-	//
-	// They are exposed here so an operator can read what a shard actually
-	// committed rather than what any one node is configured with — the two
-	// differ exactly when someone edited a node's Config after bootstrap, in
-	// which case the shard's value is the one that governs and the node logs
-	// the disagreement at startup.
-	//
-	// A shard bootstrapped before the policy was replicated reports all four
-	// as zero: it has no committed policy and every replica is still running
-	// on its own configuration. There is currently NO config change that
-	// alters these after bootstrap.
+	// SessionExpiryEntries, MaxTotalSessions, MaxResponsesPerSession and MaxSessionsPerOwner are the shard's replicated session policy, seeded at bootstrap.
 	SessionExpiryEntries uint64
 	// MaxTotalSessions is the replicated cap on concurrently registered
 	// sessions. Zero means the shard committed no session policy at all.
 	MaxTotalSessions uint64
-	// MaxResponsesPerSession is the replicated RESPONSE-CACHE DEPTH: how many
-	// cached results ONE session retains for duplicate detection. Despite the
-	// name it does not limit sessions at all — MaxSessionsPerOwner is the
-	// per-principal session cap, and MaxTotalSessions the shard-wide one.
+	// MaxResponsesPerSession is how many cached results one session retains for duplicate detection.
 	MaxResponsesPerSession uint64
-	// MaxSessionsPerOwner is the replicated cap on how many sessions one owner
-	// (the principal an embedder declares when registering) may hold
-	// concurrently. Zero means the shard committed no per-owner cap, which is
-	// also how a shard bootstrapped before the field existed reports.
+	// MaxSessionsPerOwner caps concurrent sessions per owner; zero means no per-owner cap.
 	MaxSessionsPerOwner uint64
 
-	// WireVersion is the shard's committed wire version: the transport
-	// version every replica sends at. Zero means the shard has never
-	// switched and reads as the previous version. The leader switches it on
-	// its own once every member runs a build that reads the newer version,
-	// and it never moves back.
+	// WireVersion is the shard's committed wire version; zero reads as the previous version.
 	WireVersion uint64
 
-	// Identities maps replicaID to the stable node identity the shard has
-	// COMMITTED for it — the value that node reports from Host.NodeIdentity.
-	// It is the key every peer authorizes that replica's quorum-bearing
-	// messages with, in place of its address.
-	//
-	// On a shard bootstrapped by this build behind a transport it is COMPLETE:
-	// admission requires an identity for every member
-	// (config.Config.RequireMemberIdentities). A replica absent from it has no
-	// committed identity and every message it sends is refused
-	// ("missing_identity"); the only way to hold such a configuration is data
-	// written by a build that did not require identities, or a shard on a host
-	// without a transport, where nothing crosses the wire.
-	//
-	// Seeded at bootstrap from Config.MemberIdentities; changed via
-	// Host.RequestAddNodeWithIdentity and its observer/witness variants.
+	// Identities maps replicaID to the node identity the shard committed for it, the key peers authorize its messages by.
 	Identities map[uint64]string
 
-	// RemovedIdentities maps each removed replicaID to the node identity the
-	// shard had committed for it when the removal was applied. It is the
-	// shard's identity deny-list: an identity listed here is banned from the
-	// shard permanently, under ANY replica ID, and nothing ever evicts it.
-	// Every replica refuses traffic from it, and a membership add that would
-	// bind it again is refused with ErrRemovedMemberIdentity. A host can
-	// consult it to classify a joiner before proposing the add. A replica
-	// removed without a committed identity has no entry.
+	// RemovedIdentities maps each removed replicaID to its committed identity, which stays banned from the shard.
 	RemovedIdentities map[uint64]string
 }
 
-// ConfigChangeIndex returns the ConfigChangeID. This alias exists for
-// backward compatibility with code that references ConfigChangeIndex
-// instead of ConfigChangeID. Both names refer to the same value: the
-// Raft log index of the configuration change that produced this membership.
+// ConfigChangeIndex returns ConfigChangeID, the configuration version.
 func (m *Membership) ConfigChangeIndex() uint64 {
 	return m.ConfigChangeID
 }

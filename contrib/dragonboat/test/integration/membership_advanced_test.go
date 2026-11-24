@@ -56,11 +56,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Every membership read and change below goes through whichever replica
-	// leads AT THAT MOMENT, never through the host observed above. Observing
-	// a leader does not pin it: a config change on a host that has
-	// since been re-elected is refused correctly, and through this adapter
-	// that refusal reads only "shard not ready".
+	// Every membership read and change goes through the replica leading at that moment.
 	initialID := cluster.membershipFromLeader(t, 1, membershipTimeout).ConfigChangeID
 
 	// A change against the current ConfigChangeID must land. On a freshly
@@ -81,13 +77,7 @@ func TestIntegration_DB_OrderedMembershipChange(t *testing.T) {
 	cluster.addReplicaToLeader(t, 1, 11, "127.10.0.1:59998", dbIdentityFor(11), freshID, membershipTimeout)
 	t.Logf("SyncRequestAddReplica with ConfigChangeID=%d landed", freshID)
 
-	// A change against the now-stale ID must be refused, and refused FOR
-	// STALENESS. This probe is direct on purpose: the refusal is the
-	// assertion, and the idempotent helper would treat it as an answer to
-	// re-resolve past. The probe is re-issued only while the answer is about
-	// leadership rather than staleness -- a not-leader refusal from a replica
-	// that was leading a moment ago says nothing about the ID -- and it is
-	// addressed to the replica leading at the moment of each issue.
+	// A change against the stale ID must be refused for staleness; re-issue only while the refusal is about leadership.
 	var staleErr error
 	waitForCondition(t, failoverTimeout, "the stale-ConfigChangeID probe reaches a leader", func() bool {
 		staleCtx, staleCancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -153,7 +143,7 @@ func TestIntegration_DB_SyncRequestDeleteReplica(t *testing.T) {
 	cluster.deleteReplicaToLeader(t, 1, targetReplicaID, membership.ConfigChangeID, membershipTimeout)
 	t.Logf("SyncRequestDeleteReplica removed replica %d", targetReplicaID)
 
-	// Verify the membership no longer includes the removed replica.
+	// Verify the membership excludes the removed replica.
 	updatedMembership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if _, exists := updatedMembership.Nodes[targetReplicaID]; exists {
 		t.Fatalf("replica %d should not be in membership after delete", targetReplicaID)
@@ -179,9 +169,7 @@ func TestIntegration_DB_SyncRequestAddNonVoting(t *testing.T) {
 	// Get current membership, through whichever replica leads now.
 	membership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 
-	// Add non-voting replica 20 at a dummy address, through the current
-	// leader, and confirmed by a linearizable read showing it NON-VOTING at
-	// that address -- a voter or a witness at the same ID is a conflict.
+	// Add non-voting replica 20 at a dummy address, confirmed by a linearizable read.
 	cluster.addNonVotingToLeader(t, 1, 20, "127.10.0.1:59998", dbIdentityFor(20), membership.ConfigChangeID, membershipTimeout)
 
 	// Verify the membership now includes non-voting replica 20.
@@ -192,37 +180,12 @@ func TestIntegration_DB_SyncRequestAddNonVoting(t *testing.T) {
 	t.Logf("SyncRequestAddNonVoting succeeded: NonVotings=%d", len(updated.NonVotings))
 }
 
-// TestIntegration_DB_ConcurrentConfigChangeRejected verifies that only ONE
-// config change may be in flight at a time (PhD thesis 4.1): a second config
-// change submitted while the first is still unapplied is REJECTED, the first
-// still completes, and a config change issued sequentially afterwards
-// succeeds.
-//
-// The overlap is made deterministic rather than raced for. The Raft layer's
-// latch is `log.confChangeIndex > log.processed`, and processed only advances
-// as the state machine drains committed entries, so the window normally lasts
-// the couple of milliseconds a config change takes to commit and apply. The
-// shard therefore runs gated state machines: a proposal whose key carries
-// gateKeyPrefix parks every replica's apply loop until the test releases it,
-// which pins processed below the config-change entry for as long as the test
-// needs.
-//
-// Three assertions, none of which can be satisfied by everything failing:
-//
-//	NEGATIVE  the overlapping second change must come back Rejected.
-//	FIRST     the first change must Complete once the gate opens, and
-//	          replica 10 must be in the membership while replica 11 is not.
-//	POSITIVE  a control config change issued AFTER the first one applied must
-//	          succeed and must land replica 11 in the membership. Without it a
-//	          shard that rejected every config change would pass.
+// TestIntegration_DB_ConcurrentConfigChangeRejected verifies an overlapping second config change is rejected, the first completes, and a later one succeeds, using gated state machines.
 func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
 
-	// release opens the apply gate. It is closed exactly once, either by the
-	// test body at the point the overlap is no longer needed or by the defer
-	// on any earlier failure — a parked apply loop would otherwise wedge
-	// cluster.close().
+	// release opens the apply gate exactly once, by the test body or the deferred cleanup.
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	openGate := func() { releaseOnce.Do(func() { close(release) }) }
@@ -252,12 +215,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	leaderHost := cluster.hosts[leaderIdx]
 	leaderReplicaID := uint64(leaderIdx + 1)
 
-	// Get the current ConfigChangeID. Both overlapping changes use it: apply
-	// is about to be parked, so the shard's configChangeIndex cannot advance
-	// and the Host-level staleness check passes for both. That is deliberate —
-	// it forces the rejection to come from the pending-config-change rule and
-	// not from staleness, which TestIntegration_DB_OrderedMembershipChange
-	// already covers.
+	// Both overlapping changes use the current ConfigChangeID, so the rejection comes from the pending-config-change rule, not staleness.
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 	membership, err := leaderHost.SyncGetShardMembership(ctx, 1)
@@ -296,9 +254,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 			leaderIdx, defaultTimeout)
 	}
 
-	// FIRST config change. It appends to the leader's log immediately, which
-	// raises log.confChangeIndex; because processed is pinned below it by the
-	// gate, the pending-config-change latch now stays armed indefinitely.
+	// First config change: it arms the pending-config-change latch while apply is parked.
 	//quicraft:direct-config-change this change must enter THIS leader's log, the one
 	// whose apply loop is parked: it is the first half of the overlap under test, and
 	// a helper that re-resolved could submit it to a replica whose latch is not armed
@@ -309,18 +265,12 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	defer rs1.Release()
 	t.Logf("first config change submitted (add replica 10) with ConfigChangeID=%d", configChangeID)
 
-	// Let the step worker drain the first change in its own Propose batch.
-	// Two config changes coalesced into ONE batch are both rejected (the
-	// foundCC pass in handleLeaderPropose), which is a different code path
-	// from the one under test. The step worker turns a batch around in well
-	// under a millisecond; this window is three orders of magnitude of
-	// margin, and the gate means there is no opposing race to lose — the
-	// latch cannot clear while apply is parked, however long the wait.
+	// Let the step worker take the first change in its own batch; two changes in one batch take a different rejection path.
 	settle := time.NewTimer(500 * time.Millisecond)
 	<-settle.C
 	settle.Stop()
 
-	// SECOND config change, overlapping the first. This must be rejected.
+	// Second config change, overlapping the first: it must be rejected.
 	//quicraft:direct-config-change the overlap's REJECTION is the test; an idempotent
 	// helper retries ErrRejected (a pending config change clears on its own) and would
 	// wait out the very latch this assertion exists to observe
@@ -383,10 +333,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 			"entered the log: %v", updatedMembership.Nodes)
 	}
 
-	// POSITIVE CONTROL. The very change that was rejected while overlapping
-	// must now succeed when issued sequentially. A shard that rejects every
-	// config change, or one whose latch stuck armed after the rejection,
-	// fails here.
+	// Positive control: the rejected change must succeed when issued sequentially.
 	seqCtx, seqCancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer seqCancel()
 	//quicraft:direct-config-change positive control: an ErrRejected here means the latch

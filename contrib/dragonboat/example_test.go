@@ -34,15 +34,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// kvStore is a Dragonboat-style regular state machine: a string map
-// updated by "key=value" commands and read by key. It is written exactly
-// as it would be for Dragonboat v4; only the import paths differ.
-//
-// A command without '=' is rejected in its result (Data "malformed
-// command", map unchanged) with a nil error: Update returns an error only
-// for a failure the replica cannot continue past, since the adapter turns
-// it into a terminal apply failure that stops the shard on every replica
-// and replays on restart.
+// kvStore is a dragonboat-style key=value state machine; a malformed command is rejected in its result, not with an error.
 type kvStore struct {
 	mu   sync.RWMutex
 	data map[string]string
@@ -129,12 +121,7 @@ func ExampleNewNodeHost() {
 	fmt.Println("node identity:", nh.NodeIdentity())
 }
 
-// ExampleNodeHost_SyncPropose starts a single-replica shard with a
-// Dragonboat-style state machine, writes through SyncPropose with a no-op
-// session, and reads back with SyncRead. The host runs without a transport
-// and with an in-memory log, through NewNodeHostWithOptions, so the
-// example is self-contained; a migrated application uses NewNodeHost, or
-// NewNodeHostWithOptions with quicraft.WithBarrier for encryption at rest.
+// ExampleNodeHost_SyncPropose writes and reads a single-replica shard with no transport and an in-memory log.
 func ExampleNodeHost_SyncPropose() {
 	dir, err := os.MkdirTemp("", "nodehost")
 	if err != nil {

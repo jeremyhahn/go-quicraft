@@ -113,10 +113,7 @@ func (c *BenchCluster) Leader() *quicraft.Host {
 	return c.Hosts[c.LeaderIdx]
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. A port
-// reserved up front and bound later can be taken by a concurrent job that
-// shares the network but not the reservation's lock directory (#386); a host
-// that binds port 0 holds its port from the moment it exists.
+// kernelAddr binds a host on a kernel-assigned loopback port, held from the moment the host exists.
 const kernelAddr = "127.0.0.1:0"
 
 // boundMembers reads each host's bound address back and builds the initial
@@ -281,15 +278,7 @@ func warmupPropose(ctx context.Context, h *quicraft.Host, shardID uint64, cmd []
 // and runs in addition, inside the commit-latency scenarios.
 const setupWarmupProposals = 10
 
-// verifyClusterReady runs the setup warmup on the benchmark shard
-// (quicraftShardID) of a freshly elected group of any
-// size (a single-node group included): setupWarmupProposals proposals, then
-// one linearizable read, each on the shared warmup retry budget. It
-// establishes the peer QUIC connections and primes the propose and ReadIndex
-// paths so the first timed operation pays no one-time initialization. Both
-// calls return only once their own operation has completed (applied, or the
-// read index confirmed and reached), so nothing is left in flight that would
-// need a settle delay before the timer starts.
+// verifyClusterReady warms up the benchmark shard (quicraftShardID) with setupWarmupProposals proposals and one linearizable read on the shared retry budget, leaving nothing in flight.
 func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int) {
 	b.Helper()
 

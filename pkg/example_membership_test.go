@@ -118,9 +118,7 @@ func ExampleHost_SyncRequestAddObserverWithIdentity() {
 	// config change ID now non-zero: true
 }
 
-// This example removes the observer the previous example added. Removal is a
-// consensus operation; afterwards the membership no longer lists the replica
-// and records its ID as removed.
+// This example removes the observer the previous example added; the membership then records its ID as removed.
 func ExampleHost_SyncRequestRemoveNode() {
 	runMembershipExample(context.Background(), func(ctx context.Context, h *quicraft.Host) {
 		addExampleObserver(ctx, h)

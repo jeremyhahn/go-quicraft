@@ -24,12 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// TestUpdate_MalformedEntryYieldsResultNotError is the regression test for
-// A committed entry whose payload cannot be decoded (e.g. a single
-// stray byte) must produce the reserved sm.ResultInvalidCommand result for
-// that entry only. Update must return nil and the remaining entries in the
-// batch must still apply, otherwise the engine marks the shard failed and
-// the same committed entry re-wedges it on every restart.
+// TestUpdate_MalformedEntryYieldsResultNotError: an undecodable entry yields sm.ResultInvalidCommand, Update returns nil, and the rest of the batch applies.
 func TestUpdate_MalformedEntryYieldsResultNotError(t *testing.T) {
 	junk := map[string][]byte{
 		"short_data": {0x00}, // 1-byte junk proposal
@@ -85,13 +80,7 @@ func twoBucketKeys(t *testing.T) ([]byte, []byte) {
 	return nil, nil
 }
 
-// TestConcurrentStore_UpdateBatchAtomicity is a regression test:
-// a concurrent Lookup must never observe a partially applied Update batch.
-// Each batch writes the same round number to two keys in different buckets
-// (keyA first, then keyB). A reader that loads keyA and then keyB must
-// therefore never see round(keyA) > round(keyB): that ordering is only
-// possible if the batch became visible between its two entries.
-// Run with -race.
+// TestConcurrentStore_UpdateBatchAtomicity: a concurrent Lookup never sees a partly applied batch (keyA ahead of keyB). Run with -race.
 func TestConcurrentStore_UpdateBatchAtomicity(t *testing.T) {
 	cs := NewConcurrentStore()
 	ctx := context.Background()

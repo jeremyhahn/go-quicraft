@@ -88,14 +88,7 @@ func (m *mockLogDB) AtRestProtection() logdb.AtRestProtection {
 	return logdb.AtRestNonDurable
 }
 
-// SaveState MERGES each update into the node's stored log the way a real LogDB
-// appends to it: entries at new indexes are added, an entry at an index already
-// held is replaced (the raft overwrite rule), and a non-zero hard state
-// supersedes the previous one.
-//
-// Replacing the whole Update wholesale made only the LAST call's entries
-// retrievable, so a test that seeded a log in two calls silently lost the first
-// half — a log with holes no real implementation can produce.
+// SaveState merges each update into the stored log like a real LogDB: new indexes append, existing ones are replaced.
 func (m *mockLogDB) SaveState(updates []logdb.Update) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -125,19 +118,7 @@ func (m *mockLogDB) SaveState(updates []logdb.Update) error {
 	return nil
 }
 
-// IterateEntries serves the entries a test actually persisted through
-// SaveState, in [low, high). Returning nothing unconditionally made every
-// recovered node look like one whose log had vanished — no entry, and
-// therefore no TERM, could be read back for an index the same fixture
-// declared committed and applied. Recovery is entitled to resolve the term of
-// an applied index from the log, so the stub turned a faithful, fail-closed
-// recovery into an apparent bug.
-//
-// maxSize is honoured with the interface's rule: 0 means unlimited, the first
-// entry is always admitted, and iteration otherwise stops BEFORE the entry that
-// would push the cumulative size past the budget. Ignoring it let this fixture
-// serve batches no real LogDB would, hiding every caller that depends on the
-// budget being respected.
+// IterateEntries serves persisted entries in [low, high), honouring maxSize (0 is unlimited, the first entry always fits).
 func (m *mockLogDB) IterateEntries(entries []logdb.Entry, size uint64, shardID, replicaID, low, high, maxSize uint64) ([]logdb.Entry, uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -176,14 +157,7 @@ func (m *mockLogDB) ReadState(shardID, replicaID uint64) (logdb.State, logdb.Mem
 	return u.State, logdb.Membership{}, nil
 }
 
-// EntryRange reports the range implied by what the test actually persisted:
-// entries from SaveState, or the recovered commit index when a test seeds
-// hard state without materialising entries. Returning (0, 0) unconditionally
-// described a node that had committed entries it did not hold — a state
-// production cannot reach, since HardState.Commit == N means the log holds
-// entries through N (or a snapshot covering them). Recovery legitimately
-// clamps a commit index past the end of the log, so the stub made faithful
-// recovery look like a bug.
+// EntryRange reports the persisted range, or the recovered commit index when only hard state was seeded.
 func (m *mockLogDB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -212,14 +186,7 @@ func (m *mockLogDB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error
 func (m *mockLogDB) RemoveEntriesTo(shardID, replicaID, index uint64) error { return nil }
 func (m *mockLogDB) Compact(shardID, replicaID uint64) error                { return nil }
 
-// SaveSnapshot rejects a snapshot that does not advance the recorded index,
-// exactly as memdb.MemDB.SaveSnapshot and waldb.DB.SaveSnapshot do.
-//
-// Storing unconditionally made this mock the ONE LogDB in the tree that accepts
-// a stale save, and every ImportSnapshot test ran against it — so the import
-// path's behaviour when the LogDB refuses (which is what a real deployment
-// does on a retried or index-colliding artifact) was untestable here, and the
-// data-destruction that behaviour exposed went unseen.
+// SaveSnapshot rejects a snapshot that does not advance the recorded index, like the real LogDBs.
 func (m *mockLogDB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -346,15 +313,7 @@ func (b *mockBarrier) DecryptForEpoch(dst, ciphertext []byte, epoch uint64) ([]b
 	return b.Decrypt(dst, ciphertext)
 }
 
-// ---------------------------------------------------------------------------
-// Context-AAD support for the test barriers
-//
-// The real seal.Barrier folds the caller context into the AEAD AAD, so a frame
-// sealed under one context cannot be opened under another. The pass-through
-// test barriers have no AEAD, so they stand in for that binding by appending a
-// fixed-width tag derived from the context and rejecting a frame whose tag does
-// not match the context offered at decryption.
-// ---------------------------------------------------------------------------
+// Test barriers bind the caller context by appending a context tag, standing in for the real barrier's AAD.
 
 // testSnapShardID/testSnapReplicaID/testSnapIndex are the artifact identity the
 // frame-level unit tests seal and open their snapshots under. Any triple works;
@@ -487,28 +446,7 @@ func testLoadNode(h *Host, shardID uint64) *nodeState {
 	return v.(*nodeState)
 }
 
-// injectApplyLag makes a shard's state machine look like it has fallen behind
-// its commit index, and returns the commit index the lag is measured against.
-// It is the fixture every follower-read slow-path test needs.
-//
-// The lag must be injected on the APPLIED side, never the committed one. The
-// step worker republishes the real committed index from the raft log on EVERY
-// tick (Node.publishLogMarkers), so a committed index written by a test — the
-// obvious engNode.SetCommittedIndex(lastApplied + N) — survives at most one
-// tick interval, after which the reader takes the fast path and the slow path
-// under test is never entered. ns.lastApplied is written only by the apply
-// callback, so it is the side a test can hold still.
-//
-// It must also not be moved back while an apply is still in flight. The step
-// worker publishes the commit marker BEFORE the commit/apply pipeline runs, so
-// a single read of it can name an index the apply callback has not reached yet:
-// waiting for "lastApplied >= committed" against one stale sample returns
-// immediately, the injected 0 is then overwritten by the apply that was still
-// coming, and the read completes on the fast path. Wait for the two markers to
-// agree AND stay agreed before injecting.
-//
-// The caller must have committed something first (a leader's term-opening no-op
-// is enough) so that the commit index is non-zero.
+// injectApplyLag lowers the shard's applied index once the commit and apply markers agree, and returns the commit index.
 func injectApplyLag(t *testing.T, h *Host, shardID uint64) uint64 {
 	t.Helper()
 
@@ -563,16 +501,7 @@ func newTestHost(t *testing.T) *Host {
 	return h
 }
 
-// waitForDiagLive waits until the step worker has PUBLISHED a diagnostics
-// snapshot for the shard, so DiagRaftState reports the shard's real state.
-//
-// DiagRaftState is lazily armed: the first call only turns publication on, and
-// until the next tick publishes it returns an all-zero placeholder that is
-// indistinguishable from a genuine empty log. A test that reads it as a
-// baseline records lastIdx=0 and then compares it against the real index a
-// moment later, reporting movement that never happened. A live snapshot always
-// carries a non-zero last index once the shard has a leader, because the
-// bootstrap entry is already in the log.
+// waitForDiagLive waits until the step worker has published a diagnostics snapshot for the shard.
 func waitForDiagLive(t *testing.T, h *Host, shardID uint64) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -650,10 +579,7 @@ func testIdentities(members map[uint64]string) map[uint64]string {
 	return ids
 }
 
-// testShardConfigWithIdentities is testShardConfig with MemberIdentities
-// covering every replica in members, for hosts that have a transport. The
-// local replica's entry must be the HOST's own identity — StartShard checks
-// its own entry against Host.NodeIdentity — so the host is a parameter.
+// testShardConfigWithIdentities is testShardConfig with identities for every member; the local entry is the host's own.
 func testShardConfigWithIdentities(h *Host, shardID, replicaID uint64, members map[uint64]string) config.Config {
 	c := testShardConfig(shardID, replicaID)
 	c.MemberIdentities = testIdentities(members)
@@ -675,14 +601,7 @@ func waitForLeader(t *testing.T, h *Host, shardID uint64) {
 		if engNode != nil && engNode.Peer() != nil && engNode.Peer().IsLeader() {
 			// Sync the host's cached leader state.
 			h.updateNodeLeader(shardID, engNode.Peer().LeaderID(), 0)
-			// The leader's no-op commits asynchronously on the persistence
-			// edge, and ReadIndex serves only after an entry from the CURRENT
-			// term is committed (PhD 6.4). Under config-in-log a founding
-			// leader's log is bootstrap@1 (term 1) then no-op@2 (current term),
-			// so waiting for the first apply (lastApplied>=1) is not enough —
-			// that is the bootstrap entry, whose term is not current, and
-			// ReadIndex would still be unready. Wait for lastApplied>=2 so the
-			// current-term no-op is applied before Sync* calls that follow.
+			// Wait for lastApplied >= 2 so the current-term no-op is applied and ReadIndex is ready.
 			if v, ok := h.nodes.Load(shardID); ok {
 				if ns, nsOK := v.(*nodeState); nsOK && ns.lastApplied.Load() < 2 {
 					runtime.Gosched()
@@ -696,23 +615,7 @@ func waitForLeader(t *testing.T, h *Host, shardID uint64) {
 	t.Fatalf("timed out waiting for shard %d to elect leader", shardID)
 }
 
-// waitForApplied waits until the Host's applied mirror for the shard
-// (nodeState.lastApplied) has reached index, and fails the test if it does
-// not within the timeout. It exists because a returned Sync* proposal does
-// NOT pin that mirror: OnApplied completes the proposal (completeProposal,
-// which wakes the caller) in its claim loop and stores ns.lastApplied only
-// later in the same callback, and the engine stores node.lastApplied only
-// after OnApplied returns (apply.go). A read of either counter straight after
-// SyncPropose returns can therefore still see the pre-batch value.
-//
-// The caller supplies the bound. Two bounds are always available after a
-// completed proposal: the result's Value when the state machine reports the
-// entry's index (mockStateMachine does), and the engine's published commit
-// marker (engine.Node.CommittedIndex), which the step worker stores when it
-// extracts the batch — before the apply worker ever sees it — so a sample
-// taken after SyncPropose returns names the proposal's index or higher.
-// Waiting for the mirror to reach the commit marker is exactly the gate
-// FollowerRead uses to decide the apply worker has caught up.
+// waitForApplied waits until the shard's applied mirror reaches index, or fails the test.
 func waitForApplied(t *testing.T, h *Host, shardID, index uint64) {
 	t.Helper()
 	ns := testLoadNode(h, shardID)
@@ -722,18 +625,7 @@ func waitForApplied(t *testing.T, h *Host, shardID, index uint64) {
 	}
 }
 
-// assertSeededApplied checks that StartShard seeded the Host's applied mirror
-// (nodeState.lastApplied) to want on an on-disk recovery. The seed itself is
-// synchronous — stored before the nodeState is published — so the value is
-// pinned the moment StartShard returns. It does not stay put: the
-// single-member shard elects itself and applies its term-opening no-op at
-// want+1 asynchronously, and under load that apply can land before the
-// caller's read (81 observed for want 80). The no-op is the only writer
-// that can move it, so want+1 is the one value above want that is not a
-// seeding regression; anything below want means the marker came from the
-// wrong source (the snapshot record, OnDiskIndex, or nothing), which is what
-// these tests exist to catch. Same bound TestStartShard_FreshStart_NoSeed
-// already applies to the bootstrap membership entry.
+// assertSeededApplied checks the on-disk recovery seeded the applied mirror to want (want+1 after the no-op).
 func assertSeededApplied(t *testing.T, ns *nodeState, want uint64, why string) {
 	t.Helper()
 	got := ns.lastApplied.Load()
@@ -2760,13 +2652,7 @@ func TestFailPendingRequests_DuplicateCallSafeWithCAS(t *testing.T) {
 	rs.Release()
 }
 
-// TestOnApplied_TimeoutRecycleNoCrossDelivery reproduces Bug E at the Host
-// level: a proposal (request A) is registered, its caller "times out" and
-// Releases the RequestState while the pending-map entry is still present.
-// The late OnApplied for A then removes the entry and recycles the RS into
-// the pool. A new proposal (request B) draws a RequestState from the same
-// pool. Firing A's stale OnApplied again must not deliver any result into
-// B's channel.
+// TestOnApplied_TimeoutRecycleNoCrossDelivery checks a stale OnApplied for a recycled RequestState never reaches a new request.
 func TestOnApplied_TimeoutRecycleNoCrossDelivery(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -2837,11 +2723,7 @@ func TestOnApplied_TimeoutRecycleNoCrossDelivery(t *testing.T) {
 	rsB.Release()
 }
 
-// TestClose_SecondSweepCatchesLateRegistrations verifies that proposals
-// registered after the first sweep visits a shard (but before Close
-// finishes) are still completed with ErrClosed by the second sweep.
-// This validates the TOCTOU race fix between Propose()/ReadIndex() and
-// Host.Close().
+// TestClose_SecondSweepCatchesLateRegistrations checks the second sweep completes late registrations with ErrClosed.
 func TestClose_SecondSweepCatchesLateRegistrations(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -2860,16 +2742,7 @@ func TestClose_SecondSweepCatchesLateRegistrations(t *testing.T) {
 	ns := testLoadNode(h, 1)
 	pool := NewRequestStatePool()
 
-	// Simulate the TOCTOU race: register a proposal on the nodeState
-	// AFTER it would have been swept by the first pass in Close().
-	// We do this by:
-	// 1. Close the host (which sweeps and removes the node).
-	// 2. Manually re-inject a pending proposal into the nodeState.
-	// 3. Run the second sweep manually.
-	//
-	// In production, the race occurs when a goroutine that already
-	// passed h.closed.Load() registers a proposal between the
-	// first sweep visiting the shard and Close() finishing.
+	// Close the host, re-inject a pending proposal, then run the second sweep by hand.
 	if err := h.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
 	}
@@ -2897,9 +2770,7 @@ func TestClose_SecondSweepCatchesLateRegistrations(t *testing.T) {
 	lateRS.Release()
 }
 
-// TestClose_ConcurrentProposeRegistrationCompleted verifies that a proposal
-// registered concurrently with Close() is always completed with ErrClosed,
-// regardless of timing. This is a stress test for the TOCTOU fix.
+// TestClose_ConcurrentProposeRegistrationCompleted checks a proposal registered concurrently with Close completes with ErrClosed.
 func TestClose_ConcurrentProposeRegistrationCompleted(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -2939,17 +2810,7 @@ func TestClose_ConcurrentProposeRegistrationCompleted(t *testing.T) {
 	// Start registration and Close concurrently.
 	close(startC)
 	closeErr := h.Close()
-	// ErrShutdownTimeout is an EXPECTED outcome here, not a defect. This test
-	// deliberately registers pendingOps while Close is draining, and Drain is
-	// bounded by ShutdownTimeout (500ms in this fixture) — so a registration
-	// that lands after the drain begins counting legitimately makes it time
-	// out. Failing the test on it discarded the assertion the test exists for
-	// and flaked at roughly 10% under -race, on a machine doing nothing else.
-	//
-	// The property under test is the one in the loop below: every proposal
-	// registered concurrently with Close is completed with ErrClosed,
-	// regardless of timing. That assertion is unchanged, and any Close error
-	// OTHER than the drain timeout is still a failure.
+	// ErrShutdownTimeout is an allowed Close result here; any other Close error fails.
 	if closeErr != nil && !errors.Is(closeErr, ErrShutdownTimeout) {
 		t.Fatalf("Close failed: %v", closeErr)
 	}
@@ -3165,10 +3026,7 @@ func TestHostEngineCallback_OnApplied_UpdatesLastApplied(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// waitForLeader already pinned lastApplied >= 2 (bootstrap@1, no-op@2),
-	// so a bare "lastApplied > 0" after the proposal would pass without the
-	// proposal's apply ever being observed. Record the marker first and
-	// require it to move past THIS entry.
+	// Record the applied marker first and require it to move past this entry.
 	ns := testLoadNode(h, 1)
 	appliedBefore := ns.lastApplied.Load()
 
@@ -3584,17 +3442,7 @@ func TestReadIndex_SubmitsKeyToReadIndexQueue(t *testing.T) {
 	scfg := testShardConfig(1, 1)
 	h.StartShard(members, false, testCreateFunc, scfg)
 
-	// A ReadIndex is leader-bound, so the shard has to HAVE a leader before
-	// one is issued. StartShard returns before the single-node self-election
-	// runs, and a ReadIndex that arrives first is refused outright ("not
-	// leader, no leader currently known") rather than dropped and retried —
-	// which turns the race into a completed-with-error result this test
-	// rejects.
-	//
-	// waitForLeader is the right wait rather than a sleep: it blocks until
-	// lastApplied >= 2, so the CURRENT term's no-op is committed, which is
-	// exactly ReadIndex's precondition (PhD 6.4). Waiting only for IsLeader
-	// would leave the read unready and narrow the race instead of closing it.
+	// Wait for the leader's current-term no-op so ReadIndex is ready.
 	waitForLeader(t, h, 1)
 
 	rs, err := h.ReadIndex(context.Background(), 1)
@@ -3606,17 +3454,7 @@ func TestReadIndex_SubmitsKeyToReadIndexQueue(t *testing.T) {
 	}
 	defer rs.Release()
 
-	// Verify the read was registered for this shard.
-	//
-	// A live pendingReads entry is only ONE of the two states that prove it:
-	// this is a single-node shard, so the read reaches quorum immediately and
-	// OnReadyToRead can complete it — which removes the entry — before this
-	// assertion runs. Requiring the entry to still be present therefore
-	// asserted on a transient intermediate state the system is free to have
-	// already left, and flaked under -race on a loaded machine.
-	//
-	// Either observation proves the read was submitted; observing NEITHER is
-	// the defect this test exists to catch, and still fails.
+	// The read is registered if its entry is pending or it already completed; neither is the failure.
 	ns := testLoadNode(h, 1)
 
 	ns.pendingReadsMu.Lock()
@@ -3883,14 +3721,7 @@ func TestOnReadyToRead_BatchAliasesResolvedWhenApplied(t *testing.T) {
 	rsAlias3.Release()
 }
 
-// TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration verifies that
-// if OnReadyToRead fires for a batchKey that has no aliases (because
-// OnReadIndexBatched was never called or the batchKey was deleted),
-// only the batchKey is completed. A subsequent OnReadIndexBatched for the
-// already-removed batch key must then FAIL the alias reads: aliases
-// are reachable only through the batch entry, so leaving them pending
-// would block deadline-less callers forever. This defensive path backs up
-// the fixed ordering (OnReadIndexBatched before Handle(ReadIndex)).
+// TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration checks a later OnReadIndexBatched for a completed batch key fails its aliases.
 func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -3924,9 +3755,7 @@ func TestOnReadyToRead_BatchAliasOrphanedWithoutRegistration(t *testing.T) {
 
 	cb := &hostEngineCallback{h: h}
 
-	// Simulate the OLD buggy ordering: OnReadyToRead fires BEFORE
-	// OnReadIndexBatched. The batchKey (400) has no aliases yet, so
-	// only the batchKey is completed. Aliases 401/402 remain orphaned.
+	// OnReadyToRead fires before OnReadIndexBatched, so aliases 401 and 402 are orphaned.
 	cb.OnReadyToRead(1, []proto.ReadyToRead{{Key: 400, Index: 10}})
 
 	// batchKey should be completed and deleted.
@@ -4638,15 +4467,7 @@ func TestStopShard_FailsPendingSnapshots(t *testing.T) {
 // OnLeaderUpdated - snapshot cleanup
 // ---------------------------------------------------------------------------
 
-// TestOnLeaderUpdated_LeavesPendingSnapshotsAlone asserts that a leadership
-// change does NOT complete an in-flight snapshot request.
-//
-// Saving a snapshot is purely LOCAL — it reads this replica's own state machine
-// and writes its own disk — so an election completing the caller with
-// NotLeaderError while the save kept running would only produce a retry that
-// hit ErrSnapshotInProgress. Teardown
-// (StopShard/Close), where the save really is abandoned, still fails it; see
-// failPendingRequests vs failPendingClientRequests.
+// TestOnLeaderUpdated_LeavesPendingSnapshotsAlone checks a leadership change does not complete an in-flight local snapshot request.
 func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -4691,10 +4512,7 @@ func TestOnLeaderUpdated_LeavesPendingSnapshotsAlone(t *testing.T) {
 	default:
 	}
 
-	// Surviving the election is not the whole contract: an implementation that
-	// simply LEAKED the entry would satisfy the check above and block the caller
-	// forever. The save must still be able to complete it normally, with the
-	// real snapshot index.
+	// The save must still complete the request with the real snapshot index.
 	cb.OnSnapshotRequestCompleted(1, 70, 512, nil)
 	select {
 	case result := <-rs.ResultC():
@@ -5012,8 +4830,7 @@ func TestImportSnapshot_Success(t *testing.T) {
 		t.Fatalf("ImportSnapshot failed: %v", err)
 	}
 
-	// Verify the snapshot metadata was saved in LogDB and preserves the
-	// ORIGINAL Index/Term/Membership from the artifact header.
+	// The LogDB snapshot record keeps the artifact's Index, Term and Membership.
 	db.mu.Lock()
 	snap, ok := db.snapshots[mockNodeKey{1, 1}]
 	db.mu.Unlock()
@@ -5067,12 +4884,7 @@ func TestImportSnapshot_VerifiesSnapshotDirStructure(t *testing.T) {
 	snap := db.snapshots[mockNodeKey{5, 3}]
 	db.mu.Unlock()
 
-	// The import must land in the CANONICAL tree: the shard's snapshot base
-	// directory (<NodeHostDir>/snapshots/shard-N, which itself already carries
-	// the shard segment) plus the engine's shard-N/replica-M/snapshot-... save
-	// path. An earlier hand-rolled path was one level shallower, which is
-	// invisible to listSnapshotDirs — see
-	// TestImportSnapshot_ReachesDEKPurgeFloorAndGC for what that costs.
+	// The import lands in the canonical snapshot tree that listSnapshotDirs reads.
 	base := shardSnapshotBaseDir(cfg.NodeHostDir, "", 5)
 	expectedPrefix := filepath.Join(base, "shard-5", "replica-3") + string(filepath.Separator)
 	if !strings.HasPrefix(snap.Filepath, expectedPrefix) {
@@ -5157,11 +4969,7 @@ func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 	// Set up nodeInfo for import (it uses ListNodeInfo to find replicaID).
 	db.mu.Lock()
 	db.nodeInfos = []logdb.NodeInfo{{ShardID: 1, ReplicaID: 1}}
-	// Model the disaster the import exists for: this replica no longer has the
-	// snapshot the artifact carries. Re-importing an artifact ONTO the record
-	// it was exported from is refused by every LogDB in the tree
-	// (logdb.ErrSnapshotOutOfDate — the index does not advance), so leaving the
-	// record in place would not be a round trip production can perform.
+	// Drop the replica's snapshot record first: re-importing onto it is refused as out of date.
 	delete(db.snapshots, mockNodeKey{1, 1})
 	db.mu.Unlock()
 
@@ -5184,12 +4992,7 @@ func TestExportImportSnapshot_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestExportImportSnapshot_PreservesIdentityAndMembership verifies Bug D: the
-// exported artifact carries the original snapshot Index, Term, OnDiskIndex,
-// and Membership, and ImportSnapshot persists them verbatim (using importSeq
-// only for the on-disk directory name). Synthesizing Index=importSeq, Term=1
-// and dropping Membership/OnDiskIndex would produce a different logical
-// snapshot.
+// TestExportImportSnapshot_PreservesIdentityAndMembership checks the artifact's Index, Term, OnDiskIndex and Membership persist verbatim.
 func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -5283,12 +5086,7 @@ func TestExportImportSnapshot_PreservesIdentityAndMembership(t *testing.T) {
 	if !got.Membership.Removed[5] {
 		t.Errorf("imported Removed not preserved: %#v", got.Membership.Removed)
 	}
-	// The on-disk directory is named by the snapshot's own Raft index, the
-	// same way every other snapshot writer names one. The snapshot tree is
-	// ORDERED by that name (listSnapshotDirs parses it; gcSnapshotDirs deletes
-	// the lowest, latestSnapshotDir picks the highest), so a per-host import
-	// sequence number would make this restore sort as the oldest snapshot on
-	// the node.
+	// The directory is named by the snapshot's Raft index, which orders the snapshot tree.
 	if base := filepath.Base(got.Filepath); base != "snapshot-00000000000000004242" {
 		t.Errorf("directory name = %q, want snapshot-00000000000000004242 (the Raft index)", base)
 	}
@@ -5343,9 +5141,7 @@ func TestExportImportSnapshot_RecoveryRoundTrip(t *testing.T) {
 		t.Fatalf("StopShard failed: %v", stopErr)
 	}
 
-	// Import the artifact onto a SECOND, independent host (the realistic
-	// cross-host restore). h2 is bootstrapped for shard 1 / replica 1 so
-	// ImportSnapshot can resolve the replicaID, but has no prior snapshot.
+	// Import onto a second, independent host bootstrapped for shard 1 replica 1 with no prior snapshot.
 	cfg2 := testHostConfig(t)
 	h2, err := NewHost(cfg2, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -5689,16 +5485,7 @@ func TestPropose_InboxFull(t *testing.T) {
 		t.Fatal("engine node should not be nil")
 	}
 
-	// Continuously fill the proposal queue and call Propose until we observe
-	// ErrDropped. The step worker drains the proposalQ concurrently, so
-	// we may need several attempts. Proposals go through the MPSC proposalQ
-	// (not the inbox channel), so we must fill that queue.
-	//
-	// ErrDropped, not ErrSystemBusy: this is a per-shard proposal QUEUE
-	// overflow. ErrSystemBusy is the global MaxTotalInMemLogSize limiter, and
-	// reporting it here pointed an operator at a limit that had not been
-	// reached. The two must stay distinguishable, so the assertion also
-	// rejects the busy identity outright.
+	// Fill the proposal queue until Propose returns ErrDropped (queue overflow), never ErrSystemBusy (the global limiter).
 	deadline := time.Now().Add(2 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -5743,12 +5530,7 @@ func TestReadIndex_ReadIndexQueueFull(t *testing.T) {
 		t.Fatal("engine node should not be nil")
 	}
 
-	// Park the step worker off this shard so the queue STAYS full.
-	// processReady skips a recovering node before it reaches
-	// drainAndHandleReadIndex, and that drain is the only consumer. Racing
-	// a live drain instead makes the test opportunistic: on idle hardware
-	// the worker wins every round and the queue never fills, which is
-	// exactly how this failed on a 20-thread idle host.
+	// Mark the node recovering so the step worker stops draining and the queue stays full.
 	engNode.SetRecovering(true)
 	defer engNode.SetRecovering(false)
 
@@ -5906,10 +5688,7 @@ var _ Barrier = (*testHostBarrier)(nil)
 
 func TestHost_KeyRotationLoop_Disabled(t *testing.T) {
 	cfg := testHostConfig(t)
-	// KeyRotationInterval = 0 disables SCHEDULED rotation, but the
-	// invocation-threshold check still runs whenever a barrier is
-	// configured (it enforces the NIST AEAD budget). The mock barrier's
-	// ShouldRotateKey returns false, so no rotation fires.
+	// Interval 0 disables scheduled rotation; the mock's ShouldRotateKey returns false, so none fires.
 	barrier := newTestHostBarrier(1)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
 	if err != nil {
@@ -6113,10 +5892,7 @@ func TestHost_RotateBarrierKey_ClampsToGlobalFloor(t *testing.T) {
 	}
 }
 
-// TestHost_RotateBarrierKey_RetentionBelowFloor verifies that when the
-// retention threshold is BELOW the global safe floor, the retention threshold
-// is used (we never purge MORE than retention allows, and the clamp only
-// lowers the floor, never raises it).
+// TestHost_RotateBarrierKey_RetentionBelowFloor checks a retention threshold below the safe floor is used unchanged.
 func TestHost_RotateBarrierKey_RetentionBelowFloor(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.MaxRetainedEpochs = 4
@@ -6774,13 +6550,7 @@ func TestRequestRemoveNode_Success(t *testing.T) {
 // IsShardJoining
 // ---------------------------------------------------------------------------
 
-// TestIsShardJoining_TransitionsOnSnapshot verifies that a shard started with
-// join=true reports IsShardJoining() == true until its first snapshot is
-// accepted, after which it reports false for the remaining life of the
-// process. qrdb's placement reconciler polls this to know when a dynamically
-// added replica has caught up enough that a LATER restart of that same
-// replica must use join=false instead of re-entering the join bootstrap
-// window (see pkg/server/tenant_shard_reconciler.go in go-qrdb).
+// TestIsShardJoining_TransitionsOnSnapshot checks IsShardJoining stays true until the first snapshot is accepted, then false.
 func TestIsShardJoining_TransitionsOnSnapshot(t *testing.T) {
 	const shardID = 1
 	const localReplicaID = 2
@@ -6821,12 +6591,7 @@ func TestIsShardJoining_TransitionsOnSnapshot(t *testing.T) {
 		t.Fatal("IsShardJoining = false immediately after markShardJoining, want true")
 	}
 
-	// Load an engine node whose membership includes both replicas. The
-	// sender (fromReplicaID) is deliberately NOT pre-registered in the
-	// registry, forcing HandleSnapshot down the join-window claimed-address
-	// path (messagehandler.go) rather than a normal registry resolve — this
-	// is exactly the situation a freshly join=true-started replica is in
-	// before its first snapshot arrives.
+	// The sender is not registered, so HandleSnapshot takes the join-window claimed-address path.
 	node := newEngineNodeWithMembership(t, shardID, localReplicaID, map[uint64]string{
 		localReplicaID: "127.0.0.1:6001",
 		fromReplicaID:  "127.0.0.1:6002",
@@ -8071,12 +7836,7 @@ func TestNewHost_DefaultLogger_DoesNotMutateGlobal(t *testing.T) {
 // ImportSnapshot monotonic counter
 // ---------------------------------------------------------------------------
 
-// TestImportSnapshot_MonotonicCounter verifies that ImportSnapshot uses a
-// monotonic atomic counter (instead of time.Now().UnixNano()) for the
-// on-disk snapshot DIRECTORY name, guaranteeing unique directories across
-// rapid sequential calls. The Raft snapshot index now comes from the
-// artifact header, so this test asserts directory uniqueness rather than
-// index ordering.
+// TestImportSnapshot_MonotonicCounter checks rapid imports get unique snapshot directories.
 func TestImportSnapshot_MonotonicCounter(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -8496,9 +8256,7 @@ func hasRoutingEntry(ns *nodeState, replicaID uint64) bool {
 	return ok
 }
 
-// TestOnSnapshotCompleted_ReconcilesMembership verifies that a successful
-// snapshot RECOVERY reconciles the routing table with the Peer's membership:
-// the recovered snapshot may carry config changes OnApplied never saw.
+// TestOnSnapshotCompleted_ReconcilesMembership checks snapshot recovery reconciles the routing table with the Peer's membership.
 func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
 	h, ns := startReconcileFixture(t)
 
@@ -8511,10 +8269,7 @@ func TestOnSnapshotCompleted_ReconcilesMembership(t *testing.T) {
 	}
 }
 
-// TestOnSnapshotCompleted_SaveDoesNotReconcileMembership verifies that a
-// snapshot SAVE leaves the routing table alone. Every entry a save covers was
-// applied first, and OnApplied already routed its config changes, so a save
-// has nothing to reconcile.
+// TestOnSnapshotCompleted_SaveDoesNotReconcileMembership checks a snapshot save leaves the routing table alone.
 func TestOnSnapshotCompleted_SaveDoesNotReconcileMembership(t *testing.T) {
 	h, ns := startReconcileFixture(t)
 
@@ -8579,13 +8334,7 @@ func TestOnSnapshotCompleted_ErrorSkipsReconciliation(t *testing.T) {
 // Request keys
 // ---------------------------------------------------------------------------
 
-// TestRequestKeysNeverRepeatAndAreNeverZero pins the two properties every
-// pending-request map depends on. Proposals, reads and snapshots must not share
-// a key, and keys must not repeat across incarnations (a counter restarts with
-// the Host, so a restarted replica would mint its previous incarnation's keys
-// while replaying that incarnation's log). Keys are random 64-bit draws from
-// one generator serving all three paths, so cross-path independence is
-// subsumed by the draw: a million keys, no repeat, no zero.
+// TestRequestKeysNeverRepeatAndAreNeverZero checks a million request keys contain no repeat and no zero.
 func TestRequestKeysNeverRepeatAndAreNeverZero(t *testing.T) {
 	const draws = 1 << 20
 	seen := make(map[uint64]struct{}, draws)
@@ -9249,12 +8998,7 @@ func TestTransportSender_SendSnapshot_PanicRecovery(t *testing.T) {
 func TestTransportSender_SendSnapshot_PanicRecovery_NormalError(t *testing.T) {
 	ts := &transportSender{
 		logger: slog.Default(),
-		// engine is nil -- notifySnapshotStatus will panic, but
-		// this is called in the normal error path of doSendSnapshot
-		// (snapshot file not found), not in the panic recovery.
-		// The file path is set but doesn't exist, so forEachSnapshotChunk
-		// returns an error. The handler calls notifySnapshotStatus which
-		// panics on nil engine. The panic recovery catches it.
+		// With a nil engine the missing snapshot file makes notifySnapshotStatus panic; the recovery catches it.
 	}
 
 	msg := proto.Message{
@@ -9635,18 +9379,7 @@ func TestOnLeaderUpdated_FollowerLeaderChangeFailsForwardedProposals(t *testing.
 	rsRead.Release()
 }
 
-// TestOnLeaderUpdated_FollowerLeaderlessThenNewLeaderFailsProposals covers the
-// transition a real failover actually takes: a follower observes the dying
-// leader as leaderID 0 FIRST, so by the time the new leader appears the
-// previous leader is already 0.
-//
-// Requiring prevLeaderID != 0 here would mean this second transition never
-// fires and every proposal submitted during the leaderless window stays
-// pending after a leader exists again. The caller then blocks until its OWN
-// deadline: measured on a 5-node cluster, elections completed in ~530ms but
-// writes did not resume for ~5.2s in roughly one failover in three.
-// Those proposals were never forwarded anywhere and can never complete, so the
-// new leader's arrival is exactly when to fail them.
+// TestOnLeaderUpdated_FollowerLeaderlessThenNewLeaderFailsProposals checks pending proposals fail when a new leader follows a leaderless window.
 func TestOnLeaderUpdated_FollowerLeaderlessThenNewLeaderFailsProposals(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -9687,10 +9420,7 @@ func TestOnLeaderUpdated_FollowerLeaderlessThenNewLeaderFailsProposals(t *testin
 	rs.Release()
 }
 
-// TestOnLeaderUpdated_BecomingLeaderKeepsPendingProposals verifies the
-// exclusion: when THIS replica is the one elected, its pending proposals must
-// survive, because it is about to commit them itself. Failing them here would
-// turn the fix above into spurious errors on every local election win.
+// TestOnLeaderUpdated_BecomingLeaderKeepsPendingProposals checks this replica's own election keeps its pending proposals.
 func TestOnLeaderUpdated_BecomingLeaderKeepsPendingProposals(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -9753,19 +9483,7 @@ func TestOnLeaderUpdated_FollowerSameLeaderReelectedDoesNotFail(t *testing.T) {
 	rs.Release()
 }
 
-// TestOnLeaderUpdated_FollowerNoPreviousLeaderFailsStrandedProposals asserts
-// that a proposal still pending when a new leader appears is failed, even
-// though the previously observed leader was 0.
-//
-// It is tempting to reason that a first election should not fail proposals,
-// since there was no previous leader to lose. That reasoning does not survive
-// contact with the real transition. Raft rejects a proposal
-// outright with NotLeaderError when it knows no leader, so a proposal that is
-// still PENDING here is not a first-election proposal at all — it is one that
-// was forwarded to a leader which then died, arriving after the leaderID -> 0
-// transition had already been consumed. It can never complete, and leaving it
-// pending makes the caller wait out its own deadline: ~5s on a cluster whose
-// election finished in ~530ms, in roughly one failover in three.
+// TestOnLeaderUpdated_FollowerNoPreviousLeaderFailsStrandedProposals checks a pending proposal fails when a leader appears after leader 0.
 func TestOnLeaderUpdated_FollowerNoPreviousLeaderFailsStrandedProposals(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -9989,14 +9707,7 @@ func TestHostEngineCallback_OnCommitted_NotifiesPendingProposal(t *testing.T) {
 	rs.Release()
 }
 
-// TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal verifies the
-// recycle guard: a pendingProposal whose RequestState has zero holders (its
-// caller has released and a claiming path such as OnApplied, OnProposalFailed,
-// failPendingRequests or the sweep has dropped the map's reference) has been
-// recycled and may already belong to a new request. OnCommitted must refuse
-// to pin it with tryAcquireRef and skip it. Without the guard its trailing
-// releaseRef would take holders 1 -> 0 again and recycle the object twice,
-// which the testHookTryRecycle counter observes.
+// TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal checks OnCommitted skips a proposal whose RequestState has no holders.
 func TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal(t *testing.T) {
 	// The hook runs on engine goroutines too, so the watched object is
 	// published through an atomic pointer.
@@ -10058,14 +9769,7 @@ func TestHostEngineCallback_OnCommitted_SkipsUnreferencedProposal(t *testing.T) 
 	ns.pendingProposals.Delete(uint64(88))
 }
 
-// TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress hammers
-// OnCommitted against concurrent fail-and-recycle of the same proposal.
-// Before the tryAcquireRef+re-verify guard, OnCommitted could load the
-// pendingProposal, lose the race to a claiming path (LoadAndDelete +
-// complete + releaseRef + caller Release -> pool recycle), and then push a
-// stale WAL-durable notification into the recycled object after it had been
-// handed to a brand-new request. The successor request registered here must
-// never observe a committedC notification. Run under -race.
+// TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress checks a recycled proposal never receives a stale committed notification; run under -race.
 func TestHostEngineCallback_OnCommitted_ConcurrentClaimRecycleStress(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -10325,11 +10029,7 @@ func TestRotateBarrierKey_RotateSuccessNoPurge(t *testing.T) {
 func TestRotateBarrierKey_PurgesOldEpochs(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.MaxRetainedEpochs = 2
-	// newEpoch=5 > MaxRetainedEpochs=2, so the retention threshold would be
-	// 5-2 = 3. But with a memory LogDB and no started shards, nothing
-	// encrypted is retained, so the GLOBAL safe-purge floor is unknown and
-	// rotation must FAIL SAFE: rotate but do not purge any DEK. Purging on
-	// uncertainty could brick a snapshot/WAL DEK. See rotateBarrierKey.
+	// With nothing encrypted retained the safe purge floor is unknown, so rotation must not purge any DEK.
 	rb := &rotatingBarrier{rotateEpoch: 5, purgeResult: 2}
 
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithBarrier(rb), WithoutTransport())
@@ -10516,13 +10216,7 @@ func TestHost_GetLogRange_ClosedHost(t *testing.T) {
 // P-2: pendingSweepLoop panic recovery and restart
 // ---------------------------------------------------------------------------
 
-// TestPendingSweepLoop_PanicRecovery verifies that pendingSweepLoop
-// restarts after a panic in sweepExpiredPending and continues sweeping
-// on subsequent ticks. The test injects a nodeState with a nil-rs
-// pendingProposal whose deadline has expired, causing a nil pointer
-// dereference panic in sweepPendingProposals. After the panic is
-// recovered and the loop restarts, a second (valid) sweep tick must
-// succeed, proving the loop did not exit permanently.
+// TestPendingSweepLoop_PanicRecovery checks the sweep loop restarts after a panic and keeps sweeping.
 func TestPendingSweepLoop_PanicRecovery(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -10766,14 +10460,7 @@ func TestSyncPropose_Success(t *testing.T) {
 	}
 }
 
-// TestSyncPropose_EmptyCommandIsCommitBarrier verifies that a zero-length
-// command is proposed normally rather than rejected, matching dragonboat
-// (proposalShard.propose types an empty cmd as a plain application entry).
-// It commits and advances the applied index, but the apply path skips
-// empty-Cmd non-session entries before they reach the user state machine —
-// the same treatment the leader's election no-op gets. That makes it the
-// supported way to force a current-term committed entry after an election
-// (PhD 6.4 ReadIndex warmup) without inventing a throwaway payload.
+// TestSyncPropose_EmptyCommandIsCommitBarrier checks an empty command commits and advances the applied index without reaching the user state machine.
 func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -10805,16 +10492,7 @@ func TestSyncPropose_EmptyCommandIsCommitBarrier(t *testing.T) {
 		t.Fatalf("empty proposal must be accepted, got: %v", err)
 	}
 
-	// SyncPropose returning does not pin the applied mirror (see
-	// waitForApplied). The barrier's own index is not in the result either:
-	// the apply path hands the user SM nothing for an empty entry, so its
-	// result is the zero sm.Result. Nor is the engine's commit marker a bound:
-	// it is published on the step worker's NEXT cycle, so it can still name
-	// the index before the barrier when SyncPropose returns (observed:
-	// committed 2 with the barrier at 3, failing about 1 run in 160). The
-	// barrier is the only entry proposed here, so the applied mirror moving
-	// past its prior value is the barrier committing even though the user
-	// state machine never saw it.
+	// The barrier is the only proposal, so the applied mirror moving past its prior value is the barrier committing.
 	waitForApplied(t, h, 1, appliedBefore+1)
 
 	// A subsequent non-empty proposal still works normally.
@@ -11088,16 +10766,7 @@ func TestDiagRemotes_InvalidShard(t *testing.T) {
 // translateProposalError
 // ---------------------------------------------------------------------------
 
-// TestTranslateProposalError_NotLeader pins what the NotLeader branch is FOR:
-// replacing the raft layer's internal NotLeaderError — which carries no leader
-// identity a caller can use, and lives in a package no caller can import —
-// with the public *NotLeaderError carrying the leader this replica currently
-// believes in, so a client can redirect without a second round trip.
-//
-// It calls the branch directly. The previous version proposed against a host
-// with no elected leader and then, if an error came back at all, logged
-// whatever it was with t.Logf; it returned early when the proposal succeeded,
-// asserted nothing when it failed, and passed with the branch deleted.
+// TestTranslateProposalError_NotLeader checks the internal not-leader error becomes the public *NotLeaderError with the believed leader.
 func TestTranslateProposalError_NotLeader(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -11622,18 +11291,7 @@ func TestTranslateProposalError_ReadIndexOverloaded(t *testing.T) {
 	}
 }
 
-// TestTranslateProposalError_PendingConfigChange verifies that the raft
-// layer's pending-config-change rejection reaches callers as the PUBLIC
-// ErrRejected.
-//
-// PhD 4.1 allows only one config change in flight, and the leader rejects a
-// whole Propose batch containing a second one — nothing enters the log, so
-// the caller can simply retry once the pending change commits. But
-// raft.ErrPendingConfigChange lives in an internal package: returned
-// verbatim, no consumer can match it with errors.Is, so every caller falls
-// through to its own catch-all and reports a retryable rejection as a fatal
-// error. The dragonboat compatibility shim did exactly that, mapping it to
-// RequestAborted instead of RequestRejected.
+// TestTranslateProposalError_PendingConfigChange checks the pending-config-change rejection reaches callers as the public ErrRejected.
 func TestTranslateProposalError_PendingConfigChange(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -11697,14 +11355,7 @@ func TestSyncRequestUpdateWitnessPolicy_EndToEnd(t *testing.T) {
 
 	members := map[uint64]string{1: "127.0.0.1:5000"}
 	scfg := testShardConfig(1, 1)
-	// The witness this test adds (127.0.0.1:6000) never runs, so once it
-	// is a member the voting set {1, witness 10} has quorum 2 with only one
-	// voter answering: with CheckQuorum on, the leader correctly steps down
-	// one CheckQuorum window (a few ms at test ticks) after the add, and
-	// the policy-tightening step below would race that step-down and see
-	// ErrNotLeader instead of the policy rejection it asserts (#1103).
-	// This test is about the witness policy, not CheckQuorum, so turn it
-	// off; the raft package tests the new-voter grace window itself.
+	// CheckQuorum off: the added witness never runs, and a step-down would race the policy rejection under test.
 	scfg.CheckQuorum = config.BoolPtr(false)
 	if err := h.StartShard(members, false, testCreateFunc, scfg); err != nil {
 		t.Fatalf("StartShard failed: %v", err)
@@ -11864,18 +11515,7 @@ func TestBuildTransportConfig_WithRevocation(t *testing.T) {
 	}
 }
 
-// TestBuildTransportConfig_RevocationFailsClosedByDefault is the regression
-// test, driven through the CHECKER the mapped config produces rather than
-// through the value of a field. A RevocationConfig that does not opt into
-// soft-fail must reject a peer whose status cannot be established, and the
-// opt-in must still admit it — a checker that simply refuses everything would
-// fail the second arm.
-//
-// The CRL path deliberately does not exist, so no fresh CRL is ever loaded and
-// the status of every certificate is genuinely unknown. The leaf needs no
-// issuer: with no configured CA the checker scopes the lookup to the
-// issuer-agnostic scope, which is exactly the "nothing revoked this, and
-// nothing could tell me otherwise" case.
+// TestBuildTransportConfig_RevocationFailsClosedByDefault checks unknown revocation status is rejected unless soft-fail is opted into.
 func TestBuildTransportConfig_RevocationFailsClosedByDefault(t *testing.T) {
 	build := func(t *testing.T, allowSoftFail bool) *revocation.Checker {
 		t.Helper()
@@ -12121,12 +11761,7 @@ func TestSyncRead_SuccessImmediate(t *testing.T) {
 		t.Fatalf("SyncPropose failed: %v", err)
 	}
 
-	// Now do a linearizable read. The query is non-nil and distinctive
-	// because mockStateMachine.Lookup echoes it: the echo is the only
-	// evidence available here that the state machine was actually consulted
-	// and its answer returned to the caller. Reading with a nil query and
-	// discarding the result would pass against a SyncRead that returns
-	// (nil, nil) without touching the SM.
+	// A distinctive query proves the read reached the state machine, since Lookup echoes it.
 	const query = "success-immediate"
 	result, err := h.SyncRead(ctx, 1, query)
 	if err != nil {
@@ -13213,12 +12848,7 @@ func TestTranslateProposalError_NotLeaderError(t *testing.T) {
 	v, _ := h.nodes.Load(uint64(1))
 	ns := v.(*nodeState)
 
-	// The nodeState is the authority on who the leader is. The internal error
-	// carries its own idea of it, and the translation must IGNORE that: the
-	// raft layer's copy is whatever the peer believed when it refused the
-	// proposal, while the nodeState mirrors the leadership the host has since
-	// observed. Handing the caller the stale one sends the retry to a replica
-	// that has already lost the term.
+	// The translation uses the nodeState's leader, not the stale leader in the internal error.
 	ns.leaderID.Store(9)
 	ns.nodesMu.Lock()
 	ns.nodes[9] = "192.168.1.109:5000"
@@ -13280,10 +12910,7 @@ func TestTranslateProposalError_NotLeaderError_NoLeader(t *testing.T) {
 			"the previous assertion was result != nil, which the untranslated "+
 			"pass-through satisfies too", result, result)
 	}
-	// An unknown leader must be reported as leader ZERO and still as a
-	// not-leader error. The documented contract is that a caller reads
-	// (0, true) as "retry, but discover the leader yourself" — inventing an
-	// address here, or degrading to a non-not-leader error, both break it.
+	// An unknown leader is reported as leader 0, still as a not-leader error.
 	if public.LeaderID != 0 || public.LeaderAddress != "" {
 		t.Errorf("translated leader = %d at %q, want 0 and empty",
 			public.LeaderID, public.LeaderAddress)
@@ -14251,18 +13878,7 @@ func TestSyncRead_BlockingSelectDeadlineExceeded(t *testing.T) {
 // Coverage: SyncGetShardMembership with deadline exceeded
 // ---------------------------------------------------------------------------
 
-// TestSyncGetShardMembership_DeadlineExceeded verifies that a linearizable
-// membership read is bounded by the caller's deadline.
-//
-// The read must be genuinely unable to resolve, or this test asserts a coin
-// flip. On a single-voter shard the ReadIndex takes the ReadOnly bypass and
-// can land in rs.ResultC() before the select runs; with BOTH that case and
-// ctx.Done() ready, Go chooses uniformly at random, so the call returns a
-// valid membership roughly half the time it reaches that state. (It passed 40
-// consecutive isolated runs and failed under full-suite scheduling — exactly
-// the profile of a latent race.) Adding voter 4 makes quorum 2 of 2 with one
-// replica absent, so the ReadIndex can never confirm and the deadline is the
-// only reachable outcome.
+// TestSyncGetShardMembership_DeadlineExceeded checks the caller's deadline bounds a membership read; voter 4 makes quorum unreachable.
 func TestSyncGetShardMembership_DeadlineExceeded(t *testing.T) {
 	h := startSingleVoterShard(t)
 
@@ -15256,14 +14872,7 @@ func TestOnReadyToRead_BadNodeStateType(t *testing.T) {
 // Coverage: HandleMessage - source address registration
 // ---------------------------------------------------------------------------
 
-// TestFailPendingRequests_NoDoubleReleaseRefUnderRace guards the refcount
-// invariant on the lock-free pendingProposals sync.Map: failPendingRequests
-// (and the sweeper) must claim an entry via LoadAndDelete before releaseRef so
-// they never double-release a proposal that a concurrent OnApplied-style
-// completion already removed. A double release drives RequestState.outstanding
-// negative and recycles it early, reopening the cross-request result-corruption
-// bug. With the LoadAndDelete guard, every registered proposal is released
-// exactly once and ends at outstanding == 0.
+// TestFailPendingRequests_NoDoubleReleaseRefUnderRace checks every proposal is released exactly once and ends at outstanding == 0.
 func TestFailPendingRequests_NoDoubleReleaseRefUnderRace(t *testing.T) {
 	const n = 500
 	for iter := 0; iter < 20; iter++ {
@@ -15327,12 +14936,7 @@ func TestHandleMessage_WithSourceAddress(t *testing.T) {
 		t.Errorf("expected nil error, got: %v", err)
 	}
 
-	// Shard 1 is NOT loaded on this host, so the sender (From=2) cannot be
-	// authorized as a member. Address learning is deliberately skipped for
-	// unloaded shards: an unverified in-band (replicaID, address) claim must
-	// not be allowed to seed the registry. Authoritative addresses arrive when
-	// the shard is loaded with its configured membership. (Learning for an
-	// authorized member of a loaded shard is covered in messagehandler_test.go.)
+	// Shard 1 is not loaded, so the sender cannot be authorized and no address is learned.
 	if _, resolveErr := h.registry.Resolve(1, 2); resolveErr == nil {
 		t.Errorf("expected no address learned for an unloaded shard, but (1,2) resolved")
 	}
@@ -15654,13 +15258,7 @@ func TestRequestRemoveNode_LastVoterReturnsErrorPromptly(t *testing.T) {
 	}
 }
 
-// TestRequestAddWitness_DuplicateReturnsErrorPromptly verifies that adding a
-// witness whose replica ID is already a member is rejected promptly by the
-// Host API. Like the AddNode duplicate case, this exercises the propose-time
-// validation that the Host now performs before delivering the change. (The
-// 64-voting-member cap is covered at the Peer level in
-// TestPeer_ValidateConfigChange_*, since adding 64 unreachable voters to a
-// single-node shard would break quorum and stall config-change progress.)
+// TestRequestAddWitness_DuplicateReturnsErrorPromptly checks adding an existing replica ID as a witness is refused at propose time.
 func TestRequestAddWitness_DuplicateReturnsErrorPromptly(t *testing.T) {
 	h := newTestHost(t)
 	defer h.Close()
@@ -15687,9 +15285,7 @@ func TestRequestAddWitness_DuplicateReturnsErrorPromptly(t *testing.T) {
 // ExportSnapshot/ImportSnapshot operate on plaintext with a barrier.
 // ---------------------------------------------------------------------------
 
-// TestExportSnapshot_DecryptsWithBarrier verifies that ExportSnapshot emits
-// PLAINTEXT when a barrier is configured and the on-disk snapshot is encrypted
-// (Epoch > 0), never raw ciphertext.
+// TestExportSnapshot_DecryptsWithBarrier checks an encrypted snapshot exports as plaintext.
 func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -15728,18 +15324,11 @@ func TestExportSnapshot_DecryptsWithBarrier(t *testing.T) {
 	}
 }
 
-// TestDecryptSnapshotFrames_MixedEpoch verifies the send/export decrypt path
-// handles a snapshot whose frames were sealed under DIFFERENT epochs (a key
-// rotation landed mid-save). Each frame must be decrypted with the epoch
-// embedded in its own header (barrier.Decrypt), not a single snapshot-wide
-// epoch. Under the old DecryptForEpoch-with-one-epoch behavior the post-rotation
-// frame failed AEAD, breaking InstallSnapshot send and ExportSnapshot for
-// rotation-spanning snapshots.
+// TestDecryptSnapshotFrames_MixedEpoch checks each frame decrypts with the epoch in its own header.
 func TestDecryptSnapshotFrames_MixedEpoch(t *testing.T) {
 	barrier := createTestBarrier(t)
 
-	// Both frames carry the positional context the decrypt side reproduces;
-	// only the EPOCH differs between them, which is the property under test.
+	// The frames differ only in epoch.
 	aad := engine.NewSnapshotAAD(testSnapShardID, testSnapReplicaID, testSnapIndex, barrier)
 	p1 := []byte("frame-one-sealed-before-rotation")
 	c1, e1, err := barrier.EncryptWithEpochContext(nil, p1, aad.Frame(0, false))
@@ -15838,12 +15427,7 @@ func exportShardSnapshotSetup(t *testing.T, db *mockLogDB, b Barrier, plaintext 
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 900, Filepath: snapDir, Epoch: 1})
 }
 
-// TestExportSnapshot_PerShardBarrier_Decrypts verifies ExportSnapshot resolves
-// the decrypting barrier per shard (barrierForShard). With ONLY per-shard
-// barriers configured (no host-wide barrier), an encrypted snapshot must
-// still export as plaintext. Consulting only h.barrier would return
-// ErrSnapshotEncryptedBarrierUnavailable even though the shard's own barrier
-// is unsealed.
+// TestExportSnapshot_PerShardBarrier_Decrypts checks export uses the shard's own barrier when no host-wide barrier exists.
 func TestExportSnapshot_PerShardBarrier_Decrypts(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -15879,12 +15463,7 @@ func TestExportSnapshot_PerShardBarrier_Decrypts(t *testing.T) {
 	}
 }
 
-// TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier verifies that
-// when BOTH a host-wide barrier and a per-shard barrier are configured, the
-// shard's snapshot is decrypted with the per-shard barrier it was encrypted
-// under. Decrypting with the host-wide barrier (the wrong key) fails AEAD
-// after the artifact header is already written and leaves the caller with a
-// truncated header-only artifact.
+// TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier checks the per-shard barrier wins over the host-wide one.
 func TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -15922,10 +15501,7 @@ func TestExportSnapshot_PerShardBarrier_PreferredOverHostBarrier(t *testing.T) {
 	}
 }
 
-// TestExportSnapshot_SealedShardBarrierErrors verifies the sealed-check also
-// uses the per-shard barrier: when the shard's barrier is sealed, export must
-// refuse with ErrSnapshotEncryptedBarrierUnavailable even though an unsealed
-// host-wide barrier exists (which holds the WRONG key for this shard).
+// TestExportSnapshot_SealedShardBarrierErrors checks a sealed shard barrier refuses export with ErrSnapshotEncryptedBarrierUnavailable.
 func TestExportSnapshot_SealedShardBarrierErrors(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -15967,10 +15543,7 @@ func TestExportSnapshot_SealedShardBarrierErrors(t *testing.T) {
 	}
 }
 
-// TestExportSnapshot_DecryptFailureWritesNothing verifies the artifact header
-// is withheld until the first frame decrypts: when AEAD fails (the snapshot
-// was encrypted under a different key than the export barrier), the caller's
-// writer must receive ZERO bytes — not a truncated header-only artifact.
+// TestExportSnapshot_DecryptFailureWritesNothing checks a failed decrypt writes zero bytes.
 func TestExportSnapshot_DecryptFailureWritesNothing(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -16088,13 +15661,7 @@ func TestExportImportSnapshot_RoundTrip_Encrypted(t *testing.T) {
 	}
 }
 
-// TestImportSnapshot_SealedBarrierFailsClosed verifies that ImportSnapshot
-// refuses to write an imported artifact when the host's barrier is
-// configured but SEALED, rather than durably persisting it as plaintext.
-// This is the ImportSnapshot counterpart of the already-fixed saveSnapshot
-// and HandleSnapshot fail-closed behavior: a
-// sealed barrier means encryption is temporarily unavailable, not that the
-// shard is a plaintext deployment.
+// TestImportSnapshot_SealedBarrierFailsClosed checks a sealed barrier refuses the import instead of writing plaintext.
 func TestImportSnapshot_SealedBarrierFailsClosed(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -16251,12 +15818,7 @@ func (m *recordingOnDiskSM) Close(_ context.Context) error { return nil }
 
 var _ sm.DiskStateMachine = (*recordingOnDiskSM)(nil)
 
-// TestStartShard_OnDiskSM_NoSnapshotRollback verifies BUG 1: when an on-disk
-// SM's Open() reports a durable lastApplied (100) that is ahead of an existing
-// LogDB snapshot record (index 50), StartShard must NOT call RecoverFromSnapshot
-// (which would roll the database back to 50 and silently discard entries
-// 51..100). The on-disk SM recovers solely via Open(); the framework must not
-// feed it a local snapshot on restart.
+// TestStartShard_OnDiskSM_NoSnapshotRollback checks an on-disk SM ahead of the snapshot record is not recovered from that snapshot.
 func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -16266,9 +15828,7 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 	}
 	defer h.Close()
 
-	// A real snapshot record at an OLDER index than the SM's durable
-	// lastApplied. snapshot.dat exists so the only thing that would prevent
-	// recovery is the IsOnDisk guard, not a missing file.
+	// A snapshot record older than the SM's durable lastApplied, with snapshot.dat present.
 	snapDir := filepath.Join(t.TempDir(), "shard-1-snap")
 	if mkErr := os.MkdirAll(snapDir, 0o750); mkErr != nil {
 		t.Fatalf("MkdirAll failed: %v", mkErr)
@@ -16277,15 +15837,7 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", wErr)
 	}
 	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 50, Term: 1, Filepath: snapDir})
-	// Persist a HardState consistent with the SM's durable marker. The
-	// engine writes Commit with every batch, so a node whose on-disk SM
-	// reached index 100 has necessarily persisted Commit >= 100; a mock
-	// with no HardState describes a state production cannot reach, and
-	// recovery legitimately refuses to trust an applied marker that runs
-	// past the commit index it can prove.
-	// The entry the SM's durable marker names must exist in the log: a
-	// replica that applied index 100 necessarily persisted it, and recovery
-	// resolves the TERM of the recovered index from there.
+	// Persist a HardState and the entry consistent with the SM's durable index 100.
 	db.SaveState([]logdb.Update{{
 		ShardID:   1,
 		ReplicaID: 1,
@@ -16323,25 +15875,7 @@ func TestStartShard_OnDiskSM_NoSnapshotRollback(t *testing.T) {
 	waitDiagProcessed(t, h, 1, 100)
 }
 
-// waitDiagProcessed polls DiagRaftState until the raft processed marker has
-// REACHED want, then asserts that it did. DiagRaftState is an
-// eventually-consistent snapshot published by the step worker under raftMu
-// (reading Peer.r from the caller's goroutine would race).
-//
-// It waits for "at least want" rather than "exactly want" because two things
-// make the exact value a moving target, both measured. The first DiagRaftState
-// call only ARMS publication and returns an all-zero placeholder: a 12-run
-// probe saw processed=0 on the first sample every single time. And a
-// single-node shard elects itself and appends a no-op straight after
-// StartShard, taking the marker to want+1. Exact equality therefore depended on
-// sampling in the gap between those two events; when the no-op landed inside
-// the poll interval the marker was already 81, could never match 80 again, and
-// the test failed with "raft processed = 81, want 80" having replayed nothing
-// wrong at all.
-//
-// "At least want" still catches the defect this guards. A marker that was not
-// seeded from the imported snapshot stays at 0 and the engine replays entries
-// the snapshot already covers, which is a failure by this test either way.
+// waitDiagProcessed waits until the raft processed marker reaches at least want, then asserts it.
 func waitDiagProcessed(t *testing.T, h *Host, shardID, want uint64) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
@@ -16455,17 +15989,7 @@ func TestStartShard_FreshStart_NoSeed(t *testing.T) {
 		t.Fatal("RecoverFromSnapshot called on fresh on-disk SM")
 	}
 	ns := testLoadNode(h, 1)
-	// The property is that a fresh start does not SEED the applied marker from
-	// recovery — not that nothing has been applied yet.
-	//
-	// A bootstrapping shard commits its EntryInitialMembership at index 1 and
-	// applies it ASYNCHRONOUSLY, so lastApplied legitimately becomes 1 shortly
-	// after StartShard returns. Requiring exactly 0 was a race against that
-	// apply: it held on an idle machine and failed on a loaded CI runner,
-	// reporting a seeding regression that had not happened.
-	//
-	// Anything ABOVE 1 means the marker was seeded from somewhere — which is
-	// the regression this test exists to catch, and still fails.
+	// A fresh start does not seed the applied marker: lastApplied may reach 1 (the bootstrap entry), never more.
 	if got := ns.lastApplied.Load(); got > 1 {
 		t.Errorf("ns.lastApplied = %d on fresh start; only the index-1 "+
 			"membership entry may have applied, so anything higher means the "+
@@ -16480,18 +16004,7 @@ func TestStartShard_FreshStart_NoSeed(t *testing.T) {
 	}
 }
 
-// TestStartShard_OnDiskSM_ImportBootstrap verifies the HIGH regression fix:
-// when an on-disk SM's Open() reports 0 (fresh/empty DB, e.g. after
-// ImportSnapshot wrote snapshot.dat + a LogDB snapshot record on a new host),
-// StartShard MUST call RecoverFromSnapshot exactly once to reconstruct the
-// on-disk database from the imported snapshot. The IsOnDisk gate must NOT
-// suppress recovery in this bootstrap case, otherwise the SM comes up empty
-// while raft believes a snapshot exists at ss.Index (cross-host restore data
-// loss).
-//
-// It also asserts the seeded markers: recoveredIndex is the snapshot's RAFT
-// LOG INDEX (ss.Index), which must equal raft's processed marker (initialized
-// to ss.Index by newRaftLog), ns.lastApplied, and the engine's snapshot index.
+// TestStartShard_OnDiskSM_ImportBootstrap checks an empty on-disk SM recovers once from the imported snapshot and all markers equal ss.Index.
 func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -16556,8 +16069,7 @@ func TestStartShard_OnDiskSM_ImportBootstrap(t *testing.T) {
 		t.Errorf("engine node lastSnapshotIndex = %d, want 80", got)
 	}
 
-	// Raft's processed marker must equal the seeded index so the engine
-	// replays exactly the entries AFTER the imported snapshot.
+	// The engine then replays only entries after the imported snapshot.
 	waitDiagProcessed(t, h, 1, 80)
 }
 
@@ -16732,8 +16244,7 @@ func TestStartShard_OnDiskSM_DataDir_RootsUnderDataDir(t *testing.T) {
 	dataDir := t.TempDir()
 	const shardID uint64 = 7
 
-	// The factory hands out a fresh SM per call so a restart exercises a clean
-	// Open() that must recover from disk. The latest instance is captured.
+	// A fresh SM per call, so a restart opens from disk; the latest is captured.
 	var mu sync.Mutex
 	var current *fileBackedOnDiskSM
 	create := func(_, _ uint64) interface{} {
@@ -16854,14 +16365,7 @@ func (m *gatedStateMachine) Close(_ context.Context) error {
 	return nil
 }
 
-// TestStartShard_LosesRaceWithClose verifies that a StartShard which passes
-// the closed/draining entry check and then loses the race to a complete
-// Host.Close does NOT publish an orphaned shard.
-//
-// Close stops the engine and then sweeps h.nodes; a shard published after
-// that sweep would live forever in a stopped engine: permanently inert, with
-// activeNodes incremented and its state machine open, whose on-disk lock
-// bricks the next host start on the same DataDir.
+// TestStartShard_LosesRaceWithClose checks a StartShard that loses the race to Close publishes no orphaned shard.
 func TestStartShard_LosesRaceWithClose(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -16923,13 +16427,7 @@ func TestStartShard_LosesRaceWithClose(t *testing.T) {
 // Snapshot gates on the observability surface
 // ---------------------------------------------------------------------------
 
-// TestShardHealth_ReportsSnapshotGates verifies that a shard whose state
-// machine is held by a snapshot gate is NOT reported as healthy.
-//
-// A replica in snapshot recovery applies nothing and serves no up-to-date
-// local read for as long as user RecoverFromSnapshot code runs. Reporting it
-// as healthy is what made the recovery blackout so hard to diagnose: every
-// API said the replica was fine.
+// TestShardHealth_ReportsSnapshotGates checks a shard held by a snapshot gate is not reported healthy.
 func TestShardHealth_ReportsSnapshotGates(t *testing.T) {
 	h := newTestHost(t)
 

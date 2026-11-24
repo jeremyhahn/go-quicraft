@@ -59,21 +59,7 @@ func forEachBackend(t *testing.T, fn func(t *testing.T, db logdb.LogDB)) {
 	}
 }
 
-// reopener owns one backend instance and can put it through the strongest
-// round-trip that implementation supports.
-//
-// The reopen step is the entire value of this harness. waldb answers
-// GetSnapshot and ReadState out of an in-memory map that SaveSnapshot fills
-// from the CALLER'S value, so a save/read pair inside one process never
-// reaches the record encoding at all — it would pass identically against a
-// backend that serialized nothing. Only closing the database and replaying the
-// segments proves a field reached the disk.
-//
-// memdb has no on-disk form, so Reopen is the identity there. That is not a
-// weaker assertion smuggled in: the copy path it does exercise is memdb's
-// whole round-trip, and running both backends through ONE set of assertions is
-// what stops a field being preserved by the implementation tests use while the
-// implementation production uses drops it.
+// reopener owns one backend instance and reopens it as strongly as it supports; waldb replays its segments, memdb reopens as the identity.
 type reopener struct {
 	db     logdb.LogDB
 	reopen func(t *testing.T, db logdb.LogDB) logdb.LogDB
@@ -128,12 +114,7 @@ func forEachReopenableBackend(t *testing.T, fn func(t *testing.T, r *reopener)) 
 	})
 }
 
-// identityMembership is a committed configuration of the shape the
-// receive-side sender gate authorizes against: two voters, one observer, one
-// removal tombstone, and node identities spanning more than one role. It also
-// carries a committed session policy, whose three values are deliberately
-// distinct from each other and from every default so a backend that dropped one
-// and defaulted it is caught.
+// identityMembership is a committed configuration with voters, an observer, a tombstone, identities across roles and a distinct non-default session policy.
 func identityMembership() logdb.Membership {
 	return logdb.Membership{
 		ConfigChangeID:             11,
@@ -188,18 +169,7 @@ func assertIdentities(t *testing.T, where string, got, want map[uint64]string) {
 	}
 }
 
-// TestConformanceSnapshotMembershipIdentitiesSurviveReopen pins the field the
-// whole identity binding depends on surviving the snapshot-metadata round-trip.
-//
-// Identities reach membership through the LOG — the EntryInitialMembership at
-// index 1 and every EntryConfigChange — so a replica whose log has been
-// compacted past those entries has this record and nothing else to relearn them
-// from. A backend that drops the field does not fail: the replica recovers a
-// configuration that still names every member, and quietly authorizes all of
-// them by address, which is the forgery the identity binding exists to close.
-//
-// Asserting only "no error" would pass against exactly that. The assertion is
-// the map's CONTENT after the round-trip.
+// TestConformanceSnapshotMembershipIdentitiesSurviveReopen verifies snapshot membership identities survive a reopen, by content.
 func TestConformanceSnapshotMembershipIdentitiesSurviveReopen(t *testing.T) {
 	forEachReopenableBackend(t, func(t *testing.T, r *reopener) {
 		want := identityMembership()
@@ -244,25 +214,7 @@ func TestConformanceSnapshotMembershipIdentitiesSurviveReopen(t *testing.T) {
 	})
 }
 
-// TestConformanceSnapshotMembershipRemovedIdentitiesSurviveReopen pins the
-// tombstone half of the removal deny-list across a restart.
-//
-// Removal authorization is evaluated against the AUTHENTICATED connection
-// identity, because the claimed msg.From is a value a removed replica can
-// simply change — it still holds its private key, so it authenticates normally
-// and evades a tombstone keyed on the ID it chooses to name. RemovedIdentities
-// is what makes the deny-list answerable about the identity instead.
-//
-// Dropping it across this round-trip is not an information loss, it REVOKES A
-// REVOCATION. The replica comes back holding the tombstone replica IDs (Removed
-// survives) but not the identities they were recorded against, so a
-// decommissioned node still carrying its certificate is readmitted — silently,
-// with no error raised anywhere, and precisely on the restart an operator
-// performs after removing it. Certificate revocation is the only control left
-// at that point, and it is opt-in and soft-fail by default.
-//
-// Asserting only "no error" would pass against exactly that. The assertion is
-// the map's CONTENT after the reopen.
+// TestConformanceSnapshotMembershipRemovedIdentitiesSurviveReopen verifies RemovedIdentities survives a reopen, by content.
 func TestConformanceSnapshotMembershipRemovedIdentitiesSurviveReopen(t *testing.T) {
 	forEachReopenableBackend(t, func(t *testing.T, r *reopener) {
 		want := identityMembership()
@@ -297,15 +249,11 @@ func TestConformanceSnapshotMembershipRemovedIdentitiesSurviveReopen(t *testing.
 		assertRemovedIdentities(t, "ReadState",
 			membership.RemovedIdentities, want.RemovedIdentities)
 
-		// The tombstone ID and its identity must survive TOGETHER. Keeping
-		// Removed while losing RemovedIdentities is the specific inconsistent
-		// state this test exists to refuse.
+		// The tombstone ID and its identity survive together.
 		if !membership.Removed[9] {
 			t.Fatalf("Removed[9] was lost while RemovedIdentities survived: %+v", membership)
 		}
-		// The active identity map must not have absorbed the tombstone: an
-		// identity in Identities is an ALLOW, and moving a removal into it
-		// would readmit exactly the replica the tombstone ejects.
+		// The tombstone must not move into the active identity map.
 		if _, ok := membership.Identities[9]; ok {
 			t.Fatalf("the removed replica's identity reappeared in Identities, "+
 				"which is the active binding: %+v", membership.Identities)
@@ -339,20 +287,7 @@ func assertRemovedIdentities(t *testing.T, where string, got, want map[uint64]st
 	}
 }
 
-// TestConformanceSnapshotMembershipDoesNotAliasCallerIdentities pins that a
-// backend STORES the identity map rather than borrowing it.
-//
-// This is a separate assertion from the round-trip above, and it has to be:
-// an implementation that merely retains the caller's map passes that one
-// completely, because the values are still there to read back. What it does
-// not survive is the caller reusing or mutating the map afterwards, at which
-// point committed authorization state is rewritten by a layer that does not
-// own it — and identities are the input the receive-side gate trusts for every
-// quorum-bearing message. It is the same rule Entry.Cmd is held to, for the
-// same reason.
-//
-// waldb de-aliases for free because it serializes; memdb has to clone. Running
-// both through this assertion is what keeps the in-memory backend honest.
+// TestConformanceSnapshotMembershipDoesNotAliasCallerIdentities verifies a backend stores a copy of the identity map.
 func TestConformanceSnapshotMembershipDoesNotAliasCallerIdentities(t *testing.T) {
 	forEachReopenableBackend(t, func(t *testing.T, r *reopener) {
 		want := identityMembership()
@@ -397,14 +332,7 @@ func TestConformanceSnapshotMembershipDoesNotAliasCallerIdentities(t *testing.T)
 	})
 }
 
-// TestConformanceMembershipWithoutIdentitiesRoundTrips pins the COMPATIBILITY
-// half: a record written before identities existed, or by an operator who
-// supplied none, must load as a membership with no identities rather than
-// failing or manufacturing entries.
-//
-// An absent identity is a compatibility state that falls back to the committed
-// address, never a permission, so the readable observable is an EMPTY map that
-// is safe to look up.
+// TestConformanceMembershipWithoutIdentitiesRoundTrips verifies a membership without identities loads with an empty map.
 func TestConformanceMembershipWithoutIdentitiesRoundTrips(t *testing.T) {
 	forEachReopenableBackend(t, func(t *testing.T, r *reopener) {
 		legacy := logdb.Membership{
@@ -475,18 +403,7 @@ func assertSessionPolicy(t *testing.T, where string, got, want logdb.Membership)
 		want.MaxSessionsPerOwner)
 }
 
-// TestConformanceSnapshotMembershipSessionPolicySurvivesReopen pins the
-// replicated session policy against the snapshot-metadata round-trip.
-//
-// The policy reaches membership through the LOG — the EntryInitialMembership at
-// index 1 — so a replica whose log has been compacted past that entry has this
-// record and nothing else to relearn it from. That replica is exactly the one
-// that must not fall back to local configuration: it is rejoining a running
-// shard whose other replicas are already applying the committed policy.
-//
-// The assertion is the VALUES after the round-trip. Asserting only "no error"
-// would pass against a backend that silently zeroed all three, which is the
-// shape the failure actually takes.
+// TestConformanceSnapshotMembershipSessionPolicySurvivesReopen verifies the session policy values survive a reopen.
 func TestConformanceSnapshotMembershipSessionPolicySurvivesReopen(t *testing.T) {
 	forEachReopenableBackend(t, func(t *testing.T, r *reopener) {
 		want := identityMembership()
@@ -530,16 +447,7 @@ func TestConformanceSnapshotMembershipSessionPolicySurvivesReopen(t *testing.T) 
 	})
 }
 
-// TestConformanceMembershipWithoutSessionPolicyRoundTrips is the COMPATIBILITY
-// half: a record written before the policy was replicated must load with all
-// four fields ZERO rather than failing or inventing limits.
-//
-// Zero is not a policy of zero. MaxTotalSessions can never legitimately be zero
-// in a committed policy (config.Validate rejects it), which is what makes it
-// the "no policy recorded" discriminator — proto.SessionPolicy.IsSet — and what
-// lets an expiry threshold of zero keep its own meaning of "expiry explicitly
-// disabled cluster-wide". A backend that manufactured defaults here would tell
-// the apply path a shard had committed limits it never did.
+// TestConformanceMembershipWithoutSessionPolicyRoundTrips verifies a record without a session policy loads with all fields zero (SessionPolicy.IsSet false).
 func TestConformanceMembershipWithoutSessionPolicyRoundTrips(t *testing.T) {
 	forEachReopenableBackend(t, func(t *testing.T, r *reopener) {
 		legacy := logdb.Membership{
@@ -640,12 +548,7 @@ func TestConformanceIterateEntriesRangeWithoutEntries(t *testing.T) {
 	})
 }
 
-// TestConformanceCompactionFloorIsMonotonic pins the compaction floor: a read
-// that starts below it returns ErrCompacted and the live suffix above it stays
-// readable. It also pins the floor's monotonicity: a
-// lower RemoveEntriesTo call must not lower a floor whose entries are already
-// gone, or reads between the two floors surface a hard log hole instead of
-// ErrCompacted and raft never falls back to InstallSnapshot.
+// TestConformanceCompactionFloorIsMonotonic verifies reads below the floor return ErrCompacted and a lower RemoveEntriesTo never lowers the floor.
 func TestConformanceCompactionFloorIsMonotonic(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
 		saveEntries(t, db, 1, 1, 1, 20, 4)
@@ -734,8 +637,7 @@ func TestConformanceMaxSizeBudget(t *testing.T) {
 		perEntry := uint64(logdb.EntryOverheadBytes + cmdSize)
 		saveEntries(t, db, 1, 1, 1, 10, cmdSize)
 
-		// Budget for exactly two entries plus slack smaller than a third:
-		// iteration stops BEFORE the entry that would exceed the budget.
+		// A budget of two entries plus less than a third stops before the third.
 		got, size, err := db.IterateEntries(nil, 0, 1, 1, 1, 11, 2*perEntry+10)
 		if err != nil {
 			t.Fatalf("IterateEntries: %v", err)
@@ -855,20 +757,7 @@ func TestConformanceClosedErrors(t *testing.T) {
 	})
 }
 
-// TestConformanceIterateEntriesDoesNotAliasStoredPayloads pins the read-side
-// half of the no-aliasing rule.
-//
-// The write-side half has always been asserted: SaveState deep-copies Cmd, so a
-// caller reusing its buffers cannot rewrite the stored log. The read side had
-// no such rule and no such test. Both backends served the stored Entry by
-// value, which copies the slice HEADER and not the bytes, so the caller and the
-// store shared one payload array — and what a caller writing through it would
-// be corrupting is the live in-memory log this replica serves to its followers
-// and replays to itself on restart. Nothing would report it, nothing would
-// attribute it, and every replica would corrupt differently.
-//
-// The test writes through the returned payload and then re-reads. A store that
-// aliases hands back the mutated bytes the second time.
+// TestConformanceIterateEntriesDoesNotAliasStoredPayloads verifies writing through a returned payload does not change the stored entry.
 func TestConformanceIterateEntriesDoesNotAliasStoredPayloads(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
 		const shardID, replicaID = uint64(1), uint64(1)
@@ -964,21 +853,7 @@ func TestConformanceGetEntriesDoesNotAliasStoredPayloads(t *testing.T) {
 	}
 }
 
-// TestConformanceSaveStateBelowCompactionFloorIsRefused pins the rejection both
-// backends perform, and the state that makes it necessary.
-//
-// Without it, with entries [10..20] stored and the floor at 9, a SaveState
-// starting at index 5 would return nil, DESTROY the live suffix [10..20]
-// (truncate-and-append replaces everything from the first new index onward),
-// and leave the store describing itself inconsistently — EntryRange answering
-// (5, 2) while IterateEntries(5, ...) refused the very range it had just
-// advertised with ErrCompacted. Nothing would report any of it.
-//
-// A write below the floor is always a caller bug: those indexes are provably
-// applied and already deleted, raft sends a lagging follower an InstallSnapshot
-// rather than entries beneath its own floor, and a local proposer never
-// proposes below its applied index. So it fails loudly, and — this is the part
-// that matters — it fails without storing anything.
+// TestConformanceSaveStateBelowCompactionFloorIsRefused verifies a SaveState below the floor fails without storing anything.
 func TestConformanceSaveStateBelowCompactionFloorIsRefused(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
 		const shardID, replicaID = uint64(1), uint64(1)
@@ -1011,8 +886,7 @@ func TestConformanceSaveStateBelowCompactionFloorIsRefused(t *testing.T) {
 				"with entries the store will then refuse to serve", err)
 		}
 
-		// The typed error must say WHICH write was refused, or the caller bug
-		// can be observed but not located.
+		// The typed error names the refused write.
 		var detail *logdb.EntriesBelowCompactionFloorError
 		if !errors.As(err, &detail) {
 			t.Fatalf("error carries no *EntriesBelowCompactionFloorError: %v", err)
@@ -1047,8 +921,7 @@ func TestConformanceSaveStateBelowCompactionFloorIsRefused(t *testing.T) {
 			}
 		}
 
-		// A write at the first index ABOVE the floor is still accepted, so the
-		// guard is a boundary and not a blanket refusal.
+		// A write at the first index above the floor is accepted.
 		if err := db.SaveState([]logdb.Update{{
 			ShardID: shardID, ReplicaID: replicaID,
 			Entries: []logdb.Entry{{Index: 10, Term: 3, Cmd: []byte("legal")}},
@@ -1068,13 +941,7 @@ func TestConformanceSaveStateBelowCompactionFloorIsRefused(t *testing.T) {
 	})
 }
 
-// TestConformanceSaveStateBelowFloorRejectsTheWholeBatch pins the atomicity of
-// the refusal.
-//
-// SaveState is specified to persist a batch atomically. A floor violation found
-// part-way through must therefore reject the batch, not the update: storing the
-// updates that came before it and refusing the rest would return an error
-// describing a write that had partly happened, which no caller can unwind.
+// TestConformanceSaveStateBelowFloorRejectsTheWholeBatch verifies a floor violation rejects the whole SaveState batch.
 func TestConformanceSaveStateBelowFloorRejectsTheWholeBatch(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
 		const replicaID = uint64(1)
@@ -1091,8 +958,7 @@ func TestConformanceSaveStateBelowFloorRejectsTheWholeBatch(t *testing.T) {
 			t.Fatalf("RemoveEntriesTo: %v", err)
 		}
 
-		// goodShard's update is FIRST, so a per-update implementation stores it
-		// before it ever reaches the violation.
+		// goodShard's update comes first in the batch.
 		err := db.SaveState([]logdb.Update{
 			{ShardID: goodShard, ReplicaID: replicaID,
 				Entries: []logdb.Entry{{Index: 1, Term: 1, Cmd: []byte("first")}}},
@@ -1116,20 +982,7 @@ func TestConformanceSaveStateBelowFloorRejectsTheWholeBatch(t *testing.T) {
 	})
 }
 
-// TestConformanceCompactPreservesEverythingAboveTheFloor pins what Compact is
-// allowed to touch, which nothing asserted in either backend.
-//
-// Compact reclaims storage the compaction floor has already made unreachable.
-// It is NOT a delete: everything above the floor, plus the hard state, the
-// snapshot record and the bootstrap record — none of which the floor covers at
-// all — must survive it untouched. memdb implements it as a literal no-op and
-// waldb as segment garbage collection, so the two can drift silently.
-//
-// The gap was measurable: rewriting memdb's Compact to drop the node's entries,
-// hard state and snapshot left the whole memdb suite and the whole conformance
-// suite green, because the only test of Compact asserted its return value.
-// Losing the hard state that way is a lost vote, which permits a second vote in
-// the same term.
+// TestConformanceCompactPreservesEverythingAboveTheFloor verifies Compact keeps entries above the floor, the hard state, the snapshot and the bootstrap record.
 func TestConformanceCompactPreservesEverythingAboveTheFloor(t *testing.T) {
 	forEachBackend(t, func(t *testing.T, db logdb.LogDB) {
 		const shardID, replicaID = uint64(1), uint64(1)

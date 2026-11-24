@@ -25,26 +25,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// Node.redeliver must PRESERVE the origin stamp
-// ---------------------------------------------------------------------------
+// Node.redeliver must preserve the origin stamp.
 
-// TestNode_RedeliverPreservesOrigin pins the origin stamp of a message the step
-// worker takes out of the inbox and puts back.
-//
-// Nothing else covered this. Re-stamping redeliver's messages OriginRemote —
-// the natural-looking "be safe, treat everything from the queue as wire" edit —
-// passed the entire suite while breaking follower catch-up outright: an
-// InstallSnapshot deferred during commitPending comes back stamped remote,
-// raft.step refuses it with ErrWireLocalMessage, and the deferred-snapshot
-// buffer has already dropped it because redelivery "succeeded". The snapshot
-// install is silently lost and the follower never catches up. It is silent
-// because the message was accepted by the queue; only the raft layer three
-// frames away sees the refusal, and it returns an error nobody is waiting on.
-//
-// The message that matters is process-local by construction: the snapshot
-// RECEIVE path builds it after verifying and persisting the artifact, and
-// DeliverLocal is the only way it can legitimately enter the inbox.
+// TestNode_RedeliverPreservesOrigin checks a message taken out of the inbox and put back keeps its origin, so a deferred local InstallSnapshot is not refused.
 func TestNode_RedeliverPreservesOrigin(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -103,15 +86,7 @@ func TestNode_RedeliverPreservesOrigin(t *testing.T) {
 	}
 }
 
-// TestStepWorker_DeferredSnapshotSurvivesRedeliveryIntoRaft is the CONSEQUENCE
-// half: the message that comes back out of the deferred-snapshot buffer must
-// still be one raft will act on.
-//
-// The whole round trip is exercised — defer, redeliver, drain, step — against a
-// real raft.Peer, so the assertion is "raft accepted it", not "a struct field
-// still holds a value". The negative control in the same test shows the peer
-// really does refuse a wire-stamped InstallSnapshot, which is what makes the
-// positive assertion meaningful.
+// TestStepWorker_DeferredSnapshotSurvivesRedeliveryIntoRaft checks a redelivered deferred snapshot is accepted by a real raft.Peer; a wire-stamped one is the negative control.
 func TestStepWorker_DeferredSnapshotSurvivesRedeliveryIntoRaft(t *testing.T) {
 	ldb := newTestLogDB()
 	lr := logdb.NewLogReader(1, 1, ldb)
@@ -135,9 +110,7 @@ func TestStepWorker_DeferredSnapshotSurvivesRedeliveryIntoRaft(t *testing.T) {
 	sw := newStepWorker(0, time.Millisecond, sender, ws, commitC, nil, stopC, nil)
 	sw.loadNode(node)
 
-	// The snapshot receive path's message: built in THIS process after the
-	// artifact was verified and persisted, and deferred because commitPending
-	// was up when it arrived.
+	// The snapshot receive path's local message, deferred because commitPending was set.
 	snap := proto.Message{
 		Type:     proto.InstallSnapshot,
 		From:     2,

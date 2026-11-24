@@ -19,22 +19,9 @@ import (
 	"path/filepath"
 )
 
-// SnapshotOption controls per-request snapshot behavior. A zero-value
-// SnapshotOption uses shard-level defaults (equivalent to Dragonboat's
-// SnapshotOption{}).
-//
-// When ExportPath is set, the snapshot is written to the specified
-// directory as an exported snapshot (Exported = true on the snapshot
-// metadata). When OverrideCompactionOverhead is true, CompactionOverhead
-// replaces the shard-level Config.CompactionOverhead for the log
-// compaction that follows this snapshot.
+// SnapshotOption controls per-request snapshot behavior; the zero value uses shard defaults. ExportPath exports, OverrideCompactionOverhead replaces Config.CompactionOverhead.
 type SnapshotOption struct {
-	// ExportPath, when non-empty, causes the snapshot to be written to
-	// this directory path. The directory must be an absolute path and
-	// will be created if it does not exist. When set, the snapshot
-	// metadata is marked as exported (Imported = true in proto.Snapshot)
-	// and the snapshot is additionally written to the standard snapshot
-	// directory for log compaction purposes.
+	// ExportPath, when non-empty, also writes the snapshot to this absolute directory, created if missing, and marks it exported.
 	ExportPath string
 
 	// CompactionOverhead overrides the shard-level

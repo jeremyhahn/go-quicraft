@@ -12,32 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Adversarial coverage for the message-frame RECEIVE path.
-//
-// The fuzzing this package already had (fuzz_test.go) covers frame header
-// round-trips and header validation. It never drives handleMessageFrame,
-// which is where a frame stops being bytes and becomes a batch the engine
-// hands to raft: decompression, batch decode, the ShardID / DeploymentID /
-// message-count gates, and the zero-copy detach that has to run before the
-// pooled receive buffer is recycled.
-//
-// REACHABILITY. handleMessageFrame is reachable without a live QUIC
-// connection: it takes the inbound *quic.Conn only to consult per-connection
-// state, and every such call is nil-guarded (reserveConnMsgRecvBudget,
-// inboundAuthorizedForCached, evictStaleOutboundOnRecv via the cleared
-// SourceAddress). Existing tests already call it with a nil connection. What
-// a nil connection does NOT reach is the certificate-bound SourceAddress
-// authorisation and the stale-outbound eviction that hangs off it: with no
-// connection there is no peer certificate, inboundAuthorizedForCached returns
-// false, the claimed SourceAddress is cleared, and evictStaleOutboundOnRecv
-// early-returns. Those two behaviours need a real mTLS session and are
-// covered by the connection tests, not here.
-//
-// The property that matters most here is the one that makes the raft-side
-// origin gate real: a message reconstructed from bytes is REMOTE. If a frame
-// could ever produce proto.OriginLocal, every local-injection exemption in
-// raft's step() -- the exemption a forged wire InstallSnapshot was once able
-// to use -- becomes reachable from the network.
+// Adversarial tests for the message-frame receive path via handleMessageFrame with a nil connection; a decoded message must never be OriginLocal.
 
 package transport
 
@@ -95,12 +70,7 @@ type frameCoverage struct {
 	withSnapshot    int
 }
 
-// runMessageFrameCase feeds one frame payload through handleMessageFrame and
-// asserts the receive path's contract on whatever comes out the other side.
-//
-// Refusal is a perfectly good outcome and is not asserted against: hostile
-// bytes SHOULD be refused. What is asserted is that anything the transport
-// does ACCEPT satisfies the invariants the layers above it rely on.
+// runMessageFrameCase feeds a frame payload through handleMessageFrame and checks that anything accepted meets the receive invariants.
 func runMessageFrameCase(tb testing.TB, tr *QUICTransport, handler *testHandler, payload []byte, flags FrameFlags, cov *frameCoverage) {
 	tb.Helper()
 
@@ -182,22 +152,7 @@ func runMessageFrameCase(tb testing.TB, tr *QUICTransport, handler *testHandler,
 	}
 }
 
-// assertNoBufferAliasing pins the zero-copy detach: Entry.Cmd aliases the
-// POOLED receive buffer after unmarshal, and the buffer is recycled as soon as
-// the frame is dispatched. A surviving alias is read by the step worker after
-// the buffer has been handed to another frame, so the raft layer sees another
-// peer's bytes as its own entry payload.
-//
-// Entry.Cmd is the only such alias on a decoded Message. Snapshot.Checksum was
-// the other one and was covered here too; it left the wire format in an
-// earlier pre-release layout (never computed, never verified — see the
-// proto.Snapshot type doc), so there is no field left to alias. Every other reference field on a
-// decoded Snapshot — Filepath and the membership maps — is copied by its own
-// decoder and never aliased the pool at all.
-//
-// The check is generic rather than example-based: whatever a frame delivered,
-// push a second frame of the same size through to recycle the buffer, then
-// re-read the delivered bytes and require them unchanged.
+// assertNoBufferAliasing checks delivered Entry.Cmd bytes survive recycling the pooled receive buffer.
 func assertNoBufferAliasing(tb testing.TB, tr *QUICTransport, handler *testHandler, payload []byte) {
 	tb.Helper()
 

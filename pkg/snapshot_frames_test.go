@@ -58,11 +58,7 @@ func (r *failingReader) Read(p []byte) (int, error) {
 // decryptSnapshotFrames
 // ---------------------------------------------------------------------------
 
-// TestDecryptSnapshotFrames_RejectsCorruptFrameLength verifies that an
-// oversized frame-length prefix is rejected BEFORE the allocation it
-// describes. A snapshot file is attacker- or corruption-influenced input, so
-// trusting the prefix would let a single bogus 4-byte field drive an arbitrary
-// allocation.
+// TestDecryptSnapshotFrames_RejectsCorruptFrameLength checks an oversized frame length is rejected before allocation.
 func TestDecryptSnapshotFrames_RejectsCorruptFrameLength(t *testing.T) {
 	b := createTestBarrier(t)
 
@@ -163,16 +159,7 @@ func TestEncryptSnapshotFrames_PropagatesSourceFailure(t *testing.T) {
 // classifySnapshotCompression
 // ---------------------------------------------------------------------------
 
-// TestClassifySnapshotCompression verifies that a received artifact is
-// classified by its own bytes: the wire protocol carries no compression field,
-// so misclassifying it would hand the state machine data in an encoding it
-// cannot read.
-//
-// It classifies the reassembled chunks in MEMORY rather than reading the file
-// back, because the artifact the receive path writes is encrypted from its
-// first byte — there is no plaintext file on disk to read the identifier out
-// of. Classifying AFTER the write is what forced the old two-step
-// plaintext-then-encrypt receive.
+// TestClassifySnapshotCompression checks a received artifact's compression is classified from its reassembled chunks in memory.
 func TestClassifySnapshotCompression(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -425,16 +412,7 @@ func TestReencryptSnapshotFile_FilesystemFailures(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Positional context-AAD binding of snapshot frames
-//
-// Every frame is sealed against magic || ShardID || ReplicaID || SnapshotIndex
-// || ChunkSeq. These tests run over the REAL seal.Barrier, so they assert the
-// AEAD binding itself rather than a stand-in: a frame that is moved to another
-// ordinal, or read under another artifact identity, must fail to authenticate.
-// There is no weaker retry anywhere in the reader, by design — an epoch-only
-// fallback would readmit exactly the splicing this binding prevents.
-// ---------------------------------------------------------------------------
+// Frames are sealed against magic || ShardID || ReplicaID || SnapshotIndex || ChunkSeq; there is no weaker retry.
 
 // splitSnapshotFrames decomposes the on-disk framing
 // ([ChunkLen:4 LE][AEAD frame])* into its frames.
@@ -478,11 +456,7 @@ func multiFramePlaintext() []byte {
 	return p
 }
 
-// TestSnapshotFrameAAD_ReorderedFrameFailsToDecrypt proves the ORDINAL half of
-// the binding. Two frames are swapped in place; the framing is still
-// structurally valid and every frame is still authentic under its own epoch, so
-// an epoch-only AAD would decrypt the file happily and hand the state machine a
-// silently reordered image.
+// TestSnapshotFrameAAD_ReorderedFrameFailsToDecrypt checks swapped frames fail to authenticate.
 func TestSnapshotFrameAAD_ReorderedFrameFailsToDecrypt(t *testing.T) {
 	b := createTestBarrier(t)
 	plain := multiFramePlaintext()
@@ -495,8 +469,7 @@ func TestSnapshotFrameAAD_ReorderedFrameFailsToDecrypt(t *testing.T) {
 	if len(frames) < 3 {
 		t.Fatalf("fixture produced %d frames, want at least 3", len(frames))
 	}
-	// Frames 0 and 1 are the same size (both full chunks), so the swap changes
-	// nothing but the ORDER.
+	// Frames 0 and 1 are the same size, so the swap changes only the order.
 	frames[0], frames[1] = frames[1], frames[0]
 
 	var dec bytes.Buffer
@@ -528,10 +501,7 @@ func TestSnapshotFrameAAD_ReplayedFrameAtAnotherOrdinalFails(t *testing.T) {
 	}
 }
 
-// TestSnapshotFrameAAD_ForeignArtifactIdentityFailsToDecrypt proves the
-// ARTIFACT half of the binding. The default barrier is host-wide and shared by
-// every shard, so shard/replica/index must be in the context or a frame could
-// be spliced between two shards holding a snapshot at the same index.
+// TestSnapshotFrameAAD_ForeignArtifactIdentityFailsToDecrypt checks a frame read under another shard, replica or index fails.
 func TestSnapshotFrameAAD_ForeignArtifactIdentityFailsToDecrypt(t *testing.T) {
 	b := createTestBarrier(t)
 	plain := multiFramePlaintext()
@@ -560,10 +530,7 @@ func TestSnapshotFrameAAD_ForeignArtifactIdentityFailsToDecrypt(t *testing.T) {
 	}
 }
 
-// TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected pins the ABSENCE of a
-// fallback. A frame sealed with NO context (an epoch-only frame, and what a
-// downgrade attacker would supply) must not decrypt through the reader, which
-// never retries with a weaker AAD.
+// TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected checks a frame sealed without context does not decrypt.
 func TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected(t *testing.T) {
 	b := createTestBarrier(t)
 
@@ -579,12 +546,7 @@ func TestSnapshotFrameAAD_EpochOnlyCiphertextIsRejected(t *testing.T) {
 	}
 }
 
-// TestSnapshotFrameAAD_TailTruncationIsDetected pins the property the terminal
-// frame exists for. Every frame of a shortened artifact still authenticates
-// under its own ordinal, so without a terminal flag a reader that stops at EOF
-// sees a complete, shorter snapshot. With it, whichever frame the truncated
-// artifact now ends on was sealed as non-terminal and fails authentication
-// when read as the last.
+// TestSnapshotFrameAAD_TailTruncationIsDetected checks a truncated artifact fails on its non-terminal last frame.
 func TestSnapshotFrameAAD_TailTruncationIsDetected(t *testing.T) {
 	b := createTestBarrier(t)
 	var enc bytes.Buffer
@@ -616,13 +578,7 @@ func TestSnapshotFrameAAD_TruncationToNothingIsCorrupt(t *testing.T) {
 	}
 }
 
-// TestSnapshotFrameAAD_FrameAfterTerminalIsRejected is truncation's mirror.
-// A frame copied to the end fails on its ordinal alone, so the case the
-// terminal flag adds is a SPLICE of two artifacts under the same identity:
-// the short artifact's frames followed by the long one's remaining frames,
-// whose ordinals line up exactly. Every frame then authenticates by position,
-// and only the short artifact's terminal frame, now read as non-terminal,
-// can fail.
+// TestSnapshotFrameAAD_FrameAfterTerminalIsRejected checks a splice after the terminal frame fails.
 func TestSnapshotFrameAAD_FrameAfterTerminalIsRejected(t *testing.T) {
 	b := createTestBarrier(t)
 	seal := func(size int, salt byte) [][]byte {

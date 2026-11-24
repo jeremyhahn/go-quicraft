@@ -305,12 +305,7 @@ func (c *concurrentProposeCluster) waitLeader(t *testing.T) *Host {
 func (c *concurrentProposeCluster) restart(t *testing.T, acked map[string]struct{}) {
 	t.Helper()
 	c.gate.open()
-	// Fence the live replicas at the acknowledged prefix before any host
-	// closes: each workload state machine must itself have applied every
-	// acknowledged key, so concurrentProposeCheckPreRestart checks the
-	// pipeline's own applies and not what replay later repairs. Proposals
-	// still in flight (MaybeApplied) may apply on some replicas and not
-	// others while the hosts close one at a time; they are not fenced.
+	// Fence live replicas at the acknowledged prefix before any host closes; in-flight MaybeApplied proposals are not fenced.
 	var missing string
 	if !waitUntil(30*time.Second, func() bool {
 		c.mu.Lock()
@@ -358,15 +353,7 @@ func concurrentProposeLeader(hosts []*Host) *Host {
 	return nil
 }
 
-// proposeOutcomes classifies SyncPropose outcomes. Each class bounds how many
-// times a replica may apply the key:
-//   - acked: acknowledged, applied exactly once;
-//   - maybe: already submitted to raft when it failed (MaybeApplied),
-//     applied at most once;
-//   - refused: a definite refusal before submission (a not-leader refusal,
-//     or ErrTransferInProgress from a leader mid-transfer), applied zero
-//     times;
-//   - failed: any other error, which fails the test.
+// proposeOutcomes classifies SyncPropose outcomes: acked (applied once), maybe (at most once), refused (never), failed (fails the test).
 type proposeOutcomes struct {
 	mu      sync.Mutex
 	acked   map[string]struct{}
@@ -403,14 +390,7 @@ func (o *proposeOutcomes) record(key string, err error) (moved bool) {
 	return moved
 }
 
-// TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce drives 64
-// goroutines of 50 SyncPropose calls each, with unique keys, at the leader of
-// a three-replica shard on loopback QUIC. Every acknowledged key must be
-// applied exactly once on every replica, no other key may be applied, and the
-// replicas' state hashes must agree.
-//
-// TestMultipleConcurrentProposals_Complete (host_test.go) covers only ten
-// concurrent proposals on one replica and checks that each returns.
+// TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce runs 64x50 concurrent proposals and checks every acknowledged key applies exactly once on every replica.
 func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T) {
 	const (
 		goroutines = 64
@@ -472,43 +452,14 @@ func TestConcurrentPropose_EveryAcknowledgedEntryAppliedExactlyOnce(t *testing.T
 	}
 }
 
-// concurrentProposeDrain settles every outstanding workload proposal before
-// the counts are read, and returns what concurrentProposeBarrier returns.
-//
-// wg.Wait() only means the callers returned. A MaybeApplied proposal can
-// still commit, and a proposal forwarded to a former leader is out of reach
-// of any barrier through the current one: a follower forwards a Propose to
-// whatever leader it knows at that moment (raft.go stepFollower, msg.To =
-// r.leaderID), on its stream to THAT target, and a stale-term Propose is
-// accepted and re-forwarded by its receiver once it is a follower, so a
-// message delayed on the stream to the former leader can commit after every
-// fence through the current leader. Closing every host drops every message
-// still in flight with its transport. Each host then restarts from its own
-// log with no caller proposing, so the only workload entries that can ever
-// commit are those already in a replica's log, and a barrier through the
-// restarted leader commits after every one of them that will.
+// concurrentProposeDrain restarts every host so no stray proposal can commit later, then returns concurrentProposeBarrier's result.
 func concurrentProposeDrain(ctx context.Context, t *testing.T, c *concurrentProposeCluster, out *proposeOutcomes) (string, map[string]struct{}, uint64) {
 	t.Helper()
 	c.restart(t, out.acked)
 	return concurrentProposeBarrier(ctx, t, c.hosts)
 }
 
-// concurrentProposeCheck asserts each replica applied every key within its
-// class's bound (see proposeOutcomes), the acknowledged barrier exactly once,
-// every other barrier attempt at most once, and nothing else, and that
-// every replica holds the same count for every key.
-// concurrentProposeCheckPreRestart asserts on the counts the workload's own
-// state machines held when restart closed the hosts: every acknowledged key
-// applied exactly once on each live replica (on a replica closed
-// mid-workload, at most once), no key more than once, and no refused or
-// unsubmitted key at all. Replay after the restart applies each persisted
-// entry once and would repair a skipped apply, so only these counts can show
-// a lost or duplicate apply during the concurrent workload. It does not compare the
-// replicas with each other: restart closes the hosts one at a time, and a
-// MaybeApplied proposal still in flight can commit and apply on the
-// remaining quorum after the first host has stopped, so the saved prefixes
-// may legitimately differ. Whole-state equality is asserted by
-// concurrentProposeCheck, after the restart fence and the final barrier.
+// concurrentProposeCheck asserts per-key apply counts within each class's bound and equal counts on every replica.
 func concurrentProposeCheckPreRestart(t *testing.T, c *concurrentProposeCluster, out *proposeOutcomes) {
 	t.Helper()
 	c.mu.Lock()

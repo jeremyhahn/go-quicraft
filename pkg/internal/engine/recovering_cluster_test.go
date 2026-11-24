@@ -27,17 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// In-process multi-replica cluster harness
-//
-// The harness runs a real Engine per replica (step + commit + apply +
-// snapshot workers, WAL-mode with an in-memory LogDB) and routes Raft
-// messages between them through a shared router. It exists to exercise
-// consensus-level liveness properties that a single-node peer test cannot
-// reach: elections require RequestVote/RequestVoteResp exchange across
-// replicas, and vote responses are ORDERED messages that only leave a
-// replica after the commit worker has persisted the vote.
-// ---------------------------------------------------------------------------
+// In-process multi-replica cluster harness.
 
 // clusterRouter delivers Raft messages between the engines of an
 // in-process cluster. Replicas marked down neither send nor receive,
@@ -267,21 +257,7 @@ func (c *testCluster) waitForLeader(t *testing.T, timeout time.Duration, skip ..
 	return 0
 }
 
-// TestRecovering_ClusterElectsLeaderWhileReplicasRecover is a
-// regression test. Two of five replicas are held in snapshot recovery (the
-// recovering gate raised exactly as snapshotPool.handleRequest raises it
-// around RecoverFromSnapshot) and the leader is then killed, together with
-// one healthy follower — two failures in a five-replica shard, which is
-// precisely its tolerable failure budget, so a new leader MUST be electable.
-//
-// Quorum is three and only three replicas remain live: one healthy and the
-// two recovering. Every possible winner therefore needs a vote from a
-// RECOVERING replica, which it can only get if that replica still steps
-// RequestVote and emits its RequestVoteResp (an ORDERED message, so it
-// leaves only after the commit worker has persisted the vote). A recovering
-// replica that is inert to Raft protocol traffic dissolves quorum with every
-// node still "up", and the whole shard stays leaderless for the unbounded
-// duration of user RecoverFromSnapshot code.
+// TestRecovering_ClusterElectsLeaderWhileReplicasRecover verifies a cluster elects a leader while two of five replicas are in snapshot recovery.
 func TestRecovering_ClusterElectsLeaderWhileReplicasRecover(t *testing.T) {
 	c := newTestCluster(t, 1, 5)
 

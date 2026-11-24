@@ -11,14 +11,7 @@ import (
 	"testing"
 )
 
-// The gate job of code-review.yml must stay closed while a twin run (same
-// head, same run-name) has its `Codex review` job queued or in progress,
-// even when an older APPROVED verdict stands on the head: adding an effort
-// or model label to an approved head requests a fresh review, and a title
-// edit or unrelated label that starts another run while that review is
-// pending must not pass on the old verdict. These tests run the gate's own
-// shell (fail(), the twin read through its live-base guard, and the verdict
-// block) under bash with the forge API stubbed.
+// The code-review.yml gate stays closed while a twin run's review is queued or running; these tests run the gate's shell under bash with the forge API stubbed.
 
 const (
 	gateTwinSHA      = "0123456789abcdef0123456789abcdef01234567"

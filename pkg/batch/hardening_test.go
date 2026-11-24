@@ -23,19 +23,7 @@ import (
 	"time"
 )
 
-// rendezvousProposer answers a SyncPropose only once EVERY expected shard has
-// entered one. A sequential flush can never satisfy that — the first shard
-// would have to return before the second is ever called — so a batch whose
-// proposes all complete is PROOF the shards were flushed concurrently, and a
-// batch that times out is proof they were not.
-//
-// The rendezvous replaces a "slow shard plus a wall-clock wait" shape, which
-// was a coin flip against the code it pinned. Two things were left to chance
-// there: whether the two shards landed in the same batch at all, and — because
-// flush ranges over a map, whose iteration order Go randomizes — whether the
-// SLOW shard happened to be picked first. With the concurrency removed the old
-// test still passed 5 runs in 20 (measured), because half the time the fast
-// shard was simply flushed first and never had to wait for anything.
+// rendezvousProposer answers only once every expected shard has entered SyncPropose, which proves the shards flush concurrently.
 type rendezvousProposer struct {
 	want int
 
@@ -72,16 +60,6 @@ func (p *rendezvousProposer) SyncPropose(ctx context.Context, shardID uint64, _ 
 }
 
 // TestFlush_SlowShardDoesNotBlockOtherShards pins per-shard flush concurrency.
-// Calling flushShard sequentially on the single flushLoop goroutine would let
-// one slow or leaderless shard block every other shard's flush for the full
-// proposal timeout, backing the queue up to QueueSize and producing
-// QueueFullError for entirely unrelated shards.
-//
-// The batch is filled one proposal at a time so both shards provably share a
-// single flush, and the proposer only returns once both are inside it. Reverting
-// flush to a sequential loop fails this test on every run and in either map
-// order: whichever shard is flushed first waits out ProposeTimeout for a peer
-// that cannot be called until it returns.
 func TestFlush_SlowShardDoesNotBlockOtherShards(t *testing.T) {
 	p := newRendezvousProposer(2)
 	agg, err := NewAggregator(p,
@@ -140,15 +118,7 @@ func (r rejectingProposer) SyncPropose(context.Context, uint64, []byte) error {
 	return r.err
 }
 
-// TestSubmit_ProposerErrorIndeterminacy pins the timeout distinction at the
-// proposer. A proposer timeout does NOT mean the proposal was rejected: the
-// entry may already be replicated and will apply, so reporting a definite
-// failure invites a retry that duplicates the whole batch. An ordinary
-// rejection is a definite failure and is safe to surface as one.
-//
-// The proposer returns at once, so the batch context is still live and only
-// the proposer's own error decides the outcome. TestProposeContext_CapsLongCallerDeadline
-// cannot pin this: it waits for the batch context to expire first.
+// TestSubmit_ProposerErrorIndeterminacy pins that a proposer timeout is indeterminate and an ordinary rejection is definite.
 func TestSubmit_ProposerErrorIndeterminacy(t *testing.T) {
 	cases := []struct {
 		name          string
@@ -206,13 +176,7 @@ func (p *ctxBoundProposer) SyncPropose(ctx context.Context, _ uint64, _ []byte) 
 	return ctx.Err()
 }
 
-// TestFlush_AllCallersCanceledSkipsPropose pins that pickContext has no
-// context.Background() fallback. When every proposal context is already
-// cancelled — which is what mass caller cancellation under quorum loss looks
-// like — proposing the batch on context.Background() would mean nothing can
-// cancel it, so SyncPropose would block forever ON THE SINGLE FLUSH GOROUTINE:
-// no later batch flushes, the queue fills to QueueSize, every subsequent Submit
-// returns QueueFullError, and Close hangs on wg.Wait.
+// TestFlush_AllCallersCanceledSkipsPropose pins that a batch whose callers are all cancelled is not proposed.
 func TestFlush_AllCallersCanceledSkipsPropose(t *testing.T) {
 	p := &ctxBoundProposer{entered: make(chan struct{})}
 	// An hour-long flush interval keeps the background loop's timer out of the

@@ -7,18 +7,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestStartElection_UnreadableLastTermDoesNotBurnTerm asserts that a replica
-// whose own last log term cannot be read does not enter candidate state and
-// does not advance its term.
-//
-// The guard originally lived inside campaign(), which runs AFTER
-// becomeCandidate(). The term was therefore already incremented, leaderID
-// cleared and timers reset by the time the guard fired, so the node sat as a
-// candidate having sent zero RequestVotes. Because send() stamps r.term on
-// every reply, that rising term reaches the live leader through ordinary
-// Replicate/Heartbeat rejections and forces a step-down on each exchange --
-// one replica with an unreadable log term escalating into cluster-wide leader
-// churn while emitting no election traffic of its own.
+// TestStartElection_UnreadableLastTermDoesNotBurnTerm asserts a replica that cannot read its last term neither campaigns nor advances its term.
 func TestStartElection_UnreadableLastTermDoesNotBurnTerm(t *testing.T) {
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfg(1, 1)
@@ -72,18 +61,7 @@ func unreadableLastTermReplica(t *testing.T) *raft {
 	return r
 }
 
-// TestTimeoutNow_UnreadableLastTermDoesNotBurnTerm is the same defect as
-// TestStartElection_UnreadableLastTermDoesNotBurnTerm, at the OTHER campaign
-// entry point. startElection got the guard; handleTimeoutNow did not, and it
-// reaches becomeCandidate by a path that never passes through startElection.
-//
-// The cost is not hypothetical. becomeCandidate increments the term, then
-// campaign() refuses to build the vote request (LogTerm 0 is rejected by every
-// peer holding a non-empty log) and returns having sent nothing. The replica is
-// left at T+1 with no election in progress, and because send() stamps r.term on
-// every reply it makes, the burned term travels to the LIVE leader on the next
-// ordinary Replicate/Heartbeat rejection and deposes it. A leadership transfer
-// that could never have succeeded costs the shard its healthy leader.
+// TestTimeoutNow_UnreadableLastTermDoesNotBurnTerm is the same check on the TimeoutNow entry point.
 func TestTimeoutNow_UnreadableLastTermDoesNotBurnTerm(t *testing.T) {
 	quietLogs(t)
 
@@ -94,10 +72,7 @@ func TestTimeoutNow_UnreadableLastTermDoesNotBurnTerm(t *testing.T) {
 
 	err := r.step(proto.Message{Type: proto.TimeoutNow, From: 2, To: 1, Term: 5})
 
-	// The observable damage is asserted BEFORE the error value. A test that
-	// leads with the sentinel proves only that some branch returned it; these
-	// four assertions are the property itself, and each one fails on its own
-	// when the guard is removed.
+	// Assert the observable damage before the error value.
 	if r.term != termBefore {
 		t.Fatalf("term = %d, want %d: TimeoutNow burned a term on an election that "+
 			"could not send a single vote request, and send() stamps that term onto "+

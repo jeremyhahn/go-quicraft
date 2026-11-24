@@ -14,12 +14,7 @@
 
 package proto
 
-// ReadyToRead represents a read index request that has been confirmed
-// by the leader. It carries the request key for correlation and the
-// committed log index at which the read can be safely served. The wire
-// format is exactly 16 bytes:
-//
-//	[Key:8][Index:8]
+// ReadyToRead is a leader-confirmed read: the request key and the committed index to serve at, 16 bytes [Key:8][Index:8].
 type ReadyToRead struct {
 	// Key is the client request key for correlating the read response.
 	Key uint64

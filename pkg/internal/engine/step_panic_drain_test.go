@@ -21,30 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestEngine_RunStepWorkerOnce_PanicLeavesQueuedItemsToCommitWorker is the
-// regression test for the step-worker recovery stealing in-flight items from the
-// LIVE commit worker.
-//
-// Were the recovery to call drainCommitC(sw.commitC) — the SAME channel
-// commitWorkers[i] is concurrently consuming — then for every item it won the
-// race for it would mark that item's node permanently failed, fire
-// OnShardFailed and fail its proposals. With the default CommitCBufferSize of 64, one panic
-// on one shard could permanently fail up to 64 unrelated healthy shards, and
-// which ones was a coin flip against the live consumer. There is no automatic
-// reset: recovery needs an operator StopShard/StartShard.
-//
-// The stated justification — that leaving an item queued lets the restarted
-// worker reuse the shard's commitItem slot and enqueue the same pointer twice —
-// is unreachable. getCommitSlot has exactly one caller (enqueueForCommit),
-// reachable only when node.commitPending is false; commitPending is set BEFORE
-// the commitC send and cleared only by a path that has already RECEIVED the item
-// from the channel. While shard X's item sits in commitC, its slot is provably
-// unreachable.
-//
-// So the contract is: a step-worker panic touches NOTHING in commitC. The one
-// node that genuinely needs unwedging — the one mid-enqueueForCommit, whose item
-// never reached the channel — is handled by clearStepCommitPending, and this
-// test pins that half too so the contract cannot be read as "do less".
+// TestEngine_RunStepWorkerOnce_PanicLeavesQueuedItemsToCommitWorker: a step-worker panic leaves commitC alone and only unwedges the mid-enqueue node.
 func TestEngine_RunStepWorkerOnce_PanicLeavesQueuedItemsToCommitWorker(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	defer restore()
@@ -109,8 +86,7 @@ func TestEngine_RunStepWorkerOnce_PanicLeavesQueuedItemsToCommitWorker(t *testin
 		}
 	}
 
-	// The mid-enqueue node is the one the recovery DOES own, and it must be
-	// unwedged: its item never reached commitC, so nothing else can clear it.
+	// The mid-enqueue node's item never reached commitC, so the recovery must unwedge it.
 	if midNode.commitPending.Load() {
 		t.Fatal("the node caught mid-enqueueForCommit stayed wedged with commitPending set")
 	}

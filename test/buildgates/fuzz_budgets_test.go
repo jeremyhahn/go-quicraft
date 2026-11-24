@@ -26,10 +26,7 @@ import (
 // fuzzWorkflowPath is the nightly, which owns the calibration.
 var fuzzWorkflowPath = filepath.Join(workflowsDir, "fuzz.yml")
 
-// pkgBudget matches a per-package budget line in either file:
-//
-//	./pkg/proto)              EXECS=4000000 ;;      (fuzz.yml)
-//	./pkg/proto)              base=4000000 ;;       (Makefile)
+// pkgBudget matches a per-package budget line: EXECS= in fuzz.yml or base= in the Makefile.
 var pkgBudget = regexp.MustCompile(`(\./pkg/[a-z/]+)\)\s+(?:EXECS|base)=(\d+)`)
 
 // targetBudget matches a per-target override in either file:
@@ -66,20 +63,7 @@ func budgets(t *testing.T, path string) (pkgs, targets map[string]int) {
 	return pkgs, targets
 }
 
-// TestFuzzBudgetsAgreeBetweenTheNightlyAndTheReleaseGate stops the two tables
-// drifting apart.
-//
-// `fuzz.yml` owns the calibration — it is where the measurement method and the
-// per-target reasoning are written down. The Makefile's `ci-fuzz-mutation`
-// carries the same numbers divided by FUZZ_MUT_DIVISOR, because the release
-// gate is a smoke gate rather than a search.
-//
-// Two numbers in two files is a drift hazard, and the drift would be SILENT:
-// both gates would keep passing, one of them at a budget nobody chose. So the
-// derivation is asserted rather than trusted. Adding a package to one file and
-// not the other fails here, which is the case that would otherwise leave the
-// release gate refusing a package the nightly happily fuzzes — or worse,
-// fuzzing it at a budget calibrated for something else.
+// TestFuzzBudgetsAgreeBetweenTheNightlyAndTheReleaseGate checks the Makefile budgets equal fuzz.yml's divided by FUZZ_MUT_DIVISOR, for the same packages.
 func TestFuzzBudgetsAgreeBetweenTheNightlyAndTheReleaseGate(t *testing.T) {
 	nightlyPkgs, nightlyTargets := budgets(t, fuzzWorkflowPath)
 	releasePkgs, releaseTargets := budgets(t, makefilePath)
@@ -130,14 +114,7 @@ func TestFuzzBudgetsAgreeBetweenTheNightlyAndTheReleaseGate(t *testing.T) {
 	}
 }
 
-// TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry pins the two properties the
-// conversion exists for.
-//
-// A DURATION budget makes Go's coordinator race itself at shutdown and report
-// `context deadline exceeded` with no reproducer — a failure that is not a
-// finding. The old recipe worked around that by retrying and classifying the
-// output, which is a filter on failure: with the deadline gone, a failure with
-// no reproducer should simply be a failure.
+// TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry checks the release fuzz gate uses exec counts, not durations, and no retry.
 func TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry(t *testing.T) {
 	raw, err := os.ReadFile(makefilePath)
 	if err != nil {

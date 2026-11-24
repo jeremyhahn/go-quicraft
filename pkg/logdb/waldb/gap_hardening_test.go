@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Regression tests for WAL hardening: fatal replay of malformed entry
-// batches, write-side Cmd size cap, span-derived EntryRange and
-// gap-rejecting IterateEntries, locked shard shutdown, compaction-floor
-// propagation through Reencrypt, retired snapshot payload type detection,
-// non-wedging segment rotation, 32-bit-safe snapshot length guard, and
-// functional-option validation in Open.
+// WAL hardening tests: fatal replay of malformed records, Cmd size cap, gap detection, shutdown, compaction floor, payload types, rotation and option validation.
 
 package waldb
 
@@ -431,16 +426,7 @@ func TestOpenFailsOnRetiredSnapshotPayloadType(t *testing.T) {
 	}
 }
 
-// TestOpenFailsOnUnsupportedMembershipVersion verifies the in-section version
-// gate behind the payload-type gate, on EXACT equality: a
-// current-payload-type record whose membership section carries any version
-// byte other than membershipSectionVersion fails recovery rather than having
-// its fields interpreted at this layout's offsets.
-//
-// Every format in the repository is pinned at version 1 pre-release, so there
-// is no other layout to fall back to and no window to widen. A section stamped
-// with anything else was not written by this build — the record is length-correct and CRC-clean, so the
-// version byte is the only thing that can catch it.
+// TestOpenFailsOnUnsupportedMembershipVersion checks a membership section with any version other than membershipSectionVersion fails recovery.
 func TestOpenFailsOnUnsupportedMembershipVersion(t *testing.T) {
 	// Small values near the supported one, the two ends of the byte range and
 	// both neighbours of the supported value.
@@ -608,13 +594,7 @@ func TestOpenValidatesFunctionalOptions(t *testing.T) {
 
 // --- Fatal replay of every malformed metadata record type ---
 
-// TestOpenFailsOnMalformedMetadataRecords verifies that a parse failure in
-// ANY record type is fatal, not a warn-and-skip. Every record here already
-// passed its chunk CRC, so a decode failure is corruption or format skew: a
-// skipped State record lets an OLDER state win last-writer-wins (Term/Vote
-// regression => double vote in one term), a skipped Snapshot record boots the
-// node with empty membership, a skipped compaction marker resets the floor to
-// 0, and a skipped tombstone resurrects a removed replica.
+// TestOpenFailsOnMalformedMetadataRecords checks a parse failure in any record type is fatal.
 func TestOpenFailsOnMalformedMetadataRecords(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -658,8 +638,7 @@ func TestOpenFailsOnMalformedMetadataRecords(t *testing.T) {
 			want:    ErrTruncatedSnapshotRecord,
 		},
 		{
-			// Base header only: the writer ALWAYS emits at least 33
-			// membership bytes, so a wholly absent section is corruption.
+			// Base header only: the writer always emits at least 33 membership bytes.
 			name:    "snapshot missing membership section",
 			payload: append([]byte{payloadTypeSnapshot}, make([]byte, snapshotRecordBaseSize)...),
 			want:    ErrTruncatedSnapshotRecord,
@@ -694,20 +673,7 @@ func TestOpenFailsOnMalformedMetadataRecords(t *testing.T) {
 	}
 }
 
-// TestReplaySnapshotRoundTripsEveryMembershipField is the equivalence
-// statement for this section's single layout: every field the
-// layout carries — all six maps, the witness policy and the replicated session
-// policy — must survive SaveSnapshot and replay intact.
-//
-// The version gate is EXACT, so there is no tail this replayer may skip and no
-// other layout whose absent fields would decode as empty. That
-// makes a dropped field silent rather than loud: it would come back as an empty
-// map with no error anywhere, and for the two identity maps that is a security
-// regression, not a data-loss one. Identities is the receive gate's only
-// authorization input where it is present; RemovedIdentities is the deny-list
-// evaluated against the authenticated connection, so losing it readmits a
-// decommissioned node holding a still-valid certificate on exactly the restart
-// an operator performs after removing it.
+// TestReplaySnapshotRoundTripsEveryMembershipField checks all six maps and both policies survive SaveSnapshot and replay.
 func TestReplaySnapshotRoundTripsEveryMembershipField(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))

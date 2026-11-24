@@ -28,29 +28,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 )
 
-// NodeHostDir ownership: one live Host per directory, and one deployment per
-// directory for its whole life.
-//
-// The lock (hostLockFileName) is held from NewHost to Close; see
-// fsutil.LockDir. The identity file records the DeploymentID, and the
-// RaftAddress, the directory was first started with. A later start under a
-// different DeploymentID is refused with ErrHostIdentityMismatch before the
-// log is opened: the directory's Raft state belongs to the other deployment.
-//
-// The RaftAddress is recorded but not enforced. A member may restart at a new
-// address (membership binds replicas by certificate identity, not address),
-// and a RaftAddress with port 0 takes a different kernel-assigned port on
-// every start, so a changed address is logged and the record kept.
-//
-// The file is published as the WAL's small metadata files are: a fsynced
-// temporary file renamed over the name, then the directory fsynced, so the
-// name only ever refers to a complete record.
-//
-// Layout (little-endian):
-//
-//	magic "QRHOSTID"[8] | deploymentID:u64 | addrLen:u16 | addr[addrLen] | crc32c:u32
-//
-// The CRC covers every byte before it.
+// NodeHostDir ownership: one live Host per directory (the lock file) and one DeploymentID for its life.
 const (
 	hostLockFileName         = "host.lock"
 	hostIdentityFileName     = "host.identity"
@@ -106,10 +84,7 @@ func parseHostIdentity(buf []byte) (hostIdentity, error) {
 	}, nil
 }
 
-// checkHostIdentity records want in dir on the directory's first start, and
-// on every later start refuses a recorded DeploymentID other than want's
-// with an error wrapping ErrHostIdentityMismatch that names both. A changed
-// RaftAddress is logged, not refused (see the file comment).
+// checkHostIdentity records want in dir on first start and refuses a different DeploymentID later with ErrHostIdentityMismatch.
 func checkHostIdentity(logger *slog.Logger, dir string, want hostIdentity) error {
 	path := filepath.Join(dir, hostIdentityFileName)
 	data, err := os.ReadFile(path)

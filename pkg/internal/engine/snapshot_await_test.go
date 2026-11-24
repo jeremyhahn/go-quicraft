@@ -41,33 +41,7 @@ func testDeadlineContext(t *testing.T) (context.Context, context.CancelFunc) {
 	return context.WithDeadline(t.Context(), deadline.Add(-deadlineReportingGrace))
 }
 
-// awaitSnapshotResult receives the pool's completion for the one request the
-// caller has in flight and returns it.
-//
-// The snapshotResult on CompletedC is the pool's own completion mark: the
-// worker sends it after handleSnapshot has returned, after OnSnapshotCompleted,
-// after the inFlight slot is released and after the node's snapshotting flag
-// is cleared. The channel receive happens-after that send, so every value a
-// caller reads once this returns — the LogDB record, the artifact on disk, the
-// snapshotter's state, the node's flags — is pinned to the finished operation.
-//
-// A snapshot save or recovery has no intrinsic time bound: the pool carries no
-// timeout, and a save takes as long as the state machine, the barrier and the
-// disk take. Budgeting it with a wall-clock literal treats "2s have elapsed"
-// as if it were "the save did not complete", which under a saturated runner
-// it is not. The only budget that honestly describes the wait is the
-// test binary's own, so the wait ends at the harness deadline less a grace
-// for reporting.
-//
-// A wait that ends without a result names the shards the pool still holds in
-// flight, because a timeout on its own does not distinguish in-progress from
-// never-started: a shard still in flight means the worker has not finished
-// its request; an empty set means the request completed and its result was
-// dropped (CompletedC full and unread), or was never accepted.
-//
-// format and args name the request being waited for, printf-style.
-// The package's tests read snapshot outcomes from the completedC tap, so
-// every pool they build carries one. Production pools never do.
+// Tests read snapshot outcomes from the completedC tap, so every test pool records them; production pools never do.
 func init() { recordSnapshotResults = true }
 
 // CompletedC returns the pool's completedC tap: one result per finished

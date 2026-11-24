@@ -51,7 +51,7 @@ func TestSession_InFlightReservation(t *testing.T) {
 	if !s.beginProposal(series + 1) {
 		t.Fatal("beginProposal after ProposalCompleted = false: the reservation was not released")
 	}
-	// A late endProposal for the COMPLETED series must not clear the new one.
+	// A late endProposal for the completed series must not clear the new one.
 	s.endProposal(series)
 	if s.beginProposal(series + 1) {
 		t.Fatal("a late release of the previous series cleared the current reservation")
@@ -62,10 +62,7 @@ func TestSession_InFlightReservation(t *testing.T) {
 	}
 }
 
-// TestRequestState_ErrorCompletionReleasesSession pins that a failed
-// session proposal releases its series BEFORE the caller can observe the
-// error, since the documented recovery is a retry on the same session, and
-// that Release does the same for a caller that gives up.
+// TestRequestState_ErrorCompletionReleasesSession: a failed session proposal, or Release, frees the series before the caller sees the error.
 func TestRequestState_ErrorCompletionReleasesSession(t *testing.T) {
 	pool := NewRequestStatePool()
 	s := newSession(1, 100, 0)
@@ -109,12 +106,7 @@ func TestRequestState_ErrorCompletionReleasesSession(t *testing.T) {
 	}
 }
 
-// TestProposeWithSession_RefusesConcurrentProposal is the host-level pin for
-// the session reservation. Two concurrent proposals on one session would both
-// carry the same series number; the state machine would apply the first and
-// answer the second with the first's result, and both callers would be told
-// their command ran. The second is refused with ErrSessionBusy until the first
-// has completed.
+// TestProposeWithSession_RefusesConcurrentProposal: a second concurrent proposal on one session gets ErrSessionBusy until the first completes.
 func TestProposeWithSession_RefusesConcurrentProposal(t *testing.T) {
 	h := newTestHost(t)
 	members := map[uint64]string{1: "127.0.0.1:5000"}
@@ -134,9 +126,7 @@ func TestProposeWithSession_RefusesConcurrentProposal(t *testing.T) {
 	}
 	defer rs1.Release()
 
-	// Refused while the first is in flight — and still refused after it has
-	// APPLIED, until the caller acknowledges it: the series is not advanced
-	// until ProposalCompleted, so a second command would still collide.
+	// Refused in flight and after apply, until ProposalCompleted advances the series.
 	if _, err := h.ProposeWithSession(ctx, session, []byte("credit B")); !errors.Is(err, ErrSessionBusy) {
 		t.Fatalf("second ProposeWithSession while the first is in flight = %v, want ErrSessionBusy", err)
 	}
@@ -224,12 +214,7 @@ func TestSyncProposeWithSession_ReleaseWithoutCompletedAdmitsNext(t *testing.T) 
 	rs2.Release()
 }
 
-// TestRequestState_ConcurrentReleaseElectsOneReleaser pins the ordering in
-// Release: the object is pinned before the releaser is elected, so of two
-// Releases that have both pinned, exactly one ends the session reservation
-// and recycles the object, and the loser touches nothing. (A second call is
-// outside Release's contract; this exercises the pin under the race
-// detector, not a guarantee for callers that break it — see Release.)
+// TestRequestState_ConcurrentReleaseElectsOneReleaser: of two pinned Releases exactly one ends the reservation and recycles; run under -race.
 func TestRequestState_ConcurrentReleaseElectsOneReleaser(t *testing.T) {
 	pool := NewRequestStatePool()
 	s := newSession(1, 100, 0)
@@ -294,12 +279,7 @@ func TestSession_ValidForProposal_RefusesSeriesZero(t *testing.T) {
 	}
 }
 
-// TestSession_BeginCurrentProposal_RechecksTheSeries pins the claim against
-// ProposalCompleted: the series is read, then claimed, and a completion that
-// lands between the two advances the series before it releases the
-// reservation — so a claim that succeeded may hold the PREVIOUS series, and
-// a proposal stamped with it would be answered as that command's
-// retransmission without being applied. The claim is re-checked and retaken.
+// TestSession_BeginCurrentProposal_RechecksTheSeries: the claim is re-checked when a completion lands between read and claim.
 func TestSession_BeginCurrentProposal_RechecksTheSeries(t *testing.T) {
 	s := newSession(1, 100, 0)
 	s.PrepareForPropose()

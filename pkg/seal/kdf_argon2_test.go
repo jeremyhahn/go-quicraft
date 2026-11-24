@@ -22,10 +22,7 @@ import (
 	"testing"
 )
 
-// Argon2id-specific KDF tests. They live behind //go:build !fips because a FIPS
-// build has no Argon2id deriver compiled in at all (see kdf_argon2.go), so
-// there is nothing here for it to exercise — the FIPS build's claim about
-// Argon2id is that it is ABSENT, which assertArgon2idBaseline pins instead.
+// Argon2id KDF tests; not built under fips, which has no Argon2id deriver.
 
 func TestDeriveKey_CrossVersionDifferentResults(t *testing.T) {
 	passphrase := []byte("cross-version-test")

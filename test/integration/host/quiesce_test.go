@@ -123,14 +123,7 @@ func quiesceSnapshot(logs []*quiesceLog) [][2]int {
 	return out
 }
 
-// quiesceMetrics counts, for quiesceShard on one host, the Quiesce messages
-// its transport sent and the Heartbeat and Quiesce messages it received.
-// They are the observable signals of quiesce: a leader entering quiesce
-// broadcasts Quiesce, and while quiesced it heartbeats only once per
-// liveness interval instead of every heartbeat RTT. Heartbeats are counted
-// on receipt: the transport's heartbeat fast path (sendHeartbeatBatch) does
-// not report its sends to IncMessagesSent, while the receive path reports
-// every request of every frame.
+// quiesceMetrics counts Quiesce messages sent and Heartbeat and Quiesce messages received for quiesceShard on one host.
 type quiesceMetrics struct {
 	quicraft.NoOpMetricsCollector
 	heartbeatsReceived atomic.Uint64
@@ -199,21 +192,10 @@ func assertActiveCadence(t *testing.T, c *testCluster, ms []*quiesceMetrics, lea
 	}
 }
 
-// quiesceCadenceWindow is how long assertQuiesced watches the followers'
-// heartbeats once the leader has broadcast Quiesce. An active leader
-// heartbeats each follower every heartbeat RTT (one tick), about
-// 3*testElectionRTT heartbeats per follower in the window; a quiesced leader
-// sends one liveness probe per follower per quiesceLivenessInterval, which is
-// longer than the window, so at most one per follower falls inside it.
+// quiesceCadenceWindow is how long assertQuiesced watches follower heartbeats; shorter than quiesceLivenessInterval.
 const quiesceCadenceWindow = 3 * quiesceElectionTimeout
 
-// assertQuiesced waits until the shard has entered quiesce since snap and
-// then checks the heartbeat cadence is suppressed. Entry is observed as the
-// leader sending a Quiesce message to every live follower and every live
-// follower receiving one; suppression as every live follower receiving at
-// most one heartbeat over quiesceCadenceWindow. With Quiesce off,
-// or its configuration not reaching the raft layer, no Quiesce message is
-// ever sent and the wait fails.
+// assertQuiesced waits for quiesce entry since snap, then checks each live follower gets at most one heartbeat over quiesceCadenceWindow.
 func assertQuiesced(t *testing.T, c *testCluster, ms []*quiesceMetrics, snap quiesceCounts, leaderIdx int, phase string) {
 	t.Helper()
 	live := c.liveNodeIndexes()
@@ -277,13 +259,7 @@ const quiesceFollowerElectionTimeout = 3 * quiesceLivenessInterval
 // liveness probes keep them from campaigning.
 const quiesceProbeSpan = quiesceFollowerElectionTimeout + 2*quiesceElectionTimeout
 
-// assertProbed keeps the already-quiesced shard idle for quiesceProbeSpan
-// and asserts the leader keeps it alive with liveness probes: it sends a
-// heartbeat to every live follower at least once per liveness interval
-// (and no more than about that), and every live follower receives them.
-// Leadership stability over the span is left to assertQuietSince on a
-// snapshot taken before it. A leader that never sends quiesced liveness
-// probes fails here, and its followers campaign before the span ends.
+// assertProbed checks the quiesced leader heartbeats every live follower about once per liveness interval over quiesceProbeSpan.
 func assertProbed(t *testing.T, c *testCluster, ms []*quiesceMetrics, leaderIdx int, phase string) {
 	t.Helper()
 	snap := quiesceMetricsSnapshot(ms)

@@ -22,11 +22,7 @@ import (
 	"testing"
 )
 
-// identityPrefix is the scheme prefix the identity shapes below build their
-// values from. It is a named constant because its LENGTH matters: Identities
-// and RemovedIdentities are bounded by MaxAddressLength on both the read and
-// write sides, so anything derived from a clamped address must leave room for
-// it.
+// identityPrefix is the identity scheme prefix; clamped addresses must leave room for it.
 const identityPrefix = "spki:"
 
 // FuzzEntryRoundTrip verifies that Entry marshal/unmarshal round-trips
@@ -371,14 +367,7 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		uint64(math.MaxUint64), "/a", uint64(1),
 		[]byte{0xFF}, uint64(ConcurrentStateMachine), true, uint64(math.MaxUint64), true, uint64(math.MaxUint64))
 
-	// Four parameters are unnamed because the fields they fed no longer exist:
-	// the []byte fed Snapshot.Checksum, the uint64 after it fed Snapshot.Type,
-	// and the two bools fed Imported and Witness — all removed from the wire
-	// format (never computed, never read; see the Snapshot type doc). They are
-	// kept in the signature so the seed corpus already in
-	// testdata/fuzz/FuzzSnapshotRoundTrip keeps parsing: the corpus file format
-	// is positional, and dropping an argument would make every stored case
-	// unreadable, losing the inputs rather than the fields.
+	// Four unnamed parameters keep the positional seed corpus in testdata/fuzz/FuzzSnapshotRoundTrip parsing.
 	f.Fuzz(func(t *testing.T, shardID, replicaID, index, term,
 		ccID uint64, filepath string, fileSize uint64,
 		_ []byte, _ uint64, _ bool,
@@ -619,16 +608,7 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 		removedKey uint64,
 		maxWitnesses uint64, requireFullMajority bool) {
 
-		// Clamp address values to valid length.
-		//
-		// addrVal is clamped to leave room for the "spki:" prefix the identity
-		// shapes below build from it. Clamping it to exactly MaxAddressLength
-		// made "spki:"+addrVal five bytes too long, and Identities is bounded by
-		// MaxAddressLength on BOTH sides — so the harness was constructing a
-		// membership the decoder would refuse, and asserting the encoder emit
-		// it. That went unnoticed until MarshalTo grew the matching write-side
-		// bound; before that the encoder produced a frame its own decoder could
-		// not read, which is the durability bug the bound exists to prevent.
+		// Clamp addresses, leaving room for the spki: prefix within MaxAddressLength.
 		if len(addrVal) > MaxAddressLength-len(identityPrefix) {
 			addrVal = addrVal[:MaxAddressLength-len(identityPrefix)]
 		}
@@ -749,12 +729,7 @@ func checkMembershipRoundTrip(t *testing.T, m *Membership) {
 			}
 		}
 
-		// The AUTHORIZATION maps and the replicated session policy were
-		// neither populated by any shape nor compared here — 5 of 12 fields.
-		// A regression dropping Identities or RemovedIdentities "revokes a
-		// revocation" (an ejected keypair is readmitted); one dropping the
-		// session policy makes a recovering replica expire sessions at log
-		// indexes its peers do not. Both are silent.
+		// Compare the authorization maps and the session policy too.
 		for _, p := range []struct {
 			name      string
 			want, got map[uint64]string

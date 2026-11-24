@@ -22,25 +22,14 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// heartbeatBatchPrefixSize is the size of the pre-serialized MessageBatch
-// header for heartbeat frames: BinVer(8) + DeploymentID(8) + SourceAddrLen(4)
-// + SourceAddr(N). The RequestsCount(4) is appended per-send since the
-// number of messages varies.
-//
-// The full prefix size is computed at runtime from the local address length.
+// heartbeatBatchPrefixSize is the pre-serialized heartbeat MessageBatch header size: BinVer, DeploymentID, SourceAddrLen and SourceAddr.
 const heartbeatBatchFixedPrefix = 8 + 8 + 8 + 8 + 4 // 36 bytes: BinVer+DeploymentID+SourceEpoch+MaxBinVer+AddrLen
 
 // heartbeatWriteDeadline is the write deadline for heartbeat stream writes.
 // Shorter than the 5s general deadline since heartbeats are tiny.
 const heartbeatWriteDeadline = 2 * time.Second
 
-// initHeartbeatPrefix pre-serializes the MessageBatch header fields that
-// are identical for every heartbeat frame: BinVer, DeploymentID, and
-// SourceAddress. Called once from Start() after the local address is known.
-//
-// Wire layout of the prefix (must match proto.MessageBatch's fixed region):
-//
-//	[BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddrLen:4][SourceAddr:N]
+// initHeartbeatPrefix pre-serializes the heartbeat MessageBatch header; called once from Start.
 func (t *QUICTransport) initHeartbeatPrefix() {
 	addr := t.localAddr()
 	prefixLen := heartbeatBatchFixedPrefix + len(addr)
@@ -77,10 +66,7 @@ func (t *QUICTransport) shardSendVersions(shardID uint64) (uint64, byte) {
 	return t.cfg.Wire.sendVersions(v)
 }
 
-// batchSendVersions returns the payload and frame versions for a batch. A
-// batch may carry several shards; it is stamped with the lowest version among
-// them, so a receiver that has not switched one of those shards still reads
-// it. Consecutive messages of one shard are looked up once.
+// batchSendVersions returns a batch's payload and frame versions, the lowest among its shards.
 func (t *QUICTransport) batchSendVersions(msgs []proto.Message) (uint64, byte) {
 	fn := t.wireLookup.Load()
 	if fn == nil || len(msgs) == 0 {
@@ -98,16 +84,7 @@ func (t *QUICTransport) batchSendVersions(msgs []proto.Message) (uint64, byte) {
 	return t.cfg.Wire.sendVersions(lowest)
 }
 
-// sendHeartbeatBatch is the fast path for heartbeat-only message batches.
-// It avoids the general sendBatch overhead by:
-//
-//  1. Using the pre-serialized MessageBatch header prefix (hbPrefix)
-//  2. Computing the frame size from the known constant HeartbeatMessageSize
-//  3. Marshaling messages directly into the frame buffer
-//  4. Skipping compression (heartbeats are too small to benefit)
-//
-// The wire format is fully compatible with the standard receive path:
-// the receiver sees a normal FlagNone frame containing a MessageBatch.
+// sendHeartbeatBatch is the fast path for heartbeat-only batches, using fixed-size records and a dedicated stream.
 func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Message) {
 	msgCount := len(msgs)
 
@@ -141,10 +118,7 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 	for i := range msgs {
 		n, err := msgs[i].MarshalTo(buf[offset:])
 		if err != nil {
-			// The buffer is sized for fixed HeartbeatMessageSize records, so a
-			// marshal failure means a non-fixed-size message slipped past
-			// isHeartbeatBatch — an internal routing bug. Surface it loudly:
-			// silently dropping the whole batch would stall liveness.
+			// A marshal failure here is an internal routing bug.
 			t.putBuf(bufPtr)
 			slog.Warn("transport: dropping heartbeat batch: message failed fixed-size marshal",
 				"target", target,
@@ -195,11 +169,7 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 	_, err = stream.Write(buf[:frameSize])
 	t.putBuf(bufPtr)
 	if err != nil {
-		// The peer refused a frame on the heartbeat stream (see sendFrame for
-		// why this is not a connection failure). Replace the stream only: a
-		// peer that rejects every frame — a deployment or wire-version
-		// mismatch — would otherwise turn each heartbeat tick into a
-		// connection teardown and re-dial.
+		// The peer refused a frame: replace the stream only.
 		if isPeerFrameRejection(err) {
 			t.evictStream(target, shardID, true, stream)
 			t.incBatchDropped(msgs, dropReasonPeerRejected)
@@ -221,13 +191,7 @@ func (t *QUICTransport) sendHeartbeatBatch(target, want string, msgs []proto.Mes
 	}
 }
 
-// isHeartbeatBatch returns true if all messages in the batch are heartbeat
-// or heartbeat response types carrying neither entries nor a snapshot. This is
-// used by Send() to route batches to the heartbeat fast path. The fast path
-// marshals each message into a fixed HeartbeatMessageSize slot, so a heartbeat
-// carrying ANY variable-length payload must fall through to the general
-// sendBatch path — the fixed-size buffer would otherwise overflow and the
-// whole batch would be dropped, which is a liveness event.
+// isHeartbeatBatch reports whether every message is a heartbeat or heartbeat response with no entries or snapshot.
 func isHeartbeatBatch(msgs []proto.Message) bool {
 	for i := range msgs {
 		if !isHeartbeatMessage(msgs[i].Type) ||

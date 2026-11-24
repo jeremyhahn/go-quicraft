@@ -44,10 +44,7 @@ func peerLastIndex(n *Node) uint64 {
 	return lastIdx
 }
 
-// zzR14: the else-branch truncation in processCommitPendingInbox is the ONLY
-// thing that stops a stale commitProposeBuf from being replayed into the peer.
-// Without it, the SAME client proposal is appended to the raft log again on
-// every commitPending cycle for as long as the recovery gate is up.
+// TestCommitPendingInbox_RecoveringDoesNotReplayStaleProposals: the truncation in processCommitPendingInbox stops a stale commitProposeBuf from being replayed.
 func TestCommitPendingInbox_RecoveringDoesNotReplayStaleProposals(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -79,10 +76,7 @@ func TestCommitPendingInbox_RecoveringDoesNotReplayStaleProposals(t *testing.T) 
 	}
 }
 
-// zzR14: commitProposeBuf/readKeyBuf are stepWorker-wide, not per-shard. If the
-// recovering branch does not clear them, the shard processed just before a
-// recovering shard leaks its client proposals INTO the recovering shard's raft
-// log.
+// TestCommitPendingInbox_RecoveringDoesNotInjectOtherShardsProposals: the recovering branch clears the worker-wide buffers so no other shard's proposals leak in.
 func TestCommitPendingInbox_RecoveringDoesNotInjectOtherShardsProposals(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -116,15 +110,7 @@ func TestCommitPendingInbox_RecoveringDoesNotInjectOtherShardsProposals(t *testi
 	}
 }
 
-// TestProcessReady_RecoveringLeavesClientWorkQueued is the processReady half of
-// the recovery backpressure contract. Its commitPending sibling is covered by
-// TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering; this
-// gate is older and was never covered at all — flipping it to always drain
-// during a recovery passed the entire suite.
-//
-// Beyond holding client work, the gate also suppresses redeliverDeferredSnapshots:
-// re-injecting a deferred InstallSnapshot while a recovery owns the state
-// machine restarts the drain/redeliver churn that deferring it exists to stop.
+// TestProcessReady_RecoveringLeavesClientWorkQueued: during a recovery processReady holds client work and does not redeliver deferred snapshots.
 func TestProcessReady_RecoveringLeavesClientWorkQueued(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -139,8 +125,7 @@ func TestProcessReady_RecoveringLeavesClientWorkQueued(t *testing.T) {
 
 	logBefore := peerLastIndex(node)
 
-	// A recovery owns the state machine. commitPending is CLEAR, so processReady
-	// (not processCommitPendingInbox) is the path taken.
+	// A recovery owns the state machine and commitPending is clear, so processReady runs.
 	node.SetRecovering(true)
 	if node.commitPending.Load() {
 		t.Fatal("fixture: commitPending must be clear to exercise processReady")
@@ -169,19 +154,7 @@ func TestProcessReady_RecoveringLeavesClientWorkQueued(t *testing.T) {
 	}
 }
 
-// TestEngine_UnloadNodeReleasesGlobalRateLimit pins the WIRING of the shared
-// in-memory limiter's teardown release, through the real Engine.UnloadNode.
-//
-// The raft layer can release a shard's share, but the leak only closes if the
-// engine actually calls it. Without this, every StartShard/StopShard cycle
-// leaves the stopped shard's bytes in the host-wide counter until the
-// accumulated orphans cross MaxTotalInMemLogSize and every propose on the host
-// fails ErrSystemBusy with no memory actually held.
-//
-// It goes through Engine.UnloadNode rather than stepWorker.unloadNode on
-// purpose: the release must happen only after the commit worker has been told
-// to skip Peer.Commit and the apply goroutine has exited, because an in-flight
-// Commit reaches the very same accounting through appliedTo -> subGlobalSize.
+// TestEngine_UnloadNodeReleasesGlobalRateLimit pins that Engine.UnloadNode releases the shard's share of the host-wide in-memory limit.
 func TestEngine_UnloadNodeReleasesGlobalRateLimit(t *testing.T) {
 	cfg := newTestHostConfig()
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)

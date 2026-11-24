@@ -42,21 +42,7 @@ func installSnapshotMessage(node *Node, index, term uint64) proto.Message {
 	}
 }
 
-// TestPeerLogMarkers_ReadsPublishedMarkersNeverThePeer pins the ownership rule
-// that keeps the snapshot pool off the Peer.
-//
-// The Peer is owned by the step worker. raftMu serializes the step worker's
-// Tick with the commit worker's Commit and nothing else — in particular it does
-// NOT cover drainAndHandleInbox, which is where an InstallSnapshot is stepped
-// and where raftLog.restore rewrites committed, processed and the whole
-// in-memory log. A snapshot pool that reads those fields from its own goroutine
-// therefore races with the very install it is waiting for, no matter which lock
-// it holds.
-//
-// The rule is enforced structurally: peerLogMarkers must report what the step
-// worker PUBLISHED, so a log that has installed a snapshot but has not yet
-// published still reads as un-installed. That direction is the safe one — a
-// recovery may start late, never early.
+// TestPeerLogMarkers_ReadsPublishedMarkersNeverThePeer pins that peerLogMarkers reports the step worker's published markers, not the Peer.
 func TestPeerLogMarkers_ReadsPublishedMarkersNeverThePeer(t *testing.T) {
 	node, peer := newRecoveryTestNode(t, 1, 1, newSnapshotTestSnapshotter(0))
 
@@ -88,15 +74,7 @@ func TestPeerLogMarkers_ReadsPublishedMarkersNeverThePeer(t *testing.T) {
 	}
 }
 
-// TestPeerLogMarkers_DoesNotRaceWithInboxHandling drives the two goroutines the
-// production code runs concurrently — the step worker stepping InstallSnapshot
-// messages out of its inbox, and the snapshot pool waiting for the raft log to
-// hold the snapshot — and lets the race detector judge.
-//
-// This is the failure the e2e suite hit: every snapshot catch-up test
-// (TestE2E_SnapshotCatchUp_FiveNode, the barrier replacement tests,
-// TestHostAPI_RollingRestart_ThreeNode, ...) reported a race between
-// awaitRecoverableLog's marker read and raftLog.restore. Run with -race.
+// TestPeerLogMarkers_DoesNotRaceWithInboxHandling runs inbox InstallSnapshot handling and marker reads concurrently; run with -race.
 func TestPeerLogMarkers_DoesNotRaceWithInboxHandling(t *testing.T) {
 	node, peer := newRecoveryTestNode(t, 1, 1, newSnapshotTestSnapshotter(0))
 

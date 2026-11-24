@@ -27,10 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// mustParseSnapshotMeta decodes a snapshot.meta image or fails the test. Tests
-// assert through the shared decoder rather than re-deriving field offsets, so a
-// layout change cannot leave a test passing against bytes the production
-// purge-floor scan can no longer read.
+// mustParseSnapshotMeta decodes a snapshot.meta image with the shared decoder or fails the test.
 func mustParseSnapshotMeta(t *testing.T, data []byte) SnapshotMeta {
 	t.Helper()
 	meta, err := ParseSnapshotMeta(data)
@@ -122,11 +119,7 @@ func TestSnapshotMeta_HeaderlessRefused(t *testing.T) {
 	}
 }
 
-// TestSnapshotMeta_VersionSkew proves the property the magic/version prefix was
-// added for: a reader can tell a field that is ABSENT (a different format
-// version) from bytes that are CORRUPT. Without the prefix these were the same
-// observation — "the file is shorter than I expect" — which is why appending a
-// field silently turned every older directory into an unevaluable one.
+// TestSnapshotMeta_VersionSkew checks a reader tells an absent field from a corrupt record.
 func TestSnapshotMeta_VersionSkew(t *testing.T) {
 	// A record whose body version is outside the closed read window
 	// {snapshotMetaVersion, previousSnapshotMetaVersion} is refused with the
@@ -154,9 +147,7 @@ func TestSnapshotMeta_VersionSkew(t *testing.T) {
 		}
 	})
 
-	// A record written by an OLDER version of the versioned format, whose body
-	// stops before the Epoch field. It is RECOGNISED — not corrupt — and
-	// reports the epoch as absent.
+	// An older-version record whose body ends before Epoch: recognised, epoch absent.
 	t.Run("older_version_without_epoch", func(t *testing.T) {
 		body := make([]byte, metaBodyCreatedAtOff+8)
 		binary.LittleEndian.PutUint64(body[metaBodyIndexOff:], 900)
@@ -182,10 +173,7 @@ func versionedMetaRecord(version uint16, body []byte) []byte {
 	return buf
 }
 
-// TestSnapshotMeta_CorruptRejected verifies that bytes which are not a
-// versioned record are REJECTED.
-// Parsing them positionally would hand a fabricated epoch to the purge floor,
-// which is worse than refusing to purge.
+// TestSnapshotMeta_CorruptRejected checks bytes that are not a versioned record are rejected.
 func TestSnapshotMeta_CorruptRejected(t *testing.T) {
 	tests := []struct {
 		name string
@@ -300,9 +288,7 @@ func TestReadSnapshotEpoch_Statuses(t *testing.T) {
 			wantEpoch: 0, wantStatus: snapshotEpochUnknown,
 		},
 		{
-			// No record but the ARTIFACT is still there — a crash between the
-			// two writes. Its epoch is unnameable, which can only mean "do not
-			// purge"; it can never mean "imposes no floor".
+			// No record but the artifact remains: the epoch is unknown, so do not purge.
 			name: "missing_record_artifact_present",
 			write: func(t *testing.T, dir string) {
 				t.Helper()
@@ -413,19 +399,11 @@ func epochlessMetaRecord(index, shardID, replicaID uint64) []byte {
 	return versionedMetaRecord(snapshotMetaVersion, body)
 }
 
-// TestSnapshotFloorScan_ReportsEveryBlockingDirectory pins the scan's
-// diagnostics. The scan's VERDICT is settled by the first directory it cannot
-// evaluate, but it must still visit the rest: returning early would mean the
-// operator log names one directory, and the next scan named the next, so a host
-// with several legacy directories never learned what was actually holding key
-// purging off.
+// TestSnapshotFloorScan_ReportsEveryBlockingDirectory checks the scan reports every unevaluable directory, not just the first.
 func TestSnapshotFloorScan_ReportsEveryBlockingDirectory(t *testing.T) {
 	baseDir := t.TempDir()
 
-	// Shard 1 retains TWO unevaluable directories (so a scan that stops at the
-	// first one within a shard is caught) and one good one; shard 2 is fully
-	// evaluable (so a scan that stops at the first BLOCKED shard is caught
-	// too, by the minimum). Both good directories must still be folded in.
+	// Shard 1 has two unevaluable directories and one good one; shard 2 is fully evaluable.
 	writeEpochlessShardSnapshot(t, baseDir, 1, 1, 100)
 	writeEpochlessShardSnapshot(t, baseDir, 1, 1, 150)
 	writeShardSnapshot(t, baseDir, 1, 1, 200, 6)
@@ -486,13 +464,7 @@ func TestGlobalSafePurgeFloor_LegacyDirectoryFailsSafe(t *testing.T) {
 	}
 }
 
-// TestPerBarrierPurgeFloor_LegacyDirectoryScopedToItsBarrier pins how far the
-// blast radius of an unevaluable directory reaches. It suppresses purging for
-// the barrier that could have sealed it — and for no other. A legacy directory
-// belonging to tenant A must not stop tenant B's DEKs from being reclaimed.
-//
-// (In single-barrier mode there is no smaller scope: every shard shares one
-// keyring, so suppression is host-wide by construction. See purgeOldEpochs.)
+// TestPerBarrierPurgeFloor_LegacyDirectoryScopedToItsBarrier checks an unevaluable directory blocks purging only for its own barrier.
 func TestPerBarrierPurgeFloor_LegacyDirectoryScopedToItsBarrier(t *testing.T) {
 	baseDir := t.TempDir()
 	bA := newTenantBarrier(1, 9)
@@ -541,13 +513,7 @@ func TestPerBarrierPurgeFloor_LegacyDirectoryScopedToItsBarrier(t *testing.T) {
 	}
 }
 
-// TestGlobalSafePurgeFloor_CountsAStoppedShardInItsOwnBase covers a stopped
-// shard in the PRODUCTION layout: every shard has its own snapshot base
-// (…/snapshots/shard-N), so a stopped shard's artifacts sit under a base no
-// loaded node owns. A floor that scanned loaded bases only would come out at
-// the loaded shard's epoch 8 — purging epoch 7, which the stopped shard's
-// recorded snapshot needs, and making its restart fail closed on decrypt
-// forever. The LogDB's record of that snapshot must hold the floor at 7.
+// TestGlobalSafePurgeFloor_CountsAStoppedShardInItsOwnBase checks a stopped shard's recorded snapshot holds the floor at its epoch.
 func TestGlobalSafePurgeFloor_CountsAStoppedShardInItsOwnBase(t *testing.T) {
 	root := t.TempDir()
 	baseStopped := filepath.Join(root, "snapshots", "shard-1")

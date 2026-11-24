@@ -30,18 +30,14 @@ type algorithmCase struct {
 
 	keySize int
 
-	// nonceSize is the WIRE nonce width, i.e. what SymmetricAlgorithm.NonceSize
-	// reports. It is not always the cipher.AEAD's NonceSize; see moduleNonce.
+	// nonceSize is the wire nonce width SymmetricAlgorithm.NonceSize reports; see moduleNonce.
 	nonceSize int
 
 	// maxPlaintext is the algorithm's single-invocation plaintext ceiling, the
 	// value SymmetricAlgorithm.MaxPlaintextSize reports.
 	maxPlaintext uint64
 
-	// moduleNonce marks an algorithm whose AEAD generates its own nonce inside
-	// the FIPS module boundary and prepends it to its own Seal output
-	// (cipher.NewGCMWithRandomNonce). Such an AEAD reports NonceSize() == 0,
-	// counts the nonce in Overhead(), and PANICS if handed a non-empty nonce.
+	// moduleNonce marks an AEAD that generates and prepends its own nonce (cipher.NewGCMWithRandomNonce): NonceSize 0, and a non-empty nonce panics.
 	moduleNonce bool
 }
 

@@ -63,12 +63,7 @@ func scripted(attempts *int, value string, errs ...error) func(*quicraft.Host, t
 	}
 }
 
-// TestDrive_ReResolvesBeforeEveryAttempt is the mutation guard for the class
-// this package exists to end. Hoisting the resolve out of the loop makes the
-// second attempt go to the first attempt's replica; this test sees that as a
-// resolver asked once for two attempts. The post-delivery row is the form a
-// pending read or proposal sees when the leader loses the shard underneath it,
-// wrapped in MaybeAppliedError, and must still be retried.
+// TestDrive_ReResolvesBeforeEveryAttempt checks the resolver runs before every attempt, including after a MaybeAppliedError.
 func TestDrive_ReResolvesBeforeEveryAttempt(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -186,17 +181,7 @@ func TestIsNotLeaderRejection(t *testing.T) {
 	}
 }
 
-// TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes is the policy
-// TryReadWith exists to serve.
-//
-// A pinned caller's remedy is "wait, and ask the SAME replica again", so its
-// retryable is quicraft.Temporary rather than IsNotLeaderRejection. The
-// difference is load-bearing for syncReadExact: right after an election the new
-// leader rejects ReadIndex with ErrReadIndexNotReady until it commits its
-// term's no-op, and that error is Temporary but is NOT a not-leader rejection.
-// A TryReadWith wired to IsNotLeaderRejection instead of the caller's predicate
-// would fail on the first such refusal; that IsNotLeaderRejection does not
-// retry it is TestDrive_RetriesOnlyTheNotLeaderRejection/read_index_not_ready.
+// TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes checks TryReadWith retries with the caller's quicraft.Temporary predicate.
 func TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes(t *testing.T) {
 	notReady := quicraft.ErrReadIndexNotReady
 	if !quicraft.Temporary(notReady) {
@@ -215,14 +200,7 @@ func TestDrive_PinnedReadPolicyRetriesWhatOnlyWaitingFixes(t *testing.T) {
 	}
 }
 
-// TestDriveRead_RetriesANewLeadersReadIndexNotReady is the regression guard for
-// go-quicraft#275. The resolver names a leader the instant it wins, and until
-// that leader commits an entry of its term it refuses ReadIndex with
-// ErrReadIndexNotReady (Raft PhD 6.4). TryRead and TryReadIndex used to return
-// that refusal as final and failed an ordinary election as a read.
-//
-// Mutation: give driveRead IsNotLeaderRejection instead of readRefusal and this
-// test fails on the first attempt.
+// TestDriveRead_RetriesANewLeadersReadIndexNotReady checks reads retry ErrReadIndexNotReady from a new leader.
 func TestDriveRead_RetriesANewLeadersReadIndexNotReady(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -269,12 +247,7 @@ func TestDriveRead_ANeverReadyLeaderReportsItsCause(t *testing.T) {
 	}
 }
 
-// TestDriveRead_RetriesNothingElse: driveRead retries on readRefusal and
-// nothing more. Which errors are refusals is TestReadRefusal's to pin; this
-// test pins the wiring — an error the predicate rejects reaches the caller
-// unchanged on its first occurrence, because it came from a leader that has
-// already committed in its term and neither the wait nor the re-resolve
-// changes it.
+// TestDriveRead_RetriesNothingElse checks an error readRefusal rejects is returned on first occurrence.
 func TestDriveRead_RetriesNothingElse(t *testing.T) {
 	for _, tc := range []struct {
 		name string

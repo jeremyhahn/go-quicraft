@@ -48,20 +48,7 @@ func TestErrors_Error(t *testing.T) {
 	}
 }
 
-// TestErrorTypes_AreDistinct pins that each concrete error type is
-// distinguishable from every OTHER one, which is what a caller switching on
-// errors.As depends on.
-//
-// Its previous shape asserted only errors.As(X, &targetOfXsOwnType) for each
-// type in turn — five tautologies that no implementation of Is or Unwrap could
-// falsify. Nothing in it tested distinctness, which is the name of the test and
-// the only interesting property: a type that started matching a sibling (an
-// over-broad Is, or an Unwrap chain that reached one) would have passed.
-//
-// The full cross-product is checked here, both for errors.As (type identity)
-// and errors.Is against each type's own sentinel. ErrEncode/EncodeError is
-// included; it was absent from every distinctness check in this file. Two
-// sentinels defined as the same value would also fail the errors.Is half.
+// TestErrorTypes_AreDistinct checks every error type against every other with errors.As and errors.Is.
 func TestErrorTypes_AreDistinct(t *testing.T) {
 	t.Parallel()
 

@@ -131,12 +131,7 @@ func TestConfig_ToQuicraft_AllFieldsMapped(t *testing.T) {
 	}
 }
 
-// TestConfig_ToQuicraft_WitnessPolicyDisabled pins the adapter-critical
-// witness-policy mapping: dragonboat has no witness membership policy, so
-// the adapter must disable quicraft's RequireFullReplicaMajority default
-// (nil => true) to preserve dragonboat's unrestricted witness-add
-// semantics. Dropping this mapping would silently re-enable the policy
-// and break previously-legal witness adds for adapter users.
+// TestConfig_ToQuicraft_WitnessPolicyDisabled checks the adapter disables RequireFullReplicaMajority, as dragonboat has no witness policy.
 func TestConfig_ToQuicraft_WitnessPolicyDisabled(t *testing.T) {
 	qc := Config{ShardID: 1, ReplicaID: 1, ElectionRTT: 10, HeartbeatRTT: 1}.ToQuicraft()
 	if qc.Witness.RequireFullReplicaMajority == nil || *qc.Witness.RequireFullReplicaMajority {
@@ -200,19 +195,7 @@ func TestConfig_ToQuicraft_DisableAutoCompactionsPreservesSnapshots(t *testing.T
 	}
 }
 
-// TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled pins the one place the
-// two projects' zero values disagree.
-//
-// Dragonboat reads SnapshotEntries == 0 as "automatic snapshotting is off; I
-// will call RequestSnapshot myself". In quicraft a zero there means "I did not
-// choose", and SetDefaults
-// substitutes DefaultSnapshotEntries. Passing the zero through would therefore
-// silently ENABLE snapshotting on a config that explicitly asked for it off.
-//
-// The witness case is the sharp one, because dragonboat's own Validate REQUIRES
-// SnapshotEntries == 0 for a witness — so every witness converted by this shim
-// would have started snapshotting, on a replica that holds no entry payloads to
-// snapshot.
+// TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled checks SnapshotEntries == 0 keeps auto-snapshots off, as in dragonboat.
 func TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled(t *testing.T) {
 	t.Run("plain replica", func(t *testing.T) {
 		c := Config{ShardID: 1, ReplicaID: 1, SnapshotEntries: 0}

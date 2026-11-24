@@ -24,11 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestE2E_Barrier_ReplaceNode verifies that a follower in a 3-node
-// encrypted barrier cluster can be stopped, removed from the membership,
-// and replaced by a new node with an independent barrier. The replacement
-// node must catch up on all previously committed data via encrypted
-// replication and then continue accepting new proposals.
+// TestE2E_Barrier_ReplaceNode replaces a follower of a 3-node encrypted cluster with a node on a new barrier, which catches up and keeps accepting proposals.
 func TestE2E_Barrier_ReplaceNode(t *testing.T) {
 	cluster := newBarrierTestCluster(t, 3)
 	defer cluster.close()
@@ -132,12 +128,7 @@ func TestE2E_Barrier_SnapshotCatchUp(t *testing.T) {
 	t.Logf("all 60 entries verified on 4 barrier nodes (snapshot-based catch-up)")
 }
 
-// TestE2E_Barrier_KeyRotation_ReplaceNode verifies that a barrier cluster
-// survives key rotation (epoch change) and that a replacement node with a
-// fresh barrier can recover all data spanning multiple encryption epochs.
-// The test writes data under epoch 1, rotates all barriers to epoch 2,
-// writes more data, then replaces a follower and verifies the replacement
-// has all cross-epoch data.
+// TestE2E_Barrier_KeyRotation_ReplaceNode writes under epoch 1, rotates to epoch 2, writes more, then replaces a follower that must hold all data.
 func TestE2E_Barrier_KeyRotation_ReplaceNode(t *testing.T) {
 	cluster := newBarrierTestCluster(t, 3)
 	defer cluster.close()

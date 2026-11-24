@@ -1421,10 +1421,7 @@ func TestReceiveChunksSetReadDeadlineError(t *testing.T) {
 	}
 }
 
-// TestReceiveChunksReadFrameHeaderEOF verifies the EOF break path when the
-// stream ends before all chunks are read. An early EOF is a TRUNCATED transfer:
-// the snapshot must NOT be committed, because persisting a partial snapshot as
-// the latest snapshot would let recovery load it as if whole (data corruption).
+// TestReceiveChunksReadFrameHeaderEOF verifies an early EOF is a truncated transfer that is not committed.
 func TestReceiveChunksReadFrameHeaderEOF(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<30, 0, 0, handler)

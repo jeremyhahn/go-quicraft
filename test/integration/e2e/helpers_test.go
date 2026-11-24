@@ -44,28 +44,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// ---------------------------------------------------------------------------
-// Raft timing, and the election budgets derived from it
-//
-// Every election budget below is DERIVED from the shard configuration these
-// tests actually start, and the config builders are written in terms of the
-// same constants: testHostConfig reads testRTTMillisecond, and testShardConfig
-// leaves ElectionRTT to config.Config.SetDefaults, which is the value
-// testElectionRTT names rather than restates. Neither side can be changed
-// without the other following, and TestBudgetsDescribeTheClusterTheyBudgetFor
-// pins that they still agree.
-//
-// A budget written as a literal is a value that is not pinned treated as
-// though it were — a recurring flake class. Elsewhere the unpinned value is a
-// leader index or a replica ID; here it is the shard configuration
-// the budget is supposed to describe. A literal cannot follow a config change
-// and gives no signal when it stops matching; a derivation cannot drift at all.
-//
-// This is the root module's twin of the derivation in contrib/dragonboat, and
-// it mirrors that derivation on purpose. The two suites keep
-// separate copies because contrib/dragonboat is a separate module that owns its
-// own helpers; the shape is shared, the constants are not.
-// ---------------------------------------------------------------------------
+// Raft timing and election budgets, derived from the shard configuration these tests start and pinned by TestBudgetsDescribeTheClusterTheyBudgetFor.
 
 // defaultTimeout is the standard budget for a single Raft operation that is
 // NOT an election: a proposal round trip, a lookup, a membership query. 15s
@@ -74,13 +53,7 @@ import (
 // none of its callers is waiting for an election.
 const defaultTimeout = 15 * time.Second
 
-// testRTTMillisecond is the Raft tick interval, in milliseconds, that
-// testHostConfig gives every host in this suite. One tick is one
-// RTTMillisecond, so every timeout the engine expresses in ticks is this many
-// milliseconds per tick.
-//
-// It is the harness mode's tick (harnessRTTMillisecond): 50ms with the WAL
-// fsync skipped, 500ms in WAL-sync mode.
+// testRTTMillisecond is the tick in milliseconds testHostConfig gives every host: 50ms, or 500ms in WAL-sync mode.
 var testRTTMillisecond = harnessRTTMillisecond(walSyncMode)
 
 // walSyncEnv names the switch that selects the harness's WAL-sync mode. With
@@ -119,22 +92,13 @@ func harnessRTTMillisecond(walSync bool) uint64 {
 	return noSyncRTTMillisecond
 }
 
-// testElectionRTT is the number of ticks a follower waits without hearing from
-// a leader before it stands for election.
-//
-// testShardConfig does not set ElectionRTT, so Config.SetDefaults supplies it.
-// This reads THAT value rather than restating it, so the budgets below follow
-// the default if it ever moves.
+// testElectionRTT is the election timeout in ticks, read from Config.SetDefaults.
 const testElectionRTT = config.DefaultElectionRTT
 
 // raftTick is one Raft tick in wall-clock time.
 var raftTick = time.Duration(testRTTMillisecond) * time.Millisecond
 
-// The election budgets are test/electionbudget's, derived from this suite's
-// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
-// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
-// live in that package; the pin test below is the half that cannot move,
-// because it reads THIS suite's config builders.
+// Election budgets from test/electionbudget, derived from testElectionRTT and testRTTMillisecond.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -233,27 +197,7 @@ func assertApplyOrder(t *testing.T) {
 // Engine Failure Detection
 // ---------------------------------------------------------------------------
 
-// engineFailures is the sink for engine-side faults observed while a test
-// runs: a failed shard reported through EventListener.OnShardFailed, and a
-// worker-goroutine panic that the engine's recover-and-restart loop absorbed.
-//
-// Neither reaches the test goroutine on its own. A failed shard is a callback
-// on an engine worker, and a worker panic is recovered, logged and restarted
-// by design so one bad shard cannot take the host down. That is right for a
-// library and wrong for a test: the shard the test was driving is dead or
-// wedged, so every wait the test is sitting in runs to its full timeout, then
-// the test itself runs to `panic: test timed out` -- around thirty minutes of
-// CI, with the actual panic scrolled far above the failure and no shard named
-// at the point of failure.
-//
-// So the fault is parked here by whichever goroutine sees it, and the polling
-// helpers below check the sink on every tick and fail on the TEST goroutine,
-// where t.Fatal is legal. This is the same trade the apply-order sink above
-// makes and for the same reason: the reporting goroutine has no *testing.T.
-//
-// The fix deliberately lives here and not in the engine. Restart-on-panic is
-// the engine's chosen production behaviour and is covered by its own unit
-// tests; a test harness that cannot see the restart is a harness defect.
+// engineFailures collects engine faults (OnShardFailed, recovered worker panics) so polling helpers fail on the test goroutine.
 var engineFailures struct {
 	mu    sync.Mutex
 	first string
@@ -262,10 +206,7 @@ var engineFailures struct {
 	armedBy *testing.T
 }
 
-// recordEngineFailure parks the FIRST engine fault of a test. Later faults are
-// dropped: a wedged shard cascades (the restarted worker panics again on the
-// same state, the shard fails, its peers report connection failures), and the
-// first one is the one that explains the rest.
+// recordEngineFailure keeps the first engine fault of a test.
 func recordEngineFailure(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	engineFailures.mu.Lock()
@@ -275,28 +216,7 @@ func recordEngineFailure(format string, args ...interface{}) {
 	engineFailures.mu.Unlock()
 }
 
-// armEngineFailureDetector binds the engine-failure sink to t and routes the
-// engine's own slog output through a watcher for the duration of the test. It
-// is idempotent for a given t.
-//
-// Watching the log output is what catches a worker panic. The panic is
-// recovered inside the engine and never becomes an error any Host API returns;
-// the only evidence that escapes the process is the Error-level "… panic
-// recovered …" record carrying the panic value and its stack. An invariant
-// violation (invariant.Assert) is exactly this shape: it panics on an engine
-// worker, the worker restarts, and nothing else in the process changes.
-//
-// The interception is on log.SetOutput rather than slog.SetDefault, which is
-// NOT a stylistic choice. The engine logs through the package-level slog
-// functions, and the default slog handler formats through the standard log
-// package. Installing a wrapper via slog.SetDefault ALSO redirects the log
-// package into that same wrapper (slog.SetDefault does both), so a record
-// forwarded to the original default handler re-enters the wrapper from
-// underneath while log's mutex is held, and the first engine panic deadlocks
-// the whole binary on it — a self-inflicted version of the hang this detector
-// exists to prevent. Tapping the writer sits below all of that: log holds its
-// mutex across the Write, the tap only appends to its own buffer, and nothing
-// re-enters log.
+// armEngineFailureDetector binds the sink to t and taps log output for recovered panics via log.SetOutput; idempotent per t.
 func armEngineFailureDetector(t *testing.T) {
 	t.Helper()
 
@@ -337,12 +257,7 @@ func (w *panicWatchWriter) Write(p []byte) (int, error) {
 	return w.inner.Write(p)
 }
 
-// trimPanicLogLine cuts the recovered panic's log line down to the part that
-// names the fault. The record carries the whole stack as one quoted attribute,
-// which is thousands of characters of one line and unreadable inside a test
-// failure; the full text is still in the log the writer forwarded, so what
-// belongs in the failure message is the message, the worker and the panic
-// value that precede it.
+// trimPanicLogLine cuts a recovered panic's log line to the message, worker and panic value.
 func trimPanicLogLine(line string) string {
 	line = strings.TrimRight(line, "\n")
 	if i := strings.Index(line, " stack="); i >= 0 {
@@ -351,13 +266,7 @@ func trimPanicLogLine(line string) string {
 	return line
 }
 
-// failFastOnEngineFailure fails the running test if the engine reported a
-// failed shard or absorbed a worker panic. Every polling helper in this file
-// calls it on each tick, so a fault that would otherwise be waited out for the
-// full timeout -- and then for the whole test binary's timeout -- surfaces
-// within one poll interval, quoting the original panic and naming the shard
-// whenever the engine named one (OnShardFailed does; a worker panic identifies
-// the worker, since a step worker owns a partition rather than one shard).
+// failFastOnEngineFailure fails the test if the engine reported a failed shard or a worker panic.
 func failFastOnEngineFailure(t *testing.T) {
 	t.Helper()
 	engineFailures.mu.Lock()
@@ -380,28 +289,12 @@ func failFastOnEngineFailure(t *testing.T) {
 type kvStateMachine struct {
 	mu   sync.RWMutex
 	data map[string]string
-	// prevIndex is the raft index of the previously applied entry. Every
-	// entry handed to Update must carry a STRICTLY greater index: an index
-	// that repeats or moves backward means the entry was applied twice or
-	// replayed, which no amount of state comparison can detect afterwards on
-	// a last-write-wins store. RecoverFromSnapshot is the only legal reset
-	// point.
-	//
-	// Note: consecutive indices are NOT required. The user state machine only
-	// ever sees user commands; the engine legitimately consumes indices for
-	// the initial-membership entry, each leader's no-op entry, config changes
-	// and session register/unregister entries, so gaps are expected and are
-	// counted rather than failed. See applyGaps.
+	// prevIndex is the previous applied index; each Update must carry a strictly greater one, with gaps allowed. RecoverFromSnapshot is the only reset.
 	prevIndex uint64
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
 	applied   atomic.Uint64
-	// recovers counts RecoverFromSnapshot calls. It is how a test can tell
-	// "this replica caught up by receiving a SNAPSHOT" from "this replica
-	// caught up by replaying the LOG" -- two paths that leave identical data
-	// behind, so every assertion phrased over the resulting key set is
-	// satisfied by either one. Several tests logged the snapshot claim while
-	// checking nothing that could distinguish them.
+	// recovers counts RecoverFromSnapshot calls, telling snapshot catch-up from log replay.
 	recovers atomic.Uint64
 }
 
@@ -540,10 +433,7 @@ func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, st
 
 	kv.recovers.Add(1)
 
-	// This is the only point at which the applied-index expectation may be
-	// reset, and the reset must still move the replica FORWARD: installing a
-	// snapshot older than what this replica already applied would silently
-	// roll the state machine back.
+	// The reset must still move forward.
 	indexBuf := make([]byte, 8)
 	if _, err := io.ReadFull(r, indexBuf); err != nil {
 		return err
@@ -650,8 +540,7 @@ type smKey struct {
 	replicaID uint64
 }
 
-// smTracker tracks kvStateMachine instances created by the factory
-// so tests can assert on internal state.
+// smTracker tracks kvStateMachine instances created by the factory.
 type smTracker struct {
 	mu       sync.Mutex
 	machines map[smKey]*kvStateMachine
@@ -663,14 +552,7 @@ func (t *smTracker) Get(shardID, replicaID uint64) *kvStateMachine {
 	return t.machines[smKey{shardID, replicaID}]
 }
 
-// forShard returns the one state machine this tracker holds for shardID,
-// regardless of replica ID, or nil when there is not exactly one.
-//
-// A tracker belongs to exactly one host and a host runs exactly one replica of
-// a given shard, so the lookup is unambiguous. It exists because the caller's
-// "replicaID is nodeIndex+1" convention stops holding the moment a test
-// replaces a node with a fresh replica ID — and a lookup that misses then
-// returns nil, which the old helpers read as "nothing to verify here".
+// forShard returns this tracker's single state machine for shardID, or nil unless exactly one exists.
 func (t *smTracker) forShard(shardID uint64) *kvStateMachine {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -744,17 +626,7 @@ func harnessHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig,
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
 		MaxApplyWorkers:       1,
-		// By default the WAL still writes every record through the real
-		// segment code; only the fdatasync is skipped. Raft persists term
-		// and vote before a RequestVote or vote grant leaves the node, so
-		// once every sync on the shared disk takes longer than the 0.5-1s
-		// election timeout no election can finish and the shard stays
-		// leaderless (#362, #360). Every host here gets fresh directories
-		// and none is reopened (a replacement host joins as a new node), so
-		// durability across a restart is not what this suite checks.
-		// WAL-sync mode (QUICRAFT_IT_WAL_SYNC=1) runs the fsync-before-ack
-		// path production uses, with a tick (walSyncRTTMillisecond) that
-		// puts the shortest election timeout above the stall.
+		// Skip only the fdatasync so elections finish on a shared disk; QUICRAFT_IT_WAL_SYNC=1 runs the fsync path with a longer tick.
 		NoSyncWAL: !walSync,
 		TransportConfig: config.TransportConfig{
 			MTLSConfig: mtls,
@@ -796,10 +668,7 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. Read the
-// bound address from Host.RaftAddress once the host exists: a port reserved
-// up front and bound later can be taken by a concurrent CI job that shares the
-// network but not the reservation's lock directory (#386).
+// kernelAddr binds a host on a kernel-assigned loopback port; read it from Host.RaftAddress.
 const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
@@ -819,16 +688,10 @@ type testCluster struct {
 	// serializes a node's stop and restart without hostsMu, which is never
 	// held across Host.Close (see stopNode).
 	nodeLocks sync.Map
-	// ca issues every host's leaf; leaves holds each host's own leaf — its
-	// own KEYPAIR, and so its own node identity — so a host brought back
-	// for a replica presents the identity the shard committed for it. See
-	// test/testpki.
+	// ca issues every leaf; leaves holds each host's own keypair and node identity.
 	ca     *testpki.CA
 	leaves []*config.MTLSConfig
-	// ids holds each host's node identity, recorded when the host was first
-	// built. It is a property of the leaf, so it survives a stop and a
-	// restart, and a founder's Config.MemberIdentities has to name EVERY
-	// member of the shard — stopped ones included.
+	// ids holds each host's node identity, which MemberIdentities must list for every member.
 	ids []string
 	t   *testing.T
 }
@@ -886,7 +749,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		cfg := testHostConfig(t, kernelAddr, leaves[i])
 		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
-			// Clean up any previously created hosts.
+			// Clean up any hosts already created.
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
@@ -911,14 +774,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	return c
 }
 
-// diagCluster holds the cluster most recently built by newTestCluster, so a
-// wait that expires can print the raft state behind it.
-//
-// A package-level handle rather than a parameter threaded through the twenty
-// call sites of waitForNodeData: this is the same trade the apply-order sink in
-// this package already makes, and for the same reason — integration tests here
-// never run in parallel, so "the current cluster" is unambiguous. The Cleanup
-// clears it so a later test can never print a torn-down cluster's state.
+// diagCluster holds the latest cluster from newTestCluster so an expired wait can print its raft state.
 var diagCluster struct {
 	mu sync.Mutex
 	c  *testCluster
@@ -937,13 +793,7 @@ func setDiagCluster(t *testing.T, c *testCluster) {
 	})
 }
 
-// shardStateDump renders each live node's raft state for one shard: who it
-// believes the leader is, its term, how far it has applied, what its local log
-// spans and how much is queued. A node still catching up, a node that disagrees
-// about the leader, and a node whose log stops short all look different here.
-//
-// It never fails the test — it runs while one is already failing, so an error
-// on one node is reported inline and the rest still print.
+// shardStateDump renders each live node's raft state for shardID, reporting per-node errors inline.
 func shardStateDump(shardID uint64) string {
 	diagCluster.mu.Lock()
 	c := diagCluster.c
@@ -1048,32 +898,7 @@ func (c *testCluster) findLeader(shardID uint64) int {
 	return -1
 }
 
-// replicaIDAt returns the Raft replica ID that the node at idx runs for
-// shardID, as the host itself reports it, and whether there is one.
-//
-// It is the suite's ONE index-to-replica-ID mapping, and it exists because
-// idx+1 is not that mapping. idx+1 holds for the FOUNDING members only:
-// startShard numbers them 1..N in slice order. Every replica added later by
-// addNodeToCluster takes an explicit ID its caller chose, and this suite
-// deliberately chooses IDs that do not follow the index —
-// TestE2E_Partition_HealAndReconverge uses 10 and 11 for the hosts it appends
-// at indices 5 and 6, "to avoid collision with original replica IDs".
-//
-// A helper that computes idx+1 therefore asks for a replica that never existed
-// the moment a replacement node is the subject, and reports "leader state
-// machine not found" for a proposal that committed perfectly.
-//
-// This is the recurring flake class — a value that is not pinned treated as if
-// it were — with the slice index treated as the replica ID. The remedy is: read
-// the value from whatever owns it instead of recomputing it. A host's replica
-// ID for a shard is fixed when StartShard is called and never changes while the
-// host runs, so ShardInfo is authoritative here and — unlike IsLeader — is
-// not a value that can move between the look and the use.
-//
-// ok is false when idx is out of range, the node is stopped, or the host is not
-// running that shard. Each of those means "no replica here", which is a
-// different answer from "replica idx+1", and callers must not conflate the
-// two.
+// replicaIDAt returns the replica ID node idx runs for shardID, from ShardInfo; ok is false when there is none.
 func (c *testCluster) replicaIDAt(shardID uint64, idx int) (uint64, bool) {
 	c.hostsMu.RLock()
 	defer c.hostsMu.RUnlock()
@@ -1135,8 +960,7 @@ func (c *testCluster) stopNode(idx int) {
 	lk := c.nodeLock(idx)
 	lk.Lock()
 	defer lk.Unlock()
-	// Host.Close drains in-flight operations and can take seconds, so it runs
-	// outside hostsMu: under the write lock it stalled every reader (#309).
+	// Close outside hostsMu; it can take seconds.
 	if h := c.takeHost(idx); h != nil {
 		h.Close()
 	}
@@ -1187,18 +1011,7 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 // that the shard needs to hold the election.
 const awaitLeaderHostInterval = 5 * time.Millisecond
 
-// awaitLeaderHost is leaderHost's blocking form: it returns the Host that leads
-// shardID, waiting up to timeout for one to emerge, and nil if none does.
-//
-// It never touches *testing.T, so it is usable OFF the test goroutine -- which
-// is the point, since waitForClusterLeader's t.Fatalf is illegal there.
-// Returning nil rather than failing leaves the caller to decide what a
-// leaderless shard means to it.
-//
-// It exists so a writer that finds a shard mid-election does not have to spend
-// one of its writes on a proposal it never attempted. Counting those as losses
-// would make TestE2E_MultiShardFailover_UnderLoad score the runner's clock
-// instead of the cluster's recovery.
+// awaitLeaderHost returns the Host leading shardID within timeout, or nil; it never touches t.
 func (c *testCluster) awaitLeaderHost(shardID uint64, timeout time.Duration) *quicraft.Host {
 	ticker := time.NewTicker(awaitLeaderHostInterval)
 	defer ticker.Stop()
@@ -1241,14 +1054,7 @@ type leaderObservation struct {
 	term      uint64
 }
 
-// observeLeaders samples (node, IsLeader, Term) from EVERY host currently in
-// the cluster and returns the leaders it found.
-//
-// It deliberately does NOT consult c.stopped. A node this harness believes is
-// down but which is still running — or one that was restarted and re-added —
-// is exactly where a second leader hides, and skipping it is how a same-term
-// split brain becomes invisible. A host that is genuinely closed returns an
-// error from ShardInfo and contributes nothing.
+// observeLeaders returns the leaders reported by every host in the cluster, stopped ones included.
 func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
 	c.hostsMu.RLock()
 	hosts := make([]*quicraft.Host, len(c.hosts))
@@ -1273,13 +1079,7 @@ func (c *testCluster) observeLeaders(shardID uint64) []leaderObservation {
 	return leaders
 }
 
-// splitBrain returns a description of a same-term multi-leader sighting, or the
-// empty string when the observations are consistent with election safety.
-//
-// Two leaders in DIFFERENT terms is a legal, ordinary handover: the old leader
-// simply has not learned it was superseded. Two leaders in the SAME term is the
-// Raft election-safety violation, and it is never transient — it has already
-// happened by the time it is observed, so it must never be waited out.
+// splitBrain describes two leaders in the same term, or returns "".
 func splitBrain(leaders []leaderObservation) string {
 	byTerm := make(map[uint64][]leaderObservation, len(leaders))
 	for _, obs := range leaders {
@@ -1298,16 +1098,7 @@ func splitBrain(leaders []leaderObservation) string {
 	return ""
 }
 
-// waitForSingleLeader polls until exactly one host reports leadership of the
-// shard, checking the election-safety invariant on EVERY iteration.
-//
-// This replaces the older "poll until the leader count is 1" shape, which
-// treated two simultaneous leaders as an intermediate state to wait out. That
-// IS the violation: waiting for it to resolve turns the one condition the test
-// exists to detect into a reason to keep polling. It also never read Term, so a
-// same-term split brain was indistinguishable from a legal handover, and it
-// skipped stopped nodes, so a partitioned node holding a second claim was
-// invisible.
+// waitForSingleLeader polls until exactly one host leads the shard, failing at once on a same-term split brain.
 func waitForSingleLeader(t *testing.T, cluster *testCluster, shardID uint64, timeout time.Duration) int {
 	t.Helper()
 
@@ -1389,18 +1180,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	}
 }
 
-// resolveStateMachine returns the state machine for node i on the given shard.
-//
-// The cluster's own tracker slice is consulted FIRST because it is the live
-// one: addNodeToCluster appends to it and recovery paths overwrite entries in
-// it, while a trackers slice a test captured from startShard is a snapshot
-// from before those changes and points at state machines that no longer run.
-// The caller's slice is the fallback, which covers a shard whose trackers were
-// never stored on the cluster.
-//
-// The replica ID comes from replicaIDAt — the host's own answer — and falls
-// back to i+1 only when the host cannot be asked at all (it was stopped, or it
-// never started the shard); it is never derived arithmetically.
+// resolveStateMachine returns node i's state machine for shardID, preferring the cluster's live trackers and the host's replica ID.
 func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID uint64, i int) *kvStateMachine {
 	replicaID, ok := cluster.replicaIDAt(shardID, i)
 	if !ok {
@@ -1443,16 +1223,7 @@ func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID ui
 	return nil
 }
 
-// waitForReplication waits for a key to appear with the expected value in the
-// state machine of EVERY live node, and fails if it did not actually check
-// every one of them.
-//
-// The count is the point. The previous version skipped any node whose index
-// was past the end of the caller's trackers slice and any node whose state
-// machine had not registered yet, silently and without a word in the log. A
-// test that adds a replacement node and then "verifies data intact on all live
-// nodes" verified nothing at all for that node, because the trackers slice was
-// captured before the node existed.
+// waitForReplication waits for key to hold value on every live node and fails unless every node was checked.
 func waitForReplication(t *testing.T, cluster *testCluster, trackers []*smTracker, shardID uint64, key, expectedVal string, timeout time.Duration) {
 	t.Helper()
 
@@ -1559,15 +1330,7 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 			t.Fatalf("Propose(%q=%q) result failed: %v", key, value, resErr)
 		}
 
-		// Proposal committed. Wait for the leader's SM to apply.
-		//
-		// The lookup goes through resolveStateMachine, which asks the host
-		// which replica it runs (replicaIDAt) instead of computing leaderIdx+1.
-		// The arithmetic holds only for the founding members, so when a node
-		// added by addNodeToCluster wins the election it would ask the tracker
-		// for a replica that never existed, get nil, and fail the test with
-		// "leader state machine not found" for a proposal that had just
-		// committed.
+		// Wait for the leader's state machine to apply, found via resolveStateMachine.
 		leaderSM := resolveStateMachine(cluster, trackers, shardID, leaderIdx)
 		if leaderSM == nil {
 			replicaID, ok := cluster.replicaIDAt(shardID, leaderIdx)
@@ -1586,10 +1349,7 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 	}
 }
 
-// proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
-// OF THE CALL and returns the committed result. See package
-// test/proposer for why observing a leader does not pin it, and for the
-// callers that must NOT use this.
+// proposeToLeader proposes cmd to the current leader of shardID and returns the result; see test/proposer.
 func proposeToLeader(
 	t *testing.T,
 	cluster *testCluster,
@@ -1633,8 +1393,7 @@ func testShardConfigWithSnapshot(shardID, replicaID, snapshotEntries, compaction
 	return c
 }
 
-// startShardWithConfig starts a shard on all nodes in the cluster using
-// a custom config factory. Returns smTrackers for each node.
+// startShardWithConfig starts a shard on all nodes with a config factory and returns their trackers.
 func (c *testCluster) startShardWithConfig(shardID uint64, cfgFn func(shardID, replicaID uint64) config.Config) []*smTracker {
 	c.t.Helper()
 
@@ -1672,14 +1431,7 @@ type addNodeResult struct {
 	idx     int
 }
 
-// addNodeToCluster creates a new host, requests a membership addition from
-// the leader, and starts the shard in join mode. The new host is appended
-// to the cluster's hosts/addrs/trackers/stopped slices.
-//
-// opts state the new host's at-rest encryption. With none it declares
-// WithoutEncryption, like the cluster's own hosts; a caller passing options
-// must include WithBarrier (or WithoutEncryption) itself, and NewHost refuses
-// one that does not.
+// addNodeToCluster creates a host, adds it through the leader and starts the shard in join mode; opts must state encryption.
 func addNodeToCluster(
 	t *testing.T,
 	cluster *testCluster,
@@ -1747,76 +1499,19 @@ func addNodeToCluster(
 	}
 }
 
-// syncAddNode adds a voting replica through whichever node is CURRENTLY the
-// leader and does not mistake a retry of an already-committed add for a
-// failure.
-//
-// The decision is test/membership's, not this suite's: the leader is resolved
-// at the point of each attempt, and a duplicate refusal ("already exists in
-// membership") is accepted ONLY after an attempt in the same loop was
-// genuinely submitted to raft AND a linearizable membership read shows the
-// replica as a full voter at exactly addr. This is the binding of that
-// decision to testCluster.leaderHost, nothing more.
+// syncAddNode adds a voter through the current leader, using test/membership's idempotent retry.
 func syncAddNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, addr, identity string, timeout time.Duration) {
 	t.Helper()
 	membership.AddNode(t, cluster.leaderHost, shardID, replicaID, addr, identity, timeout)
 }
 
-// syncDeleteNode removes a replica through whichever node is CURRENTLY the
-// leader, with the same idempotence as syncAddNode: "target node not found"
-// is accepted only after a genuine submission and a linearizable read showing
-// the replica holding no role at all.
+// syncDeleteNode removes a replica through the current leader, with syncAddNode's idempotence.
 func syncDeleteNode(t *testing.T, cluster *testCluster, shardID, replicaID uint64, timeout time.Duration) {
 	t.Helper()
 	membership.DeleteNode(t, cluster.leaderHost, shardID, replicaID, timeout)
 }
 
-// proposeUntilCommitted proposes one key/value through whichever node is
-// CURRENTLY the leader and returns nil once the entry commits, or an error the
-// caller should treat as fatal.
-//
-// It exists for the concurrent-writer goroutines, which must not pin the leader
-// index captured at the start of the test and treat every error — including
-// ErrNotLeader from a perfectly ordinary re-election — as a hard failure.
-// Retrying is not a weaker assertion than "no errors": every entry must still commit,
-// and the caller still verifies all of them replicated afterwards. It only
-// stops a legal leadership change from being reported as a lost write.
-//
-// Safe to call from a non-test goroutine: it never touches t.
-//
-// # Which retry policy this needs, and why it is not a third one
-//
-// It runs on the same proposer.TryWith as the rest rather than a copy of the
-// propose-retry loop, and the predicate is chosen by one principle: retry an
-// error when, and only when, what the loop does between attempts can change
-// that error's answer.
-//
-// Between attempts this loop does BOTH of the things the package's two
-// remedies name. It re-resolves the leader, which is proposer.Try's remedy and
-// fixes a not-leader rejection. And it waits, which is the pinned callers'
-// remedy and fixes the conditions that clear on their own — a shard still
-// coming up, a momentarily full pipeline, an election in flight. Its retryable
-// set is therefore the union of the two, and because ErrNotLeader is itself
-// inside quicraft.Temporary, that union IS quicraft.Temporary.
-//
-// So this needs no third predicate. It needs the SECOND one, paired with a
-// re-resolving resolver — the combination neither of TryWith's original two
-// callers uses, and the reason TryWith takes the resolver and the predicate as
-// separate parameters rather than bundling them. Try's narrowness is right for
-// Try because a caller asserting on one proposal wants a busy pipeline to
-// reach it; this helper's callers assert that every entry commits WITHIN the
-// budget, across partitions and heals, so a condition that clears on its own
-// is something to wait through rather than to report.
-//
-// quicraft.Temporary deliberately does not retry ErrCanceled or a bare context
-// cancellation, which no amount of waiting or re-resolving fixes. It does cover
-// a leadership transfer in flight: ErrTransferInProgress is in temporaryErrors,
-// matched by sentinel rather than by substring.
-//
-// Re-proposal is safe for what this writes. A not-leader error can arrive after
-// the entry already reached the log (quicraft.MaybeApplied — the form observed
-// in practice here), so a retry may apply the command twice; every command this
-// helper carries is a last-write-wins KV put.
+// proposeUntilCommitted proposes key/value through the current leader via proposer.TryWith, retrying quicraft.Temporary errors; it never touches t.
 func proposeUntilCommitted(cluster *testCluster, shardID uint64, key, value string, timeout time.Duration) error {
 	_, err := proposer.TryWith(cluster.leaderHost, shardID, encodeKVPut(key, value),
 		timeout, quicraft.Temporary)
@@ -1853,21 +1548,7 @@ func proposeNEntries(
 	return expected
 }
 
-// verifyAllData verifies that every KV pair in expected is present on the state
-// machine of EVERY live node, and fails if it did not actually check every one
-// of them.
-//
-// The count is the point, and it is the same point as in waitForReplication.
-// The previous version skipped three separate classes of node in silence: any
-// index past the end of the caller's trackers slice (which is every node a test
-// added after capturing it), any nil tracker entry, and any node whose state
-// machine lookup returned nil. That last one is the damaging case: the tracker
-// records a machine the instant the engine invokes the state-machine factory,
-// so a nil result means the factory was never invoked for that replica — a
-// startup or recovery failure. Skipping it removes the one broken node from
-// every data assertion while the caller logs "verified on N nodes". This helper
-// is the sole final assertion of the rolling-restart tests, where the node that
-// failed to come back is exactly the node being skipped.
+// verifyAllData checks every pair in expected on every live node and fails unless every node was checked.
 func verifyAllData(
 	t *testing.T,
 	cluster *testCluster,
@@ -1895,8 +1576,7 @@ func verifyAllData(
 	for _, i := range live {
 		nodeSM := resolveStateMachine(cluster, trackers, shardID, i)
 		if nodeSM == nil {
-			// A missing state machine is a condition to WAIT for and then
-			// FAIL on, never one to skip.
+			// A missing state machine is waited for, then failed on.
 			waitForCondition(t, membershipTimeout,
 				fmt.Sprintf("node[%d] registers a state machine for shard %d", i, shardID),
 				func() bool {
@@ -1923,15 +1603,7 @@ func verifyAllData(
 	}
 }
 
-// assertCaughtUpViaSnapshot fails unless the replica actually restored itself
-// from a SNAPSHOT rather than replaying the log.
-//
-// Holding the right keys proves nothing about which path produced them: log
-// replay and snapshot install leave byte-identical state, so "the joiner has
-// the keys" is satisfied by either. Several tests logged "caught up via
-// snapshot transfer (not log replay)" while asserting only the key set. The
-// state machine counts its own RecoverFromSnapshot calls, which is the one
-// signal that separates the two.
+// assertCaughtUpViaSnapshot fails unless the replica's state machine recovered from a snapshot.
 func assertCaughtUpViaSnapshot(t *testing.T, tracker *smTracker, shardID, replicaID uint64, timeout time.Duration) {
 	t.Helper()
 
@@ -1952,10 +1624,7 @@ func assertCaughtUpViaSnapshot(t *testing.T, tracker *smTracker, shardID, replic
 	t.Logf("replica=%d restored from a snapshot %d time(s)", replicaID, nodeSM.RecoverCount())
 }
 
-// assertSnapshotTaken fails unless the node at idx has written at least one
-// snapshot artifact under its NodeHostDir. It is the companion to
-// assertCaughtUpViaSnapshot on the SENDING side: a snapshot has to exist before
-// one can be transferred.
+// assertSnapshotTaken fails unless node idx wrote a snapshot under its NodeHostDir.
 func assertSnapshotTaken(t *testing.T, cluster *testCluster, idx int) {
 	t.Helper()
 	dir := cluster.nodeHostDir(idx)
@@ -1963,23 +1632,7 @@ func assertSnapshotTaken(t *testing.T, cluster *testCluster, idx int) {
 	t.Logf("node[%d] wrote %d snapshot artifact(s) under %s", idx, len(paths), dir)
 }
 
-// waitForLogCompacted blocks until every live replica of shardID has compacted
-// its log past index 1, the first entry a replica joining with an empty log
-// needs. It is the precondition of every "a joiner catches up by snapshot"
-// test, and it must be awaited, not assumed.
-//
-// The automatic snapshot a run of applies triggers is taken, and the log
-// compacted behind it, asynchronously in the snapshot pool. Neither a
-// proposal completing nor every state machine holding every key says the
-// snapshot has finished: under load the compaction was observed landing
-// seconds after the last apply. A joiner added before it lands is probed at
-// index 0 against a log that still holds index 1, so the leader replicates
-// the log to it — correct Raft, and a pass of a snapshot catch-up test would
-// then rest on nothing but which side of that race the scheduler chose.
-//
-// Every live replica is checked, not only the current leader: AddNode is a
-// membership change, and whichever voter leads when the joiner is first
-// probed is the one that serves it.
+// waitForLogCompacted waits until every live replica of shardID has compacted past index 1.
 func waitForLogCompacted(t *testing.T, cluster *testCluster, shardID uint64, timeout time.Duration) {
 	t.Helper()
 	for i := range cluster.hosts {
@@ -2022,34 +1675,7 @@ func waitForMembershipSize(
 	)
 }
 
-// waitForMembershipConverged waits until EVERY live replica in the cluster
-// reports the same configuration: exactly wantNodes as voting members, and at
-// least wantRemoved in the removed set.
-//
-// # Why this exists
-//
-// A membership assertion made against ONE replica — cluster.hosts[leaderIdx],
-// or whichever node happens to be live — through waitForMembershipSize asks
-// the leader whether the leader
-// applied the change, which it necessarily did: the leader is where the config
-// change was proposed, and it applies it on commit. The interesting failure is
-// the OTHER side of that: a config change that commits, applies on the leader,
-// and never lands on a follower. That follower then sizes every quorum over a
-// membership the rest of the shard has left — the exact denominator error that
-// lets a minority elect, or lets an entry be reported committed on a count the
-// real configuration does not accept. A single-replica assertion cannot see it,
-// and neither could any test in this suite.
-//
-// Convergence, not instantaneous agreement, is the property being asserted:
-// config changes apply on each replica when the entry commits there, so
-// followers legitimately trail the leader by a replication round trip. The
-// timeout is what separates "trailing" from "diverged".
-//
-// Replicas the harness has stopped are excluded — a dead node has no
-// configuration to report. Everything still running is included, including
-// nodes added mid-test by addNodeToCluster, because a newly joined replica
-// holding a configuration that omits its own peers is precisely the divergence
-// this is looking for.
+// waitForMembershipConverged waits until every live replica reports exactly wantNodes voters and at least wantRemoved removed.
 func waitForMembershipConverged(
 	t *testing.T,
 	cluster *testCluster,
@@ -2099,13 +1725,7 @@ func membershipDivergence(
 		if h == nil || cluster.stopped[i].Load() {
 			continue
 		}
-		// A replica in wantRemoved is excluded: convergence is a property of
-		// the CURRENT configuration, and once the removal commits the leader
-		// stops replicating to the evicted replica, so whether it ever learns
-		// of its own eviction depends on where it was in the replication stream
-		// when the entry committed. Requiring it to agree asserts on a race.
-		// Every replica still IN the configuration must converge — that is the
-		// divergence being hunted.
+		// Removed replicas need not converge.
 		if slices.Contains(wantRemoved, uint64(i+1)) {
 			continue
 		}
@@ -2217,24 +1837,7 @@ type barrierTestCluster struct {
 // Counting Barrier
 // ---------------------------------------------------------------------------
 
-// countingBarrier wraps a seal.Barrier and counts the frames the SNAPSHOT
-// pipeline seals through it, so a test can assert that at-rest encryption was
-// actually INVOKED rather than merely configured.
-//
-// It exists because IsSealed() == false alone is an in-memory flag that no
-// production code path touches.
-// A total plaintext downgrade — the engine resolving no barrier for the shard
-// and writing the snapshot in the clear — leaves that flag exactly as it was.
-//
-// EncryptWithEpochPinnedContext and EncryptWithEpochContext are the only two
-// entry points the snapshot encrypt loop uses: engine.epochPinner.sealFrame
-// takes the pinned one when the barrier offers it (seal.Barrier does) and the
-// context one otherwise. Neither is reachable from the WAL, which seals records
-// through EncryptWithEpoch/EncryptWithContext, so the count is specific to
-// snapshot frames and cannot be satisfied by ordinary log traffic.
-//
-// The overriding methods shadow the promoted ones, including for the dynamic
-// type assertions the engine performs (atomicEpochPinner, walContextBarrier).
+// countingBarrier counts snapshot frames sealed through a seal.Barrier, so tests can check encryption ran.
 type countingBarrier struct {
 	*seal.Barrier
 	frameSeals atomic.Int64
@@ -2296,7 +1899,7 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 		b := &countingBarrier{Barrier: seal.MustNewBarrier(testBarrierConfig(1))}
 		s, err := newTestSealStrategy([]byte(fmt.Sprintf("test-passphrase-%d", i)))
 		if err != nil {
-			// Clean up previously created hosts.
+			// Clean up hosts already created.
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
@@ -2366,20 +1969,10 @@ func newBarrierForNode(t *testing.T) *countingBarrier {
 // writing somewhere else entirely.
 const snapshotDataFileName = "snapshot.dat"
 
-// snapshotMetaFileName is the record the engine writes BESIDE each snapshot
-// payload once the save that produced it has finished. Like the payload name it
-// is duplicated here rather than read out of the engine, for the same reason.
+// snapshotMetaFileName is the metadata file the engine writes beside each finished snapshot.
 const snapshotMetaFileName = "snapshot.meta"
 
-// snapshotArtifacts returns every snapshot payload file beneath dir. The whole
-// tree is walked rather than the documented path being reconstructed so the
-// search still finds the artifacts if the layout changes.
-//
-// An entry that vanishes mid-walk is skipped rather than failed. Snapshot
-// garbage collection removes whole snapshot directories concurrently with the
-// walk, and a directory that no longer exists holds no bytes to assert over;
-// failing on it would report a deleted artifact as an unreadable one. Every
-// other walk error still fails.
+// snapshotArtifacts returns every snapshot payload under dir, skipping entries removed mid-walk.
 func snapshotArtifacts(t *testing.T, dir string) []string {
 	t.Helper()
 	var found []string
@@ -2401,20 +1994,7 @@ func snapshotArtifacts(t *testing.T, dir string) []string {
 	return found
 }
 
-// snapshotArtifactEpoch reads the at-rest encryption epoch out of the
-// snapshot.meta record at metaPath. ok is false when the record is not (yet) a
-// complete one, which is how a save that has not finished is recognised.
-//
-// The record is parsed positionally against its documented layout — an 8-byte
-// magic, a 2-byte body version, 2 reserved bytes, a 4-byte body length, then
-// little-endian uint64 body fields with Epoch sixth. The layout is restated
-// here rather than decoded with the engine's own reader for the reason the file
-// names are: a check that borrows the writer's decoder cannot notice the writer
-// recording something other than what it stored.
-//
-// An epoch of 0 is a VALID read and means the artifact was stored in the CLEAR.
-// It is never conflated with an unreadable record: the two are opposite in
-// consequence, and only one of them is a finding.
+// snapshotArtifactEpoch parses the Epoch field from the snapshot.meta record at metaPath by its documented layout; ok is false for an incomplete record, and 0 means plaintext.
 func snapshotArtifactEpoch(metaPath string) (epoch uint64, ok bool, why string) {
 	const (
 		magic      = "QRSNAPMD"
@@ -2442,22 +2022,7 @@ func snapshotArtifactEpoch(metaPath string) (epoch uint64, ok bool, why string) 
 	return binary.LittleEndian.Uint64(raw[headerLen+epochOff : headerLen+epochOff+8]), true, ""
 }
 
-// unfinishedSnapshotArtifacts returns, for each path whose snapshot directory
-// does not yet describe itself, why it does not — a missing, empty, or
-// half-written snapshot.meta beside snapshot.dat.
-//
-// A complete metadata record is the completion marker of every path that writes
-// an artifact, and it is what separates "the save is still running" from "the
-// save is done". A local save writes snapshot.dat, fsyncs it, encrypts it IN
-// PLACE and only then creates snapshot.meta and writes the record into it; the
-// receive and import paths assemble both files in a staging directory and
-// publish them with one rename. So a payload with no complete record beside it
-// is a save in flight, and its bytes are whatever the encrypt step has not
-// replaced yet.
-//
-// The record must be COMPLETE, not merely present: writeSnapshotMetadata
-// creates the file with O_TRUNC and writes into it afterwards, so an empty
-// snapshot.meta is observable and means the same thing as no snapshot.meta.
+// unfinishedSnapshotArtifacts returns, per path, why its snapshot directory lacks a complete snapshot.meta.
 func unfinishedSnapshotArtifacts(paths []string) []string {
 	var pending []string
 	for _, p := range paths {
@@ -2468,17 +2033,7 @@ func unfinishedSnapshotArtifacts(paths []string) []string {
 	return pending
 }
 
-// waitForFinishedSnapshotArtifacts blocks until dir holds at least one snapshot
-// artifact AND every artifact beneath it has finished being written, then
-// returns them all.
-//
-// Waiting for completion is NOT the same as ignoring what is incomplete. A
-// directory that never becomes self-describing is a leaked plaintext artifact —
-// the state a save killed between its plaintext fsync and its encrypt leaves
-// behind — so the timeout FAILS and names the directories with the reason each
-// was rejected, rather than dropping them from the search. The only thing the
-// wait removes is the window in which a save this node is running right now has
-// not finished.
+// waitForFinishedSnapshotArtifacts waits until dir holds at least one artifact and all are complete, failing with the reasons on timeout.
 func waitForFinishedSnapshotArtifacts(t *testing.T, label, dir string, timeout time.Duration) []string {
 	t.Helper()
 	var paths, pending []string
@@ -2518,42 +2073,7 @@ func waitForSnapshotArtifact(t *testing.T, label, dir string, timeout time.Durat
 	return paths
 }
 
-// assertSnapshotsSealed fails unless dir holds at least one snapshot artifact,
-// every artifact beneath it finished being written, each records a non-zero
-// at-rest epoch, and none contains any of the plaintext needles.
-//
-// This is deliberately a check of the BYTES ON DISK rather than a round trip.
-// A round trip through the engine reads back whatever it wrote, so it passes
-// identically whether the artifact was sealed or written in the clear — which
-// is exactly the plaintext downgrade at-rest encryption exists to prevent. The
-// non-empty artifact count is part of the assertion: a search that finds no
-// files to search is vacuous, not a pass.
-//
-// EVERY artifact under the node's whole tree is searched, not just the newest.
-// A stale artifact left in the clear by an earlier save is exactly the leak an
-// at-rest check exists to catch, and narrowing the search to the most recent
-// index would step over it.
-//
-// The two checks per artifact are independent and neither implies the other.
-// The recorded epoch says the encrypt path RAN and under which DEK; a zero
-// epoch on a barrier-encrypted node is a plaintext downgrade whether or not
-// this particular snapshot happens to hold a needle. The byte search says what
-// reached the disk is not readable, which a recorded epoch alone would not
-// prove.
-//
-// What the completion wait buys, and what it costs: the engine's local save
-// path writes the state machine to snapshot.dat, fsyncs it, and encrypts it IN
-// PLACE afterwards, so between those steps the canonical name holds a COMPLETE
-// plaintext copy. Scanning during that window would read a save in progress
-// and report it as a downgrade, which happens on a heavily loaded host.
-// Waiting for every artifact to become
-// self-describing removes that window WITHOUT dropping anything from the
-// search: an artifact that never finishes fails the wait rather than being
-// skipped, which is what keeps a save killed inside the window a failure here.
-//
-// The window ITSELF is a property of the product, not of this test. Nothing
-// about it is being asserted away: this function only declines to report a
-// save that is running right now as a downgrade.
+// assertSnapshotsSealed fails unless dir holds complete artifacts that each record a non-zero epoch and contain none of needles.
 func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
 	t.Helper()
 	if len(needles) == 0 {
@@ -2564,10 +2084,7 @@ func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if errors.Is(err, fs.ErrNotExist) {
-			// Snapshot garbage collection reclaimed the whole directory between
-			// the walk and this read. A path that no longer exists holds no
-			// bytes on disk, so there is nothing here to leak and nothing to
-			// assert over; every other read error still fails.
+			// Snapshot GC removed the directory; nothing to check.
 			continue
 		}
 		if err != nil {
@@ -2611,14 +2128,7 @@ func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
 		"epoch and none containing plaintext", label, checked, dir)
 }
 
-// requestSnapshotSync asks host for an explicit snapshot of shardID and WAITS
-// for the result, returning the snapshot index.
-//
-// Reading the result is the point: RequestSnapshot is asynchronous, so a caller
-// that Release()s the state without reading it has asserted nothing about
-// whether a snapshot was taken, only that one was asked for. An automatic
-// snapshot may already be running, which is the one legitimate transient
-// failure, so that case retries; everything else fails immediately.
+// requestSnapshotSync requests a snapshot of shardID on host and returns its index, retrying only while another snapshot runs.
 func requestSnapshotSync(t *testing.T, host *quicraft.Host, shardID uint64) uint64 {
 	t.Helper()
 
@@ -2653,15 +2163,7 @@ func requestSnapshotSync(t *testing.T, host *quicraft.Host, shardID uint64) uint
 	return 0
 }
 
-// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation at the top of
-// this file to the configuration the suite actually starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives testShardConfig an explicit ElectionRTT, or
-// hands testHostConfig a different RTTMillisecond, electionRound silently
-// starts describing a cluster that no longer exists and every budget built on
-// it is wrong by that factor — which is exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
+// TestBudgetsDescribeTheClusterTheyBudgetFor checks the election budget constants match the config builders.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	for _, walSync := range []bool{false, true} {
 		rtt := harnessRTTMillisecond(walSync)

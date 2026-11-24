@@ -24,12 +24,7 @@ import (
 	"testing"
 )
 
-// Read/Destroy race cover on the Shamir path specifically. The locking lives in
-// the protected-memory layer (go-enclave), but ProtectedShare is how a custody
-// ceremony actually reaches it: a ceremony tearing shares down while a reader
-// is still walking them is a realistic shape, not a contrived one.
-//
-// Meaningful under -race; `make test-race` covers this package.
+// Read/Destroy race tests for ProtectedShare; meaningful under -race.
 
 // protectedTestShare builds one share to exercise.
 func protectedTestShare(t *testing.T) *ProtectedShare {
@@ -46,18 +41,7 @@ func protectedTestShare(t *testing.T) *ProtectedShare {
 	return shares[0]
 }
 
-// TestProtectedShare_WithValueExcludesDestroy covers the window a borrow exists for:
-// the caller is still READING the share's bytes when teardown arrives.
-//
-// It asserts the lifetime invariant — a callback must never be running once
-// Destroy has returned — rather than dereferencing the value and waiting for a
-// fault. The dereferencing form silently passes against a broken implementation:
-// -race does not instrument an mmap'd region, so the only signal there is an
-// intermittent SIGSEGV.
-//
-// Each callback that does run sees the whole live value, a second Destroy is
-// safe, every borrow after Destroy is refused without running its callback,
-// and -race must report nothing.
+// TestProtectedShare_WithValueExcludesDestroy asserts no callback runs after Destroy returns.
 func TestProtectedShare_WithValueExcludesDestroy(t *testing.T) {
 	const iterations = 100
 
@@ -143,20 +127,7 @@ func TestProtectedShare_WithValueNilReceiver(t *testing.T) {
 	}
 }
 
-// TestCombineProtected_RacesShareDestroy covers the reconstruction hazard:
-// CombineProtected is the one path in this package that reads share values on
-// the caller's behalf, so if it read them through the bare alias rather than
-// the teardown-safe WithValue, a ceremony cancelled or timed out while
-// reconstruction is mid-decode could unmap the source under it. A caller
-// cannot guard that from outside, because CombineProtected obtains the slices
-// itself.
-//
-// Every read now runs inside the share's borrow, so a concurrent Destroy waits
-// rather than unmapping the decode's source operand. The outcome of any given
-// iteration is deliberately not asserted: whether reconstruction wins the race
-// or reports a destroyed share is timing, and both are correct. What must never
-// happen is a crash or a torn read, which is what running this under -race with
-// teardown landing at every point in the decode is checking.
+// TestCombineProtected_RacesShareDestroy runs CombineProtected against concurrent share Destroy under -race.
 func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 	const iterations = 200
 
@@ -199,58 +170,9 @@ func TestCombineProtected_RacesShareDestroy(t *testing.T) {
 	}
 }
 
-// --- The MarshalJSON alias ---
-//
-// "A Destroy already entered cannot COMPLETE while a WithValue callback runs" is
-// go-enclave's property — its withLocked takes the enclave's read lock and its
-// Destroy takes the write lock — and go-enclave tests it deterministically.
-// Re-implementing an observation hook here to re-test it would be
-// instrumenting a dependency through its consumer. The behavioural coverage
-// needs no hook: TestProtectedShare_WithValueExcludesDestroy and
-// TestProtectedShare_WithValueDestroyRace run the same collision under -race.
+// MarshalJSON alias lifetime.
 
-// TestProtectedShare_MarshalJSONRacesDestroy covers the MarshalJSON alias
-// lifetime. Capturing the view out of the WithValue callback and then appending
-// it into the output buffer would read protected memory after the borrow ended
-// and the enclave was free to be unmapped. Same hazard class as
-// CombineProtected's, one call site further on, and unreachable by any
-// caller-side discipline because MarshalJSON obtains the slice itself.
-//
-// THIS PROBE IS PROBABILISTIC, AND UNLIKE THE HOLD-OFF PROBES ABOVE IT CANNOT
-// BE MADE DETERMINISTIC. The deterministic construction works by having the
-// callback itself signal when the borrow is held; MarshalJSON runs no
-// caller-supplied code inside its borrow, so there is no hook, and any
-// arrangement that blocks Destroy from outside blocks it identically for a
-// fixed and a broken implementation. Adding a test-only hook to MarshalJSON to
-// manufacture one would be instrumenting production code to make a test
-// convenient.
-//
-// So the window is widened instead, by the only lever the API offers: share
-// SIZE. The value is the base64 of the largest secret this suite can split
-// without straining RLIMIT_MEMLOCK, which makes the vulnerable `append` a
-// ~44 KB copy rather than a ~44 byte one — roughly a thousandfold more time
-// spent holding the alias.
-//
-// MEASURED catch rate against that captured-view mutation, recorded so a
-// future reader knows what this test is and is not worth: 10/10 runs caught it
-// under -race, 0/10 without. The detector's instrumentation is what stretches
-// the window far enough, so THIS TEST IS ONLY MEANINGFUL UNDER -race — which is
-// how the suite runs (GOTEST carries -race), but a reader who runs the package
-// bare should know the probe is inert. The failure it produced was unambiguous:
-// `invalid character '\x00' in string literal`, i.e. the wiped buffer being
-// appended into the document mid-encode.
-//
-// A passing run is therefore weak evidence of correctness and a failing run is
-// strong evidence of a defect. The reason the code is trusted is that the encode
-// provably runs inside the borrow, which is a property of the code; this probe
-// is the backstop that would notice if that stopped being true.
-//
-// The assertion is on the RESULT, not on survival: marshalling either produces
-// the whole share or refuses because the share was destroyed first. What it must
-// never produce is a truncated or corrupted document, which is what reading a
-// wiped buffer mid-append yields — a share record that round-trips as valid JSON
-// and reconstructs garbage is a worse outcome than an error, because nothing
-// downstream would flag it.
+// TestProtectedShare_MarshalJSONRacesDestroy races MarshalJSON against Destroy with a large share; probabilistic and only meaningful under -race.
 func TestProtectedShare_MarshalJSONRacesDestroy(t *testing.T) {
 	const (
 		iterations = 200

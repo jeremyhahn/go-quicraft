@@ -28,12 +28,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// Command encoding for cachedKVDiskSM. Each command is one opcode byte, then
-// the key, then (for puts) '=' and the value:
-//
-//	P key=value  put
-//	A key=value  put-if-absent (declined when the key exists)
-//	D key        delete
+// cachedKVDiskSM commands: P key=value put, A key=value put-if-absent, D key delete.
 const (
 	cachedKVOpPut         = 'P'
 	cachedKVOpPutIfAbsent = 'A'
@@ -220,13 +215,7 @@ func (m *cachedKVDiskSM) Close(_ context.Context) error { return nil }
 
 var _ sm.DiskStateMachine = (*cachedKVDiskSM)(nil)
 
-// TestHost_CachedDiskSM runs a CachedDiskStateMachine wrapping a file-backed
-// key-value DiskStateMachine on a single-voter transportless Host with a real
-// WAL, and checks the contract docs/multi-group-host/api.md
-// ("CachedDiskStateMachine") states: reads are served from the cache, an
-// overwrite, a delete or a declined conditional write is never served stale
-// from it, a returned value is the caller's own copy, and every key keeps its
-// last value across StopShard and StartShard.
+// TestHost_CachedDiskSM checks the CachedDiskStateMachine contract in docs/multi-group-host/api.md on a single-voter Host.
 func TestHost_CachedDiskSM(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())

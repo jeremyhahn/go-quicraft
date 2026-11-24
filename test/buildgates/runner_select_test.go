@@ -16,11 +16,7 @@ package buildgates
 
 import "testing"
 
-// runnerSelectTests is the preflight step `Balanced runner pool (ruling
-// 1137)`'s own test, from the CI template: it reads the step's run block out
-// of ci.yml and runs it against a fake API, checking the runner and
-// runner_docker outputs it writes (the hosted default, ubuntu-latest, on any
-// doubt; no call off github.com; a fork's head stays hosted).
+// runnerSelectTests runs the runner-pool preflight step from ci.yml against a fake API.
 const runnerSelectTests = "testdata/runner-select-tests.py"
 
 func TestRunnerSelectStepPicksPool(t *testing.T) {

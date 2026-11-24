@@ -22,20 +22,10 @@ import (
 	"testing"
 )
 
-// moduleCredentialFile is the one place a workstation keeps the Gitea module
-// credentials the benchmark image builds need. It is a token on disk,
-// so every path that copies the working tree somewhere has to leave it behind.
+// moduleCredentialFile is where a workstation keeps the private module credentials; every tree copy must leave it out.
 const moduleCredentialFile = ".devcontainer/.env"
 
-// TestTheCredentialFileLeavesTheTreeByNoRoute pins the three copies together.
-// .gitignore keeps the token out of git; that is the obvious one and the only
-// one that was written first. Six Dockerfiles `COPY . .` the whole context, so
-// .dockerignore is what keeps the token out of the builder layer that precedes
-// the secret mount -- the mount is pointless if the COPY before it already
-// carried the file. And run-remote.sh rsyncs the tree to the bench host, where
-// rsync does not read .gitignore and --delete leaves excluded paths alone, so
-// staging must both exclude the file and remove any copy an earlier staging
-// left.
+// TestTheCredentialFileLeavesTheTreeByNoRoute checks .gitignore, .dockerignore and run-remote.sh staging all exclude the token.
 func TestTheCredentialFileLeavesTheTreeByNoRoute(t *testing.T) {
 	root := filepath.Join("..", "..")
 	for _, tc := range []struct {
@@ -92,10 +82,7 @@ func ignoreEntries(body string) []string {
 	return entries
 }
 
-// TestTheDevImageIgnoreFileRepeatsTheRootList stops the two ignore files from
-// drifting. BuildKit uses the per-Dockerfile file INSTEAD of the root one, so
-// an entry added only at the root -- a new credential, a private workflow
-// file -- would silently enter the dev image.
+// TestTheDevImageIgnoreFileRepeatsTheRootList checks the per-Dockerfile ignore file repeats the root list.
 func TestTheDevImageIgnoreFileRepeatsTheRootList(t *testing.T) {
 	root := filepath.Join("..", "..")
 	have := make(map[string]bool)

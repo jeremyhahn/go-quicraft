@@ -26,25 +26,7 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
-// The analyser build-toolchain gate
-//
-// GOLANGCI_VERSION pins WHICH ANALYSER, not WHICH GO BUILT IT, and only the
-// first half is visible to the pin gate in tool_versions_test.go. The second
-// half is what broke local linting when go.mod moved to `go 1.27.1`: a
-// correctly pinned golangci-lint built with go1.26.2 refuses the module before
-// reading a line of source, while CI's identically-versioned binary — built
-// with the runner image's 1.27 — passes. Same version string, opposite
-// outcome.
-//
-// `make check-lint-toolchain` closes that half by reading the build toolchain
-// out of the binary's own self-report. Unlike the pin recipe, this one is
-// EXECUTED here rather than re-implemented: it is short, it touches nothing
-// outside the analyser it is pointed at, and re-implementing a comparison in
-// Go would test a copy of the logic instead of the shell that actually runs.
-// Each case points TOOLS_BIN at a stub that reports a chosen version string,
-// which is the one input the guard reads.
-// ---------------------------------------------------------------------------
+// The analyser build-toolchain gate: make check-lint-toolchain reads the Go version that built golangci-lint; each case points TOOLS_BIN at a stub reporting a chosen version.
 
 // analyserReport is the shape golangci-lint's --version prints. The guard
 // parses "has version X" and "built with goY" out of it, so the stub reproduces
@@ -118,13 +100,7 @@ func pinnedAnalyserVersion(t *testing.T) string {
 	return strings.TrimPrefix(declaredGolangciVersion(t), "v")
 }
 
-// TestGuardRejectsAnAnalyserBuiltByAnOlderGo pins the toolchain guard.
-//
-// The message matters as much as the exit code. Without the guard, a developer
-// meets golangci-lint's own "the Go language version (go1.26) used to build
-// golangci-lint is lower than the targeted Go version" with nothing saying
-// which binary produced it or what to run — so the failure is diagnosed once
-// per developer, and in the meantime nobody lints before pushing.
+// TestGuardRejectsAnAnalyserBuiltByAnOlderGo checks the guard's exit code and that its message names the binary and the fix.
 func TestGuardRejectsAnAnalyserBuiltByAnOlderGo(t *testing.T) {
 	need := moduleGoDirective(t)
 	bin := stubAnalyser(t, pinnedAnalyserVersion(t), "1.26.2")
@@ -142,12 +118,7 @@ func TestGuardRejectsAnAnalyserBuiltByAnOlderGo(t *testing.T) {
 	}
 }
 
-// TestGuardComparesToolchainsNumerically pins the comparison itself.
-//
-// A lexical string compare passes go1.9 against a 1.27 module, because "1.9"
-// sorts after "1.27". That is the one wrong answer a hand-rolled comparison
-// reaches by default, and it fails OPEN: the analyser is ancient and the gate
-// waves it through.
+// TestGuardComparesToolchainsNumerically checks go1.9 is older than go1.27.
 func TestGuardComparesToolchainsNumerically(t *testing.T) {
 	version := pinnedAnalyserVersion(t)
 

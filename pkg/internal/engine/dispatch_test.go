@@ -24,9 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// unloadOnLeaderCallback is an engine Callback that reacts to a leadership
-// change by STOPPING the shard, which is what an operator handler naturally
-// does. It records how long the reaction took and signals completion.
+// unloadOnLeaderCallback stops the shard on a leadership change and records how long that took.
 type unloadOnLeaderCallback struct {
 	testCallback
 	engine  *Engine
@@ -44,22 +42,7 @@ func (c *unloadOnLeaderCallback) OnLeaderUpdated(shardID, leaderID, term uint64)
 	})
 }
 
-// TestEngine_ListenerStopsShardFromLeaderCallback_DoesNotDeadlock is the
-// regression test for the step-worker callback reentrancy deadlock.
-//
-// Every callback the step worker fired ran synchronously on the step-worker
-// goroutine WHILE it held stepWorker.nodesMu.RLock — tick() and processReady()
-// hold it for their whole body. Engine.UnloadNode (Host.StopShard) re-enters
-// nodesMu.Lock() on that same goroutine via stepWorker.unloadNode, and Go's
-// RWMutex is not reentrant, so this was a PERMANENT deadlock rather than a
-// stall: every shard mapped to shardID % numWorkers stopped ticking (no
-// heartbeats, no elections, no inbox drain) and a later Engine.Stop never
-// returned from stepWg.Wait().
-//
-// The fix delivers user-visible notifications on the listener dispatcher, a
-// goroutine that holds no engine lock. The test therefore asserts two things
-// with hard deadlines — the callback's StopShard completes, and Engine.Stop
-// afterwards returns — because a test that hangs forever is not a passing test.
+// TestEngine_ListenerStopsShardFromLeaderCallback_DoesNotDeadlock verifies a listener can stop its shard from a leader callback.
 func TestEngine_ListenerStopsShardFromLeaderCallback_DoesNotDeadlock(t *testing.T) {
 	const shardID, replicaID = 1, 1
 
@@ -72,8 +55,7 @@ func TestEngine_ListenerStopsShardFromLeaderCallback_DoesNotDeadlock(t *testing.
 	cb := &unloadOnLeaderCallback{engine: e, done: make(chan struct{})}
 	e.SetCallback(cb)
 
-	// Build the peer and carry it to leadership BEFORE the engine starts, so the
-	// test goroutine is the peer's only toucher while it is being driven.
+	// Drive the peer to leadership before the engine starts.
 	peer, lr := newTestVoterPeer(t, shardID, replicaID, 3)
 	driveToLeader(t, peer, replicaID, 2)
 
@@ -114,15 +96,7 @@ func TestEngine_ListenerStopsShardFromLeaderCallback_DoesNotDeadlock(t *testing.
 	}
 }
 
-// TestNode_HandleError_DoesNotRunListenerOnCallerGoroutine covers the other half
-// of the same defect: EventListener.OnShardFailed is fired from node.handleError,
-// which the step worker reaches under nodesMu.RLock (a GetUpdate failure) and a
-// per-shard apply goroutine reaches on the very goroutine a synchronous
-// UnloadNode joins on. "React to a failed shard by stopping it" is the obvious
-// handler, so running it on the producing goroutine is the same deadlock.
-//
-// The observable contract is that handleError RETURNS while the listener is
-// still executing, i.e. the listener does not run on the caller's goroutine.
+// TestNode_HandleError_DoesNotRunListenerOnCallerGoroutine verifies OnShardFailed runs on the dispatcher, not the caller.
 func TestNode_HandleError_DoesNotRunListenerOnCallerGoroutine(t *testing.T) {
 	cfg := newTestHostConfig()
 	cfg.NumWorkers = 1
@@ -167,11 +141,7 @@ func TestNode_HandleError_DoesNotRunListenerOnCallerGoroutine(t *testing.T) {
 	close(release)
 }
 
-// TestListenerDispatcher_PreservesProductionOrder pins the ordering guarantee the
-// dispatcher promises: one goroutine consuming a FIFO queue, so notifications
-// arrive in the order the engine produced them — a total order, and therefore
-// per-shard order too. Consumers that watch a shard go leader -> follower ->
-// leader depend on it.
+// TestListenerDispatcher_PreservesProductionOrder verifies notifications arrive in production order.
 func TestListenerDispatcher_PreservesProductionOrder(t *testing.T) {
 	d := newListenerDispatcher()
 	var wg sync.WaitGroup
@@ -204,12 +174,7 @@ func TestListenerDispatcher_PreservesProductionOrder(t *testing.T) {
 	}
 }
 
-// blockDispatcher parks the dispatcher goroutine inside a notification and
-// returns the channel that releases it, only once it is provably parked. The
-// wait is what makes "fill the queue to capacity" deterministic: without it the
-// blocker may still be sitting IN the queue when the fill starts, so the fill
-// overflows by one and then frees a slot when the consumer finally picks the
-// blocker up.
+// blockDispatcher parks the dispatcher in a notification and returns the channel that releases it.
 func blockDispatcher(t *testing.T, d *listenerDispatcher) (release chan struct{}, parked chan struct{}) {
 	t.Helper()
 	release = make(chan struct{})
@@ -229,20 +194,13 @@ func blockDispatcher(t *testing.T, d *listenerDispatcher) (release chan struct{}
 	return release, parked
 }
 
-// TestListenerDispatcher_FullQueueRefusesWithoutBlocking pins the queue-full
-// policy. dispatch must NEVER block the producing worker: a worker parked on a
-// full queue still holds nodesMu.RLock, so a listener calling StopShard from the
-// dispatcher goroutine would wait on nodesMu.Lock() behind that parked reader
-// and neither would move again — the deadlock the dispatcher exists to remove.
-// Refusal must be reported to the caller and counted, never silent.
+// TestListenerDispatcher_FullQueueRefusesWithoutBlocking verifies dispatch never blocks on a full queue.
 func TestListenerDispatcher_FullQueueRefusesWithoutBlocking(t *testing.T) {
 	d := newListenerDispatcher()
 	var wg sync.WaitGroup
 	d.start(&wg)
 
-	// Park the consumer so nothing drains, and WAIT until it is actually parked
-	// before filling: the dispatch below only leaves the queue exactly full if
-	// the blocker has already been dequeued.
+	// Park the consumer before filling the queue.
 	block, _ := blockDispatcher(t, d)
 	for i := range listenerQueueSize {
 		if !d.dispatch(func() {}) {
@@ -274,12 +232,7 @@ func TestListenerDispatcher_FullQueueRefusesWithoutBlocking(t *testing.T) {
 	wg.Wait()
 }
 
-// TestStepWorker_LeaderChangeIsRepublishedWhenQueueIsFull pins the one
-// queue-full policy that is NOT drop. OnLeaderUpdated maintains the Host's
-// isLeader mirror — the flag clients route writes by — so losing one leaves
-// ShardInfo permanently wrong. publishLeaderChange therefore commits its
-// prevLeaders bookkeeping only when the dispatch is accepted, which makes a
-// refused publish retry on the next tick instead of vanishing.
+// TestStepWorker_LeaderChangeIsRepublishedWhenQueueIsFull verifies a dropped leader change is republished.
 func TestStepWorker_LeaderChangeIsRepublishedWhenQueueIsFull(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)

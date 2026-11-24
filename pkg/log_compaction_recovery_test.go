@@ -62,12 +62,7 @@ func proposePuts(ctx context.Context, t *testing.T, h *Host, start, n int) {
 	}
 }
 
-// TestRequestCompaction_AfterSnapshotTrimsLogAndRestartRecovers drives the
-// operator sequence snapshot -> RequestCompaction on a disk LogDB, checks the
-// log really was trimmed (LogRange moves up, QueryRaftLog below it reports
-// the entries compacted), then reopens the Host on the same directories and
-// checks the state machine recovers to the same hash: the snapshot plus the
-// retained tail must still rebuild every committed write.
+// TestRequestCompaction_AfterSnapshotTrimsLogAndRestartRecovers: snapshot then RequestCompaction trims the log, and a reopened Host recovers the same state hash.
 func TestRequestCompaction_AfterSnapshotTrimsLogAndRestartRecovers(t *testing.T) {
 	cfg := testHostConfig(t)
 	members := map[uint64]string{1: cfg.RaftAddress}

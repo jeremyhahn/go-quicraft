@@ -63,14 +63,7 @@ func writeSnapshotDir(t *testing.T, data []byte) string {
 	return dir
 }
 
-// TestVerifySnapshotArtifact_DetectsSilentCorruption is the check a
-// no-barrier deployment has instead of AEAD.
-//
-// A single flipped byte inside a serialized value leaves the file LENGTH
-// unchanged, so no structural check trips: the corrupt value parses, recovers
-// into the state machine, and is served to clients. The replica then holds a
-// different value for that key than its peers at the same log index, with
-// every Raft invariant intact and no error raised anywhere.
+// TestVerifySnapshotArtifact_DetectsSilentCorruption checks a same-length flipped byte is detected without AEAD.
 func TestVerifySnapshotArtifact_DetectsSilentCorruption(t *testing.T) {
 	data := []byte("the quick brown fox jumps over the lazy dog, twice over")
 	dir := writeSnapshotDir(t, data)
@@ -96,16 +89,7 @@ func TestVerifySnapshotArtifact_DetectsSilentCorruption(t *testing.T) {
 	}
 }
 
-// TestVerifySnapshotArtifact_RefusesUnverifiableMetadata guards against an
-// integrity check that switches itself off.
-//
-// VerifySnapshotArtifact must not return nil when snapshot.meta cannot be read
-// or parsed, or carries no integrity fields, by calling the artifact
-// "legacy". Every writer stamps the fields before a directory is published, so
-// no legitimately written artifact lacks them; what does is a partial restore
-// that dropped or damaged snapshot.meta. Paired with a same-length alteration
-// of snapshot.dat — here, one flipped bit — that recovered divergent state into
-// the state machine with no error anywhere. Each case must now fail closed.
+// TestVerifySnapshotArtifact_RefusesUnverifiableMetadata checks a missing, unreadable or field-less snapshot.meta fails closed.
 func TestVerifySnapshotArtifact_RefusesUnverifiableMetadata(t *testing.T) {
 	data := []byte("the quick brown fox jumps over the lazy dog, twice over")
 	cases := []struct {
@@ -200,13 +184,7 @@ func TestRecoverSnapshot_RefusesMissingMetadata(t *testing.T) {
 	}
 }
 
-// TestSnapshotDataVerifier_AgreesWithVerifySnapshotArtifact pins that the
-// streaming verifier the send and export paths use reaches the SAME verdict
-// VerifySnapshotArtifact reaches on the same artifact, over every record
-// state — intact, flipped, truncated, pre-integrity and missing. The two share
-// one policy (checkSnapshotArtifact) rather than copies of it, so a change to
-// what a missing record means lands on egress and recovery together; this
-// test is what fails if either side grows its own.
+// TestSnapshotDataVerifier_AgreesWithVerifySnapshotArtifact checks the streaming verifier reaches the same verdict on every record state.
 func TestSnapshotDataVerifier_AgreesWithVerifySnapshotArtifact(t *testing.T) {
 	data := []byte("streamed and verified in the same pass, never read twice")
 	rewrite := func(t *testing.T, dir, name string, b []byte) {

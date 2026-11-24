@@ -32,15 +32,7 @@ import (
 // Per-barrier (per-tenant) WAL/snapshot test helpers
 // ---------------------------------------------------------------------------
 
-// tenantBarrier is a SnapshotBarrier whose ciphertext is cryptographically
-// bound to a per-instance id, so one tenant's barrier CANNOT decrypt another
-// tenant's frames. Unlike testBarrier (which keys purely on the epoch and is
-// therefore interchangeable across instances), tenantBarrier proves Invariant 2
-// (frame-level encryption) and Invariant 3 (per-shard isolation): a decrypt
-// attempt with the wrong barrier fails. Frames embed their own epoch so
-// recovery after a key rotation is still correct.
-//
-// Frame layout: [epoch:8][id:1][data XOR (byte(epoch) ^ id)].
+// tenantBarrier is a SnapshotBarrier whose frames only the same instance can decrypt.
 type tenantBarrier struct {
 	mu             sync.Mutex
 	id             byte
@@ -124,8 +116,7 @@ func (b *tenantBarrier) DecryptForEpoch(_, ciphertext []byte, epoch uint64) ([]b
 		return nil, errors.New("ciphertext too short")
 	}
 	if ciphertext[8] != b.id {
-		// Frame was sealed by a DIFFERENT tenant barrier: reject. This is what
-		// makes cross-barrier decryption fail and proves per-tenant isolation.
+		// A frame sealed by a different tenant barrier is rejected.
 		return nil, errors.New("tenantBarrier: foreign frame id")
 	}
 	key := byte(epoch) ^ b.id
@@ -198,12 +189,7 @@ var _ SnapshotBarrier = (*tenantBarrier)(nil)
 type perBarrierTestLogDB struct {
 	snapshotTestLogDB
 	floors map[any]uint64 // barrier identity -> WAL min-live epoch (key present == owned)
-	// shardsByBarrier optionally models a per-barrier shard registry
-	// (logdb.BarrierShardEnumerator). A barrier present here is treated as a
-	// fixed, fully-enumerable shard set; absent barriers report known=false so
-	// the snapshot pool's completeness guard is skipped (matching a LogDB that
-	// cannot enumerate shards). Left empty by tests that do not exercise the
-	// guard.
+	// shardsByBarrier models a per-barrier shard registry; an absent barrier reports known=false.
 	shardsByBarrier map[any][]uint64
 	queryErr        error
 }
@@ -231,9 +217,7 @@ func (db *perBarrierTestLogDB) MinLiveEpoch() (uint64, error) {
 	return min, nil
 }
 
-// MinLiveEpochForBarrier returns the WAL floor restricted to the given barrier.
-// A barrier present in floors (even with value 0) is OWNED -> known=true; an
-// absent barrier is not owned -> known=false (fail safe).
+// MinLiveEpochForBarrier returns the WAL floor for barrier; an absent barrier reports known=false.
 func (db *perBarrierTestLogDB) MinLiveEpochForBarrier(barrier any) (uint64, bool, error) {
 	if db.queryErr != nil {
 		return 0, false, db.queryErr
@@ -419,8 +403,7 @@ func TestSnapshotPool_PerBarrier_UnknownBarrierFailSafe(t *testing.T) {
 	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
 	p.shardBarriers = func(uint64) SnapshotBarrier { return bUnknown }
 	wireSnapshotNodes(p, snapshotDirNode(baseDir, 1, 1))
-	// A retained encrypted snapshot exists for the shard, so the ONLY thing
-	// preventing a purge is the unknown-barrier WAL fail-safe.
+	// Only the unknown-barrier WAL fail-safe prevents the purge here.
 	writeShardSnapshot(t, baseDir, 1, 1, 100, 3)
 
 	if floor, ok := p.perBarrierSafePurgeFloor(bUnknown); ok {
@@ -448,11 +431,7 @@ func TestSnapshotPool_PerBarrier_CorruptSnapshotMetaFailSafe(t *testing.T) {
 	p.shardBarriers = func(uint64) SnapshotBarrier { return bA }
 	wireSnapshotNodes(p, snapshotDirNode(baseDir, 1, 1))
 
-	// Create a snapshot directory whose metadata file is a TORN write: a valid
-	// record cut short so its body no longer reaches the epoch field. The
-	// header still declares the full body length, so the record decodes as
-	// CORRUPT — distinct from a recognised older version, and equally
-	// fail-safe.
+	// A torn snapshot metadata file whose body stops before the epoch field.
 	dir := snapshotSaveDir(baseDir, 1, 1, 100)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -472,12 +451,7 @@ func TestSnapshotPool_PerBarrier_CorruptSnapshotMetaFailSafe(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_PerBarrier_SharedBarrierAllShardsCounted verifies that when
-// a SINGLE barrier maps to MULTIPLE shards, the per-barrier snapshot scan must
-// include ALL of them. With every shard loaded the floor reflects the oldest
-// shard's retained snapshot; if a mapped shard is transiently absent (so its
-// older snapshot cannot be scanned) the floor MUST fail safe rather than rising
-// and over-purging the DEK that absent shard's snapshot still needs.
+// TestSnapshotPool_PerBarrier_SharedBarrierAllShardsCounted verifies a barrier shared by several shards counts all of them.
 func TestSnapshotPool_PerBarrier_SharedBarrierAllShardsCounted(t *testing.T) {
 	baseDir := t.TempDir()
 	bShared := newTenantBarrier(1, 10) // one barrier shared by shards 1, 2, 3
@@ -491,7 +465,7 @@ func TestSnapshotPool_PerBarrier_SharedBarrierAllShardsCounted(t *testing.T) {
 	p := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
 	p.shardBarriers = func(uint64) SnapshotBarrier { return bShared }
 
-	// Shard 3 retains the OLDEST snapshot (epoch 2); shards 1 and 2 are newer.
+	// Shard 3 retains the oldest snapshot (epoch 2).
 	writeShardSnapshot(t, baseDir, 1, 1, 100, 8)
 	writeShardSnapshot(t, baseDir, 2, 1, 100, 7)
 	writeShardSnapshot(t, baseDir, 3, 1, 100, 2)
@@ -602,9 +576,7 @@ func TestSnapshotPool_PerBarrier_CrashRecovery(t *testing.T) {
 		t.Fatalf("shard 9 recorded epoch = %d, want 5", snap.Epoch)
 	}
 
-	// --- simulate crash + restart + a key rotation on tenant A ---
-	// BarrierA rotates to epoch 3 AFTER its snapshot was sealed at epoch 2.
-	// Recovery must still decrypt using the per-frame embedded epoch.
+	// Restart and rotate tenant A to epoch 3; recovery decrypts by the per-frame epoch.
 	bA.rotate(3)
 
 	p2 := newSnapshotPool(2, ldb, nil, nil, nil, stopC, nil)
@@ -657,14 +629,7 @@ func (b *tenantBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD
 	return ct, epoch, nil
 }
 
-// TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier covers
-// stopped shards on the per-barrier path, where the shard enumerator is
-// OPTIONAL: without it, a floor that scanned loaded shards only would miss
-// them. In the production layout each shard has its own snapshot base, so a
-// stopped shard's artifacts would be invisible and its DEK purgeable. The
-// LogDB's records must hold each barrier's floor at its own stopped shard's epoch — and ONLY
-// its own: the resolver attributes an unloaded shard to its barrier, so
-// tenant B's older stopped shard must not lower tenant A's floor.
+// TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier verifies stopped shards count toward their barrier's floor.
 func TestSnapshotPool_PerBarrierFloor_CountsStoppedShardsOfItsOwnBarrier(t *testing.T) {
 	root := t.TempDir()
 	base := func(shardID uint64) string {
@@ -726,13 +691,7 @@ type valueTenantBarrier struct {
 	labels []string
 }
 
-// TestSnapshotPool_PerBarrier_NonComparableBarrierDeclinesPurge verifies the
-// per-barrier purge never compares barrier interface values. A barrier without
-// pointer identity cannot be matched to the shards that share its keyring, so
-// whether it is the purge target or another shard's barrier, the floor is
-// unprovable and the purge is declined: no panic, and no DEK purged that a
-// shard holding a copy of the barrier still needs (shard 2's epoch-2 snapshot
-// here).
+// TestSnapshotPool_PerBarrier_NonComparableBarrierDeclinesPurge verifies a barrier without pointer identity declines the purge.
 func TestSnapshotPool_PerBarrier_NonComparableBarrierDeclinesPurge(t *testing.T) {
 	keyring := newTenantBarrier(1, 10)
 	copyOf := valueTenantBarrier{tenantBarrier: keyring, labels: []string{"tenant"}}

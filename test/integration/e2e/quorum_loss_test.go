@@ -25,14 +25,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// assertKeyAbsentEverywhere fails if key is present on the state machine of any
-// live node, after a settling window long enough for a commit to have
-// propagated had one occurred.
-//
-// This is the assertion that actually says "the write did not happen". An error
-// from Propose says only that the CALLER gave up waiting; an entry can still be
-// in the leader's log, and if it were ever committed and applied without a
-// majority that is the safety violation, whatever the caller was told.
+// assertKeyAbsentEverywhere fails if key is on any live node's state machine after a settling window; a Propose error alone does not prove the write did not happen.
 func assertKeyAbsentEverywhere(
 	t *testing.T,
 	cluster *testCluster,
@@ -68,17 +61,7 @@ func assertKeyAbsentEverywhere(
 	t.Logf("%q is absent from all %d live state machines", key, checked)
 }
 
-// TestE2E_QuorumLoss_RejectsWrites verifies that a 5-node cluster cannot commit
-// a proposal once quorum is lost. In a 5-node cluster quorum requires 3 nodes;
-// three followers are stopped, leaving the LEADER plus one follower.
-//
-// The leader is deliberately left RUNNING. The previous version stopped the
-// leader before proposing anything, so every remaining node answered Propose
-// with ErrNotLeader — an outcome produced by the absence of a leader, not by
-// the quorum rule. That test passed identically on a build with no quorum
-// requirement at all. Keeping the old leader up puts the quorum rule itself on
-// the only path to a commit, and the decisive assertion is that the value never
-// reaches ANY state machine rather than that the caller received an error.
+// TestE2E_QuorumLoss_RejectsWrites: a 5-node cluster with three followers stopped and the leader still running never applies a proposal on any state machine.
 func TestE2E_QuorumLoss_RejectsWrites(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -90,9 +73,7 @@ func TestE2E_QuorumLoss_RejectsWrites(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Positive control: the SAME leader commits without difficulty while it
-	// still has a majority. Without this, a build that cannot commit anything
-	// would pass the quorum-loss assertion for the wrong reason.
+	// Positive control: the same leader commits while it still has a majority.
 	proposeAndWait(t, cluster, trackers, 1, "pre-quorum-loss", "intact")
 	waitForReplication(t, cluster, trackers, 1, "pre-quorum-loss", "intact", defaultTimeout)
 
@@ -314,40 +295,9 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	cancel()
 	assertKeyAbsentEverywhere(t, cluster, trackers, 1, "during-loss", time.Second)
 
-	// Restore quorum: remove stopped nodes from membership and add
-	// replacement nodes. We need to restore at least 1 node to get
-	// back to quorum (3 of N). Since we can't modify membership
-	// without quorum, we use a different approach: add a new node
-	// to one of the surviving hosts by restarting the stopped follower
-	// as a fresh node.
-	//
-	// However, since we need quorum to perform membership changes and
-	// we currently don't have it, we simulate recovery by restarting
-	// the third stopped node. Since e2e test nodes use ephemeral dirs,
-	// we add a replacement node instead.
-	//
-	// Strategy: We cannot add nodes without quorum, so we need to
-	// restore at least one stopped node. Since the e2e helpers don't
-	// support WAL-based restart, we instead create a brand new host
-	// and start the shard with the original initial members on it.
-	// This simulates a node that was temporarily partitioned but
-	// comes back with fresh state.
-	//
-	// The practical approach: create a new host, add it to the cluster
-	// addresses as the "returned" third node. Since it starts fresh,
-	// it will bootstrap and connect to the existing members, helping
-	// restore quorum.
+	// Restore quorum by starting a fresh host for a stopped replica with the original initial members; membership changes need quorum.
 
-	// Actually, the simplest correct recovery path is to create a new
-	// host that starts the same shard with the same initial members.
-	// This mimics the stopped node coming back online after losing
-	// its partition.
-	// The returning node presents the LEAF it had before: the shard's
-	// committed identity for this replica is that keypair, and a host with a
-	// fresh one would be refused by every peer as an identity mismatch.
-	// The node lock serializes this restart with the cluster's stop and
-	// close paths, and the host is replaced under hostsMu, as the harness
-	// helpers do (#309). The closure releases the node lock on t.Fatalf too.
+	// The returning node presents its original leaf, the shard's committed identity for it; it is restarted under the node lock and replaced under hostsMu, and the closure releases the lock on t.Fatalf.
 	recoveredReplicaID := uint64(thirdStop + 1)
 	var addr string
 	func() {

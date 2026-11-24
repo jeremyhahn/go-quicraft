@@ -102,12 +102,7 @@ func TestAcceptLoopRestartsAfterPanic(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	// Call acceptLoopIteration with a nil ipTracker. If a connection
-	// arrives and passes the listener.Accept, the nil ipTracker will
-	// panic. The deferred recover in acceptLoopIteration catches it.
-	// Since no connection actually arrives (no one is dialing), the
-	// Accept call blocks until the shutdown context fires. We test
-	// this by calling it in a goroutine and canceling quickly.
+	// With a nil ipTracker an accepted connection would panic; no one dials, so Accept blocks until shutdown is cancelled.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

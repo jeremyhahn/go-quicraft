@@ -78,8 +78,7 @@ func TestPendingConfig_FollowsTheLog(t *testing.T) {
 		t.Fatal("PublishPendingConfig rebuilt the view although nothing moved")
 	}
 
-	// Truncated by a conflicting append: the entry at 2 is replaced, so 4 is
-	// no longer admitted by this log; the replacement admits 7 instead.
+	// A conflicting append replaces the entry at 2, so 4 is no longer admitted and 7 is.
 	if _, ok, _, err := l.tryAppend(1, 1, []proto.Entry{addNodeEntry(t, 2, 2, 7, "spki:7")}); err != nil || !ok {
 		t.Fatalf("tryAppend: ok=%v err=%v", ok, err)
 	}
@@ -131,13 +130,7 @@ func TestPendingConfig_FollowsTheLog(t *testing.T) {
 	}
 }
 
-// TestPendingConfig_SeededFromTheRecoveredUncommittedTail pins the restart
-// case: an AddNode that was appended but not committed when the replica went
-// down is still pending after the restart, so the member it names can still
-// be admitted — and so is a COMMITTED one the applied configuration does not
-// yet reflect, since the replay that folds it is paced on the state machine
-// and the gate must be as wide after the restart as before it. Once the
-// replay folds it, the next publish prunes it.
+// TestPendingConfig_SeededFromTheRecoveredUncommittedTail checks recovered uncommitted and unfolded committed adds stay pending until folded.
 func TestPendingConfig_SeededFromTheRecoveredUncommittedTail(t *testing.T) {
 	cfg := testConfig()
 	entries := []proto.Entry{
@@ -285,13 +278,7 @@ func removeNodeEntry(t *testing.T, index, term, replicaID uint64) proto.Entry {
 	return proto.Entry{Index: index, Term: term, Type: proto.EntryConfigChange, Cmd: cmd}
 }
 
-// TestPendingConfig_RemovalsAreFoldedInLogOrder pins the pending tombstone:
-// adds and removals are resolved in log order, so a
-// removal above an add cancels the add and stands as a pending removal by ID
-// and by the identity the add bound; a removal of a COMMITTED member stands
-// with the committed identity; and an add above a removal supersedes it. A
-// restart that seeds its committed-but-unfolded stretch must not re-admit a
-// member the shard removed for as long as the replay takes to reach it.
+// TestPendingConfig_RemovalsAreFoldedInLogOrder checks pending adds and removals resolve in log order.
 func TestPendingConfig_RemovalsAreFoldedInLogOrder(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()
@@ -336,13 +323,7 @@ func TestPendingConfig_RemovalsAreFoldedInLogOrder(t *testing.T) {
 	}
 }
 
-// TestPendingConfig_UncommittedRemovalDoesNotRevoke pins the liveness half:
-// a RemoveNode that is appended but not committed revokes nobody. In a
-// two-voter shard the leader that appended RemoveNode(B) would otherwise
-// refuse B's very ack of it, the entry could never commit, and the shard
-// would stay leaderless. The removal binds the gate from the moment it is
-// committed — which the commit index alone announces, so the published
-// view is keyed on it too.
+// TestPendingConfig_UncommittedRemovalDoesNotRevoke checks an uncommitted RemoveNode revokes nobody.
 func TestPendingConfig_UncommittedRemovalDoesNotRevoke(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()

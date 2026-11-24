@@ -1196,19 +1196,13 @@ func TestCachedDiskStateMachine_UpdateInvalidatesBeforeInnerWrite(t *testing.T) 
 // Conditional writes and the EntryApplied predicate
 // ---------------------------------------------------------------------------
 
-// Result codes for condKVDiskSM. Both are SUCCESSFUL applications: a declined
-// conditional write is an answer, not an error, so neither may be reported as
-// ResultInvalidCommand.
+// Result codes for condKVDiskSM; a declined write is a successful answer, not ResultInvalidCommand.
 const (
 	condStored   uint64 = 1
 	condDeclined uint64 = 2
 )
 
-// condKVDiskSM applies "key=value" commands with put-if-absent semantics: a
-// write to a key that already exists is DECLINED and leaves the store
-// untouched. It is the shape of every conditional operation — compare-and-set,
-// put-if-absent, delete-if-match — where the command carries a value the store
-// may never take.
+// condKVDiskSM applies "key=value" with put-if-absent semantics; a write to an existing key is declined.
 type condKVDiskSM struct {
 	*kvDiskSM
 }
@@ -1243,11 +1237,7 @@ var _ DiskStateMachine = (*condKVDiskSM)(nil)
 // condApplied is the EntryApplied predicate matching condKVDiskSM.
 func condApplied(_ []byte, result Result) bool { return result.Value == condStored }
 
-// TestCachedDiskStateMachine_DeclinedConditionalWriteNotCached is the
-// cache-poisoning regression test. A declined conditional write leaves the
-// store holding its ORIGINAL value while the command carries a different one.
-// Caching the command's value would make Lookup report a value the store never
-// held — and, because the cache is checked first, it would keep reporting it.
+// TestCachedDiskStateMachine_DeclinedConditionalWriteNotCached: a declined write's value is never cached.
 func TestCachedDiskStateMachine_DeclinedConditionalWriteNotCached(t *testing.T) {
 	inner := newCondKVDiskSM()
 	cached, err := NewCachedDiskStateMachine(inner, CacheConfig{

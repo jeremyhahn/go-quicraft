@@ -16,31 +16,13 @@ package waldb
 
 import "github.com/jeremyhahn/go-quicraft/pkg/logdb"
 
-// copySnapshot returns a deep copy of ss suitable for retaining past the
-// caller's ownership of it.
-//
-// waldb keeps an in-memory record of the latest snapshot per (shard, replica)
-// and serves it from GetSnapshot. Retaining the caller's value meant retaining
-// the caller's maps: the owning layer could mutate a record waldb had already
-// reported as persisted, in either direction. memdb has deep-copied since it
-// was written; the two are implementations of the same LogDB interface, so the
-// asymmetry made code correct against the test backend wrong against the
-// production one.
+// copySnapshot returns a deep copy of ss safe to retain.
 func copySnapshot(ss logdb.Snapshot) logdb.Snapshot {
 	ss.Membership = copyMembership(ss.Membership)
 	return ss
 }
 
-// copyMembership returns a deep copy of m: every map is cloned so the stored
-// membership never aliases the caller's. A nil map stays nil, so a round-trip
-// does not manufacture empty maps where the caller had none — which the
-// encoders distinguish.
-//
-// Identities and RemovedIdentities are cloned like the rest, and dropping
-// either would be worse than an aliasing bug: they are the authorization state
-// a replica recovering from a snapshot has no other source for, and
-// RemovedIdentities is the deny-list that stops an ejected keypair being
-// readmitted.
+// copyMembership returns a deep copy of m; a nil map stays nil.
 func copyMembership(m logdb.Membership) logdb.Membership {
 	m.Addresses = copyAddrMap(m.Addresses)
 	m.Observers = copyAddrMap(m.Observers)

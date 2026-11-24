@@ -28,13 +28,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestShardFailure_ReportedOnceUnderConcurrentLatches: every path that trips
-// the failure latch — a recovery exhausting its attempts (failShard), a
-// SaveState failure on the commit worker, a Peer.Commit failure, an apply
-// failure, the host's snapshot receive and routing mirror (Engine.FailShard) —
-// may race another. Exactly one wins the latch, and the winner performs both
-// reports: one EventListener.OnShardFailed and one Callback.OnShardFailed per
-// incarnation, whatever the interleaving and whichever path wins.
+// TestShardFailure_ReportedOnceUnderConcurrentLatches verifies racing failure paths report exactly once per incarnation.
 func TestShardFailure_ReportedOnceUnderConcurrentLatches(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)
@@ -116,11 +110,7 @@ func (c *orderRecordingCallback) OnShardFailed(shardID uint64, err error) {
 	c.testCallback.OnShardFailed(shardID, err)
 }
 
-// TestShardFailure_LatchTripsBeforeTheBatchIsFailed: a latching path trips the
-// latch FIRST, then fails its own batch's proposals, then reports. Failing a
-// proposal wakes its caller, and a caller that retried before the latch
-// tripped would pass the host's IsFailed admission check and register a
-// proposal the halted shard never answers.
+// TestShardFailure_LatchTripsBeforeTheBatchIsFailed verifies the latch trips before the batch's proposals are failed.
 func TestShardFailure_LatchTripsBeforeTheBatchIsFailed(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)
@@ -168,12 +158,7 @@ func (c *panickingReportCallback) OnShardFailed(shardID uint64, err error) {
 	}
 }
 
-// TestShardFailure_ReportsSurviveAPanickingBatch: once a path wins the latch,
-// both reports are made even when failing its batch panics (a state machine
-// error whose Is/As panics inside the host's OnProposalFailed, say), and the
-// panic still reaches the worker's own recovery. The recovery's second
-// failShard loses the latch, so had the first skipped its reports nothing
-// would ever drain the shard's pending requests.
+// TestShardFailure_ReportsSurviveAPanickingBatch verifies both reports are made even when failing the batch panics.
 func TestShardFailure_ReportsSurviveAPanickingBatch(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)
@@ -359,12 +344,7 @@ func (c *hookCallback) OnReadyToRead(shardID uint64, readyToRead []proto.ReadyTo
 	c.testCallback.OnReadyToRead(shardID, readyToRead)
 }
 
-// TestCriticalWindow_PiggybackCommitToApply: once the piggyback's Peer.Commit
-// has advanced raft's processed marker, its committed entries exist only in
-// the update on its way to the apply worker. User code that exits abnormally
-// in between (a metrics collector, the OnCommitted callback) must not lose
-// them silently: either the entries still reach the apply worker, or the
-// shard is failed and their proposals are failed with it.
+// TestCriticalWindow_PiggybackCommitToApply verifies committed piggyback entries reach the apply worker or the shard fails with them.
 func TestCriticalWindow_PiggybackCommitToApply(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)
@@ -418,12 +398,7 @@ func TestCriticalWindow_PiggybackCommitToApply(t *testing.T) {
 	}
 }
 
-// TestCriticalWindow_ProposalBatchToPeerHandle: a proposal batch the step
-// worker has taken from the queue exists nowhere else until Peer.Handle
-// appends it. User code that exits abnormally in between (the batch-size
-// metric, the OnReadIndexBatched callback on the commit-pending path) must
-// not leave it lost while reported handed off: either it reached raft, or it
-// is not marked taken and its proposals are refused definitely.
+// TestCriticalWindow_ProposalBatchToPeerHandle verifies a taken proposal batch reaches raft or is refused definitely.
 func TestCriticalWindow_ProposalBatchToPeerHandle(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)
@@ -553,12 +528,7 @@ func TestCriticalWindow_ReadKeysAndStates(t *testing.T) {
 	}
 }
 
-// TestCriticalWindow_CommitBatchBeforeSaveState: GetUpdate claims a batch's
-// hard state durable as it extracts it, and only the commit worker's
-// SaveState makes the claim true. User code that exits abnormally before
-// SaveState completes (a user LogDB, its retry path) must not leave the claim
-// standing: the next update would be classified ReadOnly and a vote grant that
-// never reached disk would be treated as persisted.
+// TestCriticalWindow_CommitBatchBeforeSaveState verifies an abnormal exit before SaveState does not leave the hard state claimed durable.
 func TestCriticalWindow_CommitBatchBeforeSaveState(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)
@@ -706,12 +676,7 @@ func newCommittedNode(t *testing.T, id uint64) (*Node, proto.Update) {
 	}
 }
 
-// TestCriticalWindow_HandedOffBatchItemsAreRetired: once an item of a commit
-// batch reaches the apply worker, its commitPending belongs to the apply
-// worker. An abnormal exit later in the batch — a later item, or a metric
-// recorded after the hand-off — must not clear it: the step worker would
-// produce a second update while the first is still being applied, and the
-// shard's reusable commit item would be enqueued twice.
+// TestCriticalWindow_HandedOffBatchItemsAreRetired verifies an abnormal exit after hand-off does not clear the apply worker's commitPending.
 func TestCriticalWindow_HandedOffBatchItemsAreRetired(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	t.Cleanup(restore)

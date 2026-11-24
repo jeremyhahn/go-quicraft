@@ -16,41 +16,7 @@ package benchutil
 
 import "github.com/jeremyhahn/go-quicraft/test/netport"
 
-// Loopback TCP port reservation for engine harnesses whose transport cannot
-// bind port 0.
-//
-// Dragonboat and etcd/raft both need a concrete RaftAddress before the server
-// exists, so the harness has to pick the port itself. The obvious way -- listen
-// on 127.0.0.1:0, read the assigned port, close the listener, hand the number
-// to the engine -- draws that number from the kernel's ephemeral port range:
-// exactly the pool the kernel also draws from when it assigns a local port to
-// an OUTBOUND connection. Between the close and the engine's bind, any outbound
-// connection opened by a transport still running from the previous benchmark
-// can be handed that port, and the engine's bind then fails with EADDRINUSE.
-//
-// That is not hypothetical. It is what broke the five-node dragonboat
-// scenarios:
-//
-//	BenchmarkProposeThroughput_5N_Dragonboat
-//	    NewNodeHost[3] failed: listen tcp 127.0.0.1:41461: bind: address already in use
-//
-// with the same log showing the transport's own outbound sockets sitting on
-// 127.0.0.1:39458 and 127.0.0.1:38009 -- neighbours of 41461 in the very same
-// range.
-//
-// # Why this file is four lines
-//
-// The fix -- allocate from a window OUTSIDE the kernel's ephemeral range, and
-// remember what has been handed out -- is identical to the one the integration
-// suites need for UDP. A second, TCP-shaped copy of it here would duplicate the
-// window derivation, the two-pass scan, the recycle policy and the PID start
-// offset; two copies of a guarantee are two things to keep in step, and the
-// guarantee is then only as strong as whichever copy a caller reached for.
-//
-// test/netport is the one implementation. It provides ReserveTCP for these
-// harnesses; everything else about the reservation -- window, taken set,
-// cursor, recycling -- is shared, and its package comment carries the full
-// reasoning and the measurements.
+// TCP port reservation for harnesses that need an address before the server exists, delegated to test/netport, which allocates outside the ephemeral range.
 
 // ReserveTCPPort returns a loopback address that no other caller in this
 // process has been given, that no live listener holds, and that the kernel will

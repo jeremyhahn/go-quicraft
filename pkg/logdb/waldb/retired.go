@@ -28,34 +28,7 @@ import (
 	"sync/atomic"
 )
 
-// The retired-replica registry: the durable record of every (shardID,
-// replicaID) that RemoveNodeData has removed, and so retired for good.
-//
-// Raft never lets a removed replica ID return: its term, vote and owed lease
-// vote window went with its data, and a replica started again without them
-// could vote twice in one term. The retirement must therefore outlive every
-// record the replica ever wrote, and those records live in WAL segments that
-// the shard shares with other Raft groups and that garbage collection reclaims
-// only when nothing else pins them. A retirement kept AS a WAL record — the
-// old RemoveNode tombstone — had to pin its own segment forever to stay ahead
-// of them: a whole segment (64 MiB by default) retained per removed replica.
-//
-// The registry keeps the retirement beside the WAL instead, in one small file
-// in the WAL root: 16 bytes per retired replica. Replay drops every record of
-// a retired replica wherever it is found (purgeRetired), so nothing in the
-// segments needs pinning, and the removed replica's segments become ordinary
-// garbage. The file is rewritten whole on each retirement and published the
-// way the format marker is (writeWALFormat): a fsynced temporary file renamed
-// over the name, then the directory fsynced, so the name only ever refers to a
-// complete registry. Retirements are rare and the file is small; a whole
-// rewrite keeps it a single self-checking value with no log to replay.
-//
-// Layout (little-endian, like the record format):
-//
-//	magic "QRRETIRE"[8] | count:u64 | count × (shardID:u64 | replicaID:u64) | crc32c:u32
-//
-// The CRC covers every byte before it. Entries are sorted, so the file is a
-// function of the set.
+// The retired-replica registry durably records every (shardID, replicaID) RemoveNodeData removed.
 const (
 	retiredFilename     = "RETIRED"
 	retiredTempFilename = "RETIRED.tmp"
@@ -65,17 +38,10 @@ const (
 	retiredTrailerSize  = 4
 )
 
-// ErrRetiredRegistryMalformed is returned by Open when the retired-replica
-// registry exists but does not parse: a wrong length, magic or checksum. It
-// fails the open rather than being ignored — a registry that cannot be read is
-// a set of retirements that cannot be enforced, and opening without it would
-// hand retired replica IDs back.
+// ErrRetiredRegistryMalformed is returned by Open when the retired-replica registry does not parse.
 var ErrRetiredRegistryMalformed = errors.New("waldb: retired-replica registry is malformed")
 
-// retiredRegistry is the in-memory copy of the registry file. Reads take mu
-// for reading, behind a lock-free empty fast path; a retirement is serialized
-// by writeMu, published to disk first and only then to the set, so a reader
-// never sees a retirement that is not durable.
+// retiredRegistry is the in-memory registry; a retirement is published to disk before the set.
 type retiredRegistry struct {
 	writeMu sync.Mutex
 	mu      sync.RWMutex
@@ -182,23 +148,7 @@ func (r *retiredRegistry) keys() []nodeKey {
 	return out
 }
 
-// retire durably adds keys to the registry in dir, in one rewrite however
-// many there are, so carrying a whole registry across (Reencrypt) costs one
-// publication rather than one per key. Keys already retired are skipped;
-// retiring nothing new is a no-op.
-//
-// The new registry is published first. Then, still under writeMu, apply runs
-// — RemoveNodeData drops the node's records there — and only after it are the
-// keys added to the in-memory set. So NodeRemoved reports a retirement only
-// once it is durable AND the node's records are gone from every reader; the
-// two can never be observed out of order.
-//
-// On error, published reports whether the new registry was renamed into
-// place. If it was not, nothing has changed. If it was, only the directory
-// fsync failed: the retirement may or may not survive a crash, the same
-// uncertainty a failed WAL fsync leaves, and the caller must fail-stop the
-// database so the next open decides from what is on disk. apply does not run
-// on any error.
+// retire durably adds keys to the registry in dir in one rewrite, skipping keys already retired.
 func (r *retiredRegistry) retire(filesystem FS, dir string, keys []nodeKey, noSync bool, apply func()) (published bool, err error) {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()

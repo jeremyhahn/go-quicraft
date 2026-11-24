@@ -9,9 +9,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// BenchmarkPeerHeartbeatDrainCommitPending is the follower's commitPending
-// heartbeat path: step a Heartbeat from the leader, then drain the free-order
-// messages the way the step worker does while a WAL write is in flight (#390).
+// BenchmarkPeerHeartbeatDrainCommitPending measures a follower stepping a heartbeat and draining free-order messages during a WAL write.
 func BenchmarkPeerHeartbeatDrainCommitPending(b *testing.B) {
 	b.ReportAllocs()
 	cfg := testConfig()

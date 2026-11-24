@@ -73,14 +73,7 @@ func TestSentinelErrorsAreDistinct(t *testing.T) {
 	}
 }
 
-// TestCopyEntryCmd_DetachesThePayload pins the function both LogDB backends
-// rely on to keep their in-memory logs private.
-//
-// It is the whole read-side no-aliasing rule in one place. The backends call it
-// on every entry they serve, so a change that returned the entry unchanged
-// would hand every caller a slice into the live log — and the conformance suite
-// would catch it, but only through two backends and a round-trip. Here the
-// property is asserted directly on the function that carries it.
+// TestCopyEntryCmd_DetachesThePayload verifies copyEntryCmd returns an entry that shares no payload with the original.
 func TestCopyEntryCmd_DetachesThePayload(t *testing.T) {
 	original := []byte("committed-command")
 	src := Entry{Index: 7, Term: 3, Type: 1, Key: 9, ClientID: 2, SeriesID: 4,
@@ -124,9 +117,7 @@ func TestCopyEntryCmd_DetachesThePayload(t *testing.T) {
 	}
 }
 
-// TestEntriesBelowCompactionFloorError pins the typed error's contract: it
-// carries enough to LOCATE the caller bug, and errors.Is against the sentinel
-// holds so callers can match it without depending on the concrete type.
+// TestEntriesBelowCompactionFloorError verifies the error locates the refused write and matches its sentinel.
 func TestEntriesBelowCompactionFloorError(t *testing.T) {
 	err := &EntriesBelowCompactionFloorError{
 		ShardID: 3, ReplicaID: 7, FirstIndex: 5, CompactedTo: 9,

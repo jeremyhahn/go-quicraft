@@ -25,12 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestApplyWorker_DiscardItemFailsProposals asserts the engine.Callback
-// contract on the discard path: a committed batch dropped because the shard
-// was unloaded (or the engine is stopping) never reaches a state machine, so
-// nothing else can resolve its proposals. Without the callback every proposal
-// in the batch stays registered until its context deadline, and a
-// deadline-less caller blocks forever.
+// TestApplyWorker_DiscardItemFailsProposals verifies a discarded committed batch fails its proposals through the callback.
 func TestApplyWorker_DiscardItemFailsProposals(t *testing.T) {
 	applyC := make(chan *applyItem, 1)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}

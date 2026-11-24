@@ -25,19 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// TestStepWorker_PreVoteLeavesNodeWhileCommitPending is the narrow, fully
-// deterministic half of the pre-vote free-order contract.
-//
-// While commitPending is set, the step worker transmits ONLY the messages
-// proto.IsFreeOrderMessage admits: processReady defers the whole shard to
-// processCommitPendingInbox and tick()'s inline flush is a
-// DrainFreeOrderMessages call. A campaign launched by tick() therefore reaches
-// the wire only if RequestPreVote is classified free-order. It legitimately is
-// — becomePreCandidate changes neither term nor vote, so a pre-vote has no
-// durable state to wait behind — and classifying it as ordered starved
-// elections outright: on a busy shard commitPending is set almost
-// continuously, so pre-vote traffic sat in the outbound buffer while replicas
-// pre-campaigned dozens of times without a single round completing.
+// TestStepWorker_PreVoteLeavesNodeWhileCommitPending checks a pre-vote is sent while commitPending is set (it is free-order).
 func TestStepWorker_PreVoteLeavesNodeWhileCommitPending(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -132,24 +120,7 @@ func (g *gatedApplier) release() {
 
 var _ Applier = (*gatedApplier)(nil)
 
-// TestPreVote_RoundCompletesUnderSustainedApplyBacklog is the cluster-level
-// half of the same contract, on a real five-replica in-process cluster.
-//
-// The state machine is held inside Apply on every replica, which is exactly
-// what sustained write load does: commitPending stays set, so no replica ever
-// reaches the normal processReady path and the ONLY messages that leave any of
-// them are the free-order ones. The leader is then killed.
-//
-// A completed pre-vote round is directly observable: becomeCandidate is the
-// only thing that raises a follower's term, and PreVote gates it on a quorum
-// of grants. So a surviving replica reaching a higher term proves both
-// directions travelled under commitPending — the RequestPreVote out of the
-// campaigner and the RequestPreVoteResp back from a quorum of responders.
-//
-// This is the failure the reclassification fixed: measured on a five-node
-// cluster under chaos, all three surviving replicas pre-campaigned ~28 times
-// each without a single round completing, leaving the shard leaderless for
-// over 20 seconds with quorum fully available.
+// TestPreVote_RoundCompletesUnderSustainedApplyBacklog checks a five-replica cluster elects a new leader while every replica's apply is blocked.
 func TestPreVote_RoundCompletesUnderSustainedApplyBacklog(t *testing.T) {
 	gate := newGatedApplier()
 	c := newTestCluster(t, 1, 5, withApplier(func(uint64) Applier { return gate }))

@@ -1,38 +1,5 @@
 #!/usr/bin/env bash
-# ci-image-cache.sh v1 (ci-template v1.30, fix 1 of the 72-hour CI evaluation):
-# the toolchain image's registry cache. It ships beside ci.yml as
-# scripts/ci-image-cache.sh.
-#
-#   ci-image-cache.sh pull                 before `make docker-build`: when the
-#                                          daemon lacks the toolchain tag, pull it
-#                                          from the forge registry and tag it locally
-#   ci-image-cache.sh publish [make args]  on the release runner, on a push to main
-#                                          only: build and push the toolchain image
-#                                          when the registry lacks its tag
-#
-# The toolchain tag is `make -s toolchain-image`, <repo>-toolchain:<hash>, the
-# hash of the Dockerfile, the tool pin file and every devcontainer module's
-# go.mod and go.sum (ci-standard.md §9). The published name is
-# <registry>/<namespace>/<repo>-toolchain:<hash>-main, so the image is built
-# once per change to those files, by the release runner, and every other job
-# and runner pulls it instead of building it. The registry is the forge's own,
-# host[:port] from GITHUB_SERVER_URL, as in go-qrdb's scripts/ci-registry.sh;
-# no address is written here. The namespace is CI_IMAGE_NAMESPACE, by default
-# ci-images, public for anonymous pull (ruling 217(4)); only the release
-# runner writes there (rulings 169 and 173). On github.com both commands do
-# nothing.
-#
-# pull exits 0 when the daemon holds the tag after it, and 1 otherwise; the
-# caller runs `scripts/ci-image-cache.sh pull || true`, so a miss, an
-# unreachable registry or a failed pull falls back to the local build, never to
-# a red job. A pulled image keeps its digest in the log.
-#
-# publish reads the release runner's credential contract (ruling 173):
-# RELEASE_REGISTRY, which must be this forge's registry, RELEASE_REGISTRY_USER
-# and RELEASE_REGISTRY_TOKEN. No credential value is printed or put on a
-# command line: docker reads the token on stdin, into a private DOCKER_CONFIG
-# that is removed on exit. A pull logs in with nothing, through an empty
-# DOCKER_CONFIG.
+# ci-image-cache.sh pull|publish [make args]: pull the toolchain image from the forge registry, or build and push it from the release runner; no-op on github.com.
 set -euo pipefail
 
 die() { echo "ci-image-cache: $*" >&2; exit 1; }

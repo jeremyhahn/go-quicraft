@@ -23,28 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// Client sessions on an on-disk state machine are refused at the API boundary.
-//
-// The session table is replicated state that lives ONLY inside the snapshot
-// stream: rsm.StateMachine writes it ahead of the user state machine's bytes and
-// reads it back in RecoverFromSnapshot. A DiskStateMachine whose Open() reports
-// a durable applied index never takes that path on restart — StartShard skips
-// RecoverFromSnapshot entirely, because recovering would replace the user's
-// database files and roll it back to the snapshot index — so the replica comes
-// up with the correct data and ZERO sessions.
-//
-// Nothing downstream notices. The peers that still hold the session route a
-// session-managed entry into sm.Update; the restarted replica hits
-// ErrSessionNotFound, answers ResultSessionExpired, and never applies the write
-// at all. The client sees success, because the leader completed the proposal
-// from its own apply. That is a permanently missing write on one replica of a
-// database, with every raft invariant intact.
-//
-// dragonboat places the same constraint on IOnDiskStateMachine (NO-OP sessions
-// only), and the rejection here is deliberately a LOCAL decision: it reads the
-// state machine's own type, fixed for the life of the shard by the sm.CreateFunc
-// passed to StartShard, and never replicated state — so it cannot evaluate
-// differently on two replicas, and it lands before the entry reaches the log.
+// Client sessions on an on-disk state machine are refused at the API boundary: its restart skips snapshot recovery, so the session table would be lost.
 
 // startOnDiskShard starts a single-replica shard backed by a DiskStateMachine
 // and waits for it to lead, so the session entry points below are refused on
@@ -59,10 +38,7 @@ func startOnDiskShard(t *testing.T, h *Host, shardID uint64) {
 	waitForLeader(t, h, shardID)
 }
 
-// TestSessions_RefusedOnDiskStateMachine walks every session entry point on the
-// Host. Each must refuse with ErrSessionsUnsupportedOnDisk, and each must refuse
-// BEFORE anything reaches the raft log — a rejection that arrived at apply time
-// would be the divergence itself.
+// TestSessions_RefusedOnDiskStateMachine checks every session entry point refuses with ErrSessionsUnsupportedOnDisk before anything reaches the log.
 func TestSessions_RefusedOnDiskStateMachine(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -133,13 +109,7 @@ func TestSessions_RefusedOnDiskStateMachine(t *testing.T) {
 	}
 }
 
-// TestSessions_NoOPSessionStillWorksOnDiskStateMachine pins the other half:
-// dragonboat's model for an on-disk state machine is NO-OP sessions with
-// idempotent operations, which here is the sessionless proposal path, so that
-// must keep working. A refusal that covered it would leave on-disk shards with
-// no proposal path at all. A NO-OP session itself is not what the on-disk
-// refusal targets: ProposeWithSession refuses it on every shard with
-// ErrInvalidSession, never with ErrSessionsUnsupportedOnDisk.
+// TestSessions_NoOPSessionStillWorksOnDiskStateMachine checks sessionless proposals still work on an on-disk state machine.
 func TestSessions_NoOPSessionStillWorksOnDiskStateMachine(t *testing.T) {
 	const shardID uint64 = 1
 

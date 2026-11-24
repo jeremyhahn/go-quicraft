@@ -27,18 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// Settle first, log last, on every transport recovery path
-//
-// A transport goroutine's slog handler is user code (slog.SetDefault). Each
-// recovery used to log inline from its deferred recover: a handler that
-// panicked there crashed the process, and one that called runtime.Goexit
-// ended the goroutine — for the send-queue worker, the connection cleanup and
-// the accept loop, for good, since a Goexit is not a panic their restart loops
-// recover. A Goexit in the code those loops run (a resolver, a handler) ended
-// them the same way. These tests drive each path with a handler that exits on
-// the path's own records and check the path is still working afterwards.
-// ---------------------------------------------------------------------------
+// Settle first, log last: each transport recovery path keeps working when the slog handler panics or calls runtime.Goexit on the path's own records.
 
 // hostileRecordHandler counts the records whose message starts with prefix and
 // runs act (a panic or runtime.Goexit) on each of them; every other record is

@@ -141,7 +141,7 @@ func TestName(t *testing.T) {
 	}
 }
 
-// --- Entry CRUD tests ---
+// Entry CRUD tests.
 
 // TestSaveAndGetEntries verifies the basic save/get cycle for entries.
 func TestSaveAndGetEntries(t *testing.T) {
@@ -1061,11 +1061,7 @@ func TestConcurrentWritesDifferentShards(t *testing.T) {
 	}
 }
 
-// TestConcurrentWritesAndReads verifies that concurrent per-shard appends and
-// reads are not merely race-free but CORRECT: every append succeeds, every
-// concurrent read observes a contiguous prefix of the log (never a hole, never
-// a shortened result, never a regression of the durable tail), and the final
-// log is exactly what was written.
+// TestConcurrentWritesAndReads verifies concurrent appends succeed and reads see a contiguous prefix.
 func TestConcurrentWritesAndReads(t *testing.T) {
 	db := openTestDB(t)
 
@@ -1997,23 +1993,13 @@ func TestMembershipSizeHelper(t *testing.T) {
 	if got := membershipSize(m); got != 82 {
 		t.Fatalf("membershipSize(empty)=%d, want 82", got)
 	}
-	// membershipSize is what this binary WRITES; minMembershipSize is the floor
-	// for what it will READ. With one layout and every field written
-	// unconditionally the two are the SAME number, and they must stay equal:
-	// a read floor below the written size would let a section too short to hold
-	// the layout reach the field reads, and one above it would reject a section
-	// this very binary wrote.
+	// membershipSize is what this binary writes and minMembershipSize what it reads; they must stay equal.
 	if got, want := membershipSize(m), minMembershipSize; got != want {
 		t.Fatalf("membershipSize(empty)=%d, want minMembershipSize=%d", got, want)
 	}
 }
 
-// TestUnmarshalAddrMapRejects verifies unmarshalAddrMap returns -1 on
-// truncated data and on a hostile count: a count one past the cap is
-// rejected even if the body were large, and a count at the cap with a body
-// too small for its entries is rejected by the per-entry bounds check (and
-// does not over-allocate, since boundedMapHint clamps the make hint to
-// remaining/12 == 0).
+// TestUnmarshalAddrMapRejects verifies unmarshalAddrMap returns -1 on truncated data and a hostile count.
 func TestUnmarshalAddrMapRejects(t *testing.T) {
 	withCount := func(n uint32, size int) []byte {
 		buf := make([]byte, size)
@@ -2176,12 +2162,7 @@ func TestReplayRecordSkipsEmptyRecord(t *testing.T) {
 	}
 }
 
-// TestReplayRecordRejectsUnknownPayloadType verifies an unrecognized payload
-// type byte is fatal. Payload types are written only by this package and are
-// CRC-protected, so an unknown one is corruption or a config skew — most often
-// a keyed WAL opened with barrier==nil, where every ciphertext record's leading
-// epoch byte decodes as type 0x00. Skipping them booted the node as an empty
-// replica with no memory of prior votes.
+// TestReplayRecordRejectsUnknownPayloadType verifies an unknown payload type is fatal.
 func TestReplayRecordRejectsUnknownPayloadType(t *testing.T) {
 	s := &walShard{
 		indexes:       make(map[nodeKey]*index),
@@ -2204,9 +2185,7 @@ func TestReplayRecordRejectsUnknownPayloadType(t *testing.T) {
 	}
 }
 
-// TestReplayRecordRejectsTruncatedState verifies a short state record is
-// fatal. Skipping it would let an OLDER state record win last-writer-wins
-// replay, regressing Term/Vote and allowing a double vote in one term.
+// TestReplayRecordRejectsTruncatedState verifies a short state record is fatal, so an older Term/Vote cannot win.
 func TestReplayRecordRejectsTruncatedState(t *testing.T) {
 	s := &walShard{
 		indexes:       make(map[nodeKey]*index),
@@ -2431,12 +2410,7 @@ func BenchmarkDBReadState(b *testing.B) {
 	}
 }
 
-// --- WAL write ordering tests ---
-//
-// These tests verify that in-memory state (index, entry map, state map,
-// snapshot map, bootstrap map) is updated ONLY after the WAL record is
-// durably written. A failed writeRecord must leave all in-memory state
-// unchanged.
+// WAL write ordering: in-memory state changes only after the WAL write succeeds.
 
 // sabotageSegment marks the active WAL segment as closed for the given
 // shardID. This causes all subsequent segment.Write calls to return
@@ -2748,10 +2722,7 @@ func TestWriteStateFailureOnEmptyDBPreservesCleanState(t *testing.T) {
 	}
 }
 
-// TestSaveUpdatePartialFailurePreservesEntries verifies that when a
-// SaveState update contains both entries and state, a failure during
-// state write does not affect the previously successful entries write
-// within the same saveUpdate call.
+// TestSaveUpdatePartialFailurePreservesEntries verifies a failed state write leaves earlier entry writes intact.
 func TestSaveUpdatePartialFailurePreservesEntries(t *testing.T) {
 	db := openTestDB(t)
 	const shardID, replicaID = uint64(1), uint64(1)
@@ -2839,22 +2810,7 @@ func BenchmarkDBIterateEntries(b *testing.B) {
 	}
 }
 
-// blockNextSegment makes the shard's NEXT segment creation fail, for every
-// euid including root, and closes the active segment so that creation is what
-// the next write attempts.
-//
-// The batch-rollback tests below all need exactly one shard in a batch to fail
-// its WAL write. chmod'ing the shard directory to 0444 would not do it: that
-// denies only a NON-root euid, so under a CI container running as root the
-// sabotaged write would SUCCEED and every rollback assertion after it would be
-// vacuous.
-//
-// Pre-creating a DIRECTORY at the path of the next segment file removes the
-// euid from the question entirely: createSegment opens that path with
-// O_RDWR|O_CREATE, and open(2) on a directory with write intent is EISDIR for
-// root exactly as it is for anyone else. The failure lands on
-// ensureActiveSegment -> createSegment -> a *SegmentCreateError in every
-// environment.
+// blockNextSegment makes the shard's next segment creation fail, even as root, and closes the active segment.
 func blockNextSegment(t *testing.T, s *walShard) {
 	t.Helper()
 	s.mu.Lock()
@@ -2873,10 +2829,7 @@ func blockNextSegment(t *testing.T, s *walShard) {
 	t.Cleanup(func() { os.Remove(blocked) })
 }
 
-// TestSaveStatePartialWriteDiscardsGhostRecords verifies that when a batch
-// write fails mid-way through processing updates, previously buffered
-// records from successful shards are discarded. This prevents ghost records
-// from being fsynced on the next successful SaveState call.
+// TestSaveStatePartialWriteDiscardsGhostRecords verifies a failed batch discards records buffered for other shards.
 func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
 	dir := t.TempDir()
 	// Use sync disabled so we can observe buffer behavior without I/O noise.
@@ -2908,12 +2861,7 @@ func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
 		t.Fatalf("expected 2 entries after initial write, got %d", len(got))
 	}
 
-	// Now create a batch with two updates to different shards:
-	// - Shard 1 succeeds (writes to WAL buffer)
-	// - Shard 2 fails (triggers rollback on shard 1)
-	//
-	// We force failure on shard 2 by closing its active segment before
-	// the batch, then writing to it.
+	// Shard 1 succeeds and shard 2 fails, rolling back shard 1.
 	shard2Idx := uint16(2 % DefaultShardCount)
 	shard2 := db.shards[shard2Idx]
 
@@ -3413,12 +3361,7 @@ func TestBoundedMapHintClampsToBody(t *testing.T) {
 	}
 }
 
-// TestBootstrapDataDirSurvivesReopen covers the bootstrap DataDir field: the shard's DataDir
-// must survive a WAL close and reopen, because the only consumer
-// (Host.ImportSnapshot) runs on a host where the shard is STOPPED and has
-// nothing else to learn the snapshot-tree root from. A DataDir that did not
-// replay would put the imported artifact outside the tree the DEK purge-floor
-// scan enumerates, and the next PurgeEpochsBefore would destroy its key.
+// TestBootstrapDataDirSurvivesReopen verifies the bootstrap DataDir survives a WAL reopen.
 func TestBootstrapDataDirSurvivesReopen(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -3510,9 +3453,7 @@ func TestSaveBootstrap_DataDirBeforeReopen(t *testing.T) {
 	}
 }
 
-// A bootstrap record written BEFORE the DataDir field existed ends at the
-// address map. Replay must accept it as "no DataDir" rather than rejecting the
-// whole WAL as corrupt, which would make an upgrade unopenable.
+// A bootstrap record without the DataDir field replays as no DataDir.
 func TestReplayBootstrap_RecordWithoutDataDirRejected(t *testing.T) {
 	s := &walShard{
 		bootstraps: make(map[nodeKey]logdb.Bootstrap),

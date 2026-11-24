@@ -86,12 +86,7 @@ var artifactVariants = []artifactVariant{
 	{name: "encrypted", encrypted: true},
 }
 
-// exportTestArtifact exports a snapshot of payload from a freshly started
-// shard and returns what the writer received together with the export's
-// error. corrupt makes the source fail its recorded integrity check: a
-// same-size bit flip in a plaintext snapshot.dat, and a snapshot.meta that
-// disagrees with intact frames for an encrypted one (whose frames would
-// otherwise refuse the flip by AEAD before any plaintext was written).
+// exportTestArtifact exports a snapshot of payload and returns the writer's bytes and the error; corrupt makes the source fail its integrity check.
 func exportTestArtifact(t *testing.T, v artifactVariant, payload []byte, corrupt bool) ([]byte, error) {
 	t.Helper()
 	db := newMockLogDB()
@@ -270,13 +265,7 @@ func TestExportImportSnapshot_TrailerRoundTrip(t *testing.T) {
 	}
 }
 
-// TestImportSnapshot_RefusesADamagedArtifact verifies ImportSnapshot checks
-// the header and payload against the trailer before anything is adopted: an
-// artifact truncated anywhere after its header, or with a same-length bit flip
-// in its payload or in a header field that still parses — the index or term
-// the snapshot would be recorded under — is refused, and the refusal leaves no staged or published
-// directory and no LogDB record. The intact artifact then imports on the same
-// host, so a refusal also leaves nothing behind that blocks a retry.
+// TestImportSnapshot_RefusesADamagedArtifact checks a truncated or bit-flipped artifact is refused leaving nothing behind, and the intact one then imports.
 func TestImportSnapshot_RefusesADamagedArtifact(t *testing.T) {
 	payload := bytes.Repeat([]byte("exported-state"), (3*copyWithContextChunkSize+7)/14+1)
 	hdrLen := len(buildSnapshotArtifact(t, 42, 1, 0, proto.Membership{}, nil)) - snapshotArtifactTrailerSize
@@ -375,12 +364,7 @@ func TestImportSnapshot_RefusesAnArtifactWithoutATrailer(t *testing.T) {
 	}
 }
 
-// TestImportSnapshot_RefusesAFailedExport verifies what a failed export
-// handed its writer can never be imported, even by a caller that ignored the
-// export's error. The encrypted case is the sharp one: its frames
-// authenticate, so every plaintext byte reaches the writer before the
-// recorded-hash check fails, and only the trailer the export withheld keeps
-// that output from being a complete artifact.
+// TestImportSnapshot_RefusesAFailedExport checks a failed export's output, lacking the trailer, can never be imported.
 func TestImportSnapshot_RefusesAFailedExport(t *testing.T) {
 	for _, v := range artifactVariants {
 		for _, p := range trailerTestPayloads {

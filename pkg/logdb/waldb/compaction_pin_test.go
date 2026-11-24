@@ -20,12 +20,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestRemoveEntriesTo_PinsCompactionMarkerSegment is a regression test. A
-// compaction marker is not tracked by any entry index, so its segment must be
-// pinned in metaSegments (at runtime AND restored on recovery) — otherwise GC
-// can reclaim the segment once its entries are compacted away, and compactedTo
-// resets to 0 on the next restart (GetEntries then returns empty instead of
-// ErrCompacted for compacted indices).
+// TestRemoveEntriesTo_PinsCompactionMarkerSegment checks the compaction marker's segment is pinned at runtime and on recovery.
 func TestRemoveEntriesTo_PinsCompactionMarkerSegment(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {
@@ -78,19 +73,7 @@ func TestRemoveEntriesTo_PinsCompactionMarkerSegment(t *testing.T) {
 	}
 }
 
-// TestCompactionMarkerSurvivesGarbageCollection drives the compaction-marker pin
-// END TO END, which TestRemoveEntriesTo_PinsCompactionMarkerSegment above does
-// not: that test asserts the pin FIELD is set but never calls Compact, so the
-// branch in addMetaSegmentsToLive that actually keeps GC away from the marker's
-// segment was completely uncovered — deleting it left the whole suite green.
-//
-// The hazard it guards is a durability one, and it FAILS OPEN. The compaction
-// floor lives only in that marker record, while its effect (the entries being
-// unlinked) is irreversible. If GC reclaims the segment, the next restart
-// recovers compactedTo=0 over a log whose prefix is physically gone: reads below
-// the real floor then return ErrLogGapDetected instead of ErrCompacted, so raft
-// never falls back to InstallSnapshot, and the monotonic floor guard no longer
-// holds because the floor regressed to zero.
+// TestCompactionMarkerSurvivesGarbageCollection checks GC keeps the compaction marker's segment end to end.
 func TestCompactionMarkerSurvivesGarbageCollection(t *testing.T) {
 	dir := t.TempDir()
 	const shardID, replicaID = uint64(1), uint64(1)
@@ -146,22 +129,7 @@ func TestCompactionMarkerSurvivesGarbageCollection(t *testing.T) {
 	}
 }
 
-// TestRecovery_RederivesLostCompactionFloorUnderSnapshot pins the repair for a
-// compaction floor lost to a torn WAL block.
-//
-// The floor lives only in a marker record while its effect — the segment holding
-// the compacted entries being unlinked — is irreversible. Lose the marker and
-// replay comes back with floor 0 over a log whose prefix is physically gone. That
-// state FAILS OPEN: a missing PREFIX keeps span == count, so EntryRange accepts
-// it and the node starts, but reads below the real floor then return
-// ErrLogGapDetected instead of ErrCompacted and raft never falls back to
-// InstallSnapshot.
-//
-// Recovery re-derives the floor from the REBUILT INDEX (firstIndex-1), never from
-// the snapshot index — the snapshot pool deliberately retains entries below the
-// snapshot for cheap follower catch-up, and anchoring there would mark those live
-// entries unreadable and force a full InstallSnapshot on every lagging follower
-// after any restart. The snapshot is only the validity check on the derivation.
+// TestRecovery_RederivesLostCompactionFloorUnderSnapshot checks recovery re-derives a lost floor from the rebuilt index, validated by the snapshot.
 func TestRecovery_RederivesLostCompactionFloorUnderSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	const shardID, replicaID = uint64(1), uint64(1)

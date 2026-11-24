@@ -107,16 +107,9 @@ func (d *caDrop) assertDroppedCARefused(t *testing.T) {
 	}
 }
 
-// TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP is the session the
-// reload promises to preserve: OCSP is enforced, the responder answers, and
-// the only thing that changed is that the bundle no longer holds the CA the
-// peer's leaf was issued by. The sweep must not close it for want of an
-// issuer to build the request with.
+// TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP checks the sweep keeps a session whose issuer CA left the bundle.
 func TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP(t *testing.T) {
-	// An OCSP request's CertID is SHA-1 (RFC 6960 section 4.1.1), which
-	// GODEBUG=fips140=only refuses at use. ModeOCSP is outside the
-	// approved-only recipe; see the FIPS 140-3 exemption record in
-	// docs/quic-transport/architecture.md. Every other run executes this test.
+	// OCSP CertID is SHA-1 (RFC 6960 4.1.1), refused under fips140=only; see the FIPS exemption in docs/quic-transport/architecture.md.
 	if fips140.Enforced() {
 		t.Skip("ModeOCSP builds a SHA-1 CertID, which fips140=only refuses (FIPS 140-3 exemption record)")
 	}
@@ -166,11 +159,7 @@ func TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP(t *testing.T) {
 	d.assertDroppedCARefused(t)
 }
 
-// TestReloadMTLS_CADropStillRevokesUnderIssuerScopedCRL is the other half:
-// the old session stays checkable, so a revocation the dropped CA publishes
-// for it still lands. Before the fix its scope fell back to issuer-agnostic,
-// missing every issuer-scoped CRL entry, and the old CA's CRL no longer
-// verified at all.
+// TestReloadMTLS_CADropStillRevokesUnderIssuerScopedCRL checks a CRL from the dropped CA still revokes the old session.
 func TestReloadMTLS_CADropStillRevokesUnderIssuerScopedCRL(t *testing.T) {
 	crlPath := filepath.Join(t.TempDir(), "old.crl")
 	writeCRL := func(ca *reloadCA, number int64, revoked ...int64) {

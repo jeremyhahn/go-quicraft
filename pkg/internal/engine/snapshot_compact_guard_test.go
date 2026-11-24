@@ -44,10 +44,7 @@ func advancingReader(t *testing.T, shardID, replicaID uint64, db logdb.LogDB, la
 	return lr
 }
 
-// TestSaveSnapshot_ReportsWhatCompactionDid pins the outcome the pool hands to
-// OnLogCompacted, which is what the host's compaction events report: a
-// compaction is reported only when THIS save advanced the reader's marker.
-// The listener must not hear "compacted" for every case below.
+// TestSaveSnapshot_ReportsWhatCompactionDid checks OnLogCompacted is reported only when this save advanced the reader's marker.
 func TestSaveSnapshot_ReportsWhatCompactionDid(t *testing.T) {
 	t.Run("compacted", func(t *testing.T) {
 		f := newResaveFixture(t, 200)
@@ -111,9 +108,7 @@ func TestSaveSnapshot_ReportsWhatCompactionDid(t *testing.T) {
 		}
 	})
 	t.Run("no reader", func(t *testing.T) {
-		// The skip guard is scoped to a reader that FAILED to advance, so the
-		// LogDB removal still runs on the nil-reader path that predates it;
-		// otherwise "skip the removal" could be satisfied by never compacting.
+		// The skip guard applies only to a reader that failed to advance; the nil-reader path still removes LogDB entries.
 		f := newResaveFixture(t, 200)
 		f.node.logReader = nil
 		_, got, err := f.pool.saveSnapshotCompacting(f.req)
@@ -132,12 +127,7 @@ func TestSaveSnapshot_ReportsWhatCompactionDid(t *testing.T) {
 		}
 	})
 	t.Run("reader marker could not advance", func(t *testing.T) {
-		// Regression: a non-ErrCompacted LogReader.Compact failure was only
-		// logged and RemoveEntriesTo ran regardless, leaving the reader's
-		// markerIndex stale over entries the LogDB had discarded. The snapshot
-		// is durable by then, so the removal must be skipped and retried by
-		// the next save. An empty reader makes Compact(190) return
-		// ErrUnavailable, a real non-ErrCompacted error.
+		// A non-ErrCompacted Compact failure must skip the LogDB removal; an empty reader returns ErrUnavailable.
 		f := newResaveFixture(t, 200)
 		lr := logdb.NewLogReader(f.req.shardID, f.req.replicaID, f.ldb)
 		f.node.logReader = lr

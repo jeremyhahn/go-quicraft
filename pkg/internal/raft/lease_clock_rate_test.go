@@ -23,24 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// The read lease and the vote window that backs it are measured on two
-// different clocks: the leader's lease on its own monotonic clock from the
-// time it SENT the acked heartbeat round, the follower's promise on the
-// follower's monotonic clock from the time it acked. Clock OFFSET cancels
-// out; clock RATE does not. A leader clock running slow stretches the lease
-// in real time, a follower clock running fast shrinks the promise, and the
-// lease is shortened by the drift bound (leaseDriftDivisor, or
-// Config.MaxClockDrift) so that it still ends first.
-//
-// These tests run each replica on its own clock rate and check the bound is
-// exact. The worst case the leader admits is a follower whose promise equals
-// the lease span (ackBacksLease accepts promise >= leaseSpan): replica 2 runs
-// ElectionRTT 8 against the leader's 10, so it promises exactly the leader's
-// 8-tick lease span. Within the bound, the lease must have expired — and a
-// read must take the heartbeat round — before that follower can grant a
-// vote. Beyond it, the follower frees its vote while the lease it backs
-// still holds and a new leader is elected inside the old one's lease, which
-// is why the bound is a safety assumption and not a tuning knob.
+// The read lease and the vote window behind it run on different clocks; these tests bound the clock-rate drift the lease tolerates.
 
 // rateClock is one replica's monotonic clock in a shard whose clocks run at
 // different rates. It reads the shard's real time scaled by 1 + ppm/1e6
@@ -136,17 +119,7 @@ func runRateDrift(t *testing.T, maxClockDrift float64, leaderPPM, followerPPM in
 		t.Fatal("read inside the lease was not served from it")
 	}
 
-	// Isolate the leader. It is not ticked, so CheckQuorum does not step it
-	// down: the lease alone decides what it serves, which is the case the
-	// bound has to cover. Replica 2 ticks once per step, far faster than real
-	// time — the promise is kept on the clock, never in ticks — so its own
-	// election timer has long expired and only the promise holds its vote.
-	//
-	// Replica 3 is not ticked, so it still counts leader 1 as live and
-	// refuses replica 2's own pre-votes: no election starts by chance. The
-	// test starts one itself, from replica 3, at the first instant replica 2
-	// is free to vote, so whether a new leader can be elected inside the
-	// lease does not depend on randomized election timing.
+	// Isolate the unticked leader so the lease alone decides what it serves.
 	s.partition(1, 2)
 	f3 := s.nodes[3]
 	var out rateDriftOutcome
@@ -247,11 +220,7 @@ func checkRateDrift(t *testing.T, cases []rateDriftCase) {
 	}
 }
 
-// TestLeaseRead_ClockRateDriftWithinDefaultBound holds the default 1% bound
-// to its claim: 0.9% of drift, all on the leader, all on the follower, or
-// split between them, leaves the lease safe; 1.1% does not. The reverse
-// direction — a leader clock running FAST or a follower clock running SLOW —
-// only shortens the lease in real time, so it is safe at any drift.
+// TestLeaseRead_ClockRateDriftWithinDefaultBound verifies 0.9% drift keeps the lease safe and 1.1% does not.
 func TestLeaseRead_ClockRateDriftWithinDefaultBound(t *testing.T) {
 	checkRateDrift(t, []rateDriftCase{
 		{name: "leader_slow_0.9pct", leaderPPM: -9_000, within: true},

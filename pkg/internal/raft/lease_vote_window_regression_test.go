@@ -24,22 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Regression: a read lease must rest only on acknowledgements whose vote
-// window the acknowledging replica actually promises — and keeps across a
-// restart.
-//
-// The lease is sound while every ack it counts comes from a replica that will
-// help elect no one else until the lease has ended. If that promise were
-// assumed from the LEADER's configuration, and kept by the follower's own
-// configuration and, after a restart, by a hold-down sized from the
-// configuration it restarted into, a follower configured with a shorter
-// election timeout, a shorter tick, no CheckQuorum or no LeaseRead — while
-// running, or only after a restart — would make a weaker promise than the
-// leader counted on, and a new leader could be elected inside the old one's
-// lease. So every ack states its window (voteWindow), the leader counts only acks
-// whose window covers its lease span (ackBacksLease), and the window is
-// recorded in the hard state before any ack makes it, so a restarted replica
-// honours it whatever it restarted into (armVoteHoldDown).
+// A read lease rests only on acknowledgements whose vote window the replica promises, across restarts.
 
 // promisedAck steps a heartbeat from leader 1 into follower f and returns
 // f's HeartbeatResp to it.
@@ -393,12 +378,7 @@ func ackedFollower(t *testing.T) *raft {
 	return f
 }
 
-// TestLeaseVotePromise_SurvivesAHigherTermMessage drives the reported
-// scenario: a follower acks leader L, then a delayed higher-term response
-// from an old campaign moves it to a new term with no known leader. The
-// known-leader tests no longer apply, so without the window it would grant the
-// next candidate's vote at once while L still counted its ack. The promise holds
-// in real time until the window has passed.
+// TestLeaseVotePromise_SurvivesAHigherTermMessage verifies a follower keeps its vote promise after a higher-term message.
 func TestLeaseVotePromise_SurvivesAHigherTermMessage(t *testing.T) {
 	for _, preVote := range []bool{false, true} {
 		t.Run(map[bool]string{false: "vote", true: "pre_vote"}[preVote], func(t *testing.T) {
@@ -550,12 +530,7 @@ func TestLeaseRead_ForfeitForTheTermOnceTimeoutNowIsSent(t *testing.T) {
 	}
 }
 
-// TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease drives
-// the reported scenario: L starts a transfer to A, the TimeoutNow is
-// delayed, the transfer times out, heartbeats overtake it and L's followers
-// promise again; then the stale TimeoutNow arrives, A campaigns with the
-// transfer hint and B's promise to L at that term releases its vote. No
-// replica but L may lead while L holds a valid lease.
+// TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease verifies a stale TimeoutNow cannot elect inside a later lease.
 func TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease(t *testing.T) {
 	s := leaderLeasingOnF1(t, nil)
 	l := s.nodes[1]
@@ -593,8 +568,7 @@ func TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease(t *testi
 	l.broadcastHeartbeatCtx(0)
 	s.route()
 
-	// The stale TimeoutNow arrives and A campaigns; L no longer hears the
-	// vote traffic.
+	// The stale TimeoutNow arrives and A campaigns, unheard by L.
 	s.partition(1, 2)
 	s.partition(1, 3)
 	for _, m := range stale {

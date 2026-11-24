@@ -28,12 +28,7 @@ func fdatasync(f *os.File) error {
 	return syscall.Fdatasync(int(f.Fd()))
 }
 
-// fallocateFile reserves disk space for the file so appends within the
-// reservation do not extend the file or hit ENOSPC. Mode 0 also grows the
-// file's visible size to the requested length (keeping the size unchanged
-// would require FALLOC_FL_KEEP_SIZE); segment.Close truncates back to the
-// bytes actually written, and recovery treats the zero-filled tail of a
-// pre-allocated segment as end-of-records.
+// fallocateFile reserves space with mode 0, growing the visible size; segment.Close truncates to the written bytes.
 func fallocateFile(f *os.File, size int64) error {
 	return syscall.Fallocate(int(f.Fd()), 0, 0, size)
 }

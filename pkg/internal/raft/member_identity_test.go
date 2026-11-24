@@ -21,19 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestValidateConfigChange_RejectsSpellingVariantDuplicateAddress pins that the
-// duplicate-address check compares canonical endpoints.
-//
-// Under a literal string compare, "10.0.0.5:5001" and "10.0.0.05:5001" — or an
-// uppercase hostname, or the long form of an IPv6 literal — would be two
-// distinct members to the configuration validator and ONE host to
-// x509.VerifyHostname, which is what the receive-side gate ultimately
-// matches on. Two committed replica IDs the certificate cannot tell apart is
-// exactly the forgery the duplicate check exists to prevent: the single host
-// behind them casts two votes and advances two match indices.
-//
-// Each variant below is a DIFFERENT string from the committed one and the same
-// endpoint after canonicalisation.
+// TestValidateConfigChange_RejectsSpellingVariantDuplicateAddress verifies duplicate addresses are compared as canonical endpoints.
 func TestValidateConfigChange_RejectsSpellingVariantDuplicateAddress(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -79,8 +67,7 @@ func TestValidateConfigChange_RejectsSpellingVariantDuplicateAddress(t *testing.
 		}
 	})
 
-	// A co-located replica — same host, DIFFERENT port — remains supported.
-	// Canonicalisation must normalise the spelling, never collapse the port.
+	// Same host on a different port is allowed.
 	t.Run("same host different port still allowed", func(t *testing.T) {
 		p := newTestPeer(t, testConfig(), proto.State{}, proto.Membership{
 			Addresses: map[uint64]string{1: "10.0.0.1:5001", 2: "node-b.example.com:5001"},
@@ -93,11 +80,7 @@ func TestValidateConfigChange_RejectsSpellingVariantDuplicateAddress(t *testing.
 	})
 }
 
-// TestMemberBinding_ReportsASharedSpellingVariantAsNonExclusive is the
-// receive-side half. Validation refuses to CREATE a spelling-variant duplicate,
-// but a shard seeded through StartShard or restored from an older snapshot can
-// already hold one, so the sender binding must fail closed on it rather than
-// assume validation ran.
+// TestMemberBinding_ReportsASharedSpellingVariantAsNonExclusive verifies the sender binding fails closed on an existing spelling-variant duplicate.
 func TestMemberBinding_ReportsASharedSpellingVariantAsNonExclusive(t *testing.T) {
 	const lower, upper = "node-b.example.com:5001", "NODE-B.EXAMPLE.COM:5001"
 	p := newTestPeer(t, testConfig(), proto.State{}, proto.Membership{
@@ -122,16 +105,7 @@ func TestMemberBinding_ReportsASharedSpellingVariantAsNonExclusive(t *testing.T)
 	}
 }
 
-// TestValidateConfigChange_RejectsDuplicateMemberIdentity is the identity
-// analogue of the duplicate-address rule, and it is strictly more important:
-// the identity IS the authorization key once committed, so one identity naming
-// two replica IDs means one keypair holds two votes and two match indices in a
-// quorum that believes they are independent — with no certificate abuse and no
-// forged message anywhere.
-//
-// Unlike addresses there is no co-location exception. Two replicas on one
-// machine still need distinct keypairs; sharing one is precisely the
-// promiscuous shape identities exist to defeat.
+// TestValidateConfigChange_RejectsDuplicateMemberIdentity verifies one identity cannot name two replicas, with no co-location exception.
 func TestValidateConfigChange_RejectsDuplicateMemberIdentity(t *testing.T) {
 	const sharedIdentity = "spki:aaaa"
 	base := proto.Membership{
@@ -160,9 +134,7 @@ func TestValidateConfigChange_RejectsDuplicateMemberIdentity(t *testing.T) {
 		})
 	}
 
-	// A DISTINCT identity at a distinct address is allowed. Without this the
-	// test would pass against a validator that rejected every identity-bearing
-	// add.
+	// A distinct identity at a distinct address is allowed.
 	t.Run("distinct identity allowed", func(t *testing.T) {
 		p := newTestPeer(t, testConfig(), proto.State{}, base)
 		cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4,
@@ -184,17 +156,7 @@ func TestValidateConfigChange_RejectsDuplicateMemberIdentity(t *testing.T) {
 	})
 }
 
-// TestMembershipApply_IdentityReachesTheBindingThroughConsensus pins the
-// POPULATION path: an identity supplied on a config change must be visible to
-// the receive-side gate once — and only once — that change is applied, and must
-// survive the role changes an ordinary cluster performs.
-//
-// The "no identity leaves an existing one alone" case is the load-bearing one.
-// An AddNode with an empty identity is produced by restart replay, by follower
-// re-application, and by the StartShard members-map seed, so clearing on empty
-// would silently downgrade a migrated replica back to address-only
-// authorization — a downgrade an attacker could induce by getting any
-// identity-less config change committed for the victim.
+// TestMembershipApply_IdentityReachesTheBindingThroughConsensus verifies an applied identity reaches the binding and an empty one keeps the existing identity.
 func TestMembershipApply_IdentityReachesTheBindingThroughConsensus(t *testing.T) {
 	const identity = "spki:cccc"
 	m := newMembership(proto.Membership{

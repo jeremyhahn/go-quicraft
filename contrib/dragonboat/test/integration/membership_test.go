@@ -115,12 +115,7 @@ func TestIntegration_DB_RequestLeaderTransfer(t *testing.T) {
 	targetReplicaID := uint64(targetIdx + 1)
 	t.Logf("requesting transfer to node[%d] (replicaID=%d)", targetIdx, targetReplicaID)
 
-	// Request the transfer of whichever replica leads at the moment, and
-	// again of whoever leads later if the request is lost: a transfer is a
-	// request the engine does not retry, and the budget is derived from what
-	// one attempt is bounded by (see leaderTransferRounds in helpers_test.go).
-	// The host observed above is not used: leadership is not pinned by having
-	// been observed.
+	// Request the transfer of whoever leads now, and again if the request is lost.
 	cluster.transferLeadershipTo(t, 1, targetReplicaID, leaderTransferTimeout)
 
 	// Verify via GetLeaderID from the target host.

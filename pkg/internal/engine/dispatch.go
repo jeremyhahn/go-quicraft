@@ -24,95 +24,21 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 )
 
-// listenerQueueSize bounds the notification queue. Only COLD-PATH
-// notifications travel on it — leadership transitions, campaign launches and
-// terminal shard failures — so a thousand slots is several orders of magnitude
-// more than a healthy host produces between dispatcher wake-ups. The queue
-// fills only when a listener violates the documented non-blocking contract, and
-// what happens then is spelled out on dispatch.
+// listenerQueueSize bounds the cold-path notification queue; it fills only when a listener blocks.
 const listenerQueueSize = 1024
 
-// listenerDispatcher runs user-visible notifications on ONE dedicated goroutine
-// instead of on the engine worker that produced them.
-//
-// # Why this exists
-//
-// Every callback the step worker fired ran synchronously on the step-worker
-// goroutine WHILE that goroutine held stepWorker.nodesMu.RLock — tick() and
-// processReady() each hold it for their whole body. Host.StopShard re-enters the
-// same goroutine's nodesMu.Lock() via Engine.UnloadNode -> stepWorker.unloadNode,
-// and Go's RWMutex is not reentrant, so an operator handler that reacted to an
-// event by stopping the shard did not stall, it DEADLOCKED — permanently, and
-// not only for that shard: every shard mapped to the same worker
-// (shardID % numWorkers) stopped ticking, so no heartbeats, no elections and no
-// inbox drain, and a later Host.Close never returned from Engine.Stop's
-// stepWg.Wait(). "React to a failed shard by stopping it" is the obvious handler
-// to write, which is what made it reachable.
-//
-// Moving the notification off the worker goroutine removes the class rather than
-// the instance: the dispatcher goroutine holds no engine lock, so a listener may
-// call any Host API, including the synchronous StopShard.
-//
-// # Ordering guarantee
-//
-// Notifications are consumed by exactly one goroutine from a FIFO channel, so
-// they are delivered in the order the engine produced them — a TOTAL order, and
-// therefore per-shard order as well. A listener that watched a shard go
-// leader -> follower -> leader still sees those three events in that sequence.
-//
-// There is deliberately NO ordering guarantee between dispatched notifications
-// and the callbacks that remain synchronous (OnApplied, OnCommitted,
-// OnReadyToRead, OnProposalFailed, OnReadIndexBatched, OnReadIndexFailed). Those
-// resolve pending client requests and have documented happens-before
-// relationships with raft.Peer.Handle — OnReadIndexBatched must register its
-// aliases before the ReadIndex reaches raft, or a single-node shard completes
-// the batch key before the aliases exist — so they cannot be queued behind user
-// code. They are also unordered with respect to each other (they run on three
-// different worker tiers).
-//
-// # Queue-full policy
-//
-// dispatch NEVER blocks the producing worker. Blocking would reintroduce the
-// deadlock it exists to remove: a worker parked on a full queue still holds
-// nodesMu.RLock, so a listener calling StopShard from the dispatcher goroutine
-// would wait on nodesMu.Lock() behind that parked reader, and neither would
-// move again.
-//
-// It also never drops silently. dispatch reports acceptance, and each caller
-// chooses a policy that suits its event:
-//
-//   - Leadership changes are RETRIED, not dropped. publishLeaderChange commits
-//     its prevLeaders/prevLeaderTerms bookkeeping only on acceptance, so a
-//     rejected publish is re-attempted on the next tick and the notification
-//     cannot be lost. This matters: OnLeaderUpdated is what maintains the
-//     Host's isLeader mirror, and losing one would leave ShardInfo
-//     permanently wrong. Read readiness (OnLeaderReady) is retried the same
-//     way, and only once its leader change was accepted: a consumer waiting
-//     on it has nothing else to wake it.
-//   - Campaign launches and shard failures are dropped, counted in
-//     ListenerNotificationsDropped, and logged at ERROR with the shard, the
-//     reason and the running total, so the event still reaches the operator's
-//     log even though it does not reach their listener. Retaining them instead
-//     would mean holding engine liveness hostage to a listener that is, by
-//     construction, not consuming.
+// listenerDispatcher runs listener notifications in FIFO order on one goroutine holding no engine lock, so a listener may call any Host API.
+// It never blocks a worker: leadership changes are retried, campaign launches and shard failures are dropped, counted and logged.
 type listenerDispatcher struct {
 	q chan func()
 
-	// running gates the queueing path. While false — before Engine.Start and
-	// after Engine.Stop, and in unit tests that build workers without an engine
-	// — there is no goroutine to consume the queue, so dispatch invokes inline.
-	// That is the correct behaviour rather than a fallback: with no worker
-	// goroutines running there is no lock to be reentrant against.
+	// running gates queueing; while false there is no consumer and dispatch invokes inline.
 	running atomic.Bool
 
 	// dropped counts notifications refused because the queue was full.
 	dropped atomic.Uint64
 
-	// started records whether a goroutine was ever launched, so stop can tell
-	// "the dispatcher is draining" from "there is nothing to join". An engine
-	// that is constructed and stopped without ever being started is ordinary —
-	// unit tests do it constantly — and stop must not wait on a doneC nobody
-	// will ever close.
+	// started records whether a goroutine was ever launched, so stop knows whether to join.
 	started atomic.Bool
 
 	// stopOnce keeps stop idempotent: Engine.Stop is documented as safe to call
@@ -135,9 +61,7 @@ func newListenerDispatcher() *listenerDispatcher {
 	}
 }
 
-// start launches the dispatcher goroutine and tracks it on wg. It must run
-// BEFORE the worker tiers so no worker can enqueue into a queue nothing is
-// draining.
+// start launches the dispatcher goroutine; it must run before the worker tiers.
 func (d *listenerDispatcher) start(wg *sync.WaitGroup) {
 	d.started.Store(true)
 	d.running.Store(true)
@@ -190,11 +114,7 @@ func (d *listenerDispatcher) drain() {
 	}
 }
 
-// invoke runs one notification, containing a panic in user listener code. The
-// synchronous call sites this replaced were covered by the worker's own
-// restart-on-panic recovery; without an equivalent here a panicking listener
-// would take down the whole process, which is strictly worse than the behaviour
-// it replaced.
+// invoke runs one notification, recovering a panic in listener code.
 func (d *listenerDispatcher) invoke(fn func()) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -212,13 +132,7 @@ func (d *listenerDispatcher) invoke(fn func()) {
 	fn()
 }
 
-// dispatch queues fn for delivery on the dispatcher goroutine and reports
-// whether it was accepted. It never blocks. See the type documentation for the
-// ordering guarantee and the queue-full policy.
-//
-// A nil receiver, or a dispatcher whose goroutine is not running, invokes fn
-// inline and reports acceptance: there is no worker goroutine holding a lock in
-// that state, so there is nothing to be reentrant against.
+// dispatch queues fn for the dispatcher goroutine and reports acceptance without blocking; with no goroutine running it invokes fn inline.
 func (d *listenerDispatcher) dispatch(fn func()) bool {
 	if d == nil || !d.running.Load() {
 		fn()
@@ -233,14 +147,7 @@ func (d *listenerDispatcher) dispatch(fn func()) bool {
 	}
 }
 
-// stop shuts the dispatcher down. It must run AFTER every worker tier has
-// exited, so no producer remains that could strand a notification in the queue.
-// The final non-blocking drain covers a notification enqueued between the
-// running flag going false and the goroutine's own drain completing.
-//
-// It is idempotent, and safe on a dispatcher that was never started: an engine
-// constructed and stopped without Start has no goroutine to join, so waiting on
-// doneC would hang Stop forever.
+// stop shuts the dispatcher down after every worker tier has exited and drains the queue; idempotent and safe if never started.
 func (d *listenerDispatcher) stop() {
 	d.running.Store(false)
 	d.stopOnce.Do(func() { close(d.stopC) })

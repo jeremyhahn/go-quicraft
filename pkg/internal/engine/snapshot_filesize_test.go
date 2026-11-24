@@ -91,25 +91,12 @@ func snapshotPayload(index uint64, n int) []byte {
 	return buf
 }
 
-// TestRecoverSnapshot_RefusesATruncatedArtifact is the regression guard for a
-// FileSize that was written by every save and read by no load.
-//
-// A snapshot.dat truncated after it was recorded — a volume that filled between
-// the write and a later flush, a partial restore, a torn copy — was recovered
-// as if complete. The outcome is not an error but a SHORTER state machine: the
-// replica comes up at the snapshot's index holding a prefix of its state,
-// silently diverged from every peer at the same log position with every Raft
-// invariant intact.
+// TestRecoverSnapshot_RefusesATruncatedArtifact verifies recovery refuses a snapshot.dat shorter than its recorded FileSize.
 func TestRecoverSnapshot_RefusesATruncatedArtifact(t *testing.T) {
 	const full = 4096
 	f := newRecoverFixture(t, snapshotPayload(100, full), full)
 
-	// Truncate the artifact AFTER it was recorded, and re-stamp snapshot.meta
-	// over the truncated bytes: the file and its record replaced TOGETHER — a
-	// partial restore that brought both from the wrong place — so the meta
-	// hash agrees with the file and FileSize, which lives in LogDB, is the
-	// only check that can see the difference. The record still claims the full
-	// size; the file no longer has it.
+	// Truncate the artifact and re-stamp snapshot.meta, so only the LogDB FileSize can see the difference.
 	if err := os.Truncate(f.dataPath, full/2); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
@@ -180,12 +167,7 @@ func TestVerifySnapshotFileSize(t *testing.T) {
 // Snapshot membership must be the one in effect AT the snapshot's index
 // ---------------------------------------------------------------------------
 
-// newSaveFixtureWithMembership builds a save-side fixture whose peer publishes
-// a membership carrying configChangeID, and whose state machine is at
-// lastApplied. The two are independent on purpose: the snapshot's index comes
-// from the APPLY frontier and its membership from the COMMIT frontier, and this
-// is what lets a test drive them apart the way a config change committed but
-// not yet applied does in production.
+// newSaveFixtureWithMembership builds a save fixture whose membership and lastApplied are set independently.
 func newSaveFixtureWithMembership(
 	t *testing.T, lastApplied, configChangeID uint64,
 ) (*snapshotPool, snapshotRequest, *snapshotTestSnapshotter) {
@@ -231,18 +213,7 @@ func newSaveFixtureWithMembership(
 	}, ss
 }
 
-// TestSaveSnapshot_RefusesAMembershipAheadOfTheSnapshotIndex is the regression
-// guard for the two-frontier mismatch.
-//
-// The snapshot's index is the APPLY frontier; its membership is folded at
-// COMMIT time, and commit runs ahead of apply — necessarily so here, because
-// the saving gate this path holds stops applies while the step worker keeps
-// committing. A config change committed at C above the snapshot's index was
-// therefore recorded into a snapshot taken below it, so the artifact claimed a
-// configuration that did not exist at its own index: a follower installing it
-// adopts membership as of C, sets its fold marker to the snapshot's index, and
-// re-folds every config change in between — while computing quorums, until it
-// catches up, from a voting set the log at that index does not justify.
+// TestSaveSnapshot_RefusesAMembershipAheadOfTheSnapshotIndex verifies a save refuses membership committed above its apply index.
 func TestSaveSnapshot_RefusesAMembershipAheadOfTheSnapshotIndex(t *testing.T) {
 	pool, req, _ := newSaveFixtureWithMembership(t, 100, 500)
 

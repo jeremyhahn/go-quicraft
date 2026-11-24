@@ -1,9 +1,4 @@
-# BuildKit reads this file instead of the root .dockerignore when it builds
-# .devcontainer/Dockerfile.dev. It repeats every root entry except .git/: the
-# dev image runs `make ci`, whose test/releasability gate reads the git index
-# (`git ls-files`), so this one image keeps the repository metadata. Every
-# other image still builds without it. test/buildgates fails if a root entry is
-# missing here, and if .devcontainer/.env is missing from any ignore file.
+# Root .dockerignore entries except .git/: the dev image's make ci reads the git index; test/buildgates checks the two stay in sync.
 
 # Build artifacts
 build/coverage/

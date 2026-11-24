@@ -12,24 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package perfprofile owns the on-disk shape of a machine profile: the captured
-// machine description, the stored result JSON, and the comparison documents
-// generated from them.
-//
-// A profile is one machine class tracked over time. Its name is supplied by the
-// operator and cannot be derived from the hardware — no amount of lscpu output
-// says "this is our desktop-class reference box" — while everything in env.json
-// is derived on the target at run time, so the specification table beside a
-// number is never hand-maintained.
-//
-// Within a profile directory:
-//
-//	env.json      captured on the target, never edited
-//	results/      one JSON suite per benchmarked system
-//	logs/         one verbatim container console per benchmarked system
-//	charts/       SVG charts, regenerated wholesale
-//	<system>.md   generated comparison documents, deleted and recreated freely
-//	analysis.md   HAND-WRITTEN. The generator never writes it.
+// Package perfprofile owns a machine profile's directory: env.json (captured), results/, logs/, charts/, generated <system>.md files, and hand-written analysis.md.
 package perfprofile
 
 import (

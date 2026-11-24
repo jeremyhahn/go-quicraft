@@ -20,15 +20,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// setListenerSockopts configures the UDP listener socket fd before it is
-// bound: SO_RCVBUF/SO_SNDBUF when recvBuf/sendBuf are positive. A failure is
-// logged rather than returned: the socket still works with the system's
-// defaults.
-//
-// SO_REUSEADDR is deliberately not set. On Windows it lets a socket bind an
-// address that a live socket already holds, whether or not the holder set it,
-// so another process could take over the listener's port. The net package
-// leaves it unset on Windows for the same reason.
+// setListenerSockopts sets SO_RCVBUF/SO_SNDBUF before bind when positive, logging failures; SO_REUSEADDR is not set because on Windows it allows port takeover.
 func setListenerSockopts(fd uintptr, recvBuf, sendBuf int) {
 	if recvBuf > 0 {
 		if err := windows.SetsockoptInt(windows.Handle(fd), windows.SOL_SOCKET, windows.SO_RCVBUF, recvBuf); err != nil {

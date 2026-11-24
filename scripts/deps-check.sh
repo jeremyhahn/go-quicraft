@@ -1,25 +1,5 @@
 #!/bin/sh
-# deps-check.sh -- fail when a DIRECT dependency of any module in this repo is
-# behind its newest release.
-#
-# Runs `go list -m -u` over every module in the tree.
-#
-# A module is exempt only if the comment block directly above its `require`
-# line in go.mod contains the words DOCUMENTED PIN. There is no ignore list or
-# flag, so a pin is always recorded beside the version it holds.
-#
-# A newest release published less than GRACE_DAYS (7) days ago is reported as
-# NEW, not failed: a release that young has not had its notes read or its
-# fixes settled, and a nightly that turns red on the day of an upstream tag
-# blocks merges for no defect here (CA m823). Once it is older than that, an
-# undocumented lag fails as before. A release whose publication time the
-# proxy does not report is treated as old, so the check fails closed.
-#
-# Exit 0 = every module current, documented, or behind only a release under
-# GRACE_DAYS old. Exit 1 = at least one undocumented lag behind an older
-# release. Exit 2 = the check could not run, or the update lookup failed for a
-# direct dependency (reported as an ERROR line): a module that could not be
-# checked is not current, so neither is a pass.
+# deps-check.sh -- fail when a direct dependency is behind its newest release older than GRACE_DAYS (7), unless go.mod marks it DOCUMENTED PIN; exit 0 current, 1 lagging, 2 could not run.
 
 # -f: lines are word-split into fields below, and an error message must not glob.
 set -euf
@@ -34,10 +14,7 @@ command -v go >/dev/null 2>&1 || {
 	exit 2
 }
 
-# Module directories, sorted for stable output. Directories the go tool
-# ignores (names starting with . or _, and testdata) are pruned, the same rule
-# the Makefile's ci-modules uses, so agent worktrees under .claude/ are never
-# walked; vendored and fetched trees are pruned too.
+# Module directories, sorted; dot, underscore, testdata, vendored and fetched trees are pruned like the Makefile's ci-modules.
 mods=$(find . -mindepth 1 -type d \( -name '.*' -o -name '_*' -o -name testdata \
 	-o -name vendor -o -name node_modules \) -prune -o \
 	-name go.mod -print | sed 's|/go.mod$||' | sort)
@@ -56,26 +33,7 @@ young=0
 lookups_failed=0
 
 for dir in $mods; do
-	# A run that cannot be trusted is exit 2, never a pass. That covers both
-	# ways the lookup can fail: `go list` exiting non-zero because it cannot
-	# resolve the module graph (go.sum mismatch), and a per-module update
-	# lookup that errored (unreachable proxy or VCS, GOPROXY=off, a cache it
-	# cannot write). The second still exits 0 and leaves .Update empty, so
-	# -e is passed and .Error is read: a module with an error is an ERROR
-	# line, not "current".
-	#
-	# Each record starts with a marker. "ERR path version replacement|-
-	# message" is a failed lookup; the message is the error text, whose later lines (if
-	# any) carry no marker and are skipped, so only its first line is
-	# reported. "UPD path version -> update release-time [replacement]" is
-	# a module behind its newest release; release-time is that release's
-	# publication time in Unix seconds, or - when the proxy does not report
-	# one.
-	#
-	# A module replaced by a directory (the nested modules' `=> ../..`) has
-	# no update, whatever tag the registry reports. The replacement path is
-	# appended as a last field and judged below; a replacement by another
-	# module version is still checked.
+	# A failed lookup exits 2: records are ERR (failed lookup, first line) or UPD (behind, with release time and any replacement).
 	if ! raw=$(cd "$dir" && go list -m -u -e \
 		-f '{{if and (not .Main) (not .Indirect)}}{{if .Error}}ERR {{.Path}} {{.Version}} {{if .Replace}}{{.Replace.Path}}{{else}}-{{end}} {{.Error.Err}}{{else if .Update}}UPD {{.Path}} {{.Version}} -> {{.Update.Version}} {{if .Update.Time}}{{.Update.Time.Unix}}{{else}}-{{end}}{{if .Replace}} {{.Replace.Path}}{{end}}{{end}}{{end}}' \
 		all 2>&1); then
@@ -94,8 +52,7 @@ for dir in $mods; do
 		if [ "$1" = ERR ]; then
 			case "$4" in
 			.*|/*)
-				# Replaced by a directory: there is no release to look
-				# up, so a failed lookup does not matter (#188).
+				# Replaced by a directory: no release to look up, so a failed lookup does not matter.
 				continue ;;
 			esac
 			echo "ERROR $dir: $2 $3: update lookup failed: ${line#ERR "$2" "$3" "$4" }"
@@ -113,9 +70,7 @@ for dir in $mods; do
 			continue ;;
 		esac
 
-		# Exempt iff the comment block immediately above this module's
-		# require line says DOCUMENTED PIN. Any other non-blank line clears
-		# the flag, so a marker cannot leak to a later require line.
+		# Exempt iff the comment block directly above this require line says DOCUMENTED PIN.
 		documented=$(awk -v want="$path" '
 			/^[[:space:]]*\/\// { if (index($0, "DOCUMENTED PIN")) seen = 1; next }
 			/^[[:space:]]*$/    { next }

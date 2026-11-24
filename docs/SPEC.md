@@ -56,7 +56,7 @@ folder `docs/<feature>/` is the detail behind its row; where a row links an
 | contrib-dragonboat | shipped | A Dragonboat API compatibility layer over the `Host`, in its own module under `contrib/dragonboat/`. | [multi-group-host/](multi-group-host/) (architecture.md, Package structure) |
 | testing | shipped | The test infrastructure: suite organisation, build tags, fault injectors, fuzzing, linearizability verification, coverage gates and benchmark regression. [overview.md](testing/overview.md) | [testing/](testing/) |
 | release | shipped | Public releasability: what may be published from this tree, the development-tooling exclusion list and the `test/releasability` gate; the release recipe (`make release-candidate`, `make release-alpha`). [public-releasability.md](release/public-releasability.md) | [release/](release/) |
-| maintenance | in progress | A standing row (owner ruling 1234) for dependency updates and CI configuration: dependency bumps, automated and manual, and CI workflow changes, template adoptions included, are worked on one row branch and land as PRs from it. It stays open and gates no release. | [#1202](../../issues/1202) |
+| maintenance | in progress | A standing row for dependency updates and CI configuration: dependency bumps, automated and manual, and CI workflow changes, template adoptions included, are worked on one row branch and land as PRs from it. It stays open and gates no release. | [#1202](../../issues/1202) |
 
 Every feature is shipped except the standing `maintenance` row, which stays in progress; no feature is planned or future.
 
@@ -85,7 +85,7 @@ feature; its reason is the one the cited architecture document gives.
 The current milestone is **Dev complete**: go-quicraft tags `-alpha` only, cuts an `-rc.N` only if a consumer needs one, and keeps the rc tags already cut pinned. It closes when:
 
 - #309 is closed: `TestLinearizability_3Node_LeaderFailover` and its soak pass reliably (testing). Met.
-- #283 is closed: the spec-review scrub of `docs/` is verified by the department and its fixes have landed. Met.
+- #283 is closed: the spec-review scrub of `docs/` is verified and its fixes have landed. Met.
 - Every feature row planned for Dev complete is shipped, shard-pause included (a go-qrdb seam row); heartbeat-under-fsync (#390), planned after Dev complete, is shipped too (#398). Met: every Dev complete row in Features is `shipped` (pq-key-exchange, #412, planned after Dev complete, is shipped too), and #363, #369, #370 and #390 are closed.
 - Every seam row go-trusted-platform's SPEC names on go-quicraft is shipped; it names none, since go-trusted-platform reaches consensus only through go-qrdb. Met.
 - Nothing is dev complete until go-trusted-platform is, and every lower library has a stable, complete API. Not met: this holds until go-trusted-platform is dev complete, which this repository does not decide.
@@ -96,9 +96,9 @@ Then release candidates are tagged, deployed to staging and released; production
 The v1.0.0 bar, on top of the above:
 
 - go-enclave is at a public release (memory-enclave). Open: #427, which waits on go-enclave's public release.
-- The compatibility policy is acknowledged (`release-versioning.md` §1, §8) (compatibility). Met: the owner acknowledged it on 2026-10-20, every answer as written (#404).
+- The compatibility policy is acknowledged (`release-versioning.md` §1, §8) (compatibility). Met: acknowledged, every answer as written (#404).
 - A publication mechanism for agent files exists (release). Met (#436): the agent files are published and scanned like any other file; `.gitattributes` export-ignores only the private forge workflows and the release trust anchor, and `test/releasability` enforces the list ([release/public-releasability.md](release/public-releasability.md)).
-- The company CI template is neutralised for the public tree: `.github/workflows` names no internal repository or domain (release). Met (#436): every published workflow passes the `test/releasability` scan; the private forge's own workflows are export-ignored ([release/public-releasability.md](release/public-releasability.md)).
+- The CI template is neutralised for the public tree: `.github/workflows` names no internal repository or domain (release). Met (#436): every published workflow passes the `test/releasability` scan; the private forge's own workflows are export-ignored ([release/public-releasability.md](release/public-releasability.md)).
 - Every wire and on-disk format version stays pinned until v1.0.0 ships (wire-protocol, log-storage). Holding: every discriminator is at its pinned value ([compatibility/engineering.md](compatibility/engineering.md#version-discriminators)); it is met when v1.0.0 ships with none moved.
 - The rest of the bar is the rows of the `v1.0.0 bar` milestone, one issue each (the letter L was not used). Every row is closed:
   - V1-A, doc drift, the upgrade and root-key-compromise runbooks, the non-goal decisions above. Met (#437, #441).

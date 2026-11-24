@@ -14,14 +14,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
-// TestReencryptSnapshotFile_DirFsyncFailureReturnsEpoch pins the
-// committed-but-unsynced contract. A directory fsync that fails AFTER the
-// rename leaves the destination holding the migrated artifact sealed at epoch
-// E. Returning epoch 0 there told the caller the artifact was plaintext: it
-// recorded no epoch, the deferred deregister dropped E's in-flight pin, and
-// the next PurgeEpochsBefore destroyed E's DEK — leaving the migrated snapshot
-// permanently undecryptable, the exact outcome the pinning machinery exists to
-// prevent.
+// TestReencryptSnapshotFile_DirFsyncFailureReturnsEpoch verifies a directory fsync failure after the rename still returns the artifact's epoch.
 func TestReencryptSnapshotFile_DirFsyncFailureReturnsEpoch(t *testing.T) {
 	srcBarrier := createTestBarrier(t)
 	dstBarrier := createTestBarrier(t)
@@ -70,10 +63,7 @@ func TestReencryptSnapshotFile_DirFsyncFailureReturnsEpoch(t *testing.T) {
 		}
 	}
 
-	// The epoch must ALSO travel inside the error. The return-value contract
-	// alone is unenforceable: every caller writes `if err != nil { return 0,
-	// err }`, which drops exactly the epoch this case delivers, after which the
-	// deferred deregister releases the pin and the next purge orphans the DEK.
+	// The epoch must also travel inside the error, since callers drop return values on error.
 	var notDurable *SnapshotCommittedNotDurableError
 	if !errors.As(err, &notDurable) {
 		t.Fatalf("err = %v (%T), want a *SnapshotCommittedNotDurableError so errors.As "+
@@ -211,12 +201,7 @@ func (f closeFailFile) Close() error {
 	return f.err
 }
 
-// TestReencryptSnapshotFile_RestampFaults drives every failure on the
-// snapshot.meta restamp path through crashFS. A failure before the data
-// rename returns epoch 0 and leaves no destination; a failure after it
-// returns the committed epoch, inside a *SnapshotCommittedNotDurableError as
-// well, with the migrated data live; and since the directory fsync never
-// completed, neither the data nor the restamped meta survives a crash.
+// TestReencryptSnapshotFile_RestampFaults verifies each snapshot.meta restamp failure: epoch 0 before the rename, the committed epoch in a *SnapshotCommittedNotDurableError after it.
 func TestReencryptSnapshotFile_RestampFaults(t *testing.T) {
 	cases := []struct {
 		name      string

@@ -14,21 +14,7 @@
 
 //go:build integration && quicraft_netfault
 
-// The regression fixture for the READ half of the cached-leader class.
-//
-// It is the read-path twin of the e2e suite's
-// TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent, and
-// it lives in the netfault build for the same reason: the failure needs a live
-// replica that has lost leadership AND does not yet know who took over.
-// handleFollowerReadIndex forwards a ReadIndex whenever the follower knows the
-// leader, and refuses it with "not leader ... leader unknown" only when it does
-// not. A process kill cannot construct that state — a killed node answers
-// ErrClosed, not not-leader — but isolation can: the node keeps running, steps
-// down when check-quorum fires, and hears nothing about its successor.
-//
-// The CI failure this guards is the same refusal on a healthy cluster: a
-// leader observed once above a loop of thirty reads, deposed by the election
-// storm that follows a membership change, refusing a later read correctly.
+// Regression fixture for reads through a cached leader: an isolated incumbent steps down without learning its successor.
 
 package host_test
 
@@ -41,14 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
-// TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent asserts
-// that readFromLeader re-resolves the leader between attempts, by issuing a
-// read the instant the incumbent is cut off — while the resolver still names
-// it — and requiring the read to be answered by the majority's leader.
-//
-// Mutation: hoist the resolve out of the retry loop in test/proposer's drive
-// and this test fails with the not-leader rejection; the pinned read below
-// proves that is the rejection the isolated incumbent produces.
+// TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent checks readFromLeader re-resolves the leader between attempts.
 func TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -69,9 +48,7 @@ func TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent(t *testing.
 	// suite relies on the same mapping.
 	staleReplica := uint64(staleIdx + 1)
 
-	// Registered AFTER the cluster's own cleanup so it runs BEFORE it: the
-	// injector is process-global, and a partition left standing leaks into
-	// the next test.
+	// Registered after the cluster's cleanup so it runs first and heals the partition.
 	t.Cleanup(netfault.Heal)
 	netfault.Isolate(staleReplica)
 	// This guard is the point. Built without quicraft_netfault every netfault
@@ -84,22 +61,13 @@ func TestNetPartition_ReadFromLeader_ResolvesPastAnIsolatedIncumbent(t *testing.
 	t.Logf("node[%d] (replica %d) isolated while it still believes it leads shard %d",
 		staleIdx, staleReplica, shardID)
 
-	// No wait here, deliberately. The read races the step-down: the first
-	// resolution gets the incumbent, whose ReadIndex heartbeat can reach no
-	// quorum, so that attempt is failed not-leader when check-quorum takes the
-	// shard away from it — and the SECOND resolution, the one a cached index
-	// cannot make, finds the majority's leader.
+	// No wait: the read races the step-down, so only a second resolution finds the new leader.
 	got := readFromLeader(t, cluster, shardID, "rfl-pre", failoverTimeout)
 	if val, ok := got.(string); !ok || val != "ok" {
 		t.Fatalf("read through the leader = %v (%T), want %q", got, got, "ok")
 	}
 
-	// The read was answered, so the majority elected past the incumbent.
-	// Assert the cached-leader pattern against it once it has stepped down:
-	// one cached index, one SyncRead, no retry. This is the pattern the
-	// helpers exist to avoid, and it doubles as proof that the isolation produced the
-	// leader-unknown refusal rather than a healthy cluster that forwarded the
-	// ReadIndex on.
+	// Assert a single cached-index SyncRead is refused, proving the isolation produced the leader-unknown refusal.
 	waitForCondition(t, failoverTimeout, "the isolated incumbent steps down", func() bool {
 		info, err := cluster.hosts[staleIdx].ShardInfo(shardID)
 		return err == nil && !info.IsLeader

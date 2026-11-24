@@ -24,9 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// testTransportHostConfig returns a HostConfig with the QUIC transport ENABLED
-// — the production default — bound to an ephemeral loopback port and using a
-// throwaway mTLS identity.
+// testTransportHostConfig returns a HostConfig with QUIC enabled on an ephemeral loopback port and a throwaway mTLS identity.
 func testTransportHostConfig(t *testing.T) config.HostConfig {
 	t.Helper()
 	cfg := testHostConfig(t)
@@ -162,9 +160,7 @@ func TestNewHost_TransportEnabledWithShardBarriers(t *testing.T) {
 	}
 }
 
-// TestNewHost_KernelAssignedPortIsAdvertised verifies that a host configured
-// with port 0 reports, and advertises to peers, the port the kernel bound, so
-// a test can create a host first and read its address afterwards (#386).
+// TestNewHost_KernelAssignedPortIsAdvertised checks a port-0 host advertises the port the kernel bound.
 func TestNewHost_KernelAssignedPortIsAdvertised(t *testing.T) {
 	cfg := testTransportHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())

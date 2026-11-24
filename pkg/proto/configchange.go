@@ -14,24 +14,7 @@
 
 package proto
 
-// ConfigChange represents a membership change request. It is serialized
-// as the Cmd payload of an EntryConfigChange entry. There is exactly ONE
-// layout, and every field in it is mandatory:
-//
-//	[ConfigChangeID:8][Type:8][ReplicaID:8][Address:len+data][Initialize:8]
-//	[MaxWitnesses:8][RequireFullReplicaMajority:8][WireVersion:8]
-//	[NodeIdentity:len+data]
-//
-// The type carries no version byte and needs none. Under the pre-release
-// pinning policy (see the package comment) there is one layout to decode, so
-// there is nothing for a discriminator to discriminate: a payload that does not
-// span the whole layout is refused rather than read as an earlier one. An
-// absent NodeIdentity is spelled as a four-byte zero LENGTH PREFIX, not as a
-// short buffer — the field is always present, and only its content may be
-// empty.
-//
-// That distinction is the reason the layout is fixed rather than
-// length-discriminated. See UnmarshalFrom.
+// ConfigChange is a membership change, the Cmd of an EntryConfigChange; one layout, every field required: [ConfigChangeID:8][Type:8][ReplicaID:8][Address][Initialize:8][MaxWitnesses:8][RequireFullReplicaMajority:8][WireVersion:8][NodeIdentity].
 type ConfigChange struct {
 	// ConfigChangeID is the log index that identifies this config change.
 	ConfigChangeID uint64
@@ -55,50 +38,16 @@ type ConfigChange struct {
 	// WireVersion is the shard's new committed transport version for
 	// UpdateWireVersion changes. Zero for every other type.
 	WireVersion uint64
-	// NodeIdentity is the stable cryptographic node identity to commit for
-	// the replica being added — the value quicraft.NodeIdentity derives from
-	// that node's leaf certificate. Empty for RemoveNode and
-	// UpdateWitnessPolicy, and empty for an add whose caller supplied none.
-	//
-	// An empty value is a real, encoded state (a zero length prefix), never an
-	// absent field. There is no address-based authorization to fall back on:
-	// the receive-side gate authorizes a member by identity alone, so under
-	// RequireMemberIdentities (which the Host sets whenever it has a
-	// transport) an add with an empty identity is refused with
-	// ErrMemberIdentityRequired unless the configuration already binds an
-	// identity to the replica (a role change keeps the existing binding).
-	// It must therefore be something a
-	// WRITER chose and not something a truncated buffer produced; see
-	// UnmarshalFrom.
-	//
-	// It travels through consensus alongside Address so the receive-side gate
-	// reads a value no inbound message can write. It is supplied by the
-	// OPERATOR through the Host API, never captured from a connection: see the
-	// "Considered and rejected" note on Host.RequestAddNodeWithIdentity for why
-	// learning it from the joiner's own connection is unsound in exactly the
-	// threat model identities exist to close.
+	// NodeIdentity is the node identity committed for the added replica, supplied by the operator; empty is encoded as a zero length prefix.
 	NodeIdentity string
-	// MustMatchConfigChangeID is an IN-MEMORY marker, never encoded: it is
-	// excluded from Size, MarshalTo and UnmarshalFrom, so it changes neither
-	// the wire encoding nor any format version. It binds an add whose
-	// ConfigChangeID is 0 (the initial configuration) to that value: the
-	// leader's membership validator refuses the change unless the current
-	// config change ID is still 0. A non-zero ConfigChangeID is always bound
-	// and needs no marker. The marker is set by the Host's bound option and
-	// read by the validator before the change is marshaled into a log entry.
+	// MustMatchConfigChangeID is in-memory only: it binds an add with ConfigChangeID 0 to a current config change ID of 0.
 	MustMatchConfigChangeID bool
 }
 
-// configChangeFixedSize is the wire size of the fixed fields:
-// ConfigChangeID(8) + Type(8) + ReplicaID(8) + Initialize(8) +
-// MaxWitnesses(8) + RequireFullReplicaMajority(8) + WireVersion(8) = 56 bytes,
-// plus the 4-byte address string length prefix.
+// configChangeFixedSize is the 56 bytes of fixed fields plus the 4-byte address length prefix.
 const configChangeFixedSize = 7*8 + 4 // 60 bytes
 
-// configChangeIdentitySize is the wire size the trailing NodeIdentity field
-// adds: its own 4-byte length prefix plus the bytes. The prefix is
-// unconditional, so an empty identity still costs four bytes — that is what
-// makes an empty identity distinguishable from a payload that stops early.
+// configChangeIdentitySize is NodeIdentity's 4-byte length prefix plus its bytes.
 func (cc *ConfigChange) configChangeIdentitySize() int {
 	return 4 + len(cc.NodeIdentity)
 }
@@ -108,22 +57,7 @@ func (cc *ConfigChange) Size() int {
 	return configChangeFixedSize + len(cc.Address) + cc.configChangeIdentitySize()
 }
 
-// MarshalTo writes the config change into buf and returns bytes written.
-// buf must be at least Size() bytes.
-//
-// Returns ErrBufferTooSmall if buf is too short, ErrInvalidConfigChangeType for
-// a type UnmarshalFrom would reject, ErrAddressTooLong if Address exceeds
-// MaxAddressLength, or ErrNodeIdentityTooLong if NodeIdentity exceeds
-// MaxNodeIdentityLength.
-//
-// Those three are the READ side's checks applied on write, and they are not
-// cosmetic here: a ConfigChange is marshaled into an Entry.Cmd and COMMITTED, so
-// a payload this package can emit but not parse is a committed entry every
-// replica faults on (peer.applyMembershipEntry returns ErrCorruptConfigEntry and
-// the shard is failed) — a self-inflicted cluster-wide outage from an
-// over-length operator-supplied address. Unlike Membership these limits are
-// per-FIELD, so each keeps its own sentinel: getString is called with the right
-// bound and the right error at both ends.
+// MarshalTo writes the config change into buf (at least Size bytes), applying the read-side bounds: ErrBufferTooSmall, ErrInvalidConfigChangeType, ErrAddressTooLong, ErrNodeIdentityTooLong.
 func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
 	if cc.Type > maxConfigChangeType {
 		return 0, ErrInvalidConfigChangeType
@@ -155,49 +89,12 @@ func (cc *ConfigChange) MarshalTo(buf []byte) (int, error) {
 	return offset, nil
 }
 
-// UnmarshalFrom reads the config change from buf and returns bytes consumed.
-// Returns ErrBufferTooSmall if buf does not span the whole layout,
-// ErrInvalidConfigChangeType for an unknown type, ErrAddressTooLong if the
-// address exceeds MaxAddressLength, or ErrNodeIdentityTooLong if the identity
-// exceeds MaxNodeIdentityLength.
-//
-// # Why a short buffer is an error and not a shorter layout
-//
-// Length is not a safe discriminator for a field whose absence weakens a
-// check. Were a payload ending after RequireFullReplicaMajority decoded as one
-// with an EMPTY NodeIdentity, a truncated ConfigChange would be
-// byte-indistinguishable from one that genuinely carried no identity: a 61-byte
-// prefix of a valid 78-byte encoding would decode with err == nil and silently
-// drop the identity the receive-side gate checks.
-//
-// Under the pinning policy there is nothing to discriminate anyway — one
-// layout, all of it required — so the length test is a bound: anything that
-// does not span the layout is refused, and an identity-less change is spelled
-// with an explicit zero length prefix by MarshalTo.
+// UnmarshalFrom reads the config change from buf; a buffer that does not span the whole layout is ErrBufferTooSmall, never a shorter layout.
 func (cc *ConfigChange) UnmarshalFrom(buf []byte) (int, error) {
 	if len(buf) < 24+4 { // 3 uint64 fields + address length prefix
 		return 0, ErrBufferTooSmall
 	}
-	// Decoded into a LOCAL and assigned only on success, so the method is
-	// all-or-nothing.
-	//
-	// Writing fields into the receiver as they were parsed meant a failure
-	// part-way through left the receiver holding the NEW ConfigChangeID, Type,
-	// ReplicaID and Address bolted onto the OLD NodeIdentity — a mixture that
-	// describes no configuration any writer produced. NodeIdentity is what
-	// the receive-side gate authorizes the member by, so a stale one beside a
-	// new target is precisely the shape
-	// Membership.UnmarshalFrom was hardened against (see its comment: "a
-	// partial decode that kept a STALE Identities map would authorize a
-	// replica the decoded configuration never named"). ConfigChange carries
-	// the same class of field and did not get the same treatment.
-	//
-	// Every current caller declares a fresh value and abandons it on error, so
-	// nothing is reachable today — which is exactly the argument the
-	// Membership decoder rejected, because the invariant belongs in the
-	// decoder rather than in the discipline of its callers. This type is also
-	// the one a pooling refactor would reach for first: it is decoded once per
-	// config entry during replay.
+	// Decode into a local and assign only on success, so a failure leaves the receiver unchanged.
 	var decoded ConfigChange
 	decoded.ConfigChangeID = getUint64(buf[0:])
 	decoded.Type = getUint64(buf[8:])

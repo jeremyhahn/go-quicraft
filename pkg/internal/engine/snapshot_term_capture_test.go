@@ -27,10 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// termShiftSnapshotter simulates a leader change that applies entries at a
-// higher term while the snapshot save is still streaming AFTER afterCapture
-// released the apply gate. The (index, term) recorded by the save must be the
-// pair captured under the gate, not the post-release values.
+// termShiftSnapshotter applies entries at a higher term after afterCapture releases the gate; the save must record the captured pair.
 type termShiftSnapshotter struct {
 	lastApplied atomic.Uint64
 	node        atomic.Pointer[Node]
@@ -51,8 +48,7 @@ func (s *termShiftSnapshotter) SaveSnapshotGated(_ context.Context, w io.Writer,
 	if afterCapture != nil {
 		afterCapture()
 	}
-	// The gate is released now: simulate applies at a NEWER term advancing
-	// the node's applied markers while flush/fsync/encryption still run.
+	// Gate released: simulate applies at a newer term while the save still runs.
 	if n := s.node.Load(); n != nil {
 		n.lastApplied.Store(s.shiftIndex)
 		n.lastAppliedTerm.Store(s.shiftTerm)
@@ -73,10 +69,7 @@ func (s *termShiftSnapshotter) LastApplied() uint64 {
 var _ Snapshotter = (*termShiftSnapshotter)(nil)
 var _ gatedSnapshotter = (*termShiftSnapshotter)(nil)
 
-// TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate is a regression test: the snapshot's term must be captured together with its index INSIDE
-// the apply gate. A term read after afterCapture releases the gate can observe
-// applies from a new leader at term T+1, recording (index@T, term=T+1) — a
-// Log Matching violation for any follower that installs the snapshot.
+// TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate: the snapshot term is captured with its index inside the apply gate.
 func TestSnapshotPool_SaveSnapshot_TermCapturedUnderGate(t *testing.T) {
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
@@ -187,11 +180,7 @@ func (s *rsmLikeSnapshotter) LastApplied() uint64 {
 var _ Snapshotter = (*rsmLikeSnapshotter)(nil)
 var _ appliedSetter = (*rsmLikeSnapshotter)(nil)
 
-// TestSnapshotPool_RecoverSeedsSnapshotterLastApplied is a regression test: after recovering to snapshot index N, the snapshotter's own applied
-// counter (the INDEX source for the next save) must equal N. Without the
-// seeding, a snapshot requested right after recovery records a stale
-// pre-recovery index against post-recovery state — a payload/metadata
-// mismatch that regresses lastSnapshotIndex and double-applies on replay.
+// TestSnapshotPool_RecoverSeedsSnapshotterLastApplied: after recovering to N the snapshotter's applied counter is N.
 func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
@@ -262,9 +251,7 @@ func TestSnapshotPool_RecoverSeedsSnapshotterLastApplied(t *testing.T) {
 			"truncates the artifact the recovery just read", result.index)
 	}
 
-	// Phase 4: once applies advance past the recovered index, the save records
-	// the ADVANCED index against recovered state — never the stale
-	// pre-recovery counter (40), which is what the seeding guards.
+	// Phase 4: after applies advance, the save records the advanced index, never the stale counter (40).
 	recoverer.lastApplied.Store(150)
 	recoverer.state.Store(150)
 	if err := p.requestSnapshot(snapshotRequest{

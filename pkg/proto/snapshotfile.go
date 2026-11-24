@@ -14,10 +14,7 @@
 
 package proto
 
-// SnapshotFile represents metadata for an external file included in a
-// snapshot. The wire format is:
-//
-//	[Filepath:len+data][FileSize:8][FileID:8][Metadata:len+data]
+// SnapshotFile describes an external file in a snapshot, encoded as [Filepath:len+data][FileSize:8][FileID:8][Metadata:len+data].
 type SnapshotFile struct {
 	// Filepath is the path to the external file.
 	Filepath string
@@ -25,11 +22,7 @@ type SnapshotFile struct {
 	FileSize uint64
 	// FileID is the unique identifier for this file within the snapshot.
 	FileID uint64
-	// Metadata is application-defined metadata for this file. After
-	// UnmarshalFrom, Metadata aliases the source buffer (zero-copy), like
-	// Entry.Cmd. The caller must copy if the data needs to outlive the
-	// buffer — on the receive path the buffer is pooled and is returned
-	// before the handler runs.
+	// Metadata is application-defined and aliases the source buffer after UnmarshalFrom; copy it to keep it.
 	Metadata []byte
 }
 
@@ -38,12 +31,7 @@ func (sf *SnapshotFile) Size() int {
 	return (4 + len(sf.Filepath)) + 8 + 8 + (4 + len(sf.Metadata))
 }
 
-// MarshalTo writes the snapshot file into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
-// short, ErrFilepathTooLong if Filepath exceeds MaxFilepathLen, or
-// ErrMetadataTooLong if Metadata exceeds MaxMetadataLen — the read side's
-// bounds applied on write, so the encoder cannot emit a record this package
-// refuses to read back.
+// MarshalTo writes the file into buf and returns bytes written, or ErrBufferTooSmall, ErrFilepathTooLong or ErrMetadataTooLong.
 func (sf *SnapshotFile) MarshalTo(buf []byte) (int, error) {
 	if len(sf.Filepath) > MaxFilepathLen {
 		return 0, ErrFilepathTooLong

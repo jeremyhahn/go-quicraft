@@ -19,10 +19,7 @@ import "encoding/binary"
 // SnapshotHeaderSize is the wire size of SnapshotHeader: 7 uint64 fields.
 const SnapshotHeaderSize = 7 * 8 // 56 bytes
 
-// SnapshotHeader is the wire-format header written at the start of a
-// dedicated snapshot stream. It identifies the snapshot being transferred
-// so the receiver can validate and allocate resources before streaming
-// chunk data.
+// SnapshotHeader is the header at the start of a snapshot stream, letting the receiver validate and allocate before chunks arrive.
 type SnapshotHeader struct {
 	// ShardID identifies the Raft shard.
 	ShardID uint64
@@ -34,15 +31,9 @@ type SnapshotHeader struct {
 	Term uint64
 	// ChunkCount is the total number of chunks in this snapshot.
 	ChunkCount uint64
-	// Epoch is the barrier encryption epoch used when the snapshot was
-	// saved. Zero indicates no encryption (plaintext snapshot). The
-	// receiver uses this to save the correct epoch to LogDB so that
-	// snapshot recovery can decrypt the data.
+	// Epoch is the barrier encryption epoch of the snapshot; zero means plaintext.
 	Epoch uint64
-	// From is the sending replica. The receiver authorizes it against the
-	// connection's verified identity BEFORE it takes a receive slot or any
-	// memory (MessageHandler.AuthorizeSnapshot), and every chunk must carry
-	// the same From and ReplicaID as the header.
+	// From is the sending replica, authorized before any slot or memory is taken; every chunk must match its From and ReplicaID.
 	From uint64
 }
 

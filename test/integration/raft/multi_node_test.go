@@ -56,15 +56,14 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	ca := testpki.NewCA(t)
 	hosts := make([]*quicraft.Host, numNodes)
 	nodeHostDirs := make([]string, numNodes)
-	// Each host binds a kernel-assigned port; the member map is built from
-	// the bound addresses before any shard starts (#386).
+	// Each host binds a kernel-assigned port; members come from the bound addresses.
 	addrs := make([]string, numNodes)
 	for i := range numNodes {
 		cfg := testHostConfig(t, "127.0.0.1:0", ca.Leaf(t))
 		nodeHostDirs[i] = cfg.NodeHostDir
 		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
-			// Clean up any previously created hosts.
+			// Clean up previously created hosts.
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
@@ -154,12 +153,7 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 	return nil
 }
 
-// shardView renders every host's view of shardID — replica, term, the leader
-// it believes in and whether it believes it leads — for failure messages. A
-// leader-only call that fails with "leader unknown" is only diagnosable with
-// this: a term that advanced means leadership legitimately moved, while the
-// same term with no leader anywhere means a node gave up leadership without
-// an election.
+// shardView renders every host's view of shardID (replica, term, leader, leading) for failure messages.
 func (c *testCluster) shardView(shardID uint64) string {
 	var b strings.Builder
 	for i, h := range c.hosts {
@@ -181,21 +175,7 @@ func (c *testCluster) shardView(shardID uint64) string {
 	return b.String()
 }
 
-// onLeader runs fn against whichever host leads shardID AT THE MOMENT OF EACH
-// ATTEMPT, re-finding the leader and retrying while fn is refused as
-// not-leader, for at most budget. Any other error is returned on its first
-// occurrence, and so is success: the operation still has to succeed on a
-// leader, it just need not be the leader observed before the call.
-//
-// It exists because observing a leader does not pin it. Between
-// waitForClusterLeader and a leader-only call a loaded host can miss a
-// heartbeat, so a pre-vote or CheckQuorum moves leadership and the call is
-// refused with "leader unknown" (#309). That is Raft working, not the
-// operation failing.
-//
-// Only use it for operations whose not-leader refusal is safe to repeat:
-// a refusal wrapped in MaybeApplied means the first attempt may still take
-// effect, which for a session register leaves at most an unused session.
+// onLeader runs fn on whichever host leads shardID at each attempt, retrying not-leader refusals within budget; only for operations safe to repeat.
 func (c *testCluster) onLeader(shardID uint64, budget time.Duration, fn func(h *quicraft.Host) error) error {
 	retry := time.NewTicker(pollInterval)
 	defer retry.Stop()
@@ -243,13 +223,7 @@ func (c *testCluster) waitForClusterLeader(shardID uint64, timeout time.Duration
 	}
 }
 
-// waitForAgreedLeader waits until every host knows a leader for shardID, all
-// of them name the same replica, and the host with that replica ID reports
-// itself leader. It returns the agreed leader's replica ID.
-//
-// It does not pin the leader seen first: CheckQuorum may step a leader down
-// and a new election move leadership while the followers are still learning
-// it, and nodes that converge on the new leader satisfy the property.
+// waitForAgreedLeader waits until every host names the same leader and that host reports leading, and returns its replica ID.
 func (c *testCluster) waitForAgreedLeader(shardID uint64, timeout time.Duration) uint64 {
 	c.t.Helper()
 	agreed := func() (uint64, bool) {
@@ -338,19 +312,14 @@ func TestMultiNode_ProposeToFollower(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
 	defer cancel()
 
-	// Warmup: write via leader so the follower learns the leader ID
-	// through the replication heartbeat.
-	// Bound for the StaleRead assertion at the end; the WRITE below goes
-	// through the current leader rather than this cached host.
+	// Warmup write through the current leader so the follower learns it.
 	leaderHost := cluster.hosts[leaderIdx]
 	proposeToLeader(t, cluster, 1, encodeKVPut("warmup", "init"), defaultTimeout)
 
 	// Wait until the follower knows who the leader is.
 	waitForLeader(t, cluster.hosts[followerIdx], 1, leaderElectionTimeout)
 
-	// Propose via follower — this should succeed via leader forwarding.
-	// The FOLLOWER is the subject of this assertion, so this one call must keep
-	// its cached host: routing it to the leader would test nothing.
+	// Propose through the follower, which forwards to the leader.
 	followerHost := cluster.hosts[followerIdx]
 	//quicraft:direct-propose the follower is the subject: this asserts leader forwarding
 	rs, err := followerHost.Propose(ctx, 1, encodeKVPut("follower-forwarded", "value"))
@@ -374,18 +343,7 @@ func TestMultiNode_ProposeToFollower(t *testing.T) {
 // Multi-Node Leader Failure and Re-election
 // ---------------------------------------------------------------------------
 
-// TestMultiNode_LeaderFailover verifies that when the leader is stopped,
-// a new leader is elected from the remaining nodes, in a 3-node and a
-// 5-node cluster. This exercises the
-// Raft election timeout, candidate promotion, and vote exchange over
-// QUIC transport.
-//
-// It also verifies LEADER COMPLETENESS: every entry committed under the old
-// leader is present in the new leader's log and state machine, in the new
-// term. Electing a leader and then only writing something new is satisfied by
-// a leader that silently lost all pre-failover committed state, so the
-// pre-failover entries are re-read through the new leader — linearizably, and
-// directly out of the new leader's own state machine.
+// TestMultiNode_LeaderFailover verifies a new leader is elected after the leader stops, in 3- and 5-node clusters, and holds every previously committed entry.
 func TestMultiNode_LeaderFailover(t *testing.T) {
 	for _, nodes := range []int{3, 5} {
 		t.Run(fmt.Sprintf("nodes=%d", nodes), func(t *testing.T) {
@@ -502,8 +460,7 @@ func testLeaderFailover(t *testing.T, nodes int) {
 	assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx),
 		"after-failover", "survived")
 
-	// LEADER COMPLETENESS: every entry committed in the old term must be in
-	// the new leader's own applied state...
+	// Leader completeness: every old-term entry is in the new leader's applied state.
 	for key, value := range preFailover {
 		assertSMHasExact(t, newLeaderSM, fmt.Sprintf("new leader[%d]", newLeaderIdx), key, value)
 	}
@@ -535,8 +492,7 @@ func testSessionOnLeader(t *testing.T, nodes int) {
 	cluster.startShard(1)
 	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	// Both calls go to whoever leads at the moment of the call: leadership
-	// can legitimately move after waitForClusterLeader returns (#309).
+	// Both calls go to whoever leads at the call.
 	var session *quicraft.Session
 	err := cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
@@ -577,19 +533,7 @@ func testSessionOnLeader(t *testing.T, nodes int) {
 // Multi-Node Snapshot Request
 // ---------------------------------------------------------------------------
 
-// TestMultiNode_RequestSnapshot_OnLeader verifies that snapshot requests
-// work on the leader in a multi-node cluster.
-//
-// RequestSnapshot is ASYNCHRONOUS: the returned RequestState resolves only
-// when the snapshot has been saved, so a test that releases it without
-// reading the result waits for nothing and would pass even if no snapshot
-// were ever taken. This test reads the result, requires a non-zero snapshot
-// index covering the applied state, requires the durable snapshot.dat
-// artifact on disk, and requires a second snapshot to ADVANCE past the first.
-//
-// Note that automatic snapshots never fire here: Config.SnapshotEntries has
-// no default (SetDefaults leaves it 0) and testShardConfig does not set it,
-// so every snapshot in this package is the one explicitly requested below.
+// TestMultiNode_RequestSnapshot_OnLeader verifies a leader snapshot resolves with a covering index and artifact, and a second advances past it.
 func TestMultiNode_RequestSnapshot_OnLeader(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -657,14 +601,7 @@ func TestMultiNode_GetNodeHostInfo(t *testing.T) {
 // Multi-Node Multiple Shards
 // ---------------------------------------------------------------------------
 
-// ===========================================================================
-// 5-Node Cluster Tests
-// ===========================================================================
-//
-// These tests exercise the Raft protocol with a 5-node cluster to verify
-// correctness at the larger quorum size (majority = 3). A 5-node cluster
-// tolerates up to 2 node failures while maintaining quorum.
-// ===========================================================================
+// 5-node cluster tests: majority 3, tolerating two failures.
 
 // ---------------------------------------------------------------------------
 // 5-Node Failover

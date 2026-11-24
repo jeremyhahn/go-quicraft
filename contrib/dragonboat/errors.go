@@ -21,15 +21,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// Dragonboat-compatible error sentinels mapped to quicraft equivalents.
-// These allow existing dragonboat error-checking code (errors.Is) to work
-// transparently with quicraft's error values.
-//
-// Errors fall into two categories:
-//   - Direct aliases: 1:1 mapping to a quicraft sentinel (same pointer).
-//   - Distinct sentinels: errors that dragonboat v4 distinguishes but
-//     quicraft merges into a single value. Each gets its own errors.New
-//     so that errors.Is can differentiate them.
+// Dragonboat-compatible sentinels: direct aliases of quicraft sentinels, or distinct values where dragonboat v4 distinguishes cases quicraft merges.
 var (
 	// Direct quicraft aliases (1:1 mappings).
 	ErrClosed             = quicraft.ErrClosed
@@ -54,21 +46,13 @@ var (
 	// Distinct dragonboat sentinels (no single quicraft equivalent).
 	// Each must be its own value so that errors.Is can distinguish them.
 
-	// ErrReplicaRemoved indicates the replica's data was permanently
-	// removed via RemoveData/SyncRemoveData; the replica can never be
-	// restarted on this host. It is distinct from ErrReplicaNotFound
-	// (an unrelated lookup miss), so repair loops can safely re-add a
-	// replica that merely was not found.
+	// ErrReplicaRemoved indicates the replica's data was removed and it can never restart on this host; distinct from ErrReplicaNotFound.
 	ErrReplicaRemoved = errors.New("dragonboat: replica permanently removed")
 
 	ErrShardClosed         = errors.New("dragonboat: shard closed")
 	ErrShardNotInitialized = errors.New("dragonboat: shard not initialized")
 
-	// ErrShardNotBootstrapped is declared for API compatibility so that
-	// migrating code referencing it still compiles. Quicraft has no
-	// partial-bootstrap state to report, so this adapter never returns it;
-	// a restart of a never-bootstrapped replica surfaces as
-	// ErrShardNotInitialized.
+	// ErrShardNotBootstrapped exists for API compatibility and is never returned; see ErrShardNotInitialized.
 	ErrShardNotBootstrapped = errors.New("dragonboat: shard not bootstrapped")
 
 	ErrInvalidShardSettings = errors.New("dragonboat: invalid shard settings")
@@ -92,31 +76,14 @@ var (
 	// created yet or has already been closed.
 	ErrLogDBNotCreatedOrClosed = errors.New("logdb is not created yet or closed already")
 
-	// ErrNoSnapshot is declared for API compatibility so that migrating
-	// code referencing it still compiles. Quicraft reports a missing
-	// snapshot as ErrSnapshotNotFound, which is what this adapter returns;
-	// ErrNoSnapshot is never produced.
+	// ErrNoSnapshot exists for API compatibility and is never returned; a missing snapshot is ErrSnapshotNotFound.
 	ErrNoSnapshot = errors.New("no snapshot available")
 
-	// ErrNotLeader is a quicraft extension with no dragonboat equivalent.
-	// Dragonboat's proposal, read and config-change entry points have no
-	// leader check: they accept the request and let it resolve as
-	// Dropped(). This adapter therefore never returns ErrNotLeader from a
-	// NodeHost method; quicraft's not-leader failures are translated to
-	// ErrShardNotReady, which is dragonboat's documented "unknown leader is
-	// the most common cause" error. The sentinel is retained only so that
-	// code holding a quicraft error can still match it.
+	// ErrNotLeader is a quicraft extension never returned by NodeHost methods, which translate not-leader to ErrShardNotReady.
 	ErrNotLeader = quicraft.ErrNotLeader
 )
 
-// IsTempError reports whether the error is temporary and the operation
-// should be retried. Temporary errors include system busy, shard not
-// ready, timeout, shard closed, shard not initialized, host closed,
-// and aborted conditions.
-//
-// Note: ErrDeadlineNotSet, ErrInvalidDeadline, and ErrTimeoutTooSmall are
-// programming errors (broken caller context), NOT temporary conditions.
-// Retrying them without fixing the caller is pointless.
+// IsTempError reports whether err is temporary and the operation should be retried; deadline programming errors are not temporary.
 func IsTempError(err error) bool {
 	return errors.Is(err, ErrSystemBusy) ||
 		errors.Is(err, ErrShardNotReady) ||
@@ -134,11 +101,7 @@ func IsTempError(err error) bool {
 		errors.Is(err, quicraft.ErrShardPaused)
 }
 
-// AdapterError wraps a quicraft or quicraft-internal error that has no
-// dragonboat equivalent. Leaking the raw internal error would expose types
-// from packages a migrating application cannot import; the wrapper keeps
-// the original reachable through errors.Is/errors.As while marking it as
-// adapter-translated.
+// AdapterError wraps a quicraft error with no dragonboat equivalent, keeping it reachable through errors.Is and errors.As.
 type AdapterError struct {
 	Err error
 }
@@ -253,11 +216,7 @@ var errorMappings = []errorMapping{
 	// Dragonboat rejects an invalid leader-transfer or membership target
 	// with ErrInvalidTarget.
 	{quicraft.ErrInvalidMember, ErrInvalidTarget},
-	// Dragonboat has no not-leader error: its propose/read/config-change
-	// entry points accept the request and let it resolve as Dropped().
-	// ErrShardNotReady is the documented equivalent ("unknown leader is the
-	// most common cause") and, unlike ErrNotLeader, satisfies IsTempError
-	// in a migrated retry loop.
+	// Not-leader maps to ErrShardNotReady, dragonboat's documented equivalent, which satisfies IsTempError.
 	{quicraft.ErrNotLeader, ErrShardNotReady},
 	{quicraft.ErrStaleConfigChange, ErrStaleConfigChange},
 	{quicraft.ErrSnapshotNotFound, ErrSnapshotNotFound},
@@ -291,37 +250,7 @@ var errorMappings = []errorMapping{
 	{quicraft.ErrInvalidSMType, ErrInvalidShardSettings},
 }
 
-// translateError converts a quicraft error to the closest dragonboat-
-// compatible sentinel. Errors that already carry a dragonboat identity
-// (the adapter's own typed errors) pass through unchanged; anything with
-// no mapping is wrapped in AdapterError rather than leaking a quicraft or
-// quicraft-internal type to a migrating caller.
-//
-// # The submission bit survives the mapping
-//
-// quicraft marks the failures that happen AFTER an entry reached Raft by
-// wrapping them in *quicraft.MaybeAppliedError. That bit is the difference
-// between "the leader refused this, nothing happened" and "the leader took it
-// and then lost the shard, so it may still commit" — and on the config-change
-// path it is what separates a stale "already exists" from somebody else's
-// change.
-//
-// Mapping to the bare sentinel would discard it:
-// errors.Is(&MaybeAppliedError{&NotLeaderError{}}, quicraft.ErrNotLeader) is
-// true, so a refused and a post-delivery failure would both arrive as the bare
-// ErrShardNotReady with quicraft.MaybeApplied false for both.
-//
-// So the wrapper is rebuilt around the mapped sentinel. Every comparison by
-// errors.Is keeps working — errors.Is walks Unwrap, and IsTempError is
-// unaffected — and quicraft.MaybeApplied answers correctly through the
-// adapter.
-//
-// A caller comparing by IDENTITY against ANY mapped sentinel
-// (`err == dragonboat.ErrShardNotReady`; the rebuild is generic, so a wrapped
-// timeout or shard-closed is the same shape whenever quicraft wraps one) does
-// not match the post-delivery case. Use errors.Is: identity comparison against
-// a sentinel that may be wrapped is the wrong tool, and this package's own
-// IsTempError uses errors.Is.
+// translateError maps a quicraft error to the closest dragonboat sentinel, rebuilding any MaybeAppliedError wrapper around it; compare with errors.Is, not ==.
 func translateError(err error) error {
 	if err == nil {
 		return nil
@@ -343,10 +272,7 @@ func translateError(err error) error {
 	return &AdapterError{Err: err}
 }
 
-// isAdapterError reports whether err already carries a dragonboat identity
-// produced by this package, in which case translateError must not re-wrap
-// it. The check is by sentinel rather than by concrete type so that future
-// adapter error types are covered as long as they match a sentinel.
+// isAdapterError reports whether err already carries a dragonboat sentinel from this package, so translateError must not re-wrap it.
 func isAdapterError(err error) bool {
 	for _, target := range adapterSentinels {
 		if errors.Is(err, target) {

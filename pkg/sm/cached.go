@@ -19,37 +19,13 @@ import (
 	"io"
 )
 
-// EntryKeyFunc extracts a cache key and value from a committed entry's Cmd.
-// Return ("", nil) to skip caching the entry (e.g., for non-cacheable ops).
-// The key is a string for map compatibility; the value is the raw bytes to
-// cache. Returning a non-empty key with a nil value signals a cache delete.
+// EntryKeyFunc extracts a cache key and value from an entry's Cmd; return ("", nil) to skip caching it.
 type EntryKeyFunc func(cmd []byte) (key string, value []byte)
 
-// EntryAppliedFunc reports whether a committed entry actually took effect on
-// the inner state machine, given the command bytes and the Result the state
-// machine produced for it. Returning false suppresses caching for that entry.
-//
-// It takes the command as well as the Result because a result code alone is
-// often ambiguous: a conditional write that was declined and an unconditional
-// write that happened to return the same code are indistinguishable from the
-// Result. The command says which operation was asked for.
+// EntryAppliedFunc reports whether an entry took effect, given its Cmd and Result; false suppresses caching.
 type EntryAppliedFunc func(cmd []byte, result Result) bool
 
-// CacheConfig configures the write-through LRU cache for a
-// CachedDiskStateMachine.
-//
-// # Conditional writes
-//
-// The cache is populated from the value ExtractKV pulls out of the COMMAND,
-// not from the store. For an unconditional write those agree. For a
-// CONDITIONAL write — compare-and-set, put-if-absent, delete-if-match — they
-// do not: the command carries a value the store may have declined to take,
-// and caching it would let a later Lookup return a value the store never held.
-//
-// A state machine with conditional operations MUST therefore set EntryApplied.
-// Nothing here can infer the answer, because the outcome encoding is the state
-// machine's own (`kv.OpPutIfAbsent`, for instance, reports its verdict as
-// `kv.ResultStored` vs `kv.ResultNotStored`, both successful applications).
+// CacheConfig configures a CachedDiskStateMachine's write-through LRU cache.
 type CacheConfig struct {
 	// MaxEntries is the maximum number of entries in the LRU cache.
 	// When exceeded, the least recently used entry is evicted.
@@ -60,15 +36,7 @@ type CacheConfig struct {
 	// Required -- without this the cache cannot know what to store.
 	ExtractKV EntryKeyFunc
 
-	// EntryApplied reports whether an entry took effect, and is consulted
-	// before the extracted value is cached. Optional: nil caches every entry
-	// whose result is not the reserved ResultInvalidCommand, which is correct
-	// only when every operation ExtractKV names is unconditional.
-	//
-	// ResultInvalidCommand is excluded whether or not this is set. It is a
-	// reserved sentinel meaning the payload could not be decoded and the store
-	// was left unchanged, so caching such an entry is never correct and a
-	// predicate cannot opt back into it.
+	// EntryApplied reports whether an entry took effect before its value is cached; nil caches every entry not ResultInvalidCommand.
 	EntryApplied EntryAppliedFunc
 }
 
@@ -83,12 +51,7 @@ func (cfg *CacheConfig) validate() error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// CachedDiskStateMachine wraps a DiskStateMachine with a write-through LRU
-// cache. In-memory StateMachine and ConcurrentStateMachine do not benefit
-// from caching because their state is already resident in memory. Disk state
-// machines, however, incur I/O on every Lookup, making a cache layer valuable.
-// ---------------------------------------------------------------------------
+// A write-through LRU cache in front of a DiskStateMachine's reads.
 
 // CachedDiskStateMachine wraps a DiskStateMachine with a write-through
 // LRU cache. The cache sits in front of disk reads, converting expensive
@@ -126,15 +89,7 @@ func (c *CachedDiskStateMachine) Open(ctx context.Context, initialDir string, st
 	return lastApplied, nil
 }
 
-// Update invalidates the affected cache keys, applies entries to the inner
-// SM, then repopulates the cache.
-//
-// The invalidation MUST happen before the inner write: if the cache were
-// only repopulated afterwards, a Lookup racing with Update could return the
-// stale pre-write value from the cache while the write is already durable
-// in the inner SM. Deleting first degrades that window to a cache miss that
-// falls through to the (already or not-yet updated, but never stale-cached)
-// inner SM.
+// Update invalidates the affected keys, applies entries to the inner SM, then repopulates the cache.
 func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, results []Result) error {
 	// Extract once; the (key, value) pairs alias e.Cmd, which stays valid
 	// until this Update returns (the engine recycles Cmd buffers only after
@@ -160,21 +115,12 @@ func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, re
 	}
 
 	for _, p := range pairs {
-		// Do not cache the new value for an entry that did not take effect --
-		// a rejected payload, or a conditional write the store declined. In
-		// either case the store state was left unchanged, so caching the
-		// would-be value would let Lookup return a value the store never held.
-		// The key was already invalidated above, so a later Lookup correctly
-		// falls through to the inner SM.
+		// Do not cache the value of an entry that did not take effect.
 		if !c.applied(entries[p.idx].Cmd, results[p.idx]) {
 			continue
 		}
 		value := p.value
-		// Copy the value before caching. extractKV may return a sub-slice
-		// of e.Cmd, which under ZeroCopyEntryCmd aliases an internal buffer
-		// the engine recycles after Update returns. Caching the alias would
-		// let a later write corrupt previously-cached reads. A nil value is
-		// preserved as nil (it signals a delete to the cache).
+		// Copy the value before caching: it may alias e.Cmd, which the engine recycles under ZeroCopyEntryCmd.
 		if value != nil {
 			cached := make([]byte, len(value))
 			copy(cached, value)
@@ -185,10 +131,7 @@ func (c *CachedDiskStateMachine) Update(ctx context.Context, entries []Entry, re
 	return nil
 }
 
-// applied reports whether an entry took effect and its extracted value may
-// therefore be cached. ResultInvalidCommand is refused unconditionally: it is
-// the reserved sentinel for a payload that could not be decoded, so the store
-// was left unchanged no matter what a configured predicate believes.
+// applied reports whether an entry took effect so its value may be cached; ResultInvalidCommand never does.
 func (c *CachedDiskStateMachine) applied(cmd []byte, result Result) bool {
 	if result.Value == ResultInvalidCommand {
 		return false
@@ -199,10 +142,7 @@ func (c *CachedDiskStateMachine) applied(cmd []byte, result Result) bool {
 	return c.entryApplied(cmd, result)
 }
 
-// Lookup checks the cache first, then falls back to the inner SM on miss.
-// Cache hits return an owned copy: handing out the live cache buffer would
-// let a caller that mutates or pools the returned slice corrupt the cached
-// value for every future reader.
+// Lookup checks the cache, then the inner SM on a miss; a hit returns an owned copy.
 func (c *CachedDiskStateMachine) Lookup(ctx context.Context, query interface{}) (interface{}, error) {
 	if key := extractQueryKey(query); key != "" {
 		if val, hit := c.cache.Get(key); hit {
@@ -231,14 +171,7 @@ func (c *CachedDiskStateMachine) BytesLookup(key []byte) ([]byte, error) {
 	if b, ok := result.([]byte); ok {
 		return b, nil
 	}
-	// The inner state machine answered with something this byte-oriented path
-	// cannot represent. Returning (nil, nil) reported that as "supported, and
-	// the value is empty", which is indistinguishable from a genuine empty
-	// value and from a missing key — so a caller reading through the
-	// no-allocation path silently saw nothing where the ordinary Lookup would
-	// have handed back a real result. Report the type instead: it is a
-	// programming error in the state machine, and naming what came back is the
-	// difference between a one-line fix and an unexplained empty read.
+	// The inner SM answered with a non-byte value: report it as unsupported rather than as an empty value.
 	return nil, unsupportedLookupResult(result)
 }
 

@@ -23,21 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/raft"
 )
 
-// ---------------------------------------------------------------------------
-// The membership-rejection sentinels pkg/errors.go re-exports
-//
-// pkg/internal/raft is unimportable from outside this module, so a downstream
-// consumer can only match these rejections through the aliases in
-// pkg/errors.go. The alias is only worth anything while it is the SAME error
-// VALUE the raft package returns: a re-export that decays into
-// errors.New("<the same text>") keeps compiling, keeps reading correctly, and
-// silently stops matching every rejection the public API actually produces.
-//
-// Every assertion below is therefore paired with a NEGATIVE CONTROL — a
-// locally declared error carrying byte-identical message text — which must NOT
-// match. Without it these tests would pass against exactly the look-alike they
-// exist to refuse.
-// ---------------------------------------------------------------------------
+// The membership-rejection sentinels re-exported in pkg/errors.go must be the raft package's values; each check has a look-alike negative control.
 
 // membershipAliases is the complete set of raft sentinels pkg/errors.go
 // re-exports for the membership-change API. Adding a re-export without adding
@@ -60,14 +46,7 @@ var membershipAliases = []struct {
 	{"ErrDuplicateMemberIdentity", ErrDuplicateMemberIdentity, raft.ErrDuplicateMemberIdentity},
 }
 
-// TestMembershipAliasesAreTheRaftValues pins the IDENTITY of the
-// re-exports against the raft sentinels they alias.
-//
-// This is the assertion that cannot be made from outside the module, and it is
-// the one that fails the instant an alias is rewritten as an independent
-// errors.New with the same wording. The look-alike built in each iteration is
-// constructed FROM the sentinel's own text, so it tracks any future rewording
-// and can never stop being a faithful impostor.
+// TestMembershipAliasesAreTheRaftValues pins that each re-export is the raft sentinel itself, not an error with the same text.
 func TestMembershipAliasesAreTheRaftValues(t *testing.T) {
 	for _, a := range membershipAliases {
 		t.Run(a.name, func(t *testing.T) {
@@ -114,19 +93,7 @@ type aliasRejectionCase struct {
 	want  error
 }
 
-// TestMembershipRejectionsMatchTheExportedSentinels drives each rejection it
-// can reach from a single-voter host through NewHost -> StartShard ->
-// RequestAddNode / RequestRemoveNode and matches the result with the PUBLIC
-// alias, never the internal sentinel.
-//
-// Three things make this non-vacuous:
-//
-//   - every case must produce a non-nil error, so a validator that stopped
-//     refusing fails here rather than being reported as a match;
-//   - the error must match the expected alias and NOT match any of the
-//     others, so an alias pointed at the wrong sentinel fails;
-//   - the error must not match a look-alike built from the expected
-//     sentinel's own text, so the match cannot be coming from message equality.
+// TestMembershipRejectionsMatchTheExportedSentinels drives each reachable rejection through the public API and matches only the expected public alias.
 func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 	const localAddr = "127.0.0.1:5000"
 
@@ -172,12 +139,7 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 			want: ErrNodeNotFound,
 		},
 		{
-			// The tombstone can only be laid by a COMMITTED removal, and a
-			// single voter can commit one only for a replica that carries no
-			// vote. An observer is exactly that: it is added and removed
-			// through consensus without ever raising the quorum, so the whole
-			// add/remove/re-add sequence runs on one host with no peer
-			// reachable.
+			// A single voter can commit an observer's add and removal, so the tombstone is laid on one host.
 			name: "add a replica this shard removed",
 			setup: func(t *testing.T, ctx context.Context, h *Host) {
 				t.Helper()
@@ -291,19 +253,7 @@ func TestMembershipRejectionsMatchTheExportedSentinels(t *testing.T) {
 	}
 }
 
-// TestMembershipAliasesUnreachableFromASingleVoterHost records, as an
-// executable statement rather than a comment, WHICH of the re-exports
-// this package cannot drive through the public API, and why.
-//
-// ErrRemoveLastVoter fires only for a witness-only membership (no full
-// replicas at all), and ErrTooManyVotingMembers only past 64 voting members.
-// Both need a committed multi-member configuration, and a single voter can
-// commit at most one voter-adding change before its own quorum grows beyond
-// what it can satisfy alone. They are covered by identity above and by
-// pkg/internal/raft's own membership tests; this test asserts the PRECONDITION
-// that keeps them out of reach, so that if the validators are ever reworked to
-// fire on a reachable membership, this fails and the end-to-end cases can be
-// written.
+// TestMembershipAliasesUnreachableFromASingleVoterHost asserts the precondition that keeps ErrRemoveLastVoter and ErrTooManyVotingMembers out of single-voter reach.
 func TestMembershipAliasesUnreachableFromASingleVoterHost(t *testing.T) {
 	h := startSingleVoterShard(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -320,9 +270,7 @@ func TestMembershipAliasesUnreachableFromASingleVoterHost(t *testing.T) {
 		t.Fatalf("witnesses = %d, want 0", len(m.Witnesses))
 	}
 
-	// Removing the single voter is refused as the last FULL replica, not as
-	// the last voting member: that ordering is what puts ErrRemoveLastVoter
-	// out of reach here.
+	// Removing the single voter is refused as the last full replica, which keeps ErrRemoveLastVoter out of reach.
 	if _, err := h.RequestRemoveNode(ctx, 1, 1, 0); !errors.Is(err, ErrRemoveLastFullReplica) {
 		t.Fatalf("RequestRemoveNode(self) = %v, want ErrRemoveLastFullReplica; if "+
 			"this now returns ErrRemoveLastVoter, add it to the end-to-end table", err)

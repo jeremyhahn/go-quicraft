@@ -29,26 +29,7 @@ import (
 // makefilePath (fips_gate_test.go) and repoRoot (dockerfile_integration_test.go)
 // are declared elsewhere in this package and reused here.
 
-// injectableInputs are every variable a caller could put a make function into
-// and have it reach a parse-time or recipe-time expansion.
-//
-// The first four are the release-alpha inputs: attacker-influenced in the only
-// sense that matters here, since a version string, a remote name or a path gets
-// copied out of an issue, a chat message or another repo's release notes and
-// nothing about it looks like code.
-//
-// The last three are DERIVED build metadata, and they are on this list because
-// renaming VERSION to BUILD_VERSION moved the hole rather than closing it: a
-// command-line variable beats an ordinary makefile assignment, so
-// `make build BUILD_VERSION='$(shell ...)'` reproduced the original defect
-// under the new name, as did GIT_COMMIT and BUILD_DATE, which LDFLAGS expands
-// on the same line. They are `override` in the Makefile, which discards a
-// command-line value outright.
-//
-// NOT on this list, deliberately: GO, BUILD_DIR and the other documented knobs.
-// Naming the program make should run is choosing a command on purpose. The
-// property under test is narrower and is the one that matters — a value that
-// looks like DATA must never be evaluated as make source.
+// injectableInputs are the variables a caller could put a make function into: the release-alpha inputs and the override build metadata.
 var injectableInputs = []string{
 	"VERSION", "RELEASE_REMOTE", "RELEASE_GIT", "RELEASE_ALLOWED_SIGNERS",
 	"BUILD_VERSION", "GIT_COMMIT", "BUILD_DATE",
@@ -59,11 +40,7 @@ var injectableInputs = []string{
 // repo's real remote name breaks the day that name changes.
 const fixtureRemote = "fixture-remote"
 
-// makeTargets are the three places the payload was observed to fire before the
-// fix: the release target itself, an unrelated target, and a target that does
-// not exist at all. The last two matter most — they prove the expansion was
-// happening at PARSE time, before target selection, where no recipe guard could
-// ever have reached it.
+// makeTargets are the release target, an unrelated target and a nonexistent one, proving no parse-time expansion.
 var makeTargets = []string{"release-alpha", "release", "release-candidate", "build", "no-such-target-exists"}
 
 // runMake runs `make -n <target> <vars...>` in the repository root and returns
@@ -79,28 +56,11 @@ func runMake(t *testing.T, target string, vars ...string) string {
 	if ctx.Err() != nil {
 		t.Fatalf("make timed out: %v", ctx.Err())
 	}
-	// A non-zero exit is expected and fine — most of these invocations are
-	// supposed to be refused. Only the OUTPUT is under test.
+	// A non-zero exit is expected; only the output is under test.
 	return string(out)
 }
 
-// TestSettableReleaseInputsAreNeverExpandedByMake is the regression test for a
-// command-injection class that was live on main.
-//
-// A settable Make variable read anywhere in an IMMEDIATE (`:=`) assignment is
-// expanded when the Makefile is PARSED — before a target is chosen, and before
-// any guard in any recipe exists to reject it. While the build-metadata
-// variable was itself named VERSION and expanded into LDFLAGS, this executed:
-//
-//	make build VERSION='$(shell echo pwned >&2)'
-//
-// on `build`, on `release-alpha`, and on a target that does not exist. The
-// recipe's own guards were unreachable, being 1,500 lines further down.
-//
-// Two things keep it closed and this test fails if either is undone: the build
-// metadata reads BUILD_VERSION so a command-line VERSION reaches nothing at
-// parse time, and all four inputs cross into the recipe through $(value ...),
-// which yields a variable's raw text instead of expanding it.
+// TestSettableReleaseInputsAreNeverExpandedByMake checks no settable input is expanded at parse time: build metadata reads BUILD_VERSION and inputs cross via $(value ...).
 func TestSettableReleaseInputsAreNeverExpandedByMake(t *testing.T) {
 	const canary = "MAKE_FUNCTION_EXECUTED"
 
@@ -113,8 +73,7 @@ func TestSettableReleaseInputsAreNeverExpandedByMake(t *testing.T) {
 				// make itself and quoting is no boundary at all.
 				payload := input + `=$(shell echo ` + canary + ` >&2)v1.2.3-alpha`
 
-				// A valid VERSION so the run gets past the first guard even when
-				// the payload is on one of the other three inputs.
+				// A valid VERSION so the run passes the first guard when the payload is on another input.
 				out := runMake(t, target, "VERSION=v1.2.3-alpha", payload)
 
 				if strings.Contains(out, canary) {
@@ -129,18 +88,7 @@ func TestSettableReleaseInputsAreNeverExpandedByMake(t *testing.T) {
 	}
 }
 
-// TestNoImmediateAssignmentReadsVERSION pins the structural invariant behind
-// the behavioural test above.
-//
-// $(VERSION) in a `:=` assignment is the exact shape that made a release input
-// executable at parse time. The behavioural test would catch a regression, but
-// only for the payload it happens to try; this one rejects the shape itself,
-// which is what a future edit would reintroduce by accident — renaming
-// BUILD_VERSION back to VERSION "for consistency" looks entirely harmless.
-//
-// It cannot pass vacuously: it requires the LDFLAGS assignment to exist and to
-// read BUILD_VERSION before it judges anything, so deleting or moving the line
-// fails here rather than silently passing with nothing to check.
+// TestNoImmediateAssignmentReadsVERSION checks no := assignment reads $(VERSION) and that LDFLAGS reads BUILD_VERSION.
 func TestNoImmediateAssignmentReadsVERSION(t *testing.T) {
 	raw, err := os.ReadFile(makefilePath)
 	if err != nil {
@@ -182,9 +130,7 @@ func TestNoImmediateAssignmentReadsVERSION(t *testing.T) {
 			ldflags)
 	}
 
-	// Renaming alone was not enough: a command-line variable BEATS an ordinary
-	// makefile assignment, so every variable LDFLAGS expands at parse time must
-	// be `override` or the caller's value wins and gets evaluated as make source.
+	// Every variable LDFLAGS expands at parse time must be override, or a command-line value wins.
 	body := string(raw)
 	for _, name := range regexp.MustCompile(`\$\(([A-Z][A-Z0-9_]*)\)`).FindAllStringSubmatch(ldflags, -1) {
 		v := name[1]
@@ -198,10 +144,7 @@ func TestNoImmediateAssignmentReadsVERSION(t *testing.T) {
 	}
 }
 
-// releaseFixture is a disposable checkout for the release recipe: a copy of the
-// Makefile, VERSION and CHANGELOG.md committed to a fresh repository on main.
-// Every test that runs the recipe for real runs it here, never in the actual
-// checkout, so no test can cut a release of this repository.
+// releaseFixture is a disposable repository with the Makefile, VERSION and CHANGELOG.md, so no test can release this repository.
 type releaseFixture struct {
 	t       *testing.T
 	dir     string // the checkout make runs in
@@ -209,14 +152,7 @@ type releaseFixture struct {
 	release string // the next patch version; CHANGELOG.md has a heading for it
 }
 
-// newReleaseFixture builds the fixture. With withRemote it also registers a bare
-// repository as fixtureRemote, so a release that passes every check WOULD be
-// published: that is what makes a refusal mean something rather than being
-// satisfied by some earlier guard.
-//
-// The fixture does not copy .release-allowed-signers. Each test names the
-// signers file it means, which keeps these tests independent of the private
-// trust anchor and runnable in a published export.
+// newReleaseFixture builds the fixture, with a bare fixtureRemote when withRemote; it copies no signers file.
 func newReleaseFixture(t *testing.T, withRemote bool) *releaseFixture {
 	t.Helper()
 	f := &releaseFixture{t: t, dir: t.TempDir()}
@@ -278,10 +214,7 @@ func (f *releaseFixture) git(args ...string) string {
 	return f.gitIn(f.dir, args...)
 }
 
-// gitIn runs git in dir. Dir is always set explicitly: without it the command
-// inherits the test process's CWD, which in a linked worktree is a .git FILE
-// pointing at a parent checkout that may not be present (a container mount, a
-// CI workspace).
+// gitIn runs git with dir set explicitly.
 func (f *releaseFixture) gitIn(dir string, args ...string) string {
 	f.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -372,8 +305,7 @@ func newSigningKey(t *testing.T) (key, pub string) {
 	return key, fields[0] + " " + fields[1]
 }
 
-// writeSigners writes an allowed-signers file OUTSIDE the fixture checkout (a
-// file inside it would fail the clean-tree guard) and returns its path.
+// writeSigners writes an allowed-signers file outside the fixture checkout and returns its path.
 func writeSigners(t *testing.T, lines ...string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "allowed-signers")
@@ -381,17 +313,7 @@ func writeSigners(t *testing.T, lines ...string) string {
 	return p
 }
 
-// TestReleaseAlphaRefusesBeforeMutatingAnything pins the guard chain.
-//
-// Every guard in release-alpha is read-only, and the first thing that changes
-// state is `printf ... > VERSION`. A guard that stopped refusing would
-// therefore not merely permit a bad release — it would write VERSION and commit
-// before anything downstream noticed, and a published tag cannot be retracted.
-//
-// The fixture has no remote, which keeps the happy path unreachable by
-// construction: the recipe refuses at the remote check, several guards before
-// the first write, so this test cannot cut a release however wrong the recipe
-// becomes.
+// TestReleaseAlphaRefusesBeforeMutatingAnything checks every guard refuses before VERSION is written; the fixture has no remote.
 func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 	f := newReleaseFixture(t, false)
 	versionBefore := f.version()
@@ -435,10 +357,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 				t.Errorf("a well-formed %s did not reach the remote guard:\n%s", target.good, out)
 			}
 
-			// A RELEASE_GIT that names nothing runnable, and a signers file that
-			// does not exist, are refused before VERSION is written: the recipe
-			// fails closed rather than committing and then discovering it cannot
-			// sign or verify.
+			// An unrunnable RELEASE_GIT or missing signers file is refused before VERSION is written.
 			if out := run("VERSION="+target.good, "RELEASE_GIT=/nonexistent/git"); !strings.Contains(out, "RELEASE_GIT does not name") {
 				t.Errorf("a RELEASE_GIT naming no executable was not refused up front:\n%s", out)
 			}
@@ -454,10 +373,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 				t.Errorf("a command-line REL_PATTERN widened the accepted form:\n%s", out)
 			}
 
-			// An AMBIENT VERSION must not drive a release. `$(value VERSION)`
-			// imports an environment variable exactly like a command-line one,
-			// so without the $(origin ...) filter a bare make in a shell or CI
-			// job that exports VERSION would cut whatever it inherited.
+			// An environment VERSION must not drive a release; the $(origin ...) filter rejects it.
 			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(ctx, "make", "-C", f.dir, target.name, "RELEASE_ALLOWED_SIGNERS="+signers)
@@ -470,11 +386,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 				t.Errorf("an environment VERSION was treated as explicit; it must be command-line only.\n%s", out)
 			}
 
-			// The recipe's own inputs are `override`: a command-line REL_*
-			// would otherwise replace the value derived above and walk around
-			// every guard on it — a REL_VERSION past the command-line VERSION
-			// filter, a REL_GIT, REL_SIGNERS or REL_REMOTE past the variable
-			// the caller is meant to set.
+			// The recipe's REL_* inputs are override, so command-line values cannot bypass the guards.
 			if out := run("REL_VERSION=" + target.good); !strings.Contains(out, "state the version explicitly") {
 				t.Errorf("a command-line REL_VERSION stood in for VERSION:\n%s", out)
 			}
@@ -487,9 +399,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 				if strings.Contains(out, tc.refusal) {
 					t.Errorf("a command-line %s took effect; it must be `override` in the Makefile.\n%s", tc.override, out)
 				}
-				// And the recipe must have got PAST every input guard, to the
-				// remote lookup this fixture cannot satisfy: an absent refusal
-				// proves nothing if an earlier guard stopped it first.
+				// The run must reach the remote lookup, past every input guard.
 				if !strings.Contains(out, "no git remote named") {
 					t.Errorf("with %s the recipe stopped before the remote lookup, so the override check proved nothing.\n%s", tc.override, out)
 				}
@@ -505,18 +415,7 @@ func TestReleaseAlphaRefusesBeforeMutatingAnything(t *testing.T) {
 	}
 }
 
-// TestReleaseRemoteDefaultsToDev pins the DEFAULT, which is the only production
-// behaviour this file's other release tests do not cover.
-//
-// They all pass RELEASE_REMOTE explicitly — deliberately, so a rename of the
-// repo's real remote cannot break them — and that leaves the default itself
-// unverified: reverting it to `origin`, or to any other name, would keep the
-// suite green while `make release-alpha` selected the wrong remote.
-//
-// So this fixture gives its disposable repository exactly one remote, named
-// `dev`, and does NOT override RELEASE_REMOTE. If the default is `dev` the run
-// resolves it and stops at a later, read-only guard; if the default is anything
-// else the run stops at "no git remote named <that>", naming the wrong value.
+// TestReleaseRemoteDefaultsToDev checks RELEASE_REMOTE defaults to dev using a fixture whose only remote is dev.
 func TestReleaseRemoteDefaultsToDev(t *testing.T) {
 	f := newReleaseFixture(t, false)
 	remote := filepath.Join(t.TempDir(), "remote.git")
@@ -531,21 +430,14 @@ func TestReleaseRemoteDefaultsToDev(t *testing.T) {
 			"`dev`, and a default that points elsewhere makes the target "+
 			"unrunnable on a conforming checkout.\n%s", out)
 	}
-	// It must still refuse — the fixture's CHANGELOG has no v99.0.0-alpha section
-	// — which is what proves the run got PAST remote resolution rather than
-	// succeeding for some unrelated reason.
+	// It still refuses at the missing CHANGELOG section, proving remote resolution passed.
 	if !strings.Contains(out, "CHANGELOG.md has no") {
 		t.Errorf("expected the run to reach the CHANGELOG guard, which sits after remote "+
 			"resolution; got:\n%s", out)
 	}
 }
 
-// TestReleaseAllowedSignersDefaultsToTheCheckoutFile pins the default trust
-// anchor and that the recipe fails closed without it.
-//
-// The fixture carries no .release-allowed-signers and the run names none, so
-// the recipe must refuse, naming the default file, before anything is written:
-// a release that cannot be verified is not attempted.
+// TestReleaseAllowedSignersDefaultsToTheCheckoutFile checks the recipe refuses, naming the default signers file, when none exists.
 func TestReleaseAllowedSignersDefaultsToTheCheckoutFile(t *testing.T) {
 	f := newReleaseFixture(t, true)
 	versionBefore := f.version()
@@ -567,10 +459,7 @@ func TestReleaseAllowedSignersDefaultsToTheCheckoutFile(t *testing.T) {
 	f.requireNothingPublished()
 }
 
-// TestReleaseCandidateCutsAnRcTag runs release-candidate end to end in the
-// scratch repository against a scratch bare remote, never the real one. It pins
-// what an -rc.N version becomes: the unprefixed VERSION file, the tag names, the
-// release commit touching VERSION alone, and a refusal of a duplicate candidate.
+// TestReleaseCandidateCutsAnRcTag runs release-candidate against a scratch remote and checks VERSION, tags, the commit and duplicate refusal.
 func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
 	const maintainer = "release@example.invalid"
 	key, pub := newSigningKey(t)
@@ -614,14 +503,7 @@ func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
 	}
 }
 
-// TestReleaseVerifiesAgainstTheAllowedSigners drives the whole recipe, through
-// the push, with plain git and throwaway keys.
-//
-// The recipe trusts no tool. After the release commit and tags exist and BEFORE
-// anything is pushed, the commit's author must be a principal in the
-// allowed-signers file, and the commit and both tags must carry signatures that
-// verify against a key the file lists FOR THAT PRINCIPAL. Each refusal case
-// has a real bare remote, so the push would succeed if the check were absent.
+// TestReleaseVerifiesAgainstTheAllowedSigners checks the author and the signatures on the commit and tags are verified against the allowed-signers file before push.
 func TestReleaseVerifiesAgainstTheAllowedSigners(t *testing.T) {
 	const maintainer = "release@example.invalid"
 	keyA, pubA := newSigningKey(t)
@@ -712,13 +594,7 @@ func TestReleaseVerifiesAgainstTheAllowedSigners(t *testing.T) {
 	}
 }
 
-// TestReleaseRefusesForgedSignatureMarkers pins that the recipe asks git to
-// verify the cryptography rather than looking for signature-shaped text.
-//
-// The substituted RELEASE_GIT gets the author RIGHT, does not sign, and plants
-// "gpgsig" and "SSH SIGNATURE" inside the commit and tag MESSAGES — the precise
-// shape that defeats grepping `cat-file` output. Only real verification against
-// the pinned key rejects it.
+// TestReleaseRefusesForgedSignatureMarkers checks signature-shaped text in messages does not pass verification.
 func TestReleaseRefusesForgedSignatureMarkers(t *testing.T) {
 	const maintainer = "release@example.invalid"
 	_, pub := newSigningKey(t)
@@ -748,21 +624,7 @@ func TestReleaseRefusesForgedSignatureMarkers(t *testing.T) {
 	f.requireNothingPublished()
 }
 
-// TestReleaseRefusesAKeyTheAnchorDoesNotPin closes the trust-anchor
-// substitution, which is the failure mode that makes "we verify the signature"
-// worth anything.
-//
-// Building the allowed-signers file from a key found beside RELEASE_GIT would
-// verify nothing: a substituted helper supplies the key it is checked against,
-// so it signs the release with its own keypair, drops the matching public half
-// where the recipe looks, and every pre-push check passes against the
-// attacker's key.
-//
-// This test is that attack. The helper generates its own key, signs the release
-// commit and tag with it as the correct author, and plants a matching
-// allowed-signers file beside itself, which it also hands git as
-// gpg.ssh.allowedSignersFile. The recipe must still refuse, because its anchor
-// is the allowed-signers file the caller named and nothing the helper reaches.
+// TestReleaseRefusesAKeyTheAnchorDoesNotPin checks a helper that signs with its own key and plants matching signers is refused.
 func TestReleaseRefusesAKeyTheAnchorDoesNotPin(t *testing.T) {
 	const maintainer = "release@example.invalid"
 	_, pinned := newSigningKey(t)
@@ -791,14 +653,7 @@ func TestReleaseRefusesAKeyTheAnchorDoesNotPin(t *testing.T) {
 	f.requireNothingPublished()
 }
 
-// signingHelper writes a RELEASE_GIT in the shape of the per-project signing
-// helper: its first argument names the project, and every command runs as
-// maintainer, SSH-signed with key. onWrite runs before every command other
-// than push, and onPush replaces the push; both are bash, run with "$@"
-// holding the git arguments and g the signing git command. For a push, remote,
-// branch, tag and ptag hold the remote and the three refspecs, classified by
-// destination so the helper does not depend on their order. An empty onPush
-// performs the push it was asked for.
+// signingHelper writes a RELEASE_GIT that SSH-signs as maintainer with key; onWrite runs before non-push commands, onPush replaces the push.
 func signingHelper(t *testing.T, key, maintainer, onWrite, onPush string) string {
 	t.Helper()
 	if onPush == "" {
@@ -859,13 +714,7 @@ func TestReleasePushesObjectIDsThroughTheHelper(t *testing.T) {
 	}
 }
 
-// TestReleaseVerifiesWhatTheRemoteHolds is the defective or hostile helper at
-// the one step the recipe still delegates to it. Signatures verified locally
-// say nothing about what a helper that ignores its arguments publishes, so
-// after the push the recipe reads the remote back with plain git and fails
-// unless the branch and both tags name exactly the verified objects. Each
-// helper signs correctly, so every pre-push check passes, then misbehaves at
-// the push and exits 0.
+// TestReleaseVerifiesWhatTheRemoteHolds checks the recipe reads the remote back after push and fails unless it holds the verified objects.
 func TestReleaseVerifiesWhatTheRemoteHolds(t *testing.T) {
 	const maintainer = "release@example.invalid"
 	key, pub := newSigningKey(t)
@@ -899,12 +748,7 @@ func TestReleaseVerifiesWhatTheRemoteHolds(t *testing.T) {
 	}
 }
 
-// TestReleaseBindsTheVerifiedObjectsToTheRelease pins that the objects the
-// recipe signs off are the release it asked for, not merely objects the
-// anchor's key signed: the commit is exactly the VERSION bump on top of the
-// main it started from, and each tag object targets that commit under its own
-// name. A helper that signs whatever it likes passes signature verification,
-// so each case must be refused before anything is pushed.
+// TestReleaseBindsTheVerifiedObjectsToTheRelease checks the commit is exactly the VERSION bump on main and each tag targets it under its name.
 func TestReleaseBindsTheVerifiedObjectsToTheRelease(t *testing.T) {
 	const maintainer = "release@example.invalid"
 	key, pub := newSigningKey(t)

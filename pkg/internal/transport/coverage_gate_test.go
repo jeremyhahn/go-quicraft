@@ -63,8 +63,7 @@ func TestBuildMTLSTLS_PrebuiltCertificateWithoutLeaf(t *testing.T) {
 	}
 }
 
-// unownStream removes the owner record of target's pooled stream for shardID,
-// leaving the raw-stream shape a manually constructed transport produces.
+// unownStream removes the owner record of target's pooled stream for shardID.
 func unownStream(tr *QUICTransport, target string, shardID uint64) {
 	idx := tr.streamIndexFor(shardID, false)
 	shard := &tr.streamShards[idx&(streamShardCount-1)]

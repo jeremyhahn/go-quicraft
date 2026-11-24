@@ -12,13 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package revocation provides certificate revocation checking via CRL files
-// and OCSP responders with hot-reload support. CRL files are periodically
-// reloaded from disk using content-hash change detection, and OCSP responses
-// are cached with configurable TTL. The checker integrates with the TLS
-// handshake via VerifyConnection -- which, unlike VerifyPeerCertificate, also
-// runs for resumed sessions -- to reject revoked peer certificates at
-// connection time without requiring a restart.
+// Package revocation checks certificate revocation through hot-reloaded CRL files and cached OCSP responses, in the TLS VerifyConnection hook so resumed sessions are checked too.
 package revocation
 
 import (
@@ -40,54 +34,25 @@ var (
 	// ErrInvalidCRL is returned when a CRL file cannot be parsed.
 	ErrInvalidCRL = errors.New("revocation: invalid CRL file")
 
-	// ErrOCSPNegativeCached is the underlying cause wrapped in an
-	// OCSPUnavailableError when a recent responder failure is served from the
-	// short-TTL negative cache instead of being re-queried. It distinguishes a
-	// cached failure from a fresh transport error for diagnostics.
+	// ErrOCSPNegativeCached is wrapped in an OCSPUnavailableError when a recent responder failure is served from the negative cache.
 	ErrOCSPNegativeCached = errors.New("revocation: OCSP responder recently unavailable (negative-cached)")
 
-	// ErrCRLStale is returned (under enforcement) when a
-	// certificate's revocation status cannot be established because no
-	// fresh CRL is loaded: either the initial load has not succeeded yet,
-	// or the most recent reload failed (unreadable, unparseable, forged,
-	// or expired file). Treating a stale CRL as "nothing revoked" would
-	// silently un-revoke every certificate, so enforcement mode fails
-	// closed instead.
+	// ErrCRLStale is returned under enforcement when no fresh CRL is loaded (initial load pending or last reload failed).
 	ErrCRLStale = errors.New("revocation: no fresh CRL loaded; revocation status unknown")
 
-	// ErrCRLSignature is returned when a CRL's signature does not verify
-	// against the issuing CA certificate (or no issuer certificate is
-	// available to verify with). A forged or foreign CRL must never
-	// replace the revoked set: it could silently un-revoke certificates.
+	// ErrCRLSignature is returned when a CRL's signature does not verify against the issuing CA, or no issuer is available.
 	ErrCRLSignature = errors.New("revocation: CRL signature verification failed")
 
-	// ErrCRLExpired is returned when a CRL is past its NextUpdate time.
-	// A frozen CRL file would otherwise serve an ever-staler view of
-	// revocations indefinitely; expiry marks the set stale so
-	// enforcement fails closed until a fresh CRL is published.
+	// ErrCRLExpired is returned when a CRL is past its NextUpdate; the set is then stale.
 	ErrCRLExpired = errors.New("revocation: CRL past its NextUpdate; revocation status unknown")
 
-	// ErrOCSPResponseStale is returned when an OCSP response fails
-	// freshness validation (ThisUpdate/NextUpdate window, with clock-skew
-	// allowance). A replayed stale "good" response must be treated as
-	// status-unavailable, never as "good".
+	// ErrOCSPResponseStale is returned when an OCSP response fails the ThisUpdate/NextUpdate freshness check; it is treated as unavailable.
 	ErrOCSPResponseStale = errors.New("revocation: OCSP response outside freshness window")
 
-	// ErrOCSPStatusUnknown is returned when a responder reports RFC 6960
-	// "unknown" for a certificate. Unknown is NOT "not revoked": the
-	// responder has no record of the certificate, so its status cannot be
-	// established. It must route through the status-unavailable path so
-	// enforcement fails closed and the verdict is never cached as good.
+	// ErrOCSPStatusUnknown is returned for an RFC 6960 unknown status, which takes the status-unavailable path and is never cached as good.
 	ErrOCSPStatusUnknown = errors.New("revocation: OCSP responder reported status unknown")
 
-	// ErrOCSPResponderUnauthorized is returned when an OCSP response is signed
-	// by a delegated responder certificate that is not authorized for OCSP
-	// signing (RFC 6960 §4.2.2.2): it lacks the id-kp-OCSPSigning extended key
-	// usage, or it is outside its validity period. The parser checks only that
-	// the issuer signed the delegate, which any certificate the CA issued —
-	// a node's own included — satisfies, so without this check a revoked node
-	// could answer its own OCSP query "good". It routes through the
-	// status-unavailable path, so enforcement fails closed.
+	// ErrOCSPResponderUnauthorized is returned when a delegated responder lacks id-kp-OCSPSigning or is outside its validity (RFC 6960 §4.2.2.2).
 	ErrOCSPResponderUnauthorized = errors.New("revocation: OCSP response signed by a responder not authorized for OCSP signing")
 
 	// ErrNoCRLInFile is returned when a configured CRL file contains no
@@ -232,10 +197,7 @@ func (e *CRLReadError) Unwrap() error {
 	return e.Err
 }
 
-// CRLSignatureError is the typed error for CRLs whose signature could not
-// be verified against the issuing CA. It includes the file path and the
-// underlying verification error (nil when no issuer certificate was
-// available to verify with).
+// CRLSignatureError reports a CRL whose signature did not verify; Err is nil when no issuer certificate was available.
 type CRLSignatureError struct {
 	Path string
 	Err  error
@@ -325,15 +287,7 @@ var ErrNoCRLSources = &ConfigError{Field: "CRLPaths", Message: "selected mode re
 // default mode.
 var ErrInvalidRevocationMode = &ConfigError{Field: "Mode", Message: "unrecognized revocation mode"}
 
-// ErrNoRevocationSources is returned when revocation is enforced (fail
-// closed) but the selected mode has no source to consult: the
-// source-agnostic default mode with neither a CRL file nor an OCSP
-// responder, or ModeCRL with no CRL file. Either combination consults
-// nothing and would otherwise return "not revoked" for every certificate —
-// no error, no log, no metric —
-// which silently disables the only mechanism that evicts an unexpired
-// compromised node certificate. A deployment that genuinely wants no
-// revocation checking leaves RevocationConfig unset or opts into soft-fail.
+// ErrNoRevocationSources is returned when enforcement is on but the mode has no CRL file or OCSP responder to consult.
 var ErrNoRevocationSources = &ConfigError{
 	Field:   "CRLPaths/OCSPResponderURL",
 	Message: "enforced revocation requires at least one CRL file or an OCSP responder",

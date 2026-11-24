@@ -22,34 +22,11 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// ContextBinding reports how a barrier treats the OPTIONAL caller-supplied
-// context that the *Context methods fold into the AEAD AAD (a snapshot frame's
-// shard/replica/index/ordinal, a WAL record's shard/segment/ordinal).
-//
-// It exists because "the barrier cannot bind a context" is not one condition but
-// several with different meanings, and IsHardwareMode cannot tell them apart: the
-// no-encryption strategy also installs a barrier encryptor, so IsHardwareMode is
-// true for it even though nothing is encrypted. A caller or operator seeing only
-// "no positional binding" cannot otherwise distinguish "there is nothing to bind
-// because nothing is encrypted" from "the encryptor that IS protecting this data
-// cannot authenticate where the data belongs" from "the encryptor does not exist
-// yet, so the question has no answer".
+// ContextBinding reports how a barrier treats the optional context the *Context methods fold into the AAD.
 type ContextBinding uint8
 
 const (
-	// ContextBindingUnresolved means the barrier is not unsealed, so the
-	// capability does not exist yet: no encryptor is installed and nothing has
-	// chosen a strategy. It is NOT an answer of "no" — it is the absence of an
-	// answer, and it is the zero value so that an unset ContextBinding can
-	// never be mistaken for a barrier that binds.
-	//
-	// A barrier legitimately spends time here: a node may start sealed and be
-	// unsealed later (the Vault-style start-then-unseal flow), so every
-	// consumer that caches the capability MUST treat this state as "ask again
-	// after Unseal" rather than latching it. Binds() is false for it, which
-	// keeps the fail-safe direction for callers that only ask the predicate,
-	// but a consumer whose own correctness depends on the answer being STABLE
-	// (see Barrier.ContextBinding) must distinguish it explicitly.
+	// ContextBindingUnresolved means the barrier is sealed and no encryptor is chosen; ask again after Unseal. The zero value.
 	ContextBindingUnresolved ContextBinding = iota
 
 	// ContextBindingBarrier means the barrier encrypts with its own epoch AEAD
@@ -62,18 +39,10 @@ const (
 	// is authenticated end to end by that encryptor.
 	ContextBindingDelegated
 
-	// ContextBindingUnsupported means a delegated encryptor owns the sealing but
-	// implements only SymmetricEncrypter, which carries no AAD. The data IS
-	// encrypted, but nothing binds a frame to its position: same-epoch frames
-	// can be reordered or spliced undetected by an at-rest attacker with write
-	// access. The *Context methods refuse a non-empty context with
-	// ErrHardwareMode rather than silently dropping it.
+	// ContextBindingUnsupported means a delegated SymmetricEncrypter encrypts without AAD; *Context methods refuse a non-empty context with ErrHardwareMode.
 	ContextBindingUnsupported
 
-	// ContextBindingPlaintext means StrategyNone is in force: nothing is
-	// encrypted, so there is no AEAD, no tag, and no position to authenticate.
-	// The absence of a binding is inherent to the mode, not a limitation of an
-	// encryptor that is otherwise protecting the data.
+	// ContextBindingPlaintext means StrategyNone: nothing is encrypted, so there is nothing to bind.
 	ContextBindingPlaintext
 )
 
@@ -102,35 +71,12 @@ func (c ContextBinding) Binds() bool {
 	return c == ContextBindingBarrier || c == ContextBindingDelegated
 }
 
-// Resolved reports whether this binding is an ANSWER rather than the absence of
-// one. It is false only for ContextBindingUnresolved.
-//
-// Callers that CACHE the capability must gate on Resolved before caching:
-// !Binds() collapses "the barrier cannot bind" and "the barrier cannot say yet"
-// into one bit, and caching the latter as the former is exactly how a
-// deployment ends up permanently writing unbound records against a barrier that
-// would have bound them.
+// Resolved reports whether this binding is an answer; false only for ContextBindingUnresolved. Cache the capability only when it is true.
 func (c ContextBinding) Resolved() bool {
 	return c != ContextBindingUnresolved
 }
 
-// contextBindingFor classifies the barrier's context capability from the
-// encryptor a strategy just produced. enc is nil for the software path.
-// plaintext reports that the strategy in force is StrategyNone, whose encryptor
-// is an identity pass-through rather than a real cipher.
-//
-// A delegated encryptor that implements AADSymmetricEncrypter is not taken at
-// its word: the Go method set is a CLAIM, and the implementations live in other
-// repositories (go-xkms), where the interface's own "do not implement this if
-// you drop the aad" warning is the only thing standing between a typo and a
-// deployment that believes it has splice protection it does not have.
-// verifyAADBinding turns the claim into a measurement — see there for what is
-// proved and what it costs.
-//
-// It never returns ContextBindingUnresolved: it is called from Initialize and
-// Unseal with the encryptor in hand, at which point the capability is known by
-// construction. Whether the barrier has REACHED that point is state, not
-// encryptor shape, and is decided by Barrier.ContextBinding.
+// contextBindingFor classifies the context capability of the encryptor a strategy produced (nil for software), verifying AAD claims with verifyAADBinding; never Unresolved.
 func contextBindingFor(enc SymmetricEncrypter, plaintext bool, rand io.Reader) ContextBinding {
 	if enc == nil {
 		return ContextBindingBarrier
@@ -154,32 +100,10 @@ func contextBindingFor(enc SymmetricEncrypter, plaintext bool, rand io.Reader) C
 	return ContextBindingDelegated
 }
 
-// aadProbeSize is the byte length of the plaintext and of each AAD value used
-// by verifyAADBinding. 32 bytes is a full AES/ChaCha key's worth of entropy —
-// far more than the probe needs, and small enough that the round trip is
-// negligible even against a network KMS.
+// aadProbeSize is the byte length of verifyAADBinding's plaintext and AAD values.
 const aadProbeSize = 32
 
-// verifyAADBinding measures, once per barrier setup, whether a delegated
-// encryptor ACTUALLY authenticates the AAD it accepts.
-//
-// The test is the definition of the property: seal a probe under aadA, require
-// that it opens under aadA and returns the same bytes, and require that it
-// FAILS under a different aadB. An encryptor that accepts the aad argument and
-// drops it passes the first two and fails the third — which is precisely the
-// case AADSymmetricEncrypter's doc comment asks implementers not to create,
-// and which nothing else can detect. A structural type assertion cannot
-// distinguish the two, because both have identical method sets.
-//
-// Both AAD values are random, so an encryptor cannot special-case a known probe
-// without also breaking real traffic, and aadB is an independent draw rather
-// than a mutation of aadA so a length- or prefix-sensitive implementation
-// cannot accidentally pass.
-//
-// Cost: one encrypt and two decrypts against the delegated encryptor, at
-// Initialize/Unseal only — never on the data path. That is worth paying at
-// setup: the alternative is discovering the missing binding from the ciphertext
-// after it is at rest, at which point nothing can retroactively bind it.
+// verifyAADBinding checks once at setup that a delegated encryptor opens a probe under its random AAD and refuses it under another.
 func verifyAADBinding(enc AADSymmetricEncrypter, rand io.Reader) error {
 	probe := make([]byte, aadProbeSize)
 	aadA := make([]byte, aadProbeSize)
@@ -214,34 +138,7 @@ func verifyAADBinding(enc AADSymmetricEncrypter, rand io.Reader) error {
 	return nil
 }
 
-// ContextBinding reports how this barrier treats a caller-supplied context.
-//
-// The answer is a property of the INSTALLED ENCRYPTOR, and the encryptor is
-// installed by Initialize or Unseal. Before that — uninitialized, or sealed,
-// including after a seal/unseal cycle that is between the two — there is no
-// encryptor and therefore no capability, and this returns
-// ContextBindingUnresolved. It is NOT ContextBindingBarrier: reporting the
-// software capability for a barrier that has not yet chosen a strategy claims a
-// binding no encryptor has promised, and a consumer that cached it would keep
-// calling the *Context methods against a delegated encryptor that fails every
-// one of them with ErrHardwareMode.
-//
-// The capability is therefore VALID ONLY WHILE THE BARRIER STAYS UNSEALED, and
-// it can legitimately change across a seal/unseal cycle: the same barrier may
-// be unsealed under a software strategy (ContextBindingBarrier) and, later,
-// under a delegated encryptor without AAD (ContextBindingUnsupported). A
-// consumer that resolves this once and caches it — a WAL that decides at open
-// whether its records carry positional binding, say — MUST refuse to cache an
-// unresolved answer, and must re-resolve (or fail closed) if the barrier is
-// sealed and unsealed underneath it. See ContextBinding.Resolved.
-//
-// SupportsContextAAD is the predicate most callers want, and IsPlaintextMode
-// separates "nothing to bind" from "binding unavailable".
-// The value is RESOLVED ONCE, by the Initialize or Unseal that installed the
-// encryptor, and read back from b.binding here. Re-deriving it per call would
-// re-run verifyAADBinding — a real encrypt/decrypt round trip against a
-// possibly remote encryptor — on every query, on a predicate callers are
-// invited to ask freely.
+// ContextBinding reports how this barrier treats a caller context, resolved by Initialize or Unseal; Unresolved while sealed, and it may change across a seal/unseal cycle.
 func (b *Barrier) ContextBinding() ContextBinding {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -251,57 +148,24 @@ func (b *Barrier) ContextBinding() ContextBinding {
 	return b.binding
 }
 
-// SupportsContextAAD reports whether this barrier can ACTUALLY bind a
-// caller-supplied context into the authentication of its ciphertext.
-//
-// It is true for the software path (the barrier's own AEAD folds the context
-// into the AAD) and for a delegated encryptor that implements
-// AADSymmetricEncrypter. It is false for a delegated encryptor that does not,
-// false in no-encryption mode where there is no AEAD at all, and false for a
-// barrier that is not unsealed — where the capability does not exist yet.
-//
-// That last case is the reason this predicate is safe to ASK at any time but
-// unsafe to REMEMBER: false means either "cannot bind" or "cannot say yet", and
-// the two demand opposite handling. A caller that suppresses its context per
-// operation may use this directly; a caller that latches the answer must use
-// ContextBinding and check ContextBinding.Resolved, or it will pin the
-// capability of a barrier that had none at the time it asked.
-//
-// Callers that build a positional context should suppress it when this returns
-// false — passing one to a barrier that cannot carry it fails with
-// ErrHardwareMode, which is deliberate: the context is never silently dropped.
+// SupportsContextAAD reports whether this barrier can bind a caller context into its ciphertext authentication; false while sealed, so do not cache it.
 func (b *Barrier) SupportsContextAAD() bool {
 	return b.ContextBinding().Binds()
 }
 
-// ContextBindingResolved reports whether SupportsContextAAD currently returns a
-// real answer — that is, whether the barrier is unsealed and an encryptor is
-// installed. It exists for consumers that cache the capability and cannot
-// import this package's ContextBinding type (the WAL asserts its barrier
-// structurally); it is exactly ContextBinding().Resolved().
-//
-// A consumer that caches must treat false as "not answerable yet" and refuse to
-// record a capability, NOT as "does not support context AAD".
+// ContextBindingResolved reports ContextBinding().Resolved(), for consumers that cannot import the type; false means not answerable yet.
 func (b *Barrier) ContextBindingResolved() bool {
 	return b.ContextBinding().Resolved()
 }
 
-// IsPlaintextMode reports whether the barrier performs no encryption at all
-// (StrategyNone). It distinguishes the two ways SupportsContextAAD can be
-// false: in plaintext mode no binding is MEANINGFUL, while in
-// ContextBindingUnsupported mode the data is encrypted and a binding is
-// MISSING. Operators need that difference; IsHardwareMode is true for both.
+// IsPlaintextMode reports whether the barrier encrypts nothing (StrategyNone).
 func (b *Barrier) IsPlaintextMode() bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.plaintextMode
 }
 
-// checkContextAADPolicy enforces BarrierConfig.RequireContextAAD at barrier
-// setup. It returns ErrContextAADUnsupported when the deployment demands
-// authenticated positional binding and the encryptor about to be installed
-// cannot provide it — including no-encryption mode, where the demand is
-// unsatisfiable by construction (see BarrierConfig.RequireContextAAD).
+// checkContextAADPolicy returns ErrContextAADUnsupported when RequireContextAAD is set and the encryptor cannot bind context.
 func (b *Barrier) checkContextAADPolicy(binding ContextBinding) error {
 	if !b.config.RequireContextAAD || binding.Binds() {
 		return nil
@@ -314,24 +178,7 @@ func (b *Barrier) checkContextAADPolicy(binding ContextBinding) error {
 	return ErrContextAADUnsupported
 }
 
-// delegatedEncrypt seals plaintext through the installed delegated encryptor,
-// carrying the caller's context when — and ONLY when — that encryptor declares
-// it authenticates AAD by implementing AADSymmetricEncrypter. Caller must hold
-// at least b.mu.RLock() and must have checked b.hwEncryptor != nil.
-//
-// The aad bytes are built with aadForEpoch, the SAME helper the software path
-// uses, so the two constructions cannot drift: a delegated frame is bound to
-// [epoch][context] exactly as a software frame is.
-//
-// An EMPTY context takes the plain Encrypt path unchanged. That is deliberate,
-// not an oversight: in delegated mode Encrypt itself has no AAD to offer, and
-// the documented equivalence "EncryptWithContext with no context == Encrypt"
-// must keep holding, or ciphertext written through one method would stop
-// opening through the other. Nothing is downgraded — a caller that supplies no
-// context asked for no binding.
-//
-// A non-empty context on an encryptor without the capability returns
-// ErrHardwareMode. It is never dropped.
+// delegatedEncrypt seals through the delegated encryptor with aadForEpoch AAD when it authenticates AAD; an empty context uses plain Encrypt, a non-empty one without support returns ErrHardwareMode. Caller holds b.mu.RLock.
 func (b *Barrier) delegatedEncrypt(plaintext, contextAAD []byte) ([]byte, error) {
 	if len(contextAAD) == 0 {
 		return b.hwEncryptor.Encrypt(plaintext)
@@ -343,16 +190,7 @@ func (b *Barrier) delegatedEncrypt(plaintext, contextAAD []byte) ([]byte, error)
 	return aadEnc.EncryptWithAAD(plaintext, aadForEpoch(b.epoch, contextAAD))
 }
 
-// aadEncryptorLocked returns the delegated encryptor as an AADSymmetricEncrypter
-// only if the barrier's RESOLVED binding says it genuinely authenticates AAD.
-// The caller must hold at least b.mu.RLock().
-//
-// It gates on b.binding rather than repeating the type assertion, and that is
-// the whole point: the assertion is what the behavioural probe exists to
-// distrust. Re-deriving the capability here would hand the caller's context to
-// an encryptor the probe already caught dropping it — reporting
-// SupportsContextAAD false to whoever asks while still writing unbound frames
-// for whoever does not, which is worse than either answer alone.
+// aadEncryptorLocked returns the delegated encryptor as an AADSymmetricEncrypter only if the resolved binding says it authenticates AAD. Caller holds b.mu.RLock.
 func (b *Barrier) aadEncryptorLocked() (AADSymmetricEncrypter, bool) {
 	if b.binding != ContextBindingDelegated {
 		return nil, false
@@ -361,17 +199,7 @@ func (b *Barrier) aadEncryptorLocked() (AADSymmetricEncrypter, bool) {
 	return aadEnc, ok
 }
 
-// delegatedDecrypt opens a ciphertext sealed by delegatedEncrypt under the same
-// context. epoch is the epoch whose AAD the frame was sealed with: the current
-// epoch for the header-implicit methods, or the caller's explicitly named epoch
-// for DecryptForEpochContext. Delegated mode cannot rotate (Rotate returns
-// ErrHardwareMode), so the current epoch is stable for the barrier's lifetime
-// and the implicit form matches what the encrypt side used.
-//
-// Mirrors delegatedEncrypt exactly: an empty context takes the plain Decrypt
-// path, and a non-empty context on an encryptor without the capability fails
-// closed with ErrHardwareMode rather than opening the frame unbound. Caller
-// must hold at least b.mu.RLock() and must have checked b.hwEncryptor != nil.
+// delegatedDecrypt opens a delegatedEncrypt ciphertext under the same context and epoch, mirroring its rules. Caller holds b.mu.RLock.
 func (b *Barrier) delegatedDecrypt(ciphertext, contextAAD []byte, epoch uint64) ([]byte, error) {
 	if len(contextAAD) == 0 {
 		return b.hwEncryptor.Decrypt(ciphertext)
@@ -383,14 +211,7 @@ func (b *Barrier) delegatedDecrypt(ciphertext, contextAAD []byte, epoch uint64) 
 	return aadEnc.DecryptWithAAD(ciphertext, aadForEpoch(epoch, contextAAD))
 }
 
-// logDelegatedMode records, once per barrier setup, exactly what the barrier
-// hands to a delegated encryptor. The early return in every encrypt/decrypt
-// path (see Barrier.hwEncryptor) means delegated mode is not "the same barrier
-// with a different cipher": epoch DEK derivation, the epoch ciphertext header,
-// the nonce-reuse tracker, and the NIST SP 800-38D invocation counter are ALL
-// bypassed, because the delegated encryptor owns its own nonce and key
-// management. That is intended, but it is invisible from the config alone, so
-// it is stated at WARN where an operator will see it.
+// logDelegatedMode warns once per setup that delegated mode bypasses epoch DEKs, the epoch header, nonce tracking and the invocation counter.
 func (b *Barrier) logDelegatedMode(phase string, binding ContextBinding) {
 	if binding == ContextBindingPlaintext {
 		// Not a delegation of encryption but the absence of it. Saying

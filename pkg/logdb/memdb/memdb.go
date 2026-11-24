@@ -12,17 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package memdb provides an in-memory implementation of the logdb.LogDB
-// interface. It is suitable for testing, development, and scenarios where
-// durability is not required (e.g., ephemeral nodes, benchmarks).
-//
-// Data is sharded by (shardID, replicaID) with per-node read-write locks
-// for fine-grained concurrency. A top-level read-write lock protects the
-// node map itself, while each node's data has its own lock to allow
-// concurrent access to different nodes.
-//
-// Entries are stored in sorted slices and looked up via binary search.
-// The closed state uses sync/atomic for lock-free checking on the fast path.
+// Package memdb provides an in-memory logdb.LogDB for tests, benchmarks and ephemeral nodes, with per-node locks and sorted entry slices.
 package memdb
 
 import (
@@ -59,12 +49,7 @@ type nodeData struct {
 	bootstrap  logdb.Bootstrap
 	hasBoot    bool
 	membership logdb.Membership
-	// compactedTo is the highest index removed by RemoveEntriesTo. It is the
-	// node's compaction floor and outlives the entry slice: after a full
-	// compaction the slice is empty but reads below the floor must still
-	// report ErrCompacted so raft switches to InstallSnapshot instead of
-	// retrying an ErrUnavailable range forever. waldb keeps the same floor
-	// durably; this mirrors it.
+	// compactedTo is the node's compaction floor; reads below it return ErrCompacted even after the slice empties.
 	compactedTo uint64
 }
 
@@ -72,26 +57,14 @@ type nodeData struct {
 // It is safe for concurrent use from multiple goroutines.
 type MemDB struct {
 	closed atomic.Bool
-	// removalMu orders every write against RemoveNodeData and Close: a
-	// writer holds it for reading for its whole operation (beginWrite),
-	// RemoveNodeData and Close for writing. So a SaveState batch is applied
-	// entirely before a removal or a close or entirely after it — then
-	// refused whole — and never split by one, which would leave part of a
-	// batch the caller was told failed. One lock rather than per-node
-	// stripes: BenchmarkMemDBSaveStateParallel measured no contention gain
-	// from striping at 8 and 24 cores and a 14% single-core cost. Lock order:
-	// removalMu, then a node's mu, then mu.
+	// removalMu keeps each write whole against RemoveNodeData and Close. Lock order: removalMu, a node's mu, then mu.
 	removalMu sync.RWMutex
 	mu        sync.RWMutex
 	nodes     map[nodeKey]*nodeData
 	removed   map[nodeKey]struct{} // retired by RemoveNodeData; see NodeRemoved
 }
 
-// beginWrite takes removalMu for reading and then checks the database is still
-// open; on success the caller releases it with removalMu.RUnlock. The check
-// comes after the lock is held: Close marks the database closed before it
-// takes removalMu, so a writer that gets the lock after a Close sees the mark,
-// and one that got it before finishes before Close releases the data.
+// beginWrite read-locks removalMu and checks the database is open; the caller releases with removalMu.RUnlock.
 func (m *MemDB) beginWrite() error {
 	m.removalMu.RLock()
 	if m.closed.Load() {
@@ -114,27 +87,12 @@ func (m *MemDB) Name() string {
 	return "memory"
 }
 
-// AtRestProtection reports that this LogDB has no at-rest artifact at all.
-//
-// Every record lives in the nodes map and nothing is ever written to a file,
-// so there is no on-disk copy of a Raft log entry for an attacker with the
-// disk to read, and none survives the process. The at-rest guarantee therefore
-// holds VACUOUSLY -- which is a different fact from "encrypted", and is
-// reported as its own state so a caller cannot mistake one for the other.
+// AtRestProtection reports that this LogDB writes nothing to disk, so the at-rest guarantee holds vacuously.
 func (m *MemDB) AtRestProtection() logdb.AtRestProtection {
 	return logdb.AtRestNonDurable
 }
 
-// Close marks the database as closed and releases every node's data. All
-// subsequent operations return ErrClosed. Close is idempotent.
-//
-// Releasing the map is the whole point of closing an in-memory store: this
-// backend holds the entire Raft log of every shard on the heap, so a Close that
-// only flipped a flag left all of it alive for as long as the caller kept the
-// handle — which, in a host that closes one store and opens another, is the
-// full log twice. No operation can observe the released map: a writer checks
-// the closed flag under removalMu (beginWrite) and a reader under mu
-// (readNode), and Close sets the flag before it takes either lock.
+// Close marks the database closed and releases every node's data; later operations return ErrClosed. Close is idempotent.
 func (m *MemDB) Close() error {
 	m.closed.Store(true)
 	// Wait out every write already in flight so none is split by the release
@@ -157,11 +115,7 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 		return err
 	}
 	defer m.removalMu.RUnlock()
-	// Validate the WHOLE batch before applying any of it. SaveState is
-	// specified to be atomic, and a floor violation found half-way through
-	// would otherwise leave the updates before it stored and the ones after it
-	// not — the caller's error return would then describe a batch that had
-	// partly happened.
+	// Validate the whole batch before applying any of it, keeping SaveState atomic.
 	for i := range updates {
 		u := &updates[i]
 		if m.retired(u.ShardID, u.ReplicaID) {
@@ -194,10 +148,7 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 
 	for i := range updates {
 		u := &updates[i]
-		// The error is the whole point of withNode: it reports that the node
-		// was unlinked (RemoveNodeData) between resolving it and taking its
-		// lock. Discarding it here would return nil to a caller whose batch was
-		// silently dropped — precisely the race withNode exists to close.
+		// The error reports the node was removed before its lock was taken; it must be returned.
 		if err := m.withNode(u.ShardID, u.ReplicaID, func(nd *nodeData) error {
 			m.applyUpdate(nd, u)
 			return nil
@@ -208,31 +159,7 @@ func (m *MemDB) SaveState(updates []logdb.Update) error {
 	return nil
 }
 
-// withNode runs fn against a node's data under that node's own lock, having
-// first confirmed the node is still the one the map holds.
-//
-// The re-check is what makes a write and a concurrent RemoveNodeData
-// linearizable. getOrCreateNode resolves the *nodeData under the map lock and
-// releases it before the node lock is taken, so RemoveNodeData can unlink the
-// node in that window; writing into the unlinked value then stored the batch
-// somewhere no reader can ever reach while still returning nil, which is the
-// one thing a durability API must never do — the caller was told the write
-// happened. Neither ordering of the two calls explains that outcome.
-//
-// Re-checking settles the race one of two honest ways. RemoveNodeData retires
-// the node as it unlinks it, so a write that finds its node unlinked finds it
-// retired and is refused (logdb.ErrReplicaRetired): "remove, then save", where
-// the save is not allowed. The other ordering, "save, then remove", is what
-// happens when RemoveNodeData gets the map lock second. Both are honest; only
-// the lost write was not.
-//
-// The retry cannot spin indefinitely against anything but an unbroken stream of
-// RemoveNodeData calls for the same node, which is not a workload — each
-// iteration is bounded and makes the same progress the first attempt would.
-//
-// Lock order is nd.mu then m.mu, and it is the ONLY order in this package:
-// getNode and getOrCreateNode release m.mu before any caller touches nd.mu, and
-// RemoveNodeData/ListNodeInfo take m.mu alone.
+// withNode runs fn under the node's lock after confirming the map still holds that node; a removed node returns logdb.ErrReplicaRetired. Lock order: nd.mu then m.mu.
 func (m *MemDB) withNode(shardID, replicaID uint64, fn func(nd *nodeData) error) error {
 	key := nodeKey{shardID: shardID, replicaID: replicaID}
 	for {
@@ -270,11 +197,7 @@ func (m *MemDB) applyUpdate(nd *nodeData, u *logdb.Update) {
 		nd.hasState = true
 	}
 
-	// Persist the snapshot metadata (and its membership) carried by the
-	// Update, exactly as SaveSnapshot would: a follower's InstallSnapshot
-	// lands here via SaveState, and dropping the metadata would make
-	// GetSnapshot report ErrNoSnapshot after the install. Stale snapshots
-	// are ignored, mirroring the SaveSnapshot/waldb staleness check.
+	// Persist the Update's snapshot metadata and membership as SaveSnapshot would, ignoring stale snapshots.
 	if u.Snapshot.Index > 0 && (!nd.hasSnap || u.Snapshot.Index > nd.snapshot.Index) {
 		// The membership maps are deep-copied for the same reason Entry.Cmd
 		// is: the caller owns them and may mutate them after the call, and the
@@ -292,13 +215,7 @@ func (m *MemDB) applyUpdate(nd *nodeData, u *logdb.Update) {
 	}
 }
 
-// copyMembership returns a deep copy of m: the five maps are cloned so the
-// stored membership never aliases the caller's. A nil map stays nil so a
-// round-trip does not manufacture empty maps where the caller had none.
-//
-// Identities is cloned like the rest, and dropping it here would be worse
-// than an aliasing bug: it is the authorization key a replica recovering
-// from a snapshot has no other source for. See logdb.Membership.Identities.
+// copyMembership returns a deep copy of m, cloning all maps including Identities; nil maps stay nil.
 func copyMembership(m logdb.Membership) logdb.Membership {
 	m.Addresses = copyAddrMap(m.Addresses)
 	m.Observers = copyAddrMap(m.Observers)
@@ -327,14 +244,7 @@ func copyAddrMap(src map[uint64]string) map[uint64]string {
 	return dst
 }
 
-// mergeEntries merges new entries into existing sorted entries. If the first
-// new entry overlaps with existing entries, the existing entries from that
-// index onward are replaced (truncate-and-append semantics matching Raft).
-//
-// Incoming Cmd payloads are deep-copied: SaveState callers (Host.Propose)
-// build entries directly over application-owned buffers and may reuse them
-// after the call, so retaining the caller's backing arrays would let later
-// mutations rewrite the persisted log and diverge replicas.
+// mergeEntries merges new entries into sorted existing ones with truncate-and-append semantics, deep-copying Cmd.
 func mergeEntries(existing, incoming []logdb.Entry) []logdb.Entry {
 	if len(existing) == 0 {
 		return appendCopied(make([]logdb.Entry, 0, len(incoming)), incoming)
@@ -351,19 +261,7 @@ func mergeEntries(existing, incoming []logdb.Entry) []logdb.Entry {
 	// Reuses existing slice capacity when possible (common case: sequential append).
 	merged := appendCopied(existing[:insertAt], incoming)
 
-	// Reusing the capacity is what makes the append cheap, and it is also what
-	// keeps the DROPPED entries alive: an overwrite that replaces a long
-	// uncommitted suffix with a short one leaves the difference sitting in the
-	// backing array past len, each element still holding a pointer to its Cmd
-	// payload. Nothing reads those elements again, so the retention is
-	// invisible until it is measured — and under leader churn it is unbounded,
-	// because every overwrite adds its own orphaned tail and none is ever
-	// reclaimed. Clear the region so the payloads become collectable the moment
-	// they leave the log.
-	//
-	// When append reallocated, this clears the abandoned array instead, which
-	// costs a pass over memory that is about to be collected anyway and keeps
-	// the rule free of a special case that could silently stop applying.
+	// Clear the slots past the new length so dropped entries' payloads can be collected.
 	if n := len(merged); n < len(existing) {
 		clear(existing[n:])
 	}
@@ -385,13 +283,7 @@ func appendCopied(dst, incoming []logdb.Entry) []logdb.Entry {
 	return dst
 }
 
-// IterateEntries returns log entries in the range [low, high) for the given
-// node, up to maxSize bytes total. Results are appended to the provided
-// entries slice. Returns the modified entries slice and the cumulative size.
-//
-// Entry size is calculated as logdb.EntryOverheadBytes + len(Cmd), and the
-// error semantics follow the LogDB interface contract (see logdb.LogDB).
-// A maxSize of 0 means unlimited.
+// IterateEntries appends entries in [low, high) up to maxSize bytes (0 is unlimited) and returns them with the total size.
 func (m *MemDB) IterateEntries(
 	entries []logdb.Entry,
 	size uint64,
@@ -419,10 +311,7 @@ func (m *MemDB) IterateEntries(
 	nd.mu.RLock()
 	defer nd.mu.RUnlock()
 
-	// The compaction floor is checked FIRST, before the entry slice, exactly
-	// as waldb does. After a full compaction the slice is empty, and reporting
-	// ErrUnavailable there would make raft retry the range forever instead of
-	// falling back to InstallSnapshot.
+	// Check the compaction floor first, as waldb does.
 	if low <= nd.compactedTo {
 		return entries, size, logdb.ErrCompacted
 	}
@@ -441,11 +330,7 @@ func (m *MemDB) IterateEntries(
 		return entries, size, logdb.ErrUnavailable
 	}
 
-	// The range holds entries but not the one at low, and low is at or above
-	// the compaction floor (checked before the slice): the prefix is MISSING,
-	// not compacted. The contract — and waldb — require the loud error;
-	// reporting ErrCompacted told raft the range had been legitimately
-	// truncated and hid the hole.
+	// A missing prefix at or above the floor is a gap, not compaction.
 	if nd.entries[startIdx].Index != low {
 		return entries, size, logdb.ErrLogGapDetected
 	}
@@ -471,10 +356,7 @@ func (m *MemDB) IterateEntries(
 			break
 		}
 
-		// Copied out with its own payload: the slice held here is this store's
-		// live log, and a caller writing through the returned Cmd would be
-		// rewriting the entries this replica serves and replays. See
-		// logdb.CopyEntryCmd.
+		// Copy each entry and its payload out of the live log (see logdb.CopyEntryCmd).
 		entries = append(entries, logdb.CopyEntryCmd(e))
 		size += entryBytes
 		expected++
@@ -510,10 +392,7 @@ func (m *MemDB) ReadState(shardID uint64, replicaID uint64) (logdb.State, logdb.
 	return nd.state, copyMembership(nd.membership), nil
 }
 
-// EntryRange returns the first index and the contiguous span of available
-// log entries for the given node. Returns (0, 0, nil) when no entries exist.
-// A stored entry count that does not match the first..last index span is a
-// log hole and returns ErrLogGapDetected instead of a short length.
+// EntryRange returns the first index and contiguous length of stored entries, (0, 0, nil) when empty, or ErrLogGapDetected on a hole.
 func (m *MemDB) EntryRange(shardID uint64, replicaID uint64) (uint64, uint64, error) {
 	if m.closed.Load() {
 		return 0, 0, logdb.ErrClosed
@@ -617,22 +496,11 @@ func (m *MemDB) SaveSnapshot(shardID uint64, replicaID uint64, snapshot logdb.Sn
 	}
 	defer m.removalMu.RUnlock()
 
-	// A snapshot at index 0 is not a snapshot: index 0 is the empty log, so it
-	// covers nothing and can never be newer than what is stored. Storing it
-	// makes GetSnapshot report a snapshot that exists at no index, and the
-	// caller's next SaveSnapshot at a real index is the only thing that clears
-	// it. The staleness rule below already rejects it whenever a snapshot IS
-	// stored — this extends the same rule to the fresh node it slipped through
-	// on, and matches the SaveState path, which has always required Index > 0.
+	// A snapshot at index 0 covers nothing; refuse it.
 	if snapshot.Index == 0 {
 		return logdb.ErrSnapshotOutOfDate
 	}
-	// The other end of the range: a position at or above proto.MaxLogIndex /
-	// proto.MaxTerm is refused before it can become durable, because raft
-	// restores a saved snapshot on restart and its Index+1 arithmetic wraps
-	// there. Same predicate as raft.handleSnapshot and the chunk validator;
-	// LogDB is the one that makes the poisoning survive a restart, so it
-	// cannot rely on the callers having applied it.
+	// Refuse a position at or above proto.MaxLogIndex or proto.MaxTerm before it becomes durable.
 	if err := snapshot.CheckBounds(); err != nil {
 		return err
 	}
@@ -642,12 +510,7 @@ func (m *MemDB) SaveSnapshot(shardID uint64, replicaID uint64, snapshot logdb.Sn
 			return logdb.ErrSnapshotOutOfDate
 		}
 
-		// The snapshot's membership becomes the node's membership, exactly as
-		// it does on the SaveState path and in waldb (whose ReadState serves
-		// the latest snapshot's membership); leaving it untouched made
-		// ReadState report an empty membership after a snapshot install. The
-		// maps are deep-copied for the same reason Entry.Cmd is: the caller
-		// owns them.
+		// The snapshot's membership becomes the node's membership, deep-copied.
 		membership := copyMembership(snapshot.Membership)
 		nd.snapshot = snapshot
 		nd.snapshot.Membership = membership
@@ -763,11 +626,7 @@ func (m *MemDB) SaveBootstrap(shardID uint64, replicaID uint64, bootstrap logdb.
 	}
 	defer m.removalMu.RUnlock()
 
-	// Deep-copy the address map for exactly the reason Entry.Cmd and every
-	// Membership map are copied: the caller owns it and may reuse or mutate it
-	// after the call. This was the ONE write path that did not, so a caller
-	// that recycled its bootstrap map silently rewrote the stored initial
-	// membership — the set a recovering replica dials and authorizes against.
+	// Deep-copy the address map; the caller owns it.
 	bootstrap.Addresses = copyAddrMap(bootstrap.Addresses)
 
 	return m.withNode(shardID, replicaID, func(nd *nodeData) error {
@@ -816,14 +675,7 @@ func (m *MemDB) getNode(shardID, replicaID uint64) *nodeData {
 	return nd
 }
 
-// readNode is getNode for a reader, which holds no lock that orders it against
-// Close: it checks the closed flag again under mu. Close sets the flag before
-// it takes mu to release the map, so a reader that passed its first check just
-// before a Close and resolves its node after the release sees the flag here and
-// returns ErrClosed, instead of reporting the released map as a node with no
-// entries, state, snapshot or bootstrap. A node resolved before the release is
-// still whole (Close drops the map, not the nodes), so reading it returns the
-// state from before the close.
+// readNode is getNode for readers, rechecking the closed flag under mu so a reader racing Close returns ErrClosed.
 func (m *MemDB) readNode(shardID, replicaID uint64) (*nodeData, error) {
 	key := nodeKey{shardID: shardID, replicaID: replicaID}
 

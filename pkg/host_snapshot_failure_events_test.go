@@ -115,14 +115,7 @@ func (d *getSnapshotFailingLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.
 	return d.LogDB.GetSnapshot(shardID, replicaID)
 }
 
-// TestSnapshotRecoveryPreRestoreFailure_RejectsWithoutFailingTheShard: a
-// recovery that fails before the state machine's RecoverFromSnapshot is invoked
-// (here, reading the snapshot record) has not touched the state machine. It
-// does not trip the failure latch, so OnShardFailed does not fire; the
-// recovery is reported through OnSnapshotRejected, exactly once, and the shard
-// keeps committing and applying proposals. A recovery that fails once the
-// restore has begun still latches (engine
-// TestHandleRequest_PostRestoreErrorLatches).
+// TestSnapshotRecoveryPreRestoreFailure_RejectsWithoutFailingTheShard: a recovery failing before RecoverFromSnapshot is rejected once and does not latch.
 func TestSnapshotRecoveryPreRestoreFailure_RejectsWithoutFailingTheShard(t *testing.T) {
 	var (
 		failed        atomic.Int32
@@ -206,12 +199,7 @@ func (*savePanickingSM) SaveSnapshot(_ context.Context, _ io.Writer, _ <-chan st
 	panic("quicraft_test: injected SaveSnapshot panic")
 }
 
-// TestSnapshotSavePanic_ResolvesRequesterAsFailedSave: a SaveSnapshot that
-// panics is a failed save. The caller of SyncRequestSnapshot gets a save
-// *SnapshotFailedError wrapping the *SnapshotSavePanicError at once — it used
-// to wait out its context, because the panic path never resolved it — and the
-// error does not claim a failed shard, because none happened: the save only
-// read the state machine, and the shard keeps accepting proposals.
+// TestSnapshotSavePanic_ResolvesRequesterAsFailedSave: a panicking SaveSnapshot resolves the requester at once and does not fail the shard.
 func TestSnapshotSavePanic_ResolvesRequesterAsFailedSave(t *testing.T) {
 	var failed, rejected atomic.Int32
 	cfg := testHostConfig(t)

@@ -328,14 +328,7 @@ func TestMessageBatchUnmarshalFromEmptyPreservesCapacity(t *testing.T) {
 }
 
 func TestMessageBatchUnmarshalFromBatchSizeBoundary(t *testing.T) {
-	// Verify that a batch just under MaxBatchSize succeeds, while a batch
-	// that crosses the limit is rejected. Uses multiple messages with
-	// entries that individually stay under MaxEntrySize (8MB) but
-	// collectively approach MaxBatchSize (64MB).
-	//
-	// Strategy: use 8 messages, each with one 7MB entry = 56MB total
-	// payload. With wire overhead this stays under 64MB. Then add one
-	// more message to push it over.
+	// Eight messages with one 7MB entry each stay under MaxBatchSize (64MB); one more exceeds it.
 	const cmdSize = 7 * 1024 * 1024 // 7MB per entry, under MaxEntrySize (8MB)
 	const safeCount = 8             // 8 * ~7MB = ~56MB < 64MB
 
@@ -414,15 +407,7 @@ func TestMessageBatchUnmarshalFromBatchSizeBoundary(t *testing.T) {
 	}
 }
 
-// TestExceedsMaxBatchSizeDoesNotTruncate drives the PRODUCTION comparison at an
-// offset UnmarshalFrom cannot be driven to.
-//
-// Asserting uint32(1<<32+1) == 1 and uint64(1<<32+1) > MaxBatchSize instead
-// would check facts about Go's arithmetic, true no matter what this package
-// does, so such a test could not fail. The hazard is a truncating cast inside
-// the decoder's cumulative-size gate, and reaching it
-// through UnmarshalFrom needs a 4 GB frame no test can allocate; calling the
-// gate directly is what makes it testable at all.
+// TestExceedsMaxBatchSizeDoesNotTruncate calls the decoder's cumulative-size gate directly at an offset past 4 GB.
 func TestExceedsMaxBatchSizeDoesNotTruncate(t *testing.T) {
 	if math.MaxInt < math.MaxInt64 {
 		t.Skip("int is 32-bit on this platform; an offset past 4 GB is unrepresentable")
@@ -459,14 +444,7 @@ func TestExceedsMaxBatchSizeDoesNotTruncate(t *testing.T) {
 	}
 }
 
-// TestMessageBatchUnmarshalEnforcesMaxBatchSize is the call-site half: the gate
-// above is only worth having if the decoder actually consults it. This drives a
-// real frame past MaxBatchSize, which costs a 64 MB buffer and is the smallest
-// input that reaches the check.
-//
-// It cannot catch the truncating cast (a 64 MB offset does not overflow a
-// uint32) and does not try to; it catches the gate being removed, weakened, or
-// moved out of the request loop.
+// TestMessageBatchUnmarshalEnforcesMaxBatchSize checks UnmarshalFrom refuses a real frame past MaxBatchSize.
 func TestMessageBatchUnmarshalEnforcesMaxBatchSize(t *testing.T) {
 	// One message carrying one maximum-size entry. Cmd bytes are left zero:
 	// the decoder aliases them, so the frame is the only large allocation.

@@ -14,13 +14,7 @@
 
 package proto
 
-// UpdateCommit tracks what has been committed from an Update. It is used
-// internally by the engine to coordinate between the commit and apply
-// workers. The wire format is 48 bytes (6 fields, Processed stored as
-// uint64 on wire):
-//
-//	[StableLogTo:8][StableLogTerm:8][StableSnapshotTo:8]
-//	[Processed:8][LastApplied:8][ReadyToRead:8]
+// UpdateCommit tracks what has been committed from an Update, between the commit and apply workers; 48 bytes: [StableLogTo:8][StableLogTerm:8][StableSnapshotTo:8][Processed:8][LastApplied:8][ReadyToRead:8].
 type UpdateCommit struct {
 	// StableLogTo is the highest log index that has been persisted to LogDB.
 	StableLogTo uint64
@@ -84,11 +78,7 @@ func (uc *UpdateCommit) Reset() {
 	uc.ReadyToRead = 0
 }
 
-// Update represents a batch of changes produced by a Raft step for a
-// single shard. It is the primary data structure that flows between the
-// engine and LogDB. Update is an internal struct that does not require
-// wire serialization (it is never sent over the network). Components
-// pass it by reference within the same process.
+// Update is the batch of changes a Raft step produces for one shard, passed by reference between the engine and LogDB; never serialized.
 type Update struct {
 	// ShardID identifies the Raft shard this update belongs to.
 	ShardID uint64
@@ -114,33 +104,18 @@ type Update struct {
 	UpdateCommit UpdateCommit
 	// LastApplied is the highest applied log index.
 	LastApplied uint64
-	// ReadOnly indicates this update contains only ReadyToRead states
-	// with no entries, state changes, or snapshots requiring persistence.
-	// The engine step worker bypasses the commit/apply pipeline for
-	// read-only updates, avoiding unnecessary LogDB writes and goroutine
-	// hops that would otherwise add ~300us per ReadIndex request.
+	// ReadOnly marks an update with only ReadyToRead states; the step worker skips the commit/apply pipeline for it.
 	ReadOnly bool
-	// committedEntriesPooled is the pooled slice backing CommittedEntries.
-	// When non-nil, the apply worker returns this to proto.PutEntrySlice
-	// after applying entries to reclaim the allocation. This field is
-	// unexported because it is an internal optimization detail: only the
-	// raft log's entriesToApply sets it, and only the engine apply worker
-	// returns it.
+	// committedEntriesPooled is the pooled slice backing CommittedEntries, set by entriesToApply and released by the apply worker.
 	committedEntriesPooled *[]Entry
 }
 
-// SetCommittedEntriesPooled associates a pooled []Entry slice with this
-// Update. The apply worker uses ReleaseCommittedEntries to return the
-// slice to the pool after entries are applied. The caller must ensure
-// that CommittedEntries is a sub-slice of the pooled slice.
+// SetCommittedEntriesPooled associates a pooled slice, of which CommittedEntries must be a sub-slice, with this Update.
 func (u *Update) SetCommittedEntriesPooled(s *[]Entry) {
 	u.committedEntriesPooled = s
 }
 
-// ReleaseCommittedEntries returns the pooled committed entries slice to
-// the entry slice pool, if one was associated via SetCommittedEntriesPooled.
-// After this call, CommittedEntries must not be accessed. This method is
-// idempotent; subsequent calls are no-ops.
+// ReleaseCommittedEntries returns the pooled slice to the pool; CommittedEntries must not be used afterwards. Idempotent.
 func (u *Update) ReleaseCommittedEntries() {
 	if u.committedEntriesPooled != nil {
 		PutEntrySlice(u.committedEntriesPooled)

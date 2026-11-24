@@ -19,15 +19,7 @@ import (
 	"testing"
 )
 
-// TestCreateWALRoot_EntirelyNewTreeSurvivesCrash is the regression test for
-// the WAL root's chain sync degrading to a LEAF-ONLY fsync when nothing above
-// the root pre-exists but the filesystem root itself.
-//
-// The deepest pre-existing ancestor is then "/", and a string-prefix
-// containment test over leaf+sep and stopAt+sep builds the prefix "//", which
-// no cleaned leaf carries. The walk fell through to syncing the leaf alone, so
-// the dirents of every directory MkdirAll had just created were never made
-// durable and a crash took the whole WAL tree with it.
+// TestCreateWALRoot_EntirelyNewTreeSurvivesCrash verifies every directory created under / is fsynced.
 func TestCreateWALRoot_EntirelyNewTreeSurvivesCrash(t *testing.T) {
 	root := string(filepath.Separator)
 	dir := filepath.Join(root, "wal", "a", "b")

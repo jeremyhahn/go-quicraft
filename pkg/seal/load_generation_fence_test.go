@@ -156,7 +156,7 @@ func TestLoadGenerationFenceSupersedesEarlierLoader(t *testing.T) {
 		t.Fatal("losing the claim must be reported at error level")
 	}
 
-	// THE POINT: A may no longer add to the DEK it shares with B.
+	// A may no longer add to the DEK it shares with B.
 	if _, err := first.Encrypt(nil, []byte("A must not write")); !errors.Is(err, ErrBarrierSuperseded) {
 		t.Fatalf("a superseded barrier ENCRYPTED (err=%v); two writers are now sharing one "+
 			"epoch DEK with two independent nonce sequences", err)
@@ -189,10 +189,7 @@ func TestLoadGenerationFenceSupersedesEarlierLoader(t *testing.T) {
 	}
 }
 
-// TestSupersededBarrierStillDecrypts pins the deliberate asymmetry: losing the
-// claim stops this instance from ADDING to a shared key, not from reading data
-// it already holds. A node that cannot serve reads because another process
-// touched its sealed blob would be a worse outage than the hazard.
+// TestSupersededBarrierStillDecrypts: a superseded barrier stops encrypting but can still read its data.
 func TestSupersededBarrierStillDecrypts(t *testing.T) {
 	captureLogs(t)
 	store := bootstrapFenced(t, 102)
@@ -326,12 +323,7 @@ func TestSingleWriterUnaffectedByFence(t *testing.T) {
 	}
 }
 
-// TestLoadGenerationSurvivesPersistenceRoundTrip is the field-by-field-copy
-// guard. LoadGeneration is carried through a JSON encode/decode, through
-// cloneSealedRootKey (which copies field by field and silently drops anything
-// not listed), and through the rotate and purge persists — a field that
-// vanishes in any one of those compiles cleanly and disables the fence without
-// a single test failing anywhere else.
+// TestLoadGenerationSurvivesPersistenceRoundTrip: LoadGeneration survives JSON round trips, cloneSealedRootKey and the rotate and purge persists.
 func TestLoadGenerationSurvivesPersistenceRoundTrip(t *testing.T) {
 	captureLogs(t)
 	store := bootstrapFenced(t, 105)
@@ -444,10 +436,7 @@ func TestFenceInertWithoutStatePersister(t *testing.T) {
 	}
 }
 
-// TestFenceClaimFailureAbortsUnseal pins the ordering the fence depends on: the
-// claim must be durable BEFORE the barrier can encrypt. A persister that fails
-// must leave the barrier sealed rather than unsealed-and-unclaimed, which would
-// be a writer with no claim on disk at all.
+// TestFenceClaimFailureAbortsUnseal: the claim is durable before the barrier can encrypt; a failing persister leaves it sealed.
 func TestFenceClaimFailureAbortsUnseal(t *testing.T) {
 	captureLogs(t)
 	store := bootstrapFenced(t, 108)

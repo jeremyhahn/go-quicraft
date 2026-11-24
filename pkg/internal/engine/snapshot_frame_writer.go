@@ -19,62 +19,13 @@ import (
 	"io"
 )
 
-// snapshotFrameWriter seals a snapshot into barrier frames AS IT IS WRITTEN.
-//
-// # Why a writer and not another loop
-//
-// The frame layout — `[4-byte LE length][AEAD frame]` per
-// snapshotEncryptChunkSize chunk, each frame bound to (shardID, replicaID,
-// index), its 0-based ordinal, and whether it is the last — has to be produced
-// identically by every path that writes an artifact, because every path's
-// output is read back by the same decrypt side (OpenSnapshotFrames). This is
-// the one implementation: the local save path drives it directly, and every
-// other writer, in this package and the host's, goes through
-// SealSnapshotFrames.
-//
-// # The terminal frame
-//
-// Exactly one frame is sealed as the last (SnapshotAAD's Final flag), which is
-// what lets the reader detect tail truncation. A full chunk is therefore NOT
-// emitted the moment it fills: it is held until more plaintext arrives, which
-// proves it is not the last, or until Close, which proves it is. Close always
-// emits a terminal frame — an empty one if the plaintext was empty or ended on
-// a chunk boundary already emitted — so every sealed artifact has one, and a
-// reader can refuse an artifact truncated to nothing.
-//
-// # Why the save path streams through it
-//
-// The local save path cannot use a write-then-encrypt form without leaving a
-// window. Writing the state machine to the canonical snapshot.dat in the
-// clear, fsyncing it, and encrypting in place afterwards leaves a COMPLETE
-// PLAINTEXT STATE MACHINE durable between the plaintext fsync and the rename,
-// under the name every consumer, backup and operator reads — hundreds of
-// milliseconds under load, and permanent if the process is killed in the
-// window, because the directory is then left with no snapshot.meta and the
-// in-process discard guard never runs.
-//
-// A writer removes the window rather than narrowing it: no plaintext is ever
-// handed to the file. The bytes reach the barrier before they reach the disk.
-//
-// # Ordering with compression
-//
-// The caller chains state machine -> snappy -> snapshotFrameWriter -> file.
-// Compression happens BEFORE sealing, because ciphertext does not compress.
-//
-// # Not safe for concurrent use
-//
-// One save writes one artifact from one goroutine. The barrier underneath is
-// concurrency-safe and may rotate mid-artifact, which is exactly why the epoch
-// bookkeeping below tracks a minimum and pins every epoch it seals under.
+// snapshotFrameWriter seals a snapshot into length-prefixed AEAD frames as it is written, with exactly one terminal frame; not safe for concurrent use.
 type snapshotFrameWriter struct {
 	dst  io.Writer
 	pins *epochPinner
 	aad  *SnapshotAAD
 
-	// buf accumulates plaintext until it holds a full chunk. A full chunk is
-	// emitted when more plaintext arrives (it is then known not to be the
-	// last) and the remainder on Close as the terminal frame, so the chunking
-	// does not depend on how the state machine happens to size its writes.
+	// buf holds plaintext until a full chunk; the remainder is the terminal frame.
 	buf []byte
 	n   int
 
@@ -86,11 +37,7 @@ type snapshotFrameWriter struct {
 	closed bool
 }
 
-// newSnapshotFrameWriter returns a writer that seals into dst under barrier.
-//
-// barrier MUST NOT be nil: a nil barrier is the configured plaintext
-// deployment, and the caller writes to the file directly in that case rather
-// than routing through a sealing writer that has nothing to seal with.
+// newSnapshotFrameWriter returns a writer sealing into dst under barrier, which must not be nil.
 func newSnapshotFrameWriter(
 	dst io.Writer,
 	barrier SnapshotBarrier,
@@ -104,11 +51,7 @@ func newSnapshotFrameWriter(
 	}
 }
 
-// Write accepts plaintext, sealing and emitting the held full chunk each time
-// more plaintext arrives behind it.
-//
-// It reports the number of plaintext bytes consumed, so it satisfies io.Writer
-// for a state machine that knows nothing about framing.
+// Write accepts plaintext, emitting the held full chunk when more arrives, and reports bytes consumed.
 func (w *snapshotFrameWriter) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
@@ -134,11 +77,7 @@ func (w *snapshotFrameWriter) Write(p []byte) (int, error) {
 	return consumed, nil
 }
 
-// Close emits the terminal frame: whatever plaintext is held, which may be a
-// full chunk, a partial one, or nothing. It does NOT close dst: the caller
-// owns the file and still has to fsync it.
-//
-// Close is idempotent so a deferred Close after an explicit one is harmless.
+// Close emits the terminal frame; it does not close dst and is idempotent.
 func (w *snapshotFrameWriter) Close() error {
 	if w.err != nil {
 		return w.err
@@ -150,13 +89,7 @@ func (w *snapshotFrameWriter) Close() error {
 	return w.emit(true)
 }
 
-// emit seals the buffered plaintext as one frame and writes it. final marks the
-// artifact's terminal frame.
-//
-// On any failure it releases every epoch pinned so far and latches the error,
-// so a caller that keeps writing gets the FIRST failure rather than a later,
-// less informative one — and so the pins cannot be leaked by a caller that
-// abandons the writer on error.
+// emit seals the buffered plaintext as one frame; on failure it releases every pin and latches the first error.
 func (w *snapshotFrameWriter) emit(final bool) error {
 	ct, epoch, err := w.pins.sealFrame(w.buf[:w.n], w.aad.Frame(w.seq, final))
 	if err != nil {
@@ -186,24 +119,10 @@ func (w *snapshotFrameWriter) fail(err error) error {
 	return err
 }
 
-// ReleasePins releases every epoch this writer pinned.
-//
-// The writer releases them itself on a sealing or write failure. This is for
-// the caller's own failures — a read error on the source it was copying from,
-// say — where the pins are still held and the artifact is being abandoned.
+// ReleasePins releases every epoch this writer pinned, for a caller abandoning the artifact.
 func (w *snapshotFrameWriter) ReleasePins() { w.pins.releaseAll() }
 
-// MinEpoch is the LOWEST epoch any frame was sealed under, which is the value
-// the artifact records.
-//
-// A rotation can land between frames, so an artifact can span epochs E and
-// E+1; each frame carries its own epoch in its header and decrypts correctly
-// on its own, but the single recorded epoch has to be the minimum or the
-// DEK-purge floor can drop a key a retained frame still needs.
-//
-// It is 0 until a frame has been sealed — before Close for an artifact that
-// never filled a chunk, and after a failure. A closed writer has sealed at
-// least the terminal frame, so its MinEpoch is the recorded epoch.
+// MinEpoch is the lowest epoch any frame was sealed under, the artifact's recorded epoch; 0 until a frame is sealed.
 func (w *snapshotFrameWriter) MinEpoch() uint64 { return w.minEpoch }
 
 // Epochs is every epoch a frame was sealed under, for the caller to hold
@@ -215,16 +134,7 @@ func (w *snapshotFrameWriter) Epochs() []uint64 { return w.pins.epochs() }
 // size before sealing, which is what MaxSnapshotSize is measured against.
 func (w *snapshotFrameWriter) PlaintextBytes() int64 { return w.plain }
 
-// SealSnapshotFrames seals everything src yields into dst as one snapshot
-// artifact: the frames the local save path writes, terminal frame included.
-// It is the form for a caller that has the plaintext as a stream rather than
-// writing it piecemeal — re-encryption on receipt, import, the host's
-// re-encrypt path.
-//
-// It returns the artifact's recorded (minimum) epoch and every epoch a frame
-// was sealed under, pinned, for the caller to release once the recorded epoch
-// is durable. On any failure it releases the pins itself and returns 0 and
-// nil, so a caller never has to tell which pins a failed seal took.
+// SealSnapshotFrames seals src into dst as one artifact and returns the minimum epoch and the pinned epochs; on failure it returns 0 and nil.
 func SealSnapshotFrames(barrier SnapshotBarrier, shardID, replicaID, index uint64,
 	src io.Reader, dst io.Writer) (uint64, []uint64, error) {
 	w := newSnapshotFrameWriter(dst, barrier, shardID, replicaID, index)

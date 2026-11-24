@@ -36,15 +36,7 @@ import (
 // Session limits: MaxTotalSessions and MaxResponsesPerSession are not transposed
 // ---------------------------------------------------------------------------
 
-// TestStartShard_SessionLimitsAreNotTransposed pins the argument ORDER of
-// rsm.NewStateMachine, which is invisible at the call site because both limits
-// are uint64.
-//
-// The transposed wiring capped a shard at MaxResponsesPerSession concurrent
-// sessions (default 128 instead of 16384) while letting a single client pin
-// MaxTotalSessions cached results. The limits are chosen so each one fails a
-// different assertion: with the arguments swapped the THIRD NewSession is
-// rejected and MaxResponses reports 3.
+// TestStartShard_SessionLimitsAreNotTransposed pins the argument order of the two uint64 session limits in rsm.NewStateMachine.
 func TestStartShard_SessionLimitsAreNotTransposed(t *testing.T) {
 	h := newTestHost(t)
 
@@ -141,8 +133,7 @@ func TestResolveRecoveredTerm(t *testing.T) {
 	t.Run("fails closed when neither source answers", func(t *testing.T) {
 		h := newTestHost(t)
 		lr := logdb.NewLogReader(shardID, replicaID, h.logdb)
-		// A snapshot at a DIFFERENT index carries a term that does not belong
-		// to the recovered state, so it must not be adopted.
+		// A snapshot at a different index carries an unrelated term and must not be adopted.
 		if err := h.logdb.SaveSnapshot(shardID, replicaID, logdb.Snapshot{
 			Index: 11,
 			Term:  9,
@@ -183,11 +174,7 @@ func (f statFailFS) Stat(name string) (fs.FileInfo, error) {
 
 var _ snapshotFS = statFailFS{}
 
-// TestRecoverLogReader_StatFailureFailsClosed asserts that a snapshot record
-// whose artifact cannot be measured stops recovery instead of producing a
-// LogReader snapshot with an EMPTY Filepath. An empty Filepath is how the send
-// path recognises the one legitimate metadata-only snapshot, so the fail-open
-// turned an unreadable artifact into a follower-state eraser.
+// TestRecoverLogReader_StatFailureFailsClosed checks an unmeasurable artifact stops recovery instead of producing an empty Filepath.
 func TestRecoverLogReader_StatFailureFailsClosed(t *testing.T) {
 	const shardID, replicaID uint64 = 4, 2
 
@@ -268,17 +255,7 @@ func TestImportSnapshot_StatFailureFailsClosed(t *testing.T) {
 	}
 }
 
-// TestRecoverLogReader_MissingArtifactStillRecordsThePath is the regression
-// test for the follower-wiping path.
-//
-// A snapshot record whose snapshot.dat is ABSENT must still recover as "a
-// snapshot with a data file". Clearing Filepath instead produced
-// {Index: N, Filepath: "", FileSize: 0}, and an EMPTY Filepath is how the send
-// path recognises the one legitimate metadata-only transfer: raft.sendSnapshot
-// took it straight from raftLog.snapshot() and forEachSnapshotChunk emitted a
-// single empty chunk, erasing the state of every follower this replica streamed
-// to. StartShard's deliberate tolerance of a compacted-away artifact for an
-// on-disk state machine must not leak into the send path.
+// TestRecoverLogReader_MissingArtifactStillRecordsThePath checks a missing snapshot.dat still recovers with its Filepath, so the send path never ships an empty snapshot.
 func TestRecoverLogReader_MissingArtifactStillRecordsThePath(t *testing.T) {
 	const shardID, replicaID uint64 = 9, 4
 
@@ -310,7 +287,7 @@ func TestRecoverLogReader_MissingArtifactStillRecordsThePath(t *testing.T) {
 			"the metadata-only marker the send path acts on", snap.Filepath, want)
 	}
 
-	// The send path must now FAIL rather than ship an empty chunk.
+	// The send path must fail rather than ship an empty chunk.
 	msg := proto.Message{
 		Type:      proto.InstallSnapshot,
 		ShardID:   shardID,
@@ -338,15 +315,7 @@ func TestRecoverLogReader_MissingArtifactStillRecordsThePath(t *testing.T) {
 	}
 }
 
-// TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit asserts that an on-disk
-// state machine whose Open() reports an applied index PAST the recovered
-// HardState.Commit still starts.
-//
-// That is a lost state fsync, and SetProcessedIndex exists precisely to rescue
-// it by clamping to the commit index. Resolving the recovered TERM against the
-// raw (unclamped) index instead bricked the node — the index is by definition
-// absent from the log, so the fail-closed term lookup rejected the start — and
-// paired the clamped index with the unclamped index's term besides.
+// TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit checks a state machine applied past the recovered commit still starts, clamped to the commit index.
 func TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -383,16 +352,7 @@ func TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit(t *testing.T) {
 			"recovered commit index; the clamp exists to rescue exactly this: %v", startErr)
 	}
 
-	// The markers adopt the CLAMPED index, and the term recorded beside it is
-	// that index's term. The one-replica shard then elects itself and applies
-	// its no-op at index 51 in a new term, which may land before the reads
-	// below, so the markers are (50, 4) or the new leader's first entry
-	// (51, term > 4); anything else means the clamp is wrong.
-	//
-	// The apply path stores ns.lastApplied (in OnApplied) before the engine's
-	// lastAppliedTerm, so the term is read first: a term past 4 then
-	// guarantees ns.lastApplied already shows 51, and a term of 4 allows an
-	// index of 50, or 51 when the no-op's apply is between the two stores.
+	// Markers are the clamped (50, 4) or the new leader's no-op (51, term > 4); the term is read first because it is stored last.
 	ns := testLoadNode(h, 1)
 	engNode := h.engine.GetNode(1)
 	if engNode == nil {
@@ -416,13 +376,7 @@ func TestStartShard_OnDiskSM_AppliedIndexOutrunsCommit(t *testing.T) {
 // Deadline-less pending requests must still be sweepable
 // ---------------------------------------------------------------------------
 
-// TestPendingRequests_DeadlinelessContextIsClamped asserts that a request
-// registered under a context with NO deadline still carries one.
-//
-// The sweeper skips zero deadlines by design, so a zero-deadline entry was
-// never reclaimed: its RequestState never returned to the pool and pendingOps
-// never fell back to zero, which made EVERY later Drain() burn the full
-// ShutdownTimeout and return ErrShutdownTimeout.
+// TestPendingRequests_DeadlinelessContextIsClamped checks a request without a deadline is given one, so the sweeper reclaims it.
 func TestPendingRequests_DeadlinelessContextIsClamped(t *testing.T) {
 	h := newTestHost(t)
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,
@@ -445,11 +399,7 @@ func TestPendingRequests_DeadlinelessContextIsClamped(t *testing.T) {
 		t.Fatal("a proposal made with context.Background() carries no deadline, " +
 			"so the sweeper can never reclaim it")
 	}
-	// The bound must be TIGHT. [before, after+timeout] admits any deadline at
-	// all, including one a nanosecond out, so only the IsZero check above would
-	// be doing work: the clamp is applied at registration, which happened
-	// between before and after, so the deadline lies in
-	// [before+timeout, after+timeout].
+	// The clamp is applied at registration, so the deadline lies in [before+timeout, after+timeout].
 	if deadline.Before(before.Add(defaultPendingRequestTimeout)) ||
 		deadline.After(after.Add(defaultPendingRequestTimeout)) {
 		t.Errorf("deadline %v is not %v from the registration instant (call spanned %v..%v)",
@@ -475,9 +425,7 @@ func TestPendingRequests_DeadlinelessContextIsClamped(t *testing.T) {
 		t.Error("ReadIndex registered a zero deadline for a deadline-less context")
 	}
 
-	// A snapshot gets the SNAPSHOT backstop, not the commit-path one. Reusing
-	// the 5-minute bound expires a caller whose multi-gigabyte state machine is
-	// still serializing, and the retry then hits ErrSnapshotInProgress.
+	// A snapshot gets the snapshot backstop, not the commit-path one.
 	snapBefore := time.Now()
 	snapRS, err := h.RequestSnapshot(context.Background(), 1, SnapshotOption{})
 	if err != nil {
@@ -600,11 +548,7 @@ func TestNodeStateLeaderAndTerm_NeverTorn(t *testing.T) {
 // A pooled read buffer must not hold the state machine read guard
 // ---------------------------------------------------------------------------
 
-// TestStaleReadBuf_UnreleasedBufferDoesNotBlockClose asserts that an
-// application that never calls release() cannot wedge the shard. The buffer is
-// a COPY (the sm.NALookupInto contract), so holding the rsm read guard for its
-// lifetime bought nothing while letting APPLICATION code block Close — and,
-// once Close queued as a writer, every subsequent Lookup behind it.
+// TestStaleReadBuf_UnreleasedBufferDoesNotBlockClose checks an unreleased read buffer, which is a copy, cannot block Close.
 func TestStaleReadBuf_UnreleasedBufferDoesNotBlockClose(t *testing.T) {
 	want := []byte("pooled-value")
 	backing := &bufLookupSM{values: map[string][]byte{"k": want}}
@@ -684,15 +628,7 @@ func TestStaleReadBuf_DoubleReleaseIsIdempotent(t *testing.T) {
 // StartShard racing StopShard must not leave a zombie shard
 // ---------------------------------------------------------------------------
 
-// TestStartShard_RacingStopShardLeavesNoZombie drives the window between
-// StartShard's publication into h.nodes and its LoadNode into the engine.
-//
-// A StopShard landing there finds the engine holding nothing, so its
-// UnloadNode is a no-op: StartShard then published a node into the LIVE engine
-// backed by an already-closed state machine, absent from h.nodes and therefore
-// unremovable by any later StopShard or Close. The invariant asserted after
-// every iteration is that a shard the Host does not know about is not loaded in
-// the engine either.
+// TestStartShard_RacingStopShardLeavesNoZombie checks a StopShard between publication and LoadNode leaves no shard loaded that the Host does not know.
 func TestStartShard_RacingStopShardLeavesNoZombie(t *testing.T) {
 	h := newTestHost(t)
 	members := map[uint64]string{1: "127.0.0.1:5000"}
@@ -707,14 +643,7 @@ func TestStartShard_RacingStopShardLeavesNoZombie(t *testing.T) {
 			_ = h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1))
 		}()
 		go func() {
-			// Launched together, StopShard always LOSES this race: StartShard's
-			// pre-publication work (NewStateMachine, Open, recoverLogReader,
-			// NewPeer) runs first, so the stop returns ErrShardNotFound before
-			// h.nodes is ever populated and the test passes against the unfixed
-			// code every run. A fixed sleep cannot find the window either — it
-			// is the handful of microseconds between the h.nodes publication and
-			// LoadNode. Watch for the publication instead and stop the instant
-			// it lands, which targets that window directly.
+			// Stop the instant the shard is published in h.nodes, which targets the window before LoadNode.
 			defer wg.Done()
 			for {
 				if _, ok := h.nodes.Load(uint64(1)); ok {

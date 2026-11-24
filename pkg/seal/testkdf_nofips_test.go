@@ -23,14 +23,7 @@ import (
 	"testing"
 )
 
-// newTestStrategy returns a SoftwareStrategy wrapped with the cheapest KDF this
-// build supports, so tests that need *a* working strategy do not each hard-code
-// one. Argon2id here; PBKDF2-SHA256 in a build with -tags fips, which has no
-// Argon2id compiled in (see kdf_argon2.go).
-//
-// The work factors are far below the production floor and rely on the bypass
-// TestMain installs. Tests that are ABOUT a specific KDF must name it directly
-// rather than go through this helper.
+// newTestStrategy returns a SoftwareStrategy with the cheapest KDF this build has (Argon2id; PBKDF2-SHA256 under -tags fips), relying on TestMain's work-factor bypass.
 func newTestStrategy(passphrase []byte) (*SoftwareStrategy, error) {
 	return NewSoftwareStrategyWithParams(context.Background(), passphrase, 1, 64*1024, 1)
 }
@@ -77,11 +70,7 @@ func assertArgon2idRefusedUnderFIPS(t *testing.T, pass, salt []byte) {
 	}
 }
 
-// assertV2SeparatesSameKeySizeAlgorithms pins that the HKDFV2 info string
-// separates two algorithms of the SAME key length. ChaCha20-Poly1305 and
-// AES-256-GCM are both 32-byte keys, so under v1 — whose info omits the
-// algorithm — they would derive the identical DEK and be used as keys for two
-// different primitives.
+// assertV2SeparatesSameKeySizeAlgorithms: the HKDFV2 info string separates ChaCha20-Poly1305 and AES-256-GCM, both 32-byte keys.
 func assertV2SeparatesSameKeySizeAlgorithms(t *testing.T, rootKey, salt, aes256DEK []byte) {
 	t.Helper()
 	chacha, err := deriveDEK(rootKey, salt, 7, 3, AlgChaCha20Poly1305, HKDFV2)
@@ -93,10 +82,7 @@ func assertV2SeparatesSameKeySizeAlgorithms(t *testing.T, rootKey, salt, aes256D
 	}
 }
 
-// assertChaChaRefusedUnderFIPS pins how a normal build refuses the ChaCha20
-// family once FIPS mode is requested at runtime: the algorithms are compiled
-// in and registered, so the refusal is a POLICY decision reported as
-// ErrAlgorithmNotFIPSApproved.
+// assertChaChaRefusedUnderFIPS: in a normal build, runtime FIPS mode refuses ChaCha20 with ErrAlgorithmNotFIPSApproved.
 func assertChaChaRefusedUnderFIPS(t *testing.T) {
 	t.Helper()
 	for _, alg := range []SymmetricAlgorithm{AlgChaCha20Poly1305, AlgXChaCha20Poly1305} {

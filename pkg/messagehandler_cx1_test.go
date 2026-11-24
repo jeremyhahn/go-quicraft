@@ -40,8 +40,7 @@ func (c *capturingEngineDeliverer) DeliverMessage(shardID uint64, msg proto.Mess
 	return c.engineDeliverer.DeliverMessage(shardID, msg)
 }
 
-// DeliverLocal captures the IN-PROCESS injection path, which is the one the
-// snapshot receive path uses for InstallSnapshot (deliverSnapshotControl).
+// DeliverLocal captures the in-process path the snapshot receive uses for InstallSnapshot.
 func (c *capturingEngineDeliverer) DeliverLocal(shardID uint64, msg proto.Message) bool {
 	c.mu.Lock()
 	c.delivered = append(c.delivered, msg)
@@ -83,13 +82,7 @@ func (c *capturingEngineDeliverer) installSnapshotEpoch() (uint64, bool) {
 	return 0, false
 }
 
-// TestHandleSnapshot_DeliversReceiverAtRestEpoch is the CX1 regression test.
-// When the receiver has a barrier, the inbound snapshot is re-encrypted at rest
-// under that barrier (recvEpoch != 0) and that epoch is persisted to LogDB. The
-// InstallSnapshot delivered to raft MUST carry the SAME at-rest epoch, not the
-// wire epoch (0). Otherwise the in-memory raft layer advertises the encrypted
-// on-disk snapshot as plaintext, and if this node later becomes leader it
-// streams ciphertext that followers cannot recover.
+// TestHandleSnapshot_DeliversReceiverAtRestEpoch verifies the InstallSnapshot carries the receiver's at-rest epoch persisted to LogDB.
 func TestHandleSnapshot_DeliversReceiverAtRestEpoch(t *testing.T) {
 	nodeHostDir := t.TempDir()
 	cfg := config.HostConfig{
@@ -146,7 +139,7 @@ func TestHandleSnapshot_DeliversReceiverAtRestEpoch(t *testing.T) {
 		t.Fatalf("LogDB snapshot epoch = %d, want %d (receiver at-rest epoch)", ss.Epoch, wantEpoch)
 	}
 
-	// The InstallSnapshot delivered to raft MUST carry the SAME at-rest epoch.
+	// The InstallSnapshot delivered to raft carries the same at-rest epoch.
 	gotEpoch, ok := capEng.installSnapshotEpoch()
 	if !ok {
 		t.Fatal("no InstallSnapshot was delivered to the engine")

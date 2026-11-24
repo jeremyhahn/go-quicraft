@@ -39,15 +39,7 @@ func (a *logReaderAdapter) GetRange() (uint64, uint64) {
 	return a.reader.IndexRange()
 }
 
-// NodeState returns the last log index and current term.
-//
-// The current term is read from the live Raft peer through currentTerm: a
-// term can advance without a log append (a follower with a term-2 log that
-// accepts a term-3 heartbeat is at term 3), so neither the log tail nor the
-// reader's persisted state, recorded at bootstrap and restart only, can be
-// relied on alone. The larger of the peer's term and the log-derived term
-// (the larger of the persisted term and the last entry's term) is reported;
-// with no currentTerm the log-derived term is reported.
+// NodeState returns the last log index and the larger of the live peer's term and the log-derived term.
 func (a *logReaderAdapter) NodeState() (uint64, uint64) {
 	_, lastIndex := a.reader.IndexRange()
 	state, _ := a.reader.NodeState()

@@ -1,28 +1,4 @@
-# nightly-template: v1.9 (customized)
-# v1.9 (2026-10-31, Company Agent m1804, ci-template v1.30 fix 2): a
-# `lint-sweeps` job runs the repository's `make -k lint-sweeps` in its
-# toolchain image, nightly and on dispatch only, when the Makefile (or a
-# tracked *.mk) defines the target; without one it prints OK and passes. A
-# repository's lint sweeps never run in ci.yml: go-qrdb's ran in its PR lint
-# job at a 72-hour p95 of 87 minutes. It runs on ubuntu-latest and needs the
-# scripts ci.yml ships (in-toolchain-image.sh, ci-image-cache.sh,
-# trim-ci-caches.sh). timeout-minutes is CUSTOMIZE, ceil(1.5 x the 72-hour p95).
-# >>> CUSTOMIZE (go-quicraft): this file adopts the v1.9 lint-sweeps job only.
-# Its fips job and the template's trivy job are not taken: FIPS runs in
-# ci.yml's full tier, where CI Gate checks it (#293). The schedule is taken
-# (#1198).
-# <<< CUSTOMIZE
-#
-# Nightly jobs that verify slow-moving properties: lint sweeps, Trivy and
-# dependency freshness. They gate no merge.
-#
-# Schedule (#1198): the owner's order of 2026-11-22, verbatim: "the nightlys
-# shouldnt require any manual executiion, it should be getting run
-# automatically!" It supersedes the 2026-10-11 dispatch-only rule (#293) for
-# this workflow only. The nightly runs daily at `5 5 * * *` (05:05 UTC) and
-# can still be dispatched by hand.
-#
-# The FIPS job moved to ci.yml's full tier (#293), where CI Gate checks it.
+# Nightly checks that gate no merge: lint sweeps, Trivy and dependency freshness; runs daily at 05:05 UTC and on dispatch.
 
 name: Nightly
 
@@ -37,8 +13,7 @@ env:
   GOWORK: "off"
 
 jobs:
-  # v1.9: the repository's lint sweeps (whole-tree, slow lint passes beside
-  # `make lint`), off every push and PR path (ci-standard.md §12).
+  # Whole-tree lint sweeps, kept off every push and PR path.
   lint-sweeps:
     name: Lint sweeps [toolchain image]
     runs-on: ubuntu-latest
@@ -108,19 +83,14 @@ jobs:
     timeout-minutes: 60
     name: Trivy
     runs-on: ubuntu-latest
-    # The SARIF upload writes a code scanning analysis; the default token is
-    # read-only, so the first scheduled run failed the upload step with
-    # "Resource not accessible by integration".
+    # The SARIF upload writes a code scanning analysis, which the read-only default token cannot.
     permissions:
       contents: read
       security-events: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      # Benchmark harnesses (test/performance/*), examples and contrib adapters
-      # are excluded; none ship in a release. Do not image-scan the
-      # .devcontainer image here: its base-OS and toolchain CVEs are not
-      # findings in this source tree.
+      # Benchmarks, examples, contrib adapters and the devcontainer image ship in no release and are not scanned.
       - name: Trivy scan (SARIF for code scanning)
         # trivy-action fetches aquasecurity/trivy from github.com with the
         # runner token, which only works on GitHub.

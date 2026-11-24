@@ -162,13 +162,7 @@ func (r *stopAfterReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// TestSnapshotReceiverStopDuringReceive covers the two points a transport
-// shutdown can interrupt an inbound snapshot: at admission, and part-way
-// through the chunk stream.
-//
-// Both must be observable and must consume nothing: an unobserved refusal
-// leaves the sender waiting out its ack timeout, and a leaked concurrency slot
-// or memory reservation is permanent for the life of the process.
+// TestSnapshotReceiverStopDuringReceive checks shutdown at admission or mid-stream is observable and leaks no slot or memory.
 func TestSnapshotReceiverStopDuringReceive(t *testing.T) {
 	t.Run("shutdown before admission", func(t *testing.T) {
 		handler := newTestHandler()
@@ -911,10 +905,7 @@ func TestSendSnapshot_ShutdownCancelsStreamOpen(t *testing.T) {
 		t.Fatal("Stop() blocked too long; snapshot stream not cancelled by shutdownCtx")
 	}
 
-	// SendSnapshot must RETURN. Its result is deliberately not asserted:
-	// racing the tracker shutdown it may finish cleanly, and it may equally
-	// fail with a cancelled context or a closed stream. The property under
-	// test is that it does not stay parked past Stop().
+	// SendSnapshot must return after Stop; its result may be either.
 	select {
 	case <-sendDone:
 	case <-time.After(5 * time.Second):
@@ -1057,22 +1048,7 @@ func buildRawFrame(t *testing.T, payload []byte) []byte {
 	return buf.Bytes()
 }
 
-// TestReceiveChunks_MemoryBudgetExceeded covers the host-wide receive memory
-// budget and, critically, the RESTORE on every rejection path.
-//
-// The budget is a host-global atomic shared by all concurrent inbound
-// snapshots. Each accepted chunk reserves its wire bytes plus the retained
-// SnapshotChunk header; every path that abandons a chunk must give that
-// reservation back. A single missed restore is not a transient error — the
-// budget never recovers, and once it is exhausted the host rejects EVERY
-// inbound snapshot from then on, so no lagging follower can ever be caught up
-// again.
-//
-// The budget-exhausted case deliberately reserves the budget FIRST, then sends
-// a transfer that is tiny in absolute terms. That distinguishes the host-global
-// admission check from the per-receive cap: a single small transfer never trips
-// the per-receive cap, so if the global check is removed the chunk is admitted
-// and committed and this test fails.
+// TestReceiveChunks_MemoryBudgetExceeded checks the host-wide receive budget is enforced and restored on every rejection path.
 func TestReceiveChunks_MemoryBudgetExceeded(t *testing.T) {
 	const maxMemory = int64(1 << 20)
 
@@ -1184,15 +1160,7 @@ func TestReceiveChunks_MemoryBudgetExceeded(t *testing.T) {
 // receiveChunks initial slice capacity cap
 // ---------------------------------------------------------------------------
 
-// TestReceiveChunks_LargeChunkCountInitCapCapped verifies that the accumulator
-// slice is pre-allocated from maxInitialChunkCap, not from the peer-declared
-// ChunkCount. The header is attacker-controlled and is read before a single
-// chunk has been admitted or charged against the memory budget, so sizing the
-// allocation from it lets one frame commit hundreds of megabytes.
-//
-// The assertion is on bytes actually allocated by the call: a declared count of
-// 1<<20 would pre-allocate 1<<20 * sizeof(SnapshotChunk) if uncapped, orders of
-// magnitude above the ceiling asserted here.
+// TestReceiveChunks_LargeChunkCountInitCapCapped checks the accumulator is sized from maxInitialChunkCap, not the declared ChunkCount.
 func TestReceiveChunks_LargeChunkCountInitCapCapped(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<30, 0, 42, handler)
@@ -1342,12 +1310,7 @@ func TestReceiveChunks_WithEventListener(t *testing.T) {
 // same IP are rejected. This exercises the tryAcquire failure path
 // at recv.go:180-191.
 
-// TestReceiveChunks_HandleSnapshotError verifies that a complete transfer whose
-// handler REJECTS the snapshot is not reported as received. HandleSnapshot is
-// what actually persists the snapshot; if it fails, firing OnSnapshotReceived or
-// the snapshots-received counter tells the operator (and any listener driving
-// recovery bookkeeping) that a snapshot landed when nothing did. The budget must
-// still be returned in full on this path.
+// TestReceiveChunks_HandleSnapshotError checks a handler-rejected transfer is not reported received and returns its budget.
 func TestReceiveChunks_HandleSnapshotError(t *testing.T) {
 	handler := &errorSnapshotHandler{}
 	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
@@ -1579,16 +1542,7 @@ func TestReceiveChunks_MemoryBudgetExceededPerReceive(t *testing.T) {
 // that cleanStaleConnections fires the OnConnectionFailed event for dead
 // connections.
 
-// TestReceiveSnapshot_ShutdownTrackerRejectsNew exercises the shutdown-tracker
-// admission check in receiveSnapshot itself. That check is what makes Stop()
-// safe: TryAdd and the tracker's WaitGroup.Wait are atomic with respect to each
-// other, so a receive admitted after shutdown began could still be running when
-// Stop() tears the connections down.
-//
-// The branch runs before the stream is ever touched, so a nil *quic.Stream is
-// sufficient to reach it — and is also the proof: if the rejection did not
-// return early, receiveChunks would dereference the nil stream on the first
-// declared chunk.
+// TestReceiveSnapshot_ShutdownTrackerRejectsNew checks receiveSnapshot refuses after shutdown before touching the stream.
 func TestReceiveSnapshot_ShutdownTrackerRejectsNew(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
@@ -1666,13 +1620,7 @@ func (h *refusingAuthHandler) AuthorizeSnapshot(shardID, replicaID, from, index 
 	return errors.New("sender not admitted")
 }
 
-// TestReceiveSnapshot_UnauthorizedSenderTakesNoResources: authorization used
-// to run only once the whole transfer had been buffered, so any holder of a
-// cluster certificate could hold a peer's receive slots and half the snapshot
-// memory budget for the length of a transfer. The sender is now authorized
-// from the header first: a refused one takes no slot and no memory, and the
-// stream is never read — a nil stream proves it, as receiveChunks would
-// dereference it.
+// TestReceiveSnapshot_UnauthorizedSenderTakesNoResources checks a refused sender takes no slot or memory and its stream is never read.
 func TestReceiveSnapshot_UnauthorizedSenderTakesNoResources(t *testing.T) {
 	handler := &refusingAuthHandler{testHandler: newTestHandler()}
 	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)
@@ -1828,12 +1776,7 @@ func TestReceiveChunks_WithMetricsInstrumentation(t *testing.T) {
 // getStream concurrent dedup (conn.go:288-351 non-stale path)
 // ---------------------------------------------------------------------------
 
-// TestGetStream_ConcurrentDedupReturnsCachedStream exercises the getStream
-// slow-path dedup where two goroutines race to create a stream for the
-// same target/shardID. The second goroutine finds the first's stream in
-// the shard map during the dedup check, closes its own newly opened stream,
-// and returns the existing one. This covers conn.go:288, 293-295, 296-303,
-// 343-351.
+// TestGetStream_ConcurrentDedupReturnsCachedStream checks the losing goroutine closes its stream and returns the cached one.
 
 // ---------------------------------------------------------------------------
 // getOrCreateSendQueue slow path double-check (quic.go:568-571)
@@ -1855,14 +1798,7 @@ func TestValidateChunk_DataTooLargeDirectValidation(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1024*1024, 0, 0, handler)
 
-	// Allocate a 1-byte slice but extend its length header to exceed
-	// the limit. We use a real allocation of maxSnapshotChunkDataLen+1
-	// bytes would be too expensive for a unit test. Instead, construct
-	// a slice that reports a large length using append.
-	//
-	// Actually, we need len(chunk.Data) > maxSnapshotChunkDataLen.
-	// maxSnapshotChunkDataLen is 64*1024*1024 = 67108864.
-	// A 65MB allocation is feasible for a unit test.
+	// len(chunk.Data) must exceed maxSnapshotChunkDataLen (64 MiB); a 65 MB allocation is acceptable.
 	bigData := make([]byte, maxSnapshotChunkDataLen+1)
 	chunk := &proto.SnapshotChunk{
 		BinVer:  proto.WireVersion,
@@ -2255,14 +2191,7 @@ func TestReceiveSnapshot_ConcurrencyLimitCountsRejection(t *testing.T) {
 	}
 }
 
-// TestPerPeerSnapshotMemoryDerivation pins the ceiling perPeerSnapshotMemory
-// derives, including both guards.
-//
-// The derivation is the whole of the per-peer memory control: get it wrong in
-// the loose direction and the cap is the global budget again (inert), get it
-// wrong in the tight direction and a legal chunk no longer fits (every transfer
-// refused). Neither failure is visible from a transfer-level test that happens
-// to use small chunks.
+// TestPerPeerSnapshotMemoryDerivation checks the ceiling perPeerSnapshotMemory derives, including both guards.
 func TestPerPeerSnapshotMemoryDerivation(t *testing.T) {
 	const gb = int64(1) << 30
 	cases := []struct {
@@ -2304,19 +2233,7 @@ func TestPerPeerSnapshotMemoryDerivation(t *testing.T) {
 	}
 }
 
-// TestSnapshotReceiveMemoryIsCappedPerPeer is the regression test for a peer
-// pinning the WHOLE snapshot receive budget.
-//
-// The host-global budget (1 GB by default) had no per-peer sub-limit at all:
-// the only per-receive ceiling was the global budget itself
-// ("charged > sr.maxMemory"), so one transfer from one peer could drive the
-// budget to zero and push every other peer's chunks into the exhaustion path.
-// The per-peer CONCURRENCY limit did not help — it bounds slots, not the bytes
-// a slot may hold.
-//
-// The A/B is the point: the two runs feed byte-identical frames into
-// identically configured receivers, and differ ONLY in whether the transfer is
-// attributed to a peer identity. Without a per-peer cap both succeed.
+// TestSnapshotReceiveMemoryIsCappedPerPeer checks one peer cannot take the whole receive budget, comparing identical frames with and without a peer identity.
 func TestSnapshotReceiveMemoryIsCappedPerPeer(t *testing.T) {
 	chunks := []proto.SnapshotChunk{
 		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, Index: 50, ChunkID: 0, ChunkCount: 4, ChunkSize: 8, Data: []byte("chunk-00")},
@@ -2335,9 +2252,7 @@ func TestSnapshotReceiveMemoryIsCappedPerPeer(t *testing.T) {
 		sr := newSnapshotReceiver(4, 1<<30, 0, 0, h)
 		rec := &dropRecorder{}
 		sr.metrics = rec
-		// Set the ceiling directly: the derived value is proportional to a 1 GB
-		// budget, and lowering the budget instead would make the GLOBAL cap the
-		// thing under test. Same reason the transfer-liveness bounds are fields.
+		// Set the ceiling directly so the per-peer cap, not the global one, is under test.
 		sr.maxPerPeerMemory = ceiling
 		return sr, h, rec
 	}
@@ -2346,9 +2261,7 @@ func TestSnapshotReceiveMemoryIsCappedPerPeer(t *testing.T) {
 		return &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 0, ChunkCount: uint64(len(chunks))}
 	}
 
-	// CONTROL: an unaccounted transfer (no peer identity, i.e. the unit-test
-	// path) is admitted, so the negative case below is a per-peer verdict and
-	// not a malformed fixture.
+	// Control: a transfer with no peer identity is admitted.
 	srCtl, hCtl, recCtl := newReceiver()
 	srCtl.receiveChunks(&testChunkReader{data: frames}, hdr(), "", PeerAuth{}, make(chan struct{}))
 	if n := hCtl.snapshotCount.Load(); n != 1 {
@@ -2357,8 +2270,7 @@ func TestSnapshotReceiveMemoryIsCappedPerPeer(t *testing.T) {
 			"would pass for the wrong reason", n, recCtl.rejects())
 	}
 
-	// SUBJECT: the same bytes attributed to a peer identity must stop at that
-	// peer's ceiling.
+	// Subject: the same bytes attributed to a peer stop at that peer's ceiling.
 	sr, h, rec := newReceiver()
 	before := sr.AvailableMemory()
 	sr.receiveChunks(&testChunkReader{data: frames}, hdr(), "peer-a", PeerAuth{}, make(chan struct{}))
@@ -2385,10 +2297,7 @@ func TestSnapshotReceiveMemoryIsCappedPerPeer(t *testing.T) {
 	}
 }
 
-// TestSnapshotPerPeerMemoryIsPerIdentityAndReleased verifies the two properties
-// that make the cap a FAIRNESS control rather than a global one: a second peer
-// is unaffected by the first peer's exhaustion, and a peer's charge is returned
-// when its transfer ends.
+// TestSnapshotPerPeerMemoryIsPerIdentityAndReleased checks a second peer is unaffected by the first's exhaustion and a charge is returned when a transfer ends.
 func TestSnapshotPerPeerMemoryIsPerIdentityAndReleased(t *testing.T) {
 	sr := newSnapshotReceiver(4, 1<<30, 0, 0, newTestHandler())
 	sr.maxPerPeerMemory = 100
@@ -2423,11 +2332,7 @@ func TestSnapshotPerPeerMemoryIsPerIdentityAndReleased(t *testing.T) {
 	}
 }
 
-// TestSnapshotPerPeerMemoryCapAppliesEndToEnd exercises the cap over a real
-// QUIC transfer, which is the only thing that pins the peerKey WIRING —
-// snapshotFairnessKey through receiveSnapshot into receiveChunks. A unit test
-// that calls receiveChunks with a key of its own choosing cannot tell a wired
-// key from a hardcoded empty one.
+// TestSnapshotPerPeerMemoryCapAppliesEndToEnd checks the per-peer cap over a real QUIC transfer, covering the peerKey wiring.
 func TestSnapshotPerPeerMemoryCapAppliesEndToEnd(t *testing.T) {
 	chunks := []proto.SnapshotChunk{
 		{BinVer: proto.WireVersion, ShardID: 1, ReplicaID: 2, From: 1, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 2, ChunkSize: 10, Data: []byte("chunk-0000")},
@@ -2446,11 +2351,7 @@ func TestSnapshotPerPeerMemoryCapAppliesEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewQUICTransport(receiver): %v", err)
 	}
-	// One chunk's residency: the transfer below sends two, so the second must
-	// be refused by the receiving peer's sub-budget while the 1 GB global
-	// budget is untouched. Set BEFORE Start: once the accept loop is running
-	// the receiver's fields are read by goroutines this test does not
-	// synchronise with, and a post-Start write is a data race.
+	// One chunk's residency, so the second chunk is refused; set before Start to avoid a data race.
 	t2.snapshotRecv.maxPerPeerMemory = int64(chunks[0].Size()) + snapshotChunkStructBytes
 	if err := t2.Start(); err != nil {
 		t.Fatalf("receiver Start: %v", err)
@@ -2496,12 +2397,7 @@ func TestSnapshotPerPeerMemoryCapAppliesEndToEnd(t *testing.T) {
 	}
 }
 
-// TestSnapshotReceiverRejectionDispatched verifies a receiver-side rejection
-// reaches OnSnapshotRejected through the listener dispatcher the host installs,
-// not inline on the receive goroutine. The listener blocks until released: run
-// inline it would hold the stream handler for as long as the listener chose,
-// and a listener calling StopShard from it would lack the no-engine-lock
-// guarantee every other delivery of that event has.
+// TestSnapshotReceiverRejectionDispatched checks a receiver rejection reaches OnSnapshotRejected through the listener dispatcher, not inline.
 func TestSnapshotReceiverRejectionDispatched(t *testing.T) {
 	handler := newTestHandler()
 	sr := newSnapshotReceiver(4, 1<<20, 0, 42, handler)

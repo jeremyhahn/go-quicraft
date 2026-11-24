@@ -65,15 +65,7 @@ func TestE2E_AddRemove_RoundTrip(t *testing.T) {
 	waitForNodeData(t, result.tracker, shardID, addedReplicaID, allExpected, membershipTimeout)
 	t.Logf("phase 2: all 10 entries verified on 4 nodes")
 
-	// Verify membership is 4 before removal, on every replica rather than only
-	// on the leader.
-	//
-	// Querying the leader alone is not enough. A joining node does not learn
-	// the full membership only from a snapshot: initial membership is a
-	// committed EntryInitialMembership at log index 1, and a joiner replays that entry like any other and ends up
-	// with the same configuration as everyone else. Asserting it here is what
-	// keeps that guarantee honest — if a joiner ever again comes up knowing
-	// only its own AddNode, this fails instead of being documented around.
+	// Every replica, joiners included, must see membership 4 before removal.
 	leaderIdx = cluster.findLeader(shardID)
 	if leaderIdx < 0 {
 		t.Fatalf("no leader found for membership verification")
@@ -161,10 +153,7 @@ func TestE2E_RemoveNode_ThenPropose(t *testing.T) {
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 2, membershipTimeout)
 
-	// Both survivors must agree that the shard is now two voters. This is the
-	// case where a divergent follower is most dangerous: with a 3-voter
-	// configuration still in its head, a survivor sizes quorum at 2 out of 3
-	// and would count a vote from a replica that no longer exists.
+	// Both survivors must agree the shard has two voters.
 	var survivors []uint64
 	for i := range cluster.hosts {
 		if replicaID := uint64(i + 1); replicaID != removedReplicaID {

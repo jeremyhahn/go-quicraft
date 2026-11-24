@@ -97,9 +97,7 @@ func TestGFPolyEval(t *testing.T) {
 	}
 }
 
-// TestSplitCombineRoundTripAllSubsets verifies that EVERY
-// threshold-sized subset of shares reconstructs a random secret exactly,
-// for several (threshold, total) configurations and secret sizes.
+// TestSplitCombineRoundTripAllSubsets verifies every threshold-sized subset reconstructs the secret.
 func TestSplitCombineRoundTripAllSubsets(t *testing.T) {
 	configs := []struct{ threshold, total int }{
 		{2, 2}, {2, 3}, {3, 5}, {5, 5}, {4, 7}, {5, 9},

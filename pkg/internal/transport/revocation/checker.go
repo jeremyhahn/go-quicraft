@@ -44,10 +44,7 @@ const (
 	// ModeOCSP checks only OCSP responders.
 	ModeOCSP Mode = "ocsp"
 
-	// ModeBoth consults both CRL and OCSP; a certificate reported revoked
-	// by EITHER source is treated as revoked. (Requiring both sources to
-	// agree would let a CRL-revoked certificate with a stale OCSP "good"
-	// pass — the weakest possible composition.)
+	// ModeBoth consults CRL and OCSP; revoked by either is revoked.
 	ModeBoth Mode = "both"
 
 	// ModeAny passes if either CRL or OCSP confirms revocation (default).
@@ -84,28 +81,7 @@ const (
 	// memory exhaustion from a malicious or misconfigured responder.
 	maxOCSPResponseSize = 1 << 20 // 1 MB
 
-	// ocspUnavailableTTL is the negative-cache TTL for "responder
-	// unavailable" results. When an OCSP query fails (responder down,
-	// timeout, network error), the failure is cached for this short window
-	// so a flood of reconnect handshakes does not re-query a dead responder
-	// on every connection, adding the full OCSP timeout to each handshake.
-	// It is intentionally short so the responder is retried promptly once it
-	// recovers, and far shorter than the positive-result cache TTL so a
-	// genuine revocation that the responder reports after recovery is picked
-	// up quickly. This cache only suppresses re-queries; it never turns an
-	// unavailable result into "revoked" or "good".
-	//
-	// Soft-fail tradeoff: under AllowSoftFail, a cached unavailable
-	// entry causes the peer to be accepted (status unknown). After the
-	// responder recovers and would report a cert as revoked, that revocation
-	// can go undetected for at most ocspUnavailableTTL (until the negative
-	// entry expires and the next handshake re-queries). This bounded delay is
-	// inherent to soft-fail: with no reachable responder there is by
-	// definition no fresh verdict to act on. It is NOT a masking of a verdict
-	// already known to this checker — a definitive cached "revoked" (or
-	// "good") is never overwritten by a later unavailable result (see
-	// checkOCSPRaw). Under enforcement the cached unavailable entry fails
-	// closed regardless.
+	// ocspUnavailableTTL is the short negative-cache TTL for responder failures; it only suppresses re-queries and never overwrites a definitive verdict.
 	ocspUnavailableTTL = 10 * time.Second
 
 	// revocationClockSkew is the allowance applied when comparing CRL/OCSP
@@ -113,17 +89,10 @@ const (
 	// differences between this node and the CA/responder.
 	revocationClockSkew = 5 * time.Minute
 
-	// ocspNoNextUpdateMaxAge bounds acceptance of OCSP responses that omit
-	// NextUpdate. RFC 6960 §2.4 defines an absent NextUpdate as "newer
-	// revocation information is available all the time", which gives a
-	// replayed response no expiry at all; clients must impose their own
-	// bound, so responses older than this are treated as stale.
+	// ocspNoNextUpdateMaxAge bounds the age of an OCSP response without NextUpdate (RFC 6960 2.4).
 	ocspNoNextUpdateMaxAge = 24 * time.Hour
 
-	// maxOCSPCacheEntries bounds ocspCache. Each handshake with a distinct
-	// peer serial inserts one entry, and a churning (or hostile) peer set
-	// would otherwise grow the map without limit. When full, expired
-	// entries are pruned first, then the entry closest to expiry.
+	// maxOCSPCacheEntries bounds ocspCache; when full, expired entries go first, then the one closest to expiry.
 	maxOCSPCacheEntries = 4096
 )
 
@@ -152,20 +121,7 @@ type Config struct {
 	// Mode determines the revocation checking strategy. Default: "any".
 	Mode Mode
 
-	// AllowSoftFail, when true, admits a peer whose revocation status cannot
-	// be determined (OCSP responder unreachable, CRL stale or unreadable, no
-	// revocation source configured at all). A definitive "revoked" verdict
-	// still rejects regardless of this flag.
-	//
-	// THE ZERO VALUE ENFORCES. Fail-closed is intrinsic to this package: a
-	// Config nobody configured rejects unknown status, and soft-fail has to
-	// be asked for. Every construction path — Host, an embedding of the
-	// transport, a tool, a test — therefore inherits the safe posture, rather
-	// than the posture depending on one caller remembering to set a field.
-	//
-	// The name and sense match config.RevocationConfig.AllowSoftFail, which
-	// is the operator-facing knob, so the two layers cannot drift apart
-	// through a mistaken negation.
+	// AllowSoftFail admits a peer whose revocation status is unknown; revoked still rejects. The zero value enforces.
 	AllowSoftFail bool
 
 	// OnCertRevoked is called when a certificate is found to be revoked
@@ -181,11 +137,7 @@ func (c *Config) enforcing() bool {
 	return !c.AllowSoftFail
 }
 
-// Validate reports whether the selected Mode has the sources it requires.
-// Call SetDefaults first. Without this check a mode can be silently
-// unsatisfiable: ModeBoth/ModeOCSP with no responder URL fails every
-// handshake under enforcement, and ModeCRL/ModeBoth with no CRL file
-// can never observe a file-published revocation.
+// Validate reports whether Mode has the sources it requires; call SetDefaults first.
 func (c *Config) Validate() error {
 	if !IsValidMode(c.Mode) {
 		return ErrInvalidRevocationMode
@@ -202,12 +154,7 @@ func (c *Config) Validate() error {
 			return ErrNoCRLSources
 		}
 	}
-	// ModeAny (and the empty string that selects it) names no specific source,
-	// so it is the one mode the per-mode checks above cannot catch: with
-	// nothing configured it consults nothing and reports every certificate as
-	// not revoked. Reject that only when enforcing — soft-fail is the
-	// documented opt-out for "revocation status may be unknown", which
-	// includes having no source at all.
+	// ModeAny with no source consults nothing; reject it when enforcing.
 	if (c.Mode == ModeAny || c.Mode == "") && c.enforcing() &&
 		len(c.CRLPaths) == 0 && c.OCSPResponderURL == "" {
 		return ErrNoRevocationSources
@@ -231,26 +178,14 @@ func (c *Config) SetDefaults() {
 	}
 }
 
-// ocspCacheEntry holds a cached OCSP result with expiry. It represents either
-// a definitive status (revoked true/false) or, when unavailable is true, a
-// short-lived negative cache of a responder failure so repeated handshakes do
-// not re-query a down responder. The two cases use different TTLs: definitive
-// results use OCSPCacheSeconds; unavailable results use the much shorter
-// ocspUnavailableTTL.
+// ocspCacheEntry is a cached OCSP verdict, or a short-lived responder-unavailable entry when unavailable is true.
 type ocspCacheEntry struct {
 	revoked     bool
 	unavailable bool
 	expiresAt   time.Time
 }
 
-// Checker performs certificate revocation checking using CRL files and/or
-// OCSP responders. CRL files are periodically reloaded from disk using
-// content-hash change detection for hot-reload support. OCSP responses
-// are cached with configurable TTL to avoid per-handshake HTTP calls.
-//
-// Checker is safe for concurrent use by multiple goroutines. The TLS
-// handshake path (IsRevoked) uses read locks and atomic cache lookups
-// to minimize contention with the background CRL reload goroutine.
+// Checker checks certificate revocation against reloaded CRL files and cached OCSP responses; safe for concurrent use.
 type Checker struct {
 	// mu protects revokedSet, adminRevoked, crlHashes, and crlCurrent.
 	mu         sync.RWMutex
@@ -260,48 +195,20 @@ type Checker struct {
 	// sharing it silently undid each runtime revocation at the next reload.
 	adminRevoked map[string]struct{}
 	crlHashes    map[string][32]byte // path -> SHA-256 content hash
-	// crlCurrent is true while revokedSet reflects a fully-successful
-	// load of every configured CRL file. It is false before the first
-	// successful load and after any failed reload (unreadable or
-	// unparseable file). While false, the previous set keeps serving
-	// revocations (a stale "revoked" is still trustworthy) but a
-	// not-found result cannot be trusted as "not revoked"; under
-	// enforcement that surfaces as ErrCRLStale.
+	// crlCurrent is true while revokedSet reflects a fully successful load; when false, not-found is ErrCRLStale under enforcement.
 	crlCurrent bool
-	// crlSigners holds the issuers that signed the CRLs of the last
-	// successful reload. A configured CRL file outlives the CA reload that
-	// dropped its signer, so PruneRetainedIssuers keeps a retained issuer
-	// while it is here: pruning it would leave the next ReloadCRLs unable to
-	// verify a still-configured CRL and mark the whole set stale.
+	// crlSigners holds the issuers of the last successful reload's CRLs, kept by PruneRetainedIssuers.
 	crlSigners []*x509.Certificate
 
 	// ocspMu protects ocspCache.
 	ocspMu    sync.RWMutex
 	ocspCache map[string]*ocspCacheEntry // scopedSerial(issuer, serial) -> result
 
-	// issuers holds every candidate issuing CA parsed from the configured CA
-	// bundle. A deployment with a root plus one or more issuing
-	// intermediates presents leaves signed by an intermediate, so a single
-	// hardcoded issuer (the bundle's first block) would build OCSP requests
-	// carrying the wrong issuerNameHash/issuerKeyHash and would reject every
-	// intermediate-signed CRL. The issuer is therefore selected per leaf and
-	// per CRL at check time. It is swapped whole by SetIssuers when the
-	// transport reloads its CA bundle, so readers take one snapshot per
-	// lookup and never see a half-replaced set.
+	// issuers holds every candidate issuing CA from the bundle, selected per leaf and per CRL; SetIssuers swaps it whole.
 	issuers atomic.Pointer[[]*x509.Certificate]
-	// retained holds the issuers a CA reload dropped from issuers while an
-	// established session may still present a leaf they signed. They back
-	// the revocation verdicts of those sessions only (IsRevokedEstablished
-	// and CRL signature checks), so a CA drop neither leaves the sessions
-	// unverifiable nor un-revokes them, and never back a new handshake: the
-	// handshake path resolves against the bundle of the TLS config that
-	// verified its chain (IsRevokedUnder). PruneRetainedIssuers drops an
-	// entry once no live leaf needs it.
+	// retained holds issuers a CA reload dropped, backing established sessions' verdicts only, never a new handshake.
 	retained atomic.Pointer[[]*x509.Certificate]
-	// issuerMu serializes the writers of issuers and retained, which read
-	// one set to compute the other, and ReloadCRLs, so a CRL signer cannot
-	// be pruned between its verification and its record in crlSigners.
-	// Readers take the atomics lock-free. Lock order: issuerMu before mu.
+	// issuerMu serializes writers of issuers and retained, and ReloadCRLs; lock order issuerMu before mu.
 	issuerMu       sync.Mutex
 	cfg            Config
 	httpClient     *http.Client
@@ -312,15 +219,7 @@ type Checker struct {
 	shutdownCancel context.CancelFunc
 }
 
-// NewChecker creates a new revocation checker. The issuers are the CA
-// certificates (the full trust bundle, root and intermediates) used to
-// verify OCSP responses and CRL signatures; the one that actually issued a
-// given leaf or CRL is selected at check time. Nil entries are ignored.
-//
-// The issuer list may be empty only for purely programmatic use
-// (AddRevokedSerial with no CRL files and no OCSP responder): loading a CRL
-// file requires an issuer to verify the CRL signature, and reloads fail
-// closed (stale set) without one.
+// NewChecker creates a revocation checker with the CA bundle as candidate issuers; an empty list suits only programmatic use.
 func NewChecker(cfg Config, issuers ...*x509.Certificate) *Checker {
 	cfg.SetDefaults()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -341,17 +240,7 @@ func NewChecker(cfg Config, issuers ...*x509.Certificate) *Checker {
 	return c
 }
 
-// SetIssuers replaces the candidate issuing CAs the checker selects from
-// when it builds OCSP requests and verifies CRL signatures. The transport
-// calls it when the CA bundle is reloaded, so a CRL or OCSP responder of a
-// newly trusted CA verifies. Nil entries are ignored. Revocation state
-// already loaded is kept: the next CRL reload re-verifies every file.
-//
-// An issuer the new set drops moves to the retained set rather than being
-// forgotten: sessions established under it are still live, and their
-// revocation status must stay checkable against the CA that issued them.
-// A retained issuer never resolves a new handshake (see IsRevokedUnder); it is
-// released by PruneRetainedIssuers once no live leaf needs it.
+// SetIssuers replaces the candidate issuing CAs; dropped issuers move to the retained set until PruneRetainedIssuers releases them.
 func (c *Checker) SetIssuers(issuers ...*x509.Certificate) {
 	kept := make([]*x509.Certificate, 0, len(issuers))
 	for _, issuer := range issuers {
@@ -374,12 +263,7 @@ func (c *Checker) SetIssuers(issuers ...*x509.Certificate) {
 	c.retained.Store(&retained)
 }
 
-// PruneRetainedIssuers releases every retained issuer that no certificate in
-// live was issued by. The transport passes the leaves of all its established
-// connections after each revocation sweep, so an issuer a CA reload dropped
-// is held exactly as long as a session that needs it, or as long as a
-// configured CRL file it signed: such a source retires together with its
-// issuer once a successful ReloadCRLs no longer finds a CRL it signed.
+// PruneRetainedIssuers releases retained issuers that issued no leaf in live and signed no configured CRL.
 func (c *Checker) PruneRetainedIssuers(live []*x509.Certificate) {
 	c.issuerMu.Lock()
 	defer c.issuerMu.Unlock()
@@ -428,20 +312,10 @@ func (c *Checker) retainedSet() []*x509.Certificate {
 	return nil
 }
 
-// anyIssuerScope keys revocation records that carry no issuer: the
-// programmatic AddRevokedSerial admin path. Lookups consult the leaf's own
-// issuer scope AND this one, so a hand-revoked serial stays revoked whichever
-// configured CA issued the certificate. Over-revoking fails closed; binding
-// the admin path to a single issuer it cannot name would fail open.
+// anyIssuerScope keys issuer-less AddRevokedSerial records, consulted for every leaf.
 const anyIssuerScope = "*"
 
-// issuerScope returns a stable identifier for an issuing CA: the SHA-256 of
-// its RawSubject followed by its RawSubjectPublicKeyInfo. X.509 serial numbers
-// are unique only per ISSUER, so a bundle holding several intermediates can
-// legitimately contain two certificates with the same serial; keying
-// revocation records or cached OCSP verdicts on the serial alone lets one
-// intermediate's verdict decide the other's leaf. SubjectKeyId is not used as
-// the identity: it is an optional extension chosen by whoever issued the CA.
+// issuerScope returns SHA-256 of an issuing CA's RawSubject and RawSubjectPublicKeyInfo, since serials are unique only per issuer.
 func issuerScope(issuer *x509.Certificate) string {
 	h := sha256.New()
 	h.Write(issuer.RawSubject)
@@ -465,10 +339,7 @@ func (c *Checker) scopeFor(leaf *x509.Certificate) string {
 	return anyIssuerScope
 }
 
-// issuerFor selects the configured CA that issued leaf: the candidate whose
-// key verifies the leaf's signature, falling back to an AuthorityKeyId match
-// when the signature check is inconclusive (e.g. an unsupported algorithm).
-// Returns nil when no candidate qualifies; callers fail closed.
+// issuerFor returns the configured CA that issued leaf, by signature then AuthorityKeyId, or nil.
 func (c *Checker) issuerFor(leaf *x509.Certificate) *x509.Certificate {
 	return matchIssuer(leaf, c.issuerSet())
 }
@@ -512,10 +383,7 @@ func (c *Checker) Start() {
 		return
 	}
 	err := c.ReloadCRLs()
-	// The reload loop is started before the diagnostic, which is contained:
-	// a log handler that panicked or called runtime.Goexit here left the
-	// loop unstarted, so the CRL was never loaded and a set loaded earlier
-	// never went stale.
+	// Start the reload loop before the contained diagnostic.
 	go c.reloadLoop()
 	if err != nil {
 		supervise.LogContained(func() { slog.Warn("initial CRL reload failed", "error", err) })
@@ -553,22 +421,7 @@ func (c *Checker) reloadLoop() {
 	}
 }
 
-// ReloadCRLs reads all configured CRL files, parses them, verifies each
-// CRL's signature against the issuing CA, checks freshness (NextUpdate),
-// and rebuilds the revoked serial set. This method is exported to support
-// manual refresh (e.g., from an admin API or signal handler).
-//
-// The reload is all-or-nothing: on ANY per-file failure (read, parse,
-// signature, or expiry) the previous revoked set and hashes are kept and
-// an error is returned. Replacing the full set with a partial one would
-// silently un-revoke every certificate listed in the unreadable file — a
-// transiently missing file, permission change, or NFS blip must never
-// widen access. A failed reload also marks the set as stale (see
-// crlCurrent), which enforcement surfaces as a handshake failure
-// until a reload succeeds. Because the loop re-runs every CheckInterval,
-// a CRL that passes its NextUpdate while loaded is detected within one
-// interval and the set goes stale — a frozen CRL file cannot serve an
-// ever-staler view of revocations indefinitely.
+// ReloadCRLs reloads, verifies and checks freshness of every configured CRL, all or nothing; any failure keeps the old set and marks it stale.
 func (c *Checker) ReloadCRLs() error {
 	if len(c.cfg.CRLPaths) == 0 {
 		return nil
@@ -606,10 +459,7 @@ func (c *Checker) ReloadCRLs() error {
 			c.markCRLStale()
 			return &CRLParseError{Path: path, Err: parseErr}
 		}
-		// A configured CRL file that yields zero CRL blocks must NOT commit a
-		// fresh empty revoked set: swapping a real CRL for an unrelated PEM
-		// (or a truncated file) would otherwise un-revoke everything and mark
-		// the set current, defeating fail-closed enforcement.
+		// A CRL file with no CRL blocks must not commit an empty set.
 		if len(crls) == 0 {
 			c.markCRLStale()
 			return &CRLEmptyError{Path: path}
@@ -617,12 +467,7 @@ func (c *Checker) ReloadCRLs() error {
 
 		serialCount := 0
 		for _, crl := range crls {
-			// A CRL whose signature does not verify against one of the
-			// configured issuing CAs must never replace the revoked set: a
-			// forged (or foreign) file could silently un-revoke certificates.
-			// No issuer certificate means no way to verify, which fails closed
-			// the same way. Every bundle candidate is tried because an
-			// intermediate — not the root — signs the CRL in a two-tier PKI.
+			// A CRL must verify against a configured issuing CA, trying every bundle candidate.
 			if len(c.issuerSet()) == 0 && len(c.retainedSet()) == 0 {
 				c.markCRLStale()
 				return &CRLSignatureError{Path: path, Err: ErrNoIssuerCertificate}
@@ -639,18 +484,12 @@ func (c *Checker) ReloadCRLs() error {
 				c.markCRLStale()
 				return &CRLNotYetValidError{Path: path, ThisUpdate: crl.ThisUpdate}
 			}
-			// A CRL past NextUpdate no longer proves anything about serials
-			// it does not list; mark stale so enforcement fails closed
-			// until the CA publishes a fresh CRL. (The previous revoked set
-			// is kept: a stale "revoked" remains trustworthy.)
+			// A CRL past NextUpdate marks the set stale; the old revoked set is kept.
 			if !crl.NextUpdate.IsZero() && now.After(crl.NextUpdate.Add(revocationClockSkew)) {
 				c.markCRLStale()
 				return &CRLExpiredError{Path: path, NextUpdate: crl.NextUpdate}
 			}
-			// Scope every entry to the CA that actually signed this CRL: a
-			// serial is unique only per issuer, so an unscoped entry would
-			// revoke a same-serial certificate issued by a different
-			// intermediate in the same bundle.
+			// Scope each entry to the CRL's signing CA.
 			scope := issuerScope(crlIssuer)
 			if !containsCert(signers, crlIssuer) {
 				signers = append(signers, crlIssuer)
@@ -661,10 +500,7 @@ func (c *Checker) ReloadCRLs() error {
 			}
 		}
 
-		// Log only when content changed, and only once the new set is
-		// committed below: a log handler that panicked or called
-		// runtime.Goexit here used to keep the reloaded CRL from ever
-		// taking effect.
+		// Log only on change, after the new set is committed.
 		c.mu.RLock()
 		oldHash, existed := c.crlHashes[path]
 		c.mu.RUnlock()
@@ -697,20 +533,14 @@ type reloadedCRL struct {
 	serials int
 }
 
-// markCRLStale records that the revoked set no longer reflects a
-// fully-successful load of every configured CRL file.
+// markCRLStale records that the revoked set no longer reflects a fully successful load.
 func (c *Checker) markCRLStale() {
 	c.mu.Lock()
 	c.crlCurrent = false
 	c.mu.Unlock()
 }
 
-// parseCRLs extracts parsed revocation lists from PEM-encoded CRL data.
-// Supports multiple CRL blocks in a single file. Non-CRL PEM blocks are
-// skipped, so a nil error with an empty result means the file held no CRL
-// at all; ReloadCRLs rejects that case rather than committing an empty
-// revoked set. Signature and freshness validation are also the caller's
-// responsibility (ReloadCRLs).
+// parseCRLs extracts the CRLs from PEM data, skipping other blocks; validation is the caller's.
 func parseCRLs(data []byte) ([]*x509.RevocationList, error) {
 	var crls []*x509.RevocationList
 	rest := data
@@ -732,23 +562,14 @@ func parseCRLs(data []byte) ([]*x509.RevocationList, error) {
 	return crls, nil
 }
 
-// AddRevokedSerial programmatically adds a serial number to the revoked
-// set. The serial should be a lowercase hex string. This is useful for
-// runtime revocation via admin API without modifying CRL files on disk.
-//
-// The entry is issuer-agnostic, so it revokes the serial no matter which
-// configured CA issued the certificate: the admin API names no issuer, and
-// over-revoking is the fail-closed direction. It survives CRL reloads.
+// AddRevokedSerial adds a lowercase-hex serial to the revoked set for every issuer; it survives CRL reloads.
 func (c *Checker) AddRevokedSerial(serial string) {
 	c.mu.Lock()
 	c.adminRevoked[serial] = struct{}{}
 	c.mu.Unlock()
 }
 
-// RemoveRevokedSerial programmatically removes a serial number from the
-// revoked set. This is useful for undoing a programmatic revocation. It
-// removes only the entry AddRevokedSerial created: a CRL-published revocation
-// is owned by the CA and is unaffected.
+// RemoveRevokedSerial removes a serial AddRevokedSerial added; CRL-published revocations are unaffected.
 func (c *Checker) RemoveRevokedSerial(serial string) {
 	c.mu.Lock()
 	delete(c.adminRevoked, serial)
@@ -764,23 +585,12 @@ func (c *Checker) RevokedCount() int {
 	return n
 }
 
-// IsRevoked checks whether the given certificate has been revoked.
-// Returns (true, nil) if revoked, (false, nil) if not revoked or status
-// unknown in soft-fail mode, or (false, error) if the status could not
-// be established and the config enforces (AllowSoftFail is false).
-//
-// A "revoked" verdict from ANY consulted source always wins, in every
-// mode. "Unknown" (stale CRL, unreachable OCSP responder) is governed by
-// AllowSoftFail: fail closed when enforcing, accept when soft-fail.
+// IsRevoked reports whether cert is revoked; revoked from any source wins, and unknown status errors unless AllowSoftFail.
 func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 	return c.isRevoked(cert, c.issuerFor(cert))
 }
 
-// IsRevokedEstablished is IsRevoked for the leaf of a session that is
-// already established. It resolves the issuer against the trusted set first
-// and then against the issuers a CA reload retained, so a session admitted
-// under a CA the bundle has since dropped keeps its issuer-scoped CRL entries
-// and its OCSP lookups. It must never be used to admit a new handshake.
+// IsRevokedEstablished is IsRevoked for an established session's leaf, also resolving retained issuers; never for a new handshake.
 func (c *Checker) IsRevokedEstablished(cert *x509.Certificate) (bool, error) {
 	issuer := c.issuerFor(cert)
 	if issuer == nil {
@@ -789,12 +599,7 @@ func (c *Checker) IsRevokedEstablished(cert *x509.Certificate) (bool, error) {
 	return c.isRevoked(cert, issuer)
 }
 
-// IsRevokedUnder reports whether cert is revoked, resolving its issuer in
-// issuers rather than in the checker's current set. A handshake passes the
-// CA bundle its own TLS config verified the chain against: one in flight
-// across a CA reload was verified against the bundle it started under, and
-// resolving its leaf in the replaced set would miss the issuer-scoped
-// revocations of the CA it actually chains to.
+// IsRevokedUnder reports whether cert is revoked, resolving its issuer in the bundle the handshake verified against.
 func (c *Checker) IsRevokedUnder(cert *x509.Certificate, issuers []*x509.Certificate) (bool, error) {
 	return c.isRevoked(cert, matchIssuer(cert, issuers))
 }
@@ -809,10 +614,7 @@ func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
 		scope = issuerScope(issuer)
 	}
 
-	// Dispatch only. Each mode's policy lives in its own method: the bodies
-	// differ in which sources they consult and in what a "not found" means
-	// when nothing was consulted, and inlining all four put this function over
-	// the cyclomatic limit without making any one policy easier to read.
+	// Dispatch to the per-mode policy.
 	switch c.cfg.Mode {
 	case ModeCRL:
 		return c.isRevokedCRL(scope, serial)
@@ -825,17 +627,7 @@ func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
 	}
 }
 
-// noSourceBackstop reports the missing-source failure when enforcement is on
-// and this checker holds no CRL path to consult.
-//
-// It exists because "serial not found" is only evidence of "not revoked" when
-// something was actually consulted. checkCRLStatus cannot even report
-// staleness without a path to go stale, so with no paths configured it returns
-// a clean not-found that is indistinguishable from a real answer.
-// Config.Validate rejects the combination up front; this is the runtime
-// backstop for a checker constructed without it, or whose paths were lost in a
-// refactor, so the gap surfaces as a handshake failure rather than admitting
-// every revoked certificate in silence.
+// noSourceBackstop fails an enforcing check when no CRL path is configured, since not-found then proves nothing.
 func (c *Checker) noSourceBackstop() error {
 	if len(c.cfg.CRLPaths) == 0 {
 		return ErrNoRevocationSources
@@ -874,12 +666,7 @@ func (c *Checker) revokedLocked(scope, serial string) bool {
 	return ok
 }
 
-// isRevokedOCSP consults OCSP, plus the programmatic revoked set.
-//
-// The programmatic set (AddRevokedSerial, the runtime admin revocation path) is
-// consulted in every mode; ignoring it here would make an operator-issued
-// revocation a silent no-op whenever OCSP is the selected mode. CRL staleness
-// is NOT consulted: this mode does not derive its verdict from CRL files.
+// isRevokedOCSP consults OCSP and the programmatic revoked set, not CRL staleness.
 func (c *Checker) isRevokedOCSP(cert, issuer *x509.Certificate, scope, serial string) (bool, error) {
 	c.mu.RLock()
 	revoked := c.revokedLocked(scope, serial)
@@ -890,11 +677,7 @@ func (c *Checker) isRevokedOCSP(cert, issuer *x509.Certificate, scope, serial st
 	return c.checkOCSP(cert, issuer)
 }
 
-// isRevokedBoth consults CRL and OCSP, revoked-by-either.
-//
-// Requiring agreement of both sources would let a CRL-revoked certificate
-// slide through on a stale OCSP "good". Unknown status from either source is
-// per AllowSoftFail.
+// isRevokedBoth consults CRL and OCSP, revoked by either; unknown follows AllowSoftFail.
 func (c *Checker) isRevokedBoth(cert, issuer *x509.Certificate, scope, serial string) (bool, error) {
 	crlRevoked, crlErr := c.checkCRLStatus(scope, serial)
 	if crlRevoked {
@@ -915,12 +698,7 @@ func (c *Checker) isRevokedBoth(cert, issuer *x509.Certificate, scope, serial st
 	return false, nil
 }
 
-// isRevokedAny consults whichever sources are configured.
-//
-// With a responder configured, unknown from either source fails closed under
-// enforcement: a revocation could be hiding behind the stale CRL or the
-// unreachable responder. With no responder it degenerates to the CRL policy,
-// including the missing-source backstop.
+// isRevokedAny consults the configured sources; unknown from either fails closed when enforcing.
 func (c *Checker) isRevokedAny(cert, issuer *x509.Certificate, scope, serial string) (bool, error) {
 	crlRevoked, crlErr := c.checkCRLStatus(scope, serial)
 	if crlRevoked {
@@ -960,14 +738,7 @@ func (c *Checker) isRevokedCRLTail(crlErr error) (bool, error) {
 	return false, nil
 }
 
-// checkCRLStatus tests whether the serial is in the revoked set. The
-// second return value is non-nil when a not-found result cannot be
-// trusted as "not revoked": CRL paths are configured but no fresh,
-// fully-successful load is in effect (initial load pending, or the most
-// recent reload failed). A found (revoked) result is always trustworthy,
-// even from a stale set. Enforcement policy is applied by the caller.
-// The lookup consults the leaf's own issuer scope and the issuer-agnostic
-// scope used by AddRevokedSerial.
+// checkCRLStatus looks up the serial in the leaf's issuer scope and the issuer-agnostic scope; the error is non-nil when not-found cannot be trusted.
 func (c *Checker) checkCRLStatus(scope, serial string) (bool, error) {
 	c.mu.RLock()
 	revoked := c.revokedLocked(scope, serial)
@@ -986,18 +757,7 @@ func (c *Checker) checkCRLStatus(scope, serial string) (bool, error) {
 	return false, nil
 }
 
-// checkOCSP queries the OCSP responder for the certificate's revocation
-// status, using the cache when available. When the OCSP check fails
-// (unreachable, no URL, no issuer cert), behavior depends on AllowSoftFail:
-// when unset (enforcing) it returns the error (fail closed, including on a
-// negative-cache hit); under soft-fail it returns (false, nil).
-//
-// In soft-fail mode an unavailable result accepts the peer, so a revocation
-// the responder would report only after it recovers can go undetected for at
-// most ocspUnavailableTTL. This bounded latency is inherent to soft-fail and
-// is distinct from masking a known verdict: a definitive cached "revoked" is
-// never overwritten by a later unavailable result, so checkOCSPRaw still
-// returns the revoked verdict from cache even while the responder is down.
+// checkOCSP queries OCSP through the cache; an unavailable result errors when enforcing and accepts under soft-fail.
 func (c *Checker) checkOCSP(cert, issuer *x509.Certificate) (bool, error) {
 	revoked, err := c.checkOCSPRaw(cert, issuer)
 	if err != nil {
@@ -1009,10 +769,7 @@ func (c *Checker) checkOCSP(cert, issuer *x509.Certificate) (bool, error) {
 	return revoked, nil
 }
 
-// checkOCSPRaw queries the OCSP responder without applying enforcement
-// policy. Returns the raw error on failure so callers (e.g., ModeBoth)
-// can distinguish "OCSP says good" from "OCSP is unavailable". issuer is
-// the CA the caller resolved for cert, nil when none is known.
+// checkOCSPRaw queries OCSP without enforcement policy, returning the raw error; issuer is nil when unknown.
 func (c *Checker) checkOCSPRaw(cert, issuer *x509.Certificate) (bool, error) {
 	if c.cfg.OCSPResponderURL == "" {
 		return false, &OCSPUnavailableError{
@@ -1021,20 +778,13 @@ func (c *Checker) checkOCSPRaw(cert, issuer *x509.Certificate) (bool, error) {
 		}
 	}
 
-	// The issuer is required before touching the cache: the cache key is scoped to
-	// it, because a serial identifies a certificate only together with its
-	// issuer. Without an issuer no request can be built and no verdict can be
-	// scoped, so this fails immediately rather than caching under a key that
-	// would collide across intermediates.
+	// The issuer is required first: the cache key is scoped to it.
 	if issuer == nil {
 		return false, &OCSPUnavailableError{URL: c.cfg.OCSPResponderURL, Err: ErrNoIssuerCertificate}
 	}
 	key := scopedSerial(issuerScope(issuer), cert.SerialNumber.Text(16))
 
-	// Check cache first (read lock for concurrent handshakes). A cached
-	// unavailable entry short-circuits the query so a down responder does not
-	// add its full timeout to every reconnect handshake during its negative
-	// TTL window.
+	// Check the cache first; a cached unavailable entry skips the query.
 	c.ocspMu.RLock()
 	entry, cached := c.ocspCache[key]
 	c.ocspMu.RUnlock()
@@ -1048,19 +798,7 @@ func (c *Checker) checkOCSPRaw(cert, issuer *x509.Certificate) (bool, error) {
 	// Query the OCSP responder.
 	revoked, nextUpdate, err := c.queryOCSP(cert, issuer)
 	if err != nil {
-		// Negative-cache the failure for a short window so a flood of
-		// reconnect handshakes does not re-query a dead responder. This never
-		// upgrades to "revoked" or "good"; it only suppresses re-queries.
-		//
-		// Precedence: a definitive cached verdict (revoked or good) always
-		// wins over an unavailable result, so a query failure never clobbers a
-		// revocation status this checker already determined. Without this
-		// guard, a transient responder outage occurring after a definitive
-		// "revoked" verdict would replace that entry with an unavailable one
-		// and, in soft-fail mode, cause the known-revoked peer to be accepted
-		// — masking a verdict a cheap cache lookup would otherwise produce.
-		// We therefore only write the negative entry when no unexpired
-		// definitive entry exists for this serial.
+		// Negative-cache the failure only when no unexpired definitive verdict exists for the serial.
 		c.ocspMu.Lock()
 		if existing, ok := c.ocspCache[key]; !ok || existing.unavailable || !time.Now().Before(existing.expiresAt) {
 			c.evictOCSPCacheLocked(time.Now())
@@ -1073,10 +811,7 @@ func (c *Checker) checkOCSPRaw(cert, issuer *x509.Certificate) (bool, error) {
 		return false, &OCSPUnavailableError{URL: c.cfg.OCSPResponderURL, Err: err}
 	}
 
-	// Cache the definitive result. The entry must never outlive the response
-	// that produced it: a large OCSPCacheSeconds would otherwise serve a
-	// "good" verdict past the responder's own NextUpdate, exactly the window
-	// in which a revocation is published.
+	// Cache the verdict no longer than the response's NextUpdate.
 	now := time.Now()
 	expiresAt := now.Add(time.Duration(c.cfg.OCSPCacheSeconds) * time.Second)
 	if !nextUpdate.IsZero() && nextUpdate.Before(expiresAt) {
@@ -1118,33 +853,15 @@ func (c *Checker) evictOCSPCacheLocked(now time.Time) {
 	}
 }
 
-// queryOCSP sends an OCSP request to the configured responder and parses
-// the response. issuerCert is the CA the caller selected for cert (also the
-// cache scope), so request construction and response verification cannot
-// diverge from the key the verdict is stored under. It returns whether the
-// certificate is revoked plus the response's NextUpdate (zero when absent),
-// which bounds the cache TTL. An RFC 6960 "unknown" status is returned as an
-// error, never as "not revoked".
+// queryOCSP queries the responder for cert under issuerCert, returning revoked and NextUpdate; RFC 6960 unknown is an error.
 func (c *Checker) queryOCSP(cert, issuerCert *x509.Certificate) (bool, time.Time, error) {
-	// Build the OCSP request using golang.org/x/crypto/ocsp.
-	//
-	// Nonce note: this x/crypto/ocsp version cannot attach a nonce
-	// extension (RFC 8954) — CreateRequest's RequestOptions carries only a
-	// Hash field and no extension support — so request/response binding via
-	// nonce is not possible here. Replay protection instead relies on the
-	// freshness validation below (validateOCSPFreshness): a captured "good"
-	// response is only replayable within its ThisUpdate/NextUpdate window,
-	// and anything outside that window is treated as status-unavailable.
+	// x/crypto/ocsp cannot attach a nonce (RFC 8954), so replay protection relies on validateOCSPFreshness.
 	reqBytes, err := ocsp.CreateRequest(cert, issuerCert, nil)
 	if err != nil {
 		return false, time.Time{}, err
 	}
 
-	// Derive the timeout from the checker's shutdown context so in-flight
-	// OCSP requests are cancelled promptly during transport shutdown instead
-	// of blocking for the full timeout duration. Use the CONFIGURED timeout:
-	// a hardcoded value here would silently cap (or extend past) the
-	// operator's OCSPTimeoutSeconds.
+	// Bound the request by the configured timeout and the shutdown context.
 	ctx, cancel := context.WithTimeout(c.shutdownCtx, c.ocspRequestTimeout())
 	defer cancel()
 
@@ -1182,21 +899,12 @@ func (c *Checker) queryOCSP(cert, issuerCert *x509.Certificate) (bool, time.Time
 		return false, time.Time{}, err
 	}
 
-	// Reject responses outside their validity window. Without this, a
-	// replayed stale "good" response (captured before a revocation) would
-	// defeat fail-closed revocation checking indefinitely. The error return
-	// makes checkOCSPRaw treat the result as status-unavailable, never as
-	// "good".
+	// Reject responses outside their validity window as unavailable.
 	if err := validateOCSPFreshness(ocspResp, time.Now()); err != nil {
 		return false, time.Time{}, err
 	}
 
-	// RFC 6960 defines three statuses. "Unknown" means the responder has no
-	// record of this certificate — it is NOT a "not revoked" verdict, and
-	// must never be cached as one: doing so admits a leaf the responder does
-	// not know and pins that admission for the full cache TTL. Returning an
-	// error routes it through the short-TTL negative cache and fails closed
-	// under enforcement.
+	// RFC 6960 unknown is not a not-revoked verdict; return an error.
 	switch ocspResp.Status {
 	case ocsp.Revoked:
 		return true, ocspResp.NextUpdate, nil
@@ -1217,13 +925,7 @@ func (c *Checker) ocspRequestTimeout() time.Duration {
 	return defaultOCSPTimeoutSeconds * time.Second
 }
 
-// validateOCSPFreshness checks that an OCSP response's validity window
-// covers now, with revocationClockSkew allowance on both edges. Per RFC
-// 6960, an absent NextUpdate means newer information is available all the
-// time; since that gives a replayed response no expiry, a bounded maximum
-// age (ocspNoNextUpdateMaxAge) is applied instead. A stale or not-yet-valid
-// response returns a typed error so callers treat the status as
-// unavailable (fail-closed under enforcement), never as "good".
+// validateOCSPFreshness checks the response window covers now with revocationClockSkew, bounding a missing NextUpdate by ocspNoNextUpdateMaxAge.
 func validateOCSPFreshness(resp *ocsp.Response, now time.Time) error {
 	if resp.ThisUpdate.IsZero() || now.Add(revocationClockSkew).Before(resp.ThisUpdate) {
 		return &OCSPResponseStaleError{
@@ -1252,15 +954,7 @@ func validateOCSPFreshness(resp *ocsp.Response, now time.Time) error {
 	return nil
 }
 
-// validateOCSPResponder rejects a response signed by a delegated responder
-// that is not authorized to sign OCSP responses (RFC 6960 §4.2.2.2). A
-// response signed by the issuer itself is authorized whether or not it embeds
-// the issuer's certificate — a CA answering OCSP directly commonly includes
-// it, and ParseResponseForCert has verified the signature. Any other embedded
-// certificate is a delegate, accepted only if it carries id-kp-OCSPSigning and
-// is within its validity period: ParseResponseForCert checks nothing but the
-// issuer's signature on it, so a node's own CA-issued certificate would
-// otherwise let a revoked node vouch "good" for itself.
+// validateOCSPResponder rejects a delegated responder without id-kp-OCSPSigning or outside its validity (RFC 6960 4.2.2.2).
 func validateOCSPResponder(resp *ocsp.Response, issuer *x509.Certificate, now time.Time) error {
 	responder := resp.Certificate
 	if responder == nil || (issuer != nil && responder.Equal(issuer)) {
@@ -1275,17 +969,7 @@ func validateOCSPResponder(resp *ocsp.Response, issuer *x509.Certificate, now ti
 	return nil
 }
 
-// OnCertRevoked returns the configured revocation-notification callback, or nil
-// when none was set. It is the single field the TLS wiring needs from the
-// config.
-//
-// This deliberately returns the callback rather than a *Config. The previous
-// CfgRef handed out a mutable pointer to the checker's own config, so any
-// holder could flip AllowSoftFail on a live checker while IsRevoked was reading
-// it concurrently -- an unsynchronised write whose losing side is a silent
-// downgrade from fail-closed to fail-open. Nothing needed that reach: the only
-// caller wanted OnCertRevoked. Handing out the callback removes the write path
-// instead of documenting it.
+// OnCertRevoked returns the configured revocation callback, or nil.
 func (c *Checker) OnCertRevoked() func(string) {
 	return c.cfg.OnCertRevoked
 }

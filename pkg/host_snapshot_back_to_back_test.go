@@ -20,13 +20,7 @@ import (
 	"time"
 )
 
-// TestSyncRequestSnapshot_BackToBackIsNeverInProgress: once SyncRequestSnapshot
-// has returned, the snapshot it waited for is over, so a request issued the
-// moment it returns must be admitted. It was refused with
-// ErrSnapshotInProgress whenever the caller won the race against the pool
-// worker, which resolved the caller before releasing the shard's snapshot
-// slots. The loop issues requests back to back with nothing in between, so the
-// caller wakes into that window as often as the scheduler allows.
+// TestSyncRequestSnapshot_BackToBackIsNeverInProgress: a request issued as soon as SyncRequestSnapshot returns must be admitted.
 func TestSyncRequestSnapshot_BackToBackIsNeverInProgress(t *testing.T) {
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {

@@ -10,12 +10,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestReadIndexDropped_ReturnsSystemBusyFiresEventLeavesNothingPending covers
-// the OnReadIndexDropped row of the Raft events table in
-// docs/multi-group-host/api.md: a ReadIndex the shard's ReadIndex queue cannot
-// take is refused with ErrSystemBusy, fires OnReadIndexDropped with the shard's
-// EventShardInfo, and rolls back both the pending read and the pending-op
-// count, so a later Drain is not held up by it.
+// TestReadIndexDropped_ReturnsSystemBusyFiresEventLeavesNothingPending checks a refused ReadIndex returns ErrSystemBusy, fires OnReadIndexDropped and rolls back pending state.
 func TestReadIndexDropped_ReturnsSystemBusyFiresEventLeavesNothingPending(t *testing.T) {
 	var (
 		mu     sync.Mutex

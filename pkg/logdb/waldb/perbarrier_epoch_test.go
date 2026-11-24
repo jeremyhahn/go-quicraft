@@ -23,14 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
-// TestMinLiveEpochForBarrier_IdentityMatch verifies that a single-barrier
-// waldb.DB answers the per-barrier epoch query precisely by barrier identity:
-// when the requested barrier is the one the DB was opened with, the result is
-// (global MinLiveEpoch, known=true); for any other barrier handle the DB
-// reports known=false (it does NOT own that barrier) — never a misleading
-// (0, true) that the caller could mistake for a zero-record non-constraint.
-// This is the building block the snapshot pool's per-barrier purge floor relies
-// on.
+// TestMinLiveEpochForBarrier_IdentityMatch: the DB's own barrier gets (MinLiveEpoch, true), any other handle known=false.
 func TestMinLiveEpochForBarrier_IdentityMatch(t *testing.T) {
 	own := newTestBarrier(t)
 	other := newTestBarrier(t)

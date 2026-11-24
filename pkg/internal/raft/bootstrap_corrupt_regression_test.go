@@ -22,19 +22,6 @@ import (
 )
 
 // Corrupt and lossy index-1 entries.
-//
-// The bootstrap entry at index 1 is the ONLY thing that makes membership a
-// function of the durable log. Every consumer of it decodes a caller-supplied
-// byte slice, and a Membership that fails to decode leaves the zero value —
-// an EMPTY voting set — behind. Adopting that is not a degraded membership, it
-// is a shard with no voters at all, and on the recovery path it is worse still:
-// a silently empty reconstruction makes the caller re-seed from its local
-// members map, dropping witnesses, observers, the Removed tombstone DENY-list
-// and the replicated witness/session policy.
-//
-// So both decode sites must refuse rather than adopt: ReconstructMembership
-// returns the error (recovery fails closed) and Peer.applyMembershipEntry
-// reports "no change" and leaves the membership it already had intact.
 
 // corruptBootstrapEntries returns index-1 EntryInitialMembership entries whose
 // Cmd cannot be decoded: a wholly foreign payload, a torn (truncated) tail of a
@@ -65,11 +52,7 @@ func corruptBootstrapEntries(t *testing.T) map[string]proto.Entry {
 	}
 }
 
-// TestReconstructMembership_CorruptBootstrapEntryFailsClosed pins recovery-time
-// reconstruction as fail-closed. A decode failure must surface as an error so
-// StartShard aborts; swallowing it yields an EMPTY membership that the caller
-// cannot distinguish from "this log has no bootstrap entry", and it then
-// re-seeds the shard from its local members map.
+// TestReconstructMembership_CorruptBootstrapEntryFailsClosed verifies an undecodable bootstrap entry fails reconstruction.
 func TestReconstructMembership_CorruptBootstrapEntryFailsClosed(t *testing.T) {
 	quietLogs(t)
 	for name, e := range corruptBootstrapEntries(t) {
@@ -90,12 +73,7 @@ func TestReconstructMembership_CorruptBootstrapEntryFailsClosed(t *testing.T) {
 	}
 }
 
-// TestReconstructMembership_PreservesEveryReplicatedRoleAndPolicy is the
-// non-voter survival test. The founding entry carries the WHOLE Membership, so
-// witnesses, observers, the Removed tombstone DENY-list, the committed member
-// identities and the replicated witness/session policy all have to come back
-// out of it. These are precisely the fields a re-seed from the caller's members
-// map — which carries voter addresses and nothing else — silently drops.
+// TestReconstructMembership_PreservesEveryReplicatedRoleAndPolicy verifies reconstruction keeps every role, tombstone and policy.
 func TestReconstructMembership_PreservesEveryReplicatedRoleAndPolicy(t *testing.T) {
 	want := proto.Membership{
 		Addresses:                  map[uint64]string{1: "addr1", 2: "addr2"},
@@ -161,14 +139,7 @@ func TestReconstructMembership_PreservesEveryReplicatedRoleAndPolicy(t *testing.
 	}
 }
 
-// TestPeer_CorruptBootstrapEntryDoesNotWipeMembership covers the RUNTIME decode
-// site. applyMembershipEntry logs and continues on a decode failure — a
-// committed entry is never re-delivered, so it cannot abort the scan — but
-// "continue" must mean the membership is left ALONE. Adopting the zero
-// Membership here would leave a live replica with no voters at all: it would
-// compute quorum over an empty set, stop recognising its own peers, and
-// (because membership is persisted alongside the next snapshot) make the wipe
-// durable.
+// TestPeer_CorruptBootstrapEntryDoesNotWipeMembership verifies a runtime decode failure leaves membership intact.
 func TestPeer_CorruptBootstrapEntryDoesNotWipeMembership(t *testing.T) {
 	for name, e := range corruptBootstrapEntries(t) {
 		t.Run(name, func(t *testing.T) {
@@ -185,10 +156,7 @@ func TestPeer_CorruptBootstrapEntryDoesNotWipeMembership(t *testing.T) {
 				t.Error("applyMembershipEntry reported a membership CHANGE for an " +
 					"undecodable bootstrap entry")
 			}
-			// The decode failure must also be REPORTED, not merely survived.
-			// Recovery treats these bytes as fatal (ReconstructMembership above);
-			// the runtime swallowing them meant a replica ran on a configuration
-			// its peers do not share and persisted it with the next snapshot.
+			// The decode failure must also be reported.
 			if !errors.Is(err, ErrCorruptConfigEntry) {
 				t.Errorf("applyMembershipEntry returned err = %v, want "+
 					"ErrCorruptConfigEntry: an undecodable committed config entry "+
@@ -207,20 +175,7 @@ func TestPeer_CorruptBootstrapEntryDoesNotWipeMembership(t *testing.T) {
 	}
 }
 
-// TestReconstructMembership_CorruptConfigChangeFailsClosed closes the OTHER
-// half of the same contract. Only the EntryInitialMembership branch above ever
-// failed closed; an undecodable committed EntryConfigChange was `continue`d and
-// reconstruction returned SUCCESS over a membership missing that change.
-//
-// That is a divergence, not a degradation. The entry is committed replicated
-// state, so every peer that can read it folds it and this replica does not: two
-// replicas reconstruct DIFFERENT memberships from the same log, compute quorum
-// over different voting sets, and the loser persists its version with the next
-// snapshot. Four doc comments (peer.applyMembershipEntry, ErrCorruptConfigEntry,
-// Host.reconstructShardMembership's caller and pkg/errors.go) already asserted
-// this path was fatal and justified the runtime's own fail-closed behaviour by
-// pointing at it. The code is what changed to match; a consensus engine has no
-// "recover as much of the configuration as possible" answer.
+// TestReconstructMembership_CorruptConfigChangeFailsClosed verifies an undecodable committed config change fails reconstruction.
 func TestReconstructMembership_CorruptConfigChangeFailsClosed(t *testing.T) {
 	quietLogs(t)
 
@@ -263,11 +218,7 @@ func TestReconstructMembership_CorruptConfigChangeFailsClosed(t *testing.T) {
 	}
 }
 
-// TestReconstructMembership_ValidConfigChangeStillFolds is the liveness control
-// for the test above, and the reason the guard keys on the DECODE rather than on
-// the entry type. A committed AddNode above the bootstrap entry must still be
-// folded, or config-in-log recovery loses every membership change a shard ever
-// made.
+// TestReconstructMembership_ValidConfigChangeStillFolds verifies a valid committed AddNode still folds.
 func TestReconstructMembership_ValidConfigChangeStillFolds(t *testing.T) {
 	bootstrap, err := BuildInitialMembershipEntry(proto.Membership{
 		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
@@ -280,9 +231,7 @@ func TestReconstructMembership_ValidConfigChangeStillFolds(t *testing.T) {
 		bootstrap,
 		{Index: 2, Term: 1, Type: proto.EntryConfigChange, Cmd: marshalConfigChange(t,
 			proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "addr4"})},
-		// A ZERO-LENGTH payload stays the silent no-op it is on the runtime path:
-		// every replica reads the same nothing and skips identically, so it
-		// cannot diverge them and must not be treated as corruption.
+		// A zero-length payload stays a no-op on every replica.
 		{Index: 3, Term: 1, Type: proto.EntryConfigChange},
 		// And a non-config entry in the run is still skipped.
 		{Index: 4, Term: 1, Type: proto.EntryNormal, Cmd: []byte("payload")},

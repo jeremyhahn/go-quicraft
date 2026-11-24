@@ -14,15 +14,7 @@
 
 package proto
 
-// MessageBatch is a batch of Raft messages for transport. One batch per
-// network frame. The wire format is:
-//
-//	[BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddress:len+data][RequestsCount:4][requests...]
-//
-// BinVer is the FIRST field so the receiver can validate the wire version
-// before parsing the rest of the batch. UnmarshalFrom validates the
-// requests count before allocating the slice and tracks cumulative bytes
-// to enforce MaxBatchSize.
+// MessageBatch is one network frame of Raft messages. Wire format [BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddress:len+data][RequestsCount:4][requests...]; BinVer is first so it is validated before the rest.
 type MessageBatch struct {
 	// BinVer is the wire format version the batch is encoded at. The
 	// receiver requires it to be in its WireWindow before unmarshaling.
@@ -30,16 +22,9 @@ type MessageBatch struct {
 	// DeploymentID identifies the deployment for cross-deployment
 	// message rejection.
 	DeploymentID uint64
-	// SourceEpoch is the sender's per-process boot epoch. It changes only
-	// when the sending node restarts, letting a receiver detect a genuine
-	// peer restart (vs a benign re-dial) and evict the now-stale cached
-	// outbound connection promptly instead of waiting for MaxIdleTimeout.
+	// SourceEpoch is the sender's per-process boot epoch, which changes only on restart.
 	SourceEpoch uint64
-	// MaxBinVer is the highest wire version the sending build accepts
-	// (its WireWindow.Current). A leader commits a shard's wire-version
-	// switch only once every member has advertised at least the target
-	// (docs/compatibility/engineering.md, "Rolling upgrade"). It is
-	// advertised, never negotiated: it does not choose BinVer.
+	// MaxBinVer is the highest wire version the sender accepts (WireWindow.Current); advertised, never negotiated (docs/compatibility/engineering.md, "Rolling upgrade").
 	MaxBinVer uint64
 	// SourceAddress is the sender's network address.
 	SourceAddress string
@@ -51,16 +36,10 @@ type MessageBatch struct {
 // (BinVer, DeploymentID, SourceEpoch, MaxBinVer).
 const messageBatchFixedSize = 4 * 8 // 32 bytes
 
-// minMessageWireSize is the smallest possible encoding of a single Message:
-// the fixed fields plus the mandatory entries-count and has-snapshot
-// prefixes. Identical to HeartbeatMessageSize by construction — a heartbeat
-// (no entries, no snapshot) IS the minimal message.
+// minMessageWireSize is the smallest encoding of a Message, equal to HeartbeatMessageSize.
 const minMessageWireSize = HeartbeatMessageSize // 100 bytes
 
-// maxRetainedRequests bounds the Requests capacity a batch keeps across
-// Reset. The transport pools batches, so without this a single crafted
-// oversized batch would pin cap * unsafe.Sizeof(Message) bytes in the pool
-// for the process lifetime.
+// maxRetainedRequests bounds the Requests capacity a pooled batch keeps across Reset.
 const maxRetainedRequests = 256
 
 // Size returns the total marshaled size of the batch in bytes.
@@ -72,12 +51,7 @@ func (mb *MessageBatch) Size() int {
 	return sz
 }
 
-// MarshalTo writes the message batch into buf and returns bytes written.
-// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
-// short, ErrTooManyMessages if Requests exceeds MaxMessagesPerBatch, or
-// ErrAddressTooLong if SourceAddress exceeds MaxAddressLength — the read side's
-// bounds applied on write. MaxMessagesPerBatch's doc already made bounding the
-// producer a MUST; this is that MUST enforced rather than documented.
+// MarshalTo writes the batch into buf (at least Size() bytes) and returns bytes written; ErrBufferTooSmall, ErrTooManyMessages or ErrAddressTooLong when the read side's bounds would be violated.
 func (mb *MessageBatch) MarshalTo(buf []byte) (int, error) {
 	if len(mb.Requests) > MaxMessagesPerBatch {
 		return 0, ErrTooManyMessages
@@ -123,13 +97,7 @@ func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, erro
 		return 0, ErrBufferTooSmall
 	}
 	mb.BinVer = getUint64(buf[0:])
-	// Closed-set gate: there is no version negotiation. The set is this
-	// build's {current, previous} rolling-upgrade window (one member until a
-	// release moves WireVersion), and a batch outside it is rejected with a
-	// clear signal instead of being misparsed. Correct here because
-	// MessageBatch is transport-only: a batch lives for one frame and is
-	// never persisted, so a rejection costs one connection rather than
-	// stranding data at rest.
+	// Closed-set gate with no negotiation: a BinVer outside {current, previous} is rejected.
 	if !w.Accepts(mb.BinVer) {
 		return 0, ErrUnsupportedVersion
 	}
@@ -151,11 +119,7 @@ func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, erro
 	if reqCount > MaxMessagesPerBatch {
 		return 0, ErrTooManyMessages
 	}
-	// The count alone drives the allocation below, so it must also be
-	// consistent with what is left in the buffer: a 32-byte frame claiming
-	// 10000 requests would otherwise allocate ~2.8 MB before failing. The
-	// transport's receive-memory budget charges only the frame length, so
-	// this check is the only bound on that amplification.
+	// The count must also fit the remaining buffer before it drives the allocation.
 	if uint64(reqCount)*minMessageWireSize > uint64(len(buf)-offset) {
 		return 0, ErrBufferTooSmall
 	}
@@ -182,33 +146,12 @@ func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, erro
 	return offset, nil
 }
 
-// exceedsMaxBatchSize reports whether a decode that has consumed offset bytes
-// has passed MaxBatchSize.
-//
-// The comparison is WIDENED, never narrowed: offset is an int and MaxBatchSize
-// is a uint64. A uint32(offset) cast would wrap silently past 4 GB and let a
-// crafted batch decode without limit.
-//
-// It is a named function rather than an inline expression for one reason: the
-// regression it guards needs a 4 GB frame to reach through UnmarshalFrom, and no
-// test can allocate one. A test asserting uint32(1<<32+1) == 1 and
-// uint64(1<<32+1) > MaxBatchSize would check two facts about Go's arithmetic,
-// true whatever this package does, so it could not fail if the cast came back.
-// Calling this instead puts the PRODUCTION comparison under a test at an offset
-// the decoder cannot be driven to. See TestExceedsMaxBatchSizeDoesNotTruncate.
+// exceedsMaxBatchSize reports whether offset has passed MaxBatchSize, compared as uint64 so it never wraps; named so TestExceedsMaxBatchSizeDoesNotTruncate can test it.
 func exceedsMaxBatchSize(offset int) bool {
 	return uint64(offset) > MaxBatchSize
 }
 
-// Reset clears all fields for reuse. A Requests slice grown past
-// maxRetainedRequests is dropped rather than truncated so a pooled batch
-// cannot retain attacker-influenced capacity.
-//
-// Each retained message is reset in turn: truncating Requests alone leaves the
-// backing array holding Message values whose Entries slices are still live, so
-// Message.maxRetainedEntries would never be applied and a pooled batch could
-// pin len(Requests) * cap(Entries) * sizeof(Entry) bytes for the process
-// lifetime.
+// Reset clears all fields for reuse, resetting each retained message and dropping a Requests slice grown past maxRetainedRequests.
 func (mb *MessageBatch) Reset() {
 	mb.BinVer = 0
 	mb.DeploymentID = 0

@@ -337,13 +337,7 @@ func TestSessionError_Unwrap_ReturnsInner(t *testing.T) {
 	}
 }
 
-// TestMaybeApplied pins the distinction Temporary() cannot make: whether a
-// failed request had already reached the raft log.
-//
-// Temporary answers "is a retry reasonable?"; MaybeApplied answers "did it
-// happen?". Conflating them is what made the library's own documented retry
-// loop — gate on Temporary, use NotLeader to pick a target — able to
-// double-apply an unsessioned proposal that had already committed.
+// TestMaybeApplied pins whether a failed request had already reached the raft log, which Temporary cannot tell.
 func TestMaybeApplied(t *testing.T) {
 	preFlight := &NotLeaderError{ShardID: 1, LeaderID: 2}
 	postDelivery := &MaybeAppliedError{Err: &NotLeaderError{ShardID: 1, LeaderID: 2}}

@@ -60,16 +60,7 @@ func TestIntegration_DB_ProposalsWorkWhenRateLimited(t *testing.T) {
 	t.Logf("20 proposals succeeded with MaxInMemLogSize=10MB")
 }
 
-// TestIntegration_DB_RateLimitCanBeTriggered verifies that when
-// MaxInMemLogSize is set extremely low, proposals eventually return
-// ErrSystemBusy. Matches dragonboat's TestRateLimitCanBeTriggered.
-//
-// The test uses async Propose (not SyncPropose) to fire proposals
-// without waiting for each to complete. SyncPropose on a single-node
-// cluster applies entries nearly instantly, so the in-memory log never
-// accumulates enough to trigger rate limiting. Async proposals build
-// up backpressure in the proposal pipeline, allowing the rate limiter
-// to detect that the in-memory log size exceeds MaxInMemLogSize.
+// TestIntegration_DB_RateLimitCanBeTriggered checks that async proposals with a tiny MaxInMemLogSize return ErrSystemBusy.
 func TestIntegration_DB_RateLimitCanBeTriggered(t *testing.T) {
 	pki := dbTestPKIFor(t)
 	addr := kernelAddr

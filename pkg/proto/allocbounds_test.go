@@ -45,12 +45,7 @@ func craftedBatchHeader(reqCount uint32) []byte {
 	return buf
 }
 
-// TestMessageBatch_UnmarshalFrom_CountExceedsBuffer asserts that a request
-// count the remaining buffer cannot possibly hold is rejected before the
-// []Message is allocated. Before the length cross-check, this 32-byte payload
-// allocated ~2.88 MB (10000 * 288-byte Message) and then returned
-// ErrBufferTooSmall — a ~90,000x amplification over the frame length the
-// transport's receive-memory budget charges.
+// TestMessageBatch_UnmarshalFrom_CountExceedsBuffer: a count the remaining buffer cannot hold is rejected before the []Message is allocated.
 func TestMessageBatch_UnmarshalFrom_CountExceedsBuffer(t *testing.T) {
 	buf := craftedBatchHeader(MaxMessagesPerBatch)
 	if len(buf) != 40 {

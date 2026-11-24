@@ -21,27 +21,7 @@ import (
 	"testing"
 )
 
-// This file is the compatibility proof for the migration from caller-supplied
-// AES-GCM IVs to cipher.NewGCMWithRandomNonce (see newAESGCM).
-//
-// Every vector below was produced by the PRE-MIGRATION code — the version that
-// drew a nonce from a crypto/rand reader and wrote it into the blob by hand —
-// and is checked in as bytes. Regenerating them from the current code would
-// make these tests tautological: the point is that data written by a build that
-// no longer exists still reads.
-//
-// The vectors are also why this package needs no envelope version
-// discriminator. cipher.NewGCMWithRandomNonce emits nonce ‖ ciphertext ‖ tag,
-// which is byte-for-byte the layout the hand-rolled framing already used, in
-// the same positions, with the same total length. v1 and v2 are the same
-// format; only the party that generates the nonce changed, and that party is
-// not recorded on disk because it never was. A discriminator would have to
-// distinguish two identical byte strings.
-//
-// These tests deliberately execute NO non-approved primitive: they only OPEN
-// legacy bytes, using the approved module-nonce AEAD. That is what lets them
-// run unchanged under GOFIPS140=latest GODEBUG=fips140=only, which is where
-// this compatibility claim actually needs to hold.
+// Golden vectors written with caller-supplied AES-GCM IVs, checked in as bytes; the module-nonce AEAD reads them, using only approved primitives.
 
 // Legacy sealed root key, written by SoftwareStrategy.SealRootKey before the
 // migration: [KDFSalt:32 | Nonce:12 | EncryptedRootKey:32 | Tag:16], wrapped
@@ -206,14 +186,7 @@ func TestLegacyFormat_BarrierDecryptsFrame(t *testing.T) {
 	})
 }
 
-// TestFrameLayoutUnchangedByMigration asserts the other direction of
-// compatibility: a frame written NOW occupies exactly the bytes the legacy
-// framing did, so a reader that has not taken this change — an older node in a
-// mixed-version cluster, or a forensic tool — parses it correctly.
-//
-// It is a length-and-position assertion rather than a byte comparison because
-// the nonce is random by construction; the golden vectors above cover the
-// value-level claim in the other direction.
+// TestFrameLayoutUnchangedByMigration verifies a new frame has the legacy frame's length and layout.
 func TestFrameLayoutUnchangedByMigration(t *testing.T) {
 	b, strategy := testInitializedBarrier(t)
 	defer func() { _ = strategy.Close() }()

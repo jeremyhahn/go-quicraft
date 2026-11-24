@@ -21,30 +21,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// "the state machine applied it" is not "the membership folded it"
-//
-// SetProcessedIndex advanced p.r.log.processed UNCONDITIONALLY and then called
-// replayConfigChangesTo, DISCARDING the report of whether the fold reached the
-// end. The fold's lower bound was that same processed marker, so one unreadable
-// chunk produced a window that could never be revisited:
-//
-//	SetProcessedIndex(31) -> processed = 31, fold of [1,31] fails at 20
-//	resolveStaleStartupConfig -> scans [processed+1, staleConfigThrough]
-//	                          -> [32, 31] -> low > index -> "resolved"
-//	                          -> staleConfigThrough = 0, campaign allowed
-//
-// The replica then campaigns against the configuration its BASE described,
-// having skipped every config change in the window — soliciting votes from
-// replicas the shard removed, and computing quorum over the wrong denominator.
-//
-// The fix is to stop conflating the two facts: configFoldedThrough records what
-// the FOLD covered, and only a fold that really offered the entries to
-// applyMembershipEntry advances it.
+// SetProcessedIndex must not treat an applied index as a folded membership.
 
-// staleTailFixture builds a replica that recovered with a 3-voter BASE while its
-// committed log says 4 voters: the bootstrap entry at index 1 names {1,2,3}, and
-// a committed AddNode at index 31 adds replica 4. lr.failing decides whether the
-// tail can be read.
+// staleTailFixture builds a replica recovered with a 3-voter base whose committed log adds replica 4 at index 31; lr.failing makes the log unreadable.
 func staleTailFixture(t *testing.T) (*Peer, *failingReadLogReader) {
 	t.Helper()
 	base := map[uint64]string{1: "a1", 2: "a2", 3: "a3"}
@@ -76,17 +55,7 @@ func staleTailFixture(t *testing.T) (*Peer, *failingReadLogReader) {
 	return p, lr
 }
 
-// TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign is the
-// regression. The state machine reports lastApplied 31, so SetProcessedIndex
-// pushes processed to 31 — but the log cannot be read, so nothing is folded. The
-// replica must NOT then decide its configuration is current.
-//
-// It also pins the distinction the return value has to make. A window this
-// replica could not READ is not a window it can never read: the commit pipeline
-// or resolveStaleStartupConfig may cover it later, so it arms the watermark and
-// reports no error. Only "these committed bytes will never decode" is terminal
-// (TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry); otherwise every
-// transient log-read failure at startup would refuse to start the shard.
+// TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign verifies an unfolded tail still suppresses the campaign.
 func TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign(t *testing.T) {
 	quietLogs(t)
 
@@ -123,13 +92,7 @@ func TestSetProcessedIndex_UnfoldedWindowStillSuppressesTheCampaign(t *testing.T
 	}
 }
 
-// TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign is the POSITIVE
-// CONTROL. With a readable log the identical sequence must fold the tail, clear
-// the watermark, and campaign against the RESOLVED 4-voter set — otherwise the
-// gate is just a permanent election block. It is also the positive control of
-// TestSetProcessedIndex_ReportsACorruptCommittedConfigEntry: a readable tail
-// reports no error and records no unfolded configuration, so that assertion is
-// not satisfied by a method that returns an error unconditionally.
+// TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign verifies a readable tail folds and the campaign uses the 4-voter set.
 func TestSetProcessedIndex_FoldedWindowStillAllowsTheCampaign(t *testing.T) {
 	quietLogs(t)
 

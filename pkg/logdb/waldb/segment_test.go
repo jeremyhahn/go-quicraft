@@ -180,12 +180,7 @@ func TestLargeRecordSpansBlocks(t *testing.T) {
 	}
 }
 
-// TestLargeBlockSizeChunkCap is the regression test for the chunk-payload cap:
-// when the block size exceeds maxRecordDataLen+recordHeaderSize, a single chunk
-// must still be capped at maxRecordDataLen (the 2-byte record length field
-// limit) rather than sized to the block. Without the cap, encodeRecord fails
-// with ErrBufferTooSmall and Write returns an error. The record must split into
-// multiple chunks within the oversized block and round-trip correctly.
+// TestLargeBlockSizeChunkCap checks chunks stay capped at maxRecordDataLen when the block is larger, and the record round-trips.
 func TestLargeBlockSizeChunkCap(t *testing.T) {
 	dir := t.TempDir()
 	blockSize := 256 * 1024 // 256 KiB block, well above the 64 KiB length-field limit.
@@ -870,14 +865,7 @@ func TestDiscardPendingWithMultiBlockRecord(t *testing.T) {
 		t.Errorf("fileOffset = %d, want %d", seg.fileOffset, cleanFileOffset)
 	}
 
-	// The logical write position is the pre-batch durable boundary. With the
-	// block-aligned offset model, fileOffset is the block-aligned start and
-	// the open block tail lives in blockOffset, so the durable end is
-	// cleanFileOffset + cleanBlockOffset (the truncation target). The FILE is
-	// larger than that: DiscardPending re-takes the fallocate reservation the
-	// truncation dropped, so writes after a rollback do not pay a file
-	// extension. (Asserting the truncated size here would pin a lost
-	// reservation.)
+	// The write position is the pre-batch durable end; the file stays larger because DiscardPending re-takes the fallocate reservation.
 	wantEnd := cleanFileOffset + int64(cleanBlockOffset)
 	if seg.Size() != wantEnd {
 		t.Errorf("logical size = %d, want %d", seg.Size(), wantEnd)

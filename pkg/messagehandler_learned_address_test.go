@@ -63,14 +63,7 @@ func TestLearnSourceAddress_RefusesAddressTheCertificateCovers(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_JoiningRouteIsCommittedPublication pins that the
-// leader address a joining replica takes from its bootstrap snapshot is
-// published as committed membership: under peer admission and checked
-// against the installed certificate. It is registered even when covered,
-// because the snapshot's membership is committed and its install reconciles
-// the same address anyway, and the conflict is reported. The write used to
-// skip the lock and the check, so a covered leader address was published
-// silently.
+// TestHandleSnapshot_JoiningRouteIsCommittedPublication checks a joiner publishes the leader address from its bootstrap snapshot under peer admission and reports a covered conflict.
 func TestHandleSnapshot_JoiningRouteIsCommittedPublication(t *testing.T) {
 	const leaderAddr = "node-b.raft.test:7001"
 	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"

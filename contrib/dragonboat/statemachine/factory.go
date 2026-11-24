@@ -16,10 +16,7 @@ package statemachine
 
 import qcSM "github.com/jeremyhahn/go-quicraft/pkg/sm"
 
-// WrapCreateFunc wraps a dragonboat CreateStateMachineFunc as a quicraft
-// sm.CreateFunc. The returned factory creates regularAdapter instances
-// that translate between dragonboat's single-entry Update convention and
-// quicraft's batch Update interface.
+// WrapCreateFunc adapts a dragonboat CreateStateMachineFunc to a quicraft sm.CreateFunc.
 func WrapCreateFunc(f CreateStateMachineFunc) qcSM.CreateFunc {
 	return func(shardID, replicaID uint64) interface{} {
 		inner := f(shardID, replicaID)
@@ -27,9 +24,7 @@ func WrapCreateFunc(f CreateStateMachineFunc) qcSM.CreateFunc {
 	}
 }
 
-// WrapConcurrentCreateFunc wraps a dragonboat CreateConcurrentStateMachineFunc
-// as a quicraft sm.CreateFunc. The returned factory creates concurrentAdapter
-// instances that translate between the two batch-entry representations.
+// WrapConcurrentCreateFunc adapts a dragonboat CreateConcurrentStateMachineFunc to a quicraft sm.CreateFunc.
 func WrapConcurrentCreateFunc(f CreateConcurrentStateMachineFunc) qcSM.CreateFunc {
 	return func(shardID, replicaID uint64) interface{} {
 		inner := f(shardID, replicaID)
@@ -37,9 +32,7 @@ func WrapConcurrentCreateFunc(f CreateConcurrentStateMachineFunc) qcSM.CreateFun
 	}
 }
 
-// WrapOnDiskCreateFunc wraps a dragonboat CreateOnDiskStateMachineFunc
-// as a quicraft sm.CreateFunc. The returned factory creates diskAdapter
-// instances that translate between the on-disk state machine representations.
+// WrapOnDiskCreateFunc adapts a dragonboat CreateOnDiskStateMachineFunc to a quicraft sm.CreateFunc; Open's snapshot directory is discarded.
 func WrapOnDiskCreateFunc(f CreateOnDiskStateMachineFunc) qcSM.CreateFunc {
 	return func(shardID, replicaID uint64) interface{} {
 		inner := f(shardID, replicaID)

@@ -23,10 +23,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// lockFile takes a non-blocking exclusive flock on f. flock, not fcntl: an
-// fcntl lock belongs to the process, so a second open in the same process
-// would be granted it, which is one of the two openers this lock exists to
-// refuse.
+// lockFile takes a non-blocking exclusive flock on f; fcntl locks are per process and would admit a second open.
 func lockFile(f *os.File) error {
 	for {
 		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)

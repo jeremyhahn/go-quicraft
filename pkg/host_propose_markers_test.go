@@ -81,10 +81,7 @@ func (p *markerProbe) ObserveProposalLatency(shardID uint64, _ time.Duration) {
 	}
 }
 
-// TestSyncPropose_AcknowledgedEntryIsCoveredByLeaderMarkers proves that a
-// proposal is acknowledged only once the leader's applied index and its
-// published commit index cover the entry (#1104). A FollowerRead or
-// ReadIndex taken right after the acknowledgement relies on both.
+// TestSyncPropose_AcknowledgedEntryIsCoveredByLeaderMarkers proves an acknowledged proposal is covered by the leader's applied and published commit indexes.
 func TestSyncPropose_AcknowledgedEntryIsCoveredByLeaderMarkers(t *testing.T) {
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, 3)

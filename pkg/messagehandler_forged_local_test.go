@@ -25,33 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestHandleMessage_ForgedProcessLocalTypesAreNotStepped is the end-to-end
-// regression test. It drives the full inbound path a remote peer actually has
-// — hostMessageHandler.HandleMessage (what the transport calls with a decoded
-// MessageBatch) into the engine inbox into the step worker into Peer.Handle —
-// and asserts the shard's membership, the set quorum() is computed over, is
-// untouched.
-//
-// The attack it reproduces needs nothing but a CA-signed cluster certificate:
-//
-//	{Type: InstallSnapshot, From: <any member>, To: <victim>, ShardID: S,
-//	 Term: 0, Snapshot: {Index: <= committed,
-//	                     Membership: {ConfigChangeID: 1<<62,
-//	                                  Addresses: {2: "attacker"}}}}
-//
-// No snapshot transfer, no term, no log proof. Term 0 skipped step's whole
-// term-transition block, the Index at or below committed made handleSnapshot
-// return nil ("rejected"), and Peer.Handle read that nil as "raft acted on
-// this" and adopted the attacker's Membership because its ConfigChangeID was
-// larger. Repeated per follower it hands the attacker both the commit and the
-// election quorum.
-//
-// The forged InstallSnapshot is one of six cases. localControlMessages exempts
-// Propose, ReadIndex, InstallSnapshot, SnapshotStatus, Unreachable and
-// LeaderTransfer from the term gate; all six decode off the wire, and
-// HandleMessage applies no type filter. Delivering each of them from a
-// "member" must leave the shard's membership intact and must not take the
-// shard down.
+// TestHandleMessage_ForgedProcessLocalTypesAreNotStepped: none of the six term-exempt local message types from a peer changes membership or stops the shard.
 func TestHandleMessage_ForgedProcessLocalTypesAreNotStepped(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -142,8 +116,7 @@ func TestMessageOrigin_IsNotOnTheWire(t *testing.T) {
 		t.Fatalf("MarshalTo: %v", err)
 	}
 
-	// Decode into a message that ALREADY carries a local stamp, which is what
-	// a recycled pool entry looks like. The decoder must clear it.
+	// Decode into a message that already carries a local stamp; the decoder must clear it.
 	dst := proto.Message{Origin: proto.OriginLocal}
 	if _, err := dst.UnmarshalFrom(buf); err != nil {
 		t.Fatalf("UnmarshalFrom: %v", err)

@@ -20,38 +20,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// PreVote requires a STRICTLY higher prospective term.
-//
-// A pre-vote asks "would you vote for me if I campaigned at term M?". The
-// answer can only be yes when M is a term this replica has not already decided,
-// which is what makes PreVote's whole purpose — never disturb a term that is
-// already settled — hold. Both reference implementations require it explicitly:
-//
-//	dragonboat handleNodeRequestPreVote:  grant iff m.Term > r.term && isUpToDate
-//	etcd/raft   Step:                     canVote includes
-//	                                      (m.Type == MsgPreVote && m.Term > r.Term)
-//
-// handleVoteRequest computes the pre-vote grant as `logOK && !leaderActive`
-// with NO term comparison at all. step() rejects msg.Term < r.term before it
-// gets here, so the hole is exactly msg.Term == r.term: a pre-candidate at term
-// T-1 prospecting for T is granted by a replica already AT term T which has
-// already cast its real vote for someone else in T.
-//
-// It costs liveness, not safety — a pre-vote is not a vote, and the real
-// RequestVote that follows is still refused by the already-voted replica — but
-// the wasted round is precisely the disruption PreVote exists to prevent, and
-// it recurs every election timeout while the stale pre-candidate keeps
-// prospecting for a term the cluster has moved past.
+// PreVote requires a strictly higher prospective term.
 
-// TestRaft_PreVote_NotGrantedForAnAlreadyDecidedTerm pins the rule. The
-// responder is at term 5 and has already voted for replica 2 there; a
-// pre-candidate prospecting for that same term 5 must be REJECTED.
-//
-// KNOWN RED. This test FAILS against handleVoteRequest as it stands and is the
-// acceptance criterion for the one-line fix — adding `&& msg.Term > r.term` to
-// the pre-vote branch's canVote. That fix has been verified against the whole
-// of ./pkg/internal/raft/, ./pkg/ and ./pkg/internal/engine/ with no other test
-// affected. It is not a flake: it fails deterministically, on every run.
+// TestRaft_PreVote_NotGrantedForAnAlreadyDecidedTerm verifies a pre-vote for the responder's current, already-voted term is rejected.
 func TestRaft_PreVote_NotGrantedForAnAlreadyDecidedTerm(t *testing.T) {
 	r := newTestRaft(1)
 	r.term = 5
@@ -90,11 +61,7 @@ func TestRaft_PreVote_NotGrantedForAnAlreadyDecidedTerm(t *testing.T) {
 	}
 }
 
-// TestRaft_PreVote_GrantedForAStrictlyHigherTerm is the liveness control. The
-// term test must be STRICTLY greater-than and nothing more: a pre-candidate
-// prospecting for a term above this replica's, with an up-to-date log and no
-// active leader, must still be granted, or PreVote would deadlock every
-// election.
+// TestRaft_PreVote_GrantedForAStrictlyHigherTerm verifies a pre-vote for a higher term with an up-to-date log is granted.
 func TestRaft_PreVote_GrantedForAStrictlyHigherTerm(t *testing.T) {
 	r := newTestRaft(1)
 	r.term = 5

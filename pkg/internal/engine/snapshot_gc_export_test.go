@@ -20,24 +20,7 @@ import (
 	"testing"
 )
 
-// TestGCSnapshotDirs_ReclaimsReceivePathDirectories covers the exported GC entry
-// point the inbound-snapshot receive path and Host.ImportSnapshot need.
-//
-// gcSnapshotDirs was called from exactly ONE place, saveSnapshot, and so was
-// purgeOldEpochs. hostMessageHandler.HandleSnapshot creates
-// Node.SnapshotSaveDir(index) for every snapshot it receives and reclaimed
-// none of them; Host.ImportSnapshot publishes a directory and never GC'd it.
-// A shard configured with SnapshotEntries == 0 — supported, documented, and the
-// out-of-the-box state since the field has no default — never runs saveSnapshot
-// at all, so a follower that repeatedly falls behind the leader's compaction
-// floor and catches up via InstallSnapshot accumulates one full state-machine
-// image per catch-up, forever.
-//
-// The host-wide consequence is worse than disk: snapshotFloorScan.addNode folds
-// EVERY retained directory of EVERY loaded node into the minimum and
-// globalSafePurgeFloor takes the minimum across all of them, so one such shard's
-// stale directories pin the purge floor and a co-hosted shard that DOES save can
-// never purge a DEK.
+// TestGCSnapshotDirs_ReclaimsReceivePathDirectories covers the GC entry point used by the receive path and ImportSnapshot.
 func TestGCSnapshotDirs_ReclaimsReceivePathDirectories(t *testing.T) {
 	const shardID, replicaID = 7, 3
 	base := t.TempDir()

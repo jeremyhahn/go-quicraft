@@ -29,20 +29,7 @@ const (
 	// OpDelete removes a key.
 	OpDelete byte = 3
 
-	// OpPutIfAbsent stores a key-value pair only when the key is absent.
-	//
-	// The condition is evaluated inside Update, on every replica, against the
-	// replicated state at that log position. That is what makes it safe: the
-	// decision is a pure function of committed state, so every replica reaches
-	// the same answer and none diverge. Evaluating it on the proposer instead
-	// — read, decide, then propose a plain Put — would be a different operation
-	// with a window between the read and the commit, in which a second proposer
-	// can interleave and both writes succeed.
-	//
-	// The result carries the outcome: ResultStored when this entry created the
-	// key, ResultNotStored when it was already present. Both are successful
-	// applications; "not stored" is an answer, not an error, so it must not
-	// stall consensus.
+	// OpPutIfAbsent stores a key-value pair only when the key is absent, evaluated in Update on every replica.
 	OpPutIfAbsent byte = 4
 
 	// ResultStored is the Result.Value for a conditional write that took
@@ -59,25 +46,10 @@ const (
 	// MaxKeyLength is the maximum key length (uint16 max).
 	MaxKeyLength = 65535
 
-	// MaxValueLength bounds a single value read during snapshot recovery. A
-	// snapshot arrives from a peer over the transport; without this bound a
-	// corrupt or malicious length prefix could request an arbitrary (up to
-	// ~4 GiB) allocation, causing OOM/DoS on a follower.
-	//
-	// 64 MiB is a deliberately generous DoS ceiling, NOT the largest writable
-	// value. A KV value is always written inside a single proposal's Entry.Cmd,
-	// which the engine caps at proto.MaxEntrySize (8 MiB) at propose time and
-	// the WAL caps at maxCmdLen (also 8 MiB). So a legitimately-stored value can
-	// never exceed ~8 MiB and this recovery cap never rejects valid data — it
-	// only rejects a corrupt/oversized length prefix. Keeping it above the
-	// write-time entry limit means tightening MaxEntrySize cannot retroactively
-	// make an already-persisted snapshot unrecoverable.
+	// MaxValueLength bounds a single value read during snapshot recovery.
 	MaxValueLength = 64 * 1024 * 1024
 
-	// maxSnapshotMapHint caps the initial map capacity derived from a snapshot's
-	// untrusted entry-count prefix, bounding pre-allocation regardless of the
-	// declared count. The map still grows beyond this if the snapshot genuinely
-	// contains more entries.
+	// maxSnapshotMapHint caps the initial map capacity taken from a snapshot's untrusted entry count.
 	maxSnapshotMapHint = 1 << 20 // 1,048,576 entries
 )
 
@@ -99,13 +71,7 @@ func EncodePut(key, value []byte) ([]byte, error) {
 	return buf, nil
 }
 
-// EncodePutIfAbsent creates a binary conditional-put command:
-// [op:1][keyLen:2 LE][key][value].
-//
-// The wire shape is identical to Put — only the opcode differs — so the decoder
-// needs no new parsing path and an older reader rejects it as an unknown op
-// rather than misreading it as a Put, which would silently turn a conditional
-// write into an unconditional one.
+// EncodePutIfAbsent creates a conditional-put command: [op:1][keyLen:2 LE][key][value].
 func EncodePutIfAbsent(key, value []byte) ([]byte, error) {
 	if len(key) > MaxKeyLength {
 		return nil, &KeyTooLongError{Length: len(key)}

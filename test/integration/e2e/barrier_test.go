@@ -24,14 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
-// barrierSnapshotConfig is the shard config every barrier test uses.
-//
-// SnapshotEntries has to be set explicitly: it has NO default (declared in
-// pkg/config/config.go and never assigned in SetDefaults), so a shard started
-// with testShardConfig keeps SnapshotEntries == 0, never takes a snapshot, and
-// therefore never asks the barrier to encrypt anything. Every barrier test that
-// starts a shard without this is asserting on an at-rest pipeline that was
-// never run.
+// barrierSnapshotConfig is the shard config every barrier test uses; SnapshotEntries is set explicitly.
 func barrierSnapshotConfig(shardID, replicaID uint64) config.Config {
 	return testShardConfigWithSnapshot(shardID, replicaID, 15, 5)
 }
@@ -41,15 +34,7 @@ func barrierSnapshotConfig(shardID, replicaID uint64) config.Config {
 // into a snapshot artifact, because the barrier is supposed to have sealed it.
 const barrierCanary = "CANARY-2f8b1d-PLAINTEXT"
 
-// assertBarrierSealedEverything is the shared at-rest assertion. For every live
-// node it requires that the node's barrier actually sealed snapshot frames, and
-// that the plaintext canary is absent from every snapshot artifact that node
-// wrote under its NodeHostDir.
-//
-// Both halves are needed and neither implies the other. The seal count proves
-// the encrypt path RAN; the byte search proves what it produced is not readable
-// off the disk. A round trip through the engine proves neither, because it
-// reads back whatever it wrote either way.
+// assertBarrierSealedEverything requires every live node's barrier to have sealed snapshot frames and the canary to be absent from its artifacts.
 func assertBarrierSealedEverything(t *testing.T, cluster *barrierTestCluster, canaries []string) {
 	t.Helper()
 
@@ -86,19 +71,7 @@ func assertBarrierSealedEverything(t *testing.T, cluster *barrierTestCluster, ca
 	t.Logf("at-rest encryption verified on %d node(s)", checked)
 }
 
-// TestE2E_Barrier_ProposeAndRead verifies that a 3-node barrier-encrypted
-// cluster can propose entries, replicate them identically across all nodes
-// despite each node having an independent barrier with a distinct passphrase,
-// serve linearizable reads, take automatic and explicit snapshots and apply
-// entries on top of them, and that the data those entries carry is ENCRYPTED
-// where it lands on disk.
-//
-// The at-rest half is the reason this test exists. Asserting only
-// IsSealed() == false — an in-memory flag no production path touches — on a
-// shard whose SnapshotEntries is 0 takes no snapshot and never asks the
-// barrier to encrypt a byte, so a total plaintext downgrade would pass. It
-// takes a real snapshot and asserts both that each node's own barrier sealed
-// frames and that the plaintext canary is absent from the artifact.
+// TestE2E_Barrier_ProposeAndRead verifies a 3-node cluster with independent barriers proposes, replicates and reads.
 func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 	cluster := newBarrierTestCluster(t, 3)
 	defer cluster.close()
@@ -150,12 +123,7 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 		}
 	}
 
-	// Perform a linearizable read for one of the keys. The subject is the
-	// value the barrier-encrypted cluster returns, not the replica that
-	// serves it, so the leader is resolved at the point of the read rather
-	// than reused from the election above: thirty proposals and a
-	// verifyAllData walk have run since then, any of which can span an
-	// election.
+	// Read through the leader resolved at the point of the read.
 	targetKey := "barrier-rw-005"
 	expectedValue := expected[targetKey]
 	result := proposer.Read(t, cluster.leaderHost, 1, encodeKVGet(targetKey), defaultTimeout)
@@ -168,11 +136,7 @@ func TestE2E_Barrier_ProposeAndRead(t *testing.T) {
 		t.Fatalf("SyncRead(%q) = %q, want %q", targetKey, val, expectedValue)
 	}
 
-	// The snapshot below is deliberately still addressed to one replica: it
-	// forces the at-rest write this test then greps for, so it must happen on
-	// a host whose data directory the assertion knows. Force it and WAIT for
-	// it (save -> encrypt -> persist -> acknowledge), so the at-rest assertion
-	// does not depend on the automatic trigger having already fired there.
+	// Snapshot on a known replica and wait for it to complete.
 	snapshotIndex := requestSnapshotSync(t, cluster.hosts[leaderIdx], 1)
 	t.Logf("explicit snapshot on leader node[%d] completed at index %d", leaderIdx, snapshotIndex)
 

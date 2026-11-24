@@ -26,17 +26,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// HandleSnapshot must validate the TARGET replica, not just the sender
-// ---------------------------------------------------------------------------
+// HandleSnapshot validates the target replica, not just the sender.
 
-// TestHandleSnapshot_RejectsForeignTargetReplica pins that the in-band target
-// ReplicaID is checked rather than trusted verbatim. The whole receive keys off
-// it: a foreign value splits snapshotRecvKey
-// (bypassing the in-flight serialization guard while snapshotDir still uses
-// the LOCAL replica ID), defeats the LogDB dedup lookup, writes a durable
-// LogDB record under a replica ID this host does not own, and reaches raft
-// through DeliverMessage, which performs no destination check of its own.
+// TestHandleSnapshot_RejectsForeignTargetReplica checks a snapshot naming a replica this host does not own is rejected.
 func TestHandleSnapshot_RejectsForeignTargetReplica(t *testing.T) {
 	eng, h, handler := newRoutingHandlerFixture(t)
 
@@ -92,9 +84,7 @@ func TestHandleSnapshot_RejectsForeignTargetReplica(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// A failed InstallSnapshot delivery is a FAILED receive
-// ---------------------------------------------------------------------------
+// A failed InstallSnapshot delivery fails the receive.
 
 // refusingInstallDeliverer refuses to deliver InstallSnapshot control
 // messages while forwarding everything else, simulating a persistently full
@@ -138,18 +128,7 @@ func (d *refusingInstallDeliverer) RequestSnapshotRecovery(shardID, replicaID ui
 	return d.engineDeliverer.RequestSnapshotRecovery(shardID, replicaID, node)
 }
 
-// TestHandleSnapshot_FailedInstallDeliveryFailsReceive pins that a failed
-// deliverSnapshotControl fails the receive. Logging it as a warning while the
-// receive still reported SUCCESS and queued state-machine recovery would leave
-// raft short of the snapshot index, so recoverSnapshot would refuse to move the
-// node markers (SnapshotRecoveryBehindError) — and because the sender was told
-// the transfer succeeded, the leader would never re-send and the follower
-// would never recover.
-//
-// Under the two-phase receive nothing is recorded
-// until raft ADOPTS the install, so a failed delivery leaves no LogDB record
-// and no artifact: the leader's retry is received afresh rather than answered
-// from a record of a snapshot raft never saw.
+// TestHandleSnapshot_FailedInstallDeliveryFailsReceive checks a failed delivery fails the receive and leaves no record or artifact.
 func TestHandleSnapshot_FailedInstallDeliveryFailsReceive(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 
@@ -221,15 +200,7 @@ func (d *countingRecoveryDeliverer) RequestSnapshotRecovery(shardID, replicaID u
 	return d.engineDeliverer.RequestSnapshotRecovery(shardID, replicaID, node)
 }
 
-// TestHandleSnapshot_RaftRefusalLeavesNothingDurable pins the two-phase
-// receive. Recording the snapshot in LogDB, raising the log floor to it and
-// queueing state-machine recovery BEFORE raft has decided on the install is
-// unsafe — raft can still refuse one that passed every
-// host check (a sender deposed mid-stream; here, a membership naming more
-// voters than raft's ReadIndex ack word can address, which only raft checks).
-// A refused install would then leave a recorded snapshot, a raised floor and a
-// queued recovery the log could never reach, failing the shard. Under the two-phase
-// receive nothing is durable until raft adopts the install.
+// TestHandleSnapshot_RaftRefusalLeavesNothingDurable checks an install raft refuses leaves no record, floor or queued recovery.
 func TestHandleSnapshot_RaftRefusalLeavesNothingDurable(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)

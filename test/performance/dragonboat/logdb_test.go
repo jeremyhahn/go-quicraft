@@ -16,10 +16,7 @@ package dragonboat_perf
 
 import "testing"
 
-// TestNodeHostConfigUsesTan pins the LogDB the harness benchmarks. Without an
-// explicit factory Dragonboat falls back to its sharded Pebble LogDB, which is
-// not the log store Dragonboat v4 is built around, so the comparison would
-// measure a different storage engine than the one it reports.
+// TestNodeHostConfigUsesTan pins the harness to Dragonboat's Tan LogDB rather than its Pebble fallback.
 func TestNodeHostConfigUsesTan(t *testing.T) {
 	cfg := nodeHostConfig(t.TempDir(), "127.0.0.1:1", tlsCertBundle{})
 	if cfg.Expert.LogDBFactory == nil {

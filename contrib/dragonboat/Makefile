@@ -94,27 +94,7 @@ integration-test:
 _integration-test:
 	$(GOTEST) -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
 
-# ============================================================================
-# CI entry points
-#
-# These are what .github/workflows/ci.yml invokes, and they run on the HOST
-# rather than in the devcontainer because that is what a CI runner does. The
-# `test` and `integration-test` targets above stay as they are: the former is
-# the verbose dev loop, the latter the devcontainer path with tuned UDP
-# buffers.
-#
-# The differences from those targets are deliberate and must not be
-# "harmonised" away, and they match the same reasoning as the root Makefile's
-# ci-integration:
-#   no -v          CI logs are already large.
-#   -p 1           every integration package starts multi-node QUIC clusters
-#                  under -race; running them concurrently starves runner CPU
-#                  and flakes the tests with 30s waits.
-#   -timeout=1800s a shared CI runner is slower than a dev box, and -p 1 makes
-#                  every package share the one deadline.
-#
-# Keep each command byte-identical to the matching step in ci.yml.
-# ============================================================================
+# CI entry points run on the host: no -v, -p 1 (multi-node clusters under -race), 1800s timeout; keep each byte-identical to ci.yml.
 
 # mod-download fetches the module graph up front, up to three times, so one
 # transient proxy error does not fail the CI targets mid-test.
@@ -231,11 +211,7 @@ fmt:
 	fi; \
 	echo "All files formatted correctly"
 
-# ============================================================================
-# CI pipeline
-# Runs fmt, vet, lint, security scans, build, and tests.
-# Requires: golangci-lint, gosec, govulncheck, trivy, nancy
-# ============================================================================
+# CI pipeline: fmt, vet, lint, security scans, build and tests.
 
 .PHONY: ci
 ci: fmt vet lint gosec vuln trivy nancy build test

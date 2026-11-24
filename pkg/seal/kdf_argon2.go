@@ -14,21 +14,7 @@
 
 //go:build !fips
 
-// Argon2id is not a FIPS-approved KDF (SP 800-132 lists PBKDF2), so this file —
-// and with it the golang.org/x/crypto/argon2 dependency — is excluded from a
-// binary built with -tags fips. The registration model matters more than the
-// exclusion: kdfDispatchers is the only route from a KDFVersion to an executable
-// derivation, so a FIPS build cannot derive with Argon2id at all rather than
-// checking a flag and declining to.
-//
-// Reading data sealed under Argon2id is the capability this costs, and it is
-// the same capability FIPS runtime mode gives up: a FIPS-mode process refuses
-// such a blob with ErrKDFNotFIPSApproved, because unsealing re-derives the same
-// wrapping key, and a FIPS build answers ErrKDFUnsupportedVersion. The
-// migration is the same either way — unseal once with a non-FIPS
-// build and re-seal with NewSoftwareStrategyFIPS, which stamps KDFPbkdf2SHA256
-// into SealedRootKey.Metadata and unseals in either build. See
-// docs/seal-barrier/engineering.md ("FIPS: runtime mode vs. build tag").
+// Argon2id is not FIPS-approved, so this file and its dependency are excluded from -tags fips builds.
 
 package seal
 

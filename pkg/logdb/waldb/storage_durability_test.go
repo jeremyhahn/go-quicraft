@@ -23,12 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestOpen_StatFailureMustNotSkipRecovery is a regression test. The
-// shard-directory probe treated EVERY Stat error as "directory absent", so an
-// EACCES/EIO/ELOOP (or a stale NFS handle) skipped recovery: the shard came up
-// with no known segments and nextSegmentID 0, and the first write recreated
-// 000000.log with O_TRUNC, physically erasing the recovered node's term, vote
-// and entries.
+// TestOpen_StatFailureMustNotSkipRecovery: a shard Stat error other than not-exist fails the open instead of skipping recovery.
 func TestOpen_StatFailureMustNotSkipRecovery(t *testing.T) {
 	dir := t.TempDir()
 	ffs := &faultFS{FS: defaultFS()}
@@ -91,11 +86,7 @@ func TestOpen_StatFailureMustNotSkipRecovery(t *testing.T) {
 	}
 }
 
-// TestOpen_SyncsWholeCreatedDirectoryChain is a regression test. Open
-// fsynced only the WAL root's immediate parent, so when MkdirAll created
-// several levels the intermediate directory entries were never durable: a
-// crash after an ACKED SaveState lost the entire tree and the node came back
-// with no term and no vote — a double vote in the acked term.
+// TestOpen_SyncsWholeCreatedDirectoryChain: Open fsyncs every directory level MkdirAll created.
 func TestOpen_SyncsWholeCreatedDirectoryChain(t *testing.T) {
 	const mount = "/mnt/crashfs-chain"
 	// Only the mount point is durable; every level below it is created by Open.
@@ -137,12 +128,7 @@ func TestOpen_SyncsWholeCreatedDirectoryChain(t *testing.T) {
 	}
 }
 
-// TestRemoveEntriesTo_FloorIsMonotonic is a regression test. The
-// compaction floor was assigned unconditionally, so a lower follow-up call
-// (reachable through the caller-overridable snapshot overhead) lowered a floor
-// whose entries were already gone. Reads between the old and new floor then
-// saw a hard log hole (ErrLogGapDetected) instead of ErrCompacted, and the
-// regressed floor was written to the WAL so it survived restart.
+// TestRemoveEntriesTo_FloorIsMonotonic: a lower compaction floor is ignored.
 func TestRemoveEntriesTo_FloorIsMonotonic(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -203,13 +189,7 @@ type failingCloseFile struct {
 
 func (f *failingCloseFile) Close() error { return f.closeErr }
 
-// TestRollbackShard_RotationCloseFailureStillRollsBack is a regression
-// test. When a mid-batch ErrSegmentFull rotation fsynced the checkpoint
-// segment (making THIS batch's earlier records durable) and then failed to
-// close it, rotateSegment dropped the segment handle. rollbackShard saw
-// activeSegment == nil and returned nil without truncating anything, so the
-// failed batch's fsynced records survived and replayed as committed data the
-// caller was told had FAILED.
+// TestRollbackShard_RotationCloseFailureStillRollsBack: rollback truncates even when rotation's Close dropped the segment handle.
 func TestRollbackShard_RotationCloseFailureStillRollsBack(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(8*1024))
@@ -472,17 +452,7 @@ func TestSaveSnapshot_RollsBackPartialRecord(t *testing.T) {
 	}
 }
 
-// TestSaveBootstrap_RollsBackPartialRecord is the SaveBootstrap counterpart of
-// TestSaveSnapshot_RollsBackPartialRecord.
-//
-// SaveBootstrap was the ONE standalone writer with no checkpoint at all —
-// SaveSnapshot, RemoveEntriesTo and RemoveNodeData all take one. A record that
-// failed midway therefore left its already-flushed blocks in the segment while
-// the caller was told the write failed, and nothing ever removed them. The next
-// successful write appends directly on top, so what recovery finds is a torn
-// record with valid data above it in the middle of a live segment: the shape it
-// must fail closed on. One failed SaveBootstrap could cost the whole WAL shard
-// on the next restart.
+// TestSaveBootstrap_RollsBackPartialRecord: a failed SaveBootstrap leaves no partial record in the segment.
 func TestSaveBootstrap_RollsBackPartialRecord(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(1024*1024))
@@ -565,15 +535,7 @@ func TestSaveBootstrap_RollsBackPartialRecord(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_RejectsZeroIndex pins the fresh-node hole in the staleness
-// rule on the DIRECT snapshot path.
-//
-// TestSaveState_ZeroIndexSnapshotIsNotPersisted covers the batch path, which
-// has always required Index > 0. SaveSnapshot only compared against a STORED
-// snapshot, so on a node that had none an index-0 snapshot went straight
-// through: it wrote a WAL record, made GetSnapshot report a snapshot existing
-// at no index, and pinned the segment it landed in against garbage collection
-// until a real snapshot replaced it.
+// TestSaveSnapshot_RejectsZeroIndex: SaveSnapshot refuses an index-0 snapshot on a fresh node.
 func TestSaveSnapshot_RejectsZeroIndex(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -615,25 +577,7 @@ func TestSaveSnapshot_RejectsZeroIndex(t *testing.T) {
 	}
 }
 
-// TestOpen_FailedOpenDoesNotAccumulateEmptySegments covers closeAfterFailedOpen,
-// which had no test of any kind: deleting its removal, and deleting the
-// emptiness guard that protects it, both left the whole suite green.
-//
-// Every Open creates a fresh active segment for each shard whose directory
-// already exists. When a LATER shard then fails the open, the segments the
-// earlier shards just created are brand-new empty files nobody will ever read.
-// Working through a fail-closed condition means opening repeatedly, so without
-// the cleanup each attempt leaves one dead file per shard behind — and those
-// files are not inert: recover() advances nextSegmentID past every segment it
-// observes, so they permanently inflate the ID space of a database that is
-// already in trouble.
-//
-// The directory fsync at the end of that cleanup is deliberately NOT asserted
-// here. It is best-effort by construction — its failure is logged at Debug and
-// swallowed — and correctly so: the file it makes durable is EMPTY, the open
-// failed, and a crash that resurrects the dirent costs one stray empty segment
-// and nothing else. Pinning it would test that a call happens, not that
-// anything is true.
+// TestOpen_FailedOpenDoesNotAccumulateEmptySegments covers closeAfterFailedOpen removing the empty segments a failed open created.
 func TestOpen_FailedOpenDoesNotAccumulateEmptySegments(t *testing.T) {
 	dir := t.TempDir()
 	// Shard IDs 1 and 2 hash to WAL shards 1 and 2, and Open walks shards in
@@ -658,9 +602,7 @@ func TestOpen_FailedOpenDoesNotAccumulateEmptySegments(t *testing.T) {
 	firstDir := filepath.Join(dir, shardDirName(int(first%DefaultShardCount)))
 	secondDir := filepath.Join(dir, shardDirName(int(second%DefaultShardCount)))
 
-	// Sabotage the SECOND shard's next segment: a directory at the path
-	// createSegment will open with O_RDWR is EISDIR for every euid, root
-	// included.
+	// A directory at the second shard's next segment path makes createSegment fail with EISDIR, even as root.
 	blocked := filepath.Join(secondDir, segmentFilename(1))
 	if err := os.Mkdir(blocked, 0700); err != nil {
 		t.Fatalf("sabotage: %v", err)
@@ -729,13 +671,7 @@ func TestOpen_FailedOpenDoesNotAccumulateEmptySegments(t *testing.T) {
 	}
 }
 
-// TestRotateSegment_ClosingSyncFailurePoisons pins the fail-stop on the
-// closing fdatasync segment.Close issues: it is what puts the segment's last
-// sync mark on the medium, and after a failed fdatasync nothing about the
-// file can be established, so rotateSegment poisons the DB on it exactly as
-// it does for a failed Sync. The first Sync of the rotation (the one that
-// acknowledges the records and appends the mark) is allowed through; the
-// closing one fails.
+// TestRotateSegment_ClosingSyncFailurePoisons: a failed closing fdatasync during rotation poisons the DB.
 func TestRotateSegment_ClosingSyncFailurePoisons(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithBlockSize(1024), WithMaxFileSize(8*1024))

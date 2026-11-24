@@ -22,27 +22,14 @@ import (
 	"strings"
 )
 
-// Version is the project version the QuicRaft benchmark records, stamped
-// at build time:
-//
-//	go test -c -tags=benchmark -ldflags "-X github.com/jeremyhahn/go-quicraft/test/performance/benchutil.Version=$(cat VERSION)"
-//
-// which is what the quicraft Dockerfile does from the VERSION file in its
-// build context -- the same file `make build` stamps into the binaries, so a
-// stored result names the release it measured. Empty when the binary was
-// built without the flag; ProjectVersion then reads the file itself.
+// Version is the project version stamped at build time with -ldflags "-X github.com/jeremyhahn/go-quicraft/test/performance/benchutil.Version=$(cat VERSION)"; empty otherwise.
 var Version string
 
 // versionFile is the root of the project's single source of truth for its
 // version (release-versioning.md; the release recipe writes it).
 const versionFile = "VERSION"
 
-// ProjectVersion returns the project version for a benchmark result: the
-// build-time stamp when there is one, otherwise the contents of the VERSION
-// file found by walking up from the working directory -- a bare
-// `go test -tags=benchmark` runs in the package directory, three levels
-// below it. It fails rather than returns a placeholder: a result that
-// records "0.0.0" is a result that cannot be attributed to anything.
+// ProjectVersion returns Version, or the VERSION file found walking up from the working directory, and fails rather than return a placeholder.
 func ProjectVersion() (string, error) {
 	if Version != "" {
 		return Version, nil

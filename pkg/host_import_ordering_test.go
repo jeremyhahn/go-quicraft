@@ -28,28 +28,12 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// An imported snapshot directory must not sort as the OLDEST
-// ---------------------------------------------------------------------------
+// An imported snapshot directory must not sort as the oldest.
 
-// TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots is the
-// regression guard for the import directory's NAME.
-//
-// The snapshot tree is ORDERED by that name, not merely labelled by it:
-// engine.listSnapshotDirs parses "snapshot-<index>" and sorts ascending,
-// gcSnapshotDirs deletes everything but the last maxSnapshotsRetained, and
-// latestSnapshotDir — the recovery fallback — takes the highest. A directory
-// named from a per-host import sequence number starting at 1 would land a
-// disaster-recovery restore onto a node that already had snapshots as the
-// OLDEST directory in the tree: first in line for GC, and never the one the
-// recovery fallback picks, which would prefer a stale but higher-numbered
-// directory over the restore.
-//
-// ImportSnapshot therefore names the directory by the snapshot's own index,
-// matching every other writer (engine.SnapshotSaveDir).
+// TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots: ImportSnapshot names the directory by the snapshot index, as GC and recovery order by it.
 func TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots(t *testing.T) {
 	const shardID, replicaID uint64 = 3, 1
-	// The restore is NEWER than everything already on this node.
+	// The restore is newer than everything on this node.
 	const importIndex uint64 = 900
 	existing := []uint64{100, 200, 300}
 
@@ -94,16 +78,7 @@ func TestImportSnapshot_DirectoryOrdersByIndexAmongExistingSnapshots(t *testing.
 			imported.Filepath, wantDir)
 	}
 
-	// The consequence: among the shard's snapshot directories the restore must
-	// order LAST. Parse the names exactly as engine.listSnapshotDirs does — the
-	// imported directory's own name included, whatever it turned out to be —
-	// so this asserts the ordering GC and the recovery fallback actually see.
-	//
-	// ImportSnapshot now runs snapshot GC once the artifact is recorded, and
-	// the GC retains the last three directories — so the four here become
-	// three, with the OLDEST reclaimed. That the restore is not the one
-	// reclaimed is the property this test is about, and it is asserted
-	// directly below as well as through the ordering.
+	// The restore must order last among the snapshot directories, parsed as engine.listSnapshotDirs does; GC keeps the last three.
 	indices := snapshotDirIndices(t, filepath.Dir(wantDir))
 	const retained = 3 // engine's maxSnapshotsRetained
 	if want := min(len(existing)+1, retained); len(indices) != want {

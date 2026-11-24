@@ -262,9 +262,7 @@ func TestEntryQueue_CloseIsFinal(t *testing.T) {
 	}
 }
 
-// TestEntryQueue_HandOffAfterCloseIsRefused: a batch taken before Close but
-// not yet handed off can no longer be handed off, so Taken's final answer for
-// it — untaken — stays true.
+// TestEntryQueue_HandOffAfterCloseIsRefused checks a batch taken before Close cannot be handed off after it.
 func TestEntryQueue_HandOffAfterCloseIsRefused(t *testing.T) {
 	q := NewEntryQueue[int](4, 16)
 	var at uint64

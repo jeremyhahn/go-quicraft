@@ -128,13 +128,7 @@ func filesContaining(root string, needle []byte) []string {
 	return found
 }
 
-// TestRecoverSnapshot_DecryptsIntoAnUnnamedScratch: recovering an encrypted
-// snapshot must never put a NAMED plaintext copy of the state machine on disk.
-// The scratch it decrypts into is unlinked before the first plaintext byte is
-// written, and while RecoverFromSnapshot runs no file anywhere in the snapshot
-// tree holds the plaintext. A named scratch — removed only after recovery —
-// is a complete, readable, fsynced copy of the state machine that a power loss
-// or SIGKILL leaves at rest.
+// TestRecoverSnapshot_DecryptsIntoAnUnnamedScratch verifies no named plaintext copy exists while RecoverFromSnapshot runs.
 func TestRecoverSnapshot_DecryptsIntoAnUnnamedScratch(t *testing.T) {
 	tmpDir := t.TempDir()
 	stopC := make(chan struct{})
@@ -286,13 +280,7 @@ func (fsys removeFailScratchFS) Remove(name string) error {
 	return fsys.osScratchFS.Remove(name)
 }
 
-// TestCreateAnonymousScratch_FailedUnlinkFails: a scratch whose immediate
-// unlink fails is never handed out — plaintext decrypted into it would keep a
-// name until Close, and a SIGKILL or power loss before then leaves it at rest.
-// The call fails with ErrScratchNotUnlinked, carrying the refused unlink. The
-// name is removed once more, best effort: reclaimed, it leaves nothing and is
-// not counted; surviving that too, it is EMPTY and counted on
-// StaleDecryptSweepFailures for the sweep.
+// TestCreateAnonymousScratch_FailedUnlinkFails verifies a scratch whose unlink fails returns ErrScratchNotUnlinked.
 func TestCreateAnonymousScratch_FailedUnlinkFails(t *testing.T) {
 	t.Run("name_reclaimed", func(t *testing.T) {
 		dir := t.TempDir()

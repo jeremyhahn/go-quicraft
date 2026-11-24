@@ -55,13 +55,7 @@ func newUnreadableLogPeer(t *testing.T, shardID, replicaID uint64) (*raft.Peer, 
 	return peer, lr
 }
 
-// TestStepWorker_GetUpdateErrorLatchesShard: a GetUpdate error leaves the Peer
-// in a state the engine cannot reason about — the committed entries it owes the
-// state machine cannot be read — so the shard fails closed exactly like an
-// apply or recovery failure. The latch trips, OnShardFailed fires once (engine
-// callback and EventListener alike) with the log's own error, later cycles skip
-// the shard instead of reporting again, and another shard on the same step
-// worker keeps running.
+// TestStepWorker_GetUpdateErrorLatchesShard verifies a GetUpdate error fails the shard closed.
 func TestStepWorker_GetUpdateErrorLatchesShard(t *testing.T) {
 	ws := NewWorkSignal(1)
 	commitC := make(chan *commitItem, 16)

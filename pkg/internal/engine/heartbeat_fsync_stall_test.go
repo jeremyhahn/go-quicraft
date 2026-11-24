@@ -59,12 +59,7 @@ func (f *stalledFollower) sent() []proto.Message {
 	return out
 }
 
-// TestStepWorker_LeaderSurvivesQuorumFollowerFsyncStall holds a quorum of
-// followers in a bounded WAL fsync stall (commitPending set, the in-flight
-// update never committed) for several election timeouts. The followers
-// keep answering heartbeats from the free-order drain, so CheckQuorum keeps
-// the leader in office, and no reply acknowledges the entry that the stall
-// keeps from being durable (#390).
+// TestStepWorker_LeaderSurvivesQuorumFollowerFsyncStall checks the leader keeps office while a follower quorum stalls in WAL fsync, and nothing acknowledges the undurable entry.
 func TestStepWorker_LeaderSurvivesQuorumFollowerFsyncStall(t *testing.T) {
 	stopC := make(chan struct{})
 	defer close(stopC)

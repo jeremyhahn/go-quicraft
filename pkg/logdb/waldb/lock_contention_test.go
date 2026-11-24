@@ -42,17 +42,7 @@ func (f *slowSyncFile) Sync() error {
 	return f.File.Sync()
 }
 
-// TestReadsDoNotBlockOnFsync proves reads are served while a concurrent
-// SaveState is stalled inside its fsync.
-//
-// walShard.mu guards the segment file and is held by SaveState across
-// write -> fsync -> commit, which is load-bearing: releasing it between the
-// durable write and a rollback would let a concurrent same-shard batch commit
-// past this batch's checkpoint, and the rollback would then truncate the
-// segment and erase acknowledged records. Readers taking that SAME mutex would
-// make every read for every raft group on the shard wait out the fsync, so the
-// in-memory maps readers consult are guarded separately by dataMu, which
-// SaveState takes only for its brief Phase 3 commit.
+// TestReadsDoNotBlockOnFsync checks reads, guarded by dataMu, are served while SaveState holds walShard.mu through its fsync.
 func TestReadsDoNotBlockOnFsync(t *testing.T) {
 	slow := &slowSyncFS{
 		FS:      osFS{},
@@ -122,10 +112,7 @@ func TestReadsDoNotBlockOnFsync(t *testing.T) {
 			"shared between the segment write path and the in-memory read path")
 	}
 
-	// The commit must NOT be visible yet: the writer has not passed Phase 3.
-	// ReadState must also SUCCEED here — tolerating an error would let any
-	// change that makes a concurrent read fail mid-batch silently turn this
-	// check into a no-op.
+	// The commit is not visible yet, and ReadState must succeed.
 	state, _, err := db.ReadState(1, 1)
 	if err != nil {
 		// Release the stalled writer first: failing while it still holds

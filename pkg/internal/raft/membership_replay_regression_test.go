@@ -20,19 +20,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// membership.apply's replay guard
-// ---------------------------------------------------------------------------
-//
-// The guard skips a config change whose log index is at or below the current
-// configChangeID. It is reached on every restart that recovers a snapshot:
-// CompactionOverhead (default 5000) deliberately RETAINS entries below the
-// snapshot index, so Peer.replayConfigChangesTo re-offers config changes the
-// snapshot membership already accounts for.
-//
-// Removing the guard is not a harmless double-apply. configChangeID REGRESSES
-// to the replayed entry's index, and a replayed UpdateWitnessPolicy reverts the
-// shard's replicated policy to a superseded value.
+// membership.apply skips a config change at or below configChangeID; snapshot restarts replay retained entries the snapshot already covers.
 
 // TestMembershipApply_ReplayGuard_SkipsAlreadyAppliedChanges drives the guard
 // directly: three offers at, below, and above the current configChangeID.
@@ -43,9 +31,7 @@ func TestMembershipApply_ReplayGuard_SkipsAlreadyAppliedChanges(t *testing.T) {
 		MaxWitnesses:   7,
 	})
 
-	// BELOW the marker: a retained entry the snapshot membership already
-	// covers. Applying it would add a member the configuration removed long
-	// ago and would drag configChangeID backwards.
+	// Below the marker: already covered by the snapshot membership.
 	if err := m.apply(proto.ConfigChange{
 		Type:      proto.AddNode,
 		ReplicaID: 4,
@@ -67,8 +53,7 @@ func TestMembershipApply_ReplayGuard_SkipsAlreadyAppliedChanges(t *testing.T) {
 			m.configChangeID)
 	}
 
-	// EQUAL to the marker: the boundary case. This is the entry the snapshot
-	// membership was built from, retained below the compaction floor.
+	// Equal to the marker: the entry the snapshot membership was built from.
 	if err := m.apply(proto.ConfigChange{
 		Type:                       proto.UpdateWitnessPolicy,
 		MaxWitnesses:               1,
@@ -91,8 +76,7 @@ func TestMembershipApply_ReplayGuard_SkipsAlreadyAppliedChanges(t *testing.T) {
 		t.Fatalf("configChangeID moved to %d on a skipped replay", m.configChangeID)
 	}
 
-	// ABOVE the marker: genuinely new, must still apply. Without this the test
-	// would also pass against an apply() that skips everything.
+	// Above the marker: new, so it must apply.
 	if err := m.apply(proto.ConfigChange{
 		Type:      proto.AddNode,
 		ReplicaID: 4,
@@ -108,10 +92,7 @@ func TestMembershipApply_ReplayGuard_SkipsAlreadyAppliedChanges(t *testing.T) {
 	}
 }
 
-// TestPeerReplay_GuardStopsSnapshotCoveredEntriesFromReverting reaches the
-// guard the way production does: a restart that recovered a snapshot whose
-// membership is at configChangeID 5, over a log that still HOLDS the
-// superseded policy change at index 2 (CompactionOverhead retains it).
+// TestPeerReplay_GuardStopsSnapshotCoveredEntriesFromReverting replays a superseded policy change below a snapshot at configChangeID 5.
 func TestPeerReplay_GuardStopsSnapshotCoveredEntriesFromReverting(t *testing.T) {
 	entries := []proto.Entry{
 		{Index: 1, Term: 1},
@@ -123,8 +104,7 @@ func TestPeerReplay_GuardStopsSnapshotCoveredEntriesFromReverting(t *testing.T) 
 		{Index: 6, Term: 1},
 	}
 	lr := newTestLogReader(entries, proto.State{Term: 1, Commit: 6})
-	// The recovered snapshot membership already reflects the LATER policy
-	// change (MaxWitnesses 7) that superseded index 2.
+	// The snapshot membership already has the later policy (MaxWitnesses 7).
 	lr.membership = proto.Membership{
 		Addresses:      map[uint64]string{1: "a1", 2: "a2", 3: "a3"},
 		ConfigChangeID: 5,
@@ -161,22 +141,12 @@ func TestPeerReplay_GuardStopsSnapshotCoveredEntriesFromReverting(t *testing.T) 
 // P4: SetProcessedIndex must fold the SM-skipped window's config changes
 // ---------------------------------------------------------------------------
 
-// An on-disk state machine reports a durable lastApplied ahead of the
-// snapshot index, so the engine skips re-applying that window. Commit-time
-// membership semantics mean those entries never reach processConfigChanges,
-// which is the ONLY other place membership is applied. If SetProcessedIndex
-// does not fold them in here, nothing ever does, and this replica comes up
-// computing quorum over a stale voting set — exactly what the function's own
-// doc comment warns about.
-//
-// The two pre-existing tests only assert the NEGATIVE (an UNCOMMITTED change
-// must not be folded), so deleting the replay call broke no test at all.
+// SetProcessedIndex must fold committed config changes in the window an on-disk state machine already applied; nothing else will.
 func TestSetProcessedIndex_FoldsCommittedConfigChangeInSkippedWindow(t *testing.T) {
 	entries := []proto.Entry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
-		// COMMITTED AddNode(4): inside the window the state machine already
-		// applied and the engine will therefore never re-deliver.
+		// Committed AddNode(4) inside the already-applied window.
 		{Index: 3, Term: 1, Type: proto.EntryConfigChange, Cmd: marshalConfigChange(t,
 			proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "a4"})},
 		{Index: 4, Term: 1},

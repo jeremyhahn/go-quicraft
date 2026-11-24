@@ -127,18 +127,7 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		{"zero batch max size", func(c *Config) { c.SendBatchMaxSize = 0 }, ErrInvalidSendBatchMaxSize},
 		{"zero decompressed size", func(c *Config) { c.MaxDecompressedSize = 0 }, ErrInvalidMaxDecompressedSize},
 		{"decompressed size exceeds max frame size", func(c *Config) { c.MaxDecompressedSize = MaxFrameSize + 1 }, ErrInvalidMaxDecompressedSize},
-		// Below the frame size is the dangerous direction and the reason the
-		// value is pinned. MaxFrameSize is a compile-time constant and is what
-		// the SEND path admits against (messageFrameError/sendableGroup), so a
-		// receiver configured lower rejects frames every peer in the cluster
-		// considers valid. The sender treats that as a frame-level failure: it
-		// drops the batch and KEEPS the connection (deliberately, so a
-		// wire-version mismatch cannot become a dial storm), which leaves this
-		// replica unable to replicate with nothing but a 10s-rate-limited
-		// warning and a "peer_rejected" drop counter to show for it. Nothing is
-		// bought in exchange — a peer that wants this node to buffer MaxFrameSize
-		// bytes can just send an uncompressed frame of that size — so a lower
-		// decompression ceiling is pure downside and must fail at startup.
+		// A receive limit below MaxFrameSize would refuse frames the send path admits.
 		{"decompressed size below max frame size", func(c *Config) { c.MaxDecompressedSize = MaxFrameSize - 1 }, ErrInvalidMaxDecompressedSize},
 		{"zero MaxIncomingConnections", func(c *Config) { c.MaxIncomingConnections = 0 }, ErrInvalidMaxIncomingConnections},
 		{"negative MaxIncomingConnections", func(c *Config) { c.MaxIncomingConnections = -1 }, ErrInvalidMaxIncomingConnections},

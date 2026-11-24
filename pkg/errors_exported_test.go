@@ -25,10 +25,7 @@ import (
 	"testing"
 )
 
-// unreferencedExportedErrors lists exported Err* values in errors.go that
-// nothing in pkg returns, each with a one-line reason. An entry is dead API
-// to wire or remove before v1.0.0. The test fails when an entry becomes
-// live or is no longer declared, so the list cannot go stale.
+// unreferencedExportedErrors lists exported Err* values nothing in pkg returns, each with a reason; the test fails when one goes live or is removed.
 var unreferencedExportedErrors = map[string]string{
 	"ErrShardNotStarted":       "listed in temporaryErrors, but every registered-but-not-started path returns ErrShardNotReady; returning this from one of them would split one state over two errors",
 	"ErrSessionLimitExceeded":  "declared for the public API; the session manager returns its own internal sentinel and Host maps a registration refusal to a result code",
@@ -156,16 +153,7 @@ func usedIdentifiers(t *testing.T) (tree, local map[string]bool, decls []exporte
 	return tree, local, decls
 }
 
-// TestExportedErrors_DocumentedAndReferenced lists every exported Err* value
-// in errors.go by parsing the file (no hand-written list to drift) and fails
-// unless each one has a doc comment and is live, or is allowlisted in
-// unreferencedExportedErrors with a reason. A value is live when a non-test
-// file of package quicraft references it outside the var declarations of
-// errors.go (returned, wrapped, or matched by a typed error's Is method), or
-// when it re-exports a sentinel that a non-test file of the pkg tree
-// references outside its declaration: callers match such a value with
-// errors.Is against what the lower package returns. The re-export check is
-// by name, so it is an approximation where two packages share a name.
+// TestExportedErrors_DocumentedAndReferenced requires every exported Err* value in errors.go to be documented and referenced (directly or as a re-exported sentinel), or allowlisted.
 func TestExportedErrors_DocumentedAndReferenced(t *testing.T) {
 	tree, local, decls := usedIdentifiers(t)
 	if len(decls) == 0 {

@@ -46,16 +46,7 @@ func (b *tenantBarrier) setSealed(v bool) {
 	b.mu.Unlock()
 }
 
-// setTestShardBarrier points the pool at a per-shard barrier resolver, but
-// ONLY for a barrier that exists.
-//
-// A resolver that returns nil is NOT the same deployment as no resolver at
-// all: with per-shard barriers configured and no process-wide fallback, an
-// unresolved shard fails closed (ErrShardBarrierUnresolved) rather than being
-// written in plaintext beside encrypted tenants. These fixtures model the
-// plaintext deployment — no resolver, no barrier — so installing a
-// nil-returning resolver would make them assert the unresolved-shard error
-// instead of whatever the test is actually about.
+// setTestShardBarrier installs a per-shard resolver only for an existing barrier; a nil-returning resolver fails closed.
 func setTestShardBarrier(p *snapshotPool, barrier SnapshotBarrier) {
 	if barrier == nil {
 		return
@@ -126,12 +117,7 @@ func recoverTestSnapshot(t *testing.T, baseDir string, ldb *snapshotTestLogDB,
 	return ss.state.Load(), res.err
 }
 
-// TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier is the
-// fail-closed mirror of Host.StartShard. An artifact recorded with Epoch > 0
-// whose barrier is absent or sealed must not fall through the decrypt
-// condition silently, leaving recoverPath the ENCRYPTED file and handing the
-// raw ciphertext to RecoverFromSnapshot with no error and no log. Recovery
-// must fail so the leader re-sends instead.
+// TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier: an encrypted artifact with an absent or sealed barrier fails recovery.
 func TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -173,11 +159,7 @@ func TestSnapshotPool_RecoverSnapshot_FailsClosedWithoutBarrier(t *testing.T) {
 	}
 }
 
-// TestSnapshotPool_RecoverSnapshot_UsesArtifactCompression verifies the reader
-// chain is built from the ARTIFACT's recorded compression, not from the
-// recovering node's own config. Both directions matter: a node whose config
-// says Snappy must still read an uncompressed artifact verbatim, and a node
-// whose config says NoCompression must still decompress a Snappy artifact.
+// TestSnapshotPool_RecoverSnapshot_UsesArtifactCompression: the reader chain follows the artifact's recorded compression, not node config.
 func TestSnapshotPool_RecoverSnapshot_UsesArtifactCompression(t *testing.T) {
 	cases := []struct {
 		name      string

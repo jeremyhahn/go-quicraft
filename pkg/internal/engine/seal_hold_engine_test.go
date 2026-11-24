@@ -6,10 +6,7 @@ import (
 	"testing"
 )
 
-// TestEngineSetSealHold pins that Engine.SetSealHold installs the hold on
-// EVERY commit worker, not only some, and that a zero SealHold restores the
-// fail-the-shard behaviour on every worker. A shard on a worker the hold
-// missed would latch failed on a sealed barrier.
+// TestEngineSetSealHold pins that SetSealHold installs or clears the hold on every commit worker.
 func TestEngineSetSealHold(t *testing.T) {
 	cfg := newTestHostConfig()
 	cfg.NumWorkers = 4

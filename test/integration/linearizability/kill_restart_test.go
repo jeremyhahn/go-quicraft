@@ -16,23 +16,7 @@
 
 package linearizability_test
 
-// Kill-based restart cases (#1165). Every other restart in this suite stops a
-// host with Close, which flushes and syncs the WAL before it returns, so none
-// of them proves that an entry acknowledged to a client survives an abrupt
-// process death. These cases run the node in a child process (this test
-// binary, re-executed with TestKillRestart_Child selected), with WAL fsync
-// ON, SIGKILL it, reopen the same directories and check every acknowledged
-// entry is still there.
-//
-// The child appends one line per acknowledged proposal to an ack file and
-// fsyncs it before it does anything else, so every line the parent reads
-// after the kill names a proposal the engine had acknowledged. A proposal in
-// flight when the kill lands may be present or absent after the restart;
-// it must never be corrupt.
-//
-// SIGKILL keeps the page cache: these cases prove the engine acknowledges
-// only what it has written and that recovery replays it, not that the
-// fdatasync reached the platter.
+// Kill-based restart cases: the node runs in a child process (TestKillRestart_Child) with WAL fsync on, is SIGKILLed and reopened, and every entry it acknowledged (fsynced to an ack file) must survive; in-flight ones may be absent but never corrupt. The page cache survives SIGKILL.
 
 import (
 	"bytes"
@@ -178,11 +162,7 @@ func killChildDie(format string, args ...any) {
 	os.Exit(3)
 }
 
-// killProposers gates the child's proposers. Before the kill the parent asks
-// the child to freeze its ack record: a proposal that returns after the
-// freeze is never recorded as acknowledged, so the recorded ack set is
-// closed. The proposers keep submitting fresh keys after the freeze, so the
-// WAL stays busy until the SIGKILL.
+// killProposers gates the child's proposers: after the parent freezes the ack record no further acknowledgement is recorded, while proposers keep the WAL busy until the kill.
 type killProposers struct {
 	mu     sync.Mutex
 	frozen bool
@@ -195,15 +175,7 @@ func (p *killProposers) freeze() {
 	p.mu.Unlock()
 }
 
-// killWALBarrier holds the mid-batch child's WAL inside a segment write.
-// It is armed only after the ack record is frozen. The first write after
-// that which carries a proposal's put command writes the first half of its
-// bytes to the segment, reports the proposal's key on held, and never
-// returns. Every later write that carries a put blocks the same way. From
-// then on the engine can persist, commit and acknowledge nothing, so the
-// parent's SIGKILL lands with that proposal submitted, unacknowledged and
-// half-written in the active segment, whatever the proposers and the
-// handshake do in the meantime.
+// killWALBarrier, armed after the ack freeze, half-writes the first segment write carrying a put, reports its key on held and never returns; later put writes block too.
 type killWALBarrier struct {
 	armed atomic.Bool
 	once  sync.Once
@@ -327,14 +299,7 @@ func (f *killWALFile) PreAllocate(size int64) error {
 	return nil
 }
 
-// killViolationWatch forwards the apply-order violations the child's state
-// machines record (helpers_test.go's sink, which only a t.Cleanup would
-// otherwise report and a SIGKILLed child never runs) to the parent: each is
-// written to the ack file and the child exits non-zero at once.
-//
-// It also forwards the child test's own failure: a t.Error from any of the
-// child's goroutines (or a helper given its t) only marks the test failed,
-// and the SIGKILL would otherwise discard that mark.
+// killViolationWatch forwards the child's apply-order violations and test failure to the parent through the ack file and exits the child non-zero.
 type killViolationWatch struct {
 	t        testing.TB
 	mu       sync.Mutex
@@ -430,9 +395,7 @@ func (b *blockingSnapshotKV) SaveSnapshot(ctx context.Context, w io.Writer, stop
 	return nil
 }
 
-// TestKillRestart_Child is the child process entry point. It opens one host
-// on the directories its spec names, starts the shard, runs its mode and
-// never returns or calls Close: the parent ends it with SIGKILL.
+// TestKillRestart_Child is the child process entry point: it opens one host on its spec's directories, starts the shard and runs its mode until SIGKILLed.
 func TestKillRestart_Child(t *testing.T) {
 	if os.Getenv(killRestartChildEnv) != "1" {
 		t.Skip("child process entry point; driven by the TestKillRestart cases")
@@ -652,9 +615,7 @@ func startKillChild(t *testing.T, spec killChildSpec, name string) *killChild {
 
 	cmd := exec.CommandContext(t.Context(), os.Args[0],
 		"-test.run=^TestKillRestart_Child$", "-test.count=1", "-test.timeout=30m")
-	// A race report must stop the child at once: a SIGKILLed child never
-	// reaches the exit that -race would otherwise fail. Options already in
-	// GORACE are kept; the later halt_on_error wins.
+	// Halt on the first race report, since a SIGKILLed child never reaches -race's exit; existing GORACE options are kept.
 	gorace := "halt_on_error=1"
 	if g := os.Getenv("GORACE"); g != "" {
 		gorace = g + " " + gorace
@@ -696,10 +657,7 @@ func (c *killChild) logTail() string {
 	return string(b)
 }
 
-// logFailure scans the child's whole log for a report that a SIGKILL would
-// otherwise hide: a race detector report, a panic, a Go runtime fatal error
-// or a failed child test. It returns the log from the first such line
-// (capped at 16 KiB), or "" if there is none.
+// logFailure returns the child's log from the first race report, panic, fatal error or failed test (capped at 16 KiB), or "".
 func (c *killChild) logFailure() string {
 	b, err := os.ReadFile(c.logPath)
 	if err != nil {
@@ -771,11 +729,7 @@ func (c *killChild) waitLines(t *testing.T, desc string, pred func(lines []strin
 	}
 }
 
-// kill SIGKILLs the child and asserts it died by that signal: an exit code
-// of -1 and a SIGKILL wait status, never a clean or error exit. It fails the
-// test on any apply-order violation the child reported and returns the key
-// of the proposal the child's WAL barrier held mid-write at the kill, or ""
-// when the child has no barrier.
+// kill SIGKILLs the child, asserts it died by that signal, fails on reported apply-order violations and returns the key its WAL barrier held, or "".
 func (c *killChild) kill(t *testing.T, name string) string {
 	t.Helper()
 	// Pre-kill handshake: the child freezes its ack record, in batch mode
@@ -894,13 +848,7 @@ func singleReplicaSpec(t *testing.T, mode string) killChildSpec {
 	}
 }
 
-// verifySingleReplicaRestart reopens the killed child's directories in this
-// process and checks every acknowledged key reads back with its value, and
-// that every other key the state machine holds (a proposal in flight at the
-// kill) carries its own value.
-// killReadBack reads key linearizably from the restarted single replica,
-// retrying while the new leader has not yet committed an entry in its term
-// (ReadIndex is refused until then).
+// killReadBack reads key linearizably from the restarted single replica, retrying until the new leader has committed in its term.
 func killReadBack(h *quicraft.Host, key string) (interface{}, error) {
 	deadline := time.Now().Add(killChildWait)
 	for {
@@ -1045,12 +993,7 @@ func TestKillRestart_AfterAcks(t *testing.T) {
 	t.Logf("%s: wall time %v", name, time.Since(start).Round(time.Millisecond))
 }
 
-// TestKillRestart_MidBatch kills a single-replica child while several
-// concurrent proposers keep proposals in flight. The child's WAL barrier
-// holds a segment write that carries an unacknowledged proposal, with half
-// its bytes written, and the parent kills only after the barrier reports
-// it: the kill lands inside a batch's WAL write, before its
-// acknowledgements.
+// TestKillRestart_MidBatch kills a single-replica child while its WAL barrier holds an unacknowledged proposal half-written.
 func TestKillRestart_MidBatch(t *testing.T) {
 	const name = "mid-batch"
 	start := time.Now()
@@ -1058,9 +1001,7 @@ func TestKillRestart_MidBatch(t *testing.T) {
 	spec.Workers = 8
 	child := startKillChild(t, spec, name)
 	child.waitLines(t, "60 acks recorded", func(l []string) bool { return countAcks(l) >= 60 })
-	// kill freezes the ack record first; the child answers only once its WAL
-	// barrier holds a proposal's write half-done, and the barrier never
-	// releases it, so the SIGKILL lands inside that write.
+	// kill freezes the ack record; the child answers once its barrier holds a half-written proposal, so the SIGKILL lands inside that write.
 	held := child.kill(t, name)
 	if held == "" {
 		t.Fatalf("%s: the child's WAL barrier reported no held write before the kill", name)
@@ -1242,15 +1183,7 @@ func killReplicaData(c *testCluster, idx int) map[string]string {
 	return maps.Clone(kv.data)
 }
 
-// TestKillRestart_3Node_Linearizable runs a 3-replica shard, two replicas in
-// this process and the third in a child, under client load. The child is
-// SIGKILLed (as leader when leadership can be moved to it, else as a
-// follower), restarted as a new child on the same directories while the load
-// keeps running, and then the history must be linearizable and the restarted
-// replica's state machine must match the survivors'. The clients have no
-// fixed window: the pre-kill, down and post-restart phases each end only once
-// they have recorded successful writes and reads issued inside that phase,
-// and the restarted replica must hold values written after its restart.
+// TestKillRestart_3Node_Linearizable SIGKILLs one replica of a 3-replica shard (in a child) under load and restarts it; the history must be linearizable and the restarted state match the survivors', with every phase recording its own writes and reads.
 func TestKillRestart_3Node_Linearizable(t *testing.T) {
 	const (
 		name       = "3node"

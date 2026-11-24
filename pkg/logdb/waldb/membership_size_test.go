@@ -10,12 +10,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// The write side refuses any membership map past maxMembershipMapEntries and
-// any bootstrap DataDir past maxBootstrapDataDirLen with
-// ErrMembershipTooLarge, because replay rejects such a record as corruption.
-// These tests pin that every capped map is refused through every write path,
-// that a refusal writes nothing (the previous record survives, also across a
-// reopen), and that a record exactly at every cap is accepted and round-trips.
+// Every write path refuses an over-cap membership map or DataDir with ErrMembershipTooLarge, writing nothing, and accepts a record exactly at each cap.
 
 const (
 	membershipSizeShard   = 7

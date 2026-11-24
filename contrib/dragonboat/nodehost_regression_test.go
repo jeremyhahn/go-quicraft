@@ -59,12 +59,7 @@ func newTestNodeHostWithConfig(t *testing.T, nhConfig dbConfig.NodeHostConfig) *
 	return nh
 }
 
-// ---------------------------------------------------------------------------
-// Release must wait for the bridge goroutines to exit before
-// releasing (and thereby recycling) the inner pooled RequestState. A
-// stale bridge selecting on the recycled channel could otherwise steal a
-// successor request's result.
-// ---------------------------------------------------------------------------
+// Release waits for the bridge goroutines before recycling the pooled RequestState.
 
 func TestRequestState_Release_WaitsForBridgeGoroutines(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
@@ -495,13 +490,7 @@ func TestNodeHost_NotLeaderSurfacesAsShardNotReady(t *testing.T) {
 	session := nh.GetNoOPSession(7)
 	_, err := nh.Propose(session, []byte("cmd"), time.Second)
 	if err == nil {
-		// This is a failure, not a t.Skip, which would disarm the whole test:
-		// the ONE outcome that makes the three assertions below unreachable
-		// must not be treated as a reason not to run them. And the
-		// skipped outcome is not a benign "path not exercised" -- replica 2
-		// was started with join=true, so it is in no committed configuration
-		// and has no leader. A proposal it ACCEPTS is a raft safety defect on
-		// its own, well before anything about the error mapping matters.
+		// A failure, not a skip: a joining replica with no leader must not accept a proposal.
 		t.Fatal("Propose succeeded on a joining, leaderless replica: a replica " +
 			"in no committed configuration must never accept a proposal")
 	}
@@ -682,25 +671,7 @@ func TestShardInfo_PendingIsNothingAppliedYet(t *testing.T) {
 // ResultC must aggregate committed+applied when NotifyCommit is on
 // ---------------------------------------------------------------------------
 
-// TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffered
-// deterministically targets the commit-notification race window, instead of
-// relying on production goroutine scheduling the way a consumer that
-// calls ResultC immediately after Propose does (TestIntegration_DB_NotifyCommit_ProposalCommitted; so whether the commit
-// notification has actually landed on the source channel by the time the
-// aggregator's select runs is a scheduling accident -- under mutation testing
-// it catches a relay-bridge design in only ~2% of individual runs).
-//
-// Each iteration busy-waits until BOTH rs.inner.CommittedC() and
-// rs.CompletedC already have a buffered value -- i.e. the source-of-truth
-// channels are populated with zero remaining asynchronous hop -- before
-// ResultC is called for the first time. A relay bridge reading a separate,
-// not-yet-relayed output channel would need its own extra goroutine
-// schedule to catch up and could still lose the commit notification here;
-// reading the source directly cannot. Under mutation testing a relay bridge
-// fails ~39% of iterations; the test loops enough iterations in one run
-// (<1-in-10000 chance of a false pass against a relay bridge)
-// that a single `go test` invocation reliably catches a regression without
-// depending on an external -count flag.
+// TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffered checks ResultC reports the commit when both source channels are already buffered.
 func TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffered(t *testing.T) {
 	cfg := testNodeHostConfig(t.TempDir())
 	cfg.NotifyCommit = true
@@ -723,12 +694,7 @@ func TestRequestState_ResultC_OrdersCorrectlyWhenBothNotificationsAlreadyBuffere
 			runtime.Gosched()
 		}
 
-		// Both source channels are buffered now; ResultC is called for the
-		// very first time only after this point, so its aggregator
-		// goroutine (and, in a relay-bridge design, the separate
-		// commit-bridge goroutine) starts from a cold, unscheduled state
-		// racing against already-ready data -- exactly the scenario that
-		// can drop the commit notification.
+		// Both source channels are buffered before ResultC is first called.
 		resultC := rs.ResultC()
 		if resultC != rs.ResultC() {
 			t.Fatalf("iteration %d: ResultC must return the same aggregate channel on every call", i)
@@ -843,13 +809,7 @@ func TestNodeHost_RequireNoOPSessionOnDisk_ReportsLookupFailure(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Every timeout-taking async API rejects a timeout that is zero, negative or
-// shorter than one RTT with ErrTimeoutTooSmall, mirroring dragonboat's
-// zero-tick rejection in its propose, read, snapshot and config-change
-// requests. A negative timeout used to wrap through uint64 into an enormous
-// tick count and pass, and the membership requests never checked at all.
-// ---------------------------------------------------------------------------
+// Timeout-taking async APIs reject a zero, negative or sub-RTT timeout with ErrTimeoutTooSmall.
 
 func TestNodeHost_CheckTimeout(t *testing.T) {
 	nh := &NodeHost{config: dbConfig.NodeHostConfig{RTTMillisecond: 100}}
@@ -969,15 +929,7 @@ func TestNodeHost_TimeoutTakingAPIsRejectInvalidTimeout(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// writeRemovalMarker makes the marker durable end to end: the marker file,
-// the marker directory's entry for it, AND NodeHostDir's entry for the marker
-// directory. Without the last fsync a power loss can drop the freshly created
-// marker directory, and with it the record that a replica ID was retired, so
-// the ID could be started again on a non-persistent LogDB. A crash cannot be
-// simulated with os.Stat, so the directory fsyncs are recorded and each one
-// checks that what it makes durable already exists.
-// ---------------------------------------------------------------------------
+// writeRemovalMarker fsyncs the marker file, its directory and NodeHostDir's entry for that directory.
 
 func TestWriteRemovalMarker_SyncsParentOfMarkerDir(t *testing.T) {
 	for _, preexisting := range []bool{false, true} {

@@ -38,28 +38,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// ---------------------------------------------------------------------------
-// Raft timing, and the election budgets derived from it
-//
-// Every election budget below is DERIVED from the shard configuration these
-// tests actually start, and the config builders are written in terms of the
-// same constants: testHostConfig reads testRTTMillisecond, and testShardConfig
-// leaves ElectionRTT to config.Config.SetDefaults, which is the value
-// testElectionRTT names rather than restates. Neither side can be changed
-// without the other following, and TestBudgetsDescribeTheClusterTheyBudgetFor
-// pins that they still agree.
-//
-// A budget written as a literal is a value that is not pinned treated as
-// though it were — a recurring flake class. Elsewhere the unpinned value is a
-// leader index or a replica ID; here it is the shard configuration the
-// budget is supposed to describe. A literal cannot follow a config change and
-// gives no signal when it stops matching; a derivation cannot drift at all.
-//
-// The derivation is the one contrib/dragonboat and test/integration/e2e use,
-// mirrored on purpose: the suites
-// keep separate copies because each owns its own helpers and its own config
-// builders; the shape is shared, the constants are not.
-// ---------------------------------------------------------------------------
+// Raft timing and election budgets: every budget derives from the constants the config builders use, pinned by TestBudgetsDescribeTheClusterTheyBudgetFor.
 
 // defaultTimeout is the standard budget for a single Raft operation that is
 // NOT an election: a proposal round trip, a lookup, a membership query. It is
@@ -67,13 +46,7 @@ import (
 // is waiting for an election.
 const defaultTimeout = 15 * time.Second
 
-// testRTTMillisecond is the Raft tick interval, in milliseconds, that
-// testHostConfig gives every host in this suite. One tick is one
-// RTTMillisecond, so every timeout the engine expresses in ticks is this many
-// milliseconds per tick.
-//
-// It is the harness mode's tick (harnessRTTMillisecond): 50ms with the WAL
-// fsync skipped, 500ms in WAL-sync mode.
+// testRTTMillisecond is this suite's tick in milliseconds (harnessRTTMillisecond: 50ms without WAL fsync, 500ms in WAL-sync mode).
 var testRTTMillisecond = harnessRTTMillisecond(walSyncMode)
 
 // walSyncEnv names the switch that selects the harness's WAL-sync mode. With
@@ -112,22 +85,13 @@ func harnessRTTMillisecond(walSync bool) uint64 {
 	return noSyncRTTMillisecond
 }
 
-// testElectionRTT is the number of ticks a follower waits without hearing from
-// a leader before it stands for election.
-//
-// testShardConfig does not set ElectionRTT, so Config.SetDefaults supplies it.
-// This reads THAT value rather than restating it, so the budgets below follow
-// the default if it ever moves.
+// testElectionRTT is the election timeout in ticks, read from Config.SetDefaults since testShardConfig leaves it unset.
 const testElectionRTT = config.DefaultElectionRTT
 
 // raftTick is one Raft tick in wall-clock time.
 var raftTick = time.Duration(testRTTMillisecond) * time.Millisecond
 
-// The election budgets are test/electionbudget's, derived from this suite's
-// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
-// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
-// live in that package; the pin test below is the half that cannot move,
-// because it reads THIS suite's config builders.
+// The election budgets come from test/electionbudget, derived from testElectionRTT and testRTTMillisecond.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -138,12 +102,7 @@ var (
 // the suites' log lines keep naming the round count.
 const coldStartElectionRounds = electionbudget.ColdStartRounds
 
-// membershipTimeout is the budget for a membership change to LAND: to be
-// accepted by a leader and confirmed by a linearizable membership read
-// (test/membership). It is the sum of the two waits the old direct call sites
-// made in sequence — a failover that may be in progress when the change is
-// requested, then the change itself — because the retry loop absorbs both
-// inside one budget rather than sampling the leader once and then calling.
+// membershipTimeout is the budget for a membership change to land and be confirmed by a linearizable read (test/membership): a failover plus the change.
 var membershipTimeout = failoverTimeout + defaultTimeout
 
 // ---------------------------------------------------------------------------
@@ -206,10 +165,7 @@ func decodeIndex(data []byte) uint64 {
 	return binary.BigEndian.Uint64(data)
 }
 
-// appendResult is the value the kvStateMachine returns for an opAppend. It
-// carries the FULL post-append value so a caller can compare the result it
-// was handed against the value the model predicts, and so a session retry can
-// be checked byte-for-byte against the cached response.
+// appendResult is the full post-append value kvStateMachine returns for opAppend.
 func appendResult(value string) sm.Result {
 	return sm.Result{Value: uint64(len(value)), Data: []byte(value)}
 }
@@ -284,44 +240,16 @@ type kvStateMachine struct {
 	replicaID uint64
 	mu        sync.RWMutex
 	data      map[string]string
-	// prevIndex is the raft index of the previously applied entry. Every
-	// entry handed to Update must carry a STRICTLY greater index: an index
-	// that repeats or moves backward means the entry was applied twice or
-	// replayed, which no amount of state comparison can detect afterwards
-	// on a last-write-wins store. RecoverFromSnapshot is the only legal
-	// reset point.
-	//
-	// Note: consecutive indices are NOT required. The user state machine
-	// only ever sees user commands; the engine legitimately consumes
-	// indices for the initial-membership entry, each leader's no-op entry,
-	// config changes and session register/unregister entries, so gaps are
-	// expected and are recorded rather than failed. See applyGaps.
+	// prevIndex is the last applied index; every Update entry must be strictly greater (gaps are expected and recorded in applyGaps). Only RecoverFromSnapshot resets it.
 	prevIndex uint64
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
 	applied   atomic.Uint64
-	// lastWrite is the raft index of the entry that last wrote each key: the
-	// provenance a read-your-writes check needs, because a value alone
-	// cannot say whether it is older or newer than the write a client was
-	// just acknowledged for. After RecoverFromSnapshot it is a LOWER BOUND
-	// (the snapshot index) for every key the snapshot carries -- the value
-	// was written at or before that point, which is all the check needs.
+	// lastWrite is the index that last wrote each key; after RecoverFromSnapshot it is the snapshot index, a lower bound.
 	lastWrite map[string]uint64
 }
 
-// applyGates parks kvStateMachine.Update on a put to a chosen key, for a test
-// that needs a replay to stand still: a restarted replica replays its whole
-// log, and the only way to be certain something happens DURING that replay
-// -- rather than to race it against the machine's speed, which fails on a
-// slow CI runner -- is to stop the replay at a known entry until
-// the something is done. Armed by gateApply before the entry is proposed,
-// released by the function it returns. Process-wide, because the state
-// machine that parks is created inside StartShard by a factory the test does
-// not hold; keyed by the replica as well as the KV key, because every replica
-// of a test cluster lives in this process and applies the same entry. A gate
-// keyed by the KV key alone parked every replica that applied the entry after
-// arming, and a peer still behind on it closed parked in the subject's place:
-// the test then went ahead before the subject's replay was at the gate (#309).
+// applyGates parks kvStateMachine.Update on a put to a chosen key for one replica, so a test can act during a replay; process-wide, keyed by replica and key.
 var applyGates sync.Map // applyGateKey -> *applyGate
 
 type applyGateKey struct {
@@ -337,12 +265,7 @@ type applyGate struct {
 	releaseOnce sync.Once
 }
 
-// gateApply arms a gate on key for one replica. Every put to key that the
-// kvStateMachine of (shardID, replicaID) applies parks until release is
-// called; parked is closed when the first does. No other replica parks.
-// release is idempotent and also registered with t.Cleanup, so a failed
-// assertion while parked fails the test instead of hanging the host's Close
-// behind an apply that never returns.
+// gateApply parks every put to key applied by (shardID, replicaID) until release; parked closes on the first. release is idempotent and registered with t.Cleanup.
 func gateApply(t *testing.T, key string, shardID, replicaID uint64) (parked <-chan struct{}, release func()) {
 	t.Helper()
 	gk := applyGateKey{shardID: shardID, replicaID: replicaID, key: key}
@@ -434,9 +357,7 @@ func (kv *kvStateMachine) Update(_ context.Context, entries []sm.Entry, results 
 			kv.data[key] = value
 			kv.lastWrite[key] = entry.Index
 			kv.parkAtGate(key)
-			// Data carries the entry's index so the proposer learns WHERE
-			// its write landed; Value stays the length every existing
-			// caller checks.
+			// Data carries the entry index; Value stays the length callers check.
 			results[i] = sm.Result{Value: uint64(len(value)), Data: encodeIndex(entry.Index)}
 		case opAppend:
 			token := string(entry.Cmd[3+keyLen:])
@@ -529,11 +450,7 @@ func (kv *kvStateMachine) SaveSnapshot(_ context.Context, w io.Writer, stopper <
 	return nil
 }
 
-// RecoverFromSnapshot restores the KV store from a snapshot reader. This is
-// the only point at which the applied-index expectation may be reset, and the
-// reset must still move the replica FORWARD: installing a snapshot older than
-// what this replica already applied would silently roll the state machine
-// back, so it is recorded as a violation.
+// RecoverFromSnapshot restores the store and resets the applied-index expectation; a snapshot older than what was applied is recorded as a violation.
 func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, stopper <-chan struct{}) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -701,19 +618,7 @@ func harnessHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig,
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
 		MaxApplyWorkers:       1,
-		// By default the WAL still writes every record through the real
-		// segment code; only the fdatasync is skipped. Every host of a
-		// cluster shares one disk with whatever else the machine runs, and
-		// on a contended disk a single fdatasync blocks for seconds
-		// (measured 2.5-4.6s under -race and CPU load, finishing in the same
-		// millisecond on independent hosts). Raft must persist term and vote
-		// before a RequestVote or vote grant leaves the node, so no election
-		// fits in a 0.5-1s timeout while the disk is stalled: candidates
-		// time out, re-campaign at a higher term and the shard stays
-		// leaderless long enough to miss the throughput floor (#360).
-		// WAL-sync mode (QUICRAFT_IT_WAL_SYNC=1) runs the fsync-before-ack
-		// path production uses, with a tick (walSyncRTTMillisecond) that
-		// puts the shortest election timeout above that stall.
+		// By default the WAL skips only fdatasync, since a contended disk can stall it for seconds and block elections; QUICRAFT_IT_WAL_SYNC=1 runs the production fsync path with walSyncRTTMillisecond.
 		NoSyncWAL: !walSync,
 		TransportConfig: config.TransportConfig{
 			MTLSConfig: mtls,
@@ -755,10 +660,7 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. Read the
-// bound address from Host.RaftAddress once the host exists: a port reserved
-// up front and bound later can be taken by a concurrent CI job that shares the
-// network but not the reservation's lock directory (#386).
+// kernelAddr binds a host on a kernel-assigned loopback port; read it back from Host.RaftAddress.
 const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
@@ -952,9 +854,7 @@ func (c *testCluster) leaderHost(shardID uint64) *quicraft.Host {
 	return nil
 }
 
-// proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
-// OF THE CALL. See package test/proposer for why observing a leader
-// does not pin it.
+// proposeToLeader proposes cmd to whichever node leads shardID at the call; see test/proposer.
 func proposeToLeader(
 	t *testing.T,
 	cluster *testCluster,
@@ -1020,10 +920,7 @@ func (c *testCluster) stopNode(idx int) {
 	if h == nil {
 		return
 	}
-	// Host.Close drains in-flight client operations, so a stop is a phase of
-	// its own; its length separates a slow drain from a slow election (#309).
-	// It runs outside hostsMu: a drain held under the write lock stalled every
-	// reader, which made a slow drain look like a slow election.
+	// Host.Close drains client operations, so a stop is its own phase; it runs outside hostsMu.
 	start := time.Now()
 	h.Close()
 	c.t.Logf("node[%d] stopped in %v", idx, time.Since(start))
@@ -1126,12 +1023,7 @@ func (c *testCluster) addNode(shardID uint64) int {
 
 	newReplicaID := uint64(len(c.addrs) + 1)
 
-	// The change goes through whichever node leads the shard at each attempt,
-	// and is accepted only once a linearizable membership read confirms it.
-	// addNode is called mid-test under sustained client load, where a transient
-	// election leaves leaderHost returning nil for a few ticks; the loop asks
-	// again rather than sampling once, and still fails — loudly — if the
-	// change has not landed within membershipTimeout. See test/membership.
+	// Run the change through the leader at each attempt until a linearizable membership read confirms it, within membershipTimeout; see test/membership.
 	if err := membership.TryAddNode(c.leaderHost, shardID, newReplicaID, addr, h.NodeIdentity(), membershipTimeout); err != nil {
 		h.Close()
 		c.t.Fatalf("addNode: %v", err)
@@ -1166,14 +1058,7 @@ func (c *testCluster) addNode(shardID uint64) int {
 func (c *testCluster) removeNode(idx int, shardID uint64) {
 	c.t.Helper()
 
-	// The precondition is on the TARGET: the caller chose a follower, and this
-	// checks that it still is one. A leader is waited for rather than sampled
-	// once — removeNode runs mid-test under sustained client load, where a
-	// transient election leaves findLeader at -1 for a few ticks, and a single
-	// sample turned that ordinary window into "no leader found". A leader that
-	// has moved ONTO the target is still fatal: the test asked to remove a
-	// follower, and the caller (not this helper) owns choosing one that is
-	// current.
+	// Wait for a leader rather than sampling once; a leader that moved onto the target is fatal.
 	leaderIdx := c.waitForClusterLeader(shardID, failoverTimeout)
 	if leaderIdx == idx {
 		c.t.Fatalf("removeNode: cannot remove the leader (node[%d])", idx)
@@ -1205,13 +1090,7 @@ type leaderObservation struct {
 	isLeader  bool
 }
 
-// observeShard samples (LeaderID, Term, IsLeader) from EVERY host currently in
-// the cluster and returns one observation per host index.
-//
-// It deliberately does not consult c.stopped: restartNode and addNode replace
-// or extend c.hosts, and a check that skips indices from a stale view of which
-// nodes are up is exactly how a second leader escapes notice. A host that is
-// genuinely down returns an error from ShardInfo and is observed as down.
+// observeShard samples (LeaderID, Term, IsLeader) from every host, ignoring c.stopped; a down host is observed as down.
 func (c *testCluster) observeShard(shardID uint64) []leaderObservation {
 	c.hostsMu.RLock()
 	hosts := make([]*quicraft.Host, len(c.hosts))
@@ -1240,19 +1119,7 @@ func (c *testCluster) observeShard(shardID uint64) []leaderObservation {
 	return obs
 }
 
-// leaderTermGuard continuously asserts the Raft election-safety invariant:
-// at most one leader may exist in a given term. It fails the test the INSTANT
-// two distinct replicas report leadership of the same term — there is no
-// convergence window, because two leaders in one term is never a transient
-// state that resolves itself, it is a log-safety violation that has already
-// happened.
-//
-// ShardInfo returns (LeaderID, Term, IsLeader) as a seqlock-consistent
-// triple, so a replica can never report leading a term it did not lead; a
-// same-term pair from two replicas is therefore real and not a torn read.
-//
-// Every poll also feeds the cluster's leaderTimeline (see record), so a
-// failing test can print what each node believed about the leader and when.
+// leaderTermGuard fails the test the moment two replicas report leading the same term, and feeds leaderTimeline on every poll.
 type leaderTermGuard struct {
 	t       *testing.T
 	cluster *testCluster
@@ -1320,17 +1187,7 @@ func (g *gapTracker) longestAt(now time.Duration) (from, length time.Duration) {
 // transitions nearest the failure are the ones that explain it.
 const leaderTimelineCap = 200
 
-// leaderTimeline is a test cluster's record of leader and term transitions,
-// each stamped with its monotonic offset from the cluster's creation. Two
-// sources feed it: the leader/term guard, which writes every change it sees
-// in a node's ShardInfo between two of its polls, and the engine's own
-// dispatched leader events (OnLeaderUpdated, OnLeaderLost, OnLeaderReady,
-// OnCampaignLaunched), installed on every host's config. The events are the
-// evidence a poll cannot give: ShardInfo.Term is the term of the last
-// leadership change a replica published, not its current Raft term, so
-// split-vote churn with no leader known shows up only as campaigns.
-//
-// Nothing is printed unless the test fails; see leaderTermGuard.stop.
+// leaderTimeline records leader and term changes, from leaderTermGuard polls and the engine's leader events, with offsets from cluster creation; printed only on failure.
 type leaderTimeline struct {
 	start   time.Time
 	mu      sync.Mutex
@@ -1588,15 +1445,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	}
 }
 
-// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation beside the
-// budgets to the configuration the suite actually starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives testShardConfig an explicit ElectionRTT, or
-// hands testHostConfig a different RTTMillisecond, electionRound silently
-// starts describing a cluster that no longer exists and every budget built on
-// it is wrong by that factor — which is exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
+// TestBudgetsDescribeTheClusterTheyBudgetFor pins the budget derivation to the configuration the suite starts.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	for _, walSync := range []bool{false, true} {
 		rtt := harnessRTTMillisecond(walSync)

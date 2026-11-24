@@ -42,9 +42,7 @@ type GenerateResult struct {
 	Measured []string
 	// NotMeasured lists the known systems with no results in this profile.
 	NotMeasured []string
-	// Removed lists stale generated documents deleted because their system is
-	// no longer measured here. A stale document is worse than none: at a glance
-	// it is indistinguishable from a current one.
+	// Removed lists stale generated documents deleted because their system is no longer measured.
 	Removed []string
 	// EnvCaptured reports whether the profile had a machine description.
 	EnvCaptured bool
@@ -82,13 +80,7 @@ func (r *GenerateResult) Summary() string {
 	return sb.String()
 }
 
-// Generate writes the profile's charts and comparison documents from its stored
-// results. It rewrites every document it owns and never touches analysis.md.
-//
-// A system with no results gets no document, and its absence is reported both
-// in the returned result and inside every document that was written. Generating
-// on a partial set is a legitimate state — a profile can be measured one engine
-// at a time — but it is never silently a complete one.
+// Generate writes the profile's charts and documents from stored results, never touching analysis.md; missing systems are reported in each document.
 func (p *Profile) Generate(now time.Time) (*GenerateResult, error) {
 	suites, err := p.LoadResults()
 	if err != nil {

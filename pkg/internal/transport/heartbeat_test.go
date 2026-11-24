@@ -28,13 +28,7 @@ import (
 // isHeartbeatBatch
 // ---------------------------------------------------------------------------
 
-// TestIsHeartbeatBatch verifies which batches take the heartbeat fast path:
-// only entry-free Heartbeat and HeartbeatResp messages (an empty batch is
-// vacuously one). A heartbeat carrying entries is NOT routed to the
-// fixed-size fast path: the fast path sizes its buffer for
-// HeartbeatMessageSize records, so entries would overflow the marshal and
-// silently drop the whole batch. Such a batch must fall through to the
-// general sendBatch path.
+// TestIsHeartbeatBatch checks only entry-free Heartbeat and HeartbeatResp batches take the fast path.
 func TestIsHeartbeatBatch(t *testing.T) {
 	entry := []proto.Entry{{Index: 1, Term: 1, Cmd: []byte("x")}}
 	tests := []struct {

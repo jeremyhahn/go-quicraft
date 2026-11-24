@@ -31,27 +31,7 @@ func currentPeerEpoch(t *QUICTransport, target string) (uint64, bool) {
 	return rec.epoch, true
 }
 
-// TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict is the
-// regression test for an eviction/re-dial cascade that fired during the exact
-// event restart detection exists to handle: a peer restart.
-//
-// Boot epochs are UnixNano ^ crypto/rand, so two of them cannot be ordered by
-// comparison. The record of a peer's current incarnation was therefore plain
-// last-writer-wins: ANY authorized batch whose SourceEpoch differed from the
-// stored one replaced it, with no test that the new value was actually newer.
-//
-// A restart does not stop the old incarnation's already-written frames from
-// arriving. B restarts E1->E2; A sees E2, evicts, and re-dials stamped E2. A
-// frame written by the DEAD E1 incarnation then drains out of the old inbound:
-// the record is dragged back to E1, the healthy E2 outbound no longer matches
-// the "current" epoch and is evicted, and the re-dial is stamped E1 -- which
-// the next genuine E2 batch evicts in turn. The pair ping-pongs, each round
-// costing a dial, a stream re-open and every in-flight replication on the
-// connection.
-//
-// The invariant asserted here is that a peer's incarnation history is one-way:
-// an epoch this node has already watched be replaced can never again be
-// treated as current, nor evict anything.
+// TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict: a peer's incarnation history is one-way; a replaced epoch is never current again and evicts nothing.
 func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -86,8 +66,7 @@ func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *te
 		t.Fatalf("getStream failed: %v", err)
 	}
 
-	// A frame written by the DEAD incarnation now drains out of the old
-	// inbound and arrives after the re-dial.
+	// A frame from the dead incarnation arrives after the re-dial.
 	t1.evictStaleOutboundOnRecv(target, oldEpoch, inbound)
 
 	if t1.ConnectionCount() != 1 {
@@ -121,19 +100,7 @@ func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *te
 	}
 }
 
-// TestReapPeerIncarnations_ForgetsDepartedPeersOnly covers the lifetime of the
-// incarnation map.
-//
-// The record must survive a teardown, because the re-dial that follows is
-// stamped from it: dropping it there stamps the fresh outbound "unknown" and
-// the next batch evicts it again. That constraint removed the map's only two
-// reapers, leaving a per-process leak — a replica removed from membership kept
-// its entry for the lifetime of the host, and repeated membership churn grew
-// the map without bound.
-//
-// Reaping on an idle window satisfies both: an address that is neither
-// connected nor talking is genuinely gone, while anything connected or recently
-// heard from keeps the epoch its next dial needs.
+// TestReapPeerIncarnations_ForgetsDepartedPeersOnly: records survive a teardown but are reaped once an address is neither connected nor heard from.
 func TestReapPeerIncarnations_ForgetsDepartedPeersOnly(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()

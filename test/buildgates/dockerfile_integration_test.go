@@ -12,14 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package buildgates holds tests for the parts of the build that are not Go
-// code and therefore have no compiler and no test binary of their own: the
-// analyser-version pins the Makefile gates, and the shell in the integration
-// Dockerfile that decides whether a failed build is reported as a failure.
-//
-// They are ordinary untagged Go tests, so they run in `make test` and `make
-// ci` alongside everything else. Neither builds an image nor invokes the Go
-// toolchain.
+// Package buildgates tests the non-Go parts of the build, such as Makefile analyser pins and integration Dockerfile shell.
 package buildgates
 
 import (
@@ -32,33 +25,7 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
-// .devcontainer/Dockerfile.integration: a failed build must fail the build
-//
-// The historical line was
-//
-//	go test -c ... 2>/dev/null || echo "...placeholder" && touch ... && chmod ...
-//
-// `||` and `&&` are equal-precedence and left-associative, so it parsed as
-// ((go test || echo) && touch) && chmod: a compile failure was hidden by
-// 2>/dev/null, echo succeeded, and a ZERO-BYTE executable was installed.
-// execve on an empty file returns ENOEXEC, the shell runs it as a script, an
-// empty script exits 0, and `docker compose --exit-code-from test-runner`
-// reported the whole integration suite green.
-//
-// The fix is shell semantics, not Go, so the only honest way to guard it is to
-// RUN the shell. These tests lift the RUN body out of the real Dockerfile,
-// substitute a stub for the compile command, and assert the exit status for
-// each outcome the stub can produce. Nothing here builds an image; what is
-// under test is the operator precedence and the two post-build assertions,
-// which is exactly what regressed.
-//
-// The substitution is confined to the compile command. `set -eux`, the
-// `test -s`, the `-test.list | grep` and every redirect around them are the
-// Dockerfile's own text, so a reintroduced `|| echo ... && touch`, a restored
-// `2>/dev/null`, or a deleted assertion changes what these tests execute and
-// flips a case.
-// ---------------------------------------------------------------------------
+// A failed compile in .devcontainer/Dockerfile.integration must fail the build; the tests run the Dockerfile's RUN body with a stub compile command.
 
 // repoRoot is the module root relative to this package's directory.
 const repoRoot = "../.."
@@ -119,9 +86,7 @@ func buildRunBody(t *testing.T) string {
 // because it is what these tests exist to execute.
 var compileCommandDelimiters = []string{";", "|", "&", "2>", ">", "<", "\n"}
 
-// stubCompileCommand replaces the `go test -c ...` command in body with a call
-// to "$BUILD" and repoints the produced binary at "$BIN", leaving every other
-// token exactly as written.
+// stubCompileCommand replaces the go test -c command in body with "$BUILD" and its output with "$BIN".
 func stubCompileCommand(t *testing.T, body string) string {
 	t.Helper()
 
@@ -172,10 +137,7 @@ func runStubbedBuild(t *testing.T, body, stub string) buildOutcome {
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
 
-	// Executed through sh, not execve directly: an empty file makes execve
-	// return ENOEXEC, and it is the SHELL's fallback to running it as a script
-	// that turned the placeholder into a silent exit 0. The container's
-	// entrypoint is `exec "$@"` from /bin/sh, so this is the real path.
+	// Run through sh, as the container entrypoint does.
 	runs := false
 	if _, statErr := os.Stat(binPath); statErr == nil {
 		runs = exec.CommandContext(ctx, "sh", "-c", binPath).Run() == nil
@@ -250,17 +212,7 @@ func TestIntegrationBuildSucceedsOnARealBinary(t *testing.T) {
 	}
 }
 
-// TestTheHarnessDetectsTheSwallowingConstruct is the discrimination control.
-//
-// The four failure cases above assert that the CURRENT body fails. On their own
-// they cannot show that the harness would have caught the OLD one -- a stub
-// substitution that quietly neutered the shell would make them pass over any
-// body at all. So the historical construct is run through the identical
-// harness and must reproduce the original defect exactly: exit 0 on a failing
-// compile, and leave behind a placeholder that itself exits 0.
-//
-// If this ever stops reproducing, the harness has stopped executing the
-// Dockerfile's error handling and every case above is worthless.
+// TestTheHarnessDetectsTheSwallowingConstruct checks the harness reproduces the old construct's silent exit 0 and placeholder binary.
 func TestTheHarnessDetectsTheSwallowingConstruct(t *testing.T) {
 	got := runStubbedBuild(t, historicalBuildCommand, failingCompile)
 	if !got.exitedZero {

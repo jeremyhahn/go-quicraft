@@ -14,25 +14,7 @@
 
 //go:build integration && quicraft_netfault
 
-// The regression fixture for the cached-leader-index flake.
-//
-// It lives in the netfault suite because the failure needs a live replica that
-// has lost leadership AND does not yet know who took over. Host.Propose only
-// refuses outright in that second condition: when the local replica is not
-// leader but a leader IS known, the engine forwards the proposal and it
-// commits. That is why twenty call sites could cache a leader index for months
-// and pass — an ordinary re-election leaves the deposed replica knowing its
-// successor within a heartbeat, and the propose gets forwarded.
-//
-// The window where it does not is the one CI hit: run 10735 reported
-// "not leader for shard 1, LEADER UNKNOWN". A process kill cannot construct
-// that state, because a killed node answers nothing at all. Isolation can: the
-// node keeps running, steps down when check-quorum fires, and hears nothing
-// further, so leaderID stays 0 for as long as the isolation holds.
-//
-// Run with:
-//
-//	go test -tags 'integration quicraft_netfault' ./test/integration/e2e/...
+// Fixture for proposing while the deposed leader does not know its successor, built by network isolation. Run with: go test -tags 'integration quicraft_netfault' ./test/integration/e2e/...
 package e2e_test
 
 import (
@@ -42,21 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
-// TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent asserts
-// that a proposal issued while leadership is moving out from under it still
-// commits, and that the cached-leader pattern in the same state does not.
-//
-// ORDERING IS THE WHOLE TEST. The write is issued IMMEDIATELY after the
-// incumbent is cut off, while it still believes it leads and findLeader still
-// returns it. The helper's first resolution therefore lands on the node that is
-// about to lose the shard, and only a resolution taken again on the next
-// attempt can find the majority's new leader.
-//
-// An earlier draft waited for the new leader to be elected BEFORE proposing.
-// That version passed with the resolve hoisted out of the retry loop — by the
-// time it ran, one lookup already returned the right node, so the property it
-// claimed to cover was never exercised. Measured: hoisted resolve, 1.63s,
-// green. Do not reintroduce that ordering.
+// TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent checks a proposal issued right after isolating the leader commits, while a cached-leader propose does not.
 func TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -79,22 +47,14 @@ func TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent(t *testing
 	t.Logf("node[%d] isolated while it still believes it leads shard %d",
 		staleIdx, shardID)
 
-	// No wait here, deliberately. The proposal races the step-down: the first
-	// resolution gets the incumbent, that attempt fails not-leader when check
-	// quorum takes the shard away from it, and the SECOND resolution — the one
-	// a cached index cannot make — finds the majority's leader.
+	// Propose at once so the first resolution hits the incumbent and the second finds the new leader.
 	result := proposeToLeader(t, cluster, shardID,
 		encodeKVPut("ptl-moved", "committed"), failoverTimeout)
 	if result.Value != uint64(len("committed")) {
 		t.Errorf("result.Value = %d, want %d", result.Value, len("committed"))
 	}
 
-	// The entry committed, so the incumbent has necessarily lost the shard by
-	// now. Assert the cached-leader pattern against it: one cached index, one
-	// Propose, no retry. This is the pattern the helpers exist to avoid, and it
-	// doubles
-	// as proof that the isolation produced the leader-unknown state rather than
-	// a healthy cluster that forwarded the proposal on.
+	// The incumbent has lost the shard; a single cached-index Propose must fail.
 	waitForCondition(t, failoverTimeout, "the isolated incumbent steps down", func() bool {
 		return !isLeaderAt(cluster, staleIdx, shardID)
 	})
@@ -113,9 +73,7 @@ func TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent(t *testing
 	}
 	t.Logf("cached-leader pattern refused by the isolated incumbent: %v", err)
 
-	// Assert on the majority only: the isolated node is running but unreachable,
-	// so waitForReplication — which requires every node that is not STOPPED —
-	// would be asserting that a partition heals itself.
+	// Check the majority only; the isolated node is unreachable.
 	for i := range cluster.hosts {
 		if i == staleIdx {
 			continue
@@ -129,10 +87,7 @@ func TestNetPartition_ProposeToLeader_ResolvesPastAnIsolatedIncumbent(t *testing
 		)
 	}
 
-	// The refused proposal must not APPLY anywhere. This reads state machines,
-	// so it does not speak to what may sit unapplied in the isolated replica's
-	// own log; that entry cannot commit without a quorum it cannot reach, and
-	// the heal below is where it would have to disappear.
+	// The refused proposal must not apply anywhere.
 	for i := range cluster.hosts {
 		if v, ok := valueAt(cluster, trackers, shardID, i, "ptl-stale"); ok {
 			t.Errorf("node[%d] applied ptl-stale=%q, a value the isolated node[%d] "+

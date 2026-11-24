@@ -176,14 +176,7 @@ func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_StoppingShardStagesNothing: a stopped incarnation may
-// still hold an adopted-but-unrecorded install in its commit pipeline, and
-// that install's artifact is retained, unrecorded, at the canonical path. A
-// same-index retry against the stopping node must not reach the publish step,
-// which reclaims any unrecorded directory there as an orphan — moments before
-// the old pipeline's record naming it lands. The receive is refused before
-// staging anything; the retry waits for the next incarnation, which UnloadNode
-// releases only once the old one can no longer write LogDB.
+// TestHandleSnapshot_StoppingShardStagesNothing verifies a stopped shard's receive stages nothing.
 func TestHandleSnapshot_StoppingShardStagesNothing(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
@@ -287,12 +280,7 @@ func TestHandleSnapshot_UnloadedShardIsNotAMetricLabel(t *testing.T) {
 	}
 }
 
-// TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone: the transport asks the host
-// to authorize a snapshot's sender from the stream header, before it takes a
-// receive slot or any memory. The host applies HandleSnapshot's own gates
-// there, so a sender the shard admits proceeds and one it does not — a
-// certificate holder with the wrong identity, a misaddressed transfer, a shard
-// not loaded — is refused before the transfer costs the receiver anything.
+// TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone verifies the sender is authorized from the stream header with HandleSnapshot's gates.
 func TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
@@ -345,12 +333,7 @@ func (d *stopThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) bo
 	return d.engineDeliverer.DeliverLocalTo(node, msg)
 }
 
-// TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory: a receive that
-// published and then failed must not discard the canonical directory
-// unconditionally. On a node stopped in between, that directory may be named
-// by a record the stopped incarnation's commit pipeline is still writing — its
-// own adopted install at this index, which this receive's publish replaced —
-// so the discard takes the write lease, and a stopped node keeps it.
+// TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory verifies a failed receive does not discard a directory that may be recorded.
 func TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
@@ -386,12 +369,7 @@ func (d *recordThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) 
 	return d.engineDeliverer.DeliverLocalTo(node, msg)
 }
 
-// TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords: the write lease
-// is shared, so a local save can publish and record the very index a receive
-// published while the receive awaited its verdict. The failed receive's
-// discard then deleted the artifact LogDB named, with the log below it already
-// compacted. The discard now runs under the snapshot-directory lock and keeps
-// a directory the record names.
+// TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords verifies a failed receive keeps a directory LogDB records.
 func TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)

@@ -41,15 +41,7 @@ func waitForBatchCount(t *testing.T, h *testHandler, want int64, timeout time.Du
 		func() bool { return h.batchCount.Load() >= want })
 }
 
-// TestDataStreamSurvivesIdleOnLiveConnection is the regression test for the
-// post-idle replication stall in the consensus transport. A data/replication
-// stream that sits idle longer than StreamReadIdleTimeout must NOT be abandoned
-// by the receiver while its QUIC connection is still alive: the sender reuses
-// its cached stream across bursts, so abandoning it on the receive side
-// silently drops every subsequent message and hangs Raft proposals forever
-// (writes succeeded only while the cluster was kept warm). The receiver must
-// keep an idle-but-live stream open and deliver a message sent after the idle
-// gap on that same stream.
+// TestDataStreamSurvivesIdleOnLiveConnection: a data stream idle past StreamReadIdleTimeout on a live connection stays open and delivers the next message.
 func TestDataStreamSurvivesIdleOnLiveConnection(t *testing.T) {
 	handler1 := newTestHandler()
 	handler2 := newTestHandler()
@@ -110,7 +102,7 @@ func TestDataStreamSurvivesIdleOnLiveConnection(t *testing.T) {
 	// stream goes idle and must not be abandoned by the receiver.
 	time.Sleep(900 * time.Millisecond) // kept: the idle period is the behaviour under test
 
-	// Second send reuses the SAME cached data stream. It must be delivered.
+	// The second send reuses the same cached data stream and must be delivered.
 	t1.Send(dataMsg())
 	waitForBatchCount(t, handler2, 2, 5*time.Second)
 }
@@ -1252,12 +1244,7 @@ func TestHandleMessageFrame_DecompressionMismatchExact(t *testing.T) {
 	compSmall := snappy.Encode(nil, small)
 	compLarge := snappy.Encode(nil, large)
 
-	// Find the varint length of the large block (first few bytes).
-	// Snappy block format: varint(uncompressed_length) || compressed_data
-	// For 100 bytes, the varint is a single byte: 100 (0x64).
-	// For 50 bytes, the varint is a single byte: 50 (0x32).
-	// Replace the length varint in compSmall with the one from compLarge.
-	// Both are single-byte varints since < 128.
+	// Swap compSmall's one-byte length varint (Snappy block header) for compLarge's.
 	tampered := make([]byte, len(compSmall))
 	copy(tampered, compSmall)
 	tampered[0] = compLarge[0] // claim length is 100 instead of 50
@@ -1354,11 +1341,7 @@ func TestHandleConnection_StreamErrorAfterNormalClose(t *testing.T) {
 // getStream fast path eviction detection (conn.go:258-265)
 // ---------------------------------------------------------------------------
 
-// TestGetStream_FastPathEvictionBetweenReads exercises the path in
-// getStream where a stream is found in the fast-path RLock read, but
-// is evicted by another goroutine between the stream read and the
-// connection liveness check. The stream is no longer in the shard,
-// so getStream falls through to the slow path.
+// TestGetStream_FastPathEvictionBetweenReads: a stream evicted between the fast-path read and the liveness check sends getStream to the slow path.
 
 // ---------------------------------------------------------------------------
 // SourceAddress / certificate binding (recv.go handleMessageFrame, Bug A)
@@ -1384,12 +1367,7 @@ func buildBatchPayload(t *testing.T, deploymentID uint64, source string) []byte 
 	return payload[:n]
 }
 
-// TestHandleMessageFrame_SpoofedSourceAddressCleared verifies that a batch
-// whose claimed SourceAddress is not covered by the inbound connection's
-// verified peer certificate has SourceAddress cleared before the batch reaches
-// the handler. mTLS still authenticates the messages themselves, so they are
-// delivered — only the (unauthenticated, in-band) address hint is dropped so it
-// cannot poison the registry or epoch-based eviction.
+// TestHandleMessageFrame_SpoofedSourceAddressCleared: a SourceAddress the peer certificate does not cover is cleared; the messages are still delivered.
 func TestHandleMessageFrame_SpoofedSourceAddressCleared(t *testing.T) {
 	t1, t2, handler1, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -1597,20 +1575,7 @@ func TestForgetInboundConnAuth_RemovesCacheEntry(t *testing.T) {
 	}
 }
 
-// TestHandleStream_ErrorExitCancelsRead is the regression test: when
-// handleStream abandons a stream on a non-idle error (here, an invalid frame
-// header), it must CancelRead in addition to Close. In quic-go, Close only
-// closes the SEND direction, so without CancelRead the receive direction stays
-// open: the peer keeps writing into a stream nobody drains (silently
-// black-holing up to the stream receive window) and the abandoned stream
-// permanently holds one of the peer's stream credits. CancelRead sends
-// STOP_SENDING, so the peer's next Write on the stream fails fast.
-//
-// The code carried is QUICStreamErrFrameRejected rather than the default
-// QUICStreamErrReceiverGone, because this exit is a protocol violation: the
-// frame was unacceptable, the connection is fine. That distinction is what
-// stops the peer from tearing the connection down and re-dialling on every
-// rejected frame.
+// TestHandleStream_ErrorExitCancelsRead: abandoning a stream on an invalid frame cancels the read side with QUICStreamErrFrameRejected as well as closing it.
 func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -1674,11 +1639,7 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestProcessSnapshotHeader_OversizedHeaderLenRejected verifies that a
-// declared snapshot header length beyond maxSnapshotHeaderWireLen is
-// rejected BEFORE any bytes are read: the declared length is
-// attacker-controlled and sits outside every receive budget, so it must
-// never drive an allocation or a long discard.
+// TestProcessSnapshotHeader_OversizedHeaderLenRejected: a header length beyond maxSnapshotHeaderWireLen is rejected before any read.
 func TestProcessSnapshotHeader_OversizedHeaderLenRejected(t *testing.T) {
 	handler := newTestHandler()
 	reg := registry.NewRegistry()
@@ -1834,12 +1795,7 @@ func TestProcessSnapshotHeaderRejectionsAreReported(t *testing.T) {
 // Receive-budget exhaustion is retryable, not a stream teardown
 // ---------------------------------------------------------------------------
 
-// TestHandleMessageFrameDrainsBodyOnBudgetExhaustion is the regression
-// test. If budget exhaustion were fatal to the stream, one peer filling the
-// aggregate budget would tear down every OTHER peer's replication stream and
-// cascade into cluster-wide connection churn. The frame body is therefore
-// consumed so the stream is left at a clean frame boundary and the
-// caller can simply continue.
+// TestHandleMessageFrameDrainsBodyOnBudgetExhaustion: on budget exhaustion the body is consumed and the stream continues at a frame boundary.
 func TestHandleMessageFrameDrainsBodyOnBudgetExhaustion(t *testing.T) {
 	tr, err := NewQUICTransport(Config{
 		ListenAddress: "127.0.0.1:0",
@@ -1931,20 +1887,7 @@ func TestPerConnectionMsgRecvBudgetBoundsOnePeer(t *testing.T) {
 	}
 }
 
-// overLimitMessageCountPayload builds a MessageBatch frame whose declared
-// request COUNT exceeds proto.MaxMessagesPerBatch.
-//
-// It is assembled rather than marshaled because proto.MessageBatch.MarshalTo now
-// REFUSES to emit an over-limit batch — the write side mirrors the read side, so
-// a producer cannot build a frame every peer would reject. That is the correct
-// production behaviour and it is exactly what makes this helper necessary: the
-// decoder's own limit still has to be pinned, and the only way such a frame can
-// now reach a receiver is corruption or a hostile encoder, which is the case the
-// decoder check exists for. So the count prefix is patched directly, and the
-// message bodies are omitted: UnmarshalFrom validates the count BEFORE it reads
-// a single message, and this asserts that ordering as much as the limit.
-//
-// Layout: [BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddress:len+data][count:4].
+// overLimitMessageCountPayload hand-assembles a MessageBatch frame whose count exceeds proto.MaxMessagesPerBatch, since MarshalTo refuses one; layout [BinVer:8][DeploymentID:8][SourceEpoch:8][SourceAddress:len+data][count:4].
 func overLimitMessageCountPayload(t *testing.T, sourceAddress string) []byte {
 	t.Helper()
 	mb := proto.MessageBatch{

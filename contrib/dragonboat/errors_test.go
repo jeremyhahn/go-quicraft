@@ -365,23 +365,7 @@ func BenchmarkTranslateError(b *testing.B) {
 	})
 }
 
-// TestTranslateError_PreservesTheMaybeAppliedBit pins that translateError keeps
-// the submission bit.
-//
-// quicraft marks failures that happen AFTER an entry reached Raft by wrapping
-// them in *MaybeAppliedError. Discarding that wrapper and returning the bare
-// mapped sentinel would make the post-delivery leadership change and the
-// pre-flight refusal indistinguishable here — both ErrShardNotReady, both
-// MaybeApplied false.
-//
-// That is not a cosmetic loss. On the config-change path the submission bit is
-// what separates "the leader refused this, nothing happened" from "the leader
-// took it and then lost the shard, so it may still commit", which decides
-// whether a later "already exists" is this caller's own change landing or
-// somebody else's. Without the bit the adapter's helper would have to widen its
-// predicate to cover the fold, and an engine applying a change it had reported
-// as refused PRE-FLIGHT would go undetected here while the root module caught
-// it.
+// TestTranslateError_PreservesTheMaybeAppliedBit pins that translateError keeps the MaybeApplied submission bit.
 func TestTranslateError_PreservesTheMaybeAppliedBit(t *testing.T) {
 	postDelivery := &quicraft.MaybeAppliedError{Err: &quicraft.NotLeaderError{ShardID: 1}}
 	translated := translateError(postDelivery)
@@ -402,9 +386,7 @@ func TestTranslateError_PreservesTheMaybeAppliedBit(t *testing.T) {
 		t.Error("IsTempError = false; the wrapper must not change temporariness")
 	}
 
-	// The pre-flight refusal is the control: same sentinel, no bit. Without
-	// this the test would pass against an implementation that wrapped
-	// EVERYTHING, which would be just as wrong in the other direction.
+	// Control: the pre-flight refusal carries the same sentinel without the bit.
 	preFlight := translateError(&quicraft.NotLeaderError{ShardID: 1})
 	if !errors.Is(preFlight, ErrShardNotReady) {
 		t.Errorf("errors.Is(%v, ErrShardNotReady) = false for the pre-flight refusal", preFlight)
@@ -416,14 +398,7 @@ func TestTranslateError_PreservesTheMaybeAppliedBit(t *testing.T) {
 	}
 }
 
-// TestTranslateError_PreservesTheMaybeAppliedBitForEveryMapping is the generic
-// half. translateError rebuilds the wrapper for ANY mapped sentinel,
-// not only the not-leader one the focused test above pins, so a mutation that
-// preserved the bit for ErrNotLeader alone would pass that test and silently
-// drop it for a wrapped timeout, a wrapped shard-closed, or whatever quicraft
-// wraps next. Every row of errorMappings is exercised in both directions: the
-// wrapped input keeps the bit and still errors.Is the mapped sentinel, and the
-// bare input is the control that must NOT acquire one.
+// TestTranslateError_PreservesTheMaybeAppliedBitForEveryMapping checks every errorMappings row keeps the bit when wrapped and gains none when bare.
 func TestTranslateError_PreservesTheMaybeAppliedBitForEveryMapping(t *testing.T) {
 	if len(errorMappings) == 0 {
 		t.Fatal("errorMappings is empty; this test would verify nothing")

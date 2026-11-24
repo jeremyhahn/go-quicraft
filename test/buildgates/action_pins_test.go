@@ -30,59 +30,14 @@ import (
 // workflowsDir holds the workflows this repo runs on both planes.
 var workflowsDir = filepath.Join(repoRoot, ".github", "workflows")
 
-// TestEveryActionIsPinnedToACommitSHA pins the supply chain.
-//
-// A tag is a ref, and whoever controls the action can move it. Release and
-// security jobs here hold write-scoped tokens and upload SARIF, so a moved tag
-// runs attacker code with those credentials. `aquasecurity/trivy-action@master`
-// was the sharpest case in this repo — not merely a mutable tag but a moving
-// BRANCH, re-resolved on every run.
-//
-// A 40-hex ref is the only form that cannot be repointed. The trailing
-// `# v<x>` comment is what keeps the pin readable and bumpable; it is not
-// checked here because a comment is documentation, not a control.
-//
-// NOTE for whoever bumps one: `git ls-remote --tags --refs` returns the TAG
-// OBJECT's sha for an ANNOTATED tag, which does not resolve as a pin and fails
-// at checkout. Take the `^{}` peeled line instead. That is not hypothetical —
-// `github/codeql-action@v3` is annotated and every other action here is not.
-// isWorkflowFile reports whether name is a file GitHub Actions loads.
-//
-// BOTH extensions, deliberately. Actions loads `.github/workflows/*.yaml` as
-// readily as `*.yml`, so a scan that accepts only `.yml` fails OPEN: a
-// `release.yaml` carrying `uses: actions/checkout@v6` would be a live workflow
-// with a mutable ref that this gate ignores entirely — and the gate would still
-// pass, because its non-empty check is already satisfied by the `.yml` files.
+// TestEveryActionIsPinnedToACommitSHA verifies every remote action is pinned to a commit SHA.
 func isWorkflowFile(name string) bool {
 	return strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml")
 }
 
-// collectUses walks a parsed YAML document and appends the value of every
-// `uses` key it finds, at any depth.
-//
-// PARSED, not regexed. A line-oriented pattern only recognises the conventional
-// `- uses: <action>@<ref>` form, and YAML has others that Actions accepts
-// perfectly well — a flow mapping `- { uses: actions/checkout@v6 }`, or a
-// quoted key `- "uses": actions/checkout@v6`. A regex gate misses those
-// entirely, and because the file's ordinary entries keep the "found something"
-// floor satisfied, the gate still PASSES while the unpinned action runs. That
-// is the same fail-open shape as skipping `.yaml`, one level down: the control
-// reports success over syntax it cannot see.
+// collectUses appends the value of every uses key in a parsed YAML document, at any depth.
 func collectUses(n *yaml.Node, out *[]string, depth int) {
-	// ALIASES ARE FOLLOWED. `uses: *checkout` produces an AliasNode, not a
-	// scalar, so a collector that only reads scalars records nothing and the
-	// gate passes over a live mutable ref. Anchors are ordinary Actions YAML:
-	//
-	//     x-ref: &checkout actions/checkout@v6
-	//     ...
-	//       - uses: *checkout
-	//
-	// Merge keys (`<<: *defaults`) are the same mechanism pointing at a mapping,
-	// and following the alias covers them for free.
-	//
-	// depth bounds the walk. A self-referential alias is not expressible in a
-	// document yaml.v3 will parse, but a bound costs nothing and a stack
-	// overflow in a security gate is a bad way to find out otherwise.
+	// Aliases are followed, so an anchored uses is checked too.
 	if n == nil || depth > 100 {
 		return
 	}
@@ -112,13 +67,7 @@ func collectUses(n *yaml.Node, out *[]string, depth int) {
 	}
 }
 
-// unpinnedRefs returns "<file>: <action>@<ref>" for every remote action in dir
-// that is not pinned to a 40-hex commit, plus the total number of refs seen.
-// The count is returned so a caller can refuse to pass over an empty scan.
-//
-// Local composite actions (`uses: ./...`) carry no ref and are skipped; docker
-// refs (`docker://...`) are not GitHub actions and are out of scope for this
-// gate, which is about a ref its owner can move.
+// unpinnedRefs returns "<file>: <action>@<ref>" for each remote action in dir not pinned to a 40-hex commit, and the number of refs seen.
 func unpinnedRefs(t *testing.T, dir string) (bad []string, seen int) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -175,17 +124,10 @@ func TestEveryActionIsPinnedToACommitSHA(t *testing.T) {
 	}
 }
 
-// TestThePinGateSeesYamlWorkflowsToo proves the scan is not fail-open on the
-// other extension.
-//
-// Without it the gate's non-empty check passes on the strength of the `.yml`
-// files while an entire `.yaml` workflow — equally live to GitHub Actions —
-// goes unread. A supply-chain control that silently ignores a file class is
-// worse than none, because the tree looks audited.
+// TestThePinGateSeesYamlWorkflowsToo verifies .yaml workflows are scanned.
 func TestThePinGateSeesYamlWorkflowsToo(t *testing.T) {
 	dir := t.TempDir()
-	// A pinned .yml alongside an UNPINNED .yaml: the exact shape that made the
-	// first version of this gate pass while a mutable ref was live.
+	// A pinned .yml beside an unpinned .yaml.
 	if err := os.WriteFile(filepath.Join(dir, "pinned.yml"),
 		[]byte("jobs:\n  a:\n    steps:\n      - uses: actions/checkout@"+
 			"d23441a48e516b6c34aea4fa41551a30e30af803 # v6\n"), 0o644); err != nil {
@@ -207,16 +149,7 @@ func TestThePinGateSeesYamlWorkflowsToo(t *testing.T) {
 	}
 }
 
-// TestThePinGateSeesEveryYAMLSpelling covers the other half of the same
-// fail-open: syntax the gate cannot see.
-//
-// Actions accepts several spellings of the same key, and a line-oriented regex
-// recognises only the conventional one. The others are not exotic — a flow
-// mapping and a quoted key are both ordinary YAML — and because a file's normal
-// entries keep the "found something" floor satisfied, a gate that misses them
-// still PASSES while the unpinned action runs.
-//
-// Each case below carries exactly one mutable ref, and each must be reported.
+// TestThePinGateSeesEveryYAMLSpelling verifies every YAML spelling of uses is scanned.
 func TestThePinGateSeesEveryYAMLSpelling(t *testing.T) {
 	// wantSeen is 1 everywhere except the merge-key case, where it is 2 — and
 	// that is correct rather than a bug: `x-step: &s {uses: ...}` is itself a
@@ -271,15 +204,7 @@ func TestThePinGateSeesEveryYAMLSpelling(t *testing.T) {
 	})
 }
 
-// TestPublishRefusesATagThatMovedAfterValidation pins the release TOCTOU guard.
-//
-// `validate` and `release` are separate jobs on separate runners, each checking
-// the tag out independently. A tag force-moved between them passes every
-// self-consistency check either makes — tag and checkout agree, on the NEW
-// commit — so every gate validated a tree that is not the one published.
-//
-// The guard must also refuse an ABSENT approved commit. An empty guard is not a
-// passing guard, and empty is exactly what a renamed output produces.
+// TestPublishRefusesATagThatMovedAfterValidation verifies release refuses a tag that moved after validation.
 func TestPublishRefusesATagThatMovedAfterValidation(t *testing.T) {
 	path := filepath.Join(workflowsDir, "release.yml")
 	raw, err := os.ReadFile(path)
@@ -308,12 +233,7 @@ func TestPublishRefusesATagThatMovedAfterValidation(t *testing.T) {
 			"silently publishing the right tree hides it.")
 	}
 
-	// THE GUARD MUST ASK THE REMOTE. Comparing this job's `git rev-parse HEAD`
-	// against the approved commit cannot detect anything: on a tag-push event
-	// actions/checkout checks out the SHA captured in the triggering event, so
-	// both jobs check out the same commit however the tag moves afterwards, and
-	// the comparison passes by construction. Only resolving what the tag points
-	// at NOW answers the question.
+	// The guard must resolve the tag on the remote; the checkout is the event's SHA.
 	if !strings.Contains(body, "git ls-remote --tags origin") {
 		t.Error("the tag-immutability guard never queries the remote. Comparing two " +
 			"checkouts of the same event SHA is a guard that cannot fail: actions/checkout " +
@@ -327,19 +247,7 @@ func TestPublishRefusesATagThatMovedAfterValidation(t *testing.T) {
 	}
 }
 
-// TestTagGuardIsAdjacentToPublication pins the guard's POSITION, which is as
-// load-bearing as its logic.
-//
-// A time-of-check/time-of-use guard only covers the window it precedes. The
-// first version of this check sat at the top of the publish job, leaving the
-// build, the FIPS build, vet, the full race suite (900s timeout), coverage and
-// release-note generation between it and `softprops/action-gh-release` —
-// minutes in which the tag could move, after which the action still resolves
-// `tag_name` by NAME and publishes the moved commit. Narrowing a TOCTOU window
-// is not closing it.
-//
-// So: no executable step between the guard and the publish. A comment or a
-// blank line is fine; a `run:` or a `uses:` is not.
+// TestTagGuardIsAdjacentToPublication verifies the tag guard runs immediately before publication.
 func TestTagGuardIsAdjacentToPublication(t *testing.T) {
 	path := filepath.Join(workflowsDir, "release.yml")
 	raw, err := os.ReadFile(path)
@@ -373,13 +281,7 @@ func TestTagGuardIsAdjacentToPublication(t *testing.T) {
 	}
 }
 
-// TestTagMovementGuardLogic exercises the guard's shell logic directly, against
-// a real repository, rather than asserting that certain lines exist.
-//
-// The previous version of this test only searched release.yml for the
-// comparison — and that comparison was inert, so the test passed over a guard
-// that could never fire. Running the logic is the difference between checking
-// that a control is present and checking that it works.
+// TestTagMovementGuardLogic runs the guard's shell logic against a real repository.
 func TestTagMovementGuardLogic(t *testing.T) {
 	dir := t.TempDir()
 	remote := filepath.Join(t.TempDir(), "remote.git")
@@ -438,16 +340,14 @@ func TestTagMovementGuardLogic(t *testing.T) {
 		return plain
 	}
 
-	// An ANNOTATED tag must peel to the commit, not to the tag object.
+	// An annotated tag must peel to the commit.
 	if got := resolve(); got != approved {
 		tagObj := run("git", "rev-parse", "refs/tags/v1.0.0-alpha")
 		t.Fatalf("resolution gave %s, want the commit %s (the tag OBJECT is %s).\n"+
 			"An unpeeled comparison would refuse every annotated release.", got, approved, tagObj)
 	}
 
-	// Now MOVE the tag, exactly as the TOCTOU scenario does, and require the
-	// resolution to change. This is what a HEAD-vs-APPROVED comparison could
-	// never see: the checkout is unaffected.
+	// Move the tag and require the resolution to change.
 	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("b"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}

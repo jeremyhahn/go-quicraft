@@ -28,23 +28,7 @@ const (
 	// usage during long fuzzing sessions.
 	fuzzMaxPlaintextSize = 64 * 1024 // 64 KiB
 
-	// fuzzKDFMemoryKiB is the Argon2id memory cost for the fuzz fixture, and
-	// it is deliberately far below the 64 MiB the rest of the seal suite uses.
-	//
-	// Every target here builds a fresh barrier PER INPUT — three of the four
-	// must, because they assert on epoch numbering that only holds for a new
-	// barrier. At 64 MiB that made each execution allocate and scrub 64 MiB
-	// for a key derivation the targets explicitly do not test, which held the
-	// whole package to ~50 exec/s and then collapsed it to 0 exec/s as the GC
-	// fell behind. The release gate's bounded mutation pass failed outright
-	// with "context deadline exceeded" when a worker could no longer answer
-	// the coordinator inside its shutdown deadline.
-	//
-	// A unit test pays this cost once, so 64 MiB is free there; a fuzz target
-	// pays it hundreds of thousands of times. The work factor is meaningless
-	// either way because TestMain enables the weak-parameter bypass for the
-	// entire binary, so this trades no coverage for two orders of magnitude
-	// more inputs through the AEAD paths that ARE under test.
+	// fuzzKDFMemoryKiB is a small Argon2id memory cost so per-input barriers stay fast; TestMain bypasses the work factor anyway.
 	fuzzKDFMemoryKiB = 1024 // 1 MiB
 )
 
@@ -53,17 +37,7 @@ const (
 // barrier's AEAD layer, not the KDF.
 var fuzzPassphrase = []byte("fuzz-test-passphrase-32bytes!!")
 
-// newFuzzBarrier returns an initialized, unsealed Barrier backed by the
-// SoftwareStrategy with Argon2id at fuzzKDFMemoryKiB, which is what actually
-// keeps fuzz iterations fast — see that constant. The barrier uses
-// AES-256-GCM with nonce tracking disabled for speed.
-//
-// The no-op StatePersister is REQUIRED, not decoration: Rotate fails closed
-// with ErrNoStatePersister without one — a new epoch that is not durably
-// recorded makes every record written under it unreadable after a restart — so
-// FuzzBarrierDecryptWrongEpoch failed on all five of its own seeds without it.
-// The fixture, not the production requirement, was what needed fixing; CI now
-// runs these targets, which is why nothing caught it before.
+// newFuzzBarrier returns an unsealed AES-256-GCM software Barrier with a cheap KDF, no nonce tracking, and the no-op StatePersister Rotate requires.
 func newFuzzBarrier(t testing.TB) *Barrier {
 	t.Helper()
 

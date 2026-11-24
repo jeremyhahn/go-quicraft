@@ -78,22 +78,7 @@ func (b *blockingConcurrentSM) RecoverFromSnapshot(_ context.Context, r io.Reade
 
 func (b *blockingConcurrentSM) Close(_ context.Context) error { return nil }
 
-// TestAppliesResumeWhileSnapshotStreams pins the reason streamGuard exists.
-//
-// SaveSnapshotGated captures a point-in-time, fires afterCapture so the engine
-// releases its apply gate, and then streams. The whole purpose of that split is
-// that a large snapshot does not pause the shard: applies must run alongside the
-// stream. Two guards make that possible — readGuard covers the capture and is
-// dropped at afterCapture, while streamGuard is held across the stream purely to
-// keep Close out.
-//
-// Collapsing those two roles into readGuard alone is not a hypothetical: it is
-// what this code did when Apply became a write-lock holder, and the effect was a
-// shard-wide stall for the duration of every transfer. With one guard doing both
-// jobs, the Apply below blocks until the stream finishes, the stream does not
-// finish until the test releases it, and the test releases it only after the
-// Apply returns — so a regression deadlocks here and is reported as a timeout
-// rather than passing quietly.
+// TestAppliesResumeWhileSnapshotStreams verifies applies run while a captured snapshot streams.
 func TestAppliesResumeWhileSnapshotStreams(t *testing.T) {
 	blocking := newBlockingConcurrentSM()
 	createFn := func(uint64, uint64) interface{} { return blocking }
@@ -176,12 +161,7 @@ func TestAppliesResumeWhileSnapshotStreams(t *testing.T) {
 	}
 }
 
-// TestCloseWaitsForStreamingSnapshot pins the other half of streamGuard: moving
-// the Close-blocking job off readGuard must not drop it.
-//
-// Close must not tear the state machine down under a snapshot that is still
-// streaming. readGuard alone can no longer prove that, because the gated save
-// releases it at capture time; streamGuard is what carries the guarantee now.
+// TestCloseWaitsForStreamingSnapshot verifies Close waits for a streaming snapshot.
 func TestCloseWaitsForStreamingSnapshot(t *testing.T) {
 	blocking := newBlockingConcurrentSM()
 	createFn := func(uint64, uint64) interface{} { return blocking }
@@ -233,13 +213,7 @@ func TestCloseWaitsForStreamingSnapshot(t *testing.T) {
 	}
 }
 
-// TestGetHashAfterCloseReturnsErrClosed pins the guard GetHash takes.
-//
-// Without a guard Host.StateMachineHash could hash a user SM concurrently with
-// Apply — a replica-divergence check reporting a
-// mismatch that does not exist — or read one that Close had already torn down.
-// The Apply exclusion is covered by TestApplyExcludesLookupOnBasicTier, which
-// drives GetHash alongside Lookup; this covers the closed case.
+// TestGetHashAfterCloseReturnsErrClosed verifies GetHash after Close returns ErrClosed.
 func TestGetHashAfterCloseReturnsErrClosed(t *testing.T) {
 	detector := &overlapDetectorSM{}
 	createFn := func(uint64, uint64) interface{} { return detector }

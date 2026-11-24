@@ -22,24 +22,13 @@ import (
 	"sync"
 )
 
-// ErrDirLocked is returned, wrapped with the lock file's path, when a
-// directory is already held by another opener: another process, or another
-// open in this one. Two writers over one data directory interleave their
-// records and corrupt both, so the second is refused rather than queued.
+// ErrDirLocked is returned, wrapped with the lock file path, when another opener holds the directory.
 var ErrDirLocked = errors.New("fsutil: directory is locked by another opener")
 
 // LockFilePerms is the mode a lock file is created with.
 const LockFilePerms = 0o600
 
-// DirLock is an exclusive lock on a directory, held through a lock file
-// inside it until Close. The lock is advisory and taken on an open file
-// description (flock on unix, LockFileEx on Windows), so it is refused to a
-// second open in the same process as well as to another process, and the
-// kernel drops it when the holder dies: a crash never leaves a stale lock.
-//
-// The lock file is never removed. Removing it on Close would let an opener
-// that opened the old name lock an unlinked inode while a third creates and
-// locks a new one, and both would believe they hold the directory.
+// DirLock is an exclusive advisory lock on a directory through a lock file that is never removed; the kernel drops it when the holder dies.
 type DirLock struct {
 	path string
 	once sync.Once
@@ -47,11 +36,7 @@ type DirLock struct {
 	err  error
 }
 
-// LockDir takes the exclusive lock on dir through the file name inside it,
-// creating the file (mode LockFilePerms) when absent and fsyncing dir so the
-// created entry is durable. dir must exist. A directory already held fails
-// immediately with an error wrapping ErrDirLocked and naming the path; it
-// never waits.
+// LockDir takes the exclusive lock on dir through the file name in it, creating it and fsyncing dir; a held directory fails at once with ErrDirLocked.
 func LockDir(dir, name string) (*DirLock, error) {
 	path := filepath.Join(dir, name)
 	_, statErr := os.Stat(path)

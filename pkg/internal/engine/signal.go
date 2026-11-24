@@ -16,16 +16,7 @@ package engine
 
 import "sync/atomic"
 
-// WorkSignal routes shard work notifications to the correct worker.
-// Each worker has its own ReadyMap and notification channel. Shards
-// are assigned to workers by fixed hash: shardID % numWorkers.
-//
-// The atomic pre-filter on each worker avoids redundant channel sends
-// when the worker is already notified. A Load-before-Swap optimization
-// on the notified flag provides a two-level fast path: the Load (~1ns)
-// avoids the Swap write barrier (~5ns), and both avoid the channel
-// send (~10-15ns). Under contention, most Notify() calls hit the Load
-// fast path since workers stay notified between processing cycles.
+// WorkSignal routes shard work notifications to worker shardID % numWorkers, with an atomic pre-filter on each.
 type WorkSignal struct {
 	readyMaps []*ReadyMap
 	channels  []chan struct{}
@@ -48,19 +39,7 @@ func NewWorkSignal(numWorkers int) *WorkSignal {
 	return ws
 }
 
-// Notify marks a shard as having pending work and notifies the owning
-// worker. The shard is routed to worker shardID % numWorkers.
-//
-// Uses a two-level atomic pre-filter:
-//  1. Load: if already notified, return immediately (~1ns, no write barrier).
-//  2. Swap: atomically set to true; if it was false, send on channel.
-//
-// The Load fast path avoids the Swap write barrier under contention
-// when multiple goroutines notify the same worker concurrently. This
-// is safe because the step worker iterates ALL nodes in processReady(),
-// not just the ready set, so no work is missed by the early return.
-//
-// Safe for concurrent use by multiple goroutines.
+// Notify marks a shard as having work and wakes its worker unless already notified; safe for concurrent use.
 func (ws *WorkSignal) Notify(shardID uint64) {
 	workerID := shardID % uint64(len(ws.readyMaps))
 	ws.readyMaps[workerID].Set(shardID)
@@ -87,12 +66,7 @@ func (ws *WorkSignal) Swap(workerID int) map[uint64]struct{} {
 	return ws.readyMaps[workerID].Swap()
 }
 
-// HasWork returns true if the worker has been notified of pending work.
-// This is a cheap atomic load (~1ns) used by the adaptive spin-wait
-// loop in the step worker to detect new work without the overhead of
-// a channel receive (~500us-1ms goroutine wake-up on high-core-count
-// machines). It does not consume the notification; the caller must
-// still call ClearNotified after processing.
+// HasWork reports whether the worker has been notified; it does not consume the notification.
 func (ws *WorkSignal) HasWork(workerID int) bool {
 	return ws.notified[workerID].Load()
 }

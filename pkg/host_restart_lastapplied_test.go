@@ -24,18 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// The state machine keeps its OWN applied counter, separate from the engine
-// node's and from raft's processed marker, and StartShard must seed all three
-// to the same index on the restart path.
-//
-// rsm.StateMachine.lastApplied is the lower bound of the session expiry
-// checkpoint walk. A restart that leaves it at 0 while raft resumes at N makes
-// the restarted replica re-walk every checkpoint in (0, N] that its peers
-// already walked — and session expiry is CAPPED at 64 deletions per checkpoint,
-// so the re-walk is not idempotent: it deletes sessions the rest of the shard
-// still holds. The replica then answers ResultSessionExpired for entries its
-// peers route into the user state machine, with every raft invariant intact and
-// nothing logged. See rsm.StateMachine.SetLastApplied.
+// StartShard seeds the state machine's applied counter on restart; an unseeded counter re-walks capped session expiry and deletes live sessions.
 
 // startShardRecoveringFromSnapshot seeds a LogDB with a snapshot record at
 // index and the matching on-disk artifact, then starts the shard on it. The
@@ -74,13 +63,7 @@ func startShardRecoveringFromSnapshot(t *testing.T, h *Host, index uint64) {
 	}
 }
 
-// TestStartShard_SeedsStateMachineAppliedIndexFromSnapshot asserts the seeding
-// directly: after a restart that recovers from a local snapshot at index N, the
-// STATE MACHINE's applied counter reads N, like raft's processed marker and the
-// engine node's.
-//
-// RecoverFromSnapshot restores the session table — it travels in the snapshot
-// stream — but not this counter, so the seed has to come from StartShard.
+// TestStartShard_SeedsStateMachineAppliedIndexFromSnapshot checks the state machine's applied counter equals the recovered snapshot index.
 func TestStartShard_SeedsStateMachineAppliedIndexFromSnapshot(t *testing.T) {
 	const snapshotIndex uint64 = 40
 
@@ -99,9 +82,7 @@ func TestStartShard_SeedsStateMachineAppliedIndexFromSnapshot(t *testing.T) {
 			got, snapshotIndex, got, got, snapshotIndex)
 	}
 
-	// The two counters must AGREE, not merely both be non-zero: the engine's
-	// apply worker offers batches from its own marker and the state machine
-	// asserts contiguity against this one.
+	// The two counters must agree, not merely be non-zero.
 	engNode := h.engine.GetNode(1)
 	if engNode == nil {
 		t.Fatal("shard is not loaded in the engine")
@@ -113,15 +94,7 @@ func TestStartShard_SeedsStateMachineAppliedIndexFromSnapshot(t *testing.T) {
 	}
 }
 
-// TestStartShard_RestartedShardAppliesAfterSnapshotRecovery is the end-to-end
-// consequence. The restarted shard elects, commits its term-opening no-op at
-// snapshotIndex+1 and must APPLY it.
-//
-// An unseeded state machine sees a batch starting at snapshotIndex+1 with its
-// own marker at 0 — a hole covering every index through the snapshot — and the
-// contiguity guard fails the apply, so a proposal never completes. Before that
-// guard existed the same shape applied silently against a re-walked expiry
-// range, which is the divergence this pair of tests brackets.
+// TestStartShard_RestartedShardAppliesAfterSnapshotRecovery checks the restarted shard applies its term-opening no-op.
 func TestStartShard_RestartedShardAppliesAfterSnapshotRecovery(t *testing.T) {
 	const snapshotIndex uint64 = 40
 

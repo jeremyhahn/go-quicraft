@@ -16,9 +16,6 @@ package transport
 
 // Additional frame flags beyond the base flags defined in frame.go.
 const (
-	// FlagSnapshot indicates the frame carries a snapshot header or chunk
-	// data on a dedicated snapshot stream. The receiver uses this flag
-	// to route the stream to the snapshot handler instead of the regular
-	// message handler.
+	// FlagSnapshot routes a dedicated snapshot stream to the snapshot handler.
 	FlagSnapshot FrameFlags = 0x02
 )

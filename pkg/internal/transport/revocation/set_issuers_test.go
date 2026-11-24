@@ -20,9 +20,7 @@ import (
 	"testing"
 )
 
-// TestSetIssuers_ReplacesIssuerSet verifies that SetIssuers swaps the whole
-// candidate set a CA-bundle reload hands the checker: a leaf of the newly
-// trusted CA finds its issuer, and a leaf of the dropped CA no longer does.
+// TestSetIssuers_ReplacesIssuerSet verifies SetIssuers replaces the whole issuer set.
 func TestSetIssuers_ReplacesIssuerSet(t *testing.T) {
 	oldCA := newTestCA(t)
 	newCA := newTestCA(t)

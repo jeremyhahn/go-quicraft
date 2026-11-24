@@ -287,15 +287,7 @@ func TestSendQueueIdlePruneRemovesQueue(t *testing.T) {
 		t.Fatalf("expected 1 send queue, got %d", t1.SendQueueCount())
 	}
 
-	// Wait for the idle timeout to expire. The constant is 60s but in a
-	// production build we cannot easily override it without modifying the
-	// constant. Instead, we directly test the pruning mechanism by calling
-	// the worker's cleanup path: manually delete the queue from the map
-	// to simulate what happens when the idle timer fires.
-	//
-	// For a true timeout test, we would need to wait 60+ seconds which is
-	// too slow for unit tests. Instead, we verify the mechanism works by
-	// checking the SendQueueCount method and that re-creation works.
+	// Simulate the 60s idle timeout by deleting the queue, then check SendQueueCount and re-creation.
 	t1.sendQueuesMu.Lock()
 	for k := range t1.sendQueues {
 		delete(t1.sendQueues, k)
@@ -379,15 +371,7 @@ func TestEnqueueToTarget_PruneThenEnqueueReEnqueues(t *testing.T) {
 		t.Fatal("fresh send queue should not be marked closed")
 	}
 
-	// The message must be deliverable: it must NOT be sitting only in the
-	// orphaned channel. The fresh queue's worker (started by
-	// getOrCreateSendQueue) will have drained or will drain it; pull from the
-	// fresh channel directly to assert the message is recoverable there. We
-	// stop the transport first so the worker exits, then inspect the channel.
-	//
-	// Drain whichever channel holds the message: the worker may have already
-	// consumed it, so accept delivery via either the fresh channel or the
-	// worker having taken it (channel empty but orphan empty too).
+	// The message must be recoverable from the fresh queue, either still in its channel or taken by its worker.
 	if len(orphan.ch) != 0 {
 		t.Fatalf("message was orphaned in the closed queue (len=%d)", len(orphan.ch))
 	}
@@ -857,18 +841,7 @@ func TestSendBatch_BufferReallocationForCompressedFrame(t *testing.T) {
 // stops processing when a single snapshot receive accumulates more bytes
 // than the receiver's maxMemory budget.
 
-// TestSendBatch_WriteErrorEvictsConnection verifies that a stream write failure
-// evicts AND closes the cached connection along with every stream pooled on it.
-// Eviction is what stops the transport writing into a black-holed connection:
-// without it every cached stream on the dead connection stalls for the full
-// write deadline on each subsequent batch, and Raft sees a peer that is
-// reachable-but-silent.
-//
-// The failure is injected deterministically by cancelling the send side of the
-// pooled stream — subsequent writes on it fail immediately — so the test never
-// depends on a peer teardown racing the send. It asserts identity, not mere
-// absence, of the connection, so a legitimate re-dial cannot mask a missing
-// eviction.
+// TestSendBatch_WriteErrorEvictsConnection checks a stream write failure evicts and closes the cached connection and its streams.
 func TestSendBatch_WriteErrorEvictsConnection(t *testing.T) {
 	rec := &dropRecorder{}
 	t1, t2, cleanup := transportPairWith(t, 42, newTestHandler(), newTestHandler(),
@@ -923,18 +896,14 @@ func TestSendBatch_WriteErrorEvictsConnection(t *testing.T) {
 			dropReasonWriteFailed, rec.drops())
 	}
 
-	// The evicted connection must be CLOSED, not merely dropped from the map:
-	// a forgotten-but-open connection keeps its streams writable into a peer
-	// that will never read them.
+	// The evicted connection must be closed.
 	select {
 	case <-conn.Context().Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("connection was not closed after the write failure")
 	}
 
-	// And it must no longer be the cached connection for the target. Compare
-	// identity rather than presence so a concurrent re-dial cannot hide a
-	// missing eviction.
+	// Compare identity so a re-dial cannot hide a missing eviction.
 	t1.connMu.RLock()
 	cached, cachedOK := t1.conns[t2Addr]
 	t1.connMu.RUnlock()

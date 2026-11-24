@@ -31,22 +31,7 @@ import (
 // A witness/observer bootstrapped through the members map is a full voter
 // ---------------------------------------------------------------------------
 
-// TestStartShard_RejectsWitnessOrObserverInMembers pins the fail-closed half of
-// the fix.
-//
-// The members map seeds proto.Membership.Addresses — the FULL VOTER set — on
-// every replica that lists it, and membership is replicated state, so a replica
-// cannot hold a role for itself that its peers do not hold for it. A witness
-// bootstrapped this way was a full voter in every replica's membership: the
-// leader replicated FULL entry payloads to it, it counted as a full replica for
-// RequireFullReplicaMajority and toward every quorum, and the only witness-like
-// behaviour left was this host's local read gate refusing the reads the
-// operator asked the replica to serve. raft.checkSelfRole then latched the
-// disagreement permanently (no campaigning, no reads) — a true positive nobody
-// could act on, because the shape was created at bootstrap.
-//
-// The shard must not exist afterwards: a half-started shard would leave the
-// operator with the broken configuration the rejection exists to prevent.
+// TestStartShard_RejectsWitnessOrObserverInMembers pins that bootstrap refuses a witness or observer in members and leaves no shard behind.
 func TestStartShard_RejectsWitnessOrObserverInMembers(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -110,33 +95,9 @@ func TestStartShard_RejectsWitnessOrObserverInMembers(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// The refusal above must not apply to a RESTART
-// ---------------------------------------------------------------------------
+// The refusal above must not apply to a restart.
 
-// TestStartShard_NonVotingRestartWithRecoveredMembership pins the other side of
-// the same gate: a witness or observer that was legitimately added through a
-// committed config change must be able to RESTART.
-//
-// On a restart the members map seeds nothing — the recovered membership is
-// authoritative and the bootstrap seeding block does not run — so the map
-// cannot make this replica a voter and there is nothing to refuse. Refusing
-// anyway left no working restart at all:
-//
-//	join=false, self listed  -> NonVotingRoleInMembersError
-//	join=false, self omitted -> SelfNotInMembersError
-//	join=true                -> nil, but the shard is marked JOINING
-//
-// and join=true was therefore the only form that worked. The joining marker is
-// cleared in exactly ONE place, the InstallSnapshot adopt branch; a caught-up
-// witness receives Replicate and never InstallSnapshot, so the marker was
-// PERMANENT for the process lifetime. That is not a cosmetic flag:
-// Node.IsMember then answers true for EVERY replica ID, which disables
-// per-shard message authorization and the handler's SourceAddress binding, and
-// Peer.Tick returns early, so the replica runs with no election timer and no
-// CheckQuorum. The gate against a misconfiguration was producing a worse one.
-//
-// The assertions are on those CONSEQUENCES, not merely on the returned error.
+// TestStartShard_NonVotingRestartWithRecoveredMembership pins that a witness or observer added by config change restarts with join=false, without the joining marker.
 func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -160,11 +121,7 @@ func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 			}
 			defer h.Close()
 
-			// Give this replica the durable state a legitimately-added
-			// non-voting replica has after its config change committed: a
-			// snapshot whose REPLICATED membership carries the role. The
-			// artifact is installed through the public import path so the
-			// on-disk tree is the real one StartShard recovers from.
+			// Install a snapshot whose replicated membership carries the role, through the public import path.
 			if bsErr := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
 				Addresses: map[uint64]string{1: voterAddr},
 			}); bsErr != nil {
@@ -227,7 +184,7 @@ func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 				t.Error("IsMember(1) is false: the recovered voter is not recognised")
 			}
 
-			// The role really did come from REPLICATED state, not local config.
+			// The role came from replicated state, not local config.
 			after, memErr := h.ShardMembership(shardID)
 			if memErr != nil {
 				t.Fatalf("ShardMembership failed: %v", memErr)
@@ -246,55 +203,7 @@ func TestStartShard_NonVotingRestartWithRecoveredMembership(t *testing.T) {
 	}
 }
 
-// TestStartShard_NonVotingRestartWithoutASnapshot covers the case the gate's own
-// rationale names but its first implementation missed: a witness or observer
-// that is CAUGHT UP and has therefore never been snapshotted.
-//
-// The gate was derived from recovered MEMBERSHIP, and membership is persisted
-// ONLY alongside a snapshot record — memdb.applyUpdate sets nd.membership
-// solely inside the u.Snapshot.Index > 0 branch, and waldb sources the
-// membership ReadState reports from the latest snapshot record. A replica with
-// a hard state and log entries but no snapshot therefore recovers NO membership
-// and was indistinguishable from a bootstrap, so the refusal fired on exactly
-// the replicas it was written to exempt:
-//
-//	join=false, self listed  -> NonVotingRoleInMembersError
-//	join=false, self omitted -> SelfNotInMembersError
-//	join=true,  self omitted -> nil, but the shard is marked JOINING — the
-//	                            permanent marker the gate exists to avoid
-//
-// This is not an exotic state. A witness stores no entry payloads and a young
-// shard may never reach SnapshotEntries at all, so "running, caught up, never
-// snapshotted" is the ordinary condition of a witness. The discriminator is
-// therefore PERSISTED STATE (snapshot record, hard state, or log entries), not
-// membership.
-//
-// # What the seeded membership does, and what repairs it
-//
-// This is the ONLY start form in which the caller's members map is both seeded
-// AND contains a replica the shard has since made non-voting. join=false forces
-// the operator to list SELF (SelfNotInMembersError otherwise), and the seed
-// writes every listed replica into proto.Membership.Addresses — the FULL VOTER
-// set. So the replica comes up a voter in its own membership, and so does every
-// other witness/observer the operator listed.
-//
-// The repair is the committed AddWitness / AddNonVoting entry, still in the log
-// because config changes are compacted only behind a snapshot. The fixture
-// below therefore carries that entry, and the assertions are on the resulting
-// MEMBERSHIP — the roles and the ConfigChangeID — because that is what the
-// defect corrupted:
-//
-//   - OBSERVER: silent and DURABLE. checkSelfRole compares only the WITNESS
-//     bit, so an observer seeded as a voter raises nothing at all. The replica
-//     runs a full state machine, reaches SnapshotEntries, and saveSnapshot
-//     persists the WRONG membership into LogDB; compaction then removes the
-//     AddNonVoting entry and the corruption is authoritative from the next
-//     restart on. Promote that replica later and it campaigns with a voting set
-//     omitting every witness and observer — committing on two acks where the
-//     real configuration needs three.
-//   - WITNESS: checkSelfRole latches (no campaigning, no reads) but the
-//     membership still contradicts every peer's, and the leader-side effect of
-//     the seed is unaffected by the latch.
+// TestStartShard_NonVotingRestartWithoutASnapshot covers a caught-up, never-snapshotted witness or observer: persisted state allows the restart and the committed config change restores its role.
 func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -329,17 +238,7 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 			}
 			defer h.Close()
 
-			// The durable state of a CAUGHT-UP replica that has never
-			// snapshotted: a bootstrap record, a hard state and log entries —
-			// and, by construction, no membership record anywhere in the LogDB
-			// (both backends write one only alongside a snapshot).
-			//
-			// Entry 1 is the shard's founding configuration, which
-			// config-in-log commits before any other entry; entry 2 is the
-			// COMMITTED config change that gave this replica its non-voting
-			// role. Without entry 2 the fixture cannot exercise the repair the
-			// seeded membership depends on, and the subtest would pass over a
-			// membership nobody looked at.
+			// A caught-up, never-snapshotted replica: bootstrap record, hard state, entry 1 (founding config) and entry 2 (the committed role change).
 			if bsErr := db.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
 				Addresses: map[uint64]string{1: voterAddr},
 			}); bsErr != nil {
@@ -445,19 +344,7 @@ func TestStartShard_NonVotingRestartWithoutASnapshot(t *testing.T) {
 	}
 }
 
-// TestStartShard_WitnessEntersMembershipThroughConfigChange pins the other half:
-// the supported flow puts the witness where the DATA PATH reads it from.
-//
-// r.witnesses — the map broadcastAppend consults to choose sendWitnessAppend
-// (metadata-only entries) over sendAppend (full payloads) — is populated from
-// Membership.Witnesses and from nothing else. A witness that is not in that map
-// receives full payloads no matter what its local Config says, which is exactly
-// what the rejected bootstrap shape produced. This asserts the committed config
-// change lands the replica in Membership.Witnesses and NOT in Membership.Nodes
-// (the voter set the members map seeds).
-//
-// pkg/internal/raft.TestWitnessDataPath_FollowsReplicatedMembership pins the
-// payload-stripping consequence of that placement directly.
+// TestStartShard_WitnessEntersMembershipThroughConfigChange pins that the config change puts the witness in Membership.Witnesses, not Nodes.
 func TestStartShard_WitnessEntersMembershipThroughConfigChange(t *testing.T) {
 	h := newTestHost(t)
 

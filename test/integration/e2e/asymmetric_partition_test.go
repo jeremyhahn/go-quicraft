@@ -24,36 +24,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// ---------------------------------------------------------------------------
-// Asymmetric Network Partition Tests
-//
-// These tests exercise scenarios where network connectivity is directional
-// or partial, unlike symmetric partitions where a node is completely
-// isolated from all peers equally.
-//
-// Since the E2E test infrastructure operates with real QUIC transport on
-// loopback and does not support per-link network filtering, asymmetric
-// partitions are simulated by selectively stopping nodes to create the
-// desired reachability topology. The Raft protocol's behavior under
-// these topologies (leader isolation from minority vs majority, follower
-// isolation) is validated through leader election, proposal commitment,
-// term advancement, and state convergence assertions.
-// ---------------------------------------------------------------------------
+// Asymmetric partition tests, simulated by stopping nodes since loopback QUIC has no per-link filtering.
 
-// TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority verifies that
-// when the leader loses connectivity to a minority of followers (1 out
-// of 2 followers in a 3-node cluster), it retains quorum with the
-// remaining follower and continues to serve proposals.
-//
-// Topology (3-node cluster, quorum=2):
-//
-//	Leader (node A) <---> Follower B  (connected)
-//	Leader (node A)  X    Follower C  (partitioned)
-//	Follower B       X    Follower C  (partitioned)
-//
-// Simulated by stopping Follower C. The leader and Follower B form the
-// majority partition (2 of 3). After healing (replacing C), all nodes
-// converge.
+// TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority checks a 3-node leader cut off from one follower keeps quorum and serves proposals, then all converge.
 func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -209,20 +182,7 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMinority(t *testing.T) {
 		cluster.liveNodes(), len(expected))
 }
 
-// TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority verifies that
-// when the leader is isolated from the majority of the cluster, the
-// majority elects a new leader, the new leader serves proposals, and
-// after healing the old leader rejoins as a follower with advanced term.
-//
-// Topology (5-node cluster, quorum=3):
-//
-//	Old Leader (node A)  X  Nodes B, C, D  (majority, connected to each other)
-//	Old Leader (node A)  X  Node E         (also partitioned)
-//	Nodes B, C, D       <-->               (fully connected majority)
-//
-// Simulated by stopping the old leader AND one follower (E), leaving
-// 3 nodes (B, C, D) as the majority. The majority elects a new leader
-// and commits entries. After healing (replacing A and E), all converge.
+// TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority checks a 5-node majority elects a new leader when the old one and one follower are stopped, then all converge.
 func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -431,18 +391,7 @@ func TestE2E_AsymmetricPartition_LeaderIsolatedFromMajority(t *testing.T) {
 		cluster.liveNodes(), len(expected))
 }
 
-// TestE2E_AsymmetricPartition_FollowerIsolated verifies that when a single
-// follower is isolated from all other nodes, the remaining majority
-// continues serving proposals. After healing (replacing the isolated
-// follower), the replacement catches up via log replication or snapshot
-// transfer, and all nodes converge to consistent state.
-//
-// Topology (5-node cluster, quorum=3):
-//
-//	Follower E   X   Leader A, Follower B, C, D  (isolated)
-//	Leader A    <-->  Followers B, C, D           (connected)
-//
-// Simulated by stopping Follower E.
+// TestE2E_AsymmetricPartition_FollowerIsolated checks the majority serves proposals while one follower is stopped and its replacement catches up.
 func TestE2E_AsymmetricPartition_FollowerIsolated(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -591,16 +540,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated(t *testing.T) {
 		cluster.liveNodes(), len(expected))
 }
 
-// TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup verifies
-// that an isolated follower's replacement catches up via snapshot transfer
-// when the log has been compacted during the partition. This exercises
-// the snapshot-based recovery path rather than log replication.
-//
-// The test uses aggressive snapshot settings (SnapshotEntries=5,
-// CompactionOverhead=2) to force log compaction while the follower
-// is isolated. After healing, the replacement node must receive a
-// snapshot to catch up since the compacted log entries are no longer
-// available.
+// TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup checks the replacement catches up by snapshot after compaction during the partition.
 func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -640,7 +580,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 	activeLeaderIdx := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	t.Logf("active leader during isolation: node[%d]", activeLeaderIdx)
 
-	// Capture LastApplied BEFORE writes so we can detect advancement.
+	// Capture LastApplied before the writes.
 	initInfo, initErr := cluster.hosts[activeLeaderIdx].ShardInfo(shardID)
 	initApplied := uint64(0)
 	if initErr == nil {
@@ -680,9 +620,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 	t.Logf("added replacement node[%d] (replica=%d) for snapshot catchup",
 		result.idx, newReplicaID)
 
-	// The replacement node should catch up via snapshot transfer since
-	// the log entries before compaction are no longer available.
-	// Verify it has all expected data.
+	// The replacement catches up by snapshot; verify its data.
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, expected, membershipTimeout)
 
 	// ...and verify the recovery path itself. This test exists to exercise

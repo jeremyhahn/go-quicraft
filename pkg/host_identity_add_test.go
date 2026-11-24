@@ -23,18 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestHostIdentityAdd pins docs/membership-changes/api.md (Capability: add a
-// voter; Capability: add an observer or a witness; Errors) for the
-// WithIdentity add calls: each commits the new replica's identity in
-// Membership.Identities, refuses an identity an active member holds with
-// ErrDuplicateMemberIdentity, refuses an identity the shard removed (under
-// any replica ID) with ErrRemovedMemberIdentity, and AddNode cannot promote
-// a witness (ErrNodeAlreadyExists). Every subtest runs on its own
-// single-voter Host so an added member never leaves a later change waiting
-// on a quorum it cannot reach. A witness votes and never starts here, so
-// membership is read with the local ShardMembership (a linearizable read
-// would wait on it), and the removed identity is an observer's: removing a
-// voting witness would wait on the same missing quorum.
+// TestHostIdentityAdd checks the WithIdentity add calls against docs/membership-changes/api.md, each subtest on its own single-voter Host.
 func TestHostIdentityAdd(t *testing.T) {
 	const witnessAddr = "127.0.0.1:6002"
 

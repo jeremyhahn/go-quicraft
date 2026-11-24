@@ -14,28 +14,7 @@
 
 //go:build quicraft_errfs
 
-// Fault modes that put the medium in a state the plain error injection cannot
-// produce, and the WAL recovery paths that only those states reach.
-//
-// The rest of this suite returns an error INSTEAD of performing the operation,
-// which models an open or an unlink faithfully and models a write or a flush
-// not at all:
-//
-//   - A pwrite(2) that hits ENOSPC or EIO part way through returns n < len(p)
-//     with those n bytes on the medium. errfs.ShortWrite reproduces that, and
-//     the half-written record it leaves behind is the only input that reaches
-//     the torn-tail branch of segment.ReadAll and the on-disk repair that
-//     follows it.
-//   - A failed fsync does not leave the data pending. The kernel drops the
-//     dirty pages (fsyncgate), so everything written since the last successful
-//     flush is gone. errfs.LoseUnsyncedData reproduces that, and it is the
-//     only fault under which a WAL that acknowledges before flushing behaves
-//     differently from one that flushes first.
-//
-// Both tests run with real fsyncs — WithNoSync is deliberately absent — and
-// neither closes the faulted DB: the process that owned it is modelled as
-// gone, which is also what keeps the damaged tail on disk for the reopen to
-// find.
+// Fault modes beyond plain error injection: ShortWrite leaves a partial record, LoseUnsyncedData drops unflushed bytes on a failed fsync; both run with real fsyncs and abandon the faulted DB.
 package errfs_test
 
 import (
@@ -102,10 +81,7 @@ func activeSegmentPath(t *testing.T, shardDir string) string {
 	return filepath.Join(shardDir, active)
 }
 
-// segmentBytes returns the full on-disk image of a segment. Segments are
-// pre-allocated to their maximum size on creation, so their LENGTH says
-// nothing about what they hold and only the bytes can answer whether a write
-// reached the medium.
+// segmentBytes returns a segment's full on-disk image; segments are pre-allocated, so length says nothing.
 func segmentBytes(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -134,22 +110,7 @@ func runLength(data []byte, b byte) int {
 	return best
 }
 
-// TestErrorFS_WAL_ShortWriteLeavesTornTailAndIsRepaired drives the WAL's
-// torn-tail recovery with a real torn tail.
-//
-// A short write puts a fragment of a record on the medium and then fails, so
-// the segment ends with bytes that decode to nothing. The failing batch is
-// never acknowledged, and recovery must (a) replay the acknowledged prefix
-// whole, (b) admit nothing from the fragment, and (c) CUT the fragment off the
-// segment, because a torn tail left in place is re-detected on every
-// subsequent boot and each of those boots discards the segments written since
-// the last one.
-//
-// The rollback the write failure would normally run is faulted too. That is
-// not belt-and-braces: rollback truncates the fragment away, so with it
-// working the torn tail never survives to be recovered from, and the recovery
-// path this test exists for is unreachable. A process killed between the
-// failed write and its rollback is exactly the state modelled here.
+// TestErrorFS_WAL_ShortWriteLeavesTornTailAndIsRepaired checks recovery replays the acknowledged prefix, admits nothing from the torn tail and cuts it off.
 func TestErrorFS_WAL_ShortWriteLeavesTornTailAndIsRepaired(t *testing.T) {
 	const (
 		shardID   = uint64(41)
@@ -172,9 +133,7 @@ func TestErrorFS_WAL_ShortWriteLeavesTornTailAndIsRepaired(t *testing.T) {
 	}
 	mustClose(t, db)
 
-	// Phase 2: reopen and tear the next record. The fault is armed AFTER Open
-	// so recovery runs against a healthy filesystem and the first faulted
-	// WriteAt is the record flush.
+	// Arm the fault after Open so the first faulted WriteAt is the record flush.
 	efs := errfs.New(waldb.DefaultFS(), 0, errInjectedIO).
 		OnlyOps(errfs.OpWriteAt, errfs.OpTruncate).
 		ShortWrite(walBlockSize / 2).
@@ -190,9 +149,7 @@ func TestErrorFS_WAL_ShortWriteLeavesTornTailAndIsRepaired(t *testing.T) {
 	}
 	efs.Reset(1, errInjectedIO)
 
-	// Every reopen seals the recovered segment and appends to a fresh one, and
-	// a fresh segment is pre-allocated to its full size, so the torn record has
-	// to be found in the segment's BYTES rather than in its length.
+	// Segments are pre-allocated, so find the torn record in the bytes.
 	torn := activeSegmentPath(t, shardDir)
 	tornPattern := byte((acked + 1) & 0xFF)
 	if before := runLength(segmentBytes(t, torn), tornPattern); before >= tornPayloadSize/4 {
@@ -269,20 +226,7 @@ func TestErrorFS_WAL_ShortWriteLeavesTornTailAndIsRepaired(t *testing.T) {
 	}
 }
 
-// TestErrorFS_WAL_FailedFsyncLosesOnlyUnacknowledgedData drives the WAL's
-// fail-stop-on-fsync-failure path with a fault that has the cost a real fsync
-// failure has.
-//
-// Under LoseUnsyncedData the failing flush takes every byte written since the
-// previous successful flush with it, so what survives on the medium is exactly
-// what an EARLIER fsync covered. That makes the acknowledgement contract
-// testable: everything SaveEntries returned nil for must come back, and the
-// batch that failed must not.
-//
-// It is also the only fault in this suite that fails when the WAL stops
-// flushing. Delete the flush before the acknowledgement and the acknowledged
-// records join the lost set — the returning-an-error mode cannot tell the
-// difference, because it leaves the data on the medium either way.
+// TestErrorFS_WAL_FailedFsyncLosesOnlyUnacknowledgedData checks everything acknowledged survives a failed fsync that drops unflushed data, and the failed batch does not.
 func TestErrorFS_WAL_FailedFsyncLosesOnlyUnacknowledgedData(t *testing.T) {
 	const (
 		shardID   = uint64(42)
@@ -321,9 +265,7 @@ func TestErrorFS_WAL_FailedFsyncLosesOnlyUnacknowledgedData(t *testing.T) {
 		t.Fatalf("baseline SaveNodeState: %v", err)
 	}
 
-	// Segments are pre-allocated to their full size on creation, so the
-	// acknowledged state has to be captured as BYTES: the file's length is
-	// already its maximum and never moves.
+	// Capture the acknowledged state as bytes; segment length is fixed.
 	segment := activeSegmentPath(t, shardDir)
 	ackedImage := segmentBytes(t, segment)
 

@@ -38,17 +38,7 @@ func naLookup(inner interface{}, q nalookup.Query) (interface{}, error) {
 	return result, nil
 }
 
-// translateSnapshotControlError passes dragonboat's snapshot control-flow
-// sentinels through unwrapped. ErrSnapshotStopped and ErrSnapshotAborted
-// are not failures: dragonboat treats them as an orderly abort of an
-// in-flight save (node shutting down, or the state machine declining).
-// Wrapping them in AdapterSnapshotSaveError would report a shutdown as an
-// application error.
-//
-// NOTE: quicraft has no public equivalent sentinel, so an aborted save
-// still surfaces to the requester as a generic snapshot failure rather
-// than as dragonboat's Terminated result. Preserving the sentinel is what
-// the adapter can do without a change in the quicraft engine.
+// translateSnapshotControlError passes ErrSnapshotStopped and ErrSnapshotAborted through unwrapped: they are orderly aborts, not failures.
 func translateSnapshotControlError(err error) error {
 	if errors.Is(err, ErrSnapshotStopped) ||
 		errors.Is(err, ErrSnapshotAborted) ||
@@ -75,10 +65,7 @@ var (
 	_ qcSM.DiskStateMachine       = (*diskAdapter)(nil)
 )
 
-// regularAdapter wraps a dragonboat IStateMachine and implements
-// the quicraft sm.StateMachine interface. Each entry in the batch
-// is applied individually through the inner state machine's
-// single-entry Update method.
+// regularAdapter adapts a dragonboat IStateMachine to sm.StateMachine, applying entries one at a time.
 type regularAdapter struct {
 	inner IStateMachine
 }
@@ -116,11 +103,7 @@ func (a *regularAdapter) Lookup(_ context.Context, query interface{}) (interface
 	return result, nil
 }
 
-// SaveSnapshot delegates to the inner IStateMachine.SaveSnapshot.
-// QuicRaft does not support external snapshot files: when the inner
-// state machine adds files to the collection, the snapshot fails with
-// ErrSnapshotFilesNotSupported instead of silently producing a snapshot
-// that cannot restore the external data.
+// SaveSnapshot delegates to the inner state machine; external snapshot files fail with ErrSnapshotFilesNotSupported.
 func (a *regularAdapter) SaveSnapshot(_ context.Context, w io.Writer, stopper <-chan struct{}) error {
 	fc := &snapshotFileCollection{}
 	if err := a.inner.SaveSnapshot(w, fc, stopper); err != nil {
@@ -158,12 +141,7 @@ type concurrentAdapter struct {
 	inner IConcurrentStateMachine
 }
 
-// Update converts quicraft entries to dragonboat entries, delegates to
-// the inner IConcurrentStateMachine.Update, then copies the in-place
-// Entry.Result values back to the pre-allocated quicraft results slice.
-// The inner Update reports one error for the whole batch without naming
-// the entry that failed, so its AdapterUpdateError carries Index 0, not
-// a Raft log index.
+// Update applies the batch through the inner Update and copies results back; a batch error carries Index 0.
 func (a *concurrentAdapter) Update(_ context.Context, entries []qcSM.Entry, results []qcSM.Result) error {
 	dbEntries := make([]Entry, len(entries))
 	for i := range entries {
@@ -212,11 +190,7 @@ func (a *concurrentAdapter) PrepareSnapshot() (interface{}, error) {
 	return ctx, nil
 }
 
-// SaveSnapshot delegates to the inner IConcurrentStateMachine.SaveSnapshot.
-// QuicRaft does not support external snapshot files: when the inner
-// state machine adds files to the collection, the snapshot fails with
-// ErrSnapshotFilesNotSupported instead of silently producing a snapshot
-// that cannot restore the external data.
+// SaveSnapshot delegates to the inner state machine; external snapshot files fail with ErrSnapshotFilesNotSupported.
 func (a *concurrentAdapter) SaveSnapshot(_ context.Context, snapshotCtx interface{}, w io.Writer, stopper <-chan struct{}) error {
 	fc := &snapshotFileCollection{}
 	if err := a.inner.SaveSnapshot(snapshotCtx, w, fc, stopper); err != nil {
@@ -253,10 +227,7 @@ type diskAdapter struct {
 	inner IOnDiskStateMachine
 }
 
-// Open delegates to the inner IOnDiskStateMachine.Open. The initialDir
-// parameter from quicraft is not forwarded because dragonboat's Open
-// does not accept a directory argument; on-disk state machines in
-// dragonboat manage their own storage paths.
+// Open delegates to the inner Open; dragonboat's Open takes no directory.
 func (a *diskAdapter) Open(_ context.Context, _ string, stopper <-chan struct{}) (uint64, error) {
 	index, err := a.inner.Open(stopper)
 	if err != nil {
@@ -271,11 +242,7 @@ func (a *diskAdapter) Open(_ context.Context, _ string, stopper <-chan struct{})
 	return index, nil
 }
 
-// Update converts quicraft entries to dragonboat entries, delegates to
-// the inner IOnDiskStateMachine.Update, then copies Entry.Result values
-// back to the quicraft results slice. The inner Update reports one error
-// for the whole batch without naming the entry that failed, so its
-// AdapterUpdateError carries Index 0, not a Raft log index.
+// Update applies the batch through the inner Update and copies results back; a batch error carries Index 0.
 func (a *diskAdapter) Update(_ context.Context, entries []qcSM.Entry, results []qcSM.Result) error {
 	dbEntries := make([]Entry, len(entries))
 	for i := range entries {

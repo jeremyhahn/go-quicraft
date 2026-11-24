@@ -162,16 +162,7 @@ func (lr *testLogReader) Compact(index uint64) error {
 	return nil
 }
 
-// testLogDB is a minimal LogReader implementation for testing specific
-// term/getRange behaviors. Only the methods set via function fields are
-// active; all other methods return zero values or nil errors.
-//
-// A stub that answers Term or GetRange for an index MUST also declare a range
-// covering it via indexRangeFn. raftLog.term bounds its LogDB fallback by
-// lastIndex(), which reads IndexRange, so a stub reporting the empty range
-// (0, 0) while serving terms for indices 1..N describes a LogReader that cannot
-// exist -- and the resulting test proves nothing about the fallback it means to
-// exercise.
+// testLogDB is a LogReader stub driven by function fields; a stub serving terms must also declare a covering range via indexRangeFn.
 type testLogDB struct {
 	termFn       func(index uint64) (uint64, error)
 	getRangeFn   func(low, high, maxSize uint64) ([]proto.Entry, error)
@@ -865,10 +856,7 @@ func TestRaftLog_LimitEntrySize_LimitsCorrectly(t *testing.T) {
 }
 
 func TestRaftLog_NewRaftLog_InitializesFromState(t *testing.T) {
-	// The log must actually HOLD what the hard state claims. A Commit of 5
-	// over an empty log is a corrupt recovery, and newRaftLog clamps it (see
-	// TestNewRaftLog_TotalEntryLoss_ClampsCommittedToZero), so the fixture
-	// carries the entries the state record refers to.
+	// The log must hold the entries the hard state commits.
 	state := proto.State{Term: 1, Commit: 5}
 	logdb := newTestLogReader([]proto.Entry{
 		{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1},
@@ -907,10 +895,7 @@ func TestRaftLog_NewRaftLog_ProcessedFromSnapshot(t *testing.T) {
 	}
 }
 
-// TestRaftLog_NewRaftLog_SnapshotWithoutTail_ClampsToSnapshot covers the
-// same recovery with the committed tail above the snapshot LOST. The
-// snapshot index is the only thing the replica can prove it holds, so
-// committed must come down to it rather than stay at the recovered 10.
+// TestRaftLog_NewRaftLog_SnapshotWithoutTail_ClampsToSnapshot checks committed drops to the snapshot index when the tail is lost.
 func TestRaftLog_NewRaftLog_SnapshotWithoutTail_ClampsToSnapshot(t *testing.T) {
 	logdb := newTestLogReader(nil, proto.State{Term: 2, Commit: 10})
 	logdb.snapshot = proto.Snapshot{Index: 7, Term: 2}
@@ -926,16 +911,7 @@ func TestRaftLog_NewRaftLog_SnapshotWithoutTail_ClampsToSnapshot(t *testing.T) {
 	}
 }
 
-// TestRaftLog_NewRaftLog_ClampsUpToSnapshotIndex protects the OTHER
-// direction of the commit reconciliation: a snapshot's index is COMMITTED by
-// construction (a snapshot is only ever taken over committed state), so it is
-// a lower bound on committed no matter what HardState survived.
-//
-// Without the clamp UP, restoring from a snapshot whose HardState.Commit was
-// lost or lagging comes up with processed (= snapshot index) ABOVE committed.
-// commitUpdate asserts LastApplied <= committed and LastApplied <= processed,
-// so the very first commit cycle trips the invariant and takes the commit
-// worker — and with it the shard — down.
+// TestRaftLog_NewRaftLog_ClampsUpToSnapshotIndex checks committed is raised to the snapshot index.
 func TestRaftLog_NewRaftLog_ClampsUpToSnapshotIndex(t *testing.T) {
 	// HardState lags the snapshot: Commit=3, snapshot at 7.
 	logdb := newTestLogReader(nil, proto.State{Term: 2, Commit: 3})
@@ -1054,13 +1030,7 @@ func TestRaftLog_EntriesToApply_WithProcessedAtZero(t *testing.T) {
 	}
 }
 
-// TestRaftLog_ErrorsAreLogDBSentinels verifies that every compacted and
-// unavailable error the raft log produces -- whether it originates in the
-// LogReader or in the raft log's own bounds checks -- is logdb.ErrCompacted or
-// logdb.ErrUnavailable. One value means one condition everywhere: an embedder
-// that finds one inside ShardFailedInfo.Err or a CommitError matches it with
-// the public logdb name, and no raft-side copy of either sentinel exists to
-// diverge from it.
+// TestRaftLog_ErrorsAreLogDBSentinels checks compacted and unavailable errors are logdb.ErrCompacted and logdb.ErrUnavailable.
 func TestRaftLog_ErrorsAreLogDBSentinels(t *testing.T) {
 	tests := []struct {
 		name string

@@ -1,9 +1,6 @@
 name: Release
 
-# go-quicraft is a library with no binaries, so a release is the tag itself:
-# `go get github.com/jeremyhahn/go-quicraft@vX.Y.Z` resolves from the VCS and the
-# module proxy. This workflow checks that the tag is releasable, runs the
-# release gates on the tagged tree, and publishes the release notes.
+# A library release is the tag: check it is releasable, run the gates on the tagged tree, publish the notes.
 
 on:
   push:
@@ -44,8 +41,7 @@ jobs:
           cache: ${{ runner.environment != 'self-hosted' }}
           go-version: ${{ env.GO_VERSION }}
 
-      # Recorded BEFORE the gates run, so it names the tree this job actually
-      # validated rather than whatever the tag points at later.
+      # Recorded before the gates run: names the tree this job validated.
       - name: Record the approved commit
         id: approved
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -72,13 +68,7 @@ jobs:
             echo "FAIL: tag v$VERSION is not a semantic version"
             exit 1
           fi
-          # Compare BYTES against the writer inverted, never normalize.
-          # `tr -d '[:space:]'` accepts '0.9. 1-alpha', a VERSION split across
-          # lines, and a file with no trailing newline — each of which publishes
-          # a VERSION that does not match its own tag. The Makefile writes this
-          # file with `printf '%s\n'`, so this is that exact statement read
-          # backwards; on mismatch dump the bytes, because the difference is
-          # usually invisible in an echo.
+          # Compare bytes against the Makefile's printf '%s\n' output, never normalize; dump the bytes on mismatch.
           if ! printf '%s\n' "$VERSION" | cmp -s - VERSION; then
             echo "FAIL: the VERSION file does not match the tag byte for byte."
             echo "tag:          '$VERSION'"
@@ -93,24 +83,14 @@ jobs:
           # A v2+ module must carry the major suffix in its module path, or
           # every `go get` of it silently resolves to the v1 line.
           MAJOR="${VERSION%%.*}"
-          # GOWORK=off: inside a Go workspace `go list -m` prints EVERY module
-          # in it, and the comparison below would then test the wrong string. CI
-          # checks out this repo alone so no workspace exists there, but a
-          # release cut from a developer machine inside one would misfire.
+          # GOWORK=off: inside a workspace go list -m prints every module.
           MODULE="$(GOWORK=off go list -m)"
           if [ "$MAJOR" -ge 2 ] && [ "${MODULE##*/}" != "v$MAJOR" ]; then
             echo "FAIL: module path '$MODULE' lacks the required /v$MAJOR suffix"
             exit 1
           fi
 
-  # ==========================================================================
-  # Release gates
-  #
-  # ci.yml does not run on tags, and a tag can point at a commit ci.yml never
-  # saw. A module tag cannot be retracted, so the gates run here on the exact
-  # tagged tree, and `release` waits for all of them. They are the same
-  # commands as the matching ci.yml jobs; keep them in step.
-  # ==========================================================================
+  # Release gates: ci.yml does not run on tags, so the same gates run here on the tagged tree; keep them in step with ci.yml.
 
   # Lint, security and trivy on the exact commit being released. Advisories
   # are time-sensitive, so one published since the last branch build is caught
@@ -140,10 +120,7 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # On the self-hosted runners the analysis tools are baked into the runner
-      # image at pinned versions. Each job verifies the tools it runs itself,
-      # because jobs do not share a machine. To change a version, rebuild the
-      # image and update the pins here, in ci.yml and in the Makefile.
+      # Analysis tools are pinned in the runner image; each job verifies its own. Change pins here, in ci.yml and in the Makefile.
       - name: Verify baked analysis tools
         if: github.server_url != 'https://github.com'
         run: |
@@ -156,14 +133,7 @@ jobs:
               echo "OK   $1 $2"
             fi
           }
-          # Versions come from the binary's BUILD INFO, not its --version string.
-          # gosec self-reports "dev" unless its version is injected via ldflags
-          # at image-build time, so parsing --version would reject a correctly
-          # pinned binary built by a plain `go install`; govulncheck's first
-          # --version line is the Go version when go is on PATH and the scanner
-          # version otherwise. `go version -m` reads the module version recorded
-          # in the binary itself, which is uniform across all three tools and
-          # independent of how the image chose to build them.
+          # Read versions from go version -m build info, not --version output.
           modver() { go version -m "$(command -v "$1")" 2>/dev/null | awk '$1=="mod"{print $3; exit}'; }
           for t in golangci-lint; do
             command -v "$t" >/dev/null 2>&1 || { echo "FAIL $t: not in the runner image"; rc=1; }
@@ -210,14 +180,7 @@ jobs:
               echo "OK   $1 $2"
             fi
           }
-          # Versions come from the binary's BUILD INFO, not its --version string.
-          # gosec self-reports "dev" unless its version is injected via ldflags
-          # at image-build time, so parsing --version would reject a correctly
-          # pinned binary built by a plain `go install`; govulncheck's first
-          # --version line is the Go version when go is on PATH and the scanner
-          # version otherwise. `go version -m` reads the module version recorded
-          # in the binary itself, which is uniform across all three tools and
-          # independent of how the image chose to build them.
+          # Read versions from go version -m build info, not --version output.
           modver() { go version -m "$(command -v "$1")" 2>/dev/null | awk '$1=="mod"{print $3; exit}'; }
           for t in gosec govulncheck; do
             command -v "$t" >/dev/null 2>&1 || { echo "FAIL $t: not in the runner image"; rc=1; }
@@ -304,11 +267,7 @@ jobs:
   integration:
     name: Gate - integration suite
     runs-on: ubuntu-latest
-    # Runs after the cheap gates rather than beside them. This suite starts
-    # multi-node QUIC clusters under -race, and sharing the runner with the
-    # fuzz, errfs and module gates expires its 30s replication waits. Nothing
-    # here needs their output; the dependency only keeps them apart.
-    # `netfault` runs after this job for the same reason.
+    # Runs after the cheap gates so its multi-node -race clusters do not share the runner with them.
     needs: [validate, errfs, fuzz, modules]
     timeout-minutes: 45
     steps:
@@ -326,10 +285,7 @@ jobs:
       - name: Run integration suite
         run: go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/...
 
-  # The only suite that builds a live network partition: it deposes a leader
-  # that is still running and still believes it leads. Every other partition
-  # test stops the node outright. Serialised behind `integration`, as in
-  # ci.yml, because these tests wait on election timeouts.
+  # The live network-partition suite; serialised behind integration because it waits on election timeouts.
   netfault:
     name: Gate - network partitions [build tag quicraft_netfault]
     runs-on: ubuntu-latest
@@ -381,11 +337,7 @@ jobs:
           cache: ${{ runner.environment != 'self-hosted' }}
           go-version: ${{ env.GO_VERSION }}
 
-      # Publish only builds the FIPS variant. These steps prove the code runs
-      # under the approved-only module, matching ci.yml's full-tier FIPS job
-      # (moved from nightly.yml in #293), so a release does not depend on the
-      # last full-tier CI run being green. The transport
-      # suite starts real QUIC listeners.
+      # Prove the code runs under the approved-only FIPS module, as ci.yml's full-tier FIPS job does.
       - name: Tune QUIC UDP buffers
         run: sudo sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032
 
@@ -424,11 +376,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      # Go's fuzzer starts one worker per CPU. Too many concurrent fuzz jobs
-      # starve the coordinator's shutdown RPC, which shows up as "context
-      # deadline exceeded" after -fuzztime and looks like a crash.
-      # max-parallel is ignored by some runners (act_runner among them), so
-      # the Makefile target also limits -parallel.
+      # Limit fuzz parallelism: too many workers starve the coordinator's shutdown RPC; the Makefile also limits -parallel.
       max-parallel: 3
       matrix:
         package:
@@ -446,10 +394,7 @@ jobs:
           cache: ${{ runner.environment != 'self-hosted' }}
           go-version: ${{ env.GO_VERSION }}
 
-      # The seed pass is the gate: deterministic, covers every target, and must
-      # pass. The bounded mutation pass afterwards is a short last look for a
-      # crash the committed corpus does not encode; real fuzzing is dispatched:
-      # fuzz.yml (no schedule) or batch.yml's fuzz job.
+      # The seed pass is the gate; the short mutation pass after it is a last look, real fuzzing is dispatched.
       - name: Seed and committed-corpus pass
         run: go test -race -count=1 -tags=quicraft_fuzz -run=Fuzz '${{ matrix.package }}'
 
@@ -605,19 +550,7 @@ jobs:
             echo "See [docs/compatibility/architecture.md](https://github.com/${GITHUB_REPOSITORY}/blob/v$VERSION/docs/compatibility/architecture.md) for the API-stability guarantee and the upgrade path."
           } >> release-notes.md
 
-      # Tag immutability, checked against the remote.
-      #
-      # Comparing this job's HEAD with the approved commit cannot fail: on a
-      # tag push, actions/checkout checks out the event SHA in every job. The
-      # publish step resolves `tag_name` by name at publish time, so a tag
-      # force-moved mid-release would publish an unvalidated commit. So resolve
-      # what the tag points at on the remote now, peeled (`^{}`) because an
-      # annotated tag's ref names the tag object, and require the approved
-      # commit.
-      #
-      # Fails on a missing, ambiguous or mismatched tag, and on an empty
-      # approved value. It does not fall back to checking out the approved
-      # commit: a moved tag needs a human to look at it.
+      # Require the remote tag, peeled, to point at the approved commit; fail on a missing, ambiguous or moved tag.
       - name: Refuse a tag that moved after validation
         env:
           APPROVED: ${{ needs.validate.outputs.approved_sha }}
@@ -634,9 +567,7 @@ jobs:
             exit 1
           fi
 
-          # Peeled line first: for an ANNOTATED tag refs/tags/<t> is the tag
-          # object and refs/tags/<t>^{} is the commit. A lightweight tag has
-          # only the former, and it already points at the commit.
+          # Peeled line first: for an annotated tag refs/tags/<t>^{} is the commit.
           refs="$(git ls-remote --tags origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}")"
           REMOTE_SHA="$(printf '%s\n' "$refs" | awk -v t="refs/tags/${TAG}^{}" '$2==t{print $1}')"
           if [ -z "$REMOTE_SHA" ]; then

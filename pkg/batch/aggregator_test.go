@@ -208,19 +208,7 @@ func TestNewAggregator_WithRegistry(t *testing.T) {
 	}
 }
 
-// TestNewAggregator_WithNilRegistryUsesDefault pins WithRegistry's nil guard:
-// passing nil must LEAVE the existing registerer in place, because a nil
-// prometheus.Registerer is not a usable default — initMetrics would panic on
-// it, and the constructor has already installed prometheus.DefaultRegisterer.
-//
-// The option is exercised directly rather than through NewAggregator. The
-// previous shape passed WithRegistry(nil) followed by WithRegistry(a real one)
-// and then asserted only that the field was non-nil — which the SECOND call
-// guarantees regardless of what the first did. Deleting the nil guard left the
-// test passing, so the guard it exists to protect was unverified. Constructing
-// through NewAggregator with nil alone is not an option here either: the
-// aggregator would then register its collectors on the global default
-// registry, which is shared with every other test in the binary.
+// TestNewAggregator_WithNilRegistryUsesDefault pins that WithRegistry(nil) leaves the existing registerer in place.
 func TestNewAggregator_WithNilRegistryUsesDefault(t *testing.T) {
 	t.Parallel()
 
@@ -277,20 +265,7 @@ func (b *enteredBlockingProposer) SyncPropose(_ context.Context, _ uint64, _ []b
 	return nil
 }
 
-// TestSubmit_QueueFull pins backpressure: once the queue is at capacity, Submit
-// must report QueueFullError IMMEDIATELY rather than blocking a caller behind a
-// flush that is going nowhere.
-//
-// The previous shape of this test could not fail. It looped up to 100 times
-// hoping to observe the condition and, when it never did, called t.Log — so a
-// build in which Submit blocked forever instead of rejecting, or returned some
-// unrelated error, passed exactly as cleanly as a correct one. There was no
-// t.Error or t.Fatal reachable from any aggregator behaviour in the whole body.
-//
-// The condition is now constructed deterministically: MaxBatchSize 1 sends the
-// first proposal straight into a flush that blocks in the proposer, which parks
-// the single flush goroutine so nothing drains the queue; the next QueueSize
-// submissions fill it exactly; and the one after that must be rejected.
+// TestSubmit_QueueFull pins that Submit returns QueueFullError immediately once the queue is full, using a blocked flush.
 func TestSubmit_QueueFull(t *testing.T) {
 	t.Parallel()
 
@@ -408,15 +383,7 @@ func TestSubmit_SizeBasedFlush(t *testing.T) {
 	}
 }
 
-// TestSubmit_TimeBasedFlush pins that a batch below MaxBatchSize is flushed by
-// the interval timer, and that the flush is ATTRIBUTED to the timer.
-//
-// The previous assertion — proposer calls are non-empty — could not fail:
-// Submit returns nil only once a flush has delivered that proposal's result,
-// and a flush that delivered a result has by definition called the proposer.
-// The interesting half, that the TIMER is what triggered it, went unchecked, so
-// the flushReasonTime label had no coverage at all and a flush misreported as
-// "size" or "close" would have gone unnoticed by every test in the package.
+// TestSubmit_TimeBasedFlush pins that a batch below MaxBatchSize is flushed by, and attributed to, the interval timer.
 func TestSubmit_TimeBasedFlush(t *testing.T) {
 	t.Parallel()
 
@@ -514,12 +481,7 @@ func TestSubmit_MultipleShards(t *testing.T) {
 		t.Fatal("proposer was never called for multi-shard submissions")
 	}
 
-	// Every submitted shard must have been proposed, and its own command must
-	// be in its own batch. The previous assertion here was `len(seenShards) ==
-	// 0`, which the `len(calls) == 0` check above already rules out — every
-	// call carries a shard ID, so a non-empty call list can never produce an
-	// empty shard set. It could not fail, and in particular it could not catch
-	// a flush that merged or dropped a shard's proposals.
+	// Every submitted shard must be proposed with its own command in its own batch.
 	seen := make(map[uint64][]byte)
 	for _, call := range calls {
 		decoded, decErr := DecodeBatch(call.data)
@@ -625,12 +587,7 @@ func (c *countingProposer) count() int {
 	return c.commands
 }
 
-// TestSubmit_CloseRaceReportsRealResult exercises the shutdown race where
-// Close() fires while a caller is blocked waiting for its proposal's result.
-// The proposal has already been enqueued, so the flush loop's close branch
-// (drainQueue then flush) still proposes it and sends the genuine result on
-// resultCh. The caller must observe that result (nil here), never a spurious
-// ClosedError that would falsely report a write the cluster actually applied.
+// TestSubmit_CloseRaceReportsRealResult verifies a caller blocked during Close gets the real result, never a spurious ClosedError.
 func TestSubmit_CloseRaceReportsRealResult(t *testing.T) {
 	t.Parallel()
 
@@ -762,16 +719,7 @@ func TestConcurrentSubmit(t *testing.T) {
 	}
 }
 
-// TestConcurrentSubmitAndClose races Submit against Close and pins the property
-// that makes the race safe: a Submit that reports SUCCESS must have had its
-// command proposed, and a Submit that reports failure must not have.
-//
-// Every Submit's return value is checked, so more than the race detector can
-// fail it: a build that reported success for a command it never proposed (or
-// ClosedError for one it did) would otherwise pass silently, and that is exactly
-// the class of bug this shutdown race produces: the caller of a batched write
-// has no other signal, and the aggregator has no at-most-once path to repair a
-// wrong answer with.
+// TestConcurrentSubmitAndClose races Submit against Close: a Submit reporting success must have been proposed, and a failure must not.
 func TestConcurrentSubmitAndClose(t *testing.T) {
 	t.Parallel()
 

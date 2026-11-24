@@ -27,9 +27,7 @@ func reviewJobIf(t *testing.T, workflow string) string {
 	return strings.Join(strings.Fields(m[1]), " ")
 }
 
-// workflowsNeedReview reports whether the gate's REVIEW_REQUIRED_PATHS
-// (LOCAL, security) matches a workflow file, so no workflow change is ever
-// review-exempt.
+// workflowsNeedReview reports whether REVIEW_REQUIRED_PATHS matches a workflow file.
 func workflowsNeedReview(t *testing.T, workflow string) bool {
 	t.Helper()
 	m := regexp.MustCompile(`(?m)^      REVIEW_REQUIRED_PATHS: '([^']*)'$`).FindStringSubmatch(workflow)
@@ -39,13 +37,7 @@ func workflowsNeedReview(t *testing.T, workflow string) bool {
 	return regexp.MustCompile(m[1]).MatchString(".github/workflows/ci.yml")
 }
 
-// TestReviewRunsWhereTheGateNeedsIt: code-review.yml v5.12.1's review job
-// skips a change InfoSec's guard (the scope job) clears, but this
-// repository's gate requires a review of every workflow file
-// (REVIEW_REQUIRED_PATHS), so a guard-cleared workflow edit would get no
-// review and could never pass the gate (Codex P1 on #1170). While the gate
-// requires workflow reviews, the review job's `if:` must not skip on the
-// scope job's verdict.
+// TestReviewRunsWhereTheGateNeedsIt verifies the review job runs for every workflow change the gate requires reviewed.
 func TestReviewRunsWhereTheGateNeedsIt(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("..", "..", ".github", "workflows", "code-review.yml"))
 	if err != nil {

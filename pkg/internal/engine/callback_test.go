@@ -856,11 +856,7 @@ func TestApplyWorker_ApplyError_PendingProposalsFailedImmediately(t *testing.T) 
 		t.Fatalf("ApplyError.Err = %v, want the SM.Apply error", applyErr.Err)
 	}
 
-	// The halt is announced ONCE, with the same error, and only after the
-	// batch's own proposals were completed. OnShardFailed is what
-	// lets the host fail the reads the batch does not account for; if it
-	// fired before OnProposalFailed, the host would drain pendingReads
-	// while the proposals that caused the halt were still unresolved.
+	// The halt is announced once, with the same error, after the batch's proposals are completed.
 	shardFailed := cb.getShardFailedCalls()
 	if len(shardFailed) != 1 {
 		t.Fatalf("expected exactly 1 OnShardFailed call, got %d", len(shardFailed))
@@ -933,10 +929,7 @@ func TestApplyWorker_ApplyError_NilCallbackDoesNotPanic(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_ApplyError_FailsFast verifies that an SM.Apply error is
-// terminal: the shard is marked failed on the FIRST error, an ApplyError
-// is reported through the listener, OnProposalFailed is invoked, and
-// lastApplied is not advanced.
+// TestApplyWorker_ApplyError_FailsFast checks the first SM.Apply error fails the shard, reports ApplyError and OnProposalFailed, and leaves lastApplied.
 func TestApplyWorker_ApplyError_FailsFast(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}

@@ -30,10 +30,7 @@ type RaftMetrics interface {
 	// apply for the given shard.
 	ObserveApplyLatency(shardID uint64, d time.Duration)
 
-	// ObserveReadIndexLatency records the end-to-end ReadIndex latency
-	// from ReadIndex submission to read confirmation for the given shard.
-	// This covers the full round-trip including heartbeat quorum and any
-	// wait for the state machine to catch up to the committed index.
+	// ObserveReadIndexLatency records ReadIndex latency from submission to confirmation for the shard.
 	ObserveReadIndexLatency(shardID uint64, d time.Duration)
 
 	// IncProposalDropped increments the dropped proposal counter for
@@ -54,10 +51,7 @@ type RaftMetrics interface {
 	// IncSnapshot increments the snapshot counter for the given shard.
 	IncSnapshot(shardID uint64)
 
-	// IncPiggybackCommit increments the piggyback commit counter for
-	// the given shard. A piggyback commit occurs when the commit worker
-	// detects newly committable entries during cycle 1 and applies them
-	// in the same cycle, eliminating a second pipeline traversal.
+	// IncPiggybackCommit counts entries committed and applied in the same commit-worker cycle.
 	IncPiggybackCommit(shardID uint64)
 }
 
@@ -97,73 +91,23 @@ type TransportMetrics interface {
 	// including the byte count and duration of the transfer.
 	IncSnapshotsReceived(shardID uint64, bytes int64, d time.Duration)
 
-	// IncSnapshotsRejected counts an inbound snapshot transfer discarded
-	// before it reached the state machine. reason comes from a closed set
-	// defined by the transport: "shutdown", "concurrency_limit",
-	// "memory_budget", "liveness", "malformed", "io_error", "policy",
-	// "unauthorized", "not_accepting".
-	// Implementations must treat it as a metric label and must not derive
-	// new label values from it. shardID is 0 for a transfer rejected before
-	// its sender was authorized: until then the shard the header names is
-	// whatever the peer wrote, and is not used as a label.
+	// IncSnapshotsRejected counts an inbound snapshot discarded before the state machine; reason is a closed label set, shardID 0 before the sender is authorized.
 	IncSnapshotsRejected(shardID uint64, reason string)
 
-	// IncMessagesDropped counts a Raft message the transport discarded
-	// instead of delivering. reason comes from a closed set defined by the
-	// transport: "unresolved_target", "queue_full", "stream_unavailable",
-	// "write_failed", "marshal_failed", "protocol_violation", "unsendable",
-	// "peer_rejected", "identity_mismatch". Implementations must treat it as a metric label and
-	// must not derive new label values from it. shardID and to are both 0
-	// for "protocol_violation", where the frame is discarded before its
-	// messages are parsed.
+	// IncMessagesDropped counts a Raft message the transport discarded; reason is a closed label set, shardID and to are 0 for protocol_violation.
 	IncMessagesDropped(shardID, to uint64, reason string)
 }
 
-// SecurityMetrics covers security-relevant drop counters. These events
-// indicate either a misconfigured cluster or an active injection attempt
-// by an authenticated-but-compromised peer; they are counted (not just
-// logged) so operators can alert on them.
+// SecurityMetrics counts security-relevant drops for alerting.
 type SecurityMetrics interface {
-	// IncUnauthorizedMessageDropped counts inbound Raft messages dropped
-	// because the sender failed shard-membership authorization.
-	//
-	// reason comes from a closed set defined by the message handler:
-	// "removed_replica", "removed_identity", "misrouted", "unknown_member",
-	// "identity_mismatch", "missing_identity". The split is
-	// operational, not cosmetic — one aggregate counter cannot tell a rolling
-	// membership change from an attack:
-	//
-	//   - "unknown_member" is the benign config-change window (a voter added
-	//     by a change this replica has not applied yet). It rises and falls on
-	//     its own.
-	//   - "identity_mismatch" is the strongest signal here. Committed
-	//     membership records a node identity for the claimed replica and the
-	//     connection presented a different one, so the sender does not hold
-	//     that replica's private key. It is a forged From or a stale identity
-	//     after a key rotation; it is never routine.
-	//   - "missing_identity" means the shard records no identity for a
-	//     replica the configuration names. Admission requires one on every
-	//     host with a transport, so this is a configuration written by a
-	//     build that did not; the remedy is wipe and re-bootstrap.
-	//   - "address_mismatch" and "shared_address" are retired label values
-	//     and are not reallocated.
+	// IncUnauthorizedMessageDropped counts messages failing membership authorization; reason is one of removed_replica, removed_identity, misrouted, unknown_member, identity_mismatch, missing_identity.
 	IncUnauthorizedMessageDropped(shardID, from uint64, reason string)
 
-	// IncUnauthorizedSnapshotDropped counts inbound snapshots dropped
-	// because the sender failed authorization or TLS identity binding.
-	// shardID is 0 when the snapshot named a shard this host has not loaded:
-	// that ID is unverified and is not used as a label.
+	// IncUnauthorizedSnapshotDropped counts inbound snapshots failing authorization; shardID is 0 for an unloaded shard.
 	IncUnauthorizedSnapshotDropped(shardID, from uint64)
 }
 
-// MetricsCollector is the full metrics interface passed to WithMetrics.
-// It composes RaftMetrics, LogDBMetrics, TransportMetrics, and
-// SecurityMetrics. Internally, QuicRaft passes only the relevant
-// sub-interface to each component.
-//
-// For best performance, implementations should pre-bind metrics per shard
-// during RegisterShard and use cached metric references in the hot-path
-// methods. See PrometheusMetricsCollector for a reference implementation.
+// MetricsCollector is the full metrics interface passed to WithMetrics; see PrometheusMetricsCollector for a per-shard pre-bound implementation.
 type MetricsCollector interface {
 	RaftMetrics
 	LogDBMetrics

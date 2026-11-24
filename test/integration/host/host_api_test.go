@@ -80,19 +80,7 @@ func TestHostAPI_QueryLocalNode_ThreeNode(t *testing.T) {
 	}
 }
 
-// TestHostAPI_ReadIndex_ThreeNode verifies that a ReadIndex issued to the
-// leader resolves to a confirmed index.
-//
-// The previous version submitted the ReadIndex to a pinned host and released
-// the RequestState without reading it, which asserted only that a request was
-// accepted: a not-leader outcome, or a read index that never resolved, would
-// have surfaced in the result it never read.
-//
-// The warmup write is not there for readiness. A leader refuses ReadIndex with
-// ErrReadIndexNotReady until it commits an entry in its own term, but
-// readIndexFromLeader goes through proposer.ReadIndex, which retries that
-// refusal (go-quicraft#275). The write gives the index == 0 assertion a floor
-// the test committed itself: a confirmed index must cover it.
+// TestHostAPI_ReadIndex_ThreeNode verifies a leader ReadIndex resolves to a confirmed index covering a write the test committed.
 func TestHostAPI_ReadIndex_ThreeNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -108,13 +96,7 @@ func TestHostAPI_ReadIndex_ThreeNode(t *testing.T) {
 	}
 }
 
-// TestHostAPI_LeaderTransfer_ThreeNode requests leadership transfer to a
-// specific target and verifies that leadership actually moved to THAT target.
-//
-// The previous version only checked that RequestLeaderTransfer returned nil
-// and that ShardInfo still reported ShardID == 1 — a value the test itself
-// passed in, so it could never be wrong. An engine that ignored the requested
-// target, or never transferred at all, passed.
+// TestHostAPI_LeaderTransfer_ThreeNode verifies leadership moves to the requested target.
 func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -134,8 +116,7 @@ func TestHostAPI_LeaderTransfer_ThreeNode(t *testing.T) {
 
 	transferLeadershipTo(t, cluster, 1, targetIdx, failoverTimeout)
 
-	// Leadership must be held by the REQUESTED replica, not merely by
-	// someone.
+	// The requested replica must hold leadership.
 	targetInfo, err := cluster.hosts[targetIdx].ShardInfo(1)
 	if err != nil {
 		t.Fatalf("ShardInfo on transfer target node[%d] failed: %v", targetIdx, err)

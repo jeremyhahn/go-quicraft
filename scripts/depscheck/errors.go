@@ -6,9 +6,7 @@ import (
 	"strings"
 )
 
-// ErrLookupDisabled is returned when GOPROXY=off: without the proxy and the
-// dev Gitea no latest version can be known, and a check that cannot look
-// anything up must not report that everything is current.
+// ErrLookupDisabled is returned when GOPROXY=off, since no latest version can be looked up.
 var ErrLookupDisabled = errors.New("depscheck: GOPROXY=off disables module version lookup, so the latest release of each dependency cannot be known; run make deps-check with access to the module proxy and the dev Gitea")
 
 // ErrUsage is returned when no module directory is given.

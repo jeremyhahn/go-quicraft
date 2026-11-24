@@ -28,28 +28,7 @@ import (
 	"time"
 )
 
-// crashFS is an in-memory snapshotFS that models POSIX crash semantics in
-// addition to per-operation error injection. Error injection alone can only
-// exercise error HANDLING: a MISSING fsync produces no call to fail, so only a
-// durability model can detect one. That is what this double exists for.
-//
-// The model:
-//
-//   - Every file carries a LIVE and a DURABLE image. Write mutates LIVE only;
-//     Sync promotes LIVE to DURABLE.
-//   - A directory ENTRY (a create, a rename's new name, a removal) is pending
-//     until the PARENT directory is fsynced, matching the production
-//     SyncDir/SyncDirChain discipline.
-//   - Crash discards every non-durable effect: files revert to their DURABLE
-//     image, entries never covered by a parent fsync disappear along with
-//     everything beneath them, removals never covered by a parent fsync are
-//     resurrected, and a rename not covered by a parent fsync reverts to the
-//     source name.
-//   - Handles obtained before a Crash fail afterwards: a file descriptor
-//     cannot survive the power loss it models.
-//
-// It is deliberately NOT waldb's crashFS: that one implements waldb.FS (a
-// different, backend-specific interface) and is unexported in its own package.
+// crashFS is an in-memory snapshotFS modelling POSIX crash semantics: live and durable images, directory entries durable on parent fsync, and handles invalid after Crash.
 type crashFS struct {
 	mu    sync.Mutex
 	gen   uint64
@@ -66,17 +45,7 @@ type crashFS struct {
 	hook func(op crashOp, path string) error
 }
 
-// crashTomb is an entry unlinked from the live image whose removal is not yet
-// durable.
-//
-// renamedTo links a tombstone to the name its content MOVED to, and is empty
-// for an unlink (Remove/RemoveAll, or a rename that replaced an existing
-// destination). The link is what makes a rename atomic across a crash: without
-// it Crash resurrected the old name from the tombstone AND kept the new name
-// whenever the destination's entry had become durable under a DIFFERENT parent,
-// so one file came back under BOTH names — a tree rename(2) cannot produce, and
-// exactly the kind of impossible state a durability test would then be written
-// against.
+// crashTomb is an unlinked entry whose removal is not yet durable; renamedTo links it to where a rename moved it.
 type crashTomb struct {
 	node      *crashNode
 	renamedTo string
@@ -207,12 +176,7 @@ func (c *crashFS) Crash() {
 	defer c.mu.Unlock()
 	c.gen++
 
-	// A removal that was never covered by a parent fsync did not happen — with
-	// one exception: an entry that was RENAMED away and whose destination
-	// survives this crash has moved, not been removed. Resurrecting it as well
-	// would leave one file reachable under both names at once, which no
-	// rename(2) can produce. Survivorship is evaluated against the pre-crash
-	// image, before any resurrection perturbs it.
+	// Resurrect undurable removals, except an entry renamed to a destination that survives.
 	survived := make(map[string]bool, len(c.tombs))
 	for _, t := range c.tombs {
 		if t.renamedTo != "" {
@@ -416,11 +380,7 @@ func (c *crashFS) Rename(oldpath, newpath string) error {
 		// Replaced, not moved: nothing carries this content forward.
 		c.tombs[newpath] = crashTomb{node: existing}
 	}
-	// Renaming a DIRECTORY relocates everything beneath it in one step. Moving
-	// only the directory node left its children addressable under the old name
-	// alone, so a path that staged a whole directory and published it with a
-	// single rename looked — to this model — like it had lost every file it
-	// wrote, and a durability test could not tell that from a missing fsync.
+	// Renaming a directory moves everything beneath it.
 	oldPrefix := oldpath + string(filepath.Separator)
 	newPrefix := newpath + string(filepath.Separator)
 	var moved []string
@@ -433,10 +393,7 @@ func (c *crashFS) Rename(oldpath, newpath string) error {
 		child := c.nodes[p]
 		delete(c.nodes, p)
 		dst := newPrefix + strings.TrimPrefix(p, oldPrefix)
-		// The old name survives a crash that does not cover the rename, so the
-		// child is tombstoned exactly as the directory itself is — and linked to
-		// where it went, so a crash that DOES cover the rename does not bring it
-		// back alongside its new name.
+		// Tombstone each child at its old path, linked to its new one.
 		c.tombs[p] = crashTomb{node: child.clone(), renamedTo: dst}
 		c.nodes[dst] = child
 	}
@@ -542,15 +499,7 @@ func (c *crashFS) exists(path string) bool {
 	return ok
 }
 
-// findLiveBytes returns the path of the first file in the LIVE image whose
-// contents contain want, or "" when no file does. It is what lets a test assert
-// the CONSEQUENCE of an at-rest encryption rule — that a given plaintext is
-// nowhere on disk — instead of only that a call returned an error.
-//
-// It scans the live image, not the durable one: a plaintext file that exists
-// live but has not been fsynced is still readable by anyone with the disk while
-// the process runs, and is exactly what a kill (as opposed to a power loss)
-// leaves behind.
+// findLiveBytes returns the first live file containing want, or "".
 func (c *crashFS) findLiveBytes(want []byte) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -586,7 +535,7 @@ func (c *crashFS) entries(dir string) []string {
 	return out
 }
 
-// crashFile is an open handle. Reads and writes see the LIVE image.
+// crashFile is an open handle on the live image.
 type crashFile struct {
 	fs     *crashFS
 	path   string
@@ -677,9 +626,7 @@ func (f *crashFile) Stat() (fs.FileInfo, error) {
 
 func (f *crashFile) Name() string { return f.path }
 
-// Sync promotes this file's LIVE image to DURABLE. On a directory handle it
-// instead makes the directory's own entries durable — the production
-// SyncDir contract.
+// Sync makes this file's live image durable, or a directory's entries durable.
 func (f *crashFile) Sync() error {
 	op := opSync
 	if f.node.dir {
@@ -763,19 +710,7 @@ var (
 	_ snapshotFile = (*crashFile)(nil)
 )
 
-// TestCrashFS_RenameIsAtomicAcrossACrash is a FIDELITY test for the double
-// itself.
-//
-// Rename tombstones every child at its old path and installs it at the new one.
-// Crash resurrected any tombstone whose entry was durable, unconditionally, so
-// when the destination's entry became durable under a DIFFERENT parent — the
-// old parent's tombstones are not cleared by an fsync of the new parent — the
-// same file came back under BOTH names. rename(2) cannot produce that tree, and
-// a durability test written against this double would have been asserting
-// against a state the production filesystem never reaches.
-//
-// Both directions are pinned: a rename the crash COVERS moves, and one it does
-// not reverts.
+// TestCrashFS_RenameIsAtomicAcrossACrash checks a covered rename moves and an uncovered one reverts.
 func TestCrashFS_RenameIsAtomicAcrossACrash(t *testing.T) {
 	const payload = "staged-artifact-bytes"
 

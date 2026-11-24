@@ -49,8 +49,7 @@ func TestDefaultKDFVersion_StandardMode(t *testing.T) {
 	assertDefaultKDFVersionOutsideFIPS(t)
 }
 
-// TestFIPSEnabledOffValue verifies GOFIPS140=off is honored as DISABLED
-// rather than treated as FIPS mode merely for being non-empty.
+// TestFIPSEnabledOffValue verifies GOFIPS140=off disables FIPS mode.
 func TestFIPSEnabledOffValue(t *testing.T) {
 	skipIfModuleActive(t)
 
@@ -60,11 +59,7 @@ func TestFIPSEnabledOffValue(t *testing.T) {
 	}
 }
 
-// TestFIPSConstrainsDataPathCipher verifies that FIPS mode forces
-// AES-256-GCM from SelectOptimalAlgorithm regardless of AES-NI, and that
-// BarrierConfig.validate refuses the non-approved ChaCha20 family. The REASON
-// it is refused differs by build — policy in a normal build, absence in a
-// -tags fips one — which is what assertChaChaRefusedUnderFIPS captures.
+// TestFIPSConstrainsDataPathCipher verifies FIPS mode selects AES-256-GCM and refuses the ChaCha20 family.
 func TestFIPSConstrainsDataPathCipher(t *testing.T) {
 	t.Setenv("GOFIPS140", "latest")
 

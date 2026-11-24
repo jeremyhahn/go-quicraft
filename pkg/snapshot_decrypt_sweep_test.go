@@ -49,21 +49,7 @@ func orphanDecryptTemp(t *testing.T, dir, prefix string) string {
 	return f.Name()
 }
 
-// TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext is the regression
-// guard for the send-path plaintext leak.
-//
-// transportSender.decryptSnapshotForSend decrypted the ENTIRE snapshot into a
-// scratch file created as a SIBLING of the encrypted snapshot.dat (it now
-// uses the replica's own directory, which the same sweep covers). A leader
-// killed mid-send (SIGKILL/OOM/power loss) never runs the deferred removal, so
-// a COMPLETE PLAINTEXT COPY of the state machine is left next to the
-// ciphertext. Snapshot directories are retained indefinitely, so the copy
-// survives restarts and backups — while an operator spot-checking snapshot.dat
-// still sees ciphertext.
-//
-// The send scratch file must use a prefix the orphan sweeper matches, since no
-// other cleaner exists. This asserts a crash-ORPHANED file (not
-// one whose in-process owner removes it) is reclaimed at the next StartShard.
+// TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext: StartShard sweeps a send-decrypt scratch file left by a crash.
 func TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -75,9 +61,7 @@ func TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext(t *testing.T) {
 	const shardID, replicaID uint64 = 4, 2
 	base := shardSnapshotBaseDir(cfg.NodeHostDir, "", shardID)
 
-	// Two retained snapshots. The leader was streaming the OLDER one when it
-	// died, which is exactly the case a sweep scoped to the newest recovered
-	// directory misses.
+	// Two retained snapshots; the leader was sending the older one.
 	oldDir := engine.SnapshotSaveDir(base, shardID, replicaID, 100)
 	newDir := engine.SnapshotSaveDir(base, shardID, replicaID, 200)
 
@@ -120,15 +104,7 @@ func TestStartShard_ReclaimsCrashOrphanedSendDecryptPlaintext(t *testing.T) {
 	}
 }
 
-// TestSnapshotScratchPatternsAreSwept is the structural guard: EVERY pattern a
-// snapshot path writes a scratch file under must be a pattern the sweeper
-// matches. It fails the moment someone introduces a new, unswept scratch-file
-// name — which is how the leak was introduced in the first place.
-//
-// The encrypt-side patterns are covered too. Their orphans hold ciphertext, so
-// the exposure is a disk leak rather than a confidentiality one, but the
-// invariant the sweeper rests on admits no exceptions: a name that can be
-// CREATED is by construction a name that can be RECLAIMED.
+// TestSnapshotScratchPatternsAreSwept: every snapshot scratch-file pattern is one the sweeper matches.
 func TestSnapshotScratchPatternsAreSwept(t *testing.T) {
 	for _, pattern := range []string{
 		sendDecryptTempPattern,

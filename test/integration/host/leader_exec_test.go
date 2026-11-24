@@ -35,9 +35,7 @@ type execRecord struct {
 	started chan uint64 // replica ID, per execution
 }
 
-// serveLeaderExec registers a handler on every host BEFORE the shard starts,
-// as an embedder does. A replica with a gate holds its handler until the gate
-// closes or the request's context ends.
+// serveLeaderExec registers a handler on every host before the shard starts; a replica with a gate holds its handler until the gate closes or ctx ends.
 func serveLeaderExec(t *testing.T, cluster *testCluster, gates map[uint64]chan struct{}) *execRecord {
 	t.Helper()
 	rec := &execRecord{runs: make(map[uint64][]uint64), started: make(chan uint64, 16)}

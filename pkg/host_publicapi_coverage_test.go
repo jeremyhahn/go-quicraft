@@ -95,15 +95,7 @@ func TestFollowerRead_LaggingApplyRespectsDeadline(t *testing.T) {
 		t.Fatalf("SyncPropose: %v", err)
 	}
 
-	// Model a replica whose apply loop has fallen behind the commit index.
-	//
-	// Waiting for "lastApplied >= committed" against a SINGLE sample of the
-	// commit marker is not enough: the step worker publishes that marker before
-	// the commit/apply pipeline runs, so the sample can name the term-opening
-	// no-op while the proposal's own entry is still on its way to the state
-	// machine. The wait then returns immediately, the apply that was still
-	// coming overwrites the injected 0, and this test completes on the FAST
-	// path and returns a value instead of ErrTimeout. See injectApplyLag.
+	// Model a replica whose apply has fallen behind the commit index; see injectApplyLag.
 	injectApplyLag(t, h, 1)
 
 	// The deadline is far longer than the 50 fast polls (1ms each) that
@@ -207,10 +199,7 @@ func TestQueryRaftLog_RangeErrors(t *testing.T) {
 // RequestLeaderTransfer
 // ---------------------------------------------------------------------------
 
-// TestRequestLeaderTransfer_ObserverAndRemovedTargets verifies that leadership is never
-// handed to a replica that cannot hold it: an observer does not vote, and a
-// removed replica is no longer part of the shard. Accepting either would stall
-// the shard until the election timeout.
+// TestRequestLeaderTransfer_ObserverAndRemovedTargets verifies leadership is never transferred to an observer or removed replica.
 func TestRequestLeaderTransfer_ObserverAndRemovedTargets(t *testing.T) {
 	h := startSingleVoterShard(t)
 
@@ -331,8 +320,7 @@ func TestSyncWitnessChanges_ContextEndsUncommittedWait(t *testing.T) {
 // WithMetrics
 // ---------------------------------------------------------------------------
 
-// typedNilCollector exists only so a TYPED nil can be passed as a
-// MetricsCollector interface value.
+// typedNilCollector lets a typed nil be passed as a MetricsCollector.
 type typedNilCollector struct{ NoOpMetricsCollector }
 
 // TestWithMetrics_RejectsNilCollectors verifies that neither an untyped nil

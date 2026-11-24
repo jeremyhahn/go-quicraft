@@ -121,10 +121,7 @@ func TestIntegration_DB_ProposeSession(t *testing.T) {
 	}
 }
 
-// TestIntegration_DB_DoubleCloseSession_Rejected verifies that closing an
-// already-closed tracked session returns an error. In dragonboat's behavior
-// this manifests as ErrRejected because the session is no longer registered
-// with the state machine.
+// TestIntegration_DB_DoubleCloseSession_Rejected verifies closing an already-closed tracked session returns an error.
 func TestIntegration_DB_DoubleCloseSession_Rejected(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
@@ -175,12 +172,7 @@ func TestIntegration_DB_DoubleCloseSession_Rejected(t *testing.T) {
 	}
 }
 
-// TestIntegration_DB_OnDiskStateMachine_RejectsTrackedSession verifies
-// that on-disk state machines only support NoOP sessions. Attempting to
-// register a tracked session via SyncGetSession on a shard backed by an
-// IOnDiskStateMachine must return an error (ErrRejected or similar),
-// because on-disk SMs manage their own persistence and do not support
-// the at-most-once delivery semantics of tracked sessions.
+// TestIntegration_DB_OnDiskStateMachine_RejectsTrackedSession verifies on-disk state machines refuse tracked sessions.
 func TestIntegration_DB_OnDiskStateMachine_RejectsTrackedSession(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()

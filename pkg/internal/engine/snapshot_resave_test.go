@@ -41,10 +41,7 @@ func newResaveFixture(t *testing.T, lastApplied uint64) *resaveFixture {
 	return newResaveFixtureDB(t, lastApplied, nil)
 }
 
-// newResaveFixtureDB is newResaveFixture over a WRAPPED LogDB: wrap receives
-// the in-memory one the fixture keeps in ldb and returns the implementation the
-// pool talks to, which is how the record-read failure is injected. A nil wrap
-// uses the in-memory LogDB directly.
+// newResaveFixtureDB is newResaveFixture over a LogDB wrapped by wrap; nil uses the in-memory LogDB.
 func newResaveFixtureDB(t *testing.T, lastApplied uint64,
 	wrap func(*snapshotTestLogDB) logdb.LogDB) *resaveFixture {
 	t.Helper()
@@ -82,10 +79,7 @@ func (f *resaveFixture) saveDirFor(index uint64) string {
 	return snapshotSaveDir(f.snapDir, f.req.shardID, f.req.replicaID, index)
 }
 
-// TestSaveSnapshot_NonAdvancingResaveIsNoOp is the regression test for the
-// data-loss defect where a second snapshot at an index LogDB already records
-// resolved to the SAME directory and opened its snapshot.dat with O_TRUNC,
-// destroying the only artifact covering the compacted log.
+// TestSaveSnapshot_NonAdvancingResaveIsNoOp: a second save at a recorded index must not truncate the existing artifact.
 func TestSaveSnapshot_NonAdvancingResaveIsNoOp(t *testing.T) {
 	f := newResaveFixture(t, 200)
 
@@ -107,14 +101,10 @@ func TestSaveSnapshot_NonAdvancingResaveIsNoOp(t *testing.T) {
 		t.Fatal("first save wrote an empty snapshot data file")
 	}
 
-	// Make a re-serialization DETECTABLE. The snapshotter writes a fixed-width
-	// record, so a truncate-and-rewrite produces a file of identical LENGTH:
-	// only the CONTENT distinguishes the artifact that survived from one that
-	// was destroyed and written again.
+	// A rewrite keeps the same length, so compare content.
 	f.sm.state.Store(0xDEADBEEF)
 
-	// Nothing has been applied since, so the second request resolves to the
-	// SAME index and directory.
+	// Nothing applied since, so the second request resolves to the same index and directory.
 	index, err = f.pool.saveSnapshot(f.req)
 	if err != nil {
 		t.Fatalf("non-advancing saveSnapshot must be a silent no-op, got error: %v", err)
@@ -145,10 +135,7 @@ func TestSaveSnapshot_NonAdvancingResaveIsNoOp(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_NonAdvancingExportFails asserts that an EXPORT at a
-// non-advancing index fails loudly instead of reporting a success that
-// produced no export directory -- and that it does so without touching the
-// recorded artifact.
+// TestSaveSnapshot_NonAdvancingExportFails: an export at a non-advancing index fails without touching the recorded artifact.
 func TestSaveSnapshot_NonAdvancingExportFails(t *testing.T) {
 	f := newResaveFixture(t, 120)
 
@@ -161,8 +148,7 @@ func TestSaveSnapshot_NonAdvancingExportFails(t *testing.T) {
 		t.Fatalf("read snapshot data: %v", err)
 	}
 
-	// See TestSaveSnapshot_NonAdvancingResaveIsNoOp: a rewrite is only visible
-	// in the CONTENT, never in the length.
+	// A rewrite shows in the content, not the length.
 	f.sm.state.Store(0xFEEDFACE)
 
 	exportDir := filepath.Join(t.TempDir(), "exported")
@@ -189,10 +175,7 @@ func TestSaveSnapshot_NonAdvancingExportFails(t *testing.T) {
 // errRecordRead is the injected LogDB snapshot-record read failure.
 var errRecordRead = errors.New("resave test: snapshot record read failed")
 
-// recordReadFailLogDB fails GetSnapshot once armed and otherwise behaves like
-// the in-memory fixture. Every read the save path makes — the non-advancing
-// guard AND the publishStagedSave backstop — goes through this one method, which
-// is why a fail-OPEN guard defeats both layers at once.
+// recordReadFailLogDB fails GetSnapshot once armed; both save-path guards read through it.
 type recordReadFailLogDB struct {
 	*snapshotTestLogDB
 	failing bool
@@ -205,13 +188,7 @@ func (db *recordReadFailLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.Sna
 	return db.snapshotTestLogDB.GetSnapshot(shardID, replicaID)
 }
 
-// TestSaveSnapshot_RecordReadErrorFailsClosed asserts that a save whose LogDB
-// record cannot be READ refuses to run.
-//
-// Falling through on the read error would run a save whose publish must then
-// decide whether the canonical directory is the recorded one — and
-// publishStagedSave, the second line of defence, consults the record through
-// the SAME call, so one persistent read error defeats both layers.
+// TestSaveSnapshot_RecordReadErrorFailsClosed: a save whose LogDB record cannot be read refuses to run.
 func TestSaveSnapshot_RecordReadErrorFailsClosed(t *testing.T) {
 	var wrapper *recordReadFailLogDB
 	f := newResaveFixtureDB(t, 400, func(base *snapshotTestLogDB) logdb.LogDB {
@@ -250,13 +227,7 @@ func TestSaveSnapshot_RecordReadErrorFailsClosed(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_MissingRecordedArtifactIsRebuilt asserts that the
-// non-advancing skip is gated on the ARTIFACT, not on the record alone.
-//
-// A record whose directory was lost (operator cleanup, a partial restore) would
-// otherwise never be rebuilt: the skip is permanent for a shard taking no
-// further writes, leaving a single-node deployment repairable only by streaming
-// from a peer it does not have.
+// TestSaveSnapshot_MissingRecordedArtifactIsRebuilt: the non-advancing skip depends on the artifact existing, not the record alone.
 func TestSaveSnapshot_MissingRecordedArtifactIsRebuilt(t *testing.T) {
 	f := newResaveFixture(t, 250)
 
@@ -300,12 +271,7 @@ func TestSaveSnapshot_MissingRecordedArtifactIsRebuilt(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_RebuildRefusesAFormatTheRecordDoesNotDescribe: a rebuild
-// keeps the existing LogDB record — LogDB rejects a same-index update — so
-// recovery reads the rebuilt bytes through the OLD record's encryption and
-// compression. Rebuilding in a format the record does not describe (here: the
-// shard switched to Snappy since the recorded snapshot was taken) produced an
-// artifact that reported success and could never be recovered. It is refused.
+// TestSaveSnapshot_RebuildRefusesAFormatTheRecordDoesNotDescribe: a rebuild in a format the kept record does not describe is refused.
 func TestSaveSnapshot_RebuildRefusesAFormatTheRecordDoesNotDescribe(t *testing.T) {
 	f := newResaveFixture(t, 250)
 	if _, err := f.pool.saveSnapshot(f.req); err != nil {
@@ -330,12 +296,7 @@ func TestSaveSnapshot_RebuildRefusesAFormatTheRecordDoesNotDescribe(t *testing.T
 	}
 }
 
-// TestSaveSnapshot_RebuildRefusesWhatTheRecordCannotDescribe: a rebuild keeps
-// the surviving record, and recovery reads the rebuilt artifact through it —
-// its path and the FileSize it measures the file against. A rebuild whose
-// output size differs (the same state serialized differently), or whose
-// record names a directory the rebuild does not write, reported success and
-// left an artifact recovery could never read. Both are refused.
+// TestSaveSnapshot_RebuildRefusesWhatTheRecordCannotDescribe: a rebuild with a different size or directory than the record is refused.
 func TestSaveSnapshot_RebuildRefusesWhatTheRecordCannotDescribe(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
@@ -403,12 +364,7 @@ func TestSaveSnapshot_RebuildAcceptsALegacyUnknownSize(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_RebuildRefreshesTheLogReaderSize: a shard restarted with
-// its artifact missing loads its log reader with the recorded path and size 0,
-// and a rebuild cannot re-create the reader's snapshot at the same index —
-// so the reader kept declaring 0 and every send of the rebuilt artifact failed
-// its declared-size check until the next restart. The rebuild refreshes the
-// declared size.
+// TestSaveSnapshot_RebuildRefreshesTheLogReaderSize: a rebuild refreshes the log reader's declared snapshot size.
 func TestSaveSnapshot_RebuildRefreshesTheLogReaderSize(t *testing.T) {
 	f := newResaveFixture(t, 250)
 	lr := logdb.NewLogReader(f.req.shardID, f.req.replicaID, f.ldb)
@@ -494,7 +450,7 @@ func TestPublishStagedSave_NeverReplacesTheRecordedDirectory(t *testing.T) {
 	f.node.LockSnapshotDir()
 	defer f.node.UnlockSnapshotDir()
 
-	// The RECORDED directory is refused.
+	// The recorded directory is refused.
 	if err := f.pool.publishStagedSave(stageWith(t, "save"), recorded, 80, f.req, false); !errors.Is(err, ErrSnapshotIndexNotAdvanced) {
 		t.Fatalf("publishStagedSave onto the recorded directory = %v, want ErrSnapshotIndexNotAdvanced", err)
 	}
@@ -502,8 +458,7 @@ func TestPublishStagedSave_NeverReplacesTheRecordedDirectory(t *testing.T) {
 		t.Fatalf("DATA LOSS: publishing a staged save replaced the snapshot LogDB records: %v", statErr)
 	}
 
-	// A CLAIMED occupant — a receive's published artifact awaiting raft's
-	// verdict, unrecorded now and recorded a moment from now — is refused.
+	// A claimed occupant awaiting raft's verdict is refused.
 	claimed := f.saveDirFor(81)
 	occupy(t, claimed, "received")
 	f.node.ClaimSnapshotDir(81)
@@ -514,9 +469,7 @@ func TestPublishStagedSave_NeverReplacesTheRecordedDirectory(t *testing.T) {
 		t.Fatalf("the claimed occupant was replaced (holds %q)", got)
 	}
 
-	// An unclaimed, unrecorded occupant is an ORPHAN and is replaced: a
-	// quiescent shard keeps re-saving at that index, and GC never reclaims
-	// the newest directory.
+	// An unclaimed, unrecorded occupant is an orphan and is replaced.
 	f.node.ReleaseSnapshotDir(81)
 	if err := f.pool.publishStagedSave(stageWith(t, "save"), claimed, 81, f.req, false); err != nil {
 		t.Fatalf("publishStagedSave over an orphan: %v", err)
@@ -525,7 +478,7 @@ func TestPublishStagedSave_NeverReplacesTheRecordedDirectory(t *testing.T) {
 		t.Fatalf("the orphan was not replaced (holds %q)", got)
 	}
 
-	// And the rebuild of the RECORDED directory is allowed.
+	// The rebuild of the recorded directory is allowed.
 	if err := f.pool.publishStagedSave(stageWith(t, "rebuilt"), recorded, 80, f.req, true); err != nil {
 		t.Fatalf("rebuild publish: %v", err)
 	}
@@ -563,11 +516,7 @@ func TestPublishStagedSave_RefusesADirectoryARecoveryIsReading(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_SMErrorLeavesNoPlaintextDirectory is the regression test
-// for the leaked save directories: a failure before the metadata write left
-// snapshot-<N>/snapshot.dat holding partial PLAINTEXT state-machine bytes with
-// no snapshot.meta beside it, which readSnapshotEpoch classifies UNEVALUABLE
-// and which therefore suppresses DEK purging host-wide for every shard.
+// TestSaveSnapshot_SMErrorLeavesNoPlaintextDirectory: a failure before the metadata write leaves no directory behind.
 func TestSaveSnapshot_SMErrorLeavesNoPlaintextDirectory(t *testing.T) {
 	snapDir := t.TempDir()
 	cfg := config.Config{ShardID: 4, ReplicaID: 1, CompactionOverhead: 10}
@@ -592,10 +541,7 @@ func TestSaveSnapshot_SMErrorLeavesNoPlaintextDirectory(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_MetadataErrorLeavesNoDirectory covers the last pre-record
-// failure point: the artifact is written but not yet self-describing, so the
-// directory must not survive. snapshot.meta is pre-created as a DIRECTORY to
-// make writeSnapshotMetadata fail.
+// TestSaveSnapshot_MetadataErrorLeavesNoDirectory: a metadata write failure (snapshot.meta pre-created as a directory) leaves no directory.
 func TestSaveSnapshot_MetadataErrorLeavesNoDirectory(t *testing.T) {
 	snapDir := t.TempDir()
 	cfg := config.Config{ShardID: 5, ReplicaID: 2, CompactionOverhead: 10}
@@ -654,11 +600,7 @@ func (c *slotProbeCallback) OnSnapshotCompleted(shardID uint64, index uint64, op
 	c.testCallback.OnSnapshotCompleted(shardID, index, op, err)
 }
 
-// TestHandleRequest_CompletionFiresBeforeSlotsAreReleased pins the ordering
-// that closes the misattribution window: the completion callback resolves
-// pending requests for a shard WITHOUT matching them to a specific request, so
-// releasing the in-flight/snapshotting slots first would let a request
-// registered microseconds later be completed with this snapshot's result.
+// TestHandleRequest_CompletionFiresBeforeSlotsAreReleased: completion resolves pending requests before the slots are released.
 func TestHandleRequest_CompletionFiresBeforeSlotsAreReleased(t *testing.T) {
 	f := newResaveFixture(t, 90)
 	probe := &slotProbeCallback{pool: f.pool, node: f.node, shardID: f.req.shardID}

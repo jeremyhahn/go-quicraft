@@ -33,13 +33,7 @@ const growShrinkBudget = 2 * time.Minute
 // growShrinkCallTimeout bounds one proposal or membership request.
 const growShrinkCallTimeout = 5 * time.Second
 
-// TestE2E_GrowShrink_OneToFiveToOne grows a shard from one host to five by
-// successive single-replica adds, each naming the new member's identity and
-// the current ConfigChangeID, then shrinks it back to one by successive
-// removes, removing the leader itself twice. After every change exactly one
-// leader must exist and a write must succeed; at the end the last host must
-// read back every acknowledged write and list only itself as a voter, with
-// every removed replica in Removed.
+// TestE2E_GrowShrink_OneToFiveToOne grows a shard from one host to five and back, removing the leader twice, checking one leader and a successful write after each change.
 func TestE2E_GrowShrink_OneToFiveToOne(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), growShrinkBudget)
 	defer cancel()
@@ -250,16 +244,7 @@ func growShrinkRemove(ctx context.Context, t *testing.T, c *testCluster, shardID
 	}
 }
 
-// growShrinkConfigChange drives one membership change through the current
-// leader, passing that leader's Membership.ConfigChangeID on every attempt
-// so the version round trip is exercised rather than skipped (0 skips it).
-// It retries only on leadership churn, and only until ctx expires. landed
-// reports whether a membership holds the change: after an attempt whose
-// outcome is unknown (a timeout or a cancelled proposal may still commit),
-// the change is accepted once it is visible instead of being resubmitted
-// under a ConfigChangeID that has gone stale. Any other refusal of a first
-// or definite attempt, a stale ConfigChangeID included, fails the test. It
-// returns the leader's membership in which the change landed.
+// growShrinkConfigChange runs one membership change through the current leader with its ConfigChangeID, retrying on leadership churn and accepting an uncertain attempt once landed reports it; returns the membership.
 func growShrinkConfigChange(ctx context.Context, t *testing.T, c *testCluster, shardID uint64, what string,
 	submit func(ctx context.Context, h *quicraft.Host, ccid uint64) error,
 	landed func(m *quicraft.Membership) bool) *quicraft.Membership {

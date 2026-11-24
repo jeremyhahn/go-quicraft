@@ -53,15 +53,7 @@ func TestRaftConfigMatchesCommonConfiguration(t *testing.T) {
 	}
 }
 
-// TestTransportNegotiatesTLS13 checks the protocol version a NodeHost's
-// mutual-TLS transport negotiates with a peer built from the same material.
-//
-// Dragonboat's TCP transport sets no MinVersion on either side
-// (lni/goutils netutil.GetServerTLSConfig and NodeHostConfig.GetClientTLSConfig),
-// so Go's defaults apply: a TLS 1.2 floor and a TLS 1.3 ceiling. Between two
-// Dragonboat peers TLS 1.3 is therefore negotiated but not required, and the
-// transport lives in an internal package, so the harness cannot raise the
-// floor without replacing it. This test proves the half that is true.
+// TestTransportNegotiatesTLS13: Dragonboat's mTLS transport negotiates TLS 1.3 between its own peers, though it sets no MinVersion and so does not require it.
 func TestTransportNegotiatesTLS13(t *testing.T) {
 	dir := t.TempDir()
 	tlsDir := filepath.Join(dir, "tls")

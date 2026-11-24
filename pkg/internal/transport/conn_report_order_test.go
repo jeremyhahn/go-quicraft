@@ -26,16 +26,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 )
 
-// TestGetConnection_WaitersHoldForLeaderReport: senders coalesced onto one
-// dial do not return before the dialing sender has delivered that dial's
-// connection event. A waiter released earlier could dial again at once and
-// have its own event delivered first, so a listener would see a later
-// OnConnectionFailed overtaken by an earlier OnConnectionEstablished, or the
-// reverse.
-//
-// The target is a UDP socket that never answers, so the coalesced dial runs
-// for the whole DialTimeout — every sender joins it — and then fails; the
-// listener's OnConnectionFailed blocks until the test releases it.
+// TestGetConnection_WaitersHoldForLeaderReport verifies coalesced senders return only after the dialer reports the connection event.
 func TestGetConnection_WaitersHoldForLeaderReport(t *testing.T) {
 	silent, err := (&net.ListenConfig{}).ListenPacket(context.Background(), "udp", "127.0.0.1:0")
 	if err != nil {
@@ -109,15 +100,7 @@ func TestGetConnection_WaitersHoldForLeaderReport(t *testing.T) {
 	}
 }
 
-// TestGetConnection_ConsecutiveDialsReportInOrder: the connection events of
-// two consecutive dials to one destination are delivered in the order the
-// dials started, even though the second dial starts after the first one's
-// singleflight entry is gone. The first dial fails against a silent socket
-// and its OnConnectionFailed is held; the second, started while the first
-// dial's report has not finished, reaches a live peer on the same address and
-// must not deliver OnConnectionEstablished — nor return — until the first
-// report has. Unordered, a listener would see the peer connected and then,
-// stale, failed.
+// TestGetConnection_ConsecutiveDialsReportInOrder verifies consecutive dials' connection events arrive in dial order.
 func TestGetConnection_ConsecutiveDialsReportInOrder(t *testing.T) {
 	silent, err := (&net.ListenConfig{}).ListenPacket(context.Background(), "udp", "127.0.0.1:0")
 	if err != nil {

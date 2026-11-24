@@ -23,22 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// Committed node identities must survive the snapshot-metadata round-trip
-//
-// Identities reach membership through the LOG: the EntryInitialMembership at
-// index 1 and every EntryConfigChange. A replica that rebuilds its
-// configuration from a SNAPSHOT whose log has been compacted past those entries
-// has the logdb snapshot record and nothing else to relearn them from.
-//
-// Dropping the field anywhere on that path is silent. Nothing errors, the
-// recovered configuration still names every member, and the receive-side gate
-// simply falls back to the committed ADDRESS — which is the check a wildcard or
-// shared-SAN certificate defeats, and the reason the identity binding exists.
-// So every test here asserts the DISTINGUISHING observable: that a promiscuous
-// certificate is still refused after recovery. A test that asserted only "the
-// membership came back" would pass against the dropped field.
-// ---------------------------------------------------------------------------
+// Committed node identities must survive the snapshot-metadata round-trip; each test asserts a promiscuous certificate is still refused after recovery.
 
 // identityProtoMembership is a committed configuration carrying identities
 // across more than one role.
@@ -56,15 +41,7 @@ func identityProtoMembership() proto.Membership {
 			2: "spki:2222222222222222222222222222222222222222222222222222222222222222",
 			3: "spki:3333333333333333333333333333333333333333333333333333333333333333",
 		},
-		// RemovedIdentities is the removal DENY-LIST — the map that keeps an
-		// ejected replica's keypair from being readmitted. It was absent from
-		// this fixture, so the read-back direction (logdbMembershipToProto)
-		// could drop it entirely with no test failing anywhere: a replica
-		// would restart having forgotten which keypairs it had ejected, and a
-		// decommissioned node still holding its certificate would be
-		// readmitted — on exactly the restart an operator performs after
-		// removing it. Per the field's own doc comment, dropping it "revokes
-		// a revocation".
+		// RemovedIdentities is the removal deny-list and must survive the round-trip.
 		RemovedIdentities: map[uint64]string{
 			9: "spki:9999999999999999999999999999999999999999999999999999999999999999",
 		},
@@ -146,10 +123,7 @@ func TestMembershipConvertersRoundTripIdentities(t *testing.T) {
 	}
 }
 
-// TestMembershipConvertersCopyIdentityMap pins that neither converter ALIASES
-// the caller's map. Several bugs in this codebase came from sharing a map
-// across a boundary, and this one is read by the authorization gate on every
-// quorum-bearing message while the source is owned by another layer.
+// TestMembershipConvertersCopyIdentityMap pins that neither converter aliases the caller's map.
 func TestMembershipConvertersCopyIdentityMap(t *testing.T) {
 	source := identityProtoMembership()
 
@@ -190,13 +164,7 @@ func TestMembershipConvertersPreserveAbsentIdentities(t *testing.T) {
 	}
 }
 
-// recoveredMembership stores ms as a replica's own snapshot metadata, puts the
-// backend through the strongest round-trip it supports, and returns the
-// membership a restarting replica would rebuild its configuration from.
-//
-// It walks the real path in both directions: protoMembershipToLogDB is what
-// engine/snapshot_pool uses when a replica snapshots itself, and
-// logdbMembershipToProto is what host.recoverLogReader uses on the way back.
+// recoveredMembership round-trips ms through protoMembershipToLogDB, the backend and logdbMembershipToProto.
 func recoveredMembership(t *testing.T, ldb logdb.LogDB, reopen func() logdb.LogDB,
 	ms proto.Membership) proto.Membership {
 	t.Helper()
@@ -221,21 +189,7 @@ func recoveredMembership(t *testing.T, ldb logdb.LogDB, reopen func() logdb.LogD
 	return logdbMembershipToProto(snap.Membership)
 }
 
-// TestSnapshotRecoveryKeepsTheQuorumGateBoundToIdentities is the end-to-end
-// regression, and the reason the field has to be carried at all.
-//
-// A replica restarts and rebuilds its configuration from snapshot metadata,
-// its log having been compacted past the entries that carried the identities.
-// Then a GENUINE, authenticated member whose certificate is a cluster wildcard
-// forges a quorum-bearing ReplicateResp as replica 2.
-//
-// If the identities survived, the gate compares the attacker's own keypair
-// against the one committed for replica 2 and refuses with identity_mismatch.
-// If they were dropped anywhere on the path, the gate falls back to the
-// address check, the wildcard certificate covers replica 2's committed address,
-// and the forgery is DELIVERED and counted toward commit quorum. Delivery is
-// therefore the observable that distinguishes the fixed path from the broken
-// one — asserting the membership merely "came back" would not.
+// TestSnapshotRecoveryKeepsTheQuorumGateBoundToIdentities checks that after snapshot recovery a wildcard-certificate member forging replica 2 is refused, not delivered.
 func TestSnapshotRecoveryKeepsTheQuorumGateBoundToIdentities(t *testing.T) {
 	const (
 		victimAddr    = "10.0.0.2:5001"
@@ -249,9 +203,7 @@ func TestSnapshotRecoveryKeepsTheQuorumGateBoundToIdentities(t *testing.T) {
 
 			eng, handler, metrics := identityRig(t, recovered)
 
-			// The attacker holds a valid cluster certificate that COVERS the
-			// victim's committed address. Withholding that would make the test
-			// pass against the address binding too, proving nothing.
+			// The attacker's valid certificate covers the victim's committed address.
 			attacker := certCoveringAs(attackerIDStr, victimAddr)
 			if !attacker.Authorizes(victimAddr) {
 				t.Fatal("fixture: the attacker's certificate must cover the victim's " +
@@ -314,10 +266,7 @@ func TestSnapshotRecoveryKeepsTheLegitimateHolderAuthorized(t *testing.T) {
 	}
 }
 
-// recoveryBackend is one LogDB implementation plus the strongest restart it
-// can be put through. Both are exercised through the SAME assertions: a field
-// preserved by the backend tests use while the backend production uses drops
-// it is the failure mode this pairing exists to prevent.
+// recoveryBackend is one LogDB implementation and the strongest restart it supports.
 type recoveryBackend struct {
 	name string
 	open func(t *testing.T) (logdb.LogDB, func() logdb.LogDB)

@@ -12,18 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package testpki issues the ephemeral certificates the integration suites
-// run their clusters under: one CA per cluster, one leaf — one KEYPAIR — per
-// host.
-//
-// The per-host keypair is not a nicety. A member is authorized on the receive
-// path by its committed node identity, the SHA-256 of its certificate's
-// SubjectPublicKeyInfo, and by nothing else (config.Config.RequireMemberIdentities).
-// Hosts that share a leaf share an identity, so every one of them authenticates
-// as every other: the promiscuous-certificate shape identities exist to defeat,
-// and one the membership validator refuses to commit twice
-// (raft.ErrDuplicateMemberIdentity). This package is the one generator every
-// suite shares, so no suite can hand every host the same leaf.
+// Package testpki issues the integration suites' ephemeral certificates: one CA per cluster and a distinct keypair per host, since identity is the SPKI hash.
 package testpki
 
 import (
@@ -88,11 +77,7 @@ func NewCA(t testing.TB) *CA {
 	}
 }
 
-// Leaf issues a host certificate on a FRESH keypair, covering localhost and
-// every loopback address, and returns it as the MTLSConfig a Host is started
-// with. Each call is a distinct node identity; a host that restarts must be
-// given the same MTLSConfig again to keep the identity the shard committed
-// for it.
+// Leaf issues a host certificate on a fresh keypair for localhost and loopback, as an MTLSConfig; reuse it on restart to keep the identity.
 func (ca *CA) Leaf(t testing.TB) *config.MTLSConfig {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

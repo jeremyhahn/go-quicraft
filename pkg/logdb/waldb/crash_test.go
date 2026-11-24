@@ -35,19 +35,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
-// Crash-consistency tests kill a real writer process with SIGKILL mid-write
-// and assert the WAL recovers. Unlike the injected-fault suites (see
-// gap_hardening_test.go, segment_hardening_test.go) nothing here is
-// simulated: the child process dies without unwinding, without closing the
-// segment, and without flushing whatever the writer had buffered.
-//
-// A SIGKILL leaves everything already handed to write(2) in the page cache,
-// so the surviving tail is exactly the sequence of block writes the child
-// issued: the buffered open block is lost, and a multi-block record can end
-// as a RecordFirst chunk whose continuation blocks were never written.
-// A process death alone therefore cannot produce a CRC-corrupt block -- that
-// needs the medium to lose a partially written block, which
-// TestWALCrashTornTailRepairedAcrossRestarts adds on top of the real kill.
+// Crash-consistency tests SIGKILL a real writer process mid-write and assert the WAL recovers; a kill keeps the page cache, so it cannot corrupt a block.
 const (
 	// crashChildEnv guards the child entry point. The parent sets it to "1".
 	crashChildEnv = "WALDB_CRASH_CHILD"
@@ -95,9 +83,7 @@ const (
 // durable writes.
 var crashShardIDs = [...]uint64{1, 2, 3}
 
-// crashKillDelays are the delays between the child's first durable ack and
-// the SIGKILL. Spread across the write pipeline they land in different
-// phases: mid-block fill, mid-block flush, mid-rotation and mid-fsync.
+// crashKillDelays are the delays between the child's first durable ack and the SIGKILL.
 var crashKillDelays = []time.Duration{
 	0,
 	3 * time.Millisecond,
@@ -164,17 +150,7 @@ func crashWriteSealed(path string, sealed *seal.SealedRootKey) error {
 	return os.WriteFile(path, data, 0o600)
 }
 
-// crashBarrier initializes the barrier at sealPath on first call and restores
-// it on every later call. The config carries a StatePersister because barriers
-// fail closed with seal.ErrNoStatePersister without one — and because RESTORING
-// one rotates: the spent AEAD invocation budget of the loaded epoch cannot be
-// known across a restart, so the barrier moves to a fresh epoch rather than
-// reuse a counter it cannot bound.
-//
-// That makes every barrier built from this blob a point-in-time view. Two live
-// barriers over one blob go stale against each other the moment either restores
-// or rotates, so a caller that holds one across a child process's lifetime must
-// re-load it afterwards rather than reuse the object.
+// crashBarrier initializes or restores the barrier at sealPath; restoring rotates, so reload it after each child rather than reuse it.
 func crashBarrier(sealPath string) (*seal.Barrier, error) {
 	_ = seal.AllowWeakKDFParams()
 	strategy, err := newTestSealStrategy([]byte(crashPassphrase))
@@ -223,9 +199,7 @@ func TestWALCrashChildWriter(t *testing.T) {
 	os.Exit(0)
 }
 
-// crashChildMain writes entries until the parent kills the process. It never
-// returns cleanly under test: the parent's SIGKILL arrives first. Any error
-// exits non-zero so the parent can distinguish a bug from a kill.
+// crashChildMain writes entries until killed; any error exits non-zero.
 func crashChildMain() {
 	fail := func(format string, args ...any) {
 		fmt.Fprintf(os.Stderr, "crash child: "+format+"\n", args...)
@@ -425,21 +399,7 @@ func redactCmd(e logdb.Entry) logdb.Entry {
 	return e
 }
 
-// TestWALCrashConsistency SIGKILLs a real WAL writer at several points in the
-// write pipeline and asserts the reopened WAL keeps every promise the killed
-// process made.
-//
-// PROCESS death, not power loss, and the difference is the whole limitation:
-// SIGKILL destroys the process and leaves the page cache untouched, so every
-// byte the child handed to write(2) is still readable afterwards whether or
-// not it was ever fsynced. This test therefore cannot detect a deleted flush —
-// stub osFile.Sync to return nil and all of it still passes. It tests the
-// property its name states, crash CONSISTENCY: that what survives is a valid
-// prefix and that recovery neither loses nor invents records around the tear.
-// Durability across a real power loss is asserted elsewhere, by
-// TestWALCrashDurability_AckedWritesSurviveModelledPowerLoss (which models the
-// medium) and TestOSFileSyncIssuesRealSyscall (which proves the flush is a
-// syscall).
+// TestWALCrashConsistency SIGKILLs a WAL writer at several points and asserts recovery keeps every acked promise; power-loss durability is tested elsewhere.
 func TestWALCrashConsistency(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns writer subprocesses; skipped under -short")
@@ -500,18 +460,7 @@ func crashTearPoint(t *testing.T, data []byte) int64 {
 			end = len(data)
 		}
 		block := data[blockStart:end]
-		// A wholly zero block is the segment's pre-allocated tail. The test
-		// is the whole block, as segment.ReadAll's is, not its first byte: a
-		// record opens with its CRC32, whose low byte is zero about one time in
-		// 256, and reading that as the tail stopped the scan early and tore an
-		// earlier block — below records a later fdatasync had acknowledged,
-		// which recovery rightly refuses rather than truncating.
-		//
-		// A SHORT final block is not the tail either. A segment rotated out is
-		// truncated to its written size, and when the Sync before the rotation
-		// lands on a block boundary its sync mark opens the next block alone:
-		// recordHeaderSize bytes naming that boundary as the acknowledged end.
-		// Skipping it tore the block below, under acknowledged bytes (run 58372).
+		// The pre-allocated tail is a wholly zero block, as in segment.ReadAll; a short final block holding only a sync mark is not the tail.
 		if isAllZero(block) {
 			break
 		}
@@ -533,18 +482,7 @@ func crashTearPoint(t *testing.T, data []byte) int64 {
 	return best
 }
 
-// crashTearSegment damages one block of the WAL the killed writer left behind,
-// reproducing what a power loss adds on top of the process death: a partially
-// persisted block whose record no longer passes CRC.
-//
-// A torn tail is only ever valid in the FINAL segment: recovery fails-stop on
-// corruption in any lower segment (a lower segment was fully fdatasynced before
-// a higher one was created, so its corruption is bit rot, not a torn tail).
-// The kill can leave a higher, incompletely written active segment with no
-// complete record to tear; those higher segments are deleted here so the torn
-// segment becomes the genuine final one — the only place prefix-truncation
-// recovery is valid. Returns the torn segment's path and the offset recovery
-// must truncate it back to.
+// crashTearSegment tears one block of the final segment, deleting higher incomplete segments first, and returns its path and the offset recovery must truncate to.
 func crashTearSegment(t *testing.T, shardDir string) (string, int64) {
 	t.Helper()
 	segIDs := crashSegmentIDs(t, shardDir) // highest first
@@ -568,19 +506,7 @@ func crashTearSegment(t *testing.T, shardDir string) (string, int64) {
 		if err != nil {
 			t.Fatalf("open segment for tearing: %v", err)
 		}
-		// Destroy the block from the tear point to its end, not a single byte
-		// inside the first record. A torn tail is a block the medium did not
-		// finish taking, so NOTHING below the tear survives; flipping one byte
-		// and leaving the records after it intact models interior rot instead —
-		// bytes that reached the medium and passed CRC — which recovery must
-		// refuse rather than truncate (ErrMidSegmentCorruption). That case has
-		// its own test; this one must stay a genuine torn tail.
-		//
-		// tearAt is a block start and crashTearPoint returns the LAST
-		// data-bearing block, so this fills exactly the final live block. 0xff
-		// is deterministic and cannot decode (0xff is not a valid record type)
-		// and is not zero, so it is read as corruption rather than as the
-		// pre-allocated zero tail or a write hole.
+		// Fill from the tear point to the end of the last live block with 0xff, which is neither a valid record type nor the zero tail.
 		tearEnd := tearAt + int64(crashBlockSize)
 		if tearEnd > int64(len(data)) {
 			tearEnd = int64(len(data))
@@ -601,13 +527,7 @@ func crashTearSegment(t *testing.T, shardDir string) (string, int64) {
 	return "", 0
 }
 
-// TestCrashTearSegmentHeaderOnlyFinalBlock pins the layout behind nightly run
-// 58372. When a Sync lands exactly on a block boundary, its sync mark opens
-// the next block, and a segment rotated out then is truncated to its written
-// size: its final block is that mark alone, recordHeaderSize bytes naming the
-// boundary as the acknowledged end. The tear must land at or above that end;
-// tearing the block below it destroys bytes an fdatasync acknowledged, which
-// recovery rightly refuses as damage below acknowledged data.
+// TestCrashTearSegmentHeaderOnlyFinalBlock: when the final block is only a sync mark, the tear lands at or above the acknowledged end it names.
 func TestCrashTearSegmentHeaderOnlyFinalBlock(t *testing.T) {
 	dir := t.TempDir()
 	seg, _, err := createSegment(defaultFS(), dir, 1, crashBlockSize, crashMaxFileSize)
@@ -651,12 +571,7 @@ func TestCrashTearSegmentHeaderOnlyFinalBlock(t *testing.T) {
 	}
 }
 
-// TestWALCrashTornTailRepairedAcrossRestarts kills a real writer and then
-// tears the final block it wrote, the way an unlucky power loss would. The
-// first reopen must replay the clean prefix AND repair the segment on disk;
-// if the corrupt tail survives, the next restart re-detects it and discards
-// every segment written since -- silently deleting acknowledged data on every
-// boot. That recurrence, not the initial truncation, is the regression.
+// TestWALCrashTornTailRepairedAcrossRestarts: the first reopen replays the clean prefix and repairs the segment, so later restarts lose nothing.
 func TestWALCrashTornTailRepairedAcrossRestarts(t *testing.T) {
 	if testing.Short() {
 		t.Skip("spawns a writer subprocess; skipped under -short")
@@ -861,20 +776,7 @@ func runCrashIteration(t *testing.T, delay time.Duration, encrypted bool) {
 	ack := runCrashChildProcess(t, walDir, ackPath, sealPath, 1, delay)
 
 	if encrypted {
-		// Re-load the barrier from the sealed state the CHILD left behind.
-		// The parent stands in for a RESTARTING process here, and a restarting
-		// process re-reads that state — holding the pre-child barrier object
-		// instead assumes no other process ever moved the epoch on.
-		//
-		// That assumption is false: restoring a
-		// barrier rotates, because the spent AEAD invocation budget of the
-		// loaded epoch is unknowable across a restart and reusing it would
-		// silently erode the 2^-32 nonce-collision bound. So the child writes
-		// its records under an epoch the parent's stale object has never held a
-		// DEK for, and every record fails to decrypt. Reverting seal to before
-		// the rotation reproduces the identical failure the moment anything
-		// calls Rotate — including the host's own rotation threshold — so this
-		// is the harness modelling a restart incorrectly, not a WAL defect.
+		// Reload the barrier from the state the child left: restoring rotates the epoch, so the pre-child object cannot decrypt the child's records.
 		b, berr := crashBarrier(sealPath)
 		if berr != nil {
 			t.Fatalf("crashBarrier (post-child reload): %v", berr)

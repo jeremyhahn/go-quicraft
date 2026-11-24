@@ -159,10 +159,7 @@ func TestRemoveNodeData_FailedRegistryWriteChangesNothing(t *testing.T) {
 	}
 }
 
-// TestRemoveNodeData_RegistryDirSyncFailurePoisons verifies a retirement
-// whose registry was renamed into place but whose directory fsync failed
-// fail-stops the DB: whether the retirement survives a crash is unknown, the
-// same uncertainty a failed WAL fsync leaves, and only a restart settles it.
+// TestRemoveNodeData_RegistryDirSyncFailurePoisons checks a failed directory fsync after the registry rename fail-stops the DB.
 func TestRemoveNodeData_RegistryDirSyncFailurePoisons(t *testing.T) {
 	dir := t.TempDir()
 	ffs := &dirSyncFailFS{FS: defaultFS()}
@@ -188,12 +185,7 @@ func TestRemoveNodeData_RegistryDirSyncFailurePoisons(t *testing.T) {
 	}
 }
 
-// TestOpen_FinishesARemovalThatStoppedAfterItsRetirement verifies the open
-// that follows an interrupted removal finishes it: the retirement was
-// published, but the process stopped before the node's records were dropped
-// and its segments collected (or that collection failed). Replay finds the
-// records, purgeRetired drops them, and the segment holding nothing else is
-// reclaimed there — not left until some later compaction happens to run.
+// TestOpen_FinishesARemovalThatStoppedAfterItsRetirement checks Open purges a retired node's records and reclaims its segment.
 func TestOpen_FinishesARemovalThatStoppedAfterItsRetirement(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {

@@ -105,16 +105,7 @@ func TestFromString_InvalidMode(t *testing.T) {
 	}
 }
 
-// TestFromString_RejectsAnAliasForAnUndescribedMode is the gate on Validate's
-// production caller. parseModes and modeSpecs are separate tables — the first
-// is many-to-one — and FromString is the only thing that checks them against
-// each other. An alias pointing at a Mode modeSpecs does not describe must be
-// REFUSED, not returned: a Mode that parses cleanly and then answers
-// "unknown(N)" from String and false from every durability predicate is a
-// configuration this package accepted while promising nothing.
-//
-// The drift is injected here rather than left to a future edit, because the
-// whole point is that the mistake compiles.
+// TestFromString_RejectsAnAliasForAnUndescribedMode injects an alias to an undescribed Mode and expects FromString to refuse it.
 func TestFromString_RejectsAnAliasForAnUndescribedMode(t *testing.T) {
 	const undescribed Mode = 200
 	if _, ok := modeSpecs[undescribed]; ok {
@@ -140,16 +131,7 @@ func TestFromString_RejectsAnAliasForAnUndescribedMode(t *testing.T) {
 	}
 }
 
-// TestMode_UnknownValueGuaranteesNothing pins the answer an out-of-range Mode
-// gives, which the Mode doc comment relies on and which nothing tested.
-//
-// Mode is an open uint8, so this is the state a value decoded from
-// configuration or a wire field lands in when it does not name a real mode. All
-// three predicates report false — in particular RequiresQuorum, so an embedder
-// that branches on it treats an unnameable mode as one that needs no quorum.
-// That is why Validate exists and why the doc comment tells callers to run it
-// at the boundary; if the answers here are ever changed, this test and that
-// comment must move together.
+// TestMode_UnknownValueGuaranteesNothing pins that an out-of-range Mode answers false to every predicate.
 func TestMode_UnknownValueGuaranteesNothing(t *testing.T) {
 	for _, m := range []Mode{Mode(3), Mode(100), Mode(255)} {
 		var target *InvalidModeError

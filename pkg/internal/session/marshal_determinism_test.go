@@ -23,44 +23,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// The session table is snapshot payload. Two replicas holding the same session
-// state must encode it to the SAME bytes, because the encoded snapshot is what
-// a third replica installs and what the snapshot integrity digest is taken
-// over: an encoding that depends on Go's randomized map iteration makes two
-// honest replicas disagree about a byte-for-byte identical logical state, and
-// the disagreement surfaces as a snapshot that fails to verify rather than as
-// anything that points back here.
-//
-// MarshalTo therefore sorts twice — the client IDs in MarshalTo and the series
-// IDs in marshalSession — and NEITHER sort was covered. Both could be deleted
-// with the whole repository's tests still passing (verified by deleting each in
-// turn and running ./pkg/internal/session/... and ./pkg/internal/rsm/... at
-// -count=3). The existing round-trip coverage could not see it: the fuzz
-// round-trip registers exactly ONE session with exactly ONE cached response, and
-// a one-element map has only one iteration order.
-//
-// These constants are sized so the gate cannot pass by luck. Go randomizes both
-// the starting bucket and the offset within it on every range over a map, so an
-// unsorted encoding of a 24-entry map reproduces a given order with probability
-// well under 1/24 per marshal; requiring 12 independent marshals to agree makes
-// a false pass impossible in practice while a sorted encoding passes with
-// certainty.
+// Replicas with the same session state must encode it to the same bytes.
 const (
 	determinismSessions = 24
 	determinismSeries   = 24
 	determinismMarshals = 12
 )
 
-// buildDeterminismManager registers determinismSessions sessions each holding
-// determinismSeries cached responses, inserting both in the order the caller
-// dictates. The LOGICAL state is identical for any permutation — only the map
-// insertion order differs, which is precisely the axis the encoding must not
-// depend on.
+// buildDeterminismManager registers sessions and cached responses in the caller's order.
 func buildDeterminismManager(t *testing.T, sessionOrder, seriesOrder []uint64) *Manager {
 	t.Helper()
 
-	// maxResponses must exceed determinismSeries or RecordResult starts
-	// evicting and the two managers would no longer hold the same state.
+	// maxResponses exceeds determinismSeries so nothing is evicted.
 	m := NewManager(determinismSessions*2, determinismSeries*2, 0)
 	for _, c := range sessionOrder {
 		clientID := c + 1
@@ -93,7 +67,7 @@ func ascending(n int) []uint64 {
 	return out
 }
 
-// descending returns (n, 0] — a different INSERTION order for the same set.
+// descending returns (n, 0], a different insertion order for the same set.
 func descending(n int) []uint64 {
 	out := make([]uint64, n)
 	for i := range out {
@@ -102,16 +76,7 @@ func descending(n int) []uint64 {
 	return out
 }
 
-// TestMarshalTo_IsByteIdenticalAcrossReplicas is the gate for both sorts. It
-// builds the same logical session table twice, inserting the sessions and each
-// session's cached responses in OPPOSITE orders, then marshals each manager
-// repeatedly. Every one of the resulting encodings must be byte-identical: the
-// first marshal is the reference, and any divergence — between the two managers
-// or between two marshals of the same manager — is a replica-visible encoding
-// that depends on map iteration order.
-//
-// Deleting slices.Sort(clientIDs) in MarshalTo or slices.Sort(seriesIDs) in
-// marshalSession fails this test.
+// TestMarshalTo_IsByteIdenticalAcrossReplicas verifies two managers built in opposite orders marshal identically.
 func TestMarshalTo_IsByteIdenticalAcrossReplicas(t *testing.T) {
 	replicaA := buildDeterminismManager(t,
 		ascending(determinismSessions), ascending(determinismSeries))
@@ -141,11 +106,7 @@ func TestMarshalTo_IsByteIdenticalAcrossReplicas(t *testing.T) {
 	}
 }
 
-// TestMarshalTo_SessionOrderIsSortedByClientID pins the ORDER itself, not just
-// its stability. Byte equality alone would be satisfied by any encoding that is
-// merely self-consistent, so this reads the client IDs back off the wire and
-// requires them ascending — the property a reader (or a human diffing two
-// snapshots) can rely on.
+// TestMarshalTo_SessionOrderIsSortedByClientID verifies sessions are encoded in client ID order.
 func TestMarshalTo_SessionOrderIsSortedByClientID(t *testing.T) {
 	m := buildDeterminismManager(t,
 		descending(determinismSessions), descending(determinismSeries))

@@ -62,13 +62,7 @@ func (r *asyncWitnessPolicyRun) requestPolicy(ctx context.Context, t *testing.T,
 	return err
 }
 
-// TestWitnessPolicy_AsyncRequestCompletesAndRefusesAViolatedPolicyOrAStaleIndex
-// checks docs/membership-changes/api.md (Capability: change the witness
-// policy) for the async form: RequestUpdateWitnessPolicy hands back a
-// RequestState whose result completes with the effect of the sync form, a
-// policy the current membership violates is refused with ErrTooManyWitnesses
-// and leaves the old policy in place, and a stale configChangeIndex is
-// refused with *StaleConfigChangeError.
+// TestWitnessPolicy_AsyncRequestCompletesAndRefusesAViolatedPolicyOrAStaleIndex checks RequestUpdateWitnessPolicy (docs/membership-changes/api.md).
 func TestWitnessPolicy_AsyncRequestCompletesAndRefusesAViolatedPolicyOrAStaleIndex(t *testing.T) {
 	c := newWitnessPolicyCluster(t, 2)
 

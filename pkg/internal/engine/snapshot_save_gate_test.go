@@ -50,14 +50,7 @@ func (s *gateProbeSM) Apply(entries []proto.Entry, results []sm.Result) error {
 	return nil
 }
 
-// TestSavingGateQuiescesApplies is a regression test. It drives real
-// applies through the apply worker while a second goroutine repeatedly runs the
-// exact gate sequence snapshotPool.saveSnapshot uses around the consistent
-// capture — SetSaving(true) -> WaitForApplyDrain -> capture window ->
-// SetSaving(false). The apply worker waits out the saving gate, and the drain
-// guarantees no apply is mid-flight when the capture begins, so no Apply may
-// execute during the capture window. A non-zero violation count means the gate
-// failed to quiesce applies — the regression that crashes the host.
+// TestSavingGateQuiescesApplies checks no Apply runs during the saveSnapshot capture window.
 func TestSavingGateQuiescesApplies(t *testing.T) {
 	applyC := make(chan *applyItem, 256)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -228,12 +221,7 @@ func (s *countingSM) Apply(entries []proto.Entry, results []sm.Result) error {
 	return nil
 }
 
-// TestSavingGateDoesNotDropEntries verifies that a batch delivered to the
-// apply worker while a snapshot-save capture holds the gate is applied
-// after the gate clears, never discarded. Raft's processed marker has
-// already advanced past a delivered batch (Peer.Commit), so a discarded
-// batch would never be re-delivered and the state machine would silently
-// diverge from its peers.
+// TestSavingGateDoesNotDropEntries checks a batch delivered while the save gate is held is applied after it clears.
 func TestSavingGateDoesNotDropEntries(t *testing.T) {
 	applyC := make(chan *applyItem, 256)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}

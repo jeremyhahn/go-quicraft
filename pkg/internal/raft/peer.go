@@ -29,30 +29,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Peer is the protocol boundary between the engine and the Raft state
-// machine. It wraps the unexported raft struct and provides the API that
-// the engine's step/commit/apply pipeline operates on.
-//
-// Peer is NOT safe for concurrent access. It is owned by exactly one
-// goroutine at a time, enforced by the engine's worker pipeline. The
-// exceptions are the atomically accessed leaderID field (read by
-// LeaderID, IsLeader) and the membershipSnap atomic pointer (read by
-// IsMember, GetMembership) which can be read concurrently from any
-// goroutine.
-//
-// The wrapped raft struct is a pure state machine: messages in, messages
-// out. Peer delegates all protocol operations (elections, heartbeats,
-// log replication, read index, leader transfer, quiesce) to raft.
-//
-// Lifecycle:
-//
-//	Step Worker -> Tick/Handle/Propose/GetUpdate -> sends Update via channel
-//	Commit Worker -> Commit -> ownership returns to Step Worker
+// Peer is the engine's boundary to the raft state machine, owned by one worker at a time; only leaderID and membershipSnap are safe for concurrent reads.
 type Peer struct {
-	// boundConfigChanges holds the proposal keys of config change entries the
-	// Host bound to their ConfigChangeID even when it is 0 (see
-	// BindConfigChange). Written by the Host goroutine, consumed by the step
-	// worker in handleLeaderPropose; hence a sync.Map.
+	// boundConfigChanges holds proposal keys of config changes bound to their ConfigChangeID; written by the Host, read by the step worker.
 	boundConfigChanges sync.Map
 	// r is the core Raft state machine. All protocol operations are
 	// delegated to it. It is not safe for concurrent access; the engine
@@ -66,26 +45,13 @@ type Peer struct {
 	// logReader is the persistent log reader, retained for reference.
 	logReader LogReader
 
-	// membership tracks the cluster membership. It is updated when
-	// config change entries are proposed or when snapshots are applied.
-	// This is the mutable working copy, owned exclusively by the step
-	// worker goroutine.
+	// membership is the step worker's mutable membership.
 	membership *membership
 
-	// membershipSnap is an atomic pointer to an immutable snapshot of
-	// the membership. It is published after every mutation to membership
-	// and read lock-free by the transport recv goroutine (IsMember) and
-	// host query methods (GetMembership). This eliminates the data race
-	// between the step worker writing membership maps and the transport
-	// recv goroutine reading them for per-shard authorization.
+	// membershipSnap is the published immutable membership, read lock-free by the transport and host.
 	membershipSnap atomic.Pointer[membershipSnapshot]
 
-	// pendingSnap is the published PENDING configuration: every member a
-	// config-carrying entry in this replica's log admits with an identity,
-	// above the applied configuration. Read by the transport receive
-	// goroutine (PendingMemberIdentity) for a sender the committed
-	// configuration does not name yet; written only by the step worker
-	// (PublishPendingConfig). nil when nothing is pending.
+	// pendingSnap is the published pending configuration above the applied one, or nil; written by the step worker.
 	pendingSnap atomic.Pointer[pendingConfig]
 
 	// prevState records the hard state from the last GetUpdate call.
@@ -93,49 +59,17 @@ type Peer struct {
 	// persist new hard state.
 	prevState proto.State
 
-	// durableState is the hard state last confirmed on stable storage: the
-	// recovered state at construction, then the State of every update
-	// Commit is handed after SaveState and every piggyback hard state the
-	// engine reports persisted. Unlike prevState it never runs ahead of
-	// the disk, which is what DrainFreeOrderMessages needs: a HeartbeatResp
-	// may leave during an in-flight fsync only while the term, vote and
-	// promised vote window it answers under are already durable (#390).
+	// durableState is the hard state last confirmed on stable storage; it never runs ahead of the disk.
 	durableState proto.State
 
-	// stepMarkIndex and stepMarkTerm are the log's last index and term when
-	// the outbound buffer was last drained (or the update extracted). A log
-	// that moved since then was appended to by the current step, and that
-	// step's HeartbeatResp stays ordered behind the fsync.
+	// stepMarkIndex and stepMarkTerm are the log's last index and term at the last drain.
 	stepMarkIndex uint64
 	stepMarkTerm  uint64
 
-	// stateUnpersisted forces the next GetUpdate to report a state change even
-	// when the hard state equals prevState.
-	//
-	// GetUpdate advances prevState at EXTRACTION time, which is optimistic: it
-	// assumes the engine will go on to persist the update it just handed out.
-	// If that update is lost instead — a panic between extraction and
-	// SaveState — prevState claims a term/vote/commit that never reached disk,
-	// the next update is classified ReadOnly, and ReadOnly bypasses SaveState
-	// entirely. A vote granted in the lost update is then answered by a
-	// RequestVoteResp with no WAL write behind it, which is
-	// two-leaders-in-one-term after a crash.
-	//
-	// GetPiggybackUpdate already avoids this by not advancing prevState at all
-	// (see NotePiggybackPersisted); this flag is the equivalent for the main
-	// extraction path, where not advancing is not an option because the
-	// ReadOnly classification is computed from the same diff.
-	//
-	// Written by InvalidatePersistedState from the engine's panic-recovery
-	// path, cleared by the GetUpdate that acts on it. Guarded by the same
-	// exclusive step-worker access as the rest of Peer.
+	// stateUnpersisted forces the next GetUpdate to report a state change after an extracted update was lost before SaveState.
 	stateUnpersisted bool
 
-	// leaderID is accessed atomically for concurrent query safety.
-	// Written by syncLeaderID (called after step/tick), read by any
-	// goroutine via LeaderID() and IsLeader(). This is the only field
-	// on Peer that is safe for concurrent reads; all other state is
-	// accessed exclusively by the owning worker goroutine.
+	// leaderID is written by syncLeaderID and read atomically by any goroutine.
 	leaderID atomic.Uint64
 
 	// term mirrors r.term for the same reason leaderID mirrors r.leaderID:
@@ -143,34 +77,13 @@ type Peer struct {
 	// leadership change, and the raft struct is not thread-safe.
 	term atomic.Uint64
 
-	// leaderSeq makes leaderID and term readable as a CONSISTENT PAIR via
-	// LeaderAndTerm. They are two independent words, so a reader that loads them
-	// separately can observe a (leaderID, term) combination that never existed —
-	// syncLeaderID may land between the two loads. Reporting such a pair through
-	// OnLeaderUpdated tells a listener that a replica led in a term it never led.
-	//
-	// This is a seqlock: syncLeaderID (the only writer, always serialised by
-	// raftMu) makes the counter ODD for the duration of the update and EVEN once
-	// the pair is settled, so a reader that sees the same even value before and
-	// after its loads knows no write interleaved. Writers never block; readers
-	// retry, and the write window is two stores.
+	// leaderSeq is a seqlock making leaderID and term readable as a consistent pair; odd while syncLeaderID writes.
 	leaderSeq atomic.Uint64
 
-	// readReady completes the leaderID/term mirror, under the same seqlock:
-	// true when the leader of the current term, as this replica knows it, has
-	// committed an entry of that term. On the leader that is exactly the
-	// condition handleLeaderReadIndex tests before it stops answering
-	// ErrReadIndexNotReady (Raft PhD 6.4); on a follower it means the leader
-	// it would forward a ReadIndex to has reached it. See computeReadReady.
+	// readReady reports, under the same seqlock, whether the current term's leader has committed an entry of that term.
 	readReady atomic.Bool
 
-	// readyTerm is the term computeReadReady last found ready, and
-	// readyProbeTerm/readyProbeCommit the (term, committed) it last found NOT
-	// ready. Readiness is monotonic within a term — the commit index never
-	// moves back and every entry above a current-term entry is current-term
-	// too — so these let syncLeaderID, which runs on every step, skip the log
-	// term lookup until the term or the commit index moves. Writer-only state
-	// with the same discipline as syncLeaderID.
+	// readyTerm and readyProbeTerm/readyProbeCommit cache computeReadReady's results until the term or commit index moves.
 	readyTerm        uint64
 	readyProbeTerm   uint64
 	readyProbeCommit uint64
@@ -185,58 +98,10 @@ type Peer struct {
 	// GetUpdate returns it.
 	hasPendingSnapshot bool
 
-	// joining is true for nodes started with join=true. It means exactly one
-	// thing: this replica's configuration is KNOWN-INCOMPLETE — it may hold only
-	// itself, or nothing at all, because it has not yet replayed the entries
-	// naming the rest of the shard.
-	//
-	// It is NOT an authorization bypass. Per-shard authorization is a
-	// removed-tombstone deny-list (Peer.IsRemoved) which needs no bypass,
-	// because it never wrongly refuses a peer it simply has not heard of. The
-	// flag gates the two decisions that a configuration this replica knows to be
-	// incomplete cannot safely support: campaigning (startElection,
-	// handleTimeoutNow — a replica holding only itself would self-elect on a
-	// quorum of one) and the candidate test in handleVoteRequest (it would deny
-	// every real member and strand the shard).
-	//
-	// Under config-in-log it is cleared deterministically by clearJoiningIfKnown
-	// the moment the node applies the bootstrap membership entry (replicated like
-	// any other entry) or any config change that names a member other than
-	// itself; a snapshot adopt also clears it, for the compacted case.
+	// joining marks a configuration known to be incomplete; it blocks campaigning and the vote candidate test until a member other than self is applied.
 	joining atomic.Bool
 
-	// staleConfigThrough is the commit index this replica RECOVERED with, held
-	// until every committed config change at or below it has been folded into
-	// membership. Zero means the configuration is current.
-	//
-	// It exists because membership is config-in-log and is reconstructed
-	// ASYNCHRONOUSLY. A restart recovers only a BASE configuration — the
-	// snapshot record's membership, or the EntryInitialMembership at index 1
-	// (Host.reconstructShardMembership reads exactly that one entry) — and
-	// learns every change above it by re-applying committed entries through the
-	// ordinary pipeline (Peer.Commit -> processConfigChanges). The replica is
-	// live and TICKING throughout that replay, so its election timer can fire
-	// while its voting set is still the superseded one: it then computes quorum
-	// over the wrong denominator, solicits votes from replicas the
-	// configuration removed, and fails to solicit from ones it added. A replica
-	// restarted against a 3-voter base while the committed log says 5 wins on 2
-	// votes, in a term the real 5-voter configuration can elect in as well.
-	//
-	// The watermark makes that window OBSERVABLE to the campaign gates. It is
-	// resolved by whichever of these happens first, and every one of them is
-	// driven by state this replica already holds:
-	//
-	//   - the commit pipeline reaching it (processConfigChanges), which is the
-	//     free and overwhelmingly common case;
-	//   - replayConfigChangesTo covering it (SetProcessedIndex, for an on-disk
-	//     state machine whose durable marker outruns the snapshot);
-	//   - resolveStaleStartupConfig folding the remainder on demand, which is
-	//     what the campaign gates call.
-	//
-	// Deliberately NOT a "wait until the state machine catches up" gate. Tying
-	// campaigning to apply progress makes election liveness a function of state
-	// machine throughput, and it cannot self-clear on a replica whose apply
-	// pipeline is not running at all.
+	// staleConfigThrough is the recovered commit index until every config change at or below it is folded into membership; 0 means current.
 	staleConfigThrough uint64
 
 	// appliedClamp records the clamp SetProcessedIndex applied to a state
@@ -249,37 +114,13 @@ type Peer struct {
 	// trustworthy test for one.
 	unfoldedConfig UnfoldedConfig
 
-	// logger receives the diagnostics the step worker reports about the
-	// recovered configuration tail (resolveStaleStartupConfig and
-	// PublishPendingConfig's first classification). nil means the process
-	// slog default; the Host sets its own through SetLogger.
+	// logger receives configuration-tail diagnostics; nil means the slog default.
 	logger *slog.Logger
 
-	// wire is the set of wire versions this build reads, set through
-	// SetWireWindow. It is LOCAL configuration carried into every membership
-	// newMembership builds, so a committed UpdateWireVersion or an installed
-	// snapshot outside it is refused. Zero means proto.DefaultWireWindow.
+	// wire is the local set of readable wire versions; 0 means proto.DefaultWireWindow.
 	wire proto.WireWindow
 
-	// configFoldedThrough is the highest index up to which every committed entry
-	// HAS BEEN OFFERED to applyMembershipEntry. It is the lower bound
-	// resolveStaleStartupConfig resumes its scan from.
-	//
-	// It exists because "what the state machine APPLIED" and "what has been
-	// FOLDED into the membership" are different facts, and conflating them is a
-	// silent way to campaign against a superseded voting set. Resuming the fold
-	// at r.log.processed+1, on the reasoning that everything at or below
-	// processed had already been offered, does not hold: SetProcessedIndex
-	// advances processed UNCONDITIONALLY and then asks replayConfigChangesTo to
-	// fold the same window, DISCARDING the report of whether the fold reached the
-	// end. One unreadable chunk and the window would be skipped forever —
-	// processed already covers it, so resolveStaleStartupConfig's low > index
-	// early-out would declare the configuration resolved and clear the watermark
-	// over entries nobody read. Keeping the two markers apart makes the fold's own progress
-	// the only thing the fold trusts.
-	//
-	// Seeded from the recovered base's ConfigChangeID, which is by definition the
-	// last config change that base already accounts for.
+	// configFoldedThrough is the highest index offered to applyMembershipEntry, where resolveStaleStartupConfig resumes; seeded from the base ConfigChangeID.
 	configFoldedThrough uint64
 }
 
@@ -316,34 +157,14 @@ func NewPeer(cfg config.Config, logReader LogReader, globalRL *server.RateLimite
 	p.durableState = p.prevState
 	p.markStep()
 
-	// Arm the config-in-log staleness watermark and install the resolver the
-	// campaign gates consult. Both happen HERE, together, so the two halves can
-	// never be half-configured: a bare raft (the adversarial harness, the
-	// state-machine unit tests) has no Peer, therefore no resolver, therefore
-	// no gate at all — it also has no membership to fold, so there is nothing
-	// for the gate to protect there.
-	//
-	// The window exists only when the recovered log commits PAST the
-	// configuration the recovered membership describes. ms.ConfigChangeID is
-	// the index of the last config change that base already accounts for, so
-	// anything at or below it is folded by construction, and a commit index of
-	// zero (a genuine first start) has no tail at all.
+	// Arm the staleness watermark and its resolver together, only when the recovered commit index is past the base configuration.
 	if r.log.committed > ms.ConfigChangeID {
 		p.staleConfigThrough = r.log.committed
 	}
 	p.configFoldedThrough = ms.ConfigChangeID
 	r.resolveStaleConfig = p.resolveStaleStartupConfig
 
-	// Install the full membership validator as the leader's propose-time gate.
-	// ProposeConfigChange and the Host API already run these rules, but a
-	// wire-forwarded Propose reaches handleLeaderPropose having run NONE of
-	// them, and the apply path never re-validates. Binding the same
-	// membership.validate to both entry points is what keeps the wire path from
-	// being the laxer one; see raft.validateConfigChange.
-	//
-	// It closes over p, so it always reads the CURRENT mutable membership rather
-	// than a copy taken here. Both this and handleLeaderPropose run on the step
-	// worker, which is the goroutine that owns that membership.
+	// Use membership.validate as the leader's propose-time gate, so wire-forwarded proposals are validated too.
 	r.validateConfigChange = p.validateProposedConfigChange
 	r.takeBoundConfigChange = p.takeBoundConfigChange
 
@@ -352,38 +173,7 @@ func NewPeer(cfg config.Config, logReader LogReader, globalRL *server.RateLimite
 	return p, nil
 }
 
-// resolveStaleStartupConfig folds the committed configuration tail recovered at
-// construction into the membership, and reports whether the configuration is
-// now current through the recovered commit index.
-//
-// It is the on-demand half of the staleConfigThrough watermark and is called
-// from the raft campaign gates (startElection, handleTimeoutNow) — nowhere
-// else. That placement is the whole point of the design:
-//
-//   - On the happy path it never runs. A replica that restarts into a shard
-//     with a live leader is heartbeated long before its election timer fires,
-//     and the commit pipeline clears the watermark for free in the meantime.
-//   - It runs only when this replica is about to campaign, which means the
-//     shard is already leaderless. Paying one bounded read of the local log
-//     there is strictly better than campaigning against a voting set the
-//     configuration has moved past.
-//
-// The scan starts just above configFoldedThrough — what the FOLD itself has
-// covered — not above the processed marker. Those are different facts: processed
-// is advanced by SetProcessedIndex whether or not the accompanying fold reached
-// the end, and by raftLog.restore, so resuming from it silently declares an
-// unread window empty. configFoldedThrough is written only by a fold that
-// actually offered the entries to applyMembershipEntry (the commit path, this
-// replay, and the snapshot adopt in Handle), so the residual shrinks exactly as
-// far as the work that was really done, and by the first election timeout it is
-// usually empty.
-//
-// Returning false suppresses the campaign for THIS timeout only. The caller
-// retries on the next one, exactly like the unreadable-last-log-term gate beside
-// it. Two things cause it: a local log that cannot be read (transient), and a
-// committed config entry that does not decode (permanent — the shard needs an
-// operator, and refusing to campaign on an unknowable voting set is the
-// fail-closed answer).
+// resolveStaleStartupConfig folds the recovered configuration tail from configFoldedThrough on demand before a campaign; false skips this campaign.
 func (p *Peer) resolveStaleStartupConfig() bool {
 	if p.staleConfigThrough == 0 {
 		return true
@@ -421,38 +211,18 @@ func (p *Peer) resolveStaleStartupConfig() bool {
 type pendingConfig struct {
 	version        uint64
 	configChangeID uint64
-	// committed is the commit index the view was resolved against: a
-	// removal counts only once committed, and the commit index moves
-	// without a log mutation, so it is part of the short-circuit key — but
-	// only while something is pending; with nothing recorded the view is
-	// empty at every commit index, and re-publishing it per cycle would
-	// allocate for nothing.
+	// committed is the commit index the view was resolved against, part of the key only while something is pending.
 	committed uint64
 	adds      map[uint64]string
-	// removed is every replica a pending RemoveNode removes, with the
-	// identity the shard bound for it: the one a pending add below the
-	// removal carried, else the committed one at publish time. Both are
-	// indexed so the gate can refuse by claimed ID and by authenticated
-	// identity, as the committed tombstones are.
+	// removed is every replica a pending RemoveNode removes, indexed by ID and identity.
 	removed           map[uint64]string
 	removedIdentities map[string]uint64
 }
 
-// PublishPendingConfig publishes the pending configuration — the members
-// config-carrying entries in this replica's own log admit, with their
-// identities, above the applied configuration — for PendingMemberIdentity.
-//
-// It MUST run on the step worker goroutine, the raft log's owner; the engine
-// calls it wherever it publishes the log markers. It is cheap on the hot
-// path: the log counts mutations to its pending set, so unless that count or
-// the applied configuration moved since the last publish nothing is rebuilt.
+// PublishPendingConfig publishes the pending configuration for PendingMemberIdentity; it must run on the step worker.
 func (p *Peer) PublishPendingConfig() {
 	l := p.r.log
-	// The fold marker, not configChangeID: an entry the apply path REFUSED
-	// (a removed replica re-added, a bootstrap entry off index 1) does not
-	// advance configChangeID, and its add must stop being pending the moment
-	// it has been offered to apply, or a refused entry would admit its
-	// identity for as long as no later change applied.
+	// Use the fold marker: a refused entry does not advance configChangeID but must stop being pending.
 	applied := max(p.membership.configChangeID, p.configFoldedThrough)
 	// The first publish classifies the recovered log above the applied
 	// configuration; every later one finds pendingSeeded set.
@@ -462,10 +232,7 @@ func (p *Peer) PublishPendingConfig() {
 		(cur.committed == l.committed || len(l.pendingAdds) == 0) {
 		return
 	}
-	// Entries at or below the applied configuration have been folded into
-	// it (or refused) and can never be pending again; forget them here, on
-	// the owner's goroutine, so the map is bounded by the pending window
-	// rather than by the shard's whole history of config changes.
+	// Forget entries at or below the applied configuration so the map stays bounded.
 	l.prunePendingThrough(applied)
 	view := l.pendingIdentities(applied)
 	if view == nil {
@@ -494,18 +261,7 @@ func (p *Peer) PublishPendingConfig() {
 	p.pendingSnap.Store(snap)
 }
 
-// PendingRemoval reports whether a COMMITTED RemoveNode entry in this
-// replica's log ABOVE the applied configuration removes replicaID, or removes
-// the replica that holds identity. It is the receive gate's FIRST question,
-// asked before the committed binding, the pending adds and the anchor: the
-// removal will tombstone the replica the moment it is folded, and a replica
-// restarting with that removal still unfolded — seeded from its
-// committed-but-unfolded tail — must not admit the removed member in the
-// meantime, by either name it could use. An uncommitted removal does not
-// count; see raftLog.pendingIdentities for why revoking on one can wedge the
-// shard.
-//
-// Safe for concurrent use; it reads the snapshot PublishPendingConfig stored.
+// PendingRemoval reports whether a committed but unfolded RemoveNode removes replicaID or the holder of identity; safe for concurrent use.
 func (p *Peer) PendingRemoval(replicaID uint64, identity string) bool {
 	snap := p.pendingSnap.Load()
 	if snap == nil {
@@ -522,15 +278,7 @@ func (p *Peer) PendingRemoval(replicaID uint64, identity string) bool {
 	return false
 }
 
-// PendingMemberIdentity returns the node identity a config-carrying entry in
-// this replica's log commits for replicaID ABOVE the applied configuration,
-// and whether there is one. It is the receive gate's second question about a
-// sender the committed configuration does not name: a lagging replica holds
-// the AddNode that admits the new leader before it has committed it, and that
-// entry — which reached this log through a bound sender — names the identity
-// the leader's connection must present.
-//
-// Safe for concurrent use; it reads the snapshot PublishPendingConfig stored.
+// PendingMemberIdentity returns the identity a pending config entry in this log commits for replicaID; safe for concurrent use.
 func (p *Peer) PendingMemberIdentity(replicaID uint64) (string, bool) {
 	snap := p.pendingSnap.Load()
 	if snap == nil || snap.adds == nil {
@@ -540,86 +288,21 @@ func (p *Peer) PendingMemberIdentity(replicaID uint64) (string, bool) {
 	return identity, ok && identity != ""
 }
 
-// publishMembership creates an immutable snapshot of the current mutable
-// membership and stores it via atomic pointer. This makes the membership
-// visible to concurrent readers (transport recv goroutine for IsMember,
-// host for GetMembership) without any locks. Called after every mutation
-// to the mutable membership (config changes, snapshot restore).
+// publishMembership stores an immutable snapshot of the membership for lock-free readers.
 func (p *Peer) publishMembership() {
 	snap := p.membership.snapshot()
 	p.membershipSnap.Store(snap)
 }
 
-// SetProcessedIndex overrides the processed marker on the raft log.
-// This is used by the host layer after Open() for on-disk state machines
-// that report a last-applied index higher than the snapshot index. Without
-// this, the engine would re-apply entries that the on-disk SM has already
-// persisted, which is wasteful for large logs.
-//
-// Skipping those entries would also skip their MEMBERSHIP effect, because
-// commit-time semantics apply config changes only from CommittedEntries
-// (Peer.Commit -> processConfigChanges). Any committed config change in the
-// skipped window therefore has to be folded in here, or this replica would
-// come up computing quorum over a stale voting set. The scan is idempotent:
-// membership.apply skips anything at or below the current configChangeID.
-//
-// Must be called before the first Tick.
-//
-// It returns TWO things, and the second one is the point of this signature:
-//
-//   - The index actually applied after clamping, so the caller can seed ITS OWN
-//     markers from the same value. The engine's lastApplied and raft's processed
-//     must not diverge: a later Update carrying an unclamped LastApplied would
-//     trip commitUpdate's assertion and kill the commit worker.
-//   - The FATAL error of a committed config entry that does not decode.
-//
-// The error is returned rather than swallowed. This path cannot fault the shard
-// itself — it runs before the engine node exists — so the strongest thing it
-// can do alone is arm the staleness watermark and refuse to campaign, which it
-// does. But refusing to campaign is a LIVENESS answer to a SAFETY fact: the
-// replica would come up on a configuration it knows is unreconstructable and
-// then serve reads and ack the leader from it, with one ERROR line as the only
-// signal. The commit path faults the shard for the identical bytes
-// (processConfigChanges -> failCommit) and recovery aborts StartShard for them
-// (ReconstructMembership); reporting it lets the startup path reach the same
-// verdict instead of being the one place that fails open.
-//
-// The INCOMPLETE-but-not-corrupt case is deliberately not an error: an unread
-// window is a window this replica may yet read (the commit pipeline, or
-// resolveStaleStartupConfig on demand), so it arms the watermark and nothing
-// more. Only "these committed bytes will never decode" is terminal.
+// SetProcessedIndex sets the processed marker for an on-disk SM before the first Tick, folds skipped config changes, and returns the clamped index and any fatal decode error.
 func (p *Peer) SetProcessedIndex(index uint64) (uint64, error) {
-	// The state machine marker is durable, but it is not authority over
-	// what COMMITTED. An on-disk SM whose lastApplied outruns the recovered
-	// HardState.Commit (a lost state fsync — the engine acknowledges that
-	// hazard) would otherwise fold the uncommitted tail's config changes
-	// into the membership permanently, leaving this replica computing
-	// quorum over a voting set no other replica shares, and would push
-	// l.processed above l.committed so the first Commit trips
-	// commitUpdate's LastApplied assertions on every restart.
-	//
-	// The clamp is a recovery diagnostic for the operator. It is recorded, not
-	// logged: the Host reads it through Peer.AppliedClamp and logs it on its
-	// own logger, the one the operator configured.
+	// Clamp to the committed index; the Host reads the clamp through Peer.AppliedClamp.
 	if index > p.r.log.committed {
 		p.appliedClamp = AppliedClamp{SMApplied: index, Committed: p.r.log.committed}
 		index = p.r.log.committed
 	}
 	p.r.log.processed = index
-	// The fold's REPORT is the point of calling it. Advancing processed says the
-	// state machine already applied this window; it says nothing about whether
-	// the window's config changes reached the membership. Discarding the report
-	// and advancing anyway is what let an unread window be declared resolved: the
-	// membership stayed at the superseded voting set, configFoldedThrough never
-	// covered the window, and — under the old processed-based lower bound —
-	// resolveStaleStartupConfig's early-out then cleared the watermark and let
-	// the replica campaign against it.
-	//
-	// So an incomplete or undecodable fold ARMS the watermark. The campaign gates
-	// then refuse until the commit pipeline folds the window for real, which is
-	// the right answer for a window that is merely unread. For an UNDECODABLE
-	// entry the watermark is no longer the whole answer: the error is returned so
-	// Host.StartShard can fault the shard, matching the commit path and recovery.
+	// An incomplete or undecodable fold arms the watermark; an undecodable entry is also returned.
 	complete, err := p.replayConfigChangesTo(index)
 	switch {
 	case err == nil && complete:
@@ -650,40 +333,12 @@ func (p *Peer) SetProcessedIndex(index uint64) (uint64, error) {
 	return index, err
 }
 
-// replayConfigChangesTo folds committed config changes at or below index into
-// the membership. Entries already covered by the recovered snapshot membership
-// are skipped by the replay guard, so only the (snapshotIndex, index] window
-// has any effect. index must not exceed p.r.log.committed; callers clamp it.
-//
-// It reports what replayConfigChangesFrom reports: whether the fold REACHED
-// index, and the fatal error of an undecodable committed config entry.
+// replayConfigChangesTo folds committed config changes at or below index, reporting whether it reached index and any fatal error.
 func (p *Peer) replayConfigChangesTo(index uint64) (bool, error) {
 	return p.replayConfigChangesFrom(p.r.log.firstIndex(), index)
 }
 
-// replayConfigChangesFrom folds committed config changes in [low, index] into
-// the membership and reports whether it REACHED index — that is, whether the
-// membership can now be trusted to describe the configuration as of index.
-//
-// low is raised to the log's first available index, so a caller may pass any
-// lower bound it can justify; see resolveStaleStartupConfig for why the
-// processed marker is one.
-//
-// A compacted floor counts as reached: every index below it is subsumed by the
-// snapshot whose membership this replica recovered, which is precisely the base
-// the replay builds on. Any OTHER read failure does not, because the entries it
-// could not read may carry config changes and the caller must not treat an
-// unread window as an empty one.
-//
-// The error return is the FATAL case, separate from the incomplete one: a
-// committed config-carrying entry whose payload does not decode. It is not a
-// window this replica has yet to read, it is one it can never read, and the
-// membership it defines is unknowable here while every peer holds it. See
-// applyMembershipEntry.
-//
-// Whatever it reaches is recorded in configFoldedThrough, so a later resumption
-// starts where this one really stopped rather than where the state machine's
-// marker happens to sit.
+// replayConfigChangesFrom folds committed config changes in [low, index] and reports whether it reached index; a compacted floor counts as reached.
 func (p *Peer) replayConfigChangesFrom(low, index uint64) (bool, error) {
 	if first := p.r.log.firstIndex(); low < first {
 		low = first
@@ -691,8 +346,7 @@ func (p *Peer) replayConfigChangesFrom(low, index uint64) (bool, error) {
 	if low > index {
 		return true, nil
 	}
-	// The highest index actually OFFERED to applyMembershipEntry, seeded one
-	// below the scan's start so a scan that reads nothing records nothing.
+	// Highest index offered to applyMembershipEntry, starting one below the scan.
 	folded := low - 1
 	changed := false
 	complete := true
@@ -703,20 +357,10 @@ func (p *Peer) replayConfigChangesFrom(low, index uint64) (bool, error) {
 		if high > index+1 {
 			high = index + 1
 		}
-		// Bound each read in BYTES as well as in entries. A 1024-entry chunk of
-		// arbitrary log entries — config changes are interspersed with ordinary
-		// data entries — is otherwise unbounded (maxSize 0), up to
-		// 1024×MaxApplyEntrySize per read at startup. limitEntrySize always
-		// returns at least one entry and the loop advances by the last index
-		// read, so the byte bound cannot stall progress even on a lone oversized
-		// entry.
+		// Bound each read in bytes as well as entries.
 		entries, err := p.r.log.entries(low, high, p.r.maxReplicationPayload)
 		if err != nil || len(entries) == 0 {
-			// Compacted: the snapshot membership already covers everything
-			// below the compaction floor, so the replay is COMPLETE at this
-			// point rather than merely stopped. Any other outcome leaves a
-			// window this replica has not read, and reporting that as complete
-			// is what would let a campaign run against a superseded voting set.
+			// Compacted: the snapshot membership covers the rest, so the replay is complete.
 			complete = errors.Is(err, logdb.ErrCompacted)
 			if complete {
 				folded = index
@@ -731,10 +375,7 @@ func (p *Peer) replayConfigChangesFrom(low, index uint64) (bool, error) {
 			break
 		}
 		for i := range entries {
-			// applyMembershipEntry folds both the bootstrap EntryInitialMembership
-			// at index 1 (which is the first entry replayed when the scan starts at
-			// firstIndex) and every incremental EntryConfigChange above it. It
-			// converges on the committed role and logs any deterministic refusal.
+			// applyMembershipEntry folds the bootstrap entry and every later config change.
 			applied, err := p.applyMembershipEntry(entries[i])
 			if applied {
 				changed = true
@@ -775,26 +416,12 @@ func (p *Peer) SetOnCampaign(fn func(shardID, replicaID, term uint64)) {
 	p.r.onCampaign = fn
 }
 
-// SetTickInterval tells the peer how much real time one Tick represents,
-// which is what converts the tick-denominated election timeout into the
-// real-time read lease (see raft.hasValidLease). Must be called before
-// the first Tick, with the interval the engine's ticker actually runs at.
-// Until it is called the lease is never valid and every ReadIndex takes
-// the heartbeat quorum round, so omitting it costs latency, not safety.
-//
-// On a LeaseRead shard it also sizes the post-restart vote hold-down (see
-// raft.voteHeldDown): one election timeout of real time from construction.
-// Until it is called that window's length is unknown and the replica
-// neither grants a vote nor campaigns, so on a LeaseRead shard omitting it
-// costs availability, not safety.
+// SetTickInterval sets the real time per Tick, used for the read lease and LeaseRead vote hold-down; call before the first Tick.
 func (p *Peer) SetTickInterval(d time.Duration) {
 	p.r.setTickInterval(d)
 }
 
-// SetLogger sets the logger the Peer reports its configuration-tail
-// diagnostics on; nil restores the process slog default. It must be called
-// before the Peer is handed to a worker: the logger is read on the step
-// worker without synchronization.
+// SetLogger sets the diagnostics logger (nil for the slog default) before the Peer is handed to a worker.
 func (p *Peer) SetLogger(l *slog.Logger) {
 	p.logger = l
 }
@@ -807,26 +434,7 @@ func (p *Peer) log() *slog.Logger {
 	return slog.Default()
 }
 
-// Tick advances the peer's logical clock by one tick. The engine calls
-// this at a regular interval (RTTMillisecond). The raft state machine
-// uses ticks to drive election timeouts (followers/candidates) and
-// heartbeat intervals (leaders).
-//
-// A joining node TICKS LIKE ANY OTHER REPLICA. It is kept passive by the
-// raft-layer joining gate (see the raft.joining field), which suppresses the
-// campaign itself in startElection and handleTimeoutNow — not by freezing the
-// clock here.
-//
-// Freezing the clock was the original suppression and it was an availability
-// bug. r.electionTick stayed at 0 while r.leaderID kept naming whichever leader
-// last contacted the node, so `leaderID != noLeader && electionTick <
-// electionTimeout` was permanently true: handleVoteRequest denied every
-// PreVote and dropHighTermVote discarded every higher-term RequestVote without
-// a response. Because the joining flag is cleared only by an InstallSnapshot,
-// a node that caught up by pure log replay (SnapshotEntries defaults to 0, so
-// the leader never compacts and never sends a snapshot) stayed in that state
-// for the life of the process — and a three-voter shard that lost its leader
-// could not elect a new one despite having a healthy quorum.
+// Tick advances the logical clock by one tick; a joining node ticks normally and is kept from campaigning by the raft joining gate.
 func (p *Peer) Tick() {
 	// Ends a post-restart vote hold-down on time even on a replica that sees
 	// no vote traffic, so the owed window it lowers reaches the hard state
@@ -836,58 +444,19 @@ func (p *Peer) Tick() {
 	p.syncLeaderID()
 }
 
-// DrainMessages extracts and returns all pending outbound messages
-// without performing a full GetUpdate cycle. This is used by the step
-// worker to flush heartbeat and vote messages produced by Tick() while
-// commitPending is true. Without this, heartbeat messages would be
-// delayed until the commit+apply pipeline completes, causing follower
-// election timeouts and leader checkQuorum failures.
-//
-// The caller must hold raftMu (or otherwise ensure exclusive access).
+// DrainMessages returns pending outbound messages without a GetUpdate cycle; the caller must hold raftMu.
 func (p *Peer) DrainMessages() []proto.Message {
 	return p.r.drainMessages()
 }
 
-// DrainFreeOrderMessages extracts only free-order messages (Replicate,
-// Ping, Heartbeat, Quiesce) from the outbound buffer, leaving ordered
-// messages (VoteResp, HeartbeatResp, ReplicateResp, etc.) in place for
-// the next GetUpdate cycle. This is critical during commitPending: the
-// step worker must send heartbeats for leader liveness, but ordered
-// messages (e.g., VoteResp from processCommitPendingInbox) must not be
-// drained until WAL persistence completes. Using DrainMessages() here
-// would silently drop ordered messages, preventing elections from
-// completing during commit+apply cycles.
-//
-// A HeartbeatResp is drained too when heartbeatRespFreeOrder holds: the
-// step that produced it changed nothing the reply depends on, so it need
-// not wait out an fsync it has no part in (#390). See proto.IsFreeOrder.
-//
-// The caller must hold raftMu (or otherwise ensure exclusive access).
+// DrainFreeOrderMessages returns only free-order messages (and HeartbeatResp when safe), leaving ordered ones for GetUpdate; the caller must hold raftMu.
 func (p *Peer) DrainFreeOrderMessages() []proto.Message {
 	msgs := p.r.drainFreeOrderMessages(p.heartbeatRespFreeOrder())
 	p.markStep()
 	return msgs
 }
 
-// heartbeatRespFreeOrder reports whether a HeartbeatResp produced since the
-// last drain may leave before the in-flight WAL write completes (#390). It
-// holds when the step left the hard state as it is on disk and appended
-// nothing:
-//
-//   - term, vote and the promised vote window equal durableState. A
-//     Heartbeat that raised the term, a vote granted, or a promise widened
-//     in the same step is not yet durable, and the reply stays ordered;
-//   - the log has not moved since the last drain, and no snapshot waits to
-//     be saved: an append or install in the same step keeps it ordered;
-//   - no extracted update was lost before SaveState (stateUnpersisted).
-//
-// The commit index is deliberately not compared. A HeartbeatResp reports no
-// index of this replica — it echoes the leader's read context (Hint) and
-// lease round (LogIndex) and carries the vote window (LogTerm) — and the
-// leader uses it only for activity (CheckQuorum), ReadIndex and lease
-// confirmation, and to resume replication from its own progress record.
-// None of that reads the follower's commit, and a commit lost in a crash is
-// re-learned from the leader.
+// heartbeatRespFreeOrder reports whether a HeartbeatResp may leave before the WAL write: hard state equals durableState, the log is unmoved, nothing is unpersisted.
 func (p *Peer) heartbeatRespFreeOrder() bool {
 	r := p.r
 	if p.stateUnpersisted || p.hasPendingSnapshot ||
@@ -918,17 +487,9 @@ func (p *Peer) releaseRefusedBindings(msg proto.Message, err error) {
 	}
 }
 
-// Handle routes an incoming Raft protocol message to the raft state
-// machine. The raft struct handles all message types: term-based
-// transitions, vote requests/responses, append entries, heartbeats,
-// snapshots, read index, leader transfer, quiesce, and more.
+// Handle routes an incoming Raft message to the state machine.
 func (p *Peer) Handle(msg proto.Message) error {
-	// A joining node must not campaign. Tick() suppresses its election
-	// timer for this reason; TimeoutNow is the other campaign entry point
-	// and goes straight to the raft layer. A joining node that caught up by
-	// pure log replay (the leader never compacted, so no snapshot ever
-	// arrived) holds only itself in its membership, so it would win with a
-	// quorum of one and acknowledge writes the real cluster later discards.
+	// A joining node must not campaign on TimeoutNow.
 	if msg.Type == proto.TimeoutNow && p.joining.Load() {
 		slog.Warn("ignoring TimeoutNow on a joining node with incomplete membership",
 			"shard", p.shardID,
@@ -938,14 +499,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 		return ErrJoiningNodeCannotCampaign
 	}
 
-	// The snapshot the log held BEFORE this message was stepped. restore()
-	// installs a fresh pending snapshot, so identity is what distinguishes
-	// "THIS snapshot replaced the log" from "an earlier snapshot is still
-	// waiting to be persisted". A merely non-nil pendingSnapshot() would let
-	// a REJECTED (index at or below committed) retransmission of an older
-	// snapshot inherit the newer one's restore below and roll membership
-	// backwards. The pending snapshot is cleared only by the engine's
-	// persistence ack, so it routinely outlives the message that installed it.
+	// The pending snapshot before this step, compared by identity so an older rejected snapshot cannot inherit a newer restore.
 	if err := p.checkSnapshotWireVersion(msg); err != nil {
 		return err
 	}
@@ -963,29 +517,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 
 	p.releaseRefusedBindings(msg, err)
 
-	// raft.step DROPS a message whose term is behind ours and returns nil
-	// (see the msg.Term < r.term branch in step). A nil error therefore does
-	// NOT mean raft acted on the message, and membership must never be
-	// adopted from a message raft did not act on: the snapshot's Membership
-	// is the very set quorum() is computed over, and a stale-term
-	// InstallSnapshot carries no term check, no log proof and no committed
-	// entry behind it — only its own ConfigChangeID, which the sender
-	// chooses. Any authenticated shard member could hand this node a
-	// configuration of its choosing.
-	//
-	// An InstallSnapshot that did not arrive through the local injection API
-	// is refused outright. raft.step already rejects it (ErrWireLocalMessage,
-	// so err != nil and the adopt below is skipped), but the check is
-	// repeated at the adopt site because THIS is the code that replaces the
-	// membership: the property "only a snapshot this host received, verified
-	// and persisted may redefine the voting set" has to be checkable here,
-	// not inferred from a non-nil error produced three call frames away.
-	//
-	// The origin is stamped by the delivery API (Node.Deliver /
-	// Node.DeliverLocal) and is not part of the wire format, so it is not a
-	// value the sender can choose — unlike the term, which the previous
-	// version of this check relied on and which a forged Term 0 walked
-	// straight past.
+	// Membership is adopted only from a snapshot raft acted on and that arrived through the local injection API; the origin stamp is not on the wire.
 	wireOrigin := msg.Type == proto.InstallSnapshot && !msg.Origin.IsLocal()
 	if wireOrigin {
 		slog.Warn("ignoring membership from a wire-delivered InstallSnapshot",
@@ -998,23 +530,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 		)
 	}
 
-	// A locally injected snapshot whose MESSAGE term is behind ours is stale: the
-	// snapshot receive path can complete after this replica has moved on to a
-	// later term, and its membership is then older than what the log already
-	// applied.
-	//
-	// This is defence in depth, not the operative protection. Neither production
-	// injector (messagehandler's re-delivery of a persisted snapshot, and the
-	// post-receive install) sets Message.Term — they populate Snapshot.Term only
-	// — so msg.Term is 0 there and this never fires. It is deliberately NOT
-	// rewritten to compare Snapshot.Term: that is the term of the snapshot's last
-	// included entry, which is routinely far below the current term for a
-	// perfectly valid snapshot, and rejecting on it would refuse legitimate
-	// installs.
-	//
-	// What actually bounds this hazard is snapshotRejected below: a snapshot at
-	// or below the committed index cannot redefine membership. Index, not term,
-	// is the sound staleness test here.
+	// Defence in depth: a local snapshot message behind our term is stale; snapshotRejected below is the operative index check.
 	staleTerm := msg.Type == proto.InstallSnapshot &&
 		msg.Term > 0 && msg.Term < termBefore
 	if staleTerm {
@@ -1028,86 +544,25 @@ func (p *Peer) Handle(msg proto.Message) error {
 		)
 	}
 
-	// Config changes take effect on COMMIT, not on log append: committed
-	// EntryConfigChange entries are applied to membership in Peer.Commit
-	// via processConfigChanges, on leaders and followers alike. Because
-	// only committed entries mutate membership, log truncation on
-	// conflict can never remove an applied config change, so no
-	// membership rollback/rebuild is needed here.
-	// A nil error from step does NOT mean raft installed the snapshot. Two
-	// distinct paths return nil without installing anything, and membership --
-	// the very set quorum() is computed over -- must never come from either:
-	//
-	//   - handleSnapshot REJECTS a snapshot at or below the committed index and
-	//     returns nil. Its configuration is older than what this replica has
-	//     already committed, so adopting it rolls the voting set backwards. The
-	//     joining branch below deliberately bypasses the ConfigChangeID
-	//     staleness test, so it adopted EVERY rejected retransmission --
-	//     including configurations that do not name this replica, leaving it
-	//     self-removed, unelectable, and computing quorum over a stale set.
-	//   - stepLeader has NO InstallSnapshot case at all, so on a leader the
-	//     message is silently ignored and step returns nil. The leader then
-	//     adopted a configuration no committed entry ever established.
-	//
-	// Both are covered by one positive test: did raft actually take the
-	// snapshot? Every accepting path in handleSnapshot -- the log-matching
-	// fast-forward and the full restore alike -- advances the committed index
-	// to the snapshot's index, and it can only get there from ss.Index >
-	// committed. Neither rejection nor the leader's silent drop touches it.
-	// step processes exactly this one message, so the advance is attributable.
+	// Config changes take effect on commit, so truncation never removes one; adopt a snapshot's membership only if raft advanced committed to its index.
 	snapshotProcessed := msg.Type == proto.InstallSnapshot &&
 		p.r.log.committed > committedBefore
 	if msg.Type == proto.InstallSnapshot && err == nil && !staleTerm && !wireOrigin &&
 		snapshotProcessed {
-		// Adopt the snapshot's membership on BOTH branches, gated on it
-		// not being older than what we already have.
-		//
-		// The matching-log branch also advances the processed marker to
-		// the snapshot index, so config changes in (processed, ss.Index]
-		// are never emitted as CommittedEntries and never reach
-		// processConfigChanges — the ONLY place membership is applied
-		// under commit-time semantics. Skipping the adoption there would
-		// silently drop them, leaving this replica computing quorum over
-		// a smaller voting set than the rest of the cluster.
-		//
-		// Adopting is safe because an applied config change always has
-		// index <= processed <= committed < ss.Index (handleSnapshot
-		// early-rejects ss.Index <= committed), so the snapshot's
-		// membership can never be older than the local one. Config
-		// changes RETAINED above ss.Index still apply normally: the
-		// membership.apply replay guard skips anything at or below the
-		// adopted ConfigChangeID and applies the rest.
-		// A restore always adopts (the log was fully replaced). The
-		// matching branch adopts only when the snapshot is STRICTLY newer,
-		// so an equal ConfigChangeID (identical configuration) or a
-		// locally-newer one (config changes already applied above
-		// ss.Index) leaves the local membership untouched.
-		//
-		// A JOINING node always adopts. Its membership is incomplete by
-		// construction (the bootstrap confState is not in the log), and it
-		// has usually already applied its own AddNode — so the local
-		// ConfigChangeID EQUALS the snapshot's and the strictly-newer test
-		// rejects the only message that can repair it, leaving the replica
-		// permanently unable to campaign or to vote for the shard's real members.
+		// Adopt on restore, on a strictly newer ConfigChangeID, or when joining; applied changes are always below ss.Index, and the replay guard handles the rest.
 		ss := msg.Snapshot
 		pending := p.r.log.pendingSnapshot()
 		restored := pending != nil && pending != pendingBefore
 		joining := p.joining.Load()
 		if restored || joining || ss.Membership.ConfigChangeID > p.membership.configChangeID {
 			p.membership = p.newMembership(ss.Membership)
-			// The adopted membership covers every config change up to the
-			// snapshot's index, so the fold marker moves with it. Without this the
-			// on-demand fold would re-scan a window the snapshot already answered —
-			// or, worse for a compacted log, report it unread.
+			// The adopted membership covers the snapshot's index, so the fold marker moves with it.
 			if ss.Index > p.configFoldedThrough {
 				p.configFoldedThrough = ss.Index
 			}
 			// Publish immutable snapshot for concurrent readers.
 			p.publishMembership()
-			// handleSnapshot refuses an over-cap membership before it can be
-			// adopted, so this is a backstop; it is folded into err rather
-			// than returned early so the leader-ID publication below still
-			// runs, exactly as it does for a step error.
+			// Backstop: fold the over-cap error into err so the leader-ID publication still runs.
 			if syncErr := p.syncRaftRemotes(); syncErr != nil && err == nil {
 				err = syncErr
 			}
@@ -1128,17 +583,7 @@ func (p *Peer) Handle(msg proto.Message) error {
 	return err
 }
 
-// Propose proposes new entries to the Raft log. The entries are wrapped
-// in a Propose message and routed through the raft state machine. Only
-// the leader accepts proposals; followers either reject or forward.
-//
-// On success, returns the last log index assigned to the proposed entries.
-// The caller can use this index to track the proposal through the
-// commit/apply pipeline. On failure, returns 0 and the error.
-//
-// Only a leader can assign indices. A follower forwards the proposal and
-// r.log.lastIndex() would then describe replicated entries the caller never
-// proposed, so this returns NotLeaderError instead of a fabricated index.
+// Propose routes entries to the raft state machine and returns the last assigned index; a non-leader returns NotLeaderError.
 func (p *Peer) Propose(entries []proto.Entry) (uint64, error) {
 	if len(entries) == 0 {
 		return 0, nil
@@ -1160,20 +605,7 @@ func (p *Peer) Propose(entries []proto.Entry) (uint64, error) {
 	return p.r.log.lastIndex(), nil
 }
 
-// ProposeConfigChange proposes a membership change to the Raft log. The
-// change is serialized as an EntryConfigChange entry and routed through
-// the raft state machine as a Propose message.
-//
-// Membership takes effect when the entry COMMITS, not when it is
-// appended (the etcd/dragonboat model, diverging from Raft thesis
-// Section 4.1 append-time semantics). The commit-time application is in
-// Peer.Commit via processConfigChanges. Applying at commit is safe
-// because at most one config change is ever uncommitted at a time:
-// handleLeaderPropose rejects a second change while one is pending, and
-// becomeLeader re-arms pendingConfigChange from uncommitted inherited
-// entries. Append-time application would let a just-added (possibly not
-// yet running) member count toward the quorum required to commit its
-// own addition, stalling commit and stepping the leader down.
+// ProposeConfigChange proposes a membership change, which takes effect when the entry commits; at most one is uncommitted at a time.
 func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 	if !p.IsLeader() {
 		return &NotLeaderError{
@@ -1181,15 +613,7 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 		}
 	}
 
-	// Validate the config change before proposing. The replicated witness
-	// policy is part of the membership itself, so this path and the Host
-	// API path enforce identical rules.
-	//
-	// handleLeaderPropose runs the SAME validator (raft.validateConfigChange
-	// is wired to validateProposedConfigChange in NewPeer), so this call is not
-	// the only gate — it is the one that answers the caller before the
-	// change is marshaled, and it reports the membership error rather than
-	// whichever earlier propose-time refusal the step would have hit first.
+	// Validate before proposing so the caller gets the membership error; handleLeaderPropose runs the same validator.
 	err := p.membership.validate(cc)
 	if err != nil {
 		return err
@@ -1221,25 +645,14 @@ func (p *Peer) ProposeConfigChange(cc proto.ConfigChange) error {
 	return nil
 }
 
-// BindConfigChange marks the config change entry with proposal key as bound
-// to its ConfigChangeID even when that ID is 0: the leader's propose-time
-// validation then refuses it unless the membership's current config change ID
-// still equals it (proto.ConfigChange.MustMatchConfigChangeID). The marker is
-// in-memory and never encoded, so it is carried here, beside the entry, by
-// key. Call it before the entry is delivered; the first Propose that carries
-// the key consumes it, whether it validates, refuses or (on a non-leader)
-// refuses to forward the entry. Safe for concurrent use.
+// BindConfigChange binds the entry with key to its ConfigChangeID even when 0; the first Propose carrying key consumes it. Safe for concurrent use.
 func (p *Peer) BindConfigChange(key uint64) {
 	if key != 0 {
 		p.boundConfigChanges.Store(key, struct{}{})
 	}
 }
 
-// UnbindConfigChange forgets a key bound by BindConfigChange whose entry was
-// never delivered (registration or delivery refused). Do not call it for an
-// entry that may still be taken from the proposal queue, such as one whose
-// deadline expired: the raft layer consumes the binding when the entry is
-// taken (validated, refused, or refused instead of being forwarded).
+// UnbindConfigChange forgets a bound key whose entry was never delivered.
 func (p *Peer) UnbindConfigChange(key uint64) {
 	p.boundConfigChanges.Delete(key)
 }
@@ -1250,41 +663,12 @@ func (p *Peer) takeBoundConfigChange(key uint64) bool {
 	return ok
 }
 
-// validateProposedConfigChange validates a config change against the MUTABLE
-// membership, for the leader's propose-time gate in handleLeaderPropose.
-//
-// It reads p.membership, not the published snapshot ValidateConfigChange uses,
-// and that is the point: this runs on the step worker, which owns that
-// membership, so it sees every config change committed up to this instant. The
-// snapshot is published for readers on other goroutines and can lag by a commit.
-// A propose-time gate judging a stale configuration is how a change that the
-// current membership forbids — a second replica ID for an identity a config
-// change just bound, most sharply — reaches the log.
+// validateProposedConfigChange validates against the step worker's mutable membership, which is never stale.
 func (p *Peer) validateProposedConfigChange(cc proto.ConfigChange) error {
 	return p.membership.validate(cc)
 }
 
-// ValidateConfigChange checks a proposed config change against the current
-// published membership without mutating any state. It enforces the same
-// safety rules as ProposeConfigChange's propose-time validation (the
-// 64-voting-member cap, duplicate-add rejection, last-voter protection),
-// returning the validation error if the change would be rejected.
-//
-// This is used by the Host membership API (RequestAddNode, RequestAddWitness,
-// RequestRemoveNode, etc.), whose proposals are delivered through the engine
-// inbox and reach membership.apply directly — a path that deliberately does
-// NOT re-check the cap or the witness policy so that committed changes always
-// replay deterministically.
-// Pre-validating here gives the caller a prompt error instead of a hung
-// RequestState (or, for a 65th voting member, an invariant panic in
-// rebuildReplicaToBit).
-//
-// Safe for concurrent access from any goroutine: it validates against an
-// immutable, atomically published membership snapshot rather than the
-// step-worker-owned mutable membership. Like the Host's ConfigChangeID
-// staleness check, this validation is conservative — a config change that
-// commits concurrently may cause a benign false rejection, which the caller
-// resolves by re-reading the membership and retrying.
+// ValidateConfigChange checks a change against the published membership without mutating, for the Host membership API; safe for concurrent use and may falsely reject under a concurrent commit.
 func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
 	var m *membership
 	if snap := p.membershipSnap.Load(); snap == nil {
@@ -1295,21 +679,14 @@ func (p *Peer) ValidateConfigChange(cc proto.ConfigChange) error {
 	return m.validate(cc)
 }
 
-// newMembership builds a membership from replicated state under this peer's
-// LOCAL admission policy. Every site that replaces p.membership — snapshot
-// adoption, the initial-membership entry, the validation copy — goes through
-// here so the policy survives the replacement; it is local configuration, not
-// something the replicated state carries.
+// newMembership builds a membership from replicated state under this peer's local admission policy.
 func (p *Peer) newMembership(ms proto.Membership) *membership {
 	m := newMembershipWithPolicy(ms, p.cfg.RequireMemberIdentities)
 	m.wire = p.wireWindow()
 	return m
 }
 
-// checkSnapshotWireVersion refuses an InstallSnapshot whose membership
-// commits the shard to a wire version this build cannot read: installing it
-// would leave this replica in a shard state it cannot follow, so it is
-// refused before it reaches the log, as the apply path refuses the entry.
+// checkSnapshotWireVersion refuses an InstallSnapshot committing a wire version this build cannot read.
 func (p *Peer) checkSnapshotWireVersion(msg proto.Message) error {
 	if msg.Type != proto.InstallSnapshot {
 		return nil
@@ -1329,10 +706,7 @@ func (p *Peer) wireWindow() proto.WireWindow {
 	return p.wire
 }
 
-// SetWireWindow sets the wire versions this replica reads. Like SetLogger it
-// must be called before the Peer is handed to a worker. It returns
-// proto.ErrUnsupportedVersion when the recovered membership already commits
-// the shard to a wire version outside w: this build cannot rejoin that shard.
+// SetWireWindow sets the readable wire versions before the Peer is handed to a worker; it returns proto.ErrUnsupportedVersion if the recovered membership is outside w.
 func (p *Peer) SetWireWindow(w proto.WireWindow) error {
 	p.wire = w
 	p.membership.wire = p.wireWindow()
@@ -1354,12 +728,7 @@ func (p *Peer) WireVersion() uint64 {
 	return proto.EffectiveWireVersion(snap.wireVersion)
 }
 
-// membershipVotingBitCount returns how many ReadIndex ackBits positions the
-// peer's CURRENT membership would occupy once mirrored into the raft layer:
-// every voter and every witness other than this replica, plus self, which
-// rebuildReplicaToBit seats at bit 0 unconditionally. It counts the membership
-// rather than the raft maps because it must be answerable BEFORE syncRaftRemotes
-// mutates them.
+// membershipVotingBitCount returns the ReadIndex ackBits positions the current membership needs: other voters and witnesses plus self.
 func (p *Peer) membershipVotingBitCount() int {
 	count := 1
 	for id := range p.membership.addresses {
@@ -1375,31 +744,7 @@ func (p *Peer) membershipVotingBitCount() int {
 	return count
 }
 
-// syncRaftRemotes synchronizes the raft state machine's remote tracking
-// maps from the peer's membership. This ensures the raft layer tracks
-// the correct set of peers after config changes.
-//
-// Returns ErrTooManyVotingMembers when the applied membership names more
-// voting members than the ReadIndex ackBits word can address. Every caller is
-// on an error-returning path that the engine already treats as terminal for
-// the shard (processConfigChanges documents this: "The engine's failCommit
-// treats it as the fault it is"), so the shard is marked failed and reported
-// through EventListener.OnShardFailed while the host and its other shards keep
-// running. That replaced an invariant.Assert one frame down in
-// rebuildReplicaToBit, which took the whole step worker instead.
-//
-// The check runs BEFORE any of the raft maps are touched, deliberately. The
-// membership itself has already been applied — it is committed replicated
-// state and rolling it back would be a divergence — but the raft mirror is
-// local, and leaving it on the last configuration that fit is what makes this
-// fail CLOSED: the shard stops with a coherent voting set rather than a
-// half-synced one, and no ReadIndex is ever answered from a truncated bitmap.
-//
-// The leader propose gate (validateConfigChangePolicy) is what normally stops
-// such a configuration ever being proposed, and the committed-replay path
-// deliberately does not re-validate, because refusing an already-committed
-// entry there would make replicas diverge. Failing the shard is the honest
-// response to a committed entry this build cannot represent.
+// syncRaftRemotes mirrors membership into the raft remote maps; it returns ErrTooManyVotingMembers before touching them, which fails the shard.
 func (p *Peer) syncRaftRemotes() error {
 	if n := p.membershipVotingBitCount(); n > maxVotingMembers {
 		slog.Error("shard membership exceeds the ReadIndex ackBits word: failing the shard rather than mirroring a voting set that cannot be tracked",
@@ -1413,12 +758,7 @@ func (p *Peer) syncRaftRemotes() error {
 	}
 	nextIdx := p.r.log.lastIndex() + 1
 
-	// Add new remotes. An observer being promoted to voter keeps its
-	// existing remote struct: it carries live replication progress
-	// (match/next) and possibly an in-flight snapshot transfer or ack
-	// wait. Recreating it at next=lastIndex+1 would immediately probe a
-	// potentially still-restoring node, drawing the compacted-hint
-	// rejection and a redundant full snapshot re-send.
+	// Add new remotes; a promoted observer keeps its remote and replication progress.
 	for id := range p.membership.addresses {
 		if id == p.replicaID {
 			continue
@@ -1435,10 +775,7 @@ func (p *Peer) syncRaftRemotes() error {
 	for id := range p.r.remotes {
 		if !p.membership.isVoter(id) {
 			delete(p.r.remotes, id)
-			// If the departed node was the leader transfer target, clear
-			// the transfer state. Otherwise the cluster stays
-			// write-unavailable (rejecting proposals and ReadIndex with
-			// ErrTransferInProgress) until electionTimeout ticks elapse.
+			// Clear a leader transfer to a departed node.
 			if p.r.transferTarget == id {
 				p.r.transferTarget = noNode
 				p.r.transferElapsed = 0
@@ -1487,24 +824,15 @@ func (p *Peer) syncRaftRemotes() error {
 	p.r.maxWitnesses = p.membership.maxWitnesses
 	p.r.requireFullReplicaMajority = p.membership.requireFullReplicaMajority
 
-	// Track whether this replica is still in the configuration. A removed
-	// replica must stop campaigning: the surviving configuration computes
-	// its quorum without it, so its self-counted vote could elect it leader
-	// for a term the real configuration is also electing a leader in.
+	// A replica removed from the configuration must stop campaigning.
 	p.r.setSelfMembership(p.membership.isMember(p.replicaID))
 
-	// Cross-check the locally configured witness AND non-voting roles against
-	// the replicated configuration this call just applied. A committed
-	// AddWitness or AddObserver naming this replica, or an AddNode promoting it
-	// out of either set, is the point at which the two can start to disagree.
+	// Cross-check the local witness and observer roles against the applied configuration.
 	p.r.checkSelfRole(p.membership.isMember(p.replicaID),
 		p.membership.isWitness(p.replicaID),
 		p.membership.isObserver(p.replicaID))
 
-	// Drop vote records for replicas that just left. The election quorum is
-	// computed over the voting set this call just reshaped; a stale grant
-	// from a departed replica would be tallied against the smaller quorum.
-	// This now includes a self vote cast before a self-removal committed.
+	// Drop vote records of replicas that left, including a self vote before self-removal.
 	p.r.purgeDepartedVotes()
 
 	// When the node is leader, rebuild quorum and lease tracking maps
@@ -1518,14 +846,7 @@ func (p *Peer) syncRaftRemotes() error {
 	return nil
 }
 
-// syncLeaseAcks drops remoteLastAck entries for replicas that left the
-// voting set (remotes + witnesses).
-//
-// Newly added members are deliberately NOT seeded: absence from the map
-// already means "never acked", and handleHeartbeatResp creates the key on
-// the first real ack. Any seeded value would claim the member received a
-// heartbeat round it never answered, and so would let a member that is not
-// even running contribute to the read lease.
+// syncLeaseAcks drops remoteLastAck entries for replicas that left the voting set; new members are not seeded.
 func (p *Peer) syncLeaseAcks() {
 	if p.r.remoteLastAck == nil {
 		return
@@ -1549,55 +870,13 @@ func (p *Peer) checkLeaderSelfRemoval() {
 	}
 }
 
-// applyMembershipEntry folds one committed entry into p.membership and reports
-// whether it changed the membership. It handles the two entry types that carry
-// configuration:
-//
-//   - EntryInitialMembership: the bootstrap entry at index 1. Its Cmd is the
-//     full initial Membership, adopted wholesale (like handleSnapshot). It is
-//     always the lowest committed index, so it is folded before any incremental
-//     change, and re-adopting it on replay is idempotent.
-//   - EntryConfigChange: an incremental add/remove/policy change.
-//
-// Any other entry type is ignored. The two failure modes are reported
-// SEPARATELY, because they are opposite kinds of fact:
-//
-//   - A DECODE failure returns ErrCorruptConfigEntry and is FATAL. The bytes are
-//     committed replicated state that every peer can read and this replica
-//     cannot, so continuing means running on a configuration that differs from
-//     the rest of the shard — silently, and durably once the next snapshot
-//     persists it. Recovery already treats these exact bytes as fatal
-//     (ReconstructMembership returns the error and StartShard aborts); the
-//     runtime failing open while recovery failed closed was the inconsistency.
-//     The membership is left untouched either way, so a caller that cannot fault
-//     the shard at least does not adopt an empty voting set.
-//   - A deterministic membership.apply REFUSAL returns (false, nil) and is
-//     logged only. It is not a corruption: membership.apply CONVERGES on the role
-//     each committed add names rather than refusing an entry whose target already
-//     exists, so the refusals that survive are the ones EVERY replica evaluates
-//     identically (a Removed tombstone re-add, an add contradicting a role only a
-//     committed change could have set). Faulting on those would kill shards over
-//     an outcome the whole cluster agrees on.
-//
-// A committed entry is never re-delivered, so neither outcome may be treated as
-// "try again later" by the caller.
+// applyMembershipEntry folds one committed initial-membership or config-change entry and reports whether membership changed; a decode failure is fatal ErrCorruptConfigEntry, a deterministic refusal is logged.
 func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 	switch e.Type & proto.EntryTypeMask {
 	case proto.EntryInitialMembership:
-		// The founding configuration is defined to live at exactly
-		// BootstrapMembershipIndex. Applying one anywhere else would REPLACE the
-		// membership wholesale — discarding every config change committed since
-		// bootstrap and rolling the voting set back to the founding members,
-		// which is a configuration no live replica shares. Only index 1 can
-		// legitimately carry it, so anything else is malformed and is refused.
-		//
-		// The refusal is a pure function of the entry's index, so every replica
-		// reaches the identical decision and the membership cannot diverge.
+		// The founding configuration is valid only at BootstrapMembershipIndex; elsewhere it is refused.
 		if e.Index != BootstrapMembershipIndex {
-			// Structural, not corrupt: the refusal is a pure function of the
-			// entry's INDEX, so every replica reaches it identically and the
-			// membership stays convergent. It is the apply-refusal shape, not the
-			// undecodable-payload shape, and must not fault the shard.
+			// A structural refusal, identical on every replica; it must not fault the shard.
 			slog.Error("refusing initial-membership entry outside the bootstrap index",
 				"shard_id", p.shardID,
 				"replica_id", p.replicaID,
@@ -1619,11 +898,7 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 		p.membership = p.newMembership(ms)
 		return true, nil
 	case proto.EntryConfigChange:
-		// A zero-length payload is left as a silent no-op.
-		// It is not the corruption case: every replica reads the same nothing and
-		// skips identically, and no legitimate producer emits one (the
-		// propose-time gate refuses any payload that does not decode), so it
-		// is a shape that only appears in synthetic entries.
+		// A zero-length payload is a no-op on every replica.
 		if len(e.Cmd) == 0 {
 			return false, nil
 		}
@@ -1639,11 +914,7 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 			return false, ErrCorruptConfigEntry
 		}
 		if err := p.membership.apply(cc, e.Index); err != nil {
-			// A committed wire version this build cannot read is FATAL, like
-			// an undecodable entry: skipping it would leave this replica
-			// sending a version its peers have switched away from, and every
-			// replica that applied it would disagree with this one about the
-			// shard's state from here on.
+			// A committed wire version this build cannot read is fatal.
 			if errors.Is(err, proto.ErrUnsupportedVersion) {
 				slog.Error("committed wire version outside this build's window",
 					"shard_id", p.shardID,
@@ -1653,11 +924,7 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 				)
 				return false, err
 			}
-			// The Host membership API pre-validates against current membership
-			// (ValidateConfigChange) before proposing, so a skip on the leader's
-			// own freshly proposed entry is unexpected and would mean the
-			// caller's RequestState hangs until deadline. Log at WARN so any
-			// skip is visible to operators rather than silently swallowed.
+			// A skip on the leader's own pre-validated entry is unexpected; log it at WARN.
 			slog.Warn("config change apply skipped",
 				"shard_id", p.shardID,
 				"replica_id", p.replicaID,
@@ -1673,20 +940,7 @@ func (p *Peer) applyMembershipEntry(e proto.Entry) (bool, error) {
 	}
 }
 
-// processConfigChanges scans COMMITTED entries for config changes and
-// applies them to the peer's membership, publishing the updated snapshot
-// and syncing raft remote tracking. Called from Peer.Commit: membership
-// takes effect at commit time (etcd/dragonboat model), not on log append.
-// It returns the FATAL error of an undecodable committed config entry, which
-// Peer.Commit propagates and the engine turns into a shard fault (failCommit).
-// That is the point of the return value: recovery treats the identical bytes as
-// fatal, and runtime failing open while recovery fails closed over the same
-// input is a divergence generator: the live replica keeps serving on a
-// configuration only it holds, and persists it with the next snapshot.
-//
-// A deterministic apply REFUSAL is still ignored, and must be: every replica
-// evaluates it identically, so it is agreement, not corruption. See
-// applyMembershipEntry.
+// processConfigChanges applies committed config changes, publishes the membership and syncs remotes; it returns the fatal error of an undecodable entry.
 func (p *Peer) processConfigChanges(entries []proto.Entry) error {
 	needsSync := false
 	var fatal error
@@ -1708,10 +962,7 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) error {
 		// last coherent configuration is the one its readers see, then fail.
 		if needsSync {
 			p.publishMembership()
-			// The shard is already failing on fatal, which names the corrupt
-			// entry and is the more useful diagnosis; this one is logged
-			// rather than substituted. The raft mirror is left on the last
-			// configuration that fit either way.
+			// fatal already names the corrupt entry; log this one instead.
 			if syncErr := p.syncRaftRemotes(); syncErr != nil {
 				slog.Error("membership mirror not synced while failing the shard",
 					"shard", p.shardID,
@@ -1722,40 +973,24 @@ func (p *Peer) processConfigChanges(entries []proto.Entry) error {
 		}
 		return fatal
 	}
-	// The ordinary commit pipeline reaching the startup staleness watermark
-	// resolves the recovered configuration for FREE: every committed entry at
-	// or below it has now been offered to applyMembershipEntry, which is the
-	// same fold resolveStaleStartupConfig would perform by reading the log
-	// back. This is the branch that keeps a restart into a healthy shard from
-	// ever paying for that read. It is deliberately outside the needsSync test:
-	// a tail that contained NO config change resolves the watermark just as
-	// conclusively as one that did.
+	// The commit pipeline reaching the staleness watermark resolves it, whether or not the tail held config changes.
 	if n := len(entries); n > 0 && entries[n-1].Index >= p.staleConfigThrough {
 		p.staleConfigThrough = 0
 	}
 	if needsSync {
 		// Publish immutable snapshot for concurrent readers.
 		p.publishMembership()
-		// Terminal for this shard: a committed configuration this build cannot
-		// represent. Returning here reaches the engine's failCommit, which
-		// marks the node failed and fires OnShardFailed, exactly as it does
-		// for a config entry that will not decode.
+		// Terminal: failCommit marks the shard failed and fires OnShardFailed.
 		if err := p.syncRaftRemotes(); err != nil {
 			return err
 		}
-		// A committed entry that gave this replica a membership beyond itself
-		// ends the joining window: it now knows every member and can enforce
-		// per-shard authorization. The bootstrap EntryInitialMembership is the
-		// ordinary carrier of that on the replicate path.
+		// A committed membership beyond itself ends the joining window.
 		p.clearJoiningIfKnown()
 	}
 	return nil
 }
 
 // ReadIndex requests a linearizable read at the current commit index.
-// The request is wrapped in a ReadIndex message and routed through the
-// raft state machine, which confirms leadership via heartbeat quorum
-// (multi-node) or responds immediately (single-node).
 func (p *Peer) ReadIndex(key uint64) error {
 	msg := proto.Message{
 		Type:   proto.ReadIndex,
@@ -1768,21 +1003,12 @@ func (p *Peer) ReadIndex(key uint64) error {
 	return err
 }
 
-// FlushReadIndex sends a single deferred heartbeat broadcast for all
-// pending ReadIndex requests accumulated in the current step cycle.
-// This batches multiple concurrent reads into one heartbeat round,
-// reducing network messages from N*(cluster_size-1) to (cluster_size-1).
-// Must be called after processing all inbox messages and before GetUpdate.
+// FlushReadIndex sends one heartbeat round for all pending ReadIndex requests; call it after the inbox and before GetUpdate.
 func (p *Peer) FlushReadIndex() {
 	p.r.flushReadIndex()
 }
 
-// DrainReadStatesOnly extracts pending readStates without draining
-// outbound messages. This is used by processCommitPendingInbox where
-// inbox messages are handled under raftMu but outbound messages must
-// remain in the buffer for the next GetUpdate cycle — otherwise ordered
-// messages (ReplicateResp, VoteResp) would be lost since they cannot
-// be sent before WAL persistence.
+// DrainReadStatesOnly returns pending readStates and leaves outbound messages for the next GetUpdate.
 func (p *Peer) DrainReadStatesOnly() []proto.ReadyToRead {
 	if len(p.r.readStates) == 0 {
 		return nil
@@ -1792,11 +1018,7 @@ func (p *Peer) DrainReadStatesOnly() []proto.ReadyToRead {
 	return readStates
 }
 
-// DrainReadRejects returns and clears the keys of forwarded reads the leader
-// refused. The caller fails each read (and its batch aliases) with
-// ErrReadIndexNotReady; without that the read waits on a response that has
-// already come back as a refusal. Must be called with the same exclusion as
-// Handle.
+// DrainReadRejects returns and clears the keys of forwarded reads the leader refused; call it with Handle's exclusion.
 func (p *Peer) DrainReadRejects() []uint64 {
 	if len(p.r.readRejects) == 0 {
 		return nil
@@ -1806,11 +1028,7 @@ func (p *Peer) DrainReadRejects() []uint64 {
 	return keys
 }
 
-// RequestLeaderTransfer initiates a leadership transfer to the target
-// replica. The request is wrapped in a LeaderTransfer message and
-// routed through the raft state machine. The raft state machine handles
-// all the mechanics: checking if the target is caught up, sending
-// TimeoutNow, and tracking the transfer timeout.
+// RequestLeaderTransfer asks the raft state machine to transfer leadership to target.
 func (p *Peer) RequestLeaderTransfer(target uint64) error {
 	if !p.IsLeader() {
 		return nil
@@ -1829,12 +1047,7 @@ func (p *Peer) RequestLeaderTransfer(target uint64) error {
 	return err
 }
 
-// HasUpdate returns true if there is work for the engine to process.
-// This includes new entries to save, messages to send, committed entries
-// to apply, hard state changes, pending snapshots, or read states.
-//
-// Checks are ordered cheapest-first: slice length and field comparisons
-// before entriesToSave() which requires arithmetic on inmem indices.
+// HasUpdate reports whether there is work for the engine, checking the cheapest conditions first.
 func (p *Peer) HasUpdate(lastApplied uint64) bool {
 	if len(p.r.msgs) > 0 {
 		return true
@@ -1854,10 +1067,7 @@ func (p *Peer) HasUpdate(lastApplied uint64) bool {
 	if len(p.r.log.entriesToSave()) > 0 {
 		return true
 	}
-	// Applied entries still held in memory: without an update nothing
-	// carries lastApplied to appliedLogTo, the last applied batch would stay
-	// counted against MaxInMemLogSize, and an idle shard past its limit
-	// would refuse proposals forever.
+	// Applied entries still in memory need an update to release them from MaxInMemLogSize.
 	return p.appliedReleasePending(lastApplied)
 }
 
@@ -1876,23 +1086,11 @@ func (p *Peer) appliedReleasePending(lastApplied uint64) bool {
 	return lastApplied <= im.entries[len(im.entries)-1].Index
 }
 
-// GetUpdate collects the current state changes into an Update for the
-// engine to process. The Update contains entries to save, messages to
-// send, committed entries to apply, hard state, and snapshots.
-//
-// moreEntriesToApply controls whether committed entries are included.
-// When false (e.g., during snapshot-in-progress), committed entries are
-// omitted.
-//
-// lastApplied is the highest index the engine has applied, used to
-// determine which committed entries to include.
+// GetUpdate collects pending changes into an Update; committed entries above lastApplied are included only when moreEntriesToApply.
 func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Update, error) {
 	hs := p.r.hardState()
 
-	// Detect state change before updating prevState (needed for ReadOnly).
-	// stateUnpersisted forces the change on: a previously extracted update was
-	// lost before SaveState, so prevState is claiming durability it does not
-	// have and this update must carry the hard state back through the WAL.
+	// Detect a state change before updating prevState; stateUnpersisted forces one.
 	stateChanged := p.stateUnpersisted ||
 		hs != p.prevState
 
@@ -1911,10 +1109,7 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 		update.LastIndex = entriesToSave[len(entriesToSave)-1].Index
 	}
 
-	// Collect committed entries to apply. Entries are copied into a
-	// pooled slice to reduce allocation pressure. The apply worker
-	// calls ReleaseCommittedEntries after processing to return the
-	// slice to the pool.
+	// Committed entries go in a pooled slice the apply worker releases.
 	if moreEntriesToApply {
 		committedEntries, pooled, err := p.r.log.entriesToApply()
 		if err != nil {
@@ -1937,21 +1132,14 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 		p.r.readStates = nil
 	}
 
-	// Collect pending snapshot. Only include snapshots from inmem
-	// (received via InstallSnapshot), not the LogReader's persisted
-	// snapshot. The commit worker needs to know about new snapshots
-	// to persist; it must NOT see already-persisted local snapshots
-	// or it would incorrectly reset the LogReader's tracked range.
+	// Include only an in-memory pending snapshot, never the persisted one.
 	ss := p.r.log.pendingSnapshot()
 	if ss != nil {
 		update.Snapshot = *ss
 		p.hasPendingSnapshot = false
 	}
 
-	// Mark the update as read-only if it carries no data requiring
-	// persistence: no entries, no state change, no snapshot. The step
-	// worker uses this to bypass the commit/apply pipeline, eliminating
-	// unnecessary LogDB writes and goroutine hops for ReadIndex.
+	// An update with nothing to persist is read-only and skips the commit/apply pipeline.
 	update.ReadOnly = !stateChanged &&
 		len(update.EntriesToSave) == 0 &&
 		len(update.CommittedEntries) == 0 &&
@@ -1963,9 +1151,7 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 		p.r.log.inmem.appliedLogTo(lastApplied)
 	}
 
-	// Update previous state for next diff and sync the atomic leaderID. The
-	// re-persist demand is satisfied by THIS update: it is not ReadOnly, so it
-	// reaches SaveState.
+	// Update prevState and leaderID; this non-read-only update satisfies the re-persist demand.
 	p.prevState = hs
 	p.stateUnpersisted = false
 	p.markStep()
@@ -1974,42 +1160,17 @@ func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Upd
 	return update, nil
 }
 
-// InvalidatePersistedState marks the hard state as possibly-unpersisted, so the
-// next GetUpdate carries it back through SaveState instead of classifying the
-// update ReadOnly and skipping the WAL.
-//
-// The engine calls this when an extracted update is discarded without being
-// persisted — today, when a panic unwinds the step worker between GetUpdate and
-// the commit hand-off. Without it, prevState permanently claims a term and vote
-// that never reached disk.
-//
-// Safe to call repeatedly; it costs at most one extra hard-state write.
-// Must be called with the same exclusive Peer access GetUpdate requires.
+// InvalidatePersistedState makes the next GetUpdate carry the hard state through SaveState; call with GetUpdate's exclusive access.
 func (p *Peer) InvalidatePersistedState() {
 	p.stateUnpersisted = true
 }
 
-// InvalidateLease ends any LeaseRead lease this peer holds as leader, so the
-// next lease read must be backed by a heartbeat round sent after this call.
-//
-// The engine calls this when it parks a shard whose log write the at-rest
-// barrier refused (sealed): a leader that could not persist across the seal
-// must not serve a lease read from the lease it held before it. A no-op when
-// the peer is not a lease-holding leader.
-// Must be called with the same exclusive Peer access GetUpdate requires.
+// InvalidateLease ends this leader's LeaseRead lease; call with GetUpdate's exclusive access.
 func (p *Peer) InvalidateLease() {
 	p.r.invalidateLease()
 }
 
-// RejoinAfterPause returns a replica resuming from a pause to the protocol as
-// a follower at its current term, with a fresh randomized election timeout.
-// The vote cast in this term is kept, so a resumed replica can never vote
-// twice in one term. A replica that was a follower keeps the leader it knew,
-// so proposals queued before the pause are forwarded on rather than dropped;
-// a leader or candidate rejoins with no leader and learns the current one
-// from its first heartbeat. Nothing is persisted: the term and vote are
-// unchanged. Must be called with the node's raftMu held and while no worker
-// is stepping the peer.
+// RejoinAfterPause makes a paused replica a follower at its term with a fresh timeout, keeping its vote; call with raftMu held and no worker stepping.
 func (p *Peer) RejoinAfterPause() {
 	leaderID := noLeader
 	if p.r.state == follower {
@@ -2019,41 +1180,12 @@ func (p *Peer) RejoinAfterPause() {
 	p.syncLeaderID()
 }
 
-// GetPiggybackUpdate extracts committed entries, messages, and the
-// current hard state for piggybacking onto an empty-commit cycle.
-// Eliminates the second pipeline traversal for multi-node proposals
-// where entries are persisted in cycle 1 and the commit index advances
-// during commitPending via processCommitPendingInbox.
-//
-// Unlike GetUpdate, this method:
-//   - Does NOT write entriesToSave into the Update, and the engine path it
-//     feeds persists no entries. That is only safe for the entries this
-//     method APPLIES — they are clamped to the durable marker below. It says
-//     nothing about entries appended by processCommitPendingInbox during the
-//     commitPending window, which are still RAM-only; see the ordered-message
-//     withholding below, which is what keeps that distinction honest.
-//   - Does NOT touch readStates (drained by processCommitPendingInbox)
-//   - Does NOT touch hasPendingSnapshot
-//   - DOES drain messages the durability rules permit it to release
-//   - Does NOT advance prevState. The engine does that via
-//     NotePiggybackPersisted once the hard state is actually on disk, so a
-//     failed persist leaves hasStateChanged() true and the state is re-emitted.
-//   - Returns empty Update (CommittedEntries=nil) if nothing to apply
-//
-// The caller must hold raftMu.
+// GetPiggybackUpdate returns committed entries up to the durable marker, the hard state and releasable messages without advancing prevState; the caller must hold raftMu.
 func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	if !p.r.log.hasEntriesToApply() {
 		return proto.Update{}, nil
 	}
-	// Durability clamp. commitTo advances committed as far as lastIndex(),
-	// which counts entries still in memory and not yet fsynced. Applying that
-	// tail here, and returning a HardState.Commit that covers it, would let
-	// executePiggyback fsync a Commit past the last durable log entry: after a
-	// crash HardState.Commit would exceed the recovered log, breaking the
-	// durability invariant. Extract and advertise only up to the durable marker;
-	// the remainder re-emits on a later cycle once it is persisted, because
-	// NotePiggybackPersisted records the CLAMPED hard state as prevState rather
-	// than the raw one.
+	// Apply and advertise only up to the durable marker.
 	saved := p.r.log.savedIndex()
 	committedEntries, pooled, err := p.r.log.entriesToApplyUpTo(saved)
 	if err != nil {
@@ -2076,28 +1208,7 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	if pooled != nil {
 		update.SetCommittedEntriesPooled(pooled)
 	}
-	// Drain pending messages produced by processCommitPendingInbox
-	// (e.g., broadcastAppend Replicate after tryCommit).
-	//
-	// Durability split. The engine path this Update feeds (executePiggyback)
-	// fsyncs HARD STATE ONLY — its logdb.Update carries no Entries — so any
-	// entry appended during the commitPending window is still RAM-only when
-	// these messages go out. processCommitPendingInbox steps Replicate here
-	// (only InstallSnapshot is filtered), and handleAppend answers it with an
-	// ORDERED ReplicateResp naming an index this replica has not made durable.
-	// Releasing that is the Figure 2 violation "updated on stable storage
-	// before responding to RPCs" exists to prevent: the leader counts the
-	// match toward its commit quorum, and a crash here loses entries already
-	// acknowledged to a client.
-	//
-	// So while entriesToSave() is non-empty, hand the sender only the
-	// free-order messages and leave the ordered ones in r.msgs. They are
-	// withheld, never dropped: len(r.msgs) > 0 keeps HasUpdate true, and the
-	// next GetUpdate cycle — which DOES carry EntriesToSave through SaveState —
-	// releases them after the fsync. This reuses the existing free-order split
-	// (proto.IsFreeOrder) rather than inventing a second rule; the
-	// step worker applies exactly the same predicate for the same reason while
-	// commitPending is set.
+	// While entries are unsaved, release only free-order messages; ordered ones wait for the next GetUpdate's fsync.
 	if len(p.r.msgs) > 0 {
 		msgs := p.r.drainMessages()
 		if len(p.r.log.entriesToSave()) > 0 {
@@ -2112,55 +1223,20 @@ func (p *Peer) GetPiggybackUpdate(lastApplied uint64) (proto.Update, error) {
 	return update, nil
 }
 
-// NotePiggybackPersisted advances prevState to the hard state the engine has
-// just written to stable storage on the piggyback path.
-//
-// It exists because GetPiggybackUpdate deliberately does NOT advance prevState:
-// the persist happens after the Update leaves this package and can fail.
-// Advancing it optimistically would let a failed piggyback SaveState leave
-// prevState claiming a term/vote/commit that never reached disk. A vote granted
-// in that window would become invisible to hasStateChanged(), letting a later
-// update be ReadOnly and transmit its RequestVoteResp with no WAL write at all.
-//
-// hs must be the State carried by the Update that was persisted (the clamped
-// one), not the peer's current hard state, which may already have moved on.
-//
-// The caller must hold raftMu.
+// NotePiggybackPersisted sets prevState to hs, the persisted piggyback hard state; the caller must hold raftMu.
 func (p *Peer) NotePiggybackPersisted(hs proto.State) {
 	p.prevState = hs
 	p.durableState = hs
 }
 
-// RequeueMessages returns messages to the outbound buffer after the engine
-// failed to establish the durability they were waiting on. They are placed
-// AHEAD of anything produced since the drain, preserving emission order, and
-// go out on the next cycle that persists. Dropping them instead is not
-// equivalent: a lost VoteResp stalls an election until the next timeout.
-//
-// The caller must hold raftMu.
+// RequeueMessages puts msgs back ahead of newer ones for the next persisting cycle; the caller must hold raftMu.
 func (p *Peer) RequeueMessages(msgs []proto.Message) {
 	p.r.requeueMessages(msgs)
 }
 
-// Commit acknowledges that the engine has persisted the Update. This
-// advances the log's persistence markers and frees in-memory resources.
-//
-// appliedTo is called here (not in GetUpdate) so that the processed
-// marker only advances after the committed entries are guaranteed to
-// have reached the commit/apply pipeline. If appliedTo were called in
-// GetUpdate and the downstream send failed, committed entries would be
-// permanently lost since hasEntriesToApply would return false.
-//
-// Returns an error if the log reader detects a gap in the entry range,
-// which indicates a bug in the entry persistence pipeline.
+// Commit acknowledges the persisted Update, advancing markers; it returns an error on a gap in the entry range.
 func (p *Peer) Commit(update proto.Update) error {
-	// Register durable state with the LogReader FIRST. These are the only
-	// fallible steps in Commit; running them before any marker advances
-	// keeps an error fully RE-DELIVERABLE — the processed marker has not
-	// moved, so entriesToApply() will offer the same batch again. If they
-	// ran after appliedTo, a failure here would strand committed entries
-	// that can never be re-emitted (the state machine would silently miss
-	// a range while the shard kept serving reads).
+	// Register durable state with the LogReader first, so a failure leaves the batch re-deliverable.
 	if !update.Snapshot.IsEmpty() {
 		// Without this the LogReader keeps its initial empty range and
 		// subsequent Append calls for entries after the snapshot index
@@ -2170,10 +1246,7 @@ func (p *Peer) Commit(update proto.Update) error {
 		}
 	}
 	if len(update.EntriesToSave) > 0 {
-		// Updates the tracked range and term cache so Term() lookups still
-		// resolve for entries commitUpdate -> appliedLogTo is about to
-		// truncate from inmem; without it the leader's sendAppend cannot
-		// resolve term(prevLogIndex) for slow followers.
+		// Keep term lookups for entries about to leave inmem.
 		if err := p.logReader.Append(update.EntriesToSave); err != nil {
 			return err
 		}
@@ -2186,32 +1259,12 @@ func (p *Peer) Commit(update proto.Update) error {
 		lastProcessed := update.CommittedEntries[len(update.CommittedEntries)-1].Index
 		p.r.log.appliedTo(lastProcessed)
 
-		// Apply committed config changes to membership and sync raft
-		// remotes. This is THE point where membership takes effect
-		// (commit-time semantics, see ProposeConfigChange): each
-		// committed entry flows through exactly one update's
-		// CommittedEntries because the processed marker advances
-		// monotonically. Must run before checkLeaderSelfRemoval below so
-		// self-removal sees the post-change membership.
-		// A committed config entry that does not DECODE is terminal for this
-		// shard: it is replicated state every peer can read and this replica
-		// cannot, so there is no local state to fall back to that is not a
-		// divergence. Returning here is past appliedTo, so the batch is not
-		// re-deliverable — which is correct, because retrying decodes the same
-		// bytes. The engine's failCommit treats it as the fault it is.
+		// Apply committed config changes before checkLeaderSelfRemoval; an undecodable entry is terminal.
 		if err := p.processConfigChanges(update.CommittedEntries); err != nil {
 			return err
 		}
 
-		// The leader enforces the single-pending invariant
-		// (handleLeaderPropose rejects proposals when pendingConfigChange
-		// is true), so at most one config change is pending at any given
-		// time on the leader. However, a follower catching up via log
-		// replication can legitimately receive a batch containing
-		// multiple committed config changes that were proposed and
-		// committed across separate leader rounds. Process each one
-		// sequentially: clear pendingConfigChange and check leader self-
-		// removal for every config change entry in the batch.
+		// A catching-up follower may see several committed config changes in one batch; handle each in order.
 		for i := range update.CommittedEntries {
 			if update.CommittedEntries[i].Type&proto.EntryTypeMask == proto.EntryConfigChange {
 				p.r.pendingConfigChange = false
@@ -2238,15 +1291,7 @@ func (p *Peer) Commit(update proto.Update) error {
 		uc.StableSnapshotTo = update.Snapshot.Index
 	}
 
-	// Record the last applied index from the previous cycle. This is the
-	// index confirmed by the apply worker (node.lastApplied), NOT the
-	// index of entries being committed right now. appliedLogTo uses this
-	// to truncate inmem entries that are safe to discard: they have been
-	// both persisted to LogDB and applied to the state machine.
-	//
-	// Using CommittedEntries[last].Index here would truncate entries that
-	// haven't been applied yet, causing marker index mismatches when the
-	// inmem state is accessed during rapid create/destroy cycles.
+	// Truncate inmem only through the apply worker's confirmed lastApplied.
 	uc.LastApplied = update.LastApplied
 
 	// Record read states.
@@ -2263,14 +1308,7 @@ func (p *Peer) Commit(update proto.Update) error {
 		p.durableState = update.State
 	}
 
-	// Persistence edge: tryCommit uses the leader's durable index
-	// (inmem.savedTo) as its own match, so a commit that was blocked only
-	// on local durability becomes possible exactly here, after savedTo
-	// advanced. Re-evaluate and, if the commit index moved, broadcast so
-	// followers learn it promptly. This mirrors etcd's async-storage-
-	// writes design (self-directed append-resp after the local append
-	// completes). The messages land in r.msgs and are drained by the
-	// commit worker's piggyback update or the next step-worker cycle.
+	// Persistence edge: re-evaluate the commit now that savedTo advanced, and broadcast if it moved.
 	if p.r.state == leader && uc.StableLogTo > 0 {
 		if p.r.tryCommit() {
 			p.r.broadcastAppend()
@@ -2301,16 +1339,7 @@ func (p *Peer) IsFollower() bool {
 	return !p.IsLeader() && !p.IsObserver() && !p.cfg.IsWitness
 }
 
-// IsObserver reports whether this peer is currently a non-voting observer.
-//
-// It reports the EFFECTIVE role, which follows the committed membership: an
-// observer whose promotion to voter has been applied here reports false
-// without a restart. config.IsObserver is only the initial hint, returned while
-// the membership does not mention this replica (a joiner that has not yet
-// learned the entry adding it). See raft.checkSelfRole.
-//
-// Safe for concurrent access from any goroutine. Reads an atomic pointer to an
-// immutable membership snapshot.
+// IsObserver reports whether this peer is currently an observer per the committed membership; safe for concurrent use.
 func (p *Peer) IsObserver() bool {
 	snap := p.membershipSnap.Load()
 	if snap == nil {
@@ -2335,88 +1364,20 @@ func (p *Peer) GetMembership() proto.Membership {
 	return snap.toProto()
 }
 
-// MarkJoining records that this peer's configuration is known-incomplete: it
-// was started with join=true and has not yet replayed the entries naming the
-// rest of the shard. See the joining field for exactly what that gates — it is
-// not an authorization bypass.
-//
-// The raft state machine gets its own mirror of the flag: it owns the campaign
-// entry points (startElection, handleTimeoutNow) and the vote guard, and cannot
-// see a field on Peer. The mirror is written only here — before the shard's step
-// worker starts — and in Handle's snapshot-adopt branch, which runs on the step
-// worker, so it needs no synchronization of its own. Peer.joining stays atomic
-// because MarkJoining runs on the caller's goroutine before the step worker
-// exists, while every later read happens on a worker.
+// MarkJoining marks this peer's configuration as incomplete before the step worker starts, mirroring the flag into raft.
 func (p *Peer) MarkJoining() {
 	p.setJoining(true)
-	// Then immediately test whether this replica is joining AT ALL. join=true is
-	// a startup flag, not durable state: an operator restarting an established
-	// replica keeps it set, and NewPeer has already seeded the membership from
-	// the persisted NodeState. Without this evaluation the flag would only ever
-	// be reconsidered by a config change or a snapshot, so a restarted replica in
-	// a quiescent shard — nothing joining, nothing leaving, no compaction — would
-	// refuse to campaign for the entire lifetime of the process.
+	// join=true is a startup flag, so test at once whether this replica is joining at all.
 	p.clearJoiningIfKnown()
 }
 
-// setJoining writes BOTH copies of the joining flag: the atomic one on Peer
-// that IsMember reads from the transport recv goroutine, and the raft-layer
-// mirror that gates campaigning. It is the only writer of either, so the two
-// cannot drift apart — a divergence would leave a node that has learned the
-// full membership still refusing to campaign, permanently.
-//
-// The raft mirror needs no synchronization of its own: this is called from
-// MarkJoining (before the shard's step worker starts) and from Handle's
-// snapshot-adopt branch (on the step worker).
+// setJoining writes both the atomic Peer flag and the raft mirror; it is their only writer.
 func (p *Peer) setJoining(joining bool) {
 	p.joining.Store(joining)
 	p.r.setJoining(joining)
 }
 
-// clearJoiningIfKnown ends the joining window once this replica's configuration
-// is complete enough to trust. "Complete enough" means it can support the two
-// decisions the window gates — campaigning, and the candidate test in
-// handleVoteRequest — without either self-electing on a quorum of one or denying
-// votes to the real members. Three sufficient signals, any of which clears it:
-//
-//	(a) the LEADER it is following is a known member. Membership is learned
-//	    incrementally on the replicate path and may still be PARTIAL: the current
-//	    leader may have been ADDED AFTER the initial bootstrap, so it is not in
-//	    the founding membership the index-1 EntryInitialMembership carries.
-//	    Clearing on "knows any member" would let a joiner that received the
-//	    bootstrap entry in an earlier batch than the leader's own AddNode start
-//	    denying that leader's votes. Gating on the leader closes that gap.
-//
-//	(b) this replica is itself a member ALONGSIDE somebody else. It has replayed
-//	    or received its own AddNode, so the committed membership up to its
-//	    addition is complete. This is what covers the RESTART path:
-//	    replayConfigChangesTo (SetProcessedIndex) runs before the first Tick, so
-//	    leaderID is noLeader and (a) cannot fire; without (b) a replica restarted
-//	    with join=true on a fully-caught-up log would reconstruct its whole
-//	    membership yet refuse to campaign until the next snapshot or config
-//	    change.
-//
-//	    The hasMemberOtherThan half matters because self-membership alone is not
-//	    knowledge of the shard: a configuration naming only this replica would
-//	    otherwise let it campaign and win with a quorum of one.
-//
-//	(c) this replica carries a Removed TOMBSTONE. A committed RemoveNode for self
-//	    is equally durable evidence that the committed configuration has been
-//	    learned, and it is the one terminal state (b) misses: a join=true replica
-//	    that replays its own removal before any leader is known is neither a
-//	    member nor following a leader, so without (c) the flag would persist for
-//	    the process — and since clearJoiningIfKnown only runs on membership
-//	    changes, no later heartbeat would ever clear it.
-//
-// No signal fires too early: (a) only once the leader is in the configuration,
-// (b) only once this replica is in it alongside somebody else, and (c) only once
-// its removal is committed. In the post-bootstrap-leader case all three are
-// false after the founding entry alone, so the window correctly persists until
-// the leader's AddNode arrives.
-//
-// A snapshot also clears joining unconditionally (Handle's adopt branch), for
-// the compacted case. A single-node bootstrap never sets joining, so this is
-// only ever reached by a replica added to an existing cluster.
+// clearJoiningIfKnown ends the joining window when the followed leader is a member, self is a member alongside another, or self carries a Removed tombstone.
 func (p *Peer) clearJoiningIfKnown() {
 	if !p.joining.Load() {
 		return
@@ -2429,33 +1390,12 @@ func (p *Peer) clearJoiningIfKnown() {
 	}
 }
 
-// ReleaseGlobalRateLimit returns this shard's entire contribution to the SHARED
-// host-wide in-memory limiter. It must be called exactly once when the shard is
-// torn down.
-//
-// The global limiter is one counter for every shard on the host, and each shard
-// tracks its own share (inMemory.globalContribution) so it can apply deltas
-// without disturbing the others. That share lives on the raft log and dies with
-// the Peer, so a shard that simply stops leaves its bytes counted against a
-// shard that no longer exists. Repeated StartShard/StopShard cycles accumulate
-// those orphans until the total crosses MaxTotalInMemLogSize, at which point
-// every propose on the host fails with ErrSystemBusy, permanently and with no
-// memory actually held.
-//
-// Idempotent: the contribution is zeroed, so a second call releases nothing.
+// ReleaseGlobalRateLimit returns this shard's share of the host-wide in-memory limiter; call it once at teardown. It is idempotent.
 func (p *Peer) ReleaseGlobalRateLimit() {
 	p.r.log.inmem.setGlobalSize(0)
 }
 
-// IsMember reports whether replicaID is in this shard's current configuration
-// in any active role (voter, observer, or witness).
-//
-// This is a view of REPLICATED STATE, not an authorization decision. It must
-// never be used to decide whether to accept an inbound message: see IsRemoved
-// for why, and use that instead.
-//
-// Safe for concurrent access from any goroutine. Reads an atomic pointer to an
-// immutable snapshot.
+// IsMember reports whether replicaID is an active member; it is not an authorization check (see IsRemoved). Safe for concurrent use.
 func (p *Peer) IsMember(replicaID uint64) bool {
 	snap := p.membershipSnap.Load()
 	if snap == nil {
@@ -2464,53 +1404,19 @@ func (p *Peer) IsMember(replicaID uint64) bool {
 	return snap.isMember(replicaID)
 }
 
-// MemberBinding is everything this shard's COMMITTED configuration authorizes
-// one replica ID with. It is the input to the receive-side sender gate, and its
-// fields are ranked: Identity supersedes Address wherever it is present.
+// MemberBinding is what the committed configuration authorizes one replica ID with; Identity supersedes Address.
 type MemberBinding struct {
-	// Identity is the committed cryptographic node identity, or "" when the
-	// configuration holds none for this replica (a shard bootstrapped before
-	// identities existed, or by an operator who supplied none).
-	//
-	// Where it is present it is the ONLY authorization input the gate needs.
-	// It is derived from the peer's public key rather than matched against
-	// certificate SANs, so — unlike the address — a wildcard or shared-SAN
-	// certificate does not let its holder present it, and it survives the
-	// holder moving to a new address.
+	// Identity is the committed node identity derived from the public key, or "" when none is held.
 	Identity string
 	// Address is the committed network address. It remains the authorization
 	// input only for a replica with no committed Identity, and is otherwise
 	// pure routing metadata.
 	Address string
-	// Exclusive reports whether Address identifies this replica and no other
-	// active member. A certificate is matched on the address alone, so two
-	// active replicas at one address let the single host behind it speak as
-	// BOTH. It is meaningless once Identity is present — identities are
-	// checked for duplication at config-change time and are not matched on an
-	// address at all — but it is reported unconditionally so a caller that
-	// falls back to the address never has to ask a second question.
+	// Exclusive reports whether Address identifies this replica and no other active member.
 	Exclusive bool
 }
 
-// MemberBinding returns what this shard's COMMITTED configuration authorizes
-// replicaID with, and whether the replica is in the configuration at all.
-//
-// Unlike IsMember, this IS usable as an authorization input, and it is what the
-// inbound message path binds a claimed msg.From to. The distinction is the
-// direction of the failure: IsMember as an allow-list makes a LAGGING replica
-// reject a legitimate peer (see IsRemoved), whereas requiring the claimed
-// sender to match what the configuration committed for it can only ever refuse
-// a peer this replica has not yet been told about — and a replica that has not
-// been told about a peer has, by construction, never sent that peer a request
-// for it to be answering. Everything here arrived through Raft consensus (a
-// committed EntryInitialMembership or ConfigChange), which is what makes it a
-// source no inbound message can forge.
-//
-// It allocates nothing, unlike GetMembership, because it is read once per
-// inbound quorum-bearing message, and it takes ONE snapshot load so the
-// identity and the address it returns can never straddle a membership change.
-// Safe for concurrent access from any goroutine: it reads an atomic pointer to
-// an immutable snapshot.
+// MemberBinding returns what the committed configuration authorizes replicaID with and whether it is a member, from one snapshot load without allocating. Safe for concurrent use.
 func (p *Peer) MemberBinding(replicaID uint64) (MemberBinding, bool) {
 	snap := p.membershipSnap.Load()
 	if snap == nil {
@@ -2527,48 +1433,12 @@ func (p *Peer) MemberBinding(replicaID uint64) (MemberBinding, bool) {
 	}, true
 }
 
-// IsJoining reports whether THIS replica's configuration is known-incomplete —
-// it was started with join=true and has not yet replayed the entries naming the
-// rest of the shard. It is a statement about the local replica, never about a
-// peer, and it is not an authorization bypass. See the joining field.
-//
-// Safe for concurrent access from any goroutine.
+// IsJoining reports whether this replica's configuration is known to be incomplete. Safe for concurrent use.
 func (p *Peer) IsJoining() bool {
 	return p.joining.Load()
 }
 
-// IsRemoved reports whether replicaID carries a committed Removed tombstone in
-// this shard's configuration. It is the per-shard authorization predicate for
-// INBOUND messages, and it is a DENY-list on purpose.
-//
-// A replica's configuration is replicated state that LAGS BY DESIGN: a follower
-// legitimately has not yet applied the config change that added the current
-// leader. Using the member set as an allow-list therefore makes a stale replica
-// drop the very messages that would bring it up to date — it rejects the
-// leader's Replicate, rejects its Heartbeat, and rejects the InstallSnapshot
-// that would repair it, permanently, while the shard silently runs with reduced
-// redundancy. Membership cannot be an authorization oracle because it is not
-// guaranteed fresh.
-//
-// The removed set has the opposite character: it is MONOTONE. Entries are only
-// ever added, by a committed config change, so a stale replica's failure mode is
-// not yet knowing about a removal — which the next committed entry fixes — and
-// never wrongly rejecting a legitimate peer. That is the only membership-derived
-// fact it is safe to enforce on the receive path.
-//
-// This matches both reference implementations. etcd checks exactly this and
-// nothing else before stepping a message (EtcdServer.Process:
-// "cannot process message from removed member"), and its transport comments name
-// the lagging-follower case explicitly. hashicorp/raft, which Consul uses,
-// performs no sender-membership check on appendEntries at all and applies its
-// configuration test only to VOTE requests — which is where our equivalent guard
-// lives (see raft.handleVoteRequest).
-//
-// Authentication proper is the transport's job: mandatory mTLS with a verified
-// node certificate plus the deployment ID. This is defence in depth on top of an
-// already-authenticated peer.
-//
-// Safe for concurrent access from any goroutine.
+// IsRemoved reports whether replicaID has a committed Removed tombstone; the monotone removed set is the inbound deny-list. Safe for concurrent use.
 func (p *Peer) IsRemoved(replicaID uint64) bool {
 	snap := p.membershipSnap.Load()
 	if snap == nil {
@@ -2577,38 +1447,7 @@ func (p *Peer) IsRemoved(replicaID uint64) bool {
 	return snap.isRemoved(replicaID)
 }
 
-// IsRemovedIdentity reports whether identity — the AUTHENTICATED node identity
-// of a connection, derived from its leaf certificate's public key — is one this
-// shard has committed a removal for.
-//
-// It is the same deny-list as IsRemoved, asked of the one fact about an inbound
-// message that its sender cannot choose. IsRemoved alone was never sufficient:
-// it is evaluated against the CLAIMED msg.From, and a removed replica still
-// holds its private key, so it authenticates normally and evades its own
-// tombstone by naming any other replica ID. That evasion is closed here, and
-// only here, because only here is the question asked of the connection rather
-// than of the message.
-//
-// Every property that makes IsRemoved safe to enforce on the receive path holds
-// identically: the set is MONOTONE — entries are only ever added, by a committed
-// config change, and nothing evicts them — so a stale replica's failure mode is
-// not yet knowing about a removal, which the next committed entry fixes, and
-// never wrongly refusing a legitimate peer. Two facts specific to this one:
-//
-//   - An identity is bound to ONE replica ID at a time
-//     (raft.membership.identityHolder refuses a duplicate at config-change time)
-//     and handleRemoveNode moves it out of the active map as it records it here,
-//     so a live member's identity can never appear in this set.
-//   - The empty identity is never removed, so a connection with no
-//     authenticated identity falls through to the gates that can judge it
-//     instead of being denied by a tombstone it cannot be told apart from.
-//
-// RESIDUAL: a shard whose members carry no committed identities records nothing
-// here, and its removal deny-list stays what it was — the claimed-From check,
-// evadable by naming another ID. There is no replicated fact for such a shard to
-// answer this question with. See proto.Membership.RemovedIdentities.
-//
-// Safe for concurrent access from any goroutine.
+// IsRemovedIdentity reports whether the authenticated connection identity has a committed removal; the empty identity is never removed. Safe for concurrent use.
 func (p *Peer) IsRemovedIdentity(identity string) bool {
 	snap := p.membershipSnap.Load()
 	if snap == nil {
@@ -2617,17 +1456,7 @@ func (p *Peer) IsRemovedIdentity(identity string) bool {
 	return snap.isRemovedIdentity(identity)
 }
 
-// IdentityHolder reports the replica the COMMITTED configuration binds the
-// given node identity to, and whether there is one. The receive gate asks it
-// before admitting a sender on the strength of a non-committed source — the
-// pending configuration or the operator anchor — because those sources name
-// senders the committed configuration does not know, so a keypair the
-// committed configuration already binds to another replica could otherwise be
-// admitted under a second ID. The committed configuration is what every peer
-// authorizes against, and it is current at the moment of the question, which
-// no start-time check can be. False when nothing is committed yet.
-//
-// Safe for concurrent access from any goroutine.
+// IdentityHolder reports the replica the committed configuration binds identity to, if any. Safe for concurrent use.
 func (p *Peer) IdentityHolder(identity string) (uint64, bool) {
 	snap := p.membershipSnap.Load()
 	if snap == nil {
@@ -2636,22 +1465,7 @@ func (p *Peer) IdentityHolder(identity string) (uint64, bool) {
 	return snap.identityHolder(identity)
 }
 
-// DiagRaftState returns diagnostic raft state for debugging pipeline stalls.
-// Returns term, committed index, processed index, lastIndex, number of
-// pending messages, and the raft state name (leader/follower/candidate).
-//
-// The state string also carries the two conditions under which this replica
-// cannot participate in an election. Both are fail-closed and were otherwise
-// invisible, which is the worst possible combination: they present as a shard
-// that will not elect a leader while every node is up and reachable, with
-// nothing in the diagnostics to say why.
-//
-//   - "self-removed": the replica is absent from the current configuration, so
-//     startElection refuses to campaign. Permanent until a config change
-//     re-adds it.
-//   - "unreadable-log-denials=N": N votes were denied because this replica's
-//     own last log term could not be read (a compaction race, a torn tail, a
-//     closed LogDB), which denies every candidate regardless of its log.
+// DiagRaftState returns term, committed, processed, lastIndex, pending messages and a state string that also flags self-removed and unreadable-log-denials=N.
 func (p *Peer) DiagRaftState() (term, committed, processed, lastIdx uint64, msgs int, state string) {
 	r := p.r
 	var stateStr string
@@ -2695,18 +1509,7 @@ func (p *Peer) DiagRemotes() string {
 	return result
 }
 
-// RemoteProgress reports how far each follower has replicated, as the leader
-// currently understands it. It covers every remote the leader tracks: voters,
-// observers and witnesses, each tagged with its Role, so a caller that wants
-// voters only (quorum or health arithmetic) must filter on Role. It returns nil when this replica is not the leader,
-// because only a leader tracks remote progress at all.
-//
-// This is the structured form of what DiagRemotes renders as text, so the answer
-// to "which follower is behind, and why" is available to metrics, to the public
-// ShardInfo, and to anything that is not a human reading a log line, without
-// parsing that string.
-//
-// Caller must hold raftMu (or be the step worker): it reads Peer.r directly.
+// RemoteProgress returns the leader's view of every remote's replication, tagged by Role, or nil when not leader; the caller must hold raftMu.
 func (p *Peer) RemoteProgress() []RemoteProgress {
 	r := p.r
 	if r.state != leader {
@@ -2762,10 +1565,7 @@ const (
 	RoleWitness Role = "witness"
 )
 
-// RemoteProgress is one follower's replication position as the leader
-// understands it. Every field is the leader's local belief, which is what makes
-// it useful for diagnosing a stall: a follower stuck in probe with a stale match
-// index looks different from one that is simply behind.
+// RemoteProgress is one follower's replication position as the leader believes it.
 type RemoteProgress struct {
 	// ReplicaID identifies the follower.
 	ReplicaID uint64
@@ -2793,15 +1593,7 @@ type RemoteProgress struct {
 	IsObserver bool
 }
 
-// hasStateChanged returns true if the hard state has changed since the
-// last GetUpdate call. Checks term, vote, commit index and the owed vote
-// window.
-//
-// It also reports true while a re-persist is owed (see stateUnpersisted).
-// HasUpdate is what wakes the step worker; if this returned false there, the
-// shard would sit idle with unpersisted hard state until unrelated traffic
-// happened to move term, vote or commit — which on an idle follower that has
-// just granted a vote is exactly when it matters.
+// hasStateChanged reports whether term, vote, commit or the owed vote window changed since the last GetUpdate, or a re-persist is owed.
 func (p *Peer) hasStateChanged() bool {
 	return p.stateUnpersisted ||
 		p.r.term != p.prevState.Term ||
@@ -2822,11 +1614,7 @@ func (p *Peer) RateLimiter() *server.InMemRateLimiter {
 	return p.r.rl
 }
 
-// AppliedToTerm returns the term of the last applied entry tracked by the
-// in-memory log. This is reliable even after compaction because it is
-// cached in inMemory.appliedToTerm and never requires a LogDB lookup.
-// Used by the snapshot pool to record the correct term in snapshot metadata
-// without risking a stale 0 from a compacted LogReader.
+// AppliedToTerm returns the cached term of the last applied entry, valid after compaction.
 func (p *Peer) AppliedToTerm() uint64 {
 	return p.r.log.inmem.appliedToTerm.Load()
 }
@@ -2837,25 +1625,12 @@ func (p *Peer) CommittedIndex() uint64 {
 	return p.r.log.committed
 }
 
-// LogMarkers returns the Raft log's committed and processed markers as a
-// consistent pair. Must only be called with the same exclusive Peer access
-// Commit requires — the step worker goroutine, or the commit worker under the
-// node's raftMu (the single-owner invariant CommittedIndex documents); it
-// exists so an owner can PUBLISH both markers for goroutines that may not
-// touch the Peer at all, and so an owner about to extract committed entries
-// can tell whether the log has moved its applied frontier out from under the
-// state machine (engine: snapshotAdoptionPending).
-// Unlike DiagRaftState it formats nothing and allocates nothing, so it is
-// cheap enough to call on every tick.
+// LogMarkers returns the committed and processed markers as a consistent pair; call it with Commit's exclusive access.
 func (p *Peer) LogMarkers() (committed, processed uint64) {
 	return p.r.log.committed, p.r.log.processed
 }
 
-// RecoveryClamp returns the clamp NewPeer applied to a recovered commit index
-// that was ahead of the recovered log; its Applied method reports whether
-// there was one. The raft package does not log it: the caller owns the logger.
-// It is set once, at construction, so reading it before the Peer is handed to
-// a worker needs no synchronization.
+// RecoveryClamp returns the clamp NewPeer applied to a recovered commit index ahead of the log; set once at construction.
 func (p *Peer) RecoveryClamp() RecoveryClamp {
 	return p.r.log.recoveryClamp
 }
@@ -2876,19 +1651,12 @@ func (c AppliedClamp) Applied() bool {
 	return c.SMApplied > c.Committed
 }
 
-// AppliedClamp returns the clamp SetProcessedIndex applied to a state machine
-// applied index that was ahead of the recovered commit index; its Applied
-// method reports whether there was one. The raft package does not log it: the
-// caller owns the logger. It is set by SetProcessedIndex, which runs before the
-// Peer is handed to a worker, so reading it then needs no synchronization.
+// AppliedClamp returns the clamp SetProcessedIndex applied to an applied index ahead of the commit index.
 func (p *Peer) AppliedClamp() AppliedClamp {
 	return p.appliedClamp
 }
 
-// UnfoldedConfig describes SetProcessedIndex failing to fold the committed
-// config changes below the state machine's applied index, which arms the
-// staleness watermark so the replica will not campaign until they are folded.
-// The zero value means the fold was complete.
+// UnfoldedConfig describes an incomplete config fold in SetProcessedIndex; the zero value means complete.
 type UnfoldedConfig struct {
 	// Index is the applied index the fold had to reach.
 	Index uint64
@@ -2908,20 +1676,12 @@ func (c UnfoldedConfig) Recorded() bool {
 	return c.recorded
 }
 
-// UnfoldedConfig returns the incomplete fold SetProcessedIndex recorded; its
-// Recorded method reports whether there was one. The raft package does not
-// log it: the caller owns the logger. It is set by SetProcessedIndex, which
-// runs before the Peer is handed to a worker, so reading it then needs no
-// synchronization.
+// UnfoldedConfig returns the incomplete fold SetProcessedIndex recorded, if any.
 func (p *Peer) UnfoldedConfig() UnfoldedConfig {
 	return p.unfoldedConfig
 }
 
-// syncLeaderID copies the raft state machine's leaderID to the atomic
-// field on Peer. This is called after every operation that may change
-// leadership (tick, step, GetUpdate). The raft struct is not thread-safe,
-// but the atomic leaderID on Peer provides safe concurrent reads for
-// LeaderID() and IsLeader().
+// syncLeaderID copies raft's leaderID to the atomic field on Peer for concurrent readers.
 func (p *Peer) syncLeaderID() {
 	ready := p.computeReadReady()
 	// Odd for the duration of the update, even once settled: see leaderSeq.
@@ -2932,21 +1692,7 @@ func (p *Peer) syncLeaderID() {
 	p.leaderSeq.Add(1)
 }
 
-// computeReadReady reports whether the leader of the current term, as this
-// replica knows it, has committed an entry of the current term.
-//
-// On the leader this is hasCommittedEntryAtCurrentTerm, the very test
-// handleLeaderReadIndex applies before it serves a read, so a ReadIndex
-// stepped after a true result is not refused with ErrReadIndexNotReady while
-// the replica still leads that term.
-//
-// On a follower the same predicate carries the leader's readiness without any
-// extra protocol. A follower's commit index only ever comes from a leader, and
-// only a leader of the follower's current term T can have told it about an
-// entry of term T (the entry did not exist before that leader created it). So
-// a committed entry of term T in the follower's log means the unique leader of
-// T had already committed it: that leader is read-ready for T, and a ReadIndex
-// forwarded to it is not refused as not-ready either.
+// computeReadReady reports whether the current term's leader has committed an entry of that term, which a follower can infer from its own log.
 func (p *Peer) computeReadReady() bool {
 	r := p.r
 	if r.leaderID == noLeader {
@@ -2966,22 +1712,13 @@ func (p *Peer) computeReadReady() bool {
 	return true
 }
 
-// LeaderAndTerm returns the leader ID and the term TOGETHER, as a pair that
-// actually co-existed. Callers that report both — OnLeaderUpdated and anything
-// deriving a leadership event — must use this rather than LeaderID() and Term()
-// separately, which can straddle a syncLeaderID and yield a combination that
-// never held.
-//
-// Safe for concurrent access from any goroutine.
+// LeaderAndTerm returns the leader ID and term as a consistent pair. Safe for concurrent use.
 func (p *Peer) LeaderAndTerm() (uint64, uint64) {
 	leaderID, term, _ := p.LeaderTermReady()
 	return leaderID, term
 }
 
-// LeaderTermReady returns the leader ID, the term and whether that term's
-// leader is read-ready (see computeReadReady), as one CONSISTENT TRIPLE: the
-// three were published together by the same syncLeaderID. Safe from any
-// goroutine.
+// LeaderTermReady returns the leader ID, term and read-readiness as a consistent triple. Safe for concurrent use.
 func (p *Peer) LeaderTermReady() (leaderID, term uint64, readReady bool) {
 	for {
 		before := p.leaderSeq.Load()

@@ -21,32 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// InstallSnapshot from a replica that is not this term's leader
-//
-// handleSnapshot must not open with two unconditional lines:
-//
-//	r.electionTick = 0
-//	r.leaderID = msg.From
-//
-// The heartbeat path is gated on sender identity (ErrHeartbeatNotFromLeader)
-// precisely because a Heartbeat proves nothing about the sender's log. An
-// InstallSnapshot proves strictly less and does strictly more: no prevLogIndex,
-// no prevLogTerm, no entries, and its non-matching branch REPLACES the entire
-// log and rebuilds the voting set from a Membership the sender supplied, so it
-// needs the same gate.
-//
-// Without it two separate capabilities fall out, and both are exercised below.
-//
-//  1. ELECTION SUPPRESSION, available even on the REJECT path. Run before the
-//     ss.Index <= committed rejection, those two lines mean retransmitting one
-//     obsolete snapshot holds a healthy follower's election timer at zero AND
-//     installs the sender as its leaderID — which makes handleVoteRequest's leader-lease test
-//     deny PreVotes and dropHighTermVote discard higher-term RequestVotes. A
-//     replica that cannot be made to campaign or to vote is removed from every
-//     quorum without ever being removed from the configuration.
-//
-//  2. LOG REPLACEMENT on the accept path, from a sender Election Safety says
-//     cannot be this term's leader.
+// InstallSnapshot from a replica that is not this term's leader must neither reset the election timer, set leaderID, nor replace the log.
 
 // followerWithEstablishedLeader builds a follower at term 5 that already
 // recognises replica 2 as this term's leader and holds committed entries 1..5.
@@ -69,15 +44,7 @@ func followerWithEstablishedLeader(t *testing.T) *raft {
 	return r
 }
 
-// TestInstallSnapshot_SameTermNonLeaderCannotReplaceTheLog is the attacker test
-// for the accept path. Replica 3 sends a snapshot at index 40 — above the
-// committed index, so it takes the non-matching branch and would restore the log
-// wholesale — at the SAME term, while replica 2 is this term's leader.
-//
-// Election Safety says term 5 has exactly one leader, so replica 3 is either a
-// deposed sender replaying an old transfer or a forgery. Either way its snapshot
-// must move nothing: adopting it discards entries 1..5 that the real leader
-// replicated and rebuilds the voting set from a membership replica 3 chose.
+// TestInstallSnapshot_SameTermNonLeaderCannotReplaceTheLog checks a same-term non-leader's snapshot changes nothing.
 func TestInstallSnapshot_SameTermNonLeaderCannotReplaceTheLog(t *testing.T) {
 	quietLogs(t)
 
@@ -114,16 +81,7 @@ func TestInstallSnapshot_SameTermNonLeaderCannotReplaceTheLog(t *testing.T) {
 	}
 }
 
-// TestInstallSnapshot_RejectedSnapshotFromNonLeaderCannotSuppressTheElection is
-// the attacker test for the capability that survives even when the snapshot is
-// REJECTED. The snapshot is at index 3, at or below the committed index, so
-// handleSnapshot's first branch throws it away — but the election timer reset and
-// the leaderID install both happened above that branch.
-//
-// This is the cheaper and more durable half of the defect: the attacker needs no
-// valid snapshot at all, just one stale artifact re-sent on a timer, and the
-// victim is silently excluded from every subsequent election. Suppressing an
-// election is not a lesser power than winning one.
+// TestInstallSnapshot_RejectedSnapshotFromNonLeaderCannotSuppressTheElection checks a rejected non-leader snapshot resets no timer and sets no leader.
 func TestInstallSnapshot_RejectedSnapshotFromNonLeaderCannotSuppressTheElection(t *testing.T) {
 	quietLogs(t)
 
@@ -209,12 +167,7 @@ func TestInstallSnapshot_NoLeaderYetStillInstalls(t *testing.T) {
 	}
 }
 
-// TestInstallSnapshot_HigherTermSenderStillInstalls is the third liveness
-// control, and it is the one the gate's placement depends on. step() installs a
-// leader-originated sender at a HIGHER term via becomeFollower(msg.Term,
-// msg.From) before the handler runs, so by the time the gate reads r.leaderID
-// the new leader is already there. A gate that read the PRE-step leader would
-// reject every legitimate snapshot from a newly elected leader.
+// TestInstallSnapshot_HigherTermSenderStillInstalls checks a newly elected higher-term leader's snapshot installs.
 func TestInstallSnapshot_HigherTermSenderStillInstalls(t *testing.T) {
 	quietLogs(t)
 

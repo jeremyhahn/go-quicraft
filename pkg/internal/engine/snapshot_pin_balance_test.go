@@ -26,19 +26,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// pinCountBarrier wraps a SnapshotBarrier and records the RAW net in-flight
-// reference count per epoch, INCLUDING negatives.
-//
-// The production Barrier (and the engine's testBarrier) delete an epoch's entry
-// once its count drops to <= 0, which makes a double-free indistinguishable
-// from a balanced release. That erasure is exactly what a leak/double-free
-// audit must not inherit: an epoch released once too often can drop a count
-// another concurrent writer still needs to 1 -> 0, letting PurgeEpochsBefore
-// drop a live DEK. This wrapper therefore keeps the running sum and the LOWEST
-// value each epoch ever reached, so both directions are provable:
-//
-//	net[e] > 0 after a full cycle  => LEAK (the DEK can never be purged)
-//	low[e] < 0 at any point        => DOUBLE-FREE / under-count
+// pinCountBarrier records the raw net in-flight count per epoch and its lowest value: net > 0 is a leak, low < 0 a double-free.
 type pinCountBarrier struct {
 	SnapshotBarrier
 	mu     sync.Mutex
@@ -98,8 +86,7 @@ func (b *pinCountBarrier) snapshotCounts() string {
 	return out
 }
 
-// assertBalanced asserts the net in-flight count for EVERY epoch is exactly
-// zero and that no epoch ever went negative.
+// assertBalanced asserts every epoch's net count is zero and none went negative.
 func (b *pinCountBarrier) assertBalanced(t *testing.T, what string) {
 	t.Helper()
 	b.mu.Lock()
@@ -138,12 +125,7 @@ func (b *pinCountBarrier) snapshotCountsLocked() string {
 
 var _ SnapshotBarrier = (*pinCountBarrier)(nil)
 
-// TestPinBalance_FrameWriter_SuccessHoldsExactlyOnePinPerEpoch proves the
-// SUCCESS contract of the frame writer, which is the save path:
-// every epoch it sealed a frame under is held with a net count of exactly
-// ONE when Close returns -- not zero, because saveSnapshot relies on the pin
-// surviving until the artifact's durable record exists, and not two, which
-// its single deferred ReleasePins would leave leaked forever.
+// TestPinBalance_FrameWriter_SuccessHoldsExactlyOnePinPerEpoch: on success each sealed epoch holds exactly one pin.
 func TestPinBalance_FrameWriter_SuccessHoldsExactlyOnePinPerEpoch(t *testing.T) {
 	// Rotate after the first frame so the artifact spans TWO epochs; this is
 	// the mixed-epoch case the pins exist to protect.
@@ -185,12 +167,7 @@ func TestPinBalance_FrameWriter_SuccessHoldsExactlyOnePinPerEpoch(t *testing.T) 
 	}
 }
 
-// TestPinBalance_FrameWriter_ErrorReleasesEverythingAndReportsNoEpochs covers
-// the writer's whole failure family: a sealing failure and both write
-// failures route through the single fail helper, so proving it releases and
-// leaves Epochs empty proves the family -- the caller has nothing to release,
-// so there is neither a leak nor a double-free, and its deferred ReleasePins
-// is a no-op.
+// TestPinBalance_FrameWriter_ErrorReleasesEverythingAndReportsNoEpochs covers the writer's failure paths.
 func TestPinBalance_FrameWriter_ErrorReleasesEverythingAndReportsNoEpochs(t *testing.T) {
 	// Seal one frame successfully (pinning its epoch), then fail: the writer
 	// is holding a pin at the moment the error occurs.
@@ -327,12 +304,7 @@ func TestPinBalance_SaveSnapshot_EncryptFailureReturnsToZero(t *testing.T) {
 	barrier.assertBalanced(t, "saveSnapshot encrypt failure")
 }
 
-// bulkThenFailSnapshotter writes n bytes successfully and then fails.
-//
-// The size matters: it must be at least one snapshotEncryptChunkSize so the
-// frame writer has actually EMITTED a frame — and therefore pinned an epoch —
-// before the failure. A snapshotter that fails without filling the chunk buffer
-// leaks nothing, and a test built on one would pass against the defect.
+// bulkThenFailSnapshotter writes n bytes then fails; n must fill a chunk so a frame is emitted first.
 type bulkThenFailSnapshotter struct {
 	snapshotTestSnapshotter
 	bytes int
@@ -357,19 +329,7 @@ func (s *bulkThenFailSnapshotter) SaveSnapshotGated(_ context.Context, w io.Writ
 	return s.err
 }
 
-// TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero covers the way
-// out of saveSnapshot taken when the state machine's SaveSnapshot fails.
-//
-// Any frames already emitted have registered their epoch as in-flight, so an
-// early return that skipped the frame writer's release would leave them
-// registered forever. The
-// effect is not a lost error but a key-lifecycle one: PurgeEpochsBefore can
-// never retire a DEK that still has an in-flight reference, so the key material
-// is retained for the life of the process.
-//
-// It is reachable whenever a state machine writes a full chunk and then fails,
-// which is why the fixture writes snapshotEncryptChunkSize+1 bytes rather than
-// a token payload.
+// TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero: a failing SaveSnapshot releases its epoch pins.
 func TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero(t *testing.T) {
 	snapDir := t.TempDir()
 	cfg := config.Config{ShardID: 12, ReplicaID: 1, CompactionOverhead: 50}
@@ -404,28 +364,12 @@ func TestPinBalance_SaveSnapshot_StateMachineFailureReturnsToZero(t *testing.T) 
 	barrier.assertBalanced(t, "saveSnapshot state-machine failure")
 }
 
-// TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero covers every return
-// between the last frame being sealed and the end of saveSnapshot: fsync
-// failure, stat failure, MaxSnapshotSize exceeded, and the deferred writeback
-// error Linux reports at Close. Each must release the frame writer's epoch
-// pins.
-//
-// Releasing on individual error paths is fragile, because every later return
-// is a new way to drop the pins. The release is a single deferred call
-// registered where the pins begin to exist, so it covers every exit by
-// construction. This test pins the property using the one
-// of those four paths a test can trigger deterministically: an artifact that
-// exceeds MaxSnapshotSize.
-//
-// The payload is deliberately larger than one snapshotEncryptChunkSize, so the
-// writer has actually emitted a frame and pinned an epoch before the size check
-// refuses the save. A smaller payload leaks nothing and would pass against the
-// defect.
+// TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero: a save refused by MaxSnapshotSize after sealing frames releases its pins.
 func TestPinBalance_SaveSnapshot_SizeLimitReturnReturnsToZero(t *testing.T) {
 	snapDir := t.TempDir()
 	cfg := config.Config{ShardID: 13, ReplicaID: 1, CompactionOverhead: 50}
 	cfg.SetDefaults()
-	// Below the payload, so the save is refused AFTER frames have been sealed.
+	// Below the payload, so the save is refused after frames are sealed.
 	cfg.MaxSnapshotSize = snapshotEncryptChunkSize
 
 	snapshotter := &bulkSnapshotter{bytes: snapshotEncryptChunkSize * 3}

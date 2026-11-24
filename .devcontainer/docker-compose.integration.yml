@@ -1,18 +1,4 @@
-# docker-compose.integration.yml - containerised runner for the E2E suite.
-#
-# Usage:
-#   docker compose -f .devcontainer/docker-compose.integration.yml up --build \
-#       --abort-on-container-exit --exit-code-from test-runner
-#
-# There is a single service. The suite builds its own clusters:
-# newTestCluster in test/integration/e2e starts N quicraft.Host instances over
-# real QUIC with mTLS on loopback ports, so no cross-container topology is
-# needed. The container provides the pinned toolchain and the tuned QUIC UDP
-# buffers the entrypoint sets.
-#
-# The builder stage downloads modules with the gomodauth BuildKit secret, taken
-# from the gitignored .devcontainer/.env (format: .env.example). The runner
-# stage holds only the compiled binary, so it needs no credentials at run time.
+# Runs the E2E suite in one container: docker compose -f .devcontainer/docker-compose.integration.yml up --build --abort-on-container-exit --exit-code-from test-runner
 
 services:
 

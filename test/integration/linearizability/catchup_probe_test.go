@@ -22,27 +22,7 @@ import (
 	"time"
 )
 
-// TestRestartedReplicaResumesReplication asserts that a replica which restarts
-// while the leader keeps writing is sent entries again, WITHOUT depending on a
-// leader change to rescue it.
-//
-// This is the isolated form of the rolling-restart soak's "restarted replica
-// catches up" assertion. The soak restarts a node every few seconds, so an
-// election is usually in flight and a fresh leader rebuilds its per-peer
-// replication state from scratch — which masks a leader that has stopped
-// sending to one peer. Here the leadership deliberately stays put, so the
-// leader's own recovery path is the only thing under test.
-//
-// The failure it guards against is a leader whose per-peer send window is full
-// of messages that were delivered to the peer's PREVIOUS incarnation: those
-// acks can never arrive, the window never drains, and the peer is starved
-// indefinitely while heartbeats keep it looking healthy. The cluster still
-// commits on the remaining majority, so nothing else reports a problem.
-//
-// Several restart cycles are needed: the first one or two find the leader's
-// window for that peer already backed off (a rejection or an eviction moved it
-// out of the pipelining state), which recovers on its own. The steady state,
-// where the peer is dropped mid-pipeline, is what stalls.
+// TestRestartedReplicaResumesReplication checks a repeatedly restarted follower is sent entries again with no leader change.
 func TestRestartedReplicaResumesReplication(t *testing.T) {
 	const (
 		numNodes   = 5

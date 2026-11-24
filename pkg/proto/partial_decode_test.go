@@ -16,18 +16,7 @@ package proto
 
 import "testing"
 
-// TestConfigChangeUnmarshalLeavesNoPartialState pins that a failed decode does
-// not mutate the receiver.
-//
-// A partial decode that left the NEW ConfigChangeID, Type, ReplicaID and
-// Address on the receiver beside the OLD NodeIdentity would produce a value
-// describing no configuration any writer produced. NodeIdentity is what the
-// receive-side gate authorizes the member by, so a stale one beside a new
-// target is the same shape Membership.UnmarshalFrom was
-// hardened against.
-//
-// Every truncation point is swept, so the guarantee holds wherever the payload
-// stops rather than at the one boundary a single fixture would probe.
+// TestConfigChangeUnmarshalLeavesNoPartialState verifies a failed decode at every truncation point leaves the receiver unchanged.
 func TestConfigChangeUnmarshalLeavesNoPartialState(t *testing.T) {
 	full := ConfigChange{
 		ConfigChangeID: 1,

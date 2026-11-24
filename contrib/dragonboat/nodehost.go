@@ -133,24 +133,13 @@ type removedKey struct {
 	replicaID uint64
 }
 
-// defaultQueryTimeout is the default deadline for local state machine
-// queries in ReadLocalNode. Zero means no deadline, matching dragonboat,
-// whose ReadLocalNode calls sm.Lookup without one. SetQueryTimeout is a
-// quicraft extension that opts into a bound.
+// defaultQueryTimeout is the ReadLocalNode query deadline; zero means none, as in dragonboat.
 const defaultQueryTimeout time.Duration = 0
 
-// maxDetachedLookups bounds the timed local lookups (see SetQueryTimeout)
-// in flight on one NodeHost. A lookup holds its slot until the state
-// machine's Lookup or NALookup actually returns, so lookups that outlive
-// their deadline cannot accumulate without limit; a timed read that finds
-// every slot taken is refused with ErrSystemBusy.
+// maxDetachedLookups bounds timed lookups in flight; a timed read finding no slot gets ErrSystemBusy.
 const maxDetachedLookups = 64
 
-// defaultWaitReadyTimeout bounds the Start*Replica readiness wait used
-// when Config.WaitReady is set. Dragonboat blocks on the node's
-// initializedC until the node is initialized or stopped; the adapter
-// polls and gives up after this timeout so a shard that never
-// initializes cannot wedge the caller forever.
+// defaultWaitReadyTimeout bounds the Start*Replica readiness wait when Config.WaitReady is set.
 const defaultWaitReadyTimeout = 30 * time.Second
 
 // waitReadyPollInterval is how often the WaitReady loop re-checks shard
@@ -164,41 +153,17 @@ type NodeHost struct {
 	host   *quicraft.Host
 	config dbConfig.NodeHostConfig
 
-	// removed tracks shard/replica pairs that have been permanently
-	// removed via RemoveData or SyncRemoveData. Dragonboat rejects
-	// attempts to restart a replica whose data was removed.
-	//
-	// The guard is backed by on-disk marker files under NodeHostDir
-	// (see removedMarkerDir): markRemoved persists a marker and
-	// NewNodeHost reloads the markers at startup, so the removal
-	// decision survives process restarts, matching dragonboat's
-	// persistent dir-deleted marker.
-	//
-	// This map grows monotonically and never evicts entries. This is
-	// intentional and matches dragonboat's behavior: once a replica's
-	// data is removed, that decision is permanent. The map is bounded
-	// by the total number of unique (shardID, replicaID) pairs ever
-	// removed, which in practice is small (typically fewer than the
-	// total number of shards configured on this host).
+	// removed holds permanently removed shard/replica pairs, persisted as marker files under NodeHostDir and reloaded at startup.
 	removed sync.Map // map[removedKey]struct{}
 
-	// queryTimeout is the timeout for local state machine queries in
-	// ReadLocalNode, stored as nanoseconds for atomic access. Defaults to
-	// 0 (no deadline), matching dragonboat's ReadLocalNode, which calls
-	// the state machine's Lookup with no deadline at all. Use
-	// SetQueryTimeout to opt into a bound.
+	// queryTimeout is the ReadLocalNode query deadline in nanoseconds; 0 means none.
 	queryTimeout atomic.Int64
 
 	// detachedLookups counts the timed local lookups whose state machine
 	// call has not returned yet, bounded by maxDetachedLookups.
 	detachedLookups atomic.Int64
 
-	// shardConfigs retains the dragonboat Config each shard was started
-	// with, keyed by shardID. OrderedConfigChange is only expressible in
-	// the dragonboat Config, and quicraft's host-level staleness check
-	// never consults it, so the adapter must remember it to reproduce
-	// dragonboat's rule that ConfigChangeIndex is ignored unless
-	// OrderedConfigChange is true.
+	// shardConfigs keeps each shard's dragonboat Config so OrderedConfigChange can be honoured.
 	shardConfigs sync.Map // map[uint64]dbConfig.Config
 }
 
@@ -215,12 +180,7 @@ type SnapshotOption struct {
 	// OverrideCompactionOverhead is true.
 	CompactionOverhead uint64
 
-	// CompactionIndex specifies an exact log index for compaction.
-	// Mutually exclusive with CompactionOverhead; setting both
-	// causes Validate to return an error.
-	//
-	// NOTE: quicraft does not support CompactionIndex. Setting a
-	// non-zero value causes Validate to return ErrInvalidOption.
+	// CompactionIndex is not supported by quicraft; a non-zero value fails Validate with ErrInvalidOption.
 	CompactionIndex uint64
 
 	// OverrideCompactionOverhead controls whether CompactionOverhead
@@ -232,11 +192,7 @@ type SnapshotOption struct {
 	Exported bool
 }
 
-// Validate checks that the SnapshotOption fields are consistent and
-// valid. CompactionOverhead and CompactionIndex are mutually exclusive:
-// setting both is an error. Additionally, setting CompactionIndex when
-// OverrideCompactionOverhead is true is always rejected because quicraft
-// does not support index-based compaction.
+// Validate rejects setting both CompactionOverhead and CompactionIndex, and any CompactionIndex.
 func (o SnapshotOption) Validate() error {
 	if o.CompactionOverhead > 0 && o.CompactionIndex > 0 {
 		return &CompactionIndexNotSupportedError{}
@@ -329,10 +285,7 @@ type ShardInfo struct {
 	// IsWitness is true if this replica is a voting witness.
 	IsWitness bool
 
-	// StateMachineType identifies the state machine variant using
-	// dragonboat's numbering (Regular=1, Concurrent=2, OnDisk=3), as
-	// defined by the statemachine package's Type constants. Quicraft's
-	// internal codes (0/1/2) are translated during conversion.
+	// StateMachineType uses dragonboat's numbering (Regular=1, Concurrent=2, OnDisk=3), translated from quicraft's 0/1/2.
 	StateMachineType uint64
 
 	// Pending reports that details of this shard node are not available
@@ -377,13 +330,7 @@ func (e *NodeHostConstructionError) Unwrap() error {
 	return e.Err
 }
 
-// validateNodeHostConfig runs the dragonboat construction-time config
-// checks, mirroring NewNodeHost in dragonboat, which calls Validate then
-// Prepare before doing anything else. Skipping them would silently accept
-// configurations that cannot work: an empty NodeHostDir resolves the
-// removed-replica marker directory relative to the process working
-// directory, and a gossip deployment would construct successfully and then
-// never resolve its peers.
+// validateNodeHostConfig runs dragonboat's construction-time Validate and Prepare checks.
 func validateNodeHostConfig(cfg *dbConfig.NodeHostConfig) error {
 	if err := cfg.Validate(); err != nil {
 		return &NodeHostConstructionError{Reason: "config validation", Err: err}
@@ -394,14 +341,7 @@ func validateNodeHostConfig(cfg *dbConfig.NodeHostConfig) error {
 	return nil
 }
 
-// NewNodeHost creates a new NodeHost by converting the dragonboat-
-// compatible configuration to quicraft's HostConfig, then constructing
-// a quicraft Host with in-memory LogDB and no transport for test
-// isolation, or full transport for production use.
-//
-// Like Dragonboat, the host stores its Raft log and snapshots UNENCRYPTED at
-// rest (quicraft.WithoutEncryption). To encrypt, use NewNodeHostWithOptions
-// with quicraft.WithBarrier.
+// NewNodeHost builds a quicraft Host from a dragonboat config; storage is unencrypted at rest, use NewNodeHostWithOptions with quicraft.WithBarrier to encrypt.
 func NewNodeHost(nhConfig dbConfig.NodeHostConfig) (*NodeHost, error) {
 	if err := validateNodeHostConfig(&nhConfig); err != nil {
 		return nil, err
@@ -412,10 +352,7 @@ func NewNodeHost(nhConfig dbConfig.NodeHostConfig) (*NodeHost, error) {
 		return nil, &NodeHostConstructionError{Reason: "config conversion", Err: err}
 	}
 
-	// Dragonboat has no at-rest encryption, so the drop-in constructor keeps
-	// Dragonboat's behaviour and declares it: the Raft log and snapshots are
-	// stored as plaintext. NewNodeHostWithOptions is the way to encrypt, by
-	// passing quicraft.WithBarrier.
+	// The drop-in constructor stores the Raft log and snapshots as plaintext, as dragonboat does.
 	host, err := quicraft.NewHost(qcCfg, quicraft.WithoutEncryption())
 	if err != nil {
 		return nil, &NodeHostConstructionError{Reason: "host creation", Err: err}
@@ -435,19 +372,7 @@ func NewNodeHost(nhConfig dbConfig.NodeHostConfig) (*NodeHost, error) {
 	return nh, nil
 }
 
-// NewNodeHostWithOptions creates a new NodeHost with explicit quicraft
-// HostOptions. This allows callers to specify custom LogDB backends,
-// transport settings, and other advanced configuration.
-//
-// This method accepts QuicRaft-specific HostOption values, which is an
-// extension beyond the standard Dragonboat v4 API. It provides access
-// to QuicRaft-native capabilities such as WithMemoryLogDB() and
-// WithoutTransport() that have no Dragonboat equivalent.
-//
-// opts must state the host's at-rest encryption: quicraft.WithBarrier (or
-// WithShardBarriers) to encrypt, or quicraft.WithoutEncryption to store
-// plaintext. quicraft.NewHost refuses opts that state neither, and the error
-// is returned wrapped in a NodeHostConstructionError.
+// NewNodeHostWithOptions creates a NodeHost with quicraft HostOptions, which must state at-rest encryption (WithBarrier, WithShardBarriers or WithoutEncryption).
 func NewNodeHostWithOptions(nhConfig dbConfig.NodeHostConfig, opts ...quicraft.HostOption) (*NodeHost, error) {
 	if err := validateNodeHostConfig(&nhConfig); err != nil {
 		return nil, err
@@ -477,13 +402,7 @@ func NewNodeHostWithOptions(nhConfig dbConfig.NodeHostConfig, opts ...quicraft.H
 	return nh, nil
 }
 
-// checkContextDeadline mirrors the validation in dragonboat's
-// getTimeoutFromContext: the context must carry a deadline and that deadline
-// must not already have passed. Checking only for the deadline's presence, as
-// the adapter used to, accepted an already-expired context and let the
-// operation run to a zero-length timeout instead of reporting the caller's
-// bug. Dragonboat also returns the remaining time; quicraft takes the context
-// itself, so only the validation is needed.
+// checkContextDeadline requires a context deadline that has not passed, as dragonboat's getTimeoutFromContext does.
 func checkContextDeadline(ctx context.Context) error {
 	d, ok := ctx.Deadline()
 	if !ok {
@@ -495,14 +414,7 @@ func checkContextDeadline(ctx context.Context) error {
 	return nil
 }
 
-// checkTimeout reports ErrTimeoutTooSmall when the requested timeout is not
-// positive or is shorter than a single RTT. Dragonboat converts a timeout to
-// ticks with getTimeoutTick (whole milliseconds divided by the RTT) and
-// rejects a zero tick count in its propose, read-index, snapshot and
-// config-change requests; this is that check. Unlike getTimeoutTick it
-// rejects a negative timeout instead of letting it wrap through uint64 into
-// an enormous tick count. The comparison is in whole milliseconds, so it
-// cannot overflow for any RTT.
+// checkTimeout returns ErrTimeoutTooSmall for a non-positive timeout or one shorter than an RTT.
 func (nh *NodeHost) checkTimeout(timeout time.Duration) error {
 	if timeout <= 0 || uint64(timeout.Milliseconds()) < nh.config.RTTMillisecond {
 		return ErrTimeoutTooSmall
@@ -510,17 +422,7 @@ func (nh *NodeHost) checkTimeout(timeout time.Duration) error {
 	return nil
 }
 
-// SetQueryTimeout sets the deadline used for local state machine queries
-// in ReadLocalNode. This is a quicraft extension: dragonboat has no such
-// bound and calls the state machine's Lookup with no deadline, which is
-// also this adapter's default. A zero or negative duration restores that
-// default. This method is safe for concurrent use.
-//
-// Under a positive deadline a lookup that outlives it keeps running in the
-// background: a []byte query is copied first, so its buffer may be reused
-// after ErrTimeout, but a query of another type must not be mutated after
-// one. At most maxDetachedLookups such lookups run at once; a timed read
-// beyond that is refused with ErrSystemBusy.
+// SetQueryTimeout sets the ReadLocalNode query deadline (zero or negative disables it); a timed-out lookup keeps running in the background.
 func (nh *NodeHost) SetQueryTimeout(d time.Duration) {
 	if d < 0 {
 		d = 0
@@ -568,11 +470,7 @@ func (nh *NodeHost) ID() string {
 // Replica Management
 // ---------------------------------------------------------------------------
 
-// validateStartReplica performs the shared pre-start checks for the three
-// Start*Replica methods: the shard configuration must be valid, a joining
-// replica must not carry initial members (dragonboat returns
-// ErrInvalidShardSettings for that combination), and the replica must not
-// have been permanently removed.
+// validateStartReplica checks the shard config, that a joining replica has no initial members, and that the replica was not removed.
 func (nh *NodeHost) validateStartReplica(initialMembers map[uint64]Target, join bool, cfg dbConfig.Config) error {
 	if err := cfg.Validate(); err != nil {
 		return &ShardSettingsError{Err: err}
@@ -611,11 +509,7 @@ func (nh *NodeHost) startReplica(initialMembers map[uint64]Target, join bool, cr
 	return nil
 }
 
-// waitShardReady polls until the shard reports a known leader or the
-// bounded wait elapses. Dragonboat's startShard blocks on the node's
-// initializedC when Config.WaitReady is set; quicraft's StartShard returns
-// as soon as the node is registered, so bootstrap code that proposes right
-// after Start*Replica would otherwise fail as not ready.
+// waitShardReady polls until the shard knows a leader or the bounded wait elapses.
 func (nh *NodeHost) waitShardReady(shardID uint64) {
 	deadline := time.NewTimer(defaultWaitReadyTimeout)
 	defer deadline.Stop()
@@ -666,12 +560,7 @@ func (nh *NodeHost) orderedConfigChange(shardID uint64) bool {
 	return ok && cfg.OrderedConfigChange
 }
 
-// effectiveConfigChangeIndex returns the configChangeIndex to forward to
-// quicraft. Dragonboat's Config.OrderedConfigChange documents that
-// "when set to false (default), ConfigChangeIndex is ignored for
-// membership change requests" (internal/rsm.membership.isUpToDate), while
-// quicraft's host-level staleness check rejects any mismatching non-zero
-// value regardless. Zeroing the index restores dragonboat's behavior.
+// effectiveConfigChangeIndex zeroes the index unless OrderedConfigChange is set, as dragonboat ignores it then.
 func (nh *NodeHost) effectiveConfigChangeIndex(shardID, configChangeIndex uint64) uint64 {
 	if !nh.orderedConfigChange(shardID) {
 		return 0
@@ -745,27 +634,13 @@ func (nh *NodeHost) isRemoved(shardID, replicaID uint64) bool {
 	return removed
 }
 
-// markRemoved records a shard/replica pair as permanently removed, both
-// in memory and as a durable marker file so the guard survives restarts.
-// The in-memory record is stored first so the in-process guard holds even
-// when marker persistence fails; the persistence error is still returned
-// so callers learn the guard is not yet durable.
+// markRemoved records a removed shard/replica in memory and as a durable marker; a persistence error is returned.
 func (nh *NodeHost) markRemoved(shardID, replicaID uint64) error {
 	nh.removed.Store(removedKey{shardID, replicaID}, struct{}{})
 	return writeRemovalMarker(fsutil.SyncDir, nh.removedMarkerDir(), nh.removedMarkerPath(shardID, replicaID))
 }
 
-// writeRemovalMarker durably creates the marker file at path inside the
-// marker directory dir, fsyncing directories through syncDir. Every link of
-// the chain is made durable: dir's parent (NodeHostDir) so dir's own entry
-// survives a crash, the marker file, and then dir so the marker's entry
-// survives. The parent is synced even when dir already existed, because a
-// previous attempt may have created dir and failed before syncing it.
-//
-// dir is created with Mkdir, not MkdirAll: quicraft.NewHost has already
-// created NodeHostDir and synced its chain, so dir is the only directory
-// this function may create. A missing NodeHostDir is an error, not something
-// to recreate as a chain of directories nothing would sync.
+// writeRemovalMarker creates the marker file in dir and fsyncs the file, dir and dir's parent.
 func writeRemovalMarker(syncDir func(string) error, dir, path string) error {
 	if err := os.Mkdir(dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return &RemovalMarkerError{Op: "mkdir", Path: dir, Err: err}
@@ -826,22 +701,7 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 		return dbSM.Result{}, ErrInvalidSession
 	}
 
-	// Use ProposeWithSession (not SyncProposeWithSession) so that
-	// ProposalCompleted is NOT called automatically. Dragonboat's API
-	// contract requires the caller to advance the session by calling
-	// session.ProposalCompleted() after receiving a successful result.
-	// Auto-advancing would break duplicate detection: the session's
-	// series ID would already be incremented before the duplicate
-	// proposal is re-submitted, bypassing at-most-once enforcement.
-	//
-	// Release runs before the caller's ProposalCompleted, and Release ends
-	// the session's in-flight reservation (quicraft.ErrSessionBusy) — the
-	// adapter cannot hold it open across the return without breaking the
-	// contract above. The reservation therefore covers only the window in
-	// which this call is in flight; a second SyncPropose on the same session
-	// issued between this return and ProposalCompleted carries the same
-	// series and is answered as a retransmission, which is dragonboat's own
-	// rule for a session used before it was advanced.
+	// ProposeWithSession leaves ProposalCompleted to the caller, as dragonboat's contract requires.
 	rs, err := nh.host.ProposeWithSession(ctx, session.Inner(), cmd)
 	if err != nil {
 		return dbSM.Result{}, translateError(err)
@@ -884,15 +744,7 @@ func (nh *NodeHost) GetNoOPSession(shardID uint64) *dbClient.Session {
 	return dbClient.NewNoOPSession(shardID, nil)
 }
 
-// SyncGetSession registers a new client session through Raft consensus
-// and returns it. The session provides at-most-once proposal semantics.
-// Returns ErrRejected for shards backed by an on-disk state machine, which
-// do not support tracked sessions: they manage their own persistence and
-// do not participate in the session tracking machinery (dragonboat
-// semantics: ErrRejected). The comparison below is against the UNCONVERTED
-// quicraft ShardInfo, so it must use quicraft's numbering
-// (proto.OnDiskStateMachine == 2), not the dragonboat-numbered
-// statemachine.OnDiskStateMachine (== 3).
+// SyncGetSession registers a client session through Raft; on-disk state machines get ErrRejected (compared in quicraft numbering).
 func (nh *NodeHost) SyncGetSession(ctx context.Context, shardID uint64) (*dbClient.Session, error) {
 	if err := checkContextDeadline(ctx); err != nil {
 		return nil, err
@@ -936,22 +788,7 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) 
 	}
 }
 
-// requireNoOPSessionOnDisk enforces dragonboat's rule that replicas backed
-// by an IOnDiskStateMachine must use a NoOP session: they manage their own
-// persistence and do not participate in session tracking. Dragonboat
-// panics with "IOnDiskStateMachine based nodes must use NoOPSession"; a
-// library must not panic on caller input, so the adapter reports
-// ErrRejected, the same outcome dragonboat gives for a session a shard
-// will not honor.
-//
-// The comparison is against the UNCONVERTED quicraft ShardInfo, so it uses
-// quicraft's numbering (proto.OnDiskStateMachine == 2), not the
-// dragonboat-numbered statemachine.OnDiskStateMachine (== 3).
-//
-// A failed shard lookup is returned, translated: without the shard's state
-// machine type the rule cannot be checked, and it is the same error the
-// caller's proposal would have met, reported before any work starts, as
-// dragonboat's getShard check does.
+// requireNoOPSessionOnDisk returns ErrRejected when an on-disk state machine gets a non-NoOP session (quicraft numbering).
 func (nh *NodeHost) requireNoOPSessionOnDisk(session *dbClient.Session) error {
 	if session == nil || session.IsNoOPSession() {
 		return nil
@@ -980,13 +817,7 @@ func validateCloseSessionResult(resultValue, clientID uint64) error {
 // Asynchronous Operations
 // ---------------------------------------------------------------------------
 
-// Propose submits an asynchronous proposal. Returns a RequestState that
-// the caller polls for the result.
-//
-// The context is created with a timeout derived from the timeout parameter.
-// The context is NOT canceled when this method returns because the async
-// operation may still be in flight. Instead, the cancel function is attached
-// to the returned RequestState and invoked when Release() is called.
+// Propose submits an asynchronous proposal; the context's cancel runs on RequestState.Release.
 func (nh *NodeHost) Propose(session *dbClient.Session, cmd []byte, timeout time.Duration) (*RequestState, error) {
 	if err := nh.checkTimeout(timeout); err != nil {
 		return nil, err
@@ -1017,29 +848,7 @@ func (nh *NodeHost) Propose(session *dbClient.Session, cmd []byte, timeout time.
 	return wrapRequestState(rs, session.ShardID, cancel, nh.config.NotifyCommit), nil
 }
 
-// ProposeSession submits a session proposal (registration or
-// unregistration) asynchronously. Returns a RequestState that the caller
-// polls for the result. In dragonboat, this is used to register or
-// unregister a client session via Raft consensus.
-//
-// The session's SeriesID determines the operation:
-//   - SeriesIDForRegister   → register a new session
-//   - SeriesIDForUnregister → close an existing session
-//
-// Any other series returns ErrInvalidSession, matching dragonboat's
-// ValidForSessionOp check: a live in-use session must never be passed
-// here, or it would be silently unregistered. Quicraft's own
-// Session.ValidForSessionOp does not require the sentinel, so the shim
-// enforces the strict dragonboat rule itself.
-//
-// The register path returns without waiting for consensus: quicraft has
-// no asynchronous register primitive (Host.RegisterSession is
-// synchronous), so it runs in its own goroutine and its outcome is
-// delivered through the returned RequestState. Quicraft's
-// RegisterSession prepares the session for normal proposals internally
-// on success; the caller's subsequent PrepareForPropose (per the
-// dragonboat pattern) is an idempotent no-op, so the series never
-// regresses.
+// ProposeSession registers or unregisters a session asynchronously, per its SeriesID; any other series returns ErrInvalidSession.
 func (nh *NodeHost) ProposeSession(session *dbClient.Session, timeout time.Duration) (*RequestState, error) {
 	if !session.ValidForSessionOp(session.ShardID) {
 		return nil, ErrInvalidSession
@@ -1070,10 +879,7 @@ func (nh *NodeHost) ProposeSession(session *dbClient.Session, timeout time.Durat
 			if err != nil {
 				return translateResult(quicraft.RequestResult{Err: err})
 			}
-			// Atomically swap the inner quicraft session pointer so
-			// concurrent readers never observe a partially written
-			// struct. ShardID is invariant (same shard), so only the
-			// inner pointer needs updating.
+			// Swap the inner session pointer atomically; ShardID is unchanged.
 			session.SwapInner(registered)
 			return RequestResult{
 				inner: quicraft.RequestResult{Value: session.ClientID()},
@@ -1108,34 +914,12 @@ func (nh *NodeHost) ReadIndex(shardID uint64, timeout time.Duration) (*RequestSt
 	return wrapRequestState(rs, shardID, cancel, nh.config.NotifyCommit), nil
 }
 
-// ReadLocalNode queries the local state machine after a ReadIndex has
-// completed. Per the dragonboat contract, it is only allowed to be called
-// after the caller has received a RequestCompleted notification from the
-// RequestState returned by ReadIndex:
-//
-//	rs, _ := nh.ReadIndex(shardID, timeout)
-//	defer rs.Release()
-//	s := <-rs.ResultC()
-//	if s.Completed() {
-//	    val, err := nh.ReadLocalNode(rs, query)
-//	}
-//
-// The completion is latched on the RequestState when it is delivered, so
-// this method never receives from ResultC itself — the caller has already
-// drained the single buffered value. Calling ReadLocalNode before the
-// ReadIndex has completed returns ErrInvalidOperation; calling it after a
-// failed ReadIndex returns that failure's error.
+// ReadLocalNode queries the local state machine after the ReadIndex for rs completed; before that it returns ErrInvalidOperation.
 func (nh *NodeHost) ReadLocalNode(rs *RequestState, query interface{}) (interface{}, error) {
 	return nh.readLocalNode(rs, query)
 }
 
-// NAReadLocalNode is the byte-slice variant of ReadLocalNode, as in
-// dragonboat v4: the query is passed to the state machine's
-// statemachine.IExtended NALookup method and its result is returned as is.
-// It returns statemachine.ErrNotImplemented when the state machine does not
-// implement IExtended. Like ReadLocalNode, it may only be called after the
-// ReadIndex that produced rs has completed, and is served under the same
-// read guard and query timeout.
+// NAReadLocalNode is the byte-slice ReadLocalNode via IExtended.NALookup; statemachine.ErrNotImplemented when not implemented.
 func (nh *NodeHost) NAReadLocalNode(rs *RequestState, query []byte) ([]byte, error) {
 	val, err := nh.readLocalNode(rs, nalookup.Query{Key: query})
 	if err != nil {
@@ -1182,17 +966,7 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 		}
 		return val, nil
 	}
-	// The dragonboat Lookup and NALookup take no context, so the deadline
-	// cannot reach the user's state machine: run the query in its own
-	// goroutine and stop waiting for it when the deadline passes. A lookup
-	// that outlives the deadline finishes in the background and its result
-	// is discarded.
-	//
-	// That lookup may still read the query after ErrTimeout returns, so
-	// it gets its own copy of a []byte query (and of the NAReadLocalNode
-	// key) and the caller may reuse its buffer at once. A query of any
-	// other type is passed as is: the caller must not mutate it after a
-	// timeout.
+	// Lookup takes no context: run it in a goroutine with its own copy of a []byte query and stop waiting at the deadline.
 	query = detachedQuery(query)
 	// Each lookup holds a slot until it actually returns, not until its
 	// caller stops waiting, so stuck lookups cannot pile up.
@@ -1211,16 +985,7 @@ func (nh *NodeHost) readLocalNode(rs *RequestState, query interface{}) (interfac
 	go func() {
 		defer nh.detachedLookups.Add(-1)
 		var r lookupResult
-		// A Lookup panic must not end the process from this goroutine,
-		// which no caller can recover: carry it back to the caller,
-		// which re-raises it inside its own panic-handling boundary,
-		// as the synchronous call did. A panic after the caller stopped
-		// waiting has no caller left and is dropped.
-		//
-		// A lookup that ends its goroutine with runtime.Goexit neither
-		// returns nor panics (recover() is nil): it never produced a
-		// result, so it is reported as ErrAborted, not as a successful
-		// (nil, nil) read.
+		// Carry a Lookup panic back to the caller; a Goexit is reported as ErrAborted.
 		returned := false
 		defer func() {
 			if p := recover(); p != nil {
@@ -1304,11 +1069,7 @@ func (nh *NodeHost) SyncGetShardMembership(ctx context.Context, shardID uint64) 
 	return fromQuicraftMembership(m), nil
 }
 
-// GetShardInfo returns information about the specified shard. The bool
-// return value is true when the shard is found, false when it is not
-// loaded on this host; a shard that is not loaded also returns a nil
-// ShardInfo and ErrShardNotFound. This matches dragonboat's three-value
-// return signature for shard info queries.
+// GetShardInfo returns the shard's info and true, or nil, false and ErrShardNotFound when the shard is not loaded.
 func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
 	info, err := nh.host.ShardInfo(shardID)
 	if err != nil {
@@ -1321,10 +1082,7 @@ func (nh *NodeHost) GetShardInfo(shardID uint64) (*ShardInfo, bool, error) {
 	return &adapted, true, nil
 }
 
-// GetShardMembership returns the shard membership without a linearizable
-// consensus check. Unlike SyncGetShardMembership, this reads committed
-// membership directly from the local replica's Raft peer state and does
-// not perform a ReadIndex round-trip.
+// GetShardMembership returns the local replica's committed membership without a ReadIndex.
 func (nh *NodeHost) GetShardMembership(shardID uint64) (*Membership, error) {
 	m, err := nh.host.ShardMembership(shardID)
 	if err != nil {
@@ -1339,10 +1097,7 @@ func (nh *NodeHost) GetShardMembership(shardID uint64) (*Membership, error) {
 	return fromQuicraftMembership(m), nil
 }
 
-// GetLeaderID returns the leader's replicaID, the current term, whether
-// a leader is known, and any error. This matches dragonboat's four-value
-// return signature, which Quicraft's Host.LeaderIDAndTerm returns as is
-// (Host.LeaderID returns only leaderID, valid and error).
+// GetLeaderID returns the leader's replicaID, the term, whether a leader is known, and any error.
 func (nh *NodeHost) GetLeaderID(shardID uint64) (uint64, uint64, bool, error) {
 	leaderID, term, valid, err := nh.host.LeaderIDAndTerm(shardID)
 	if err != nil {
@@ -1363,11 +1118,7 @@ func (nh *NodeHost) SyncRequestAddReplica(ctx context.Context, shardID, replicaI
 	return translateError(nh.host.SyncRequestAddNode(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
 }
 
-// SyncRequestAddReplicaWithIdentity is SyncRequestAddReplica carrying the node
-// identity quicraft commits for the new replica (its NodeHost.NodeIdentity).
-// It has no dragonboat counterpart: a NodeHost with a transport refuses the
-// identity-less form with quicraft.ErrMemberIdentityRequired, because
-// quicraft authorizes a member by its identity and by nothing else.
+// SyncRequestAddReplicaWithIdentity is SyncRequestAddReplica committing the new replica's node identity.
 func (nh *NodeHost) SyncRequestAddReplicaWithIdentity(ctx context.Context, shardID, replicaID uint64, target Target, identity string, configChangeIndex uint64) error {
 	if err := checkContextDeadline(ctx); err != nil {
 		return err
@@ -1402,23 +1153,12 @@ func (nh *NodeHost) SyncRequestAddWitnessWithIdentity(ctx context.Context, shard
 	return translateError(nh.host.SyncRequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
 }
 
-// NodeIdentity returns this NodeHost's stable node identity — the value
-// peers must have committed for it (Config.MemberIdentities at bootstrap, the
-// *WithIdentity adds afterwards) before they count its messages. It is empty
-// for a NodeHost started WithoutTransport.
+// NodeIdentity returns this NodeHost's node identity; empty without a transport.
 func (nh *NodeHost) NodeIdentity() string {
 	return nh.host.NodeIdentity()
 }
 
-// ReloadMutualTLS re-reads NodeHostConfig's CAFile, CertFile and KeyFile and
-// makes them the material every new handshake uses, without a restart. It is
-// quicraft's Host.ReloadMTLS over the configured files: the new material is
-// validated as at start, must keep this NodeHost's NodeIdentity (re-issue on
-// the same keypair), and is swapped only when every check passes. A file
-// that cannot be read returns a *config.FileReadError; refused material
-// returns a *quicraft.MTLSReloadError. Either way the previous material stays
-// in force. Established connections keep their session until they
-// reconnect.
+// ReloadMutualTLS re-reads CAFile, CertFile and KeyFile and swaps them in for new handshakes when every check passes.
 func (nh *NodeHost) ReloadMutualTLS() error {
 	if !nh.config.MutualTLS {
 		return nh.host.ReloadMTLS(nil)
@@ -1463,11 +1203,7 @@ func (nh *NodeHost) SyncRequestDeleteReplica(ctx context.Context, shardID, repli
 	return translateError(nh.host.SyncRequestRemoveNode(ctx, shardID, replicaID, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
 }
 
-// RequestLeaderTransfer requests leadership transfer to the specified
-// target replica. targetReplicaID must name a voting member: 0, an
-// observer, a witness and a removed replica are all rejected with
-// ErrInvalidTarget, as they are by dragonboat. There is no guarantee the
-// transfer completes.
+// RequestLeaderTransfer asks to transfer leadership to a voting replica; others get ErrInvalidTarget.
 func (nh *NodeHost) RequestLeaderTransfer(shardID, targetReplicaID uint64) error {
 	ctx := context.Background()
 	return translateError(nh.host.RequestLeaderTransfer(ctx, shardID, targetReplicaID))
@@ -1477,17 +1213,7 @@ func (nh *NodeHost) RequestLeaderTransfer(shardID, targetReplicaID uint64) error
 // Async Membership Operations
 // ---------------------------------------------------------------------------
 
-// RequestAddReplica requests adding a voting replica asynchronously. Unlike upstream
-// dragonboat, quicraft pre-validates membership changes: a change that is
-// invalid against the current membership (e.g. removing the last full
-// replica, or a witness policy violation) is rejected synchronously with a
-// nil RequestState and a non-nil error, instead of failing later through
-// RequestState.ResultC.
-// Returns a RequestState that resolves when the config change is committed.
-//
-// It commits no node identity for the replica, which a NodeHost with a
-// transport refuses (quicraft.ErrMemberIdentityRequired); use
-// RequestAddReplicaWithIdentity there. See NodeHost.NodeIdentity.
+// RequestAddReplica adds a voting replica asynchronously; invalid changes are rejected synchronously, and a transport host needs RequestAddReplicaWithIdentity.
 func (nh *NodeHost) RequestAddReplica(shardID, replicaID uint64, target Target, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
 	return nh.RequestAddReplicaWithIdentity(shardID, replicaID, target, "", configChangeIndex, timeout)
 }
@@ -1538,13 +1264,7 @@ func (nh *NodeHost) RequestAddNonVotingWithIdentity(shardID, replicaID uint64, t
 	return wrapRequestState(rs, shardID, cancel, nh.config.NotifyCommit), nil
 }
 
-// RequestAddWitness requests adding a voting witness asynchronously. Unlike upstream
-// dragonboat, quicraft pre-validates membership changes: a change that is
-// invalid against the current membership (e.g. removing the last full
-// replica, or a witness policy violation) is rejected synchronously with a
-// nil RequestState and a non-nil error, instead of failing later through
-// RequestState.ResultC. It commits no node identity, which a NodeHost with a
-// transport refuses; use RequestAddWitnessWithIdentity there.
+// RequestAddWitness adds a witness asynchronously; invalid changes are rejected synchronously, and a transport host needs RequestAddWitnessWithIdentity.
 func (nh *NodeHost) RequestAddWitness(shardID, replicaID uint64, target Target, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
 	return nh.RequestAddWitnessWithIdentity(shardID, replicaID, target, "", configChangeIndex, timeout)
 }
@@ -1568,12 +1288,7 @@ func (nh *NodeHost) RequestAddWitnessWithIdentity(shardID, replicaID uint64, tar
 	return wrapRequestState(rs, shardID, cancel, nh.config.NotifyCommit), nil
 }
 
-// RequestDeleteReplica requests removing a replica asynchronously. Unlike upstream
-// dragonboat, quicraft pre-validates membership changes: a change that is
-// invalid against the current membership (e.g. removing the last full
-// replica, or a witness policy violation) is rejected synchronously with a
-// nil RequestState and a non-nil error, instead of failing later through
-// RequestState.ResultC.
+// RequestDeleteReplica removes a replica asynchronously; invalid changes are rejected synchronously.
 func (nh *NodeHost) RequestDeleteReplica(shardID, replicaID uint64, configChangeIndex uint64, timeout time.Duration) (*RequestState, error) {
 	if err := nh.checkTimeout(timeout); err != nil {
 		return nil, err
@@ -1592,18 +1307,7 @@ func (nh *NodeHost) RequestDeleteReplica(shardID, replicaID uint64, configChange
 // Compaction
 // ---------------------------------------------------------------------------
 
-// RequestCompaction requests log compaction for the specified shard/replica
-// pair. Returns a SysOpState that completes immediately since quicraft's
-// RequestCompaction is synchronous.
-//
-// A shard that is not loaded is treated as already retired via RemoveData
-// and reclaims what it can, matching dragonboat's behavior for that case.
-// Quicraft deliberately does NOT compact such a shard to MaxUint64 the way
-// dragonboat does: it cannot distinguish a removed replica from a merely
-// stopped one, and a stopped replica's log is live data it needs on
-// restart. Segment GC honors the existing compaction markers instead, so
-// the canonical StopShard -> RemoveData -> RequestCompaction sequence
-// succeeds without risking a healthy replica's log.
+// RequestCompaction compacts synchronously and returns a completed SysOpState; an unloaded shard is treated as removed, without compacting a stopped replica's log.
 func (nh *NodeHost) RequestCompaction(shardID, replicaID uint64) (*SysOpState, error) {
 	err := nh.host.RequestCompaction(shardID, replicaID)
 	if err != nil {
@@ -1783,23 +1487,12 @@ func (nh *NodeHost) HasNodeInfo(shardID, replicaID uint64) bool {
 // Log Access
 // ---------------------------------------------------------------------------
 
-// QueryRaftLog returns Raft log entries in the half-open range
-// [firstIndex, lastIndex) up to maxSize bytes.
-//
-// NOTE: Dragonboat returns a RequestState (async) for QueryRaftLog.
-// Quicraft's QueryRaftLog is synchronous and returns entries directly.
-// This adapter calls the synchronous version and wraps the result in a
-// pre-resolved RequestState for API compatibility. Callers can read
-// from ResultC() immediately; it will never block.
+// QueryRaftLog returns entries in [firstIndex, lastIndex) up to maxSize bytes in a pre-resolved RequestState.
 func (nh *NodeHost) QueryRaftLog(shardID, firstIndex, lastIndex, maxSize uint64) (*RequestState, error) {
 	ctx := context.Background()
 	protoEntries, err := nh.host.QueryRaftLog(ctx, shardID, firstIndex, lastIndex, maxSize)
 	if err != nil {
-		// A range outside the entries currently retained is not a caller
-		// error in dragonboat: it resolves the RequestState with
-		// RequestOutOfRange and the available range so that a paginating
-		// reader can re-anchor. Only a malformed range (lastIndex <=
-		// firstIndex) is reported synchronously, as dragonboat does.
+		// Out-of-range resolves with RequestOutOfRange and the available range; only lastIndex <= firstIndex is a synchronous error.
 		if errors.Is(err, qcLogDB.ErrCompacted) || errors.Is(err, qcLogDB.ErrUnavailable) {
 			return newResolvedRequestState(RequestResult{
 				code:     RequestOutOfRange,
@@ -1850,10 +1543,7 @@ func (nh *NodeHost) availableLogRange(shardID uint64) LogRange {
 	return LogRange{FirstIndex: r.FirstIndex, LastIndex: r.LastIndex}
 }
 
-// GetLogReader returns a read-only view of the Raft log for the shard.
-// Dragonboat reports both a closed LogDB and an unknown shard as
-// ErrLogDBNotCreatedOrClosed, so the adapter does the same rather than
-// distinguishing them with ErrShardNotFound.
+// GetLogReader returns a read-only view of the shard's log; a closed LogDB and an unknown shard both give ErrLogDBNotCreatedOrClosed.
 func (nh *NodeHost) GetLogReader(shardID uint64) (ReadonlyLogReader, error) {
 	reader, err := nh.host.LogReader(shardID)
 	if err != nil {
@@ -1866,11 +1556,7 @@ func (nh *NodeHost) GetLogReader(shardID uint64) (ReadonlyLogReader, error) {
 // Data Cleanup
 // ---------------------------------------------------------------------------
 
-// SyncRemoveData removes all LogDB data for the given shard/replica pair
-// synchronously. The shard must be stopped before calling. On success a
-// durable removal marker is persisted so the replica stays rejected after
-// a restart; a marker persistence failure is returned as a
-// RemovalMarkerError (the data has already been removed at that point).
+// SyncRemoveData removes a stopped replica's LogDB data and persists a removal marker; a marker failure is a RemovalMarkerError.
 func (nh *NodeHost) SyncRemoveData(ctx context.Context, shardID, replicaID uint64) error {
 	if err := translateError(nh.host.SyncRemoveData(ctx, shardID, replicaID)); err != nil {
 		return err
@@ -1878,11 +1564,7 @@ func (nh *NodeHost) SyncRemoveData(ctx context.Context, shardID, replicaID uint6
 	return nh.markRemoved(shardID, replicaID)
 }
 
-// RemoveData removes all LogDB data for the given shard/replica pair.
-// The shard must be stopped before calling. After removal, the replica
-// cannot be restarted on this host: a durable removal marker is persisted
-// so the guard survives restarts. A marker persistence failure is returned
-// as a RemovalMarkerError (the data has already been removed at that point).
+// RemoveData removes a stopped replica's LogDB data and persists a removal marker; a marker failure is a RemovalMarkerError.
 func (nh *NodeHost) RemoveData(shardID, replicaID uint64) error {
 	if err := translateError(nh.host.RemoveData(shardID, replicaID)); err != nil {
 		return err
@@ -1894,11 +1576,7 @@ func (nh *NodeHost) RemoveData(shardID, replicaID uint64) error {
 // Health Metrics
 // ---------------------------------------------------------------------------
 
-// WriteHealthMetrics is not supported and writes nothing to w. It exists for
-// dragonboat v4 API compatibility, where it writes dragonboat's process-wide
-// metrics. QuicRaft keeps metrics per host, in the quicraft.MetricsCollector
-// passed to NewNodeHostWithOptions with quicraft.WithMetrics; read them from
-// that collector.
+// WriteHealthMetrics writes nothing; metrics are in the quicraft.MetricsCollector passed with quicraft.WithMetrics.
 func WriteHealthMetrics(w io.Writer) {
 	// Deliberately writes nothing: there is no process-wide metric set to
 	// write. See the doc comment.
@@ -1909,11 +1587,7 @@ func WriteHealthMetrics(w io.Writer) {
 // Internal Helpers
 // ---------------------------------------------------------------------------
 
-// toDragonboatStateMachineType translates a quicraft/proto state machine
-// type code (Regular=0, Concurrent=1, OnDisk=2) to dragonboat's numbering
-// (Regular=1, Concurrent=2, OnDisk=3) as defined by the statemachine
-// package's Type constants. Unknown codes map to 0, which is not a valid
-// dragonboat type and therefore cannot be mistaken for any real variant.
+// toDragonboatStateMachineType maps quicraft codes 0/1/2 to dragonboat's 1/2/3; unknown codes map to 0.
 func toDragonboatStateMachineType(t uint64) uint64 {
 	switch t {
 	case proto.RegularStateMachine:
@@ -1951,12 +1625,7 @@ func fromQuicraftShardInfo(si quicraft.ShardInfo) ShardInfo {
 	}
 }
 
-// codeToError maps a RequestResultCode back to a sentinel error for
-// error translation in ReadLocalNode.
-// The mapping mirrors dragonboat's getRequestState: Terminated means the
-// shard is being shut down (ErrShardClosed), not that the whole host is
-// closing, and Dropped means the leader is not ready (ErrShardNotReady),
-// not that the system is overloaded.
+// codeToError maps a RequestResultCode to a sentinel as dragonboat's getRequestState does (Terminated: ErrShardClosed, Dropped: ErrShardNotReady).
 var codeErrorMap = map[RequestResultCode]error{
 	RequestTimeout:    ErrTimeout,
 	RequestTerminated: ErrShardClosed,

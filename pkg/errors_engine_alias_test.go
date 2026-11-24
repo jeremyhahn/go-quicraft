@@ -38,18 +38,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// ---------------------------------------------------------------------------
-// Errors that reach an embedder from the engine, raft and transport packages
-//
-// Three channels hand an embedder an error built inside an internal package:
-// the result of a proposal whose batch failed to apply or persist, the Err of
-// config.ShardFailedInfo, and the cause inside a *HostInitError. Those
-// packages are unimportable from outside this module, so pkg/errors.go
-// re-exports each such error as an alias of the SAME value or type. A
-// re-export that decays into errors.New("<same text>") or a look-alike struct
-// keeps compiling and silently stops matching, so every identity assertion is
-// paired with a look-alike that must NOT match.
-// ---------------------------------------------------------------------------
+// Internal errors re-exported in pkg/errors.go must be the same value or type; each identity check is paired with a look-alike that must not match.
 
 // internalSentinelAliases is the complete set of engine, raft and transport
 // sentinels pkg/errors.go re-exports for the three channels above. A

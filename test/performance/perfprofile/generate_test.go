@@ -29,15 +29,7 @@ import (
 // thing that changes between two otherwise identical runs.
 var generatedAt = time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
 
-// realOmegaProfile copies the repository's omega profile into a temporary
-// directory and returns the copy.
-//
-// The fixture is the real measured data on purpose. omega genuinely has
-// quicraft, dragonboat and openraft results and genuinely has no etcd result —
-// that run failed on a harness bug — so it is the honest input for the
-// missing-system path. The preconditions are asserted rather than assumed: if
-// somebody later measures etcd on omega, this test says so instead of quietly
-// testing a case that no longer exists.
+// realOmegaProfile copies the repository's measured profile into a temp directory and returns the copy.
 func realOmegaProfile(t *testing.T) *Profile {
 	t.Helper()
 
@@ -69,9 +61,7 @@ func realOmegaProfile(t *testing.T) *Profile {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// The repository copy already holds generated documents from the last run.
-	// Drop them, so every assertion below is about what THIS run produced
-	// rather than about what happened to be checked in.
+	// Drop the checked-in generated documents first.
 	for _, sys := range KnownSystems {
 		if err := os.Remove(p.DocPath(sys)); err != nil && !os.IsNotExist(err) {
 			t.Fatalf("clear generated %s.md from the fixture: %v", sys, err)
@@ -146,10 +136,7 @@ func TestGenerateReportsUnmeasuredSystem(t *testing.T) {
 		}
 	}
 
-	// The documents must be rendered from the real JSON, not from defaults.
-	// 287.9 ops/s is QuicRaft's measured commit_latency_3n_wal on omega and
-	// 100.0 is Dragonboat's; neither can appear unless the stored results were
-	// read and formatted.
+	// The documents must show the measured values from the JSON.
 	dragonboat := readFile(t, p.DocPath("dragonboat"))
 	for _, want := range []string{
 		"# QuicRaft vs Dragonboat — `omega` profile",
@@ -166,13 +153,7 @@ func TestGenerateReportsUnmeasuredSystem(t *testing.T) {
 	}
 }
 
-// TestGenerateNeverWritesAnalysis asserts the hand-written document survives a
-// run that rewrites its siblings.
-//
-// The test cannot pass by doing nothing: dragonboat.md is seeded with a
-// sentinel first, and the run is only accepted if that sentinel is gone
-// afterwards. So the generator demonstrably wrote in this directory, and
-// analysis.md is demonstrably byte-identical anyway.
+// TestGenerateNeverWritesAnalysis checks analysis.md is untouched while its siblings are rewritten.
 func TestGenerateNeverWritesAnalysis(t *testing.T) {
 	p := realOmegaProfile(t)
 
@@ -217,10 +198,7 @@ func TestWriteDocRefusesAnalysisFile(t *testing.T) {
 	}
 }
 
-// TestGenerateLeavesOtherProfilesAlone asserts profile isolation: generating
-// omega must not read, rewrite, or delete anything belonging to another
-// machine. r640 in particular holds the only surviving copy of a baseline that
-// cannot be re-measured until the hardware is repaired.
+// TestGenerateLeavesOtherProfilesAlone checks generating one profile leaves the others unchanged.
 func TestGenerateLeavesOtherProfilesAlone(t *testing.T) {
 	root := t.TempDir()
 
@@ -289,9 +267,7 @@ func TestGenerateRemovesStaleDocument(t *testing.T) {
 	}
 }
 
-// TestGenerateWithoutEnvSaysSo covers the omega case as it stands today: real
-// results, no machine capture. The documents must state that rather than print
-// a hardware table nobody measured.
+// TestGenerateWithoutEnvSaysSo checks documents without a machine capture say so.
 func TestGenerateWithoutEnvSaysSo(t *testing.T) {
 	p := realOmegaProfile(t)
 	if err := os.Remove(p.EnvPath()); err != nil && !os.IsNotExist(err) {

@@ -71,12 +71,7 @@ func newDropTransport(t *testing.T, opts ...func(*Config)) (*QUICTransport, *dro
 // Heartbeat fast-path drop accounting
 // ---------------------------------------------------------------------------
 
-// TestSendHeartbeatBatch_MarshalFailureDropsBatch covers the defensive guard in
-// the heartbeat fast path. The frame buffer is sized for FIXED
-// HeartbeatMessageSize records, so a heartbeat carrying a variable-length
-// payload that slipped past isHeartbeatBatch must be dropped loudly and
-// accounted, never marshalled into an undersized slot (which would corrupt the
-// frame for every OTHER heartbeat in the same batch).
+// TestSendHeartbeatBatch_MarshalFailureDropsBatch verifies a heartbeat with a variable payload is dropped and counted, not marshalled.
 func TestSendHeartbeatBatch_MarshalFailureDropsBatch(t *testing.T) {
 	tr, rec := newDropTransport(t)
 
@@ -126,12 +121,7 @@ func TestSendHeartbeatBatch_StreamUnavailableDropsBatch(t *testing.T) {
 	}
 }
 
-// TestSendHeartbeatBatch_WriteFailureEvictsConnection pins the recovery
-// behaviour after a heartbeat write fails on a dead connection: the batch is
-// accounted as a write failure AND the connection plus every stream cached on
-// it is evicted. Without the eviction, each remaining cached stream would hang
-// for the full write deadline on the next send, compounding latency across
-// every message type until the connection finally aged out.
+// TestSendHeartbeatBatch_WriteFailureEvictsConnection verifies a failed heartbeat write evicts the connection and its cached streams.
 func TestSendHeartbeatBatch_WriteFailureEvictsConnection(t *testing.T) {
 	withDebugLogging(t)
 	rec := &dropRecorder{}
@@ -214,18 +204,7 @@ func TestSendBatch_StreamUnavailableDropsBatch(t *testing.T) {
 	}
 }
 
-// TestSendBatch_OversizedFrameDropsBatch covers the ErrPayloadTooLarge branch.
-// This is a producer defect with a silent-quorum-degradation failure mode:
-// raft sizes replication batches against MaxApplyEntrySize, and if that exceeds
-// the frame cap the message is dropped WITHOUT advancing the follower's next
-// index, so raft rebuilds the identical oversized message forever and the
-// follower can never catch up. The drop must at minimum be attributed so the
-// condition is observable rather than silent.
-//
-// The message is refused by the pre-write sendability check
-// (dropReasonUnsendable), not by MarshalFrame: an unacceptable frame must
-// never reach the wire, because the peer's rejection of it is indistinguishable
-// at the sender from a broken connection.
+// TestSendBatch_OversizedFrameDropsBatch verifies an oversized message is refused before the wire and attributed as unsendable.
 func TestSendBatch_OversizedFrameDropsBatch(t *testing.T) {
 	tr, rec := newDropTransport(t)
 
@@ -268,18 +247,7 @@ func TestSendBatch_OversizedFrameDropsBatch(t *testing.T) {
 // Snapshot metadata ownership
 // ---------------------------------------------------------------------------
 
-// TestCopySnapshotRefs_DetachesEveryReference pins the ownership contract of
-// the asynchronous send path: SendSnapshot hands snapshot metadata to a
-// background marshal, so every reference-typed field must be copied. If any
-// field still aliased the caller's memory, a caller mutating its membership maps
-// after the call would race the marshal and could put a DIFFERENT membership on
-// the wire than the one raft committed.
-//
-// The two AUTHORIZATION maps are covered explicitly. Identities was missed when
-// copySnapshotRefs was written and RemovedIdentities arrived later; a snapshot
-// whose identity map is mutated between the enqueue and the marshal ships a
-// configuration that authorizes a different set of replicas than the caller
-// submitted, which is a strictly worse outcome than a stale address.
+// TestCopySnapshotRefs_DetachesEveryReference verifies copySnapshotRefs copies every reference field, the identity maps included.
 func TestCopySnapshotRefs_DetachesEveryReference(t *testing.T) {
 	orig := proto.Snapshot{
 		Index: 7,
@@ -486,12 +454,7 @@ func TestSendBatch_WriteFailureEvictsConnection(t *testing.T) {
 	}
 }
 
-// TestMsgRecvBudget_PerConnectionCompressedDeltaRejected covers the
-// per-connection sub-budget applied to the DECOMPRESSION delta. The aggregate
-// check alone is not enough: one peer with several compressed frames in flight
-// could pin the whole host budget and force every other peer's frames into the
-// exhaustion path. The rejection must also be exactly balanced — a leaked
-// reservation would permanently shrink that connection's budget.
+// TestMsgRecvBudget_PerConnectionCompressedDeltaRejected verifies the per-connection decompression sub-budget rejects with balanced accounting.
 func TestMsgRecvBudget_PerConnectionCompressedDeltaRejected(t *testing.T) {
 	tr, conn := liveConn(t)
 
@@ -524,10 +487,7 @@ func TestMsgRecvBudget_PerConnectionCompressedDeltaRejected(t *testing.T) {
 	if got := tr.msgRecvBudget.Load(); got != aggregateBefore {
 		t.Fatalf("aggregate budget = %d after rejection, want %d (reserve/release imbalance)", got, aggregateBefore)
 	}
-	// The sub-budget is keyed by the peer's authenticated IDENTITY, not by the
-	// connection: keying on the connection let one peer open
-	// MaxConnectionsPerIP connections and hold that many separate sub-budgets,
-	// which is exactly the cap this reservation exists to impose.
+	// The sub-budget is keyed by the peer's authenticated identity, not the connection.
 	v, ok := tr.connMsgBudget.Load(msgBudgetKey(conn))
 	if !ok {
 		t.Fatal("per-peer budget entry disappeared")
@@ -630,12 +590,7 @@ func TestSnapshotReceiver_ReleaseUnknownPeerIsNoop(t *testing.T) {
 	}
 }
 
-// TestParseCACertificates_SkipsNonCertificateBlocks pins the bundle scan's
-// tolerance for non-certificate PEM blocks. Operators routinely concatenate
-// keys, CRLs or DH parameters into a bundle; treating such a block as fatal
-// (or, worse, as an issuer) would either refuse a valid bundle at startup or
-// wire revocation to a bogus issuer, which under enforcement is a total
-// handshake outage.
+// TestParseCACertificates_SkipsNonCertificateBlocks verifies non-certificate PEM blocks in a CA bundle are skipped.
 func TestParseCACertificates_SkipsNonCertificateBlocks(t *testing.T) {
 	caPEM, caKeyPEM, _, _ := generateTestCertPair(t)
 
@@ -652,8 +607,7 @@ func TestParseCACertificates_SkipsNonCertificateBlocks(t *testing.T) {
 		t.Fatal("the parsed issuer is not a CA certificate")
 	}
 
-	// A bundle with ONLY non-certificate blocks still fails closed: there is no
-	// issuer to build an OCSP request against or verify a CRL with.
+	// A bundle with only non-certificate blocks fails closed.
 	if _, err := parseCACertificates(caKeyPEM); !errors.Is(err, ErrCACertificateParse) {
 		t.Fatalf("parseCACertificates on a key-only bundle = %v, want ErrCACertificateParse", err)
 	}
@@ -756,13 +710,7 @@ func TestConfigValidate_RejectsNegativeDialTimeout(t *testing.T) {
 	}
 }
 
-// TestPeerMsgBudget_EntryStaysLiveWhileReferenced: a release that decremented
-// a peer's budget entry to zero and then deleted it could remove the entry a
-// connection from the same peer had counted itself on in between. That live
-// connection's reservations then went to an entry no longer in the map, and
-// the next reservation for the peer created a fresh one, splitting the peer's
-// accounting. While a connection holds a reference, the map must hold a live
-// entry for its peer; once none does, no entry may remain.
+// TestPeerMsgBudget_EntryStaysLiveWhileReferenced verifies a peer's budget entry stays in the map while any connection references it and is removed after.
 func TestPeerMsgBudget_EntryStaysLiveWhileReferenced(t *testing.T) {
 	var tr QUICTransport
 	const key = "spki:peer"

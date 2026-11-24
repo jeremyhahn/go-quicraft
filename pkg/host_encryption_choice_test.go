@@ -69,8 +69,7 @@ func TestNewHost_AtRestEncryptionIsAStatedChoice(t *testing.T) {
 			b := createTestBarrier(t)
 			return []HostOption{WithShardBarriers(func(uint64) Barrier { return b })}
 		}},
-		// Per-shard barriers are independent of the host-wide posture (#240):
-		// sealing disabled host-wide still gives each shard its own barrier.
+		// Per-shard barriers are independent of the host-wide posture.
 		{"WithoutEncryption with WithShardBarriers", func(t *testing.T) []HostOption {
 			b := createTestBarrier(t)
 			return []HostOption{WithShardBarriers(func(uint64) Barrier { return b }), WithoutEncryption()}
@@ -90,12 +89,7 @@ func TestNewHost_AtRestEncryptionIsAStatedChoice(t *testing.T) {
 	}
 }
 
-// TestNewHost_StatedBarrierMustCoverTheLog pins that a stated encryption covers
-// the Raft log: the host-wide barrier is wired only into the default WAL, so a
-// caller-supplied LogDB never receives it. Accepting WithBarrier plus an
-// unencrypted waldb.Open(dir) — the one-line change that relocates the WAL —
-// would encrypt snapshots and write every proposed command to disk in
-// plaintext, with no error.
+// TestNewHost_StatedBarrierMustCoverTheLog pins that a barrier with a caller-supplied LogDB is refused, since it would not encrypt the log.
 func TestNewHost_StatedBarrierMustCoverTheLog(t *testing.T) {
 	t.Run("unencrypted supplied WAL is refused", func(t *testing.T) {
 		db, err := waldb.Open(t.TempDir())

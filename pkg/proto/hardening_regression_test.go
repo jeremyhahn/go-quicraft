@@ -21,12 +21,7 @@ import (
 	"testing"
 )
 
-// TestGetMapRejectsValueLengthAboveMaxInt32 pins the 32-bit wrap guard that
-// getBytes and getString already carry. A valLen above math.MaxInt32 becomes
-// NEGATIVE when converted to int on a 32-bit platform, which passes both bound
-// checks and panics on the slice expression. The guard must reject the length
-// prefix itself, before any int conversion, so the verdict is identical on
-// every word size.
+// TestGetMapRejectsValueLengthAboveMaxInt32 pins getMap's 32-bit wrap guard on the value length prefix.
 func TestGetMapRejectsValueLengthAboveMaxInt32(t *testing.T) {
 	// [count:4=1][key:8][valLen:4=0x80000000] and no value bytes.
 	buf := make([]byte, 4+8+4)

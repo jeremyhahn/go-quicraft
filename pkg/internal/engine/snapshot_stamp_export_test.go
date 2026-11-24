@@ -28,9 +28,7 @@ import (
 // errInjectedStampHash is the read failure the stamping tests inject.
 var errInjectedStampHash = errors.New("injected snapshot hash read failure")
 
-// failStampHash makes every snapshot.meta WRITER's hash fail until the
-// returned restore runs (or the test ends). The verifiers are unaffected: they
-// hash through hashSnapshotData directly.
+// failStampHash makes snapshot.meta writers' hash fail until restore runs; verifiers are unaffected.
 func failStampHash(t *testing.T) (restore func()) {
 	t.Helper()
 	orig := stampSnapshotHash
@@ -48,17 +46,7 @@ func failStampHash(t *testing.T) (restore func()) {
 	return restore
 }
 
-// TestSaveSnapshot_HashFailureRecordsAndCompactsNothing is the regression
-// guard for a save that published an artifact it knew it could not vouch for.
-//
-// writeSnapshotMetadata treated a failure to hash snapshot.dat as non-fatal
-// and wrote the record "without the fields" — but the encoder always emits
-// them, so it recorded DataLen 0 and DataHash 0 as fact. The save then
-// published the directory, recorded it in LogDB and compacted the log it
-// covers, and every later recovery refused the artifact on the hash mismatch:
-// a single-replica shard was left with neither a usable snapshot nor the log
-// to rebuild one. The failure must land BEFORE the publish, leaving nothing
-// recorded and nothing compacted, and the next save must succeed.
+// TestSaveSnapshot_HashFailureRecordsAndCompactsNothing checks a hash failure fails the save before publish, and the next save succeeds.
 func TestSaveSnapshot_HashFailureRecordsAndCompactsNothing(t *testing.T) {
 	f := newResaveFixture(t, 200)
 	f.node.logReader = advancingReader(t, f.req.shardID, f.req.replicaID, f.ldb, 200)
@@ -211,11 +199,7 @@ func TestWriteSnapshotExport_RefusesEmptyMetadata(t *testing.T) {
 	}
 }
 
-// TestSaveSnapshot_EncryptedExportCarriesAVerifiablePair covers the decrypted
-// export: its snapshot.meta is re-marshalled with Epoch 0, and marshalling it
-// from the save's metadata WITHOUT the integrity fields would leave the
-// exported plaintext carrying a zero DataLen/DataHash that every verifier
-// refuses. The fields must be stamped over the bytes the export holds.
+// TestSaveSnapshot_EncryptedExportCarriesAVerifiablePair checks the decrypted export's meta has Epoch 0 and integrity fields over the plaintext.
 func TestSaveSnapshot_EncryptedExportCarriesAVerifiablePair(t *testing.T) {
 	f := newResaveFixture(t, 200)
 	setTestShardBarrier(f.pool, newTenantBarrier(1, 4))

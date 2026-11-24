@@ -22,13 +22,7 @@ import "github.com/jeremyhahn/go-quicraft/test/netfault"
 // is a constant rather than a variable.
 const netFaultEnabled = true
 
-// netFaultDrop forwards to the injector.
-//
-// The state lives in test/netfault rather than here because the integration
-// suites that drive it sit outside pkg/ and so cannot import an internal
-// package. This file is the only thing that couples the two, and it exists
-// only under the build tag, so a normal build never pulls test/netfault into
-// the dependency graph.
+// netFaultDrop forwards to the injector in test/netfault.
 func netFaultDrop(shardID, from, to uint64) bool {
 	return netfault.Drop(shardID, from, to)
 }

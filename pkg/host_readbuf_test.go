@@ -165,16 +165,7 @@ func TestSyncReadBuf_PooledPathReturnsCopy(t *testing.T) {
 	}
 }
 
-// TestSyncReadBuf_LookupOutcomes covers every lookup branch of a linearizable
-// buffered read on a running shard: an error from the state machine's
-// BytesLookupInto reaches the caller unwrapped (errors.Is must classify it);
-// a state machine with no byte-slice lookup goes through Lookup, whose []byte
-// result is returned directly, whose non-[]byte result is rejected with
-// ErrInvalidOperation instead of panicking on a type assertion, and whose
-// error reaches the caller; and a canceled context aborts the read with
-// ErrCanceled rather than returning a result read after the caller gave up.
-// Every case must hand back a callable release func, so a caller that
-// unconditionally defers release() cannot panic.
+// TestSyncReadBuf_LookupOutcomes covers every lookup branch of a buffered linearizable read; each returns a callable release func.
 func TestSyncReadBuf_LookupOutcomes(t *testing.T) {
 	tests := []struct {
 		name     string

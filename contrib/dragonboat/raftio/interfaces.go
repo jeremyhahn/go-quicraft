@@ -56,9 +56,7 @@ type MessageHandler func(msg interface{})
 // indicate the chunk was accepted.
 type ChunkHandler func(chunk interface{}) bool
 
-// ILogDB is the interface for the Raft log database. In dragonboat,
-// this is implemented by pebble-based and custom backends. QuicRaft
-// provides this interface for API compatibility with factory types.
+// ILogDB is the Raft log database interface, kept for API compatibility with dragonboat factory types.
 type ILogDB interface {
 	// Name returns the human-readable name of the LogDB implementation.
 	Name() string

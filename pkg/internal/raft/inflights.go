@@ -14,13 +14,7 @@
 
 package raft
 
-// inflights is a sliding window tracking in-flight append messages sent to a
-// single remote peer. It limits the number of outstanding (unacknowledged)
-// messages to prevent fast leaders from overwhelming slow followers.
-//
-// Internally it uses a circular buffer of entry indices. The start field
-// tracks the position of the oldest in-flight entry, and count tracks
-// how many entries are currently in-flight.
+// inflights is a circular-buffer window of unacknowledged append messages to one peer.
 type inflights struct {
 	start  int      // position of the oldest in-flight entry in buffer
 	count  int      // number of in-flight entries
@@ -37,10 +31,7 @@ func newInflights(size int) *inflights {
 	}
 }
 
-// add records a new in-flight message for the given log index. The buffer
-// grows lazily up to the configured size. Returns ErrInflightsFull if the
-// buffer is already at capacity. Callers should check full() before calling
-// add as a fast-path guard; this error return is a defensive backstop.
+// add records an in-flight message for index, growing lazily; it returns ErrInflightsFull at capacity.
 func (in *inflights) add(index uint64) error {
 	if in.full() {
 		return ErrInflightsFull
@@ -84,20 +75,7 @@ func (in *inflights) freeTo(index uint64) {
 	}
 }
 
-// freeFirstOne frees the oldest in-flight slot WITHOUT the acknowledgement
-// that would normally retire it. It exists for one situation: a peer whose
-// in-flight messages were delivered to a PREVIOUS incarnation of that peer.
-// Those acknowledgements can never arrive, and freeTo only frees records at
-// or below an acknowledged index, so every later ack from the restarted peer
-// (which reports a position BELOW the window) frees nothing. The window would
-// stay full forever, and a full window is exactly what makes isPaused report
-// true, so the leader would never send that peer another entry.
-//
-// Releasing one slot per heartbeat response bounds that: the peer is known to
-// be alive, so let exactly one message through. Either it is acknowledged
-// (the window was merely busy) or it is rejected (the peer restarted), and
-// the rejection drives the normal backtracking that repairs the peer's
-// position. This mirrors etcd/raft's MsgHeartbeatResp handling.
+// freeFirstOne frees the oldest slot without an ack, once per heartbeat response, so a restarted peer's full window drains, as etcd/raft does.
 func (in *inflights) freeFirstOne() {
 	if in.count == 0 {
 		return

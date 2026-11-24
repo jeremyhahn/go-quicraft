@@ -12,54 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package errfs provides a fault-injection filesystem for testing WAL I/O
-// error handling. It wraps any waldb.FS implementation and injects a
-// configurable fault at the Nth file operation across all files opened
-// through the ErrorFS instance.
-//
-// Usage:
-//
-//	efs := errfs.New(realFS, 5, errDisk)
-//	// The 5th I/O operation (across any file) returns an InjectedError
-//	// wrapping errDisk.
-//
-//	// Restrict injection to WriteAt operations only:
-//	efs := errfs.New(realFS, 3, errDisk).OnlyOps(errfs.OpWriteAt)
-//	// The counter increments for every operation, but the fault fires only
-//	// when the counter is >= 3 AND the operation is WriteAt.
-//
-// # Fault modes
-//
-// The default mode returns the error WITHOUT touching the delegate, which
-// models the operations that either happen or do not (open, rename, unlink).
-// It does NOT model a failing write or a failing flush, and using it for those
-// leaves the recovery paths that exist for them unreachable:
-//
-//   - ShortWrite(n) makes a firing Write/WriteAt put p[:n] on the medium and
-//     THEN report the error, which is what a pwrite(2) hitting ENOSPC or EIO
-//     mid-transfer does. The torn record this leaves behind is the only input
-//     that reaches the WAL's torn-tail recovery.
-//   - LoseUnsyncedData makes a firing Sync/SyncMetadata DISCARD everything
-//     written since the last successful sync before reporting the error, which
-//     is what the kernel does to the dirty pages of a failed fsync (fsyncgate:
-//     the pages are dropped, not retried). Nothing else can distinguish a WAL
-//     that fsyncs before acknowledging from one that does not.
-//
-// # Injection budget
-//
-// Injection is one-shot by DEFAULT. Times(n) raises the budget to n faults and
-// Times(0) makes it unlimited, which is what makes a retry-exhaustion path
-// (engine saveStateMaxRetries) and a rollback-after-write-failure path
-// reachable: both need the SECOND fault, not the first.
-//
-// All FS-level operations and all File-level operations share a single
-// monotonic counter. When the counter reaches injectAt and the operation is
-// eligible the fault fires; further operations pass through once the budget is
-// spent, unless Reset is called.
-//
-// Valid operation names are the Op* constants; OnlyOps panics on any other
-// name, because a typo'd name silently disables injection and turns every
-// assertion downstream of it vacuous.
+// Package errfs is a fault-injection waldb.FS that fails the Nth operation across all files, with ShortWrite, LoseUnsyncedData, Times and OnlyOps controls.
 package errfs
 
 import (
@@ -110,9 +63,7 @@ const (
 	OpSeek = "Seek"
 	// OpSync is File.Sync — fdatasync on the production Linux osFile.
 	OpSync = "Sync"
-	// OpSyncMetadata is File.SyncMetadata, the full fsync every DIRECTORY sync
-	// must use. It is a distinct name from OpSync precisely so a test can arm
-	// one and not the other; see waldb.FileMetadataSyncer.
+	// OpSyncMetadata is File.SyncMetadata, the full fsync for directories; see waldb.FileMetadataSyncer.
 	OpSyncMetadata = "SyncMetadata"
 	// OpClose is File.Close.
 	OpClose = "Close"
@@ -246,15 +197,7 @@ type fault struct {
 	shortN int
 }
 
-// ErrorFS wraps a waldb.FS and injects a caller-supplied fault at a specific
-// operation number. A counter shared across all files opened through this
-// instance is incremented before every FS-level and File-level operation.
-//
-// A value of 0 for injectAt disables injection entirely (pure passthrough).
-//
-// ErrorFS is safe for concurrent use: the counter and the fire budget are
-// lock-free atomics, and the configuration is published as an immutable value
-// behind an atomic pointer.
+// ErrorFS wraps a waldb.FS and injects a fault at operation number injectAt (0 disables); safe for concurrent use.
 type ErrorFS struct {
 	delegate waldb.FS
 
@@ -274,27 +217,12 @@ type ErrorFS struct {
 // can be armed later with Reset.
 func New(delegate waldb.FS, injectAt int64, err error) *ErrorFS {
 	efs := &ErrorFS{delegate: delegate}
-	// mode is stated rather than left to the zero value. modeError IS the zero
-	// value, so omitting it compiles to the same thing — but then the default
-	// behaviour of every ErrorFS depends on the ORDER of the iota block above,
-	// and a reader has to go and check it. Naming it here is the difference
-	// between "the default is to return the error untouched" being a fact in
-	// the code and being a fact about a constant's position.
+	// State the mode explicitly rather than rely on the zero value.
 	efs.spec.Store(&injectSpec{at: injectAt, err: err, times: 1, mode: modeError})
 	return efs
 }
 
-// OnlyOps restricts injection to fire only when the operation name matches one
-// of the provided Op* constants. Returns the ErrorFS for chaining.
-//
-// When set, the counter still increments for all operations, but the fault
-// only fires when the counter has reached injectAt AND the operation matches.
-// If the counter reaches injectAt on a non-matching operation the fault is
-// deferred to the next matching one.
-//
-// It PANICS on a name that is not an Op* constant. A misspelled name would
-// match no operation, disarm the injection, and leave the test asserting
-// against a filesystem that never failed.
+// OnlyOps restricts injection to the given Op* operations, deferring a fault to the next match; it panics on an unknown name.
 func (efs *ErrorFS) OnlyOps(ops ...string) *ErrorFS {
 	m := make(map[string]struct{}, len(ops))
 	for _, op := range ops {
@@ -317,13 +245,7 @@ func (efs *ErrorFS) ClearOpsFilter() {
 	efs.spec.Store(next)
 }
 
-// Times sets how many faults may fire before injection stops. The default is
-// 1 (one-shot); 0 means unlimited. Returns the ErrorFS for chaining.
-//
-// A one-shot fault cannot reach any code that runs BECAUSE the first fault
-// happened — a retry loop's exhaustion, or the rollback a failed write
-// triggers — because that code runs against a filesystem that has silently
-// become healthy again.
+// Times sets how many faults may fire: 1 by default, 0 unlimited.
 func (efs *ErrorFS) Times(n int64) *ErrorFS {
 	next := efs.spec.Load().clone()
 	next.times = n
@@ -331,13 +253,7 @@ func (efs *ErrorFS) Times(n int64) *ErrorFS {
 	return efs
 }
 
-// ShortWrite makes a firing Write or WriteAt transfer the first n bytes of the
-// buffer to the delegate and then report the error with that byte count, the
-// way a pwrite(2) that runs out of space mid-transfer does. Returns the
-// ErrorFS for chaining.
-//
-// n is clamped to the length of the buffer. A firing operation that is not a
-// write is unaffected and reports the error without touching the delegate.
+// ShortWrite makes a firing write transfer the first n bytes, clamped, then report the error.
 func (efs *ErrorFS) ShortWrite(n int) *ErrorFS {
 	next := efs.spec.Load().clone()
 	next.mode = modeShortWrite
@@ -346,18 +262,7 @@ func (efs *ErrorFS) ShortWrite(n int) *ErrorFS {
 	return efs
 }
 
-// LoseUnsyncedData makes a firing Sync or SyncMetadata discard every byte
-// written to that file since its last successful sync — restoring the
-// overwritten ranges and truncating away the appended tail — before reporting
-// the error. Returns the ErrorFS for chaining.
-//
-// This is what a failed fsync actually costs: the kernel drops the dirty pages
-// rather than retrying them, so the data is gone and only the bytes an EARLIER
-// successful fsync covered survive. A test that merely returns an error from
-// Sync leaves the data on the medium and therefore cannot tell a WAL that
-// flushes before acknowledging from one that does not.
-//
-// The restored image is itself fsynced, so the loss survives a reopen.
+// LoseUnsyncedData makes a firing sync discard everything written since the last successful sync, durably, then report the error.
 func (efs *ErrorFS) LoseUnsyncedData() *ErrorFS {
 	next := efs.spec.Load().clone()
 	next.mode = modeLoseUnsynced
@@ -502,15 +407,7 @@ func (efs *ErrorFS) Rename(oldpath, newpath string) error {
 	return efs.delegate.Rename(oldpath, newpath)
 }
 
-// wrap returns a waldb.File carrying exactly the optional capabilities the
-// delegate carries.
-//
-// The capability set has to be reproduced rather than always offered: waldb
-// selects the pre-allocation and directory-metadata-sync paths by type
-// assertion, so a wrapper that answers every assertion sends production down a
-// path its real filesystem does not have, and a wrapper that answers none of
-// them silently degrades a directory fsync to fdatasync — the one thing
-// FileMetadataSyncer exists to prevent.
+// wrap returns a waldb.File with exactly the delegate's optional capabilities.
 func (efs *ErrorFS) wrap(file waldb.File) waldb.File {
 	ef := &ErrorFile{delegate: file, efs: efs}
 	_, preAlloc := file.(waldb.FilePreAllocator)
@@ -537,14 +434,7 @@ type undoRecord struct {
 	pre []byte
 }
 
-// ErrorFile wraps a waldb.File and routes every I/O operation through the
-// parent ErrorFS counter. When a fault fires the operation raises it, having
-// first disturbed the delegate as the fault mode requires.
-//
-// ErrorFile itself carries no optional capability. The capability-bearing
-// wrappers below embed it and are chosen by ErrorFS.wrap to mirror the
-// delegate, so a type assertion against the returned file answers exactly what
-// the same assertion against the delegate would.
+// ErrorFile wraps a waldb.File and routes every operation through the ErrorFS counter; capability wrappers embed it.
 type ErrorFile struct {
 	delegate waldb.File
 	efs      *ErrorFS
@@ -680,9 +570,7 @@ func (ef *ErrorFile) sync(op string, doSync func() error) error {
 	return f.err
 }
 
-// preAllocate implements the pre-allocation capability for the wrappers whose
-// delegate has it. The count is taken BEFORE the delegate is consulted so the
-// operation number a sweep computes does not depend on the delegate's type.
+// preAllocate counts the operation before consulting the delegate.
 func (ef *ErrorFile) preAllocate(size int64) error {
 	if f := ef.efs.tick(OpPreAllocate); f != nil {
 		return f.err
@@ -697,9 +585,7 @@ func (ef *ErrorFile) syncMetadata() error {
 	return ef.sync(OpSyncMetadata, ms.SyncMetadata)
 }
 
-// markDurable records the file's post-sync size and drops the undo journal:
-// everything written up to here is on the medium and can no longer be lost by
-// a later failed sync.
+// markDurable records the post-sync size and drops the undo journal.
 func (ef *ErrorFile) markDurable() {
 	if !ef.efs.tracksLoss() {
 		return

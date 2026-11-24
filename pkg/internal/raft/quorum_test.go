@@ -16,20 +16,7 @@ package raft
 
 import "testing"
 
-// TestQuorumOf pins the majority rule itself.
-//
-// quorumOf is the SINGLE definition from which election tallying
-// (checkElectionResult), commit advancement (tryCommit), the ReadIndex quorum
-// and the membership validators all derive. Until this test existed it had no
-// direct coverage at all: the only occurrence of the identifier in any test
-// file was a COMMENT. That mattered — changing it to n/2 (majority to half)
-// left 18 of the 19 linearizability tests passing, because producing two
-// leaders from a halved quorum needs a split vote or a live partition and the
-// integration suite constructs neither.
-//
-// A one-character change here silently halves the safety margin of the entire
-// engine, so it is pinned as a table rather than left to emerge from a
-// multi-second cluster test.
+// TestQuorumOf pins the majority rule every election, commit, ReadIndex and membership check derives from.
 func TestQuorumOf(t *testing.T) {
 	// Hand-computed majorities: strictly more than half of n.
 	cases := []struct {
@@ -67,8 +54,7 @@ func TestQuorumOf_IsStrictMajority(t *testing.T) {
 				"in %d members, so two candidates could each claim a quorum "+
 				"in the same term", n, q, n)
 		}
-		// It must also be the SMALLEST such value, or the cluster loses
-		// availability it is entitled to (a 5-node shard must tolerate 2 down).
+		// It must also be the smallest such value (a 5-node shard tolerates 2 down).
 		if q > 1 && 2*(q-1) > n {
 			t.Fatalf("quorumOf(%d) = %d is larger than the smallest strict "+
 				"majority: the shard refuses to make progress with a "+

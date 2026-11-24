@@ -31,15 +31,7 @@ import (
 // for a tag. .gitattributes is therefore the one exclusion list.
 const exportIgnoreAttr = "export-ignore"
 
-// privateWorkflowFiles are exact root-relative paths that stay in the private
-// repository: the private forge's own workflows (red-main revert and
-// pull-request review automation, which are not the CI template) and the release
-// trust anchor pinning the internal agent principal, which only the private
-// release recipe reads. Everything else is published -- the agent files
-// (CLAUDE.md, AGENTS.md, .claude/, .serena/) and every other workflow under
-// .github/workflows included (owner ruling on #406 and #407, option (a)) --
-// and scanned like any other file. The list is exact on purpose: a file of
-// the same name elsewhere is published.
+// privateWorkflowFiles are the exact paths that stay private: the private forge workflows and the release trust anchor.
 var privateWorkflowFiles = []string{
 	".github/workflows/revert-red-main.yml",
 	".github/workflows/code-review.yml",
@@ -107,12 +99,7 @@ func publishedFiles(ctx context.Context, root string) ([]string, error) {
 	return published, nil
 }
 
-// statIndex stats the git index from this process, so that go test's result
-// cache keys on it. The manifest is read by git in a subprocess, which the
-// cache cannot see: without this, staging a new file — whose contents the
-// previous run never opened — leaves a plain `go test` reporting a cached pass
-// over a tree that now leaks. A missing index (a repository with nothing
-// staged yet) is not an error; ls-files then reports an empty index anyway.
+// statIndex stats the git index so go test's cache keys on it; a missing index is not an error.
 func statIndex(ctx context.Context, root string) error {
 	out, err := gitCommand(ctx, root, "rev-parse", "--path-format=absolute", "--git-path", "index").Output()
 	if err != nil {

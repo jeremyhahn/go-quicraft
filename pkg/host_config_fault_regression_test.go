@@ -27,24 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// Runtime and recovery must agree on failing CLOSED
-//
-// A committed config-carrying entry this binary cannot DECODE is replicated
-// state every peer can read and this replica cannot. Recovery has always
-// treated it as fatal (ReconstructMembership -> StartShard aborts) and the
-// commit pipeline now does too (processConfigChanges -> failCommit). The Host's
-// ROUTING MIRROR of the same fold — applyMembershipRouting and
-// registerBootstrapAddresses, which decode the identical entries a second time
-// to update ns.nodes and the transport registry — logged an ERROR and carried
-// on.
-//
-// Carrying on is wrong even though the commit path means nothing undecodable
-// should reach here: if one does, the invariant the two paths share has been
-// broken, and the result is a replica whose routing table silently disagrees
-// with the membership raft is computing quorum over, while it keeps acking the
-// leader and serving reads.
-// ---------------------------------------------------------------------------
+// A committed config entry the routing mirror cannot decode must fail the shard closed, as recovery and the commit path do.
 
 // corruptConfigEntries returns the two committed shapes the Host mirror
 // decodes, each with a payload that cannot be parsed. Both are non-empty: an
@@ -94,10 +77,7 @@ func TestApplyMembershipRouting_FaultsTheShardOnACorruptCommittedEntry(t *testin
 	}
 }
 
-// TestApplyMembershipRouting_HealthyEntriesDoNotFaultTheShard is the POSITIVE
-// CONTROL. Without it a mutation that faulted the shard unconditionally would
-// satisfy the assertion above — and would take down every shard on the first
-// committed config change.
+// TestApplyMembershipRouting_HealthyEntriesDoNotFaultTheShard is the positive control.
 func TestApplyMembershipRouting_HealthyEntriesDoNotFaultTheShard(t *testing.T) {
 	h := newTestHost(t)
 	if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false,

@@ -33,12 +33,7 @@ const (
 	crossBuildCurve = tls.SecP256r1MLKEM768
 )
 
-// assertHandshakeCurves pins the standard build's list: X25519MLKEM768 FIRST,
-// because a client sends its key share for the first group it names and two
-// standard nodes should land on the hybrid in one round trip;
-// SecP256r1MLKEM768 PRESENT, because it is the hybrid a FIPS build offers;
-// P-256 PRESENT, because it is the classical group shared with a FIPS build
-// and a cluster has to be convertible one node at a time.
+// assertHandshakeCurves checks the standard build offers X25519MLKEM768 first and includes SecP256r1MLKEM768 and P-256 for FIPS interop.
 func assertHandshakeCurves(t *testing.T, role string, curves []tls.CurveID) {
 	t.Helper()
 

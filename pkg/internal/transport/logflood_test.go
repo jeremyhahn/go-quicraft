@@ -20,14 +20,7 @@ import (
 	"time"
 )
 
-// TestLogSampled_BoundsPeerDrivenDiagnostics pins the rate limiter that keeps
-// the inbound receive path off the log.
-//
-// Every warning on that path is triggerable at frame rate by one authenticated
-// peer. slog's default handler writes synchronously to stderr under a single
-// mutex, so an unsampled line costs a write syscall on the raft receive path
-// AND serialises every other log call in the process behind it. The attacker's
-// cost is a few dozen bytes per line produced.
+// TestLogSampled_BoundsPeerDrivenDiagnostics verifies the receive-path log rate limiter.
 func TestLogSampled_BoundsPeerDrivenDiagnostics(t *testing.T) {
 	var stamp atomic.Int64
 

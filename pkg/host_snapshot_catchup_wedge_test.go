@@ -23,26 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 )
 
-// TestSnapshotCatchUp_LeavesNoHoleInTheEntryIndex is the regression guard for a
-// permanent, unrecoverable wedge reachable through ENTIRELY NORMAL OPERATION —
-// no crash, no corruption, no operator error:
-//
-//	leader compacts -> a follower falls behind -> the leader sends
-//	InstallSnapshot -> the follower records it and resumes replication ABOVE it
-//	-> the follower restarts.
-//
-// The receive path recorded the snapshot but never advanced the log compaction
-// floor, so the follower kept its old entries BELOW the snapshot while appending
-// above it. Its durable entry index became {1..k} U {N+1..M} — a hole. EntryRange
-// checks the stored count against the first..last span and correctly reports
-// ErrLogGapDetected; recoverLogReader turns that into a StartShard failure, so
-// the replica can NEVER be started again. There is no self-heal (SnapshotEntries
-// has no default, so this replica never compacts on its own) and no repair path
-// (RequestCompaction on an unloaded shard only runs segment GC).
-//
-// The fix advances the floor on receive, exactly as the local save path and
-// ImportSnapshot do. This test drives the LogDB shape directly so it pins the
-// durable-state invariant rather than one code path's plumbing.
+// TestSnapshotCatchUp_LeavesNoHoleInTheEntryIndex pins that receiving a snapshot advances the log floor, so a restarted follower has no gap.
 func TestSnapshotCatchUp_LeavesNoHoleInTheEntryIndex(t *testing.T) {
 	const shardID, replicaID = uint64(1), uint64(1)
 	const snapshotIndex = uint64(6000)
@@ -103,17 +84,7 @@ func TestSnapshotCatchUp_LeavesNoHoleInTheEntryIndex(t *testing.T) {
 	}
 }
 
-// TestRecoverLogReader_RepairsHoleBelowRecordedSnapshot pins the self-heal that
-// rescues replicas ALREADY wedged in the field.
-//
-// A replica whose log floor was never advanced past a snapshot it recorded holds
-// {1..k} U {N+1..M}. EntryRange reports ErrLogGapDetected and StartShard fails
-// forever — nothing compacts it and RequestCompaction cannot run on an unloaded
-// shard. Two ways in: the receive path before it advanced the floor, and a crash
-// inside ImportSnapshot between recording the snapshot and advancing the floor,
-// a window that still exists by construction. A write-path fix alone cannot help
-// a replica that is already in this state, so recovery repairs it: the snapshot
-// subsumes the stale prefix, so removing it loses nothing.
+// TestRecoverLogReader_RepairsHoleBelowRecordedSnapshot pins that recovery removes the stale prefix below a recorded snapshot.
 func TestRecoverLogReader_RepairsHoleBelowRecordedSnapshot(t *testing.T) {
 	const shardID, replicaID = uint64(1), uint64(1)
 	const snapshotIndex = uint64(6000)
@@ -203,9 +174,7 @@ func TestRecoverLogReader_FailsClosedOnGapWithNoSnapshot(t *testing.T) {
 	}
 }
 
-// repairFailLogDB presents a holed index (as a wedged replica does) but fails the
-// repair write, so a test can assert WHICH error recovery reports. Embedding the
-// concrete MemDB keeps every other method behaving normally.
+// repairFailLogDB presents a holed index but fails the repair write.
 type repairFailLogDB struct {
 	*memdb.MemDB
 	rmErr error
@@ -215,11 +184,7 @@ func (d *repairFailLogDB) RemoveEntriesTo(shardID, replicaID, index uint64) erro
 	return d.rmErr
 }
 
-// TestRecoverLogReader_ReportsRepairFailureNotTheGap pins the diagnostic: when
-// the self-heal write itself fails (a write-gate rejection, a failed fsync, a
-// closed DB), recovery must report THAT failure — not the ErrLogGapDetected that
-// prompted the repair. Reporting the gap sends an operator after data corruption
-// that did not happen while hiding the fault that actually blocked recovery.
+// TestRecoverLogReader_ReportsRepairFailureNotTheGap pins that recovery reports the repair failure, not ErrLogGapDetected.
 func TestRecoverLogReader_ReportsRepairFailureNotTheGap(t *testing.T) {
 	const shardID, replicaID = uint64(1), uint64(1)
 	const snapshotIndex = uint64(6000)
@@ -272,20 +237,7 @@ type floorFailLogDB struct {
 
 func (d *floorFailLogDB) RemoveEntriesTo(_, _, _ uint64) error { return d.err }
 
-// TestSnapshotReceive_FloorAdvanceFailureKeepsTheCommittedSnapshot pins the
-// invariant that the log-floor advance must never be able to destroy a snapshot
-// LogDB already durably references.
-//
-// The advance runs inside the block that precedes committed = true, so returning
-// an error from it would send the deferred rollback through RemoveAll on the very
-// directory SaveSnapshot just recorded: the shard could then not start (its LogDB
-// record points at a deleted directory) and every leader re-send would be refused
-// by the dedup branch — a permanent wedge, which is the exact failure the floor
-// advance exists to prevent.
-//
-// The advance is therefore non-fatal: the receive genuinely succeeded (the
-// snapshot is durable and installed), and the hole left below it is precisely
-// what recoverLogReader repairs on the next start.
+// TestSnapshotReceive_FloorAdvanceFailureKeepsTheCommittedSnapshot pins that a failed floor advance is non-fatal and never removes the recorded snapshot.
 func TestSnapshotReceive_FloorAdvanceFailureKeepsTheCommittedSnapshot(t *testing.T) {
 	const index, term = uint64(3300), uint64(9)
 	payload := bytes.Repeat([]byte("state-machine-image"), 64)

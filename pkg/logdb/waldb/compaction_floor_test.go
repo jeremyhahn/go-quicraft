@@ -155,9 +155,7 @@ func tearBlockFrom(t *testing.T, path string, off int64, blockSize int64) {
 	}
 }
 
-// BenchmarkDBAppendEntries measures the single-entry append path.
-// renameFailFS fails every Rename onto the COMPACTED file: a crash at the
-// floor publication, before its rename lands.
+// renameFailFS fails every Rename onto the COMPACTED file.
 type renameFailFS struct {
 	FS
 }
@@ -169,8 +167,7 @@ func (f *renameFailFS) Rename(oldpath, newpath string) error {
 	return f.FS.Rename(oldpath, newpath)
 }
 
-// floorFileFloors reads the COMPACTED file of dir, failing the test when it
-// does not parse.
+// floorFileFloors reads dir's COMPACTED file, failing the test if it does not parse.
 func floorFileFloors(t *testing.T, dir string) map[nodeKey]uint64 {
 	t.Helper()
 	floors, err := loadCompactionFloors(defaultFS(), dir)
@@ -411,6 +408,7 @@ func TestCompactionFloors_Codec(t *testing.T) {
 	}
 }
 
+// BenchmarkDBAppendEntries measures the single-entry append path.
 func BenchmarkDBAppendEntries(b *testing.B) {
 	b.ReportAllocs()
 	db := openBenchDB(b)

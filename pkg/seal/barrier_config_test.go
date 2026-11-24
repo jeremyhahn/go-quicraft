@@ -66,12 +66,7 @@ func TestBarrierConfig_Validate(t *testing.T) {
 		})
 	}
 
-	// An algorithm this build does not register is refused at configuration
-	// time as an unsupported identifier, not as a policy violation — in a FIPS
-	// build the ChaCha20 family is not "disallowed", it is absent. The runtime
-	// FIPS rejection (ErrAlgorithmNotFIPSApproved) is a separate check that
-	// still fires in a non-FIPS build with GOFIPS140 set; see
-	// TestFIPSConstrainsDataPathCipher.
+	// An algorithm this build does not register is refused as unsupported.
 	for _, alg := range unregisteredAlgorithms {
 		t.Run(fmt.Sprintf("unregistered_%#x", byte(alg)), func(t *testing.T) {
 			cfg := BarrierConfig{
@@ -86,14 +81,7 @@ func TestBarrierConfig_Validate(t *testing.T) {
 	}
 }
 
-// TestBarrierConfig_Validate_InvalidAlgorithm verifies that an invalid
-// algorithm returns ErrUnsupportedAlgorithm.
-// TestBarrierConfig_Algorithm_Selection verifies that DefaultBarrierConfig
-// selects a valid algorithm (either AES256GCM or ChaCha20Poly1305) based on
-// the CPU capabilities.
-// TestBarrierConfigValidate_ExportedForRuntimeConfigs asserts the validation
-// is reachable as an error, so an embedder assembling a config at runtime can
-// reject it at admission time.
+// TestBarrierConfigValidate_ExportedForRuntimeConfigs verifies Validate reports an invalid runtime config as an error.
 func TestBarrierConfigValidate_ExportedForRuntimeConfigs(t *testing.T) {
 	valid := DefaultBarrierConfig(1)
 	if err := valid.Validate(); err != nil {

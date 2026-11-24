@@ -23,12 +23,7 @@ import (
 	"testing"
 )
 
-// Tests for the Argon2id-only surface of SoftwareStrategy. They live behind
-// //go:build !fips because they need Argon2id to actually DERIVE, and its
-// deriver is not compiled into a FIPS build (kdf_argon2.go); the cross-KDF cases
-// additionally need two different KDFs to cross between. The constructor itself
-// exists in both builds — the FIPS-side contract is pinned by
-// strategy_params_api_fips_test.go.
+// Argon2id-only SoftwareStrategy tests; not built under fips. The FIPS contract is in strategy_params_api_fips_test.go.
 
 func TestNewSoftwareStrategyWithParams_Valid(t *testing.T) {
 	s, err := NewSoftwareStrategyWithParams(context.Background(), []byte("test"), 1, 64*1024, 2)

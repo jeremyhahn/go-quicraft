@@ -26,11 +26,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// These tests pin the decision core of driveConfigChange without a cluster:
-// which errors count as a submission, which are retried, and above all that
-// "already exists" / "not found" / "stale ConfigChangeID" become a success
-// ONLY behind a submitted attempt AND a linearizable read showing the exact
-// change requested. Each rule has a test that fails when it is removed.
+// These tests pin which driveConfigChange errors count as submitted or retried, and that idempotent refusals succeed only after a confirming read.
 
 // scriptedAttempts returns each error in errs in turn, then the last one
 // forever, and counts the calls.
@@ -148,12 +144,7 @@ func requireConflict(t *testing.T, err error) *membershipConflictError {
 // "already exists" / "not found" / "stale" refusal does. The refusal itself
 // is therefore what the loop has to accept, not the first observation.
 
-// postDeliverySubmitted is what the adapter produces when leadership moves
-// AFTER the change reached Raft: the mapped sentinel with quicraft's submission
-// bit intact, exactly as translateError returns it.
-//
-// A bare ErrShardNotReady means what it says -- the replica refused it,
-// nothing was submitted -- so a fixture that means "submitted" has to say so.
+// postDeliverySubmitted is the mapped sentinel with quicraft's submission bit, as translateError returns it after delivery.
 func postDeliverySubmitted() error {
 	return &quicraft.MaybeAppliedError{Err: dragonboat.ErrShardNotReady}
 }
@@ -163,10 +154,7 @@ func TestIntegration_DB_ConfigChangeRetry_RefusalAfterSubmissionLands(t *testing
 		"already-exists after post-delivery not-leader": {postDeliverySubmitted(), errAlreadyExistsHere},
 		// An ErrTimeout is produced only after delivery, so it is a submission.
 		"already-exists after timeout": {dragonboat.ErrTimeout, errAlreadyExistsHere},
-		// The caller's ConfigChangeID describes the configuration BEFORE its
-		// own change; once that change commits under a new leader, the retry
-		// is refused as stale. Only the read can say the change is the loop's
-		// own.
+		// A retry after the change committed is refused as stale; only the read proves the change is the loop's own.
 		"stale ID after post-delivery not-leader": {postDeliverySubmitted(), dragonboat.ErrStaleConfigChange},
 	}
 	for name, tc := range cases {
@@ -249,16 +237,10 @@ func TestIntegration_DB_ConfigChangeRetry_AlreadyExistsWithoutSubmissionStillFai
 		"no leader observed":    errNoLeaderObserved,
 		"system busy":           dragonboat.ErrSystemBusy,
 		"pending config change": dragonboat.ErrRejected,
-		// The real sentinel, not a look-alike built from the same text:
-		// matching it by sentinel means a fixture that only LOOKED like a
-		// transfer refusal would not be retried, so the fixture has to be the
-		// thing it models.
+		// The real sentinel, so the retry matches by identity.
 		"transfer in progress":  &dragonboat.AdapterError{Err: quicraft.ErrTransferInProgress},
 		"refused on first call": errAlreadyExistsHere,
-		// The BARE sentinel, with no submission bit, distinguishable from the
-		// post-delivery leadership change. It is the one an engine that applied
-		// a change it reported as refused PRE-FLIGHT would slip through if the
-		// helper armed the submission bit for it.
+		// The bare sentinel, without the submission bit: a pre-flight refusal.
 		"pre-flight not-leader": dragonboat.ErrShardNotReady,
 	}
 	landed := membershipOf(map[uint64]dragonboat.Target{10: helperTestAddr}, nil, nil)
@@ -397,11 +379,7 @@ func (r *countingResolver) resolve(uint64) (*dragonboat.NodeHost, int) {
 	return nil, -1
 }
 
-// TestIntegration_DB_ConfigChangeRetry_LeaderIsResolvedOnEveryAttempt pins
-// the property the whole class is about: the leader is named at the point of
-// EACH attempt, never sampled once before the loop. A hoisted resolve is
-// asked exactly once; the loop below asks on every attempt for a whole
-// budget.
+// TestIntegration_DB_ConfigChangeRetry_LeaderIsResolvedOnEveryAttempt pins that the leader is resolved on each attempt.
 func TestIntegration_DB_ConfigChangeRetry_LeaderIsResolvedOnEveryAttempt(t *testing.T) {
 	resolver := &countingResolver{}
 	const budget = 500 * time.Millisecond
@@ -416,11 +394,7 @@ func TestIntegration_DB_ConfigChangeRetry_LeaderIsResolvedOnEveryAttempt(t *test
 	t.Logf("leader resolved %d times across %v", resolver.calls, budget)
 }
 
-// TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget runs the
-// cluster-facing form against a shard that CANNOT elect -- a three-member
-// membership with one replica running -- so the resolver never finds a leader.
-// It pins that the budget is a bound rather than a hope, against the real
-// resolver and real hosts.
+// TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget pins that a shard that cannot elect exhausts the budget.
 func TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
@@ -451,16 +425,7 @@ func TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget(t *testing.T
 	t.Logf("no leader: exhausted after %v against a %v budget: %v", elapsed.Round(time.Millisecond), budget, err)
 }
 
-// TestIntegration_DB_BudgetsDescribeTheClusterTheyBudgetFor pins the
-// derivation beside the budgets to the configuration this suite actually
-// starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives dbTestShardConfig an explicit ElectionRTT, or
-// hands dbTestNodeHostConfig a different RTTMillisecond, electionRound
-// silently starts describing a cluster that no longer exists and every budget
-// built on it is wrong by that factor -- exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
+// TestIntegration_DB_BudgetsDescribeTheClusterTheyBudgetFor pins the budget derivation to the RTT settings this suite starts.
 func TestIntegration_DB_BudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	pki := dbTestPKIFor(t)
 	if got := dbTestNodeHostConfig(t, "127.10.0.5:1", pki.leaf(t)).RTTMillisecond; got != testRTTMillisecond {

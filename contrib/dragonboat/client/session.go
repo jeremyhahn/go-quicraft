@@ -12,17 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package client provides dragonboat-compatible client session types that
-// wrap quicraft's Session for at-most-once proposal semantics.
-//
-// MIGRATION NOTE: this is the type migrating code touches most, and its
-// shape differs from dragonboat's. Dragonboat's client.Session exposes
-// ShardID, ClientID, SeriesID and RespondedTo as struct FIELDS. Here only
-// ShardID is a field; ClientID, SeriesID and RespondedTo are METHODS,
-// because the underlying quicraft session is swapped atomically during
-// registration and cannot be read as plain fields. Code reading those
-// fields fails to compile — loudly, never silently — and must be changed
-// to method calls (s.ClientID() instead of s.ClientID).
+// Package client provides dragonboat-compatible client sessions; ClientID, SeriesID and RespondedTo are methods, not fields as in dragonboat.
 package client
 
 import (
@@ -42,13 +32,7 @@ type Source interface {
 	Uint64() uint64
 }
 
-// Session represents a client session for at-most-once proposal semantics.
-// It wraps quicraft's Session and exposes the ShardID as a public field
-// for dragonboat API compatibility.
-//
-// The inner session pointer is stored via atomic.Pointer to allow lock-free
-// concurrent reads while ProposeSession atomically swaps the underlying
-// quicraft session after registration.
+// Session wraps a quicraft Session (swapped atomically on registration) and exposes ShardID as a field.
 type Session struct {
 	inner atomic.Pointer[quicraft.Session]
 
@@ -65,15 +49,7 @@ func newSessionFromInner(inner *quicraft.Session, shardID uint64) *Session {
 	return s
 }
 
-// NewSession creates a new tracked client session for the specified shard.
-// The rng parameter provides the random source for client ID generation,
-// matching dragonboat v4's API signature. If rng is nil, a cryptographically
-// secure random source is used. The generated client ID is guaranteed to be
-// non-zero.
-//
-// The session is NOT yet registered. The caller must register it through
-// NodeHost.SyncGetSession or by proposing a session registration before
-// using it for normal proposals.
+// NewSession creates an unregistered session for shardID with a non-zero client ID; a nil rng uses crypto/rand.
 func NewSession(shardID uint64, rng Source) *Session {
 	clientID := generateClientID(rng)
 	return newSessionFromInner(quicraft.NewSession(shardID, clientID), shardID)
@@ -89,12 +65,7 @@ func generateClientID(rng Source) uint64 {
 		}
 		// Fall through to crypto/rand if rng returned zero.
 	}
-	// Try crypto/rand a bounded number of times. A transient RNG failure must
-	// not crash the host process from a client-session allocation, so on
-	// persistent failure fall back to a process-unique, monotonic value rather
-	// than panicking. The fallback is not cryptographically random, but a
-	// client ID only needs to be unique within the deployment, which the
-	// nanosecond clock mixed with a monotonic counter provides.
+	// On persistent crypto/rand failure fall back to a unique clock-and-counter ID rather than panicking.
 	for attempt := 0; attempt < 8; attempt++ {
 		var buf [8]byte
 		if _, err := rand.Read(buf[:]); err != nil {
@@ -116,11 +87,7 @@ func generateClientID(rng Source) uint64 {
 // when crypto/rand is persistently unavailable (see generateClientID).
 var fallbackClientIDCounter atomic.Uint64
 
-// NewNoOPSession returns a no-op session that bypasses at-most-once
-// deduplication. Use for idempotent operations that do not require
-// exactly-once delivery guarantees. The rng parameter is accepted for
-// dragonboat v4 API compatibility but is not used, as quicraft generates
-// client IDs internally.
+// NewNoOPSession returns a session without at-most-once deduplication; rng is accepted for API compatibility and unused.
 func NewNoOPSession(shardID uint64, rng Source) *Session {
 	_ = rng // accepted for dragonboat v4 API compatibility
 	return newSessionFromInner(quicraft.NewNoOPSession(shardID), shardID)
@@ -168,10 +135,7 @@ func (s *Session) ProposalCompleted() {
 	s.inner.Load().ProposalCompleted()
 }
 
-// PrepareForRegister sets the session state for a register proposal.
-// The seriesID is set to SeriesIDForRegister and respondedTo is cleared.
-// Matches dragonboat's client.Session.PrepareForRegister; callers use it
-// before NodeHost.ProposeSession to register the session through Raft.
+// PrepareForRegister sets the series to SeriesIDForRegister and clears respondedTo before ProposeSession.
 func (s *Session) PrepareForRegister() {
 	s.inner.Load().PrepareForRegister()
 }
@@ -182,18 +146,7 @@ func (s *Session) PrepareForUnregister() {
 	s.inner.Load().PrepareForUnregister()
 }
 
-// ValidForProposal returns true if the session is valid for submitting
-// normal proposals to the specified shard. This enforces:
-//   - ShardID must match
-//   - ClientID must not be 0 (not a no-op session)
-//   - SeriesID must not be a register/unregister sentinel
-//   - RespondedTo must be below SeriesID: a series that has already been
-//     responded to (RespondedTo == SeriesID) is not proposed again until
-//     ProposalCompleted advances it
-//
-// NodeHost.SyncPropose and NodeHost.Propose call it on every tracked
-// session before submission and return ErrInvalidSession when it fails,
-// because the host's own validator admits RespondedTo == SeriesID.
+// ValidForProposal reports whether the session matches shardID, is not no-op, has a normal series and RespondedTo below SeriesID.
 func (s *Session) ValidForProposal(shardID uint64) bool {
 	in := s.inner.Load()
 	if !in.ValidForProposal(shardID) {
@@ -202,12 +155,7 @@ func (s *Session) ValidForProposal(shardID uint64) bool {
 	return in.RespondedTo() < in.SeriesID()
 }
 
-// ValidForSessionOp returns true if the session is valid for session
-// operations (registration/unregistration) on the specified shard. This
-// enforces:
-//   - ShardID must match
-//   - ClientID must not be 0 (not a no-op session)
-//   - SeriesID must be exactly SeriesIDForRegister or SeriesIDForUnregister
+// ValidForSessionOp reports whether the session matches shardID, is not no-op, and its series is the register or unregister sentinel.
 func (s *Session) ValidForSessionOp(shardID uint64) bool {
 	inner := s.inner.Load()
 	if s.ShardID != shardID || inner.IsNoOPSession() {

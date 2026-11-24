@@ -92,12 +92,7 @@ func assertOnlyExportPair(t *testing.T, exportPath string) {
 	}
 }
 
-// TestWriteSnapshotExport_FsyncsEveryCreatedDirectory: an export into a
-// directory the export itself creates must fsync every directory MkdirAll
-// created, and the pre-existing ancestor's entry for the first of them. The
-// export directory's own fsync makes the two renames durable, but not the
-// directory: a power loss could lose it, and with it an export reported as
-// written. Nothing above the pre-existing ancestor is touched.
+// TestWriteSnapshotExport_FsyncsEveryCreatedDirectory verifies an export fsyncs every directory it creates.
 func TestWriteSnapshotExport_FsyncsEveryCreatedDirectory(t *testing.T) {
 	base := t.TempDir()
 	exportPath := filepath.Join(base, "a", "b", "c")
@@ -132,12 +127,7 @@ func TestWriteSnapshotExport_FsyncsEveryCreatedDirectory(t *testing.T) {
 	}
 }
 
-// TestWriteSnapshotExport_FailedPublishKeepsThePreviousPair: a publication
-// that fails over an existing export must leave the previous pair exactly as
-// it was — complete, consistent and verifiable. Renaming snapshot.dat over
-// the old one and then failing on snapshot.meta left the new data beside the
-// old record: the previous export destroyed, and nothing published in its
-// place. Each step after the previous pair is moved aside is failed in turn.
+// TestWriteSnapshotExport_FailedPublishKeepsThePreviousPair verifies a failed publication leaves the previous export intact.
 func TestWriteSnapshotExport_FailedPublishKeepsThePreviousPair(t *testing.T) {
 	isMetaPublish := func(oldpath, newpath string) bool {
 		return strings.HasPrefix(filepath.Base(oldpath), ".snapshot-export-") &&
@@ -261,12 +251,7 @@ func TestWriteSnapshotExport_ReplacesThePreviousPair(t *testing.T) {
 	assertOnlyExportPair(t, exportPath)
 }
 
-// TestWriteSnapshotExport_SweepsACrashedExportsLeftovers: an export that
-// crashes after moving the previous pair aside — or while its temps are
-// staged — leaves a backup directory or a temp file that its own cleanup
-// never got to run on. They hold an obsolete snapshot, plaintext when the
-// export decrypted it, and nothing else knows their names. The next export
-// that publishes successfully removes every one of them.
+// TestWriteSnapshotExport_SweepsACrashedExportsLeftovers verifies the next export removes a crashed export's leftovers.
 func TestWriteSnapshotExport_SweepsACrashedExportsLeftovers(t *testing.T) {
 	exportPath := filepath.Join(t.TempDir(), "export")
 	if err := os.MkdirAll(exportPath, 0o750); err != nil {

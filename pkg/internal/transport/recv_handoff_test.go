@@ -142,13 +142,7 @@ func TestHandoffToSnapSem_ConnContextCancelled(t *testing.T) {
 	}
 }
 
-// TestDataStreamNeverUsesSnapSem verifies invariant (c): a normal
-// (non-snapshot) data stream only ever consumes the data-stream budget and
-// never enters the snapshot handoff. It drives a real data message end to end
-// through handleConnection/handleStream over a live loopback connection and
-// asserts the receiver's snapshot handler is never invoked, which is the
-// externally observable proof that snapSem (touched only by handoffToSnapSem,
-// reachable only under FlagSnapshot) was never used.
+// TestDataStreamNeverUsesSnapSem: a data stream end to end never reaches the snapshot handoff or snapSem.
 func TestDataStreamNeverUsesSnapSem(t *testing.T) {
 	t1, _, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()

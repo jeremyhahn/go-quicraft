@@ -24,13 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 )
 
-// TestSnapshotCallbacks_DispatchUserListeners: the snapshot callbacks are
-// invoked INLINE on a snapshot-pool worker, and a recovery reports while
-// holding its node's write lease, which UnloadNode waits out. Calling the
-// user's EventListener from them directly would make a listener doing the
-// natural thing — StopShard once a recovery has finished — wait on its own
-// lease forever. The fan-out is dispatched: the callback returns while the listener
-// is still running.
+// TestSnapshotCallbacks_DispatchUserListeners: snapshot callbacks dispatch the user listener, so StopShard from it cannot deadlock on the write lease.
 func TestSnapshotCallbacks_DispatchUserListeners(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:        t.TempDir(),
@@ -68,9 +62,7 @@ func TestSnapshotCallbacks_DispatchUserListeners(t *testing.T) {
 		{"OnLogCompacted", func() {
 			cb.OnLogCompacted(7, 1, engine.LogCompaction{Index: 100, Reader: true})
 		}},
-		// The pool rejects INLINE on its worker (a panicked save, a stopping
-		// pool) and on the requesting goroutine (a full queue, a duplicate);
-		// a listener calling StopShard from either must not stall that path.
+		// The pool rejects inline on its worker and on the requester; StopShard from either must not stall it.
 		{"OnSnapshotRejected", func() { cb.OnSnapshotRejected(7, 1, nil) }},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -98,11 +90,7 @@ func TestSnapshotCallbacks_DispatchUserListeners(t *testing.T) {
 	}
 }
 
-// flushListeners waits until every EventListener notification the callback's
-// host has dispatched so far has been delivered. The dispatcher is FIFO, so a
-// sentinel queued behind them runs only after they have; the channel close
-// also orders the test's reads after the listener's writes. With no engine the
-// host delivers inline and there is nothing to wait for.
+// flushListeners waits for every listener notification dispatched so far by queuing a FIFO sentinel; inline without an engine.
 func flushListeners(t *testing.T, cb *hostEngineCallback) {
 	t.Helper()
 	if cb.h.engine == nil {

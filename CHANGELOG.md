@@ -360,14 +360,14 @@ breaking change takes the MINOR position).
 ## [0.22.0-alpha] - 2026-10-14
 
 The planned 0.21.0-rc.3. Release candidates now wait until the whole stack is
-dev complete (owner ruling 2026-10-14), so this is an alpha, and a MINOR bump
+dev complete, so this is an alpha, and a MINOR bump
 so that it sorts above 0.21.0-rc.2.
 
 ### Added
 
 - `Host.PauseShard` and `Host.ResumeShard` stop and restart one replica
   without unloading it, so a runtime seal finds none of the shard's log, apply
-  or snapshot work in flight (go-qrdb cl1493, seal ruling A). A paused replica
+  or snapshot work in flight. A paused replica
   keeps its log, state machine, membership and Raft state. It does not
   campaign, vote, replicate, acknowledge, apply, or take, send, receive or
   recover a snapshot, and every client call returns the new `ErrShardPaused`
@@ -1094,7 +1094,7 @@ sites and any custom `Barrier` implementation.
   at v4.0.1, its newest tag.
 - `scripts/deps-check.sh` skips the directories the go tool ignores (names
   starting with `.` or `_`, and `testdata`), the rule `make ci-modules` uses, so
-  it no longer walks agent worktrees under `.claude/`.
+  it no longer walks tool directories such as `.claude/`.
 
 - The Dragonboat benchmark harness runs Dragonboat on its Tan LogDB instead of
   the default sharded Pebble store, and its election benchmarks rotate through

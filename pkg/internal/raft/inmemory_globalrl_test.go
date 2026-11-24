@@ -30,8 +30,7 @@ func newRateLimitedInMemory(global *server.RateLimiter) *inMemory {
 	return &im
 }
 
-// newGlobalOnlyInMemory builds an in-memory log with ONLY the host-wide limiter
-// configured (MaxTotalInMemLogSize set, MaxInMemLogSize left at its default 0).
+// newGlobalOnlyInMemory builds an in-memory log with only the host-wide limiter configured.
 func newGlobalOnlyInMemory(global *server.RateLimiter) *inMemory {
 	im := newInMemory(0)
 	im.globalRL = global
@@ -46,15 +45,7 @@ func rlEntries(first, count uint64) []proto.Entry {
 	return entries
 }
 
-// TestGlobalRateLimiter_IsSharedAndUpdatedByDelta pins the accounting model of
-// the global (cross-shard) limiter. It is ONE counter shared by every shard on
-// the host, so a shard may only ever apply DELTAS to it. Writing an absolute
-// size — which is correct for the per-shard limiter — silently overwrites every
-// other shard's contribution, so the host-wide total no longer reflects the
-// memory actually held and MaxTotalInMemLogSize stops applying backpressure.
-//
-// The snapshot-restore path is the sharpest case: one shard restoring would
-// zero the total for all of them.
+// TestGlobalRateLimiter_IsSharedAndUpdatedByDelta checks shards update the shared global limiter by deltas only.
 func TestGlobalRateLimiter_IsSharedAndUpdatedByDelta(t *testing.T) {
 	global := server.NewRateLimiter(1 << 30)
 	shardA := newRateLimitedInMemory(global)
@@ -113,13 +104,7 @@ func TestGlobalRateLimiter_ShardCannotConsumeAnotherShardsShare(t *testing.T) {
 	}
 }
 
-// TestGlobalRateLimiter_WorksWithoutThePerShardLimiter pins that the two limits
-// are INDEPENDENT knobs. MaxInMemLogSize and MaxTotalInMemLogSize both default
-// to 0 and are not cross-validated, so configuring only the host-wide cap is
-// both legal and the documented way to enable it. Nesting the global accounting
-// inside the per-shard limiter's nil check meant that configuration allocated a
-// limiter that was consulted on every propose and permanently read zero — the
-// cap silently did nothing.
+// TestGlobalRateLimiter_WorksWithoutThePerShardLimiter checks the host-wide cap works with no per-shard limit.
 func TestGlobalRateLimiter_WorksWithoutThePerShardLimiter(t *testing.T) {
 	global := server.NewRateLimiter(1 << 30)
 	shard := newGlobalOnlyInMemory(global)
@@ -144,14 +129,7 @@ func TestGlobalRateLimiter_WorksWithoutThePerShardLimiter(t *testing.T) {
 	}
 }
 
-// TestGlobalRateLimiter_ReleasedOnShardTeardown pins the teardown half of the
-// shared-counter contract. Each shard tracks its own share so it can apply
-// deltas without disturbing the others, but that share lives on the raft log
-// and dies with the Peer. Without an explicit release, a stopped shard's bytes
-// stay counted against a shard that no longer exists, and every
-// StartShard/StopShard cycle leaks a little more until the accumulated orphan
-// total crosses MaxTotalInMemLogSize — at which point every propose on the host
-// fails with ErrSystemBusy, permanently, with no memory actually held.
+// TestGlobalRateLimiter_ReleasedOnShardTeardown checks a stopped shard releases its share of the global limiter.
 func TestGlobalRateLimiter_ReleasedOnShardTeardown(t *testing.T) {
 	global := server.NewRateLimiter(1 << 30)
 	survivor := newRateLimitedInMemory(global)

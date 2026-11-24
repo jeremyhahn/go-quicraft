@@ -29,12 +29,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
 )
 
-// These tests drive the operator's backup-and-restore path end to end with a
-// real state machine: entries are applied through raft, a snapshot is taken,
-// exported to a file, and imported into a Host that has never seen the data.
-// The artifact framing itself is covered on synthetic payloads in
-// snapshot_artifact_trailer_test.go; here the claim is about STATE — the
-// restored replica must hash to exactly what the source replica held.
+// End-to-end backup and restore: apply entries, snapshot, export to a file and import into a fresh Host.
 
 const exportImportShardID = 1
 

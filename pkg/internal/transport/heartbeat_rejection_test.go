@@ -24,27 +24,11 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestPeerRejectedHeartbeatFrameKeepsConnection is the heartbeat-stream twin of
-// TestPeerRejectedFrameKeepsConnection, and it matters MORE than the data-path
-// case it mirrors.
-//
-// Heartbeats are the one thing a node emits unconditionally, every tick, to
-// every peer. If a peer's decoder refuses those frames — a deployment-ID
-// mismatch here, equally a wire-version skew — and the sender reads the
-// resulting stream reset as a dead connection, then every heartbeat tick costs
-// a connection teardown plus a re-dial, to every peer, forever. That is the
-// dial storm the frame-rejection branch exists to prevent, and it is reached
-// through the heartbeat path first and most often.
-//
-// A rejected frame means "that frame was unacceptable", not "this connection is
-// dead": the stream is replaced, the connection is kept, and the drop is
-// counted so a silent, permanently-rejecting peer is still visible to an
-// operator.
+// TestPeerRejectedHeartbeatFrameKeepsConnection verifies a rejected heartbeat frame replaces the stream, not the connection.
 func TestPeerRejectedHeartbeatFrameKeepsConnection(t *testing.T) {
 	mtls := testMTLSConfig(t)
 
-	// Receiver in a DIFFERENT deployment: it authenticates the sender at the
-	// TLS layer, then refuses every batch it decodes.
+	// A receiver in another deployment refuses every batch.
 	receiver, err := NewQUICTransport(Config{
 		ListenAddress: "127.0.0.1:0",
 		DeploymentID:  43,
@@ -80,15 +64,7 @@ func TestPeerRejectedHeartbeatFrameKeepsConnection(t *testing.T) {
 
 	sendReg.Register(1, 2, receiver.Addr().String())
 
-	// A bare Heartbeat carries neither entries nor a snapshot, so Send routes
-	// it through the heartbeat fast path and its dedicated stream (index 0).
-	// The sender learns of a rejection only when it NEXT writes to the stream
-	// the peer reset, so the counter trails the sends by one: waiting for
-	// attempt i to be counted before making attempt i+1 deadlocks. Instead
-	// one heartbeat goes out per poll tick until three rejections are counted,
-	// which takes writes after the first two rejections, each of which
-	// would have re-dialed had a rejection torn the connection down. The
-	// tick keeps the sends from being coalesced into one frame.
+	// A bare Heartbeat goes through the heartbeat fast path on stream 0.
 	const wantRejections = 3
 	attempts := 0
 	pollUntil(t, 10*time.Second, 50*time.Millisecond,

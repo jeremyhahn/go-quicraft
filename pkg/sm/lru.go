@@ -26,11 +26,7 @@ type lruEntry struct {
 	prev, next *lruEntry
 }
 
-// lruCache is a concurrency-safe LRU cache using a map and doubly-linked list.
-// The head is the most recently used entry and the tail is the least recently
-// used. The RWMutex allows concurrent reads (Get) while serializing writes
-// (Put/Delete/Clear). Atomic hit/miss counters avoid lock contention on the
-// read path for metrics.
+// lruCache is a concurrency-safe LRU cache with atomic hit and miss counters.
 type lruCache struct {
 	maxEntries int
 	mu         sync.RWMutex
@@ -48,11 +44,7 @@ func newLRUCache(maxEntries int) *lruCache {
 	}
 }
 
-// Get retrieves a value from the cache. Returns the value and true on hit,
-// or nil and false on miss. On hit the entry is promoted to head (MRU).
-// Promotion requires a write lock upgrade, so Get acquires a full lock
-// rather than a read lock to avoid a TOCTOU race between the map lookup
-// and the list manipulation.
+// Get returns the value and true on a hit, promoting it, under a full lock.
 func (c *lruCache) Get(key string) ([]byte, bool) {
 	c.mu.Lock()
 	entry, ok := c.items[key]

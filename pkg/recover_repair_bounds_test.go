@@ -11,16 +11,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 )
 
-// TestRecoverLogReader_RepairNeverAcceptsAGapTheSnapshotDoesNotCover pins the
-// backstop that makes the recoverLogReader self-heal safe.
-//
-// The repair's own condition — ErrLogGapDetected plus ss.Index > 0 — does NOT
-// prove the snapshot subsumes the hole. A snapshot recorded BELOW the hole
-// (entries {1..5} U {5000..5002}, snapshot at 100) satisfies it exactly, and the
-// repair happily removes the prefix. What keeps that from silently starting a
-// replica whose log is holed between the compaction marker and its first entry
-// is LogReader.SetRange, which rejects firstIndex beyond markerIndex+length with
-// ErrLogGapDetected. Recovery must still FAIL CLOSED here.
+// TestRecoverLogReader_RepairNeverAcceptsAGapTheSnapshotDoesNotCover checks recovery fails closed when the snapshot is below the hole.
 func TestRecoverLogReader_RepairNeverAcceptsAGapTheSnapshotDoesNotCover(t *testing.T) {
 	const shardID, replicaID = uint64(1), uint64(1)
 	const snapshotIndex = uint64(100)
@@ -37,8 +28,7 @@ func TestRecoverLogReader_RepairNeverAcceptsAGapTheSnapshotDoesNotCover(t *testi
 	}}); err != nil {
 		t.Fatalf("seed stale prefix: %v", err)
 	}
-	// A snapshot BELOW the hole: it subsumes 1..100, and nothing covers
-	// 101..4999.
+	// The snapshot covers 1..100; nothing covers 101..4999.
 	if err := db.SaveSnapshot(shardID, replicaID, logdb.Snapshot{Index: snapshotIndex, Term: 2}); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
 	}

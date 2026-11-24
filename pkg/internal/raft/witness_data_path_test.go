@@ -22,22 +22,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// The witness DATA PATH is driven by the replicated membership alone
-// ---------------------------------------------------------------------------
+// The witness data path is driven by the replicated membership alone.
 
-// TestWitnessDataPath_FollowsReplicatedMembership pins the consequence that
-// makes Host.StartShard refuse to bootstrap a witness through the initial
-// members map (see pkg.TestStartShard_RejectsWitnessOrObserverInMembers).
-//
-// broadcastAppend picks sendWitnessAppend over sendAppend by looking up the
-// target in r.witnesses, and r.witnesses is populated from
-// Membership.Witnesses — from nothing else. The target's own Config.IsWitness
-// is not an input and cannot be: the leader never sees it. So a replica the
-// operator started with IsWitness=true, but which the members map seeded into
-// Membership.Addresses, receives FULL entry payloads exactly like any other
-// voter, while its local host gates keep refusing the reads a witness must not
-// serve. It is a full voter wearing a witness label.
+// TestWitnessDataPath_FollowsReplicatedMembership verifies the leader chooses the witness data path from Membership.Witnesses, not the target's IsWitness.
 func TestWitnessDataPath_FollowsReplicatedMembership(t *testing.T) {
 	payload := []byte("linearizable-state")
 
@@ -135,16 +122,7 @@ func TestWitnessDataPath_FollowsReplicatedMembership(t *testing.T) {
 	}
 }
 
-// TestWitnessBootstrapShape_LatchesRoleMismatch pins the other half of the same
-// disagreement, seen from the witness itself: a replica started with
-// Config.IsWitness=true whose replicated membership lists it among the full
-// voters latches roleMismatch at construction and can then neither campaign nor
-// serve reads for the life of the shard.
-//
-// That latch is a TRUE positive — the replica really is a full voter in the
-// configuration the shard agreed on — so it must not be suppressed. The
-// configuration has to be prevented from being created, which is what
-// Host.StartShard now does.
+// TestWitnessBootstrapShape_LatchesRoleMismatch verifies a witness listed as a full voter latches roleMismatch.
 func TestWitnessBootstrapShape_LatchesRoleMismatch(t *testing.T) {
 	cfg := raftTestCfgPreVote(1, 1, false)
 	cfg.IsWitness = true
@@ -174,28 +152,9 @@ func TestWitnessBootstrapShape_LatchesRoleMismatch(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// A RESTARTED leader must not replicate full payloads to a seeded witness
-// ---------------------------------------------------------------------------
+// A restarted leader must not replicate full payloads to a seeded witness.
 
-// TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange is the
-// regression, seen from the LEADER.
-//
-// Host.StartShard seeds proto.Membership.Addresses from the caller's members
-// map whenever recovery restored no membership — the ordinary state of a
-// replica that has never snapshotted. That map is the operator's list of
-// replica IDs; it records no roles, so every witness and observer in it is
-// seeded as a full VOTER. syncRaftRemotes then fills r.witnesses from
-// membership.witnesses alone, so the witness is absent from it, and
-// broadcastAppend selects sendAppend — the FULL command stream — for a replica
-// whose entire purpose is to hold none of it. Omitting the witness from the
-// map instead is not an alternative: it disappears from the leader's remotes
-// altogether.
-//
-// The committed AddWitness entry is still in the log (config changes are
-// compacted only behind a snapshot, and a snapshot would have restored the
-// membership instead) and is re-applied on restart. This asserts it moves the
-// witness OUT of the voting set and back onto the metadata-only data path.
+// TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange verifies replaying the committed AddWitness moves a seeded witness back to the metadata-only path.
 func TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange(t *testing.T) {
 	payload := []byte("full-entry-payload")
 
@@ -203,8 +162,7 @@ func TestWitnessDataPath_RestartSeedRepairedByCommittedConfigChange(t *testing.T
 	cfg.CheckQuorum = config.BoolPtr(false)
 
 	lr := newTestLogReader(nil, proto.State{})
-	// The restart seed: replica 4 is a WITNESS, but the members map the
-	// operator passed lists it exactly like every full replica.
+	// The members map lists witness 4 like a full replica.
 	lr.membership = proto.Membership{
 		Addresses: map[uint64]string{1: "addr1", 2: "addr2", 4: "wit4"},
 	}

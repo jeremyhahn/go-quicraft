@@ -20,30 +20,9 @@ import (
 	"time"
 )
 
-// nodeState.configChangeIndex is the staleness guard every membership change is
-// compare-and-swapped against: RequestAddNode/RemoveNode reject a caller whose
-// ConfigChangeID does not match, which is what stops two operators racing
-// contradictory changes.
-//
-// Two writers advance it, and they run on different goroutines with no ordering
-// between them:
-//
-//	OnApplied (incremental)          Store(entry.Index) as each config change applies
-//	reconcileMembershipFromPeer      seeds it from a snapshot-adopted membership,
-//	                                 whose config-change entries were compacted
-//	                                 out of the log and so never re-fire OnApplied
-//
-// The second is a CATCH-UP, not an authority: the snapshot it reconciles from
-// can be older than an incremental apply that already landed. Storing its value
-// unconditionally would REGRESS the guard, and a regressed guard rejects the
-// very ConfigChangeID that SyncGetShardMembership just handed the caller —
-// wedging membership changes on that shard until something else advances it.
-// Hence the never-regress compare-and-swap loop, which had no test at all:
-// replacing the whole loop with an unconditional Store left ./pkg/ fully green.
+// configChangeIndex is advanced by OnApplied and by reconcileMembershipFromPeer; the latter must never regress it.
 
-// TestReconcileMembershipFromPeer_NeverRegressesConfigChangeIndex drives the
-// membership-restored path with a LOWER ConfigChangeID than the guard already
-// holds and asserts the stored value does not move.
+// TestReconcileMembershipFromPeer_NeverRegressesConfigChangeIndex asserts a lower ConfigChangeID does not move the guard.
 func TestReconcileMembershipFromPeer_NeverRegressesConfigChangeIndex(t *testing.T) {
 	h := startSingleVoterShard(t)
 
@@ -65,10 +44,7 @@ func TestReconcileMembershipFromPeer_NeverRegressesConfigChangeIndex(t *testing.
 	}
 
 	ns := testLoadNode(h, 1)
-	// A LATER incremental apply that this replica has already seen. In
-	// production it arrives from OnApplied on the apply worker while a snapshot
-	// install reconciles concurrently; the value is what SyncGetShardMembership
-	// would have just reported to the operator.
+	// A later incremental apply already seen by this replica.
 	const ahead = 1_000
 	newer := peerCCID + ahead
 	ns.configChangeIndex.Store(newer)
@@ -84,12 +60,7 @@ func TestReconcileMembershipFromPeer_NeverRegressesConfigChangeIndex(t *testing.
 			"StaleConfigChangeError", newer, got, peerCCID)
 	}
 
-	// Positive control: the reconciliation must still ADVANCE a guard that is
-	// BEHIND the membership it is restoring — that is the whole reason the
-	// seeding exists (a snapshot compacts the config-change entries away, so
-	// OnApplied never fires for them and a fresh nodeState would sit at 0 and
-	// reject every membership change forever). Without this half, a mutation
-	// that simply deleted the write would pass the assertion above.
+	// Positive control: reconciliation still advances a guard that is behind.
 	ns.configChangeIndex.Store(0)
 	cb.reconcileMembershipFromPeer(1, ns)
 	if got := ns.configChangeIndex.Load(); got != peerCCID {

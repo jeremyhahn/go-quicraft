@@ -19,12 +19,7 @@ import "crypto/cipher"
 // Compile-time interface compliance check.
 var _ AEADProvider = (*SoftwareAEADProvider)(nil)
 
-// SoftwareAEADProvider creates cipher.AEAD instances using the standard Go
-// crypto library. It delegates to the algorithm registry (newAEADForAlgorithm)
-// which selects the appropriate implementation for each SymmetricAlgorithm.
-//
-// This is the default AEADProvider when no hardware-backed provider is
-// configured in BarrierConfig.
+// SoftwareAEADProvider creates cipher.AEAD instances with the Go crypto library; the default AEADProvider.
 type SoftwareAEADProvider struct{}
 
 // NewSoftwareAEADProvider returns a new SoftwareAEADProvider.
@@ -32,10 +27,7 @@ func NewSoftwareAEADProvider() *SoftwareAEADProvider {
 	return &SoftwareAEADProvider{}
 }
 
-// NewAEAD creates a cipher.AEAD for the given algorithm and key using the
-// standard Go crypto library. Returns ErrUnsupportedAlgorithm if alg is not
-// registered, or ErrInvalidKeySize if the key length does not match the
-// algorithm's requirements.
+// NewAEAD creates a cipher.AEAD for alg and key: ErrUnsupportedAlgorithm or ErrInvalidKeySize on failure.
 func (p *SoftwareAEADProvider) NewAEAD(alg SymmetricAlgorithm, key []byte) (cipher.AEAD, error) {
 	return newAEADForAlgorithm(alg, key)
 }

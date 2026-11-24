@@ -69,12 +69,7 @@ func awaitReadFailure(t *testing.T, cb *testCallback, key uint64) error {
 	return failure
 }
 
-// TestForwardedRead_NewLeaderNotReady_FailsFast holds a freshly elected
-// leader before it commits its first entry of the term (every Replicate is
-// dropped; heartbeats still flow, so it stays leader) and issues a read on a
-// follower. The read cannot be served until that commit, and nothing ends
-// the wait unless the refusal reaches the caller: it must fail with
-// ErrReadIndexNotReady, not hang.
+// TestForwardedRead_NewLeaderNotReady_FailsFast verifies a follower read fails with ErrReadIndexNotReady before the new leader's first commit.
 func TestForwardedRead_NewLeaderNotReady_FailsFast(t *testing.T) {
 	const shardID = 41
 	c, cbs := newCallbackCluster(t, shardID)
@@ -105,13 +100,7 @@ func TestForwardedRead_NewLeaderNotReady_FailsFast(t *testing.T) {
 	}
 }
 
-// TestForwardedRead_RefusedUnderCommitPending_IsAnswered is the #376 shape: the
-// new leader has not committed in its term AND its commit/apply pipeline is
-// busy, so the forwarded ReadIndex is stepped by processCommitPendingInbox, not
-// processReady. That path transmits only free-order messages; a refusal kept
-// behind the pipeline waits as long as the pipeline does, and the follower's
-// caller waits with it. The reject carries no state the leader must persist
-// first, so it leaves now, and the read is still never served (PhD 6.4).
+// TestForwardedRead_RefusedUnderCommitPending_IsAnswered verifies the leader answers a refused forwarded read while commitPending is set.
 func TestForwardedRead_RefusedUnderCommitPending_IsAnswered(t *testing.T) {
 	const shardID = 43
 	c, cbs := newCallbackCluster(t, shardID)
@@ -129,18 +118,7 @@ func TestForwardedRead_RefusedUnderCommitPending_IsAnswered(t *testing.T) {
 		return l == leader
 	})
 
-	// Hold the leader in commitPending and deliver the read under the hold.
-	// The flag is the step worker's hand-off ownership: a hand-off in flight
-	// lowers it when it completes (with nothing committed, commitBatchItem's
-	// no-piggyback path), and the step worker may have passed processReady's
-	// check just before the flag was raised here, so the hand-off it is about
-	// to make lowers it later — under -race and coverage, well past any fixed
-	// window. No signal reports that no hand-off is in flight, so each attempt
-	// claims the flag only from an unowned state and holds it until the
-	// refusal is answered; an attempt whose flag was lowered by someone else
-	// proves nothing about the path its read took and is retried with a fresh
-	// read. Once the flag stays raised, processReady skips the leader and
-	// nothing else lowers it.
+	// Hold the leader in commitPending, claiming the flag only from an unowned state and retrying when another owner lowers it.
 	t.Cleanup(func() {
 		lnode.commitPending.Store(false)
 		c.replicas[leader].engine.NotifyWork(shardID)
@@ -196,12 +174,7 @@ func TestForwardedRead_RefusedUnderCommitPending_IsAnswered(t *testing.T) {
 	}
 }
 
-// TestForwardedRead_LeaderRefusalIsAnswered covers the refusal a read-ready
-// follower cannot predict: the leader is mid leadership transfer (to a
-// replica that is down, so the transfer aborts and the leader stays leader).
-// The leader must answer the forwarded read with a reject, and the follower
-// must fail the read with ErrReadIndexNotReady rather than wait for an
-// answer that never comes.
+// TestForwardedRead_LeaderRefusalIsAnswered verifies a leader mid-transfer rejects a forwarded read and the follower fails it with ErrReadIndexNotReady.
 func TestForwardedRead_LeaderRefusalIsAnswered(t *testing.T) {
 	const shardID = 42
 	c, cbs := newCallbackCluster(t, shardID)

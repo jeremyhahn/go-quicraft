@@ -22,9 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// assertReadReady checks the published triple and, on the leader, that it
-// agrees with the gate handleLeaderReadIndex applies: ready exactly when a
-// ReadIndex is no longer refused with ErrReadIndexNotReady.
+// assertReadReady checks the published triple and, on the leader, that it matches handleLeaderReadIndex's ErrReadIndexNotReady gate.
 func assertReadReady(t *testing.T, p *Peer, wantLeader, wantTerm uint64, want bool, probeKey uint64) {
 	t.Helper()
 	leaderID, term, ready := p.LeaderTermReady()
@@ -67,8 +65,7 @@ func TestPeer_ReadReady_LeaderAtFirstCommitOfTerm(t *testing.T) {
 	term := p.r.term
 	assertReadReady(t, p, 1, term, false, 1)
 
-	// The follower acknowledges the no-op, but the leader has not persisted
-	// it: tryCommit counts the leader's DURABLE index, so nothing commits.
+	// The leader has not persisted the no-op and tryCommit counts its durable index, so nothing commits.
 	mustHandle(t, p, proto.Message{
 		Type: proto.ReplicateResp, From: 2, Term: term, LogIndex: p.r.log.lastIndex(),
 	})

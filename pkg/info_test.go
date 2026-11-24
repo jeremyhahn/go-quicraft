@@ -35,13 +35,7 @@ var allShardHealthValues = []ShardHealth{
 	ShardSnapshotting,
 }
 
-// TestShardHealth_UnmarshalJSONFailsClosed pins the direction an unrecognized
-// health value must fail in.
-//
-// ShardHealthy is the ZERO value, so decoding an unknown string to it is a
-// fail-open on a health signal: a typo in a monitoring payload, a truncated
-// field, or a state a newer binary knows and this one does not all read back as
-// "this shard is fine". The decode must refuse and leave the receiver alone.
+// TestShardHealth_UnmarshalJSONFailsClosed checks an unknown health value is refused, never decoded as healthy.
 func TestShardHealth_UnmarshalJSONFailsClosed(t *testing.T) {
 	for _, s := range []string{"", "healty", "HEALTHY", "unknown-value", "0"} {
 		data, err := json.Marshal(s)

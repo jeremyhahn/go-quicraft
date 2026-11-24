@@ -34,9 +34,7 @@ import (
 // keepalive through to its log would have done so several times over.
 const sealedHold = 4 * time.Second
 
-// TestE2E_SealedFollower_IdleCluster seals a follower while clients keep
-// proposing to it and nothing else writes, then unseals it and checks the shard
-// accepts and serves work through it again (#296).
+// TestE2E_SealedFollower_IdleCluster seals a follower clients propose to, then unseals it and checks the shard serves through it again.
 func TestE2E_SealedFollower_IdleCluster(t *testing.T) {
 	runSealedReplica(t, false, false)
 }
@@ -152,8 +150,7 @@ func runSealedReplica(t *testing.T, sealLeader, underLoad bool) {
 	engineFailures.mu.Lock()
 	tripped := engineFailures.first
 	engineFailures.mu.Unlock()
-	// A Raft-originated write refused by the sealed barrier holds the shard
-	// until the unseal (#296); it must never trip the failure latch.
+	// A Raft write refused by the sealed barrier holds the shard until unseal; it must never trip the failure latch.
 	if tripped != "" {
 		t.Fatalf("sealed %s's failure latch tripped on a write refused while "+
 			"sealed: %s", role, tripped)

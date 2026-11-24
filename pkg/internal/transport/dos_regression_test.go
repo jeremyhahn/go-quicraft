@@ -28,20 +28,7 @@ import (
 // User callbacks must never run under the connection-pool write lock
 // ---------------------------------------------------------------------------
 
-// TestCleanStaleConnections_ListenerRunsOutsideConnLock pins that the
-// OnConnectionFailed callback is never invoked from INSIDE the t.connMu write
-// section, during the map iteration itself.
-//
-// connMu is the transport's hottest lock: every outbound Raft message on every
-// shard reads it through getStream/getConnection. A listener is user code of
-// unbounded duration, so holding the write lock across it stalls every
-// heartbeat host-wide — long enough to time out elections on shards that have
-// nothing to do with the dead peer — and a listener that re-enters transport
-// teardown (Stop, CloseTarget) deadlocks outright, sync.RWMutex not being
-// reentrant.
-//
-// The check is TryLock rather than an actual re-entrant call so a regression
-// fails the test instead of hanging the suite.
+// TestCleanStaleConnections_ListenerRunsOutsideConnLock checks OnConnectionFailed never runs inside the connMu write section.
 func TestCleanStaleConnections_ListenerRunsOutsideConnLock(t *testing.T) {
 	var holder atomic.Pointer[QUICTransport]
 	var fired atomic.Int64
@@ -102,23 +89,7 @@ func TestCleanStaleConnections_ListenerRunsOutsideConnLock(t *testing.T) {
 // Snapshot per-peer fairness must key on identity, not on an ip:port
 // ---------------------------------------------------------------------------
 
-// TestSnapshotFairnessKey_IndependentOfPeerAddress pins that the per-peer
-// snapshot slot limit is not keyed on conn.RemoteAddr().String() — an address
-// whose PORT the peer chooses.
-//
-// Keyed that way, one authenticated host could open MaxConnectionsPerIP (16 by
-// default) connections from 16 source ports, present 16 distinct keys, and
-// become entitled to 16 * maxPerPeer slots against a host-global budget of only
-// MaxConcurrentSnapshotRecv (4). Each slot is holdable while sustaining only
-// the throughput floor, so every legitimate InstallSnapshot would be rejected —
-// and
-// a follower below the leader's compaction floor cannot be repaired by
-// replication either, so the shard stays under-replicated indefinitely.
-//
-// The test builds two connections to two DIFFERENT ip:ports that present the
-// SAME certificate, which is what one host opening several connections looks
-// like to the receiver, and pins that they resolve to one fairness key sharing
-// one budget.
+// TestSnapshotFairnessKey_IndependentOfPeerAddress checks connections with the same certificate share one snapshot fairness key.
 func TestSnapshotFairnessKey_IndependentOfPeerAddress(t *testing.T) {
 	// One shared mTLS identity across all three endpoints: t2 and t3 stand in
 	// for two connections from the same host.
@@ -203,17 +174,12 @@ func TestSnapshotFairnessKey_IndependentOfPeerAddress(t *testing.T) {
 // The whole-transfer ceiling is derived from the declared work
 // ---------------------------------------------------------------------------
 
-// TestTransferBudget_DerivedFromDeclaredWork pins the replacement for the flat
-// one-hour transfer ceiling. Combined with the 1 KB/s throughput floor, the
-// flat hour let a single slot be held for barely 3.6 MB of work regardless of
-// what the sender claimed it was sending. The budget now scales with the
-// declared chunk count and the receiver's configured rate, and is clamped at
-// both ends.
+// TestTransferBudget_DerivedFromDeclaredWork checks the transfer budget scales with declared chunks and rate, clamped at both ends.
 func TestTransferBudget_DerivedFromDeclaredWork(t *testing.T) {
 	const ratePerSec = 256 * 1024 * 1024
 	sr := newSnapshotReceiver(4, 1<<30, ratePerSec, 0, newTestHandler())
 
-	// The cheapest possible declaration no longer buys the absolute ceiling.
+	// The cheapest declaration does not buy the ceiling.
 	small := sr.transferBudget(1)
 	if small != minSnapshotTransferDuration {
 		t.Fatalf("budget for a 1-chunk declaration = %v, want %v", small, minSnapshotTransferDuration)

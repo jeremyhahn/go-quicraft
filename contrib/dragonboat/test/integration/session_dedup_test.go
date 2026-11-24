@@ -41,10 +41,7 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Resolved AFTER the warmup above, not from the index read before it: the
-	// tracked session below is registered on this replica and every proposal in
-	// this test is deliberately addressed to it, so the one resolve that does
-	// happen must be as late as possible.
+	// Resolved after the warmup, as late as possible: every proposal here targets this replica.
 	leaderHost := cluster.waitForLeaderHost(1, leaderElectionTimeout)
 
 	// Register a tracked session.
@@ -112,10 +109,7 @@ func TestIntegration_DB_TrackedSession_DuplicateRejection(t *testing.T) {
 		}
 	}
 
-	// Verify the second key was NOT written (the duplicate should not
-	// have applied the different command). The proposals above stay pinned
-	// because the SERIES ID is the subject; this read is not, so it resolves
-	// the leader.
+	// The second key must not be written; this read is not pinned, so it resolves the leader.
 	readResult := cluster.readFromLeader(t, 1, encodeKVGet("dup-reject-key2"), defaultTimeout)
 	val, ok := readResult.(string)
 	if ok && val == "dup-reject-val2" {

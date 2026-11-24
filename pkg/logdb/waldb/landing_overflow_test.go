@@ -9,10 +9,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
-// oversizeEnvelopeTail is the number of bytes oversizeEnvelopeBarrier adds to
-// every sealed record on top of the real envelope. It is far above
-// maxCiphertextExpansion, so a record pre-fitted near the end of a segment by
-// reserveLanding no longer fits once sealed.
+// oversizeEnvelopeTail is the extra bytes oversizeEnvelopeBarrier adds per record, well above maxCiphertextExpansion.
 const oversizeEnvelopeTail = 2048
 
 // oversizeEnvelopeBarrier models a delegated encryptor whose envelope exceeds

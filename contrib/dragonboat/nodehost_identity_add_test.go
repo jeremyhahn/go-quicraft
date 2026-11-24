@@ -54,17 +54,7 @@ func identityAddMembers(m *Membership) int {
 	return len(m.Nodes) + len(m.NonVotings) + len(m.Witnesses)
 }
 
-// TestNodeHost_IdentityAdd drives the three Sync*WithIdentity add calls as
-// contrib/dragonboat/README.md documents them: each adds the replica in its
-// role with the identity the shard commits, an address that fails
-// IsValidAddress returns ErrInvalidAddress and changes nothing, and a
-// duplicate identity is refused with an error that still matches
-// quicraft.ErrDuplicateMemberIdentity.
-//
-// A witness votes, so adding one to a single-voter shard whose other replicas
-// are not running leaves the leader without quorum, as adding a voter does.
-// Each of those adds is therefore the last on its shard: the witness gets a
-// shard of its own, and the voter closes the main shard.
+// TestNodeHost_IdentityAdd checks the Sync*WithIdentity adds, address validation and duplicate identity refusal; each quorum-breaking add is last on its shard.
 func TestNodeHost_IdentityAdd(t *testing.T) {
 	nh := newTestNodeHost(t)
 	const (

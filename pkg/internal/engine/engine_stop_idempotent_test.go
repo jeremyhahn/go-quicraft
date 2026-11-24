@@ -20,16 +20,7 @@ import (
 	"time"
 )
 
-// TestEngine_StopIsIdempotent pins the property Node.Stop already had and
-// Engine.Stop did not.
-//
-// Engine.Stop closes four stop channels unconditionally, so a second call
-// panicked with "close of closed channel". That is reachable from ordinary
-// use: Host.Close documents ITSELF as idempotent and calls Engine.Stop, and a
-// supervisor that stops the engine before closing the host — or any teardown
-// that runs both a deferred and an explicit shutdown — makes the second call.
-// A panic in that path takes the process down during a shutdown that was
-// meant to be graceful.
+// TestEngine_StopIsIdempotent checks a second Engine.Stop does not panic.
 func TestEngine_StopIsIdempotent(t *testing.T) {
 	cfg := newTestHostConfig()
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)
@@ -51,14 +42,7 @@ func TestEngine_StopIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestEngine_StopConcurrentCallersAllReturn covers the other way the second
-// call arrives: at the same time as the first, from another goroutine.
-//
-// Every caller must return only once the ordered shutdown has FINISHED. A Stop
-// that returned early would let its caller tear down the transport or the
-// LogDB while the engine's commit and apply workers were still draining into
-// them, which is precisely the ordering Host.Close relies on Stop to
-// establish.
+// TestEngine_StopConcurrentCallersAllReturn checks concurrent Stop callers all return only after shutdown finishes.
 func TestEngine_StopConcurrentCallersAllReturn(t *testing.T) {
 	cfg := newTestHostConfig()
 	e := NewEngine(cfg, newTestLogDB(), newTestSender(), nil, nil, nil)

@@ -363,9 +363,7 @@ func TestRotate_WithoutPersisterFailsClosed(t *testing.T) {
 	}
 }
 
-// TestRotate_DataSurvivesRestartFromPersistedBlob is the end-to-end proof: data
-// encrypted AFTER a rotation must decrypt on a fresh barrier restored solely
-// from the persisted blob.
+// TestRotate_DataSurvivesRestartFromPersistedBlob checks data encrypted after a rotation decrypts on a barrier restored from the persisted blob.
 func TestRotate_DataSurvivesRestartFromPersistedBlob(t *testing.T) {
 	b, s, p := testPersistingBarrier(t)
 	defer s.Close()
@@ -550,9 +548,7 @@ func TestUnseal_NoneStrategyWithoutEncryptorFailsClosed(t *testing.T) {
 
 // --- HKDF info domain separation ---
 
-// TestDeriveDEK_V2SeparatesAlgorithmAndKeySize verifies that the v2 info binds
-// the algorithm and key length: the AES-128 DEK is no longer the first half of
-// the AES-256 DEK for the same (deployment, epoch), as it is under v1.
+// TestDeriveDEK_V2SeparatesAlgorithmAndKeySize checks v2 derivation binds the algorithm and key length.
 func TestDeriveDEK_V2SeparatesAlgorithmAndKeySize(t *testing.T) {
 	rootKey := make([]byte, rootKeySize)
 	salt := make([]byte, hkdfSaltSize)
@@ -610,10 +606,7 @@ func TestSetSealedRootKey_RefusesRetiredHKDFVersions(t *testing.T) {
 
 // --- SoftwareStrategy.Close concurrency ---
 
-// TestSoftwareStrategy_CloseRacesSealUnseal is the regression test for the
-// plain `s.passphrase = nil` field write, which raced the reads in
-// seal/unseal (a TOCTOU that -race flagged). Every operation must return
-// either a valid result or ErrStrategyClosed — never panic, never race.
+// TestSoftwareStrategy_CloseRacesSealUnseal checks Close racing seal and unseal returns a result or ErrStrategyClosed without racing.
 func TestSoftwareStrategy_CloseRacesSealUnseal(t *testing.T) {
 	s := testStrategy(t)
 	rootKey := make([]byte, 32)
@@ -651,21 +644,7 @@ func TestSoftwareStrategy_CloseRacesSealUnseal(t *testing.T) {
 
 // --- context-binding capability is unanswerable before it exists ---
 
-// TestBarrier_ContextBinding_UnresolvedBeforeUnseal is the regression for a
-// barrier that ANSWERED a question it had no basis to answer: the capability
-// was classified from b.hwEncryptor alone, and seal() sets that to nil, so an
-// uninitialized or sealed barrier reported the SOFTWARE binding and
-// SupportsContextAAD returned true.
-//
-// That mattered because the capability is latched by consumers. A node may
-// start sealed and be unsealed later, so a WAL opened at start would pin
-// "records are positionally bound" against a barrier that had not yet chosen a
-// strategy — and then be unsealed with a delegated encryptor that fails every
-// context-bearing write with ErrHardwareMode, with the deliberate fail-closed
-// refusal at open having been a no-op because the capability lied.
-//
-// The fix makes the pre-unseal state its own answer: Binds() is false for it,
-// AND it is distinguishable from an unsealed barrier that genuinely cannot bind.
+// TestBarrier_ContextBinding_UnresolvedBeforeUnseal checks a sealed or uninitialized barrier reports its context binding as unresolved.
 func TestBarrier_ContextBinding_UnresolvedBeforeUnseal(t *testing.T) {
 	// (a) Uninitialized: no strategy has been chosen, so there is no answer.
 	fresh := MustNewBarrier(testBarrierConfig(1))
@@ -734,12 +713,7 @@ func TestBarrier_ContextBinding_UnresolvedBeforeUnseal(t *testing.T) {
 
 // --- SetSealedRootKey structural bounds ---
 
-// TestSetSealedRootKey_BoundsKnownEpochs is the DoS regression: KnownEpochs is
-// plaintext, unauthenticated metadata, and Unseal derives one HKDF DEK, one
-// AEAD and one mlock'd enclave PER ENTRY. An attacker with write access to the
-// persisted blob — the same attacker the sealing strategies already defend
-// against — could rewrite it to millions of epochs and hang or OOM the node on
-// every start, with no passphrase required.
+// TestSetSealedRootKey_BoundsKnownEpochs checks the unauthenticated KnownEpochs list is bounded.
 func TestSetSealedRootKey_BoundsKnownEpochs(t *testing.T) {
 	src, _ := testInitializedBarrier(t)
 	base := src.SealedRootKeyData()
@@ -822,13 +796,7 @@ func TestSetSealedRootKey_BoundsKnownEpochs(t *testing.T) {
 	}
 }
 
-// TestSetSealedRootKey_RejectsAlgorithmMismatch pins that a blob written under
-// one data-path AEAD is refused by a barrier configured for another, naming
-// both. Without the check the mismatch surfaces only as the deliberately
-// generic ErrDecryptionFailed on every read — indistinguishable from tampering,
-// with nothing on disk naming the algorithm that would work. This is the
-// restore-onto-a-host-without-AES-NI case, which SelectOptimalAlgorithm makes
-// silent by default.
+// TestSetSealedRootKey_RejectsAlgorithmMismatch checks a blob written under another AEAD is refused, naming both.
 func TestSetSealedRootKey_RejectsAlgorithmMismatch(t *testing.T) {
 	writerCfg := testBarrierConfig(1)
 	writerCfg.Algorithm = AlgAES256GCM

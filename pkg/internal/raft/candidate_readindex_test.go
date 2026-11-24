@@ -7,12 +7,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// candidateReadIndexCases enumerates every way a ReadIndex reaches a
-// campaigning replica: from its own host (Origin local, no term) and forwarded
-// by a follower that still believed this replica led (Origin remote, stamped
-// with the forwarder's term). Both roles that share stepCandidate are covered,
-// because becomePreCandidate and becomeCandidate install the same step
-// function and a gap in it is a gap in both.
+// candidateReadIndexCases covers local and forwarded ReadIndex at a pre-candidate and a candidate.
 var candidateReadIndexCases = []struct {
 	name    string
 	build   func() *raft
@@ -76,18 +71,7 @@ func candidateReadIndexMessage(r *raft, forward bool) proto.Message {
 	}
 }
 
-// TestStepCandidate_ReadIndexIsRefusedNotLeader asserts that a ReadIndex
-// arriving at a campaigning replica is refused with the same
-// NotLeaderError{LeaderID: 0} a Propose gets, rather than falling to
-// stepCandidate's default and being silently dropped.
-//
-// A dropped ReadIndex is never answered: nothing is queued in
-// pendingReadIndex, nothing is forwarded, and no ReadyToRead is ever produced,
-// so the host's pending read waits to the caller's deadline and SyncRead
-// reports ErrTimeout for what is a not-leader condition. The follower path
-// (handleFollowerReadIndex) already refuses this way when it knows no leader;
-// a candidate by definition knows none and cannot supply a leader's commit
-// index, so it must refuse the same way, for the same reason.
+// TestStepCandidate_ReadIndexIsRefusedNotLeader checks a campaigning replica refuses ReadIndex with NotLeaderError{LeaderID: 0} instead of dropping it.
 func TestStepCandidate_ReadIndexIsRefusedNotLeader(t *testing.T) {
 	for _, tc := range candidateReadIndexCases {
 		t.Run(tc.name, func(t *testing.T) {

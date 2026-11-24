@@ -1663,23 +1663,12 @@ func TestStateMachine_CloseErrorPropagation(t *testing.T) {
 // Lookup: absence must survive both paths
 // ---------------------------------------------------------------------------
 
-// testAbsenceSM distinguishes the three outcomes a byte-valued read can have,
-// so one SM can drive BOTH Lookup paths in the absence tests: a key that is
-// absent (nil), a key that exists and holds an EMPTY value (non-nil, zero
-// length), and a key that holds data.
-//
-// It exists rather than reusing testHasherSM/testKV because the assertion is
-// that the two paths AGREE, which needs a generic path that is itself right:
-// testKV.Lookup returns kv.data[key], so a miss comes back as the zero string
-// boxed in a non-nil interface, and comparing the fast path against that would
-// have "agreed" on the wrong answer.
+// testAbsenceSM distinguishes absent (nil), present-but-empty and present-with-data, so both Lookup paths can be checked to agree.
 type testAbsenceSM struct {
 	testKV
 }
 
-// emptyValueKey is the key testAbsenceSM reports as PRESENT with an empty
-// value, on both paths. It is answered ahead of the map so the case cannot be
-// confused with a miss, which is the whole distinction under test.
+// emptyValueKey is reported present with an empty value on both paths.
 const emptyValueKey = "empty"
 
 // BytesLookup implements sm.NALookup, driving StateMachine.Lookup's fast path.
@@ -1697,8 +1686,7 @@ func (s *testAbsenceSM) BytesLookup(key []byte) ([]byte, error) {
 	return []byte(val), nil
 }
 
-// Lookup overrides testKV.Lookup to answer a miss with an UNTYPED nil, which
-// is what a correct SM returns and what the fast path has to match.
+// Lookup answers a miss with an untyped nil, as a correct SM does.
 func (s *testAbsenceSM) Lookup(_ context.Context, query interface{}) (interface{}, error) {
 	key, ok := query.(string)
 	if !ok {
@@ -2561,8 +2549,7 @@ func (c *countingSM) Update(_ context.Context, entries []sm.Entry, results []sm.
 	for i, e := range entries {
 		c.applies[string(e.Cmd)]++
 		c.total++
-		// Return a unique, deterministic result derived from the command so
-		// the test can confirm a mirror copies the FIRST occurrence's result.
+		// Return a deterministic result derived from the command, so the test can see which occurrence's result was mirrored.
 		results[i] = sm.Result{Value: uint64(len(e.Cmd)), Data: append([]byte(nil), e.Cmd...)}
 	}
 	return nil
@@ -2582,11 +2569,7 @@ func (c *countingSM) RecoverFromSnapshot(_ context.Context, _ io.Reader, _ <-cha
 
 func (c *countingSM) Close(_ context.Context) error { return nil }
 
-// TestApply_InBatchDuplicateAppliedOnce verifies that when a single Apply
-// batch contains two entries with the SAME (clientID, seriesID) — a committed
-// client retry — the user operation is applied EXACTLY ONCE and both results[]
-// entries carry the identical (first-occurrence) result, which is what
-// at-most-once delivery requires.
+// TestApply_InBatchDuplicateAppliedOnce: two entries with the same (clientID, seriesID) in one batch apply once and both carry the first result.
 func TestApply_InBatchDuplicateAppliedOnce(t *testing.T) {
 	cs := newCountingSM()
 	createFn := func(shardID, replicaID uint64) interface{} {
@@ -2706,23 +2689,7 @@ func TestApply_BatchExceedsMaxResponses(t *testing.T) {
 	}
 }
 
-// TestStateMachineApply_ExpiryBatchShapeInvariant is the regression test:
-// session expiry must be a pure function of the committed entry SEQUENCE, never
-// of how a replica groups those entries into Apply batches. It replays the SAME
-// committed log in three batch shapes (one big batch, per-entry batches, and an
-// arbitrary split) and asserts every replica ends with byte-for-byte identical
-// session state AND returns the identical result for a late proposal against the
-// (possibly expired) session.
-//
-// The scenario is chosen to expose the pre-fix bug directly: session 42 is
-// registered at index 1 and left idle, and a session op for 42 lands at index
-// 21. With the OLD per-batch expiry, the one-big-batch replica evaluated expiry
-// only at index 21 — AFTER the loop had already admitted the op against the
-// still-live session — so 42 survived and the op applied; the per-entry replica
-// expired 42 at an intermediate batch boundary (index >= 12), so the op was
-// rejected SESSION_EXPIRED. Same log, divergent state, every Raft invariant
-// intact. The fix evaluates expiry at fixed index checkpoints regardless of
-// batching, so all shapes now agree.
+// TestStateMachineApply_ExpiryBatchShapeInvariant: session expiry depends only on the committed entry sequence; one log in three batch shapes yields identical sessions and results.
 func TestStateMachineApply_ExpiryBatchShapeInvariant(t *testing.T) {
 	const threshold = 10
 
@@ -2823,19 +2790,7 @@ func newRecoverTestSM(t *testing.T, failing bool) *StateMachine {
 	return s
 }
 
-// TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched pins
-// snapshot restore atomicity.
-//
-// The session table and the user state machine describe the SAME log index.
-// If RecoverFromSnapshot decoded the snapshot's session table directly over the
-// live one and only then called the user SM, a user restore that failed after
-// that point would leave the node running user data from index N beside
-// session metadata from a later index M — so a client retry could be answered
-// from a cached result for an operation the user SM never applied, or a
-// cached response could disappear and let a duplicate command execute twice.
-// At-most-once delivery is broken in both directions, silently.
-//
-// The table is now staged and adopted only on success.
+// TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched: the session table is staged and adopted only when the user restore succeeds.
 func TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched(t *testing.T) {
 	// A snapshot whose session table holds clientID 4242.
 	source := newRecoverTestSM(t, false)
@@ -2849,7 +2804,7 @@ func TestRecoverFromSnapshot_FailedUserRestoreLeavesSessionsUntouched(t *testing
 	}
 	snap.WriteString("user-state-payload-the-target-will-refuse")
 
-	// The target holds a DIFFERENT live session and refuses the user restore.
+	// The target holds a different live session and refuses the user restore.
 	target := newRecoverTestSM(t, true)
 	const liveClientID uint64 = 99
 	if err := target.sessions.Register(liveClientID, 0, 1); err != nil {

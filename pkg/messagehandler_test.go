@@ -150,16 +150,7 @@ func TestHostMessageHandler_HandleSnapshot_UnauthorizedSender(t *testing.T) {
 	}
 }
 
-// authorizeAllSenders is a PeerAuth that authorizes any address. Used by tests
-// that exercise behaviour PAST the sender-binding check.
-//
-// It presents fixtureIdentity, the one identity every member of a fixture
-// membership built by newEngineNodeWithMembership or snapshotPathMembership
-// holds, so it satisfies the identity gate for every replica those fixtures
-// name — which is what "authorize all senders" means now that a member is
-// authorized by its identity and by nothing else. A test about FORGERY must not
-// use it: build the membership with distinct identities (certCoveringAs) so the
-// attacker's keypair is not the victim's.
+// authorizeAllSenders is a PeerAuth that authorizes any address and presents fixtureIdentity, which every fixture member holds; forgery tests must use certCoveringAs instead.
 var authorizeAllSenders = transport.PeerAuth{
 	Identity:          fixtureIdentity,
 	AuthorizesAddress: func(string) bool { return true },
@@ -179,32 +170,13 @@ func fixtureIdentities(voters map[uint64]string) map[uint64]string {
 	return ids
 }
 
-// The committed addresses authorizeSnapshotPath installs. They are named
-// because snapshotPathMembership has to reproduce them exactly: a chunk
-// Membership that disagrees with the configuration the fixture authorized
-// against is a REWRITE of it, which is the whole hazard the helper exists to
-// keep out of tests.
+// The committed addresses authorizeSnapshotPath installs, reproduced exactly by snapshotPathMembership.
 const (
 	snapshotPathLocalAddr  = "127.0.0.1:6001"
 	snapshotPathSenderAddr = "127.0.0.1:6002"
 )
 
-// snapshotPathMembership is the committed configuration authorizeSnapshotPath
-// installs, in the form a snapshot chunk carries it. A test whose snapshot must
-// not REWRITE that configuration ships this as the chunk Membership.
-//
-// Shipping it is what a real sender does, not a convenience: forEachSnapshotChunk
-// and emptySnapshotChunk both stamp every chunk with the leader's committed
-// snap.Membership, so a chunk with an EMPTY Membership is a shape no sender
-// produces. Delivering one is not inert — HandleSnapshot forwards it to raft as
-// the InstallSnapshot's Snapshot.Membership, raft.Peer.Handle adopts it
-// wholesale on the restore path (p.membership = newMembership(ss.Membership)),
-// and the sender the fixture authorized is then a replica the committed
-// configuration does not name. Every later receive from it is refused
-// unknown_member. That adoption happens on the engine worker, ASYNCHRONOUSLY to
-// the HandleSnapshot that queued it, so a test that delivers an empty
-// membership and then authorizes anything else is a race, not a failure.
-// snapshot_durability_test.go's recvFixture carries the same guard.
+// snapshotPathMembership is the configuration authorizeSnapshotPath installs, as a chunk carries it; ship it so the snapshot does not rewrite the membership raft adopts.
 func snapshotPathMembership(localReplicaID, fromReplicaID uint64) proto.Membership {
 	addrs := map[uint64]string{
 		localReplicaID: snapshotPathLocalAddr,
@@ -216,13 +188,7 @@ func snapshotPathMembership(localReplicaID, fromReplicaID uint64) proto.Membersh
 	}
 }
 
-// authorizeSnapshotPath wires everything HandleSnapshot's fail-closed
-// authorization needs to admit a test sender: it loads an engine node for
-// shardID whose membership contains both the local replica and the
-// sender, and registers the sender's address in the host registry.
-//
-// The membership it installs is snapshotPathMembership; a snapshot delivered
-// through this path should carry that same value (see there).
+// authorizeSnapshotPath loads an engine node for shardID whose membership includes the local replica and the sender, and registers the sender's address; snapshots should carry snapshotPathMembership.
 func authorizeSnapshotPath(t *testing.T, eng *engine.Engine, h *Host, shardID, localReplicaID, fromReplicaID uint64) {
 	t.Helper()
 	const fromAddr = snapshotPathSenderAddr
@@ -236,15 +202,7 @@ func authorizeSnapshotPath(t *testing.T, eng *engine.Engine, h *Host, shardID, l
 	h.registry.Register(shardID, fromReplicaID, fromAddr)
 }
 
-// TestHostMessageHandler_HandleSnapshot_ShardNotLoaded verifies that a
-// snapshot for a shard that is not loaded locally is rejected (fail
-// closed): without a loaded node there is no membership to authorize the
-// sender against, and persisting the snapshot would poison a later
-// StartShard.
-// TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound verifies
-// that a snapshot whose claimed From identity is not covered by the
-// sending connection's verified TLS certificate is rejected, even when
-// From is a legitimate member of the shard.
+// TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound: a snapshot whose From is not covered by the connection's certificate is rejected, even from a member.
 func TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -292,9 +250,7 @@ func TestHostMessageHandler_HandleSnapshot_SenderIdentityNotBound(t *testing.T) 
 		t.Fatalf("expected UnauthorizedMessageError for nil callback, got %T: %v", err, err)
 	}
 
-	// A sender the COMMITTED MEMBERSHIP does not name must be rejected too,
-	// however permissive the certificate is. Authorization comes from the
-	// configuration, not from the routing registry inbound traffic writes.
+	// A sender committed membership does not name is rejected too, whatever the certificate.
 	chunksFromStranger := []proto.SnapshotChunk{
 		{ShardID: 1, ReplicaID: 1, From: 99, Index: 100, Term: 5, ChunkID: 0, ChunkCount: 1, Data: []byte("x")},
 	}
@@ -480,13 +436,7 @@ func TestHostMessageHandler_HandleSnapshot_WritesSnapshotToDisk(t *testing.T) {
 		t.Errorf("LogDB membership Addresses len = %d, want 2",
 			len(snap.Membership.Addresses))
 	}
-	// Per-node snapshot encryption: the receiver records its OWN at-rest epoch
-	// from re-encrypting the (plaintext) received snapshot under its own barrier,
-	// NOT the wire epoch. This handler has no barrier, so the snapshot stays
-	// plaintext at rest and the recorded epoch is 0 — the chunks' wire Epoch (5)
-	// is intentionally not trusted (in production the sender streams plaintext
-	// with Epoch=0 via decrypt-for-send; the receiver is authoritative for its
-	// own at-rest epoch).
+	// The receiver records its own at-rest epoch, not the wire Epoch; with no barrier it stays plaintext at epoch 0.
 	if snap.Epoch != 0 {
 		t.Errorf("LogDB snapshot epoch = %d, want 0 (no receiver barrier => plaintext at rest)", snap.Epoch)
 	}
@@ -873,9 +823,7 @@ func TestHostMessageHandler_HandleSnapshot_CleansUpOnWriteError(t *testing.T) {
 		t.Fatalf("seed close: %v", err)
 	}
 
-	// Fail the receive's own write, after it has created its staging
-	// directory. The hook is installed AFTER the seeding above so the seed is
-	// not what trips it.
+	// Fail the receive's own write after its staging directory exists; installed after seeding.
 	cfs.failOnce(opWrite, "snapshot.dat", errInjected)
 
 	chunks := []proto.SnapshotChunk{
@@ -949,10 +897,7 @@ func TestCopyMapUint64Bool(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_HandleMessage_SourceAddressLearning verifies that
-// when a MessageBatch carries a non-empty SourceAddress, the handler learns
-// the sender's address in the host registry — but ONLY for senders that are
-// authorized members of a loaded shard.
+// TestHostMessageHandler_HandleMessage_SourceAddressLearning: a batch's SourceAddress is learned only for authorized members of a loaded shard.
 func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -1014,12 +959,7 @@ func TestHostMessageHandler_HandleMessage_SourceAddressLearning(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned is the
-// regression test: when the batch SourceAddress is NOT bound to the sender's
-// certificate (senderAuthorized returns false, or is nil), the handler must not
-// learn it into the return-path registry — otherwise a peer could teach the
-// registry an address its certificate does not cover and hijack another
-// replica's return path.
+// TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned: a SourceAddress not bound to the sender's certificate is not learned.
 func TestHostMessageHandler_HandleMessage_UnauthorizedSourceNotLearned(t *testing.T) {
 	cfg := config.HostConfig{
 		WALDir:                t.TempDir(),
@@ -1244,9 +1184,7 @@ func TestHostMessageHandler_HandleSnapshot_MetadataWriteError(t *testing.T) {
 	handler := &hostMessageHandler{engine: eng, host: h}
 	authorizeSnapshotPath(t, eng, h, 7, 4, 1)
 
-	// Fail the metadata write. The receive stages in a directory of its own,
-	// so a blocker planted at the canonical path no longer intercepts it — the
-	// failure is injected at the filesystem instead.
+	// Fail the metadata write at the filesystem, since the receive stages in its own directory.
 	node := handler.engine.GetNode(7)
 	cfs := newCrashFS(node.SnapshotDir(), cfg.NodeHostDir)
 	h.fsys = cfs
@@ -1290,14 +1228,7 @@ func (f *failingSaveSnapshotLogDB) SaveSnapshot(shardID, replicaID uint64, snaps
 	return f.saveErr
 }
 
-// TestHostMessageHandler_HandleSnapshot_LogDBSaveError verifies that when
-// the LogDB SaveSnapshot call fails, the handler returns a
-// SnapshotReceiveError with op="logdb_save".
-//
-// Under the two-phase receive the record is written only after raft ADOPTED
-// the install, so the failure cannot be answered by rolling back: raft now
-// depends on the artifact. The directory is kept and the shard is failed, as
-// a failed SaveState fails it; a restart replays the log.
+// TestHostMessageHandler_HandleSnapshot_LogDBSaveError: a failed SaveSnapshot returns SnapshotReceiveError op="logdb_save", keeps the directory and fails the shard.
 func TestHostMessageHandler_HandleSnapshot_LogDBSaveError(t *testing.T) {
 	nodeHostDir := t.TempDir()
 	cfg := config.HostConfig{
@@ -1467,10 +1398,7 @@ func TestHostMessageHandler_HandleSnapshot_DuplicateSkipped(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_HandleSnapshot_NoEngineDelivery verifies that
-// HandleSnapshot REJECTS a snapshot when the engine node is nil (shard
-// not loaded in engine): authorization fails closed because there is no
-// membership to validate the sender against.
+// TestHostMessageHandler_HandleSnapshot_NoEngineDelivery: with no engine node there is no membership, so the snapshot is rejected.
 func TestHostMessageHandler_HandleSnapshot_NoEngineDelivery(t *testing.T) {
 	nodeHostDir := t.TempDir()
 	cfg := config.HostConfig{
@@ -1625,9 +1553,7 @@ func TestHandleSnapshot_RejectsInconsistentCount(t *testing.T) {
 	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
-// TestHandleSnapshot_RejectsIdentityMismatch verifies that a chunk whose
-// identity/metadata (here Term) differs from chunk 0 is rejected. This is
-// the core BUG C fix: chunks[0] is no longer blindly trusted for the set.
+// TestHandleSnapshot_RejectsIdentityMismatch: a chunk whose metadata (here Term) differs from chunk 0 is rejected.
 func TestHandleSnapshot_RejectsIdentityMismatch(t *testing.T) {
 	handler, _ := newSnapshotHandler(t)
 
@@ -1719,13 +1645,7 @@ func assertNoSnapshotDir(t *testing.T, handler *hostMessageHandler, shardID, rep
 	}
 }
 
-// TestHandleSnapshot_LandsUnderNodeSnapshotDir is the CX3 regression test: an
-// inbound snapshot must be written under the engine node's SnapshotDir() — the
-// root that snapshot GC and the DEK-purge floor scan — NOT under a hardcoded
-// NodeHostDir/snapshots path. For a per-shard DataDir (which roots SnapshotDir()
-// off the DataDir, distinct from NodeHostDir), the old hardcoded path was
-// invisible to GC/purge: received snapshots leaked and a key rotation could
-// purge a DEK they still needed.
+// TestHandleSnapshot_LandsUnderNodeSnapshotDir: an inbound snapshot is written under the node's SnapshotDir(), which GC and the DEK-purge floor scan.
 func TestHandleSnapshot_LandsUnderNodeSnapshotDir(t *testing.T) {
 	nodeHostDir := t.TempDir()
 	cfg := config.HostConfig{
@@ -1816,22 +1736,7 @@ func authorizationRigJoining(t *testing.T, ms proto.Membership) (*engine.Engine,
 	return eng, handler, node
 }
 
-// recordingDeliverWrapper wraps a real engineDeliverer, synchronously
-// recording every message DeliverMessage accepts before delegating to the
-// wrapped implementation.
-//
-// authorizationRig's eng.Start() runs a real background worker that
-// concurrently drains the same inbox queue a test would otherwise have to
-// poll (DiagState().InboxLen) to observe delivery -- and that queue-depth
-// snapshot is racy: under enough scheduling delay on the test goroutine, the
-// worker can drain the just-delivered message before the test ever samples
-// the length, so a later re-read (even a polled one tracking the maximum
-// seen) is indistinguishable from "never delivered" if the worker both
-// drains and stabilizes before the first sample. Recording synchronously at
-// the DeliverMessage call itself -- which HandleMessage invokes directly,
-// in the test's own goroutine, before it returns -- removes the race
-// entirely: delivery is observed at the moment it happens, not inferred
-// from a live counter a second goroutine is concurrently mutating.
+// recordingDeliverWrapper records every message DeliverMessage accepts, synchronously, before delegating; reading the inbox length instead races the engine worker.
 type recordingDeliverWrapper struct {
 	engineDeliverer
 	mu        sync.Mutex
@@ -1875,12 +1780,7 @@ func authorizationRigRecordingJoining(t *testing.T, ms proto.Membership) (*hostM
 	return handler, node, rec
 }
 
-// appendPendingAdd puts an UNCOMMITTED AddNode(replicaID, identity) into the
-// node's raft log, the way a lagging follower holds one: replicated from the
-// leader the configuration already names (leaderID, at term), appended, not
-// yet committed. It then publishes the pending configuration the receive gate
-// reads, as the step worker would on its next cycle. The log must be empty
-// before the call (the entry lands at index 1).
+// appendPendingAdd appends an uncommitted AddNode(replicaID, identity) at index 1 from leaderID at term and publishes the pending configuration; the log must be empty.
 func appendPendingAdd(t *testing.T, node *engine.Node, leaderID, term, replicaID uint64, addr, identity string) {
 	t.Helper()
 	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: replicaID, Address: addr, NodeIdentity: identity}
@@ -1902,18 +1802,7 @@ func appendPendingAdd(t *testing.T, node *engine.Node, leaderID, term, replicaID
 	}
 }
 
-// TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange pins the
-// sound answer to the wedge a member allow-list causes.
-//
-// A replica's configuration lags by design. Replica 5 is added to the shard and
-// becomes leader while this host is behind: the local COMMITTED configuration
-// still reads {1,2}, but the AddNode that admits 5 — replicated here by the old
-// leader — sits in this replica's own log, uncommitted. Under an allow-list
-// every Heartbeat and Replicate from leader 5 would be dropped, so the replica
-// would be deaf to its own leader for the life of the process. Under an
-// unknown-member exemption ANY certificate holder naming replica 5 would be
-// admitted, which is a hole. The pending configuration is the fact between
-// the two: this replica's own log names 5 and the identity it must present.
+// TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange: a leader named only by an uncommitted AddNode in this replica's log is admitted with the identity it binds.
 func TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange(t *testing.T) {
 	const newLeaderAddr = "127.0.0.1:5005"
 	const newLeaderID = "spki:5555555555555555555555555555555555555555555555555555555555555555"
@@ -1974,9 +1863,7 @@ func TestHostMessageHandler_AcceptsSenderNamedByAPendingConfigChange(t *testing.
 	}
 }
 
-// TestHostMessageHandler_RejectsRemovedSender pins the other half: a COMMITTED
-// removal is still enforced. The tombstone is the one membership-derived fact
-// that is safe on the receive path, because it only ever grows.
+// TestHostMessageHandler_RejectsRemovedSender: a committed removal is enforced on receive.
 func TestHostMessageHandler_RejectsRemovedSender(t *testing.T) {
 	_, handler, node := authorizationRig(t, proto.Membership{
 		Addresses: map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
@@ -2004,12 +1891,7 @@ func TestHostMessageHandler_RejectsRemovedSender(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor pins the third
-// source of the sender binding for an ESTABLISHED replica: it was down while
-// replica 8 was added and elected, so neither its committed configuration nor
-// its log names 8. Its operator restarted it with a Config.MemberIdentities
-// that does, and on that — bound to 8's identity — 8's heartbeats are admitted
-// and the replica catches up without a wipe.
+// TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor: a replica restarted with Config.MemberIdentities naming the new leader admits its heartbeats.
 func TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor(t *testing.T) {
 	const leaderAddr = "127.0.0.1:5008"
 	const leaderID = "spki:8888888888888888888888888888888888888888888888888888888888888888"
@@ -2061,15 +1943,7 @@ func TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor(t *testing.T) 
 	}
 }
 
-// TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress is the regression
-// for the bootstrap deadlock a strict membership gate on address learning
-// causes.
-//
-// A replica joining a shard starts with an EMPTY configuration, so IsMember is
-// false for everyone -- including the leader. If it cannot record the leader's
-// address it cannot route its ReplicateResp back, so it never acks, the leader's
-// match index never advances, and the join never completes. Every membership
-// change and add-node integration test times out at exactly this point.
+// TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress: a joiner with an empty configuration records the leader's address so it can ack.
 func TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress(t *testing.T) {
 	_, handler, node := authorizationRigJoining(t, proto.Membership{})
 	// The join anchor is what admits the leader while the joiner holds no
@@ -2104,10 +1978,7 @@ func TestHostMessageHandler_JoiningReplicaLearnsTheLeaderAddress(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress pins the
-// other half. First contact may fill in a mapping; nothing outside the committed
-// configuration may REPLACE one. Otherwise any authenticated peer could re-point
-// an established member's traffic at itself.
+// TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress: first contact may fill a mapping, but only a committed member may replace one.
 func TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress(t *testing.T) {
 	_, handler, _ := authorizationRig(t, proto.Membership{
 		Addresses:  map[uint64]string{1: "127.0.0.1:5001", 2: "127.0.0.1:5002"},
@@ -2136,9 +2007,7 @@ func TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress(t *testin
 			"address to %q: shard traffic for replica 2 now goes to it", got)
 	}
 
-	// And a MEMBER may still overwrite, which recovery at a new address needs —
-	// on the strength of its committed identity, which authorizeAllSenders
-	// presents.
+	// A member may still overwrite, on its committed identity.
 	if err := handler.HandleMessage(batch, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
@@ -2148,13 +2017,7 @@ func TestHostMessageHandler_NonMemberCannotRepointAnEstablishedAddress(t *testin
 	}
 }
 
-// TestHostMessageHandler_CommittedKeypairIsNotAdmittedUnderASecondID pins the
-// gate in front of the non-committed sources: neither the operator anchor nor
-// the pending configuration may admit a keypair the COMMITTED configuration
-// binds to another replica, or that member would be sending as a second ID.
-// Asked of the committed configuration at the moment of the message, so a
-// member added after the snapshot a restart recovered from is covered where
-// the start-time anchor check could not see it.
+// TestHostMessageHandler_CommittedKeypairIsNotAdmittedUnderASecondID: neither the anchor nor the pending configuration admits a keypair committed to another replica.
 func TestHostMessageHandler_CommittedKeypairIsNotAdmittedUnderASecondID(t *testing.T) {
 	const memberAddr = "127.0.0.1:5002"
 	const memberID = "spki:2222222222222222222222222222222222222222222222222222222222222222"
@@ -2202,12 +2065,7 @@ func TestHostMessageHandler_CommittedKeypairIsNotAdmittedUnderASecondID(t *testi
 	}
 }
 
-// appendPendingRemoval puts a COMMITTED but not yet applied
-// RemoveNode(replicaID) into the node's log at index 1 the way
-// appendPendingAdd puts an add there (the leader's Commit covers it; the
-// apply path that would fold it is not driven), and publishes the pending
-// configuration. An uncommitted removal is deliberately not a pending
-// tombstone — see raft.Peer.PendingRemoval.
+// appendPendingRemoval puts a committed, unapplied RemoveNode(replicaID) at index 1 and publishes the pending configuration (see raft.Peer.PendingRemoval).
 func appendPendingRemoval(t *testing.T, node *engine.Node, leaderID, term, replicaID uint64) {
 	t.Helper()
 	cc := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: replicaID}

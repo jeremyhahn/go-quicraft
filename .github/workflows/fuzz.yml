@@ -1,20 +1,6 @@
 name: Fuzz
 
-# Mutation fuzzing, kept out of ci.yml.
-#
-# `go test -fuzz` is unbounded and nondeterministic, so on a PR it would fail
-# unrelated changes at random. ci.yml's `fuzz-seeds` job runs the targets
-# against their seeds and committed corpus only; the searching happens here,
-# dispatched by hand (no schedule: a cron run nobody asked for spends runner
-# time no one reads, #293). Promote an interesting input to the full tier by
-# committing it under pkg/*/testdata/fuzz/.
-#
-# The budget is an execution count (`-fuzztime=<N>x`), never a duration. With
-# a duration, Go's fuzz coordinator can record its own expected deadline as a
-# "context deadline exceeded" failure with no reproducer. A count creates no
-# deadline and keeps the search depth the same across runners of different
-# speeds. Go then no longer bounds the wall clock, so `timeout-minutes` below
-# is the only backstop.
+# Mutation fuzzing, dispatched by hand; the budget is an execution count, never a duration, so timeout-minutes is the only wall-clock bound.
 
 on:
   workflow_dispatch:
@@ -37,11 +23,7 @@ jobs:
   fuzz:
     name: Fuzz ${{ matrix.package }}
     runs-on: ubuntu-latest
-    # The only wall-clock bound, since an execution budget bounds work, not
-    # time, and per-exec cost grows with the corpus. The largest package,
-    # pkg/proto with 13 targets, takes about 12 minutes on the runner, so 60
-    # leaves ~5x headroom. A job that hits it has a target whose per-exec cost
-    # exploded, which is worth investigating.
+    # The only wall-clock bound; the slowest package takes about 12 minutes.
     timeout-minutes: 60
     strategy:
       # A crash in one package must not cancel the search in the others.
@@ -76,17 +58,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Per-package execution budgets, calibrated 2026-09-01 to land near a
-          # minute per target on the runner.
-          #
-          # Method: every target was run once at -fuzztime=60s on an idle
-          # 24-core host and its execution count recorded. The runner measured
-          # 4.2M execs/60s on FuzzSnapshotChunkRoundTrip against 18.6M on that
-          # host, so the local counts are scaled by ~0.23. Each package's
-          # budget comes from its slowest target, so nothing overruns.
-          #
-          # The measured spread is 20k to 36M execs per minute and does not
-          # follow package boundaries, hence the per-target overrides below.
+          # Per-package execution budgets, sized to about a minute per target; per-target overrides below.
           case "${PACKAGE}" in
             # 13 targets, 18.2M–36.1M execs/min; slowest FuzzMembershipRoundTrip.
             ./pkg/proto)              EXECS=4000000 ;;
@@ -178,18 +150,12 @@ jobs:
               -fuzz="^${target}\$" -fuzztime="${count}x" "${PACKAGE}"
           done
 
-      # A crash writes its reproducer to testdata/fuzz/<Target>/, which would
-      # be discarded with the runner. Print it to the job log, which works on
-      # every host; commit the file and ci.yml's fuzz-seeds job turns it into
-      # a regression test.
+      # Print a crash reproducer to the log; commit it and the fuzz-seeds job makes it a regression test.
       - name: Print crash reproducers
         if: failure()
         run: |
           set -euo pipefail
-          # Untracked, because the committed corpus lives in the same
-          # directories: the file Go just wrote is the one git does not know.
-          # Checked explicitly rather than inside the `for`, where a failure
-          # would look identical to "nothing was written".
+          # Untracked files are the reproducers Go just wrote beside the committed corpus.
           if ! untracked="$(git ls-files --others --exclude-standard -- pkg)"; then
             echo "FAIL: could not list untracked files, so a reproducer may exist and not be shown here"
             exit 1

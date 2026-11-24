@@ -23,12 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestRequestLeaderTransferTargets pins the documented result of
-// RequestLeaderTransfer (docs/multi-group-host/api.md, Leader transfer) for
-// target 0, the leader itself, a witness, a replica unknown to the shard, an
-// unknown shard and a closed Host. Observer, removed and follower targets are
-// covered by TestRequestLeaderTransfer_ObserverAndRemovedTargets and the
-// follower test in host_test.go.
+// TestRequestLeaderTransferTargets pins RequestLeaderTransfer results for target 0, self, a witness, unknown replica, unknown shard and a closed Host.
 func TestRequestLeaderTransferTargets(t *testing.T) {
 	t.Run("target zero", func(t *testing.T) {
 		h := startSingleVoterShard(t)

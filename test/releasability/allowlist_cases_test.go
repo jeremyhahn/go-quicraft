@@ -147,9 +147,7 @@ func TestAcceptedClassesUnionsEveryMatchingRule(t *testing.T) {
 	}
 }
 
-// TestScanNeverReadsAFileWhoseEveryClassIsAllowed pins the shortcut. The named
-// file sits under a regular file, so any attempt to stat it fails with ENOTDIR
-// and surfaces as a readError: a clean result proves it was never touched.
+// TestScanNeverReadsAFileWhoseEveryClassIsAllowed verifies a fully allowed file is never read.
 func TestScanNeverReadsAFileWhoseEveryClassIsAllowed(t *testing.T) {
 	root, _ := writeTree(t, map[string]string{"vendored": "a file, not a directory\n"})
 	files := []string{"vendored/thing.js"}

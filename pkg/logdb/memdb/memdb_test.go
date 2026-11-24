@@ -621,13 +621,7 @@ func TestRemoveEntriesToIndexZeroIsNoOp(t *testing.T) {
 
 // --- Compact ---
 
-// TestCompactIsNoOp covers one narrow contract point: Compact on a node this
-// store has never heard of succeeds rather than erroring. That it does not
-// DISTURB a populated node is a cross-backend property and is asserted in
-// TestConformanceCompactPreservesEverythingAboveTheFloor; asserting it here as
-// well would only duplicate it. Keeping the scope explicit matters because this
-// test alone does not catch a Compact rewritten to delete the node's entries,
-// hard state and snapshot.
+// TestCompactIsNoOp checks Compact on an unknown node succeeds; preservation is covered by TestConformanceCompactPreservesEverythingAboveTheFloor.
 func TestCompactIsNoOp(t *testing.T) {
 	db := New()
 	if err := db.Compact(1, 1); err != nil {
@@ -1029,20 +1023,7 @@ func TestRemoveNodeDataThenRecreateSameNodeIsRefused(t *testing.T) {
 	}
 }
 
-// TestRemoveEntriesToReleasesMemory asserts what its name claims: that
-// compaction actually RELEASES the compacted prefix, rather than re-slicing
-// past it and leaving the whole original array — every dropped Cmd payload
-// included — reachable from the surviving slice.
-//
-// Asserting only that the remaining entries read back is not a test of that. It
-// passes identically for `nd.entries = nd.entries[cutIdx:]`, which releases
-// nothing at all and turns a compacted node into a permanent hold on the log it
-// was compacting away.
-//
-// The release is proven by aliasing rather than by measuring the heap: the old
-// backing array is overwritten after the compaction, and a slice that merely
-// re-sliced it would then serve the overwritten bytes. A GC-and-measure test
-// would be nondeterministic; this one cannot be.
+// TestRemoveEntriesToReleasesMemory proves compaction drops the old backing array by overwriting it and checking the survivors.
 func TestRemoveEntriesToReleasesMemory(t *testing.T) {
 	db := New()
 	entries := make([]logdb.Entry, 1000)
@@ -1166,9 +1147,7 @@ func TestMemDB_NodeRemovedRetiresTheReplica(t *testing.T) {
 	}
 }
 
-// TestRemoveEntriesToRefusesARetiredNode verifies RemoveEntriesTo refuses a
-// node RemoveNodeData retired, as every other writer does, rather than
-// reporting success for a node that no longer exists.
+// TestRemoveEntriesToRefusesARetiredNode verifies RemoveEntriesTo refuses a node RemoveNodeData retired.
 func TestRemoveEntriesToRefusesARetiredNode(t *testing.T) {
 	db := New()
 	if err := db.SaveState([]logdb.Update{{ShardID: 1, ReplicaID: 1,

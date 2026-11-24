@@ -34,12 +34,7 @@ type wantShard struct {
 func healthPtr(h ShardHealth) *ShardHealth { return &h }
 func boolPtr(b bool) *bool                 { return &b }
 
-// TestHealthCheck_ReportsEveryCallerReachableState drives one in-process Host
-// through every state a caller can put a shard or the host in and checks
-// HealthCheck against the documented values: Status is "unhealthy" when no
-// shard is loaded and "ok" otherwise unless a shard has ShardError
-// (docs/multi-group-host/api.md, Host.HealthCheck); ShardInfo.Paused follows
-// PauseShard/ResumeShard; a stopped shard leaves Shards.
+// TestHealthCheck_ReportsEveryCallerReachableState checks HealthCheck in every caller-reachable shard and host state against docs/multi-group-host/api.md.
 func TestHealthCheck_ReportsEveryCallerReachableState(t *testing.T) {
 	h := newPauseTestHost(t, 1, 2)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -315,12 +310,7 @@ func TestHealthCheck_NotReadyWhenLeaderlessPastElectionTimeout(t *testing.T) {
 	})
 }
 
-// TestHealthCheck_LeaderlessGraceCoversRandomizedElection pins the window
-// to the randomized election timeout: raft campaigns after a timeout drawn
-// from [ElectionRTT, 2*ElectionRTT) ticks and the campaign then has one
-// more election timeout to win, so a shard leaderless for less than
-// 3 * ElectionRTT * RTTMillisecond may still be in a normal first election
-// and must not count as not-ready.
+// TestHealthCheck_LeaderlessGraceCoversRandomizedElection pins the leaderless window to 3 * ElectionRTT * RTTMillisecond.
 func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -355,21 +345,7 @@ func TestHealthCheck_LeaderlessGraceCoversRandomizedElection(t *testing.T) {
 	}
 }
 
-// TestHealthCheck_HealthyStartupNeverNotReady observes health on every
-// step of a healthy single-member shard's startup, from StartShard until
-// its leader is published: it never reports not-ready inside the
-// election window, and reports ok once the leader is known.
-//
-// The window is wall-clock (docs/observability/api.md: 3 * ElectionRTT *
-// RTTMillisecond from StartShard) while the election runs on logical
-// ticks from a time.Ticker, which drops ticks whenever the step worker
-// overruns the tick interval. Under -race on a loaded runner a 1ms tick
-// overran often enough that the 50-100 tick election outlasted the 150ms
-// window (CI run 44581832844: not-ready 0.16s after StartShard). That
-// shard really was leaderless past its window, so not-ready was the
-// contract's answer. The test therefore uses a 10ms tick, against which
-// the step worker's per-tick cost is small, and fails only on a not-ready
-// report before the window has elapsed since StartShard was called.
+// TestHealthCheck_HealthyStartupNeverNotReady observes health through startup: never not-ready inside the window, ok once a leader is known; a 10ms tick keeps ticks from dropping.
 func TestHealthCheck_HealthyStartupNeverNotReady(t *testing.T) {
 	for round := 0; round < 5; round++ {
 		hc := testHostConfig(t)
@@ -490,11 +466,7 @@ func (c *resumeProbeClock) monoNanos() int64 {
 	return c.steppedClock.monoNanos()
 }
 
-// TestHealthCheck_ResumeNeverExposesExpiredWindow checks that a health
-// probe running concurrently with ResumeShard of a leaderless shard whose
-// window expired before the pause never reports not-ready from the
-// pre-pause timestamp (#1175 review round 3): the fresh window is in place
-// before the shard is published as unpaused.
+// TestHealthCheck_ResumeNeverExposesExpiredWindow checks ResumeShard installs a fresh window before publishing the shard as unpaused.
 func TestHealthCheck_ResumeNeverExposesExpiredWindow(t *testing.T) {
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -554,11 +526,7 @@ func TestHealthCheck_ResumeNeverExposesExpiredWindow(t *testing.T) {
 	}
 }
 
-// TestHealthCheck_UnrepresentableGraceNeverNotReady checks a configuration
-// whose nominal election timeout fits time.Duration but whose tripled
-// window does not (#1175 review round 3): a freshly started leaderless
-// shard must not report not-ready, and the window saturates rather than
-// wrapping negative.
+// TestHealthCheck_UnrepresentableGraceNeverNotReady checks the window saturates when tripling the election timeout overflows time.Duration.
 func TestHealthCheck_UnrepresentableGraceNeverNotReady(t *testing.T) {
 	hc := testHostConfig(t)
 	hc.RTTMillisecond = 60000
@@ -655,10 +623,7 @@ func (s *clockedShard) notReady(t *testing.T) bool {
 	return listed
 }
 
-// TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps covers #1175
-// review round 2: the leaderless window is measured on the monotonic
-// clock, so a wall-clock correction neither makes a not-ready host ok
-// again nor fails readiness inside a normal election.
+// TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps checks the window uses the monotonic clock.
 func TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps(t *testing.T) {
 	t.Run("backward step keeps an expired window expired", func(t *testing.T) {
 		s := newClockedShard(t, 21)
@@ -689,10 +654,7 @@ func TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps(t *testing.T) {
 	})
 }
 
-// TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow covers #1175
-// review round 2: a shard that loses its leader long after startup gets a
-// fresh election window from the loss, repeated leaderless updates do not
-// postpone it, and a new leader clears it.
+// TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow checks a later leader loss opens a fresh window that a new leader clears.
 func TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow(t *testing.T) {
 	s := newClockedShard(t, 23)
 	s.clk.advance(s.grace / 2)

@@ -42,17 +42,11 @@ type bucket struct {
 type ConcurrentStore struct {
 	buckets [numBuckets]bucket
 
-	// ops is a scratch slice reused across Update calls for the decode
-	// pass, avoiding a per-batch allocation. Update is serialized on the
-	// apply worker, so no lock guards it; entries alias Entry.Cmd only for
-	// the duration of a single Update call.
+	// ops is decode scratch reused across Update calls, which the apply worker serializes; entries alias Entry.Cmd only within one call.
 	ops []decodedOp
 }
 
-// decodedOp is a pre-validated command staged during the first pass of
-// Update, paired with its target bucket. valid is false for entries whose
-// payload failed to decode; those receive the reserved
-// sm.ResultInvalidCommand result and are skipped during the apply pass.
+// decodedOp is a decoded command and its bucket; invalid ones get sm.ResultInvalidCommand and are skipped.
 type decodedOp struct {
 	cmd    Command
 	bucket uint32
@@ -73,20 +67,7 @@ func bucketIndex(key []byte) uint32 {
 	return uint32(xxhash.Sum64(key) % numBuckets)
 }
 
-// Update applies committed entries.
-//
-// The entries are committed Raft log entries: they MUST be applied
-// deterministically on every replica, so a payload that fails to decode
-// produces the reserved sm.ResultInvalidCommand result for that entry
-// rather than an Update error (the engine treats an Update error as
-// terminal for the shard).
-//
-// All entries are decoded before any mutation, and the write locks of every
-// affected bucket are held together for the whole apply pass, so the batch
-// is all-or-nothing AND concurrent Lookups never observe a partially
-// applied batch. Buckets are locked in ascending index order -- the same
-// order used by Lookup(ListQuery) and PrepareSnapshot -- so lock
-// acquisition cannot deadlock.
+// Update applies committed entries all-or-nothing under every affected bucket's write lock, taken in ascending order; undecodable payloads get sm.ResultInvalidCommand.
 func (cs *ConcurrentStore) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
 	// Pass 1: decode every command before touching any bucket. An
 	// undecodable payload is marked invalid and its reserved per-entry
@@ -139,10 +120,7 @@ func (cs *ConcurrentStore) Update(_ context.Context, entries []sm.Entry, results
 			b.data[string(cmd.Key)] = val
 			results[i] = sm.Result{Value: uint64(len(cmd.Value))}
 		case OpPutIfAbsent:
-			// Evaluated here, under the bucket lock and against replicated
-			// state, so every replica reaches the same decision. See
-			// handlePutIfAbsent in memory.go for why the check cannot live on
-			// the proposer.
+			// Evaluated under the bucket lock against replicated state; see handlePutIfAbsent in memory.go.
 			if _, exists := b.data[string(cmd.Key)]; exists {
 				results[i] = sm.Result{Value: ResultNotStored}
 				break
@@ -234,10 +212,7 @@ func (cs *ConcurrentStore) BytesLookup(key []byte) ([]byte, error) {
 	return cp, nil
 }
 
-// BytesLookupInto implements sm.NALookupInto. It copies the value for key
-// into dst, growing it via append if necessary, and returns the populated
-// sub-slice. The caller owns the returned slice and MUST NOT retain dst
-// across a subsequent call that may use the same backing array.
+// BytesLookupInto implements sm.NALookupInto, appending key's value into dst and returning it; do not retain dst across calls.
 func (cs *ConcurrentStore) BytesLookupInto(key, dst []byte) ([]byte, error) {
 	idx := bucketIndex(key)
 	b := &cs.buckets[idx]
@@ -254,15 +229,7 @@ func (cs *ConcurrentStore) BytesLookupInto(key, dst []byte) ([]byte, error) {
 	return dst, nil
 }
 
-// GetHash computes a deterministic xxhash64 hash of all key-value pairs
-// across all buckets. The read locks of EVERY bucket are held together for
-// the whole computation so the hash reflects a state that actually existed
-// atomically — releasing and re-acquiring per key would let a concurrent
-// Update interleave, producing a hash of a state no replica ever held and
-// raising false divergence alarms. Buckets are locked in ascending index
-// order, matching Lookup(ListQuery)/PrepareSnapshot/Update, so lock
-// acquisition cannot deadlock. Each key and value is hashed via
-// hashLenPrefixed so pair boundaries are unambiguous.
+// GetHash returns an xxhash64 of all length-prefixed pairs with every bucket read-locked in ascending order, so it hashes one consistent state.
 func (cs *ConcurrentStore) GetHash() (uint64, error) {
 	for i := range cs.buckets {
 		cs.buckets[i].mu.RLock()
@@ -362,13 +329,7 @@ func (cs *ConcurrentStore) SaveSnapshot(_ context.Context, snapshotCtx interface
 	return nil
 }
 
-// RecoverFromSnapshot restores state from the reader, replacing all data.
-//
-// The entire stream is read and validated into local staging maps BEFORE
-// any live bucket is touched: a truncated or corrupt stream must return an
-// error while leaving the existing state fully intact. Only after a clean
-// full parse are the bucket write locks taken and the staged maps swapped
-// in atomically (mirrors MemoryStore.RecoverFromSnapshot).
+// RecoverFromSnapshot fully reads and validates reader before swapping the staged maps in, leaving state intact on error.
 func (cs *ConcurrentStore) RecoverFromSnapshot(_ context.Context, r io.Reader, stopper <-chan struct{}) error {
 	var count uint32
 	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {

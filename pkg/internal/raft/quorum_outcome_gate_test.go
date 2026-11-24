@@ -25,14 +25,7 @@ import (
 // ReadIndexResp is the wire form of a quorum outcome
 // ---------------------------------------------------------------------------
 
-// TestRaft_ReadIndexResp_RefusedFromNonLeader is the raft half of the
-// ReadIndexResp sender gate. A handleReadIndexResp that resolved a pending
-// linearizable read from ANY sender — no check that the response came from the
-// leader this replica actually asked, no check that a matching read existed —
-// would be exploitable: the correlation key is a plain monotonic counter, so it
-// is guessable, and one forged message would serve a read at an index of the sender's choosing with no
-// heartbeat quorum ever run, which is a silent linearizability violation and
-// the worst possible failure for a read the caller asked to be linearizable.
+// TestRaft_ReadIndexResp_RefusedFromNonLeader: a ReadIndexResp resolves a read only from the leader asked and for a pending read.
 func TestRaft_ReadIndexResp_RefusedFromNonLeader(t *testing.T) {
 	r := atTerm(newTestRaft(1), 4)
 	r.leaderID = 2
@@ -79,15 +72,7 @@ func TestRaft_ReadIndexResp_RefusedWithNoKnownLeader(t *testing.T) {
 	}
 }
 
-// TestRaft_ReadIndexResp_AcceptsAnIndexAheadOfTheLocalCommit pins the check
-// that must NOT be added.
-//
-// The leader answers with ITS committed index, which is by construction at or
-// ahead of the follower's — that gap is the entire point of ReadIndex, and the
-// follower waits for lastApplied to reach the returned index before serving the
-// read (hostEngineCallback.OnReadyToRead). Rejecting LogIndex > r.log.committed
-// as "stale or forged" would therefore refuse the common case: every
-// linearizable read taken while the follower is even one entry behind.
+// TestRaft_ReadIndexResp_AcceptsAnIndexAheadOfTheLocalCommit: a leader index ahead of the local commit is normal and accepted.
 func TestRaft_ReadIndexResp_AcceptsAnIndexAheadOfTheLocalCommit(t *testing.T) {
 	r := atTerm(newTestRaft(1), 4)
 	r.leaderID = 2
@@ -117,22 +102,7 @@ func TestRaft_ReadIndexResp_AcceptsAnIndexAheadOfTheLocalCommit(t *testing.T) {
 // The leadership-transfer exemption from the CheckQuorum vote guard
 // ---------------------------------------------------------------------------
 
-// TestRaft_DropHighTermVote_TransferHintCappedAtNextTerm pins the bound on the
-// transfer exemption.
-//
-// Hint == From is a value the SENDER chooses, and RequestVote is deliberately
-// not bound to committed membership on the receive path (a member that
-// recovered at a new address must still be able to campaign during quorum
-// loss). Unbounded, the exemption let any certificate holder send
-// RequestVote{Hint: From, Term: r.term + 1000}, walk past a live leader lease,
-// and force every recipient to becomeFollower at an arbitrary term — a leader
-// step-down on demand, repeatable for as long as the sender kept sending.
-//
-// r.term+1 is exactly what a real transferee campaigns at: it takes its term
-// from the leader's own TimeoutNow and becomeCandidate adds one. A replica far
-// enough behind for a bigger gap has not heard from the leader inside the
-// election timeout, so the lease clause is already false and the vote is not
-// dropped for an unrelated reason.
+// TestRaft_DropHighTermVote_TransferHintCappedAtNextTerm: the transfer exemption from the lease applies only at r.term+1.
 func TestRaft_DropHighTermVote_TransferHintCappedAtNextTerm(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -163,10 +133,7 @@ func TestRaft_DropHighTermVote_TransferHintCappedAtNextTerm(t *testing.T) {
 	}
 }
 
-// TestRaft_DropHighTermVote_ForgedTransferCannotUnseatALiveLeader asserts the
-// OBSERVABLE effect, not just the predicate: a follower with a fresh leader
-// lease must not advance its term or forget its leader because of a
-// transfer-hinted vote at an arbitrary term.
+// TestRaft_DropHighTermVote_ForgedTransferCannotUnseatALiveLeader: a leased follower keeps its term and leader on a forged transfer vote.
 func TestRaft_DropHighTermVote_ForgedTransferCannotUnseatALiveLeader(t *testing.T) {
 	r := followerWithKnownLeader(t, 5)
 	termBefore, leaderBefore := r.term, r.leaderID
@@ -196,13 +163,7 @@ func TestRaft_DropHighTermVote_ForgedTransferCannotUnseatALiveLeader(t *testing.
 // One address may name only one member
 // ---------------------------------------------------------------------------
 
-// TestValidateConfigChange_RejectsDuplicateMemberAddress is quorum forgery with
-// no forged message and no certificate abuse at all: add a SECOND replica ID at
-// an address an existing member already holds and the single host behind it
-// legitimately authenticates as both. It then sends ReplicateResp{From: 2} and
-// ReplicateResp{From: 4}, both pass every inbound check, both advance a remote
-// match index, and tryCommit counts them as two independent replicas. The same
-// host also casts two votes.
+// TestValidateConfigChange_RejectsDuplicateMemberAddress: two replica IDs at one address would let one host count twice.
 func TestValidateConfigChange_RejectsDuplicateMemberAddress(t *testing.T) {
 	const sharedAddr = "10.0.0.5:5001"
 	base := proto.Membership{Addresses: map[uint64]string{
@@ -229,10 +190,7 @@ func TestValidateConfigChange_RejectsDuplicateMemberAddress(t *testing.T) {
 	}
 }
 
-// TestValidateConfigChange_AllowsADepartedReplicasAddress pins the other side:
-// a REMOVED replica's address is free to reuse. Its tombstone denies it
-// regardless of who holds the address, and recycling a machine into a new
-// replica ID is ordinary operations.
+// TestValidateConfigChange_AllowsADepartedReplicasAddress: a removed replica's address may be reused.
 func TestValidateConfigChange_AllowsADepartedReplicasAddress(t *testing.T) {
 	const recycledAddr = "10.0.0.5:5001"
 	p := newTestPeer(t, testConfig(), proto.State{}, proto.Membership{
@@ -247,11 +205,7 @@ func TestValidateConfigChange_AllowsADepartedReplicasAddress(t *testing.T) {
 	}
 }
 
-// TestMemberAddress_ReportsASharedAddressAsNonExclusive covers the receive-side
-// fail-closed for a configuration that is ALREADY in the duplicate state —
-// seeded through StartShard before that validation existed, or restored from an
-// older snapshot's membership. Validation refuses to create it; the sender
-// binding must not assume validation ran.
+// TestMemberAddress_ReportsASharedAddressAsNonExclusive: an existing duplicate-address configuration is reported non-exclusive.
 func TestMemberAddress_ReportsASharedAddressAsNonExclusive(t *testing.T) {
 	const sharedAddr, ownAddr = "10.0.0.5:5001", "10.0.0.1:5001"
 	p := newTestPeer(t, testConfig(), proto.State{}, proto.Membership{

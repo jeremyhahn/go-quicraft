@@ -12,39 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package netfault injects network partitions between live replicas.
-//
-// # Why this exists
-//
-// A "partition" test that calls stopNode performs a process kill, and a killed
-// node is not a partitioned node: it holds no leadership belief, it
-// answers nothing, and it returns with cold in-memory state. The single most
-// dangerous configuration in Raft — a LIVE leader deposed by a quorum it can no
-// longer reach — could not be constructed anywhere in the suite. The cost of
-// that blind spot is measurable: with it, weakening the election quorum to n/2
-// passed 18 of 19 linearizability tests.
-//
-// # How it is wired
-//
-// The transport consults this package from its send path, and only in a build
-// tagged quicraft_netfault. In a normal build the check is a false compile-time
-// constant, the branch folds away, and this package is not in the binary's
-// dependency graph at all — the same discipline test/errfs uses for filesystem
-// faults. Calling anything here in a normal build is therefore inert.
-//
-// Drops are applied on the SENDING side, which expresses any directed cut: the
-// edge A->B is controlled entirely at A. Both nodes stay alive, keep ticking,
-// and keep whatever term and role they held.
-//
-// # Model
-//
-// Drops are silent, as on a real network: the sender's connections stay up and
-// no error is surfaced. Raft cannot distinguish an unanswered message from an
-// undelivered one, and neither can this.
-//
-// The blocked set is published as a whole through an atomic.Pointer, so the
-// send path reads it without a lock and a test may flip a partition while
-// traffic is in flight.
+// Package netfault drops messages on the sending side to partition live replicas silently; active only in builds tagged quicraft_netfault, inert otherwise.
 package netfault
 
 import (
@@ -75,12 +43,7 @@ var (
 	cur atomic.Pointer[state]
 )
 
-// Drop reports whether a message must be dropped. The transport calls this on
-// every outbound message when built with quicraft_netfault.
-//
-// shardID is accepted for symmetry with the call site and for future per-shard
-// cuts; partitions today are node-level, which is what a network partition
-// actually is.
+// Drop reports whether a message must be dropped; the transport calls it for every outbound message under quicraft_netfault. shardID is unused.
 func Drop(_, from, to uint64) bool {
 	s := cur.Load()
 	if s == nil {
@@ -118,10 +81,7 @@ func mutate(fn func(*state)) {
 	cur.Store(next)
 }
 
-// BlockLink drops every message sent from replica `from` to replica `to`,
-// leaving the reverse direction intact. This is the primitive for asymmetric
-// partitions — a leader that still hears acknowledgements it can no longer
-// answer, or answers nothing it still hears.
+// BlockLink drops every message from replica from to replica to, leaving the reverse direction intact.
 func BlockLink(from, to uint64) {
 	mutate(func(s *state) { s.blocked[link{from: from, to: to}] = struct{}{} })
 }
@@ -168,14 +128,7 @@ func Heal() {
 	cur.Store(nil)
 }
 
-// BlockedCount reports how many faults are currently installed — directed edges
-// plus isolated replicas.
-//
-// It exists so a test can assert its own fault setup took effect rather than
-// silently exercising a healthy cluster. That is not hypothetical: a partition
-// suite that secretly tested nothing is the reason this package exists, and a
-// suite built with the wrong tag would reproduce it exactly, because every
-// function here is inert without quicraft_netfault. Assert on this.
+// BlockedCount reports installed faults (directed edges plus isolated replicas); assert on it, since everything here is inert without quicraft_netfault.
 func BlockedCount() int {
 	s := cur.Load()
 	if s == nil {

@@ -16,20 +16,7 @@ package proto
 
 import "testing"
 
-// TestSessionPolicyLayoutRoundTrip pins the MaxSessionsPerOwner field through
-// the Membership wire format, and pins the size constants against the bytes the
-// encoder actually produces.
-//
-// Both halves are needed and neither substitutes for the other. A round-trip
-// alone passes against a layout whose size constant is too large — the encoder
-// writes into a buffer with slack and the decoder reads the right offsets — and
-// the slack then silently shifts every map in the six-map region for any OTHER
-// consumer that computes offsets from the same constant. A size assertion alone
-// passes against a field that is never written. The failure this pair exists to
-// catch is a field added to the struct but missed in Size(), MarshalTo, or
-// UnmarshalFrom, which is durable corruption rather than a decode error:
-// Membership is embedded in a larger buffer, so nothing downstream can tell a
-// short section from a long one.
+// TestSessionPolicyLayoutRoundTrip checks MaxSessionsPerOwner round-trips and the size constants match the encoded bytes.
 func TestSessionPolicyLayoutRoundTrip(t *testing.T) {
 	want := Membership{
 		ConfigChangeID:             7,
@@ -79,9 +66,7 @@ func TestSessionPolicyLayoutRoundTrip(t *testing.T) {
 	if gp != wp {
 		t.Fatalf("session policy round-trip = %+v, want %+v", gp, wp)
 	}
-	// Named explicitly as well as via the struct compare: the struct compare
-	// would still pass if BOTH sides lost the field to a zeroing bug in
-	// SessionPolicy()/SetSessionPolicy() rather than in the codec.
+	// Named explicitly in case both sides lose the field outside the codec.
 	if got.MaxSessionsPerOwner != 44444 {
 		t.Fatalf("MaxSessionsPerOwner = %d, want 44444: the field did not "+
 			"survive marshal/unmarshal, so a shard's per-owner cap would be "+
@@ -118,13 +103,7 @@ func TestSessionPolicyLayoutRoundTrip(t *testing.T) {
 	}
 }
 
-// TestEntryOwnerIDRoundTrip pins Entry.OwnerID through the entry wire format
-// and pins the header size against the field widths.
-//
-// Entry is the hottest structure in the system and its header size is
-// duplicated as a literal in several decoders, so a field added without moving
-// entryHeaderSize does not fail to compile — it reads CmdLen out of the middle
-// of OwnerID and produces a command of nonsense length.
+// TestEntryOwnerIDRoundTrip checks Entry.OwnerID round-trips and entryHeaderSize matches the field widths.
 func TestEntryOwnerIDRoundTrip(t *testing.T) {
 	const wantHeader = 8*8 + 4 // 68
 	if entryHeaderSize != wantHeader {

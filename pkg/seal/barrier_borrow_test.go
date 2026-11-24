@@ -26,26 +26,13 @@ import (
 // errLockRefused stands in for the kernel refusing an mlock.
 var errLockRefused = errors.New("mlock refused")
 
-// plainStrategy exposes ONLY the SealingStrategy method set.
-//
-// It is a hand-written delegation rather than an embedding on purpose: an
-// embedded *SoftwareStrategy would promote SealRootKeyProtected and
-// UnsealRootKeyProtected too, and the type would silently satisfy
-// ProtectedSealingStrategy — which is exactly the thing these tests must prove
-// the barrier does not require. Go interfaces are structural, so the only way to
-// assert "implements one and not the other" is to build a type that genuinely
-// has one method set.
+// plainStrategy exposes only the SealingStrategy method set.
 type plainStrategy struct {
 	inner *SoftwareStrategy
 	// lastUnsealed retains the exact slice header UnsealRootKey handed back, so
 	// a test can inspect that memory after Unseal has returned.
 	lastUnsealed []byte
 	// onBarrierEncryptor, when set, runs at the start of BarrierEncryptor.
-	//
-	// It is the only observation point INSIDE unsealWithRootKey that a test can
-	// reach without a new production seam, and it is what lets a test pin the
-	// ORDER of the heap-key wipe rather than only its end state. See
-	// TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns.
 	onBarrierEncryptor func()
 }
 
@@ -87,16 +74,7 @@ func newPlainStrategy(t *testing.T) *plainStrategy {
 	return &plainStrategy{inner: testStrategy(t)}
 }
 
-// TestBarrier_WorksWithAPlainSealingStrategy pins that the barrier's
-// locked-memory handling does not quietly start depending on
-// ProtectedSealingStrategy, because most strategies implement
-// only the []byte pair — go-xkms's TPM2, PKCS#11 and cloud-KMS strategies, and
-// go-qrdb's shamir and recovery strategies.
-//
-// Initialize generates the root key into locked memory and Unseal copies the
-// strategy's return into locked memory, but BOTH still hand the strategy an
-// ordinary []byte, because SealingStrategy is deliberately a []byte interface.
-// This test is what holds that line.
+// TestBarrier_WorksWithAPlainSealingStrategy verifies the barrier works without ProtectedSealingStrategy.
 func TestBarrier_WorksWithAPlainSealingStrategy(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()
@@ -134,18 +112,7 @@ func TestBarrier_WorksWithAPlainSealingStrategy(t *testing.T) {
 	}
 }
 
-// TestUnseal_WipesTheStrategysHeapKey pins the one place the root key still
-// reaches the ordinary heap, and how briefly.
-//
-// SealingStrategy.UnsealRootKey returns a plain []byte, so on the unseal path
-// the key does exist outside protected memory. What the barrier controls is
-// the WINDOW: the slice is copied into locked pages
-// and wiped immediately, instead of staying live across MAC verification,
-// encryptor resolution, the load-generation claim and one DEK derivation per
-// known epoch — nine hand-written wipes' worth of error paths.
-//
-// The strategy retains the exact slice header it returned, so this asserts on
-// the same backing array the barrier was handed.
+// TestUnseal_WipesTheStrategysHeapKey verifies Unseal wipes the root key the strategy returned on the heap.
 func TestUnseal_WipesTheStrategysHeapKey(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()
@@ -183,13 +150,7 @@ func TestUnseal_WipesTheStrategysHeapKey(t *testing.T) {
 	}
 }
 
-// TestInitialize_LockedMemoryRefusalIsClean pins what happens when the kernel
-// will not give Initialize its root-key enclave.
-//
-// The interesting property is not the error, it is the STATE: a barrier whose
-// Initialize failed must stay uninitialized, so a retry after the operator has
-// raised RLIMIT_MEMLOCK behaves like a first boot rather than hitting
-// ErrBarrierAlreadyInit against a half-built barrier.
+// TestInitialize_LockedMemoryRefusalIsClean verifies Initialize fails cleanly when locked memory is refused.
 func TestInitialize_LockedMemoryRefusalIsClean(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()
@@ -222,12 +183,7 @@ func TestInitialize_LockedMemoryRefusalIsClean(t *testing.T) {
 	}
 }
 
-// TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey is the same failure on the
-// unseal path, where it matters more: the strategy has ALREADY returned the root
-// key on the ordinary heap by the time the enclave is asked for. A refusal that
-// returned early without wiping would leave the root key readable in the heap of
-// a process that is still running — and running in exactly the degraded state
-// (locked memory exhausted) where a core dump is most likely.
+// TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey verifies a locked-memory refusal on Unseal still wipes the heap key.
 func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()
@@ -267,30 +223,7 @@ func TestUnseal_LockedMemoryRefusalStillWipesTheHeapKey(t *testing.T) {
 	}
 }
 
-// TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey is the sibling failure to
-// the one above.
-//
-// A wipe of the strategy's heap key placed only INSIDE the borrow that copies
-// it into locked memory is skipped on one path: Memory.WithBytes returns
-// ErrEnclaveDestroyed BEFORE it calls fn when the enclave is nil or wiped, so
-// fn never runs and the full plaintext root key stays on the ordinary Go heap —
-// swappable, core-dumpable, alive until the collector reclaims it. The deferred
-// wipe is the floor that covers it.
-//
-// A (nil, nil) allocator is the shape that reaches it. The default lockRootKey
-// is enclave.NewMemorySized, which cannot return one, so this is not
-// reachable in production — but lockRootKey is an injectable field, and the
-// comment at the borrow says the redesign exists precisely so "an error path
-// added later cannot forget one". An allocator whose refusal is a nil enclave
-// rather than an error is such a path.
-//
-// Verified by mutation: moving the wipe back inside the borrow —
-// deleting `defer enclave.Wipe(heapKey)` and restoring the four hand-written
-// calls — fails here with
-//
-//	barrier_borrow_test.go:319: byte 0 of the strategy's heap key = 0xa after
-//	Unseal returned through a short-circuited borrow: the plaintext root key was
-//	left readable on the ordinary heap
+// TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey verifies a short-circuited borrow still wipes the heap key.
 func TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()
@@ -334,32 +267,7 @@ func TestUnseal_ShortCircuitedBorrowStillWipesTheHeapKey(t *testing.T) {
 	}
 }
 
-// TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns pins the ORDER of the
-// wipe, which no other test in this package does.
-//
-// TestUnseal_WipesTheStrategysHeapKey inspects s.lastUnsealed after Unseal
-// RETURNS, so it is satisfied by any wipe that happens at all — including the
-// deferred backstop. That alone would leave the eager wipe inside the borrow
-// deletable with a green suite, which is the reverse of what the backstop is
-// for: the defer is meant to be a floor UNDER the eager wipe, not a substitute
-// that quietly retires it. A future edit dropping the eager wipe as dead code
-// would reopen the long plaintext-on-heap window — across
-// verifySealedStateMAC, the load-generation claim (which calls the embedder's
-// StatePersister, so real I/O) and one DEK derivation per known epoch.
-//
-// BarrierEncryptor is the earliest point inside unsealWithRootKey a test can
-// observe without adding a production seam. It runs after verifySealedStateMAC
-// and long before the defer, so "already zero here" is a strictly stronger
-// statement than the end-state assertion, and it is the one that dies when the
-// eager wipe does.
-//
-// Verified by mutation: deleting the eager enclave.Wipe(heapKey)
-// from inside the borrow leaves TestUnseal_WipesTheStrategysHeapKey PASSING and
-// fails only here, with
-//
-//	barrier_borrow_test.go:425: byte 0 of the strategy's heap key = 0x8f when
-//	unsealWithRootKey called back into the strategy: the eager wipe inside the
-//	borrow is gone and only the deferred backstop is left
+// TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns verifies the heap key is wiped before the rest of Unseal runs.
 func TestUnseal_HeapKeyIsWipedBeforeTheRestOfUnsealRuns(t *testing.T) {
 	s := newPlainStrategy(t)
 	defer s.Close()

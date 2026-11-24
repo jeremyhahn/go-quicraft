@@ -65,10 +65,7 @@ func TestIntegration_DB_SyncRead_AfterLeaderChange(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "post-leader-change", "new-value")
 	t.Logf("post-failover entry proposed")
 
-	// Verify linearizable reads of the pre-failover entries. What is under test
-	// is that the DATA survived the leadership change, not which replica serves
-	// it -- and with one node stopped the surviving two can elect again, so
-	// newLeaderIdx is a snapshot and each read re-resolves.
+	// The pre-failover data must survive; each read re-resolves the leader.
 	for _, want := range []struct{ key, value string }{
 		{"pre-leader-change", "old-value"},
 		{"pre-leader-change-2", "old-value-2"},

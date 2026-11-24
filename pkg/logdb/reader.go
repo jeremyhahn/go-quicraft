@@ -20,10 +20,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// maxEntrySliceSize limits the capacity of entry slices allocated during
-// GetRange to prevent excessive memory allocation when the requested
-// range is extremely large. With proto.Entry at ~120 bytes each, 4MB
-// allows roughly 34,000 entries per allocation.
+// maxEntrySliceSize caps the capacity of entry slices GetRange allocates.
 const maxEntrySliceSize uint64 = 4 * 1024 * 1024
 
 // entrySize is the approximate size in bytes of a single proto.Entry
@@ -31,10 +28,7 @@ const maxEntrySliceSize uint64 = 4 * 1024 * 1024
 // maxEntrySliceSize to cap slice pre-allocation.
 const entrySize uint64 = 120
 
-// maxTermCacheEntries is the capacity of the term ring buffer.
-// Once the buffer is full, the oldest entries are evicted automatically.
-// This prevents unbounded memory growth during sustained high-throughput
-// operation while providing O(1) append and O(log n) lookup.
+// maxTermCacheEntries is the capacity of the term ring buffer; the oldest entries are evicted when full.
 const maxTermCacheEntries = 100_000
 
 // termRingEntry stores a single (index, term) pair in the ring buffer.
@@ -43,11 +37,7 @@ type termRingEntry struct {
 	term  uint64
 }
 
-// termRingBuffer is a fixed-capacity circular buffer for (index, term) pairs.
-// Entries are appended in monotonically increasing index order and trimmed
-// from the low end, making a ring buffer the ideal data structure: O(1)
-// append with automatic eviction when full, O(log n) lookup via binary
-// search over the ordered entries, and O(log n) trim.
+// termRingBuffer is a fixed-capacity ring of (index, term) pairs in increasing index order, with O(1) append and O(log n) lookup and trim.
 type termRingBuffer struct {
 	buf   []termRingEntry
 	head  int // index of first valid entry in buf
@@ -61,14 +51,7 @@ func newTermRingBuffer(capacity int) *termRingBuffer {
 	}
 }
 
-// append adds an (index, term) pair at the tail of the ring buffer.
-// If the buffer is full, the oldest entry (at head) is evicted.
-//
-// lookup binary-searches the buffer, so the stored indices must stay
-// strictly increasing. An index at or below the current tail would break
-// that ordering, so the superseded suffix is dropped first (trimFrom) and
-// the pair is appended over it. This repairs — rather than corrupts — the
-// ring when a caller re-appends an overwritten index.
+// append adds an (index, term) pair at the tail, evicting the oldest when full; an index at or below the tail first drops the superseded suffix.
 func (r *termRingBuffer) append(index, term uint64) {
 	if r.count > 0 {
 		bufLen := len(r.buf)
@@ -137,14 +120,7 @@ func (r *termRingBuffer) trimTo(index uint64) {
 	r.count -= lo
 }
 
-// trimFrom removes all entries with index >= the given cutoff, dropping
-// them from the tail. Uses binary search to find the new count in O(log n).
-//
-// This is the truncation counterpart of trimTo: a follower conflict
-// truncation replaces a suffix of the log, and every cached term at or
-// above the new first index is superseded. Leaving them cached would let
-// termLocked serve a stale term for a re-written index (Log Matching
-// violation) and would bake a wrong markerTerm into Compact.
+// trimFrom removes every entry with index >= cutoff, so a truncated suffix never serves a stale term.
 func (r *termRingBuffer) trimFrom(index uint64) {
 	if r.count == 0 {
 		return
@@ -176,25 +152,7 @@ func (r *termRingBuffer) len() int {
 	return r.count
 }
 
-// LogReader provides a cached view of entry ranges available in LogDB.
-// It acts as a coordination point between the step worker (which reads
-// entries and terms) and the commit worker (which updates the range
-// after persisting entries). The cached markerIndex and length track
-// which entries are available without querying LogDB every time.
-//
-// Concurrency model: LogReader uses sync.RWMutex. NodeState acquires
-// RLock for concurrent read access. GetRange and Term acquire a full
-// Lock because they mutate reusable entry buffers (logdbEntryBuf,
-// protoEntryBuf) to avoid per-call allocation on the hot path. Write
-// operations (SetRange, SetState, Append, CreateSnapshot,
-// ApplySnapshot, Compact) also acquire Lock. In production, GetRange
-// and Term are called from the step worker (single goroutine per
-// shard), so full lock contention is negligible.
-//
-// The markerIndex represents the boundary between compacted entries and
-// available entries. Entries at index <= markerIndex have been compacted.
-// The first available entry is at markerIndex+1. The markerTerm caches
-// the term at markerIndex to avoid a LogDB lookup on the common fast path.
+// LogReader caches the entry range available in LogDB, shared by the step and commit workers; entries at or below markerIndex are compacted.
 type LogReader struct {
 	mu sync.RWMutex
 
@@ -232,55 +190,24 @@ type LogReader struct {
 	// InstallSnapshot to followers that are behind the compacted region.
 	snapshot proto.Snapshot
 
-	// termBuf caches entry terms indexed by log index in a ring buffer.
-	// Populated by Append when entries are registered, checked by Term
-	// before querying LogDB. This allows term lookups to succeed even
-	// when LogDB is nil (testing) or entries have not been indexed yet.
-	// The ring buffer auto-evicts the oldest entries when full, providing
-	// O(1) append and O(log n) lookup via binary search.
+	// termBuf caches entry terms by index, filled by Append and checked by Term before LogDB.
 	termBuf *termRingBuffer
 
-	// entryCache stores full entries when LogDB is nil (testing mode).
-	// This allows GetRange to serve entry data for indices that have
-	// been truncated from inmem but are still needed by sendAppend
-	// for slow followers. Only populated when logdb is nil.
-	// Cleaned by Compact and ApplySnapshot.
+	// entryCache holds full entries when LogDB is nil (testing); cleaned by Compact and ApplySnapshot.
 	entryCache map[uint64]proto.Entry
 
-	// logdbEntryBuf is a reusable buffer for logdb.Entry slices passed
-	// to IterateEntries. Avoids allocating a new []Entry per GetRange
-	// call. The buffer capacity grows to the high-water mark and is
-	// reused across calls, eliminating per-call allocation overhead
-	// on the hot path (sendAppend, once per follower per tick).
+	// logdbEntryBuf is GetRange's reusable buffer for IterateEntries.
 	logdbEntryBuf []Entry
 
-	// protoEntryBuf is a reusable buffer for the []proto.Entry result
-	// of converting logdb entries to proto entries. Avoids allocating
-	// a new slice per GetRange call.
-	//
-	// It is RETAINED by GetRange's caller past the lock, so it is confined to
-	// the ONE goroutine that owns GetRange: the raft step worker on a running
-	// shard, and StartShard before the shard's step worker exists (they never
-	// overlap on the same per-shard LogReader). Every OTHER reader uses a
-	// separate path — termLocked has its own term buffers, and GetRangeCopy
-	// copies under the lock into a private buffer — so no goroutine can overwrite
-	// this buffer while GetRange's caller is still reading it.
+	// protoEntryBuf is GetRange's reusable result buffer, retained by its caller, so only the goroutine owning GetRange may use it.
 	protoEntryBuf []proto.Entry
 
-	// termLogdbBuf / termProtoBuf back termLocked's single-entry reads. termLocked
-	// is reachable from goroutines OTHER than the step worker (the snapshot pool's
-	// Compact -> termLocked), so it must NOT share the GetRange buffers the step
-	// worker retains past the lock. It never retains its result (it returns only a
-	// term) and always holds lr.mu, so these buffers are safe to share across its
-	// callers: every access is serialized and none outlives the lock.
+	// termLogdbBuf and termProtoBuf back termLocked's reads, separate from the GetRange buffers.
 	termLogdbBuf []Entry
 	termProtoBuf []proto.Entry
 }
 
-// NewLogReader creates a LogReader for the specified shard and replica,
-// backed by the given LogDB. The reader starts with no entries available
-// (length=1, representing only the marker position). Call SetRange or
-// ApplySnapshot to initialize the available range.
+// NewLogReader creates a LogReader for the shard and replica with no entries available; call SetRange or ApplySnapshot to initialize it.
 func NewLogReader(shardID, replicaID uint64, logdb LogDB) *LogReader {
 	return &LogReader{
 		logdb:     logdb,
@@ -302,10 +229,7 @@ func (lr *LogReader) lastIndex() uint64 {
 	return lr.markerIndex + lr.length - 1
 }
 
-// IndexRange returns the first and last available entry indices. This is
-// used by the raft layer to initialize the in-memory log boundary and
-// to determine the first available entry for re-apply after restart.
-// Returns (0, 0) when no entries are available.
+// IndexRange returns the first and last available entry indices, or (0, 0) when none are available.
 func (lr *LogReader) IndexRange() (uint64, uint64) {
 	lr.mu.RLock()
 	defer lr.mu.RUnlock()
@@ -315,35 +239,19 @@ func (lr *LogReader) IndexRange() (uint64, uint64) {
 	return lr.firstIndex(), lr.lastIndex()
 }
 
-// GetRange returns entries in [low, high) up to maxSize bytes total.
-// Returns ErrCompacted if low is at or below the compacted marker.
-// Returns ErrUnavailable if high exceeds the available range.
-//
-// GetRange acquires a write lock because it mutates reusable entry
-// buffers (logdbEntryBuf, protoEntryBuf) to avoid per-call allocation.
-// In production, GetRange is called from the step worker (single
-// goroutine per shard), so write lock contention is negligible.
+// GetRange returns entries in [low, high) up to maxSize bytes; ErrCompacted below the marker, ErrUnavailable past the range.
 func (lr *LogReader) GetRange(low, high, maxSize uint64) ([]proto.Entry, error) {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
 	return lr.getRangeLocked(low, high, maxSize)
 }
 
-// getRangeLocked performs the entry retrieval with the lock held, reusing the
-// GetRange buffers. Its result is backed by protoEntryBuf, which the caller
-// retains past the lock — so getRangeLocked is only for the step worker's own
-// GetRange (and StartShard reconstruction, which never overlaps it). termLocked
-// and GetRangeCopy use getRangeLockedInto with their own buffers.
+// getRangeLocked retrieves entries with the lock held into the GetRange buffers; only for GetRange's owner.
 func (lr *LogReader) getRangeLocked(low, high, maxSize uint64) ([]proto.Entry, error) {
 	return lr.getRangeLockedInto(low, high, maxSize, &lr.logdbEntryBuf, &lr.protoEntryBuf)
 }
 
-// getRangeLockedInto performs the entry retrieval with the lock held, into the
-// caller-supplied reuse buffers. Separating the buffers is what makes the reader
-// safe under its real multi-goroutine access: the step worker's GetRange retains
-// its result, so no other goroutine may write the buffers backing it. termLocked
-// (reachable from the snapshot pool) and GetRangeCopy (an arbitrary API caller)
-// therefore pass DIFFERENT buffers than GetRange.
+// getRangeLockedInto retrieves entries with the lock held into caller-supplied buffers.
 func (lr *LogReader) getRangeLockedInto(low, high, maxSize uint64, logdbBuf *[]Entry, protoBuf *[]proto.Entry) ([]proto.Entry, error) {
 	if low > high {
 		return nil, ErrUnavailable
@@ -377,11 +285,7 @@ func (lr *LogReader) getRangeLockedInto(low, high, maxSize uint64, logdbBuf *[]E
 		return result, nil
 	}
 
-	// Reuse the caller's logdb entry buffer to avoid per-call allocation. The
-	// maxSize budget is enforced by IterateEntries itself: every LogDB backend
-	// stops BEFORE appending an entry that would exceed it, except for the first
-	// entry which is always included so a single oversized entry can still make
-	// progress. No post-trim is therefore possible or needed here.
+	// IterateEntries enforces maxSize, always including the first entry.
 	ents := (*logdbBuf)[:0]
 	var err error
 	ents, _, err = lr.logdb.IterateEntries(
@@ -398,13 +302,7 @@ func (lr *LogReader) getRangeLockedInto(low, high, maxSize uint64, logdbBuf *[]E
 	return *protoBuf, nil
 }
 
-// GetRangeCopy returns entries in [low, high) as freshly-allocated proto entries
-// the caller fully owns, safe to read on any goroutine at any time.
-//
-// Unlike GetRange it does NOT hand out a reused buffer: it copies each entry
-// (including Cmd) UNDER the lock into private storage, so an arbitrary API-caller
-// goroutine (Host.QueryRaftLog) never touches the buffers the step worker retains
-// past the lock. Use this from any goroutine that is not the step worker.
+// GetRangeCopy returns entries in [low, high) copied into caller-owned memory; use it from any goroutine other than the step worker.
 func (lr *LogReader) GetRangeCopy(low, high, maxSize uint64) ([]proto.Entry, error) {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
@@ -428,14 +326,7 @@ func (lr *LogReader) GetRangeCopy(low, high, maxSize uint64) ([]proto.Entry, err
 	return out, nil
 }
 
-// Term returns the term for the entry at the given index.
-// Returns ErrCompacted if the index is below the compacted marker.
-// Returns ErrUnavailable if the index is beyond the available range.
-// If index equals markerIndex, the cached markerTerm is returned
-// without a LogDB lookup.
-//
-// Term acquires a write lock because its fallback path through
-// getRangeLocked mutates reusable entry buffers.
+// Term returns the term at index; ErrCompacted below the marker, ErrUnavailable past the range.
 func (lr *LogReader) Term(index uint64) (uint64, error) {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
@@ -454,35 +345,19 @@ func (lr *LogReader) termLocked(index uint64) (uint64, error) {
 			return t, nil
 		}
 	}
-	// Use termLocked's OWN buffers, never GetRange's: termLocked is reachable
-	// from the snapshot pool (Compact) as well as the step worker, and writing
-	// GetRange's protoEntryBuf here would race a step-worker GetRange result that
-	// is being read without the lock. termLocked returns only a term, so nothing
-	// retains these buffers past the lock.
+	// Use termLocked's own buffers, never GetRange's.
 	ents, err := lr.getRangeLockedInto(index, index+1, 0, &lr.termLogdbBuf, &lr.termProtoBuf)
 	if err != nil {
 		return 0, err
 	}
-	// Term 0 is Raft's "no term" sentinel: propagated as prevLogTerm it
-	// makes followers reject appends forever, and as the local last-log
-	// term it grants votes to shorter logs (Election Safety violation). A
-	// missing or mismatched entry must therefore surface as ErrUnavailable,
-	// never as a fabricated zero term.
+	// A missing or mismatched entry is ErrUnavailable, never term 0.
 	if len(ents) == 0 || ents[0].Index != index {
 		return 0, ErrUnavailable
 	}
 	return ents[0].Term, nil
 }
 
-// SetRange updates the LogReader to reflect newly available entries
-// starting at firstIndex with the given length. This is called by the
-// commit worker after entries have been persisted to LogDB.
-//
-// SetRange handles three cases:
-//   - Overlap: firstIndex falls within the existing range, extending it.
-//   - Contiguous: firstIndex is exactly at the end of the existing range.
-//   - Gap: firstIndex is beyond the existing range, returning
-//     ErrLogGapDetected to indicate a bug in the entry persistence pipeline.
+// SetRange extends the range with entries persisted from firstIndex; a gap returns ErrLogGapDetected.
 func (lr *LogReader) SetRange(firstIndex, length uint64) error {
 	if length == 0 {
 		return nil
@@ -512,12 +387,7 @@ func (lr *LogReader) setRangeLocked(firstIndex, length uint64) error {
 	offset := firstIndex - lr.markerIndex
 	switch {
 	case lr.length > offset:
-		// Overwrite: the existing range already covers firstIndex, so every
-		// cached term and entry at or above it is superseded. Purge them
-		// before the caller re-populates the new suffix, otherwise
-		// termLocked — which consults termBuf ahead of the range check —
-		// keeps serving the old terms for re-written indices and keeps
-		// answering for indices the truncation removed entirely.
+		// Overwrite: purge cached terms and entries at or above firstIndex.
 		lr.truncateCachesFrom(firstIndex)
 		lr.length = offset + length
 	case lr.length == offset:
@@ -549,25 +419,14 @@ func (lr *LogReader) SetState(state proto.State) {
 	lr.state = state
 }
 
-// Append records that the given entries have been persisted to LogDB.
-// It updates the cached range to include these entries. The entries
-// must be contiguous (no gaps in index values). Returns
-// ErrLogGapDetected if the entries are not contiguous with the
-// existing range.
+// Append records persisted contiguous entries in the range; a gap returns ErrLogGapDetected.
 func (lr *LogReader) Append(entries []proto.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
-	// Drop any head that sits at or below the marker. setRangeLocked clamps
-	// the RANGE the same way, but the caches below are populated from this
-	// slice: caching the trimmed prefix records terms for indices the log no
-	// longer holds, and termLocked consults termBuf ahead of the range check,
-	// so those indices answer with a term instead of ErrCompacted. A leader
-	// resolving term(prevLogIndex) for a lagging follower would then get a
-	// plausible term rather than the ErrCompacted that triggers the
-	// InstallSnapshot fallback, and the follower could never catch up.
+	// Drop entries at or below the marker before caching their terms.
 	first := lr.firstIndex()
 	if entries[len(entries)-1].Index < first {
 		return nil
@@ -575,11 +434,7 @@ func (lr *LogReader) Append(entries []proto.Entry) error {
 	if entries[0].Index < first {
 		entries = entries[first-entries[0].Index:]
 	}
-	// Update the tracked range FIRST. A truncating append (follower
-	// conflict resolution) takes setRangeLocked's overwrite branch, which
-	// purges the superseded suffix from the term and entry caches; the new
-	// terms below are then written over a clean tail. Doing it the other
-	// way round would drop the terms just cached.
+	// Update the range first, so a truncating append purges the old suffix before new terms are cached.
 	if err := lr.setRangeLocked(entries[0].Index, uint64(len(entries))); err != nil {
 		return err
 	}
@@ -604,17 +459,7 @@ func (lr *LogReader) Append(entries []proto.Entry) error {
 	return nil
 }
 
-// PersistBootstrap durably writes a shard's initial log entries and hard state,
-// then registers them in the reader's in-memory tracking. It is called exactly
-// once, at first StartShard of a founding member, to lay down the
-// EntryInitialMembership entry at index 1 (config-in-log bootstrap) so that a
-// replica's membership is a function of its durable log rather than an
-// out-of-band seed.
-//
-// The durable write happens FIRST: if it fails, nothing is registered in memory,
-// so the reader never reports a range the LogDB does not hold. With a nil LogDB
-// (testing) only the in-memory registration runs, which Append already backs
-// with an entry cache.
+// PersistBootstrap durably writes a founding member's initial entries and hard state, then registers them; with a nil LogDB only the registration runs.
 func (lr *LogReader) PersistBootstrap(entries []proto.Entry, state proto.State) error {
 	if len(entries) == 0 {
 		return nil
@@ -675,10 +520,7 @@ func (lr *LogReader) CreateSnapshot(ss proto.Snapshot) error {
 	return lr.setSnapshot(ss)
 }
 
-// ApplySnapshot applies a snapshot, resetting the available range to
-// start at the snapshot index. All prior entries are considered
-// compacted. Returns ErrSnapshotOutOfDate if the snapshot is older
-// than the currently recorded snapshot.
+// ApplySnapshot resets the range to start at the snapshot index; an older snapshot returns ErrSnapshotOutOfDate.
 func (lr *LogReader) ApplySnapshot(ss proto.Snapshot) error {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
@@ -699,23 +541,7 @@ func (lr *LogReader) ApplySnapshot(ss proto.Snapshot) error {
 // setSnapshot stores snapshot metadata if it is newer than the current
 // snapshot. Caller must hold mu.Lock.
 func (lr *LogReader) setSnapshot(ss proto.Snapshot) error {
-	// Each guard is conditioned on the state IT compares against, not on a
-	// proxy for "this reader has been used".
-	//
-	// Gating both behind a "has this reader been used" proxy such as
-	// `lr.membership.ConfigChangeID != 0 || lr.state.Commit != 0` would be a
-	// guess: ConfigChangeID 0 and Commit 0 are perfectly legal values for a
-	// replica that has recovered from a snapshot and not yet committed anything
-	// of its own, and for that replica the guess would switch BOTH guards off,
-	// letting a stale snapshot overwrite the recorded one and, with it,
-	// lr.membership — the quorum set. Such a proxy would also buy nothing: on a genuinely fresh reader markerIndex and
-	// snapshot.Index are both 0, which makes each guard inert on its own terms.
-	//
-	// The marker check alone is insufficient for CreateSnapshot: compaction
-	// retains CompactionOverhead entries below the snapshot, so markerIndex
-	// normally TRAILS the recorded snapshot index, and an ss with
-	// markerIndex < ss.Index < lr.snapshot.Index would pass it. The legitimate
-	// advance (ApplySnapshot/CreateSnapshot to a higher index) clears both.
+	// Each guard compares against its own state; markerIndex trails the recorded snapshot, so CreateSnapshot also checks the snapshot index.
 	if ss.Index > 0 && ss.Index <= lr.markerIndex {
 		return ErrSnapshotOutOfDate
 	}
@@ -736,14 +562,7 @@ func (lr *LogReader) Snapshot() proto.Snapshot {
 	return lr.snapshot
 }
 
-// RefreshSnapshotFileSize sets the FileSize of the snapshot the reader
-// already records at index. It exists for one caller: a local save that
-// REBUILT a missing artifact at the recorded index. Such a save cannot go
-// through CreateSnapshot — a non-advancing index is refused — so without this
-// the reader kept the size it was loaded with, which is 0 when the artifact
-// was missing at start, and every send of the rebuilt snapshot failed its
-// declared-size check until a restart re-measured the file. Any other index
-// is refused with ErrSnapshotOutOfDate.
+// RefreshSnapshotFileSize sets the FileSize of the snapshot recorded at index, for a rebuilt artifact; any other index is ErrSnapshotOutOfDate.
 func (lr *LogReader) RefreshSnapshotFileSize(index, fileSize uint64) error {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
@@ -754,24 +573,13 @@ func (lr *LogReader) RefreshSnapshotFileSize(index, fileSize uint64) error {
 	return nil
 }
 
-// Compact removes entries up to and including the given index by
-// advancing the marker. After compaction, entries at or below index
-// are no longer available and requests for them return ErrCompacted.
-//
-// Compact atomically updates both markerIndex and markerTerm within
-// a single Lock scope to maintain the invariant that markerTerm always
-// corresponds to markerIndex.
+// Compact removes entries up to and including index, updating markerIndex and markerTerm together.
 func (lr *LogReader) Compact(index uint64) error {
 	_, err := lr.CompactTo(index)
 	return err
 }
 
-// CompactTo is Compact that also reports whether the marker MOVED. Compacting
-// at the current marker is a nil no-op, so a nil error alone does not prove a
-// compaction happened; a caller that reports compactions — the snapshot pool,
-// for OnLogCompacted — needs this answer, taken under the same lock as the
-// compaction rather than by reading the marker before and after, which a
-// concurrent ApplySnapshot could move in between.
+// CompactTo is Compact that also reports, under the same lock, whether the marker moved.
 func (lr *LogReader) CompactTo(index uint64) (bool, error) {
 	lr.mu.Lock()
 	defer lr.mu.Unlock()
@@ -807,11 +615,7 @@ func (lr *LogReader) CompactTo(index uint64) (bool, error) {
 	return i > 0, nil
 }
 
-// logdbEntriesToProtoReuse converts logdb entries to proto entries using
-// the provided buffer to avoid allocation. The buffer is grown if its
-// capacity is insufficient, otherwise it is resliced to len(entries).
-// Returns the (potentially reallocated) buffer. Callers must not retain
-// the returned slice past the next call.
+// logdbEntriesToProtoReuse converts entries into buf, growing it if needed; do not retain the result past the next call.
 func logdbEntriesToProtoReuse(buf []proto.Entry, entries []Entry) []proto.Entry {
 	if len(entries) == 0 {
 		return buf[:0]

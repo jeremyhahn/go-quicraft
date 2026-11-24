@@ -256,12 +256,7 @@ func TestWrapSysOpState_Release(t *testing.T) {
 	pool := quicraft.NewRequestStatePool()
 	inner := pool.Get().(*quicraft.RequestState)
 
-	// Release BEFORE wrapping, so the wrapper's goroutine is certain to see a
-	// released state (ResultC == nil) and complete at once. Releasing after
-	// wrapping raced that goroutine: when it read ResultC first it held a live
-	// channel a released, never-completed request never closes, and the test
-	// timed out under load. In production a SysOpState releases its own inner
-	// state through sysOp.Release, which also stops that goroutine.
+	// Release before wrapping so the wrapper's goroutine sees a released state.
 	inner.Release()
 	sysOp := WrapSysOpState(inner)
 
@@ -571,10 +566,7 @@ func TestResolvedRequestState_MultipleReads(t *testing.T) {
 	}
 	rs := newResolvedRequestState(result)
 
-	// ResultC, AppliedC and CompletedC must all be the SAME channel, each
-	// call returning the same instance. Handing out a fresh pre-loaded
-	// channel per call makes the idiomatic dragonboat receive loop spin
-	// forever on the same value.
+	// ResultC, AppliedC and CompletedC must return the same channel instance on every call.
 	if rs.ResultC() != rs.AppliedC() || rs.ResultC() != rs.CompletedC {
 		t.Fatal("resolved RequestState must hand out one shared channel")
 	}

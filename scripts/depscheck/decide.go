@@ -23,9 +23,7 @@ type finding struct {
 	Fresh bool
 	// Released is when Latest was released; zero when unknown.
 	Released time.Time
-	// Untouched is set, under -base, when the change leaves this line's
-	// path and version as they were at the merge base: a lag behind latest
-	// is then reported, not failed (ruling 640).
+	// Untouched is set under -base when this line's path and version match the merge base; a lag is then reported, not failed.
 	Untouched bool
 }
 
@@ -33,18 +31,7 @@ type finding struct {
 // behind it, with no go.mod reason comment, fails the check.
 const freshWindow = 7 * 24 * time.Hour
 
-// assess judges one dependency against its `go list` entry. listed is false
-// when the listing has no entry for the module at all.
-//
-// The latest version is, for a first-party module (path under firstParty),
-// the highest published tag including -alpha prereleases, the version
-// `make deps-latest` moves to (dependency-resolution.md §3). For a
-// third-party require it is the go command's own Update answer, which
-// prefers releases and skips retractions. A replace has no Update of its
-// own, so for it the latest is the highest release in Versions.
-//
-// now is the clock the release age is measured against. Only the Update
-// answer carries a release time; a latest version without one is old.
+// assess judges one dependency against its go list entry: latest is the highest tag for first-party modules, else Update, else the highest release for a replace.
 func assess(dep dependency, mod listedModule, listed bool, firstParty string, now time.Time) finding {
 	f := finding{Dep: dep}
 	switch {
@@ -105,16 +92,9 @@ func latestVersion(dep dependency, mod listedModule, firstParty bool) string {
 	return dep.Version
 }
 
-// isBehind compares positions in the go command's semantic-version ordering
-// of the published versions. A current version that is not a published tag
-// (a pseudo-version) is behind any tag the latest names; a latest that is
-// not in the list came from Update, which the go command reports only when
-// it is newer.
+// isBehind compares current and latest in semantic-version order; a pseudo-version is behind any named tag.
 func isBehind(current, latest string) bool {
-	// SemVer precedence, not the position in go list's Versions: a
-	// pseudo-version is normally absent from that list, and one cut after
-	// the latest tag must not read as behind it (a bump would move it back
-	// to the older tag).
+	// SemVer precedence, not the position in Versions.
 	return latest != current && semverLess(current, latest)
 }
 
@@ -128,9 +108,7 @@ func releasesOnly(versions []string) []string {
 	return releases
 }
 
-// isPrerelease reports a semantic-version prerelease, including a
-// pseudo-version: a "-" before any "+build" suffix, since the
-// vMAJOR.MINOR.PATCH core never contains one.
+// isPrerelease reports a prerelease or pseudo-version: a - before any +build suffix.
 func isPrerelease(version string) bool {
 	core, _, _ := strings.Cut(version, "+")
 	return strings.Contains(core, "-")

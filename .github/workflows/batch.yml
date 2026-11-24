@@ -1,43 +1,4 @@
-# batch-template: v1.1 — token-free CPU work on hosted runners: fuzz,
-# race-full, soak, bench. Dispatch only; never in a merge gate.
-#
-# It puts idle runner capacity to work: long CPU-bound checks that need no
-# model account and still find defects in the release-candidate products.
-#
-# WHO RUNS IT. The project's coordinator dispatches it on `main` when the
-# workflow lands and again after every merge to `main`:
-#   POST /repos/{owner}/{repo}/actions/workflows/batch.yml/dispatches
-#        {"ref":"main","inputs":{"jobs":"all"}}
-# and files ONE issue per real finding, quoting the log lines that start
-# with `BATCH-FINDING`:
-#   fuzz       a crasher (the new corpus file is in the log and the artifact)
-#   race-full  a DATA RACE report, or a test that fails in any of the 3 runs
-#   soak       an iteration that fails
-#   bench      a regression > 20 % against the previous dispatch on main
-#              (benchstat old.txt new.txt; the coordinator compares, the
-#              workflow does not, because a run cannot read another run's
-#              artifact on Gitea)
-# A finding that is already an open issue gets a comment, not a new issue.
-#
-# RUNNERS. Every job runs on GitHub-hosted ubuntu-latest (4 vCPU, 16 GB RAM,
-# about 14 GB free disk, a 6 h job limit), so each is sized to finish well
-# inside that limit: fuzz and race-full are matrices of four shards, and every
-# timeout leaves headroom under the 6 h cap.
-#
-# ARTIFACTS. actions/upload-artifact v4 and later refuse any server that is
-# not github.com ("not currently supported on GHES"; Gitea presents as one),
-# so Gitea uploads with v3 and github.com with v6. Every finding is ALSO
-# printed in the log, so a coordinator can file it without the artifact.
-#
-# CUSTOMIZE, per repo (keep everything else verbatim):
-#   FUZZ_TAGS, RACE_TAGS   build tags the repo's fuzz and unit suites need
-#                          (go-quicraft: quicraft_fuzz)
-#   RACE_PKGS              the unit-test package scope, the same as ci.yml's
-#                          Test job (dark or environment-bound suites excluded)
-#   SOAK_CMD               the repo's integration suite. go-quicraft runs
-#                          its cluster suites on the hosted runner itself
-#   BENCH_PKGS             benchmark scope (harness modules excluded)
-# A repo with no Fuzz* targets keeps the fuzz job; it finds none and passes.
+# Dispatch-only CPU work on hosted runners (fuzz, race-full, soak, bench); never a merge gate. Findings are logged as BATCH-FINDING lines.
 
 name: Batch
 
@@ -50,8 +11,7 @@ env:
   FUZZ_TAGS: 'quicraft_fuzz'  # CUSTOMIZE: the fuzz targets' build tag
   RACE_TAGS: 'quicraft_fuzz'  # CUSTOMIZE: the unit suite plus the fuzz targets' seeds
   RACE_PKGS: './...'     # CUSTOMIZE: ci.yml's Test scope
-  # CUSTOMIZE: ci.yml's integration suite, then the network-partition suite
-  # (make ci-netfault). Both run every iteration; either failing fails it.
+  # The integration suite, then the network-partition suite; either failing fails the iteration.
   SOAK_CMD: 'rc=0; go test -race -count=1 -tags=integration -timeout=1800s -p 1 ./test/integration/... || rc=1; make ci-netfault || rc=1; exit $rc'
   BENCH_PKGS: './pkg/...'  # CUSTOMIZE: the library; the test/performance harness modules are excluded
 
@@ -77,11 +37,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Every package with Fuzz* targets; every target fuzzed for `fuzztime`.
-  # The runner does not expand a matrix built from another job's output
-  # (go-quicraft ci.yml), so the targets are split over a static matrix of
-  # four shards, and each shard fuzzes two targets at a time with
-  # -parallel=2: the runner's 4 cores, 20 minutes per pair of targets.
+  # Fuzz targets are split over a static four-shard matrix, two targets at a time with -parallel=2.
   fuzz:
     name: Fuzz (shard ${{ matrix.shard }}/4)
     if: inputs.jobs == 'all' || inputs.jobs == 'fuzz'
@@ -169,13 +125,7 @@ jobs:
             fuzz-logs/
           retention-days: 30
 
-  # The unit suite under the race detector, three times, on main, dealt over
-  # four shards by `make shard-packages` (the deal ci.yml's unit shards use:
-  # packages weighed by their test files, heaviest first to the lightest
-  # shard). Basis: one -race pass of a quarter of the suite is sized at about
-  # 20 minutes on a 4-core runner, so three are about an hour; a shard gets a
-  # 240-minute job and a 220-minute go test -timeout. -p 2 bounds the race
-  # detector's memory to what the runner's 16 GB holds.
+  # The unit suite under -race three times, dealt over four shards by make shard-packages; -p 2 bounds race-detector memory.
   race-full:
     name: Race (full, -count=3, shard ${{ matrix.shard }}/4)
     if: inputs.jobs == 'all' || inputs.jobs == 'race-full'
@@ -243,10 +193,7 @@ jobs:
           end=$(( $(date +%s) + SOAK_MINUTES * 60 ))
           i=0 failed=0
           mkdir -p soak-logs
-          # Each failing test's own output, so a failed iteration is
-          # diagnosable from the job log alone: the --- FAIL: line and the
-          # indented lines go test prints under it (t.Log, t.Error, nested
-          # subtests), the last 200 per failed test.
+          # Print each failing test's output (last 200 lines) so the job log alone diagnoses it.
           fail_blocks() {
             local line inb=0 buf=()
             while IFS= read -r line || [ -n "$line" ]; do

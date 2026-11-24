@@ -74,11 +74,7 @@ func assertMirror(t *testing.T, ns *nodeState, leaderID, term uint64, ready bool
 	}
 }
 
-// The host's readiness mirror belongs to exactly the (leader, term) pair it
-// was delivered for: every leader update ends it — including a same-leader
-// re-election, which OnLeaderLost does not report — and a readiness for a
-// pair that is no longer current is refused rather than applied to its
-// successor.
+// The readiness mirror belongs to one (leader, term) pair; every leader update ends it and stale readiness is refused.
 func TestHostLeaderReady_MirrorFollowsTheDeliveredPair(t *testing.T) {
 	h, rec := newReadyRecorderHost(t)
 	addTestNodeState(h, 1, 1)

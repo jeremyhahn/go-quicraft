@@ -24,12 +24,7 @@ import (
 	"testing"
 )
 
-// The barrier never calls StorageBackend — it is a shape an embedder satisfies
-// by duck typing (go-qrdb's storage.Storage). That means nothing in this
-// module would notice a signature drifting away from what consumers implement,
-// so the contract is pinned here instead: referenceStore is a minimal
-// conforming implementation, and the tests below execute the semantics the
-// interface documents rather than restating them in prose.
+// StorageBackend is satisfied by embedders (go-qrdb's storage.Storage), so referenceStore and these tests pin its documented semantics.
 
 // referenceStore is a single-process StorageBackend. It serializes the
 // check-then-write and the compare-then-delete under one mutex, which is
@@ -92,8 +87,7 @@ func (s *referenceStore) Scan(ctx context.Context, prefix string, fn func(string
 	if err != nil {
 		return err
 	}
-	// Snapshot under List, then call fn OUTSIDE the lock: fn is caller code and
-	// may re-enter the store.
+	// Snapshot under the lock, then call fn outside it, since fn may re-enter the store.
 	for _, k := range keys {
 		v, err := s.Get(ctx, k)
 		if err != nil {
@@ -227,26 +221,7 @@ func TestCompareAndDeleteStopsAStaleReleaserFromRemovingTheNextHolder(t *testing
 	}
 }
 
-// The guarantee is only as good as its serialization: concurrent releasers all
-// holding the same observed value must produce exactly one winner, the same
-// property PutIfAbsent has on the acquire side.
-// TestCompareAndDeleteNilExpectedIsAValueNotAWildcard pins the nil semantics,
-// which is the one part of this contract an implementer is most likely to get
-// wrong by importing an assumption from elsewhere.
-//
-// nil is a VALUE: it compares equal to a stored EMPTY value and to nothing
-// else. It is NOT a wildcard, and it does NOT mean "require the key absent" —
-// an absent key is refused whatever expected holds, because the compare has
-// nothing to compare against. PutIfAbsent is the verb for an absence-guarded
-// write; there is deliberately no way to spell that request through this one.
-//
-// This is written down as a test rather than only as prose because a sibling
-// interface one layer up reads nil the opposite way: go-xkms's
-// CompareAndSwapper treats nil as "require the key ABSENT".
-// go-qrdb's engine agrees with the behaviour asserted here. An implementer
-// arriving from the go-xkms interface would otherwise carry the assumption
-// across and produce a store that deletes on absence — silently, and only
-// under the interleaving that matters.
+// TestCompareAndDeleteNilExpectedIsAValueNotAWildcard: nil expected equals only a stored empty value, and an absent key is always refused (go-xkms's CompareAndSwapper reads nil the opposite way).
 func TestCompareAndDeleteNilExpectedIsAValueNotAWildcard(t *testing.T) {
 	ctx := context.Background()
 

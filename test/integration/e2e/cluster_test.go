@@ -34,9 +34,7 @@ func TestE2E_ThreeNodeCluster_LeaderElection(t *testing.T) {
 		t.Fatalf("expected leader index in [0,2], got %d", leaderIdx)
 	}
 
-	// Wait for exactly one leader, checking election safety on every poll.
-	// Two nodes leading the SAME term is not a transition to wait out, it is
-	// the violation, so it fails immediately rather than being polled past.
+	// Wait for exactly one leader; two leaders in one term fail immediately.
 	singleIdx := waitForSingleLeader(t, cluster, 1, leaderElectionTimeout)
 
 	t.Logf("leader elected at node index %d (single-leader check settled on node[%d])", leaderIdx, singleIdx)

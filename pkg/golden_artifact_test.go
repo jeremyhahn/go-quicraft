@@ -60,9 +60,7 @@ func encodeGoldenArtifact(t *testing.T, h snapshotArtifactHeader, payload []byte
 	return out.Bytes()
 }
 
-// TestGoldenExportArtifact pins the exported snapshot artifact: the QRSNAP01
-// header with its membership, the payload, and the QRSNTRLR trailer whose
-// hash is seeded with the header bytes.
+// TestGoldenExportArtifact pins the exported snapshot artifact: QRSNAP01 header with membership, payload, and QRSNTRLR trailer hashed over the header.
 func TestGoldenExportArtifact(t *testing.T) {
 	in := goldenArtifactHeader()
 	golden.Check(t, "export-artifact.bin", encodeGoldenArtifact(t, in, goldenArtifactPayload))

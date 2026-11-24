@@ -108,18 +108,7 @@ func TestConfig_SetDefaults(t *testing.T) {
 	})
 }
 
-// TestConfig_SetDefaults_SnapshotEntries pins the field's tri-state.
-//
-// If zero meant "never snapshot", "never" would be the DEFAULT — the one
-// configuration a practical Raft deployment cannot run in (Ongaro, "Consensus:
-// Bridging Theory and Practice", ch. 5 treats compaction as a requirement, not
-// a feature). In this implementation it would also silently disable three
-// things that advance only inside saveSnapshot: the snapshot-directory GC, the
-// epoch purge floor, and the at-rest barrier — the last of which would leave
-// barrier end-to-end tests asserting nothing at all.
-//
-// Three states, three distinct meanings, and the test asserts each separately
-// because collapsing any two of them is exactly the defect.
+// TestConfig_SetDefaults_SnapshotEntries checks the field's three states (unset, explicit value, disabled) stay distinct.
 func TestConfig_SetDefaults_SnapshotEntries(t *testing.T) {
 	t.Run("unset takes the default rather than meaning disabled", func(t *testing.T) {
 		c := Config{}
@@ -261,9 +250,7 @@ func TestConfig_Validate_ObserverWitness(t *testing.T) {
 }
 
 func TestConfig_Validate_SnapshotEntries(t *testing.T) {
-	// Validate accepts a zero because SetDefaults runs first at both entry
-	// points and replaces it; the name says "unset", not "disabled", because
-	// zero no longer means disabled — see TestSetDefaults_SnapshotEntries.
+	// Validate accepts zero because SetDefaults replaces it first.
 	t.Run("zero (unset) passes validation, since SetDefaults resolves it", func(t *testing.T) {
 		c := validConfig()
 		c.SnapshotEntries = 0
@@ -590,20 +577,7 @@ func TestConfig_Validate_MaxProposalPayloadSize(t *testing.T) {
 	})
 }
 
-// TestConfig_SetDefaults_SessionExpiryEntries pins the default that replicating
-// the threshold made safe.
-//
-// Defaulting is safe only because of where the threshold lives: a defaulted
-// threshold read from node-local configuration would make a cluster with one
-// un-upgraded replica expire different sessions and diverge silently. The
-// threshold is seeded into the shard's replicated membership at bootstrap and
-// read from there by the apply path
-// (proto.SessionPolicy), so a replica adopts what its shard committed rather
-// than what its binary defaults to, and the default is the fix for the leak an
-// unexpiring session table represents.
-//
-// The third case is the one that would otherwise be lost: zero can no longer
-// mean "disabled", so disabling has to remain expressible.
+// TestConfig_SetDefaults_SessionExpiryEntries checks the default and that disabling stays expressible; the threshold is replicated, so the default is safe.
 func TestConfig_SetDefaults_SessionExpiryEntries(t *testing.T) {
 	t.Run("SetDefaults fills the documented default", func(t *testing.T) {
 		var c Config
@@ -704,16 +678,7 @@ func TestConfig_Validate_LeaseReadRequiresCheckQuorum(t *testing.T) {
 	})
 }
 
-// TestConfig_Validate_LeaseReadRequiresElectionRTT covers the second lease-read
-// precondition: the lease timeout is ElectionRTT-2 ticks, so an ElectionRTT
-// below 5 leaves a lease window too short to be useful (and, at ElectionRTT<=2,
-// non-positive).
-//
-// validateLeaseRead is exercised directly here because validateTiming already
-// rejects ElectionRTT < 5 for every configuration and runs first in Validate,
-// making this check unreachable through the public API. It is kept as
-// defense-in-depth: the lease-read requirement is independent of the general
-// timing floor and must survive a relaxation or reordering of validateTiming.
+// TestConfig_Validate_LeaseReadRequiresElectionRTT calls validateLeaseRead directly; validateTiming makes it unreachable through Validate.
 func TestConfig_Validate_LeaseReadRequiresElectionRTT(t *testing.T) {
 	t.Run("LeaseRead with ElectionRTT below 5 is rejected", func(t *testing.T) {
 		c := validConfig()

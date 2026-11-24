@@ -29,11 +29,7 @@ import (
 	"github.com/anishathalye/porcupine"
 )
 
-// The two fixtures under testdata/ are REAL single-key partitions dumped by
-// reportPartitionDiagnosis from CI runs that returned Unknown: key-43 of
-// TestSoak_RollingRestartUnderLoad and key-9 of
-// TestLinearizability_4Node_ElectionSafety. Offline, key-43 was still Unknown
-// after a 30-minute budget. Both are legal.
+// The testdata fixtures are real single-key partitions from CI runs that returned Unknown (key-43 of TestSoak_RollingRestartUnderLoad, key-9 of TestLinearizability_4Node_ElectionSafety); both are legal.
 var fixtureLine = regexp.MustCompile(`^client=(\d+) id=(\d+) (call|return)\s+\{(.*)\}$`)
 var fixtureCall = regexp.MustCompile(`^(put|get|append) (\S+) ?(.*)$`)
 var fixtureRet = regexp.MustCompile(`^(.*?) (true|false) (true|false)$`)
@@ -142,12 +138,7 @@ func TestPrune_IsExactlyNeverReadIndeterminatePuts(t *testing.T) {
 	}
 }
 
-// strandedGetsHistory builds one key's history the way a rolling restart
-// leaves it: `stranded` gets called early that never return, then `rounds` of
-// two concurrent completed puts followed by a completed get that returns the
-// put the checker has to order second. The last get returns final. Every
-// stranded get's Unknown return sits at the end, as opRecorder.events emits
-// it.
+// strandedGetsHistory builds one key's history as a rolling restart leaves it: stranded gets that never return, rounds of two concurrent puts and a get, a final get, and the Unknown returns at the end.
 func strandedGetsHistory(stranded, rounds int, final string) []porcupine.Event {
 	ev := func(id, cid int, kind porcupine.EventKind, v interface{}) porcupine.Event {
 		return porcupine.Event{ClientId: cid, Kind: kind, Value: v, Id: id}

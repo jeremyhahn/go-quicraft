@@ -20,10 +20,7 @@ import (
 	"os"
 )
 
-// SnapshotFile is the open-handle surface the snapshot scratch paths use. It
-// is the host's snapshot file surface too (the host aliases it), which is what
-// lets one anonymous-scratch implementation serve the engine's recovery and
-// the host's recovery and send.
+// SnapshotFile is the open-handle surface of the snapshot scratch paths, shared with the host.
 type SnapshotFile interface {
 	Read(p []byte) (int, error)
 	Write(p []byte) (int, error)
@@ -60,28 +57,7 @@ func (osScratchFS) Remove(name string) error {
 	return os.Remove(name)
 }
 
-// CreateAnonymousScratch creates a scratch file in dir from pattern and
-// unlinks its name at once, returning the open handle. Plaintext decrypted
-// into it therefore never has a name: a crash or power loss cannot leave it
-// readable on disk, the snapshot GC cannot remove it from under a reader, and
-// the caller's Close is the whole cleanup.
-//
-// It is the single implementation of that sequence, shared by the engine's
-// snapshot recovery, the host's startup recovery and the host's transport
-// send. The caller must write nothing into the file before this returns — the
-// unlink is what makes it safe to fill.
-//
-// A failed unlink fails the call with a *ScratchUnlinkError
-// (ErrScratchNotUnlinked) before a byte is written. A scratch is never handed
-// out with a name: plaintext decrypted into it would be a complete, readable
-// copy of the state machine that a SIGKILL or power loss before its Close
-// leaves at rest. The handle is closed and the name removed once more, best
-// effort; a name that survives that too is still EMPTY, and is counted on
-// StaleDecryptSweepFailures and left to the decrypt-scratch sweep of the
-// replica directory (SweepStaleDecryptTmpTree). dir must therefore be a
-// directory that sweep covers — the replica's own snapshot directory
-// (ReplicaSnapshotDir). The recovery or send that asked for the scratch fails
-// with the error and is retried later.
+// CreateAnonymousScratch creates a scratch file in dir and unlinks it at once; a failed unlink returns *ScratchUnlinkError before any write. dir must be under the replica's snapshot directory.
 func CreateAnonymousScratch(fsys ScratchFS, dir, pattern string) (SnapshotFile, error) {
 	f, err := fsys.CreateTemp(dir, pattern)
 	if err != nil {

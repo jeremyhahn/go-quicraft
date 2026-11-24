@@ -14,12 +14,7 @@
 
 package raft
 
-// Raft paper correctness tests.
-//
-// These tests verify that the go-quicraft Raft implementation matches the
-// specification described in "In Search of an Understandable Consensus
-// Algorithm" (Ongaro & Ousterhout, 2014). Each test references the
-// relevant section of the paper.
+// Raft paper correctness tests (Ongaro & Ousterhout, 2014); each names its section.
 
 import (
 	"testing"
@@ -250,13 +245,7 @@ func TestPaper_LeaderBroadcastsHeartbeats(t *testing.T) {
 	}
 }
 
-// TestPaper_FollowerStartsElectionOnTimeout verifies that a follower
-// transitions to candidate and starts an election when the election
-// timeout elapses without receiving messages from a leader.
-//
-// Raft Section 5.2: "If a follower receives no communication over a
-// period of time called the election timeout, then it assumes there is
-// no viable leader and begins an election."
+// TestPaper_FollowerStartsElectionOnTimeout verifies a follower campaigns after the election timeout (Raft §5.2).
 func TestPaper_FollowerStartsElectionOnTimeout(t *testing.T) {
 	r := newPaperRaft(1)
 	initialTerm := r.term
@@ -283,12 +272,7 @@ func TestPaper_FollowerStartsElectionOnTimeout(t *testing.T) {
 	}
 }
 
-// TestPaper_CandidateRestartsElectionOnTimeout verifies that a candidate
-// starts a new election when the election timeout elapses without
-// winning or losing.
-//
-// Raft Section 5.2: "If the election timeout elapses, a new election
-// begins (incrementing the term)."
+// TestPaper_CandidateRestartsElectionOnTimeout verifies a candidate starts a new election on timeout (Raft §5.2).
 func TestPaper_CandidateRestartsElectionOnTimeout(t *testing.T) {
 	r := newPaperRaft(1)
 	r.becomeCandidate()
@@ -313,12 +297,7 @@ func TestPaper_CandidateRestartsElectionOnTimeout(t *testing.T) {
 	}
 }
 
-// TestPaper_ElectionCompletesInOneRound verifies that an election
-// completes in a single round when a candidate receives a majority
-// of votes. Tests both 3-node and 5-node clusters.
-//
-// Raft Section 5.2: "A candidate wins an election if it receives votes
-// from a majority of the servers in the full cluster for the same term."
+// TestPaper_ElectionCompletesInOneRound verifies a majority of votes wins in one round, for 3 and 5 nodes (Raft §5.2).
 func TestPaper_ElectionCompletesInOneRound(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -411,13 +390,7 @@ func TestPaper_FollowerVoteOncePerTerm(t *testing.T) {
 	}
 }
 
-// TestPaper_CandidateFallsBackToFollower verifies that a candidate
-// becomes a follower when it receives a heartbeat from a valid leader
-// in the same or higher term.
-//
-// Raft Section 5.2: "If the candidate receives a heartbeat from another
-// server claiming to be leader [...] it recognizes the leader as
-// legitimate and returns to follower state."
+// TestPaper_CandidateFallsBackToFollower verifies a candidate follows a valid leader's heartbeat (Raft §5.2).
 func TestPaper_CandidateFallsBackToFollower(t *testing.T) {
 	r := newPaperRaft(1)
 	r.becomeCandidate()
@@ -494,12 +467,7 @@ func TestPaper_LeaderCommitsPrecedingEntries(t *testing.T) {
 	}
 }
 
-// TestPaper_FollowerRejectsInconsistentAppend verifies that a follower
-// rejects an AppendEntries RPC with an incorrect prevLogIndex or
-// prevLogTerm.
-//
-// Raft Section 5.3: "If a follower does not find an entry in its log
-// with the same index and term, then it refuses the new entries."
+// TestPaper_FollowerRejectsInconsistentAppend verifies a mismatched prevLogIndex/prevLogTerm is rejected (Raft §5.3).
 func TestPaper_FollowerRejectsInconsistentAppend(t *testing.T) {
 	// Create a follower with entries at term 1: indices 1, 2.
 	entries := []proto.Entry{
@@ -544,12 +512,7 @@ func TestPaper_FollowerRejectsInconsistentAppend(t *testing.T) {
 	}
 }
 
-// TestPaper_FollowerAppendsEntries verifies that a follower correctly
-// appends new entries when the prevLogIndex and prevLogTerm match.
-//
-// Raft Section 5.3: "If an existing entry conflicts with a new one
-// (same index but different terms), delete the existing entry and all
-// that follow it. Append any new entries not already in the log."
+// TestPaper_FollowerAppendsEntries verifies a matching append truncates conflicts and appends (Raft §5.3).
 func TestPaper_FollowerAppendsEntries(t *testing.T) {
 	// Follower has entry at index 1, term 1.
 	entries := []proto.Entry{
@@ -593,13 +556,7 @@ func TestPaper_FollowerAppendsEntries(t *testing.T) {
 	}
 }
 
-// TestPaper_LeaderSyncsFollowerLog tests the 7 scenarios from Raft
-// Figure 7 where a follower's log diverges from the leader's. The
-// leader must force the follower's log to match its own by finding
-// the latest matching entry and sending entries from that point.
-//
-// Raft Section 5.3: "The leader handles inconsistencies by forcing the
-// followers' logs to duplicate its own."
+// TestPaper_LeaderSyncsFollowerLog runs the seven divergent-follower cases of Raft Figure 7 (§5.3).
 func TestPaper_LeaderSyncsFollowerLog(t *testing.T) {
 	// The leader's log has 10 entries:
 	// Index: 1  2  3  4  5  6  7  8  9  10
@@ -746,12 +703,7 @@ func TestPaper_LeaderSyncsFollowerLog(t *testing.T) {
 				}
 			}
 
-			// Verify the follower's log matches the leader's entries
-			// for indices 1 through len(leaderEntries). The log may
-			// have extra trailing entries if the follower's log was
-			// longer and the append contained no conflicting entries
-			// at those positions - the leader will overwrite them
-			// with future entries.
+			// The follower log matches the leader's entries; extra trailing entries may remain until overwritten.
 			leaderLastIdx := uint64(len(leaderEntries))
 			if f.log.lastIndex() < leaderLastIdx {
 				t.Fatalf("expected follower lastIndex >= %d, got %d",
@@ -775,13 +727,7 @@ func TestPaper_LeaderSyncsFollowerLog(t *testing.T) {
 // Section 5.4 - Safety
 // ==========================================================================
 
-// TestPaper_LeaderOnlyCommitsCurrentTermEntries verifies that a leader
-// cannot commit entries from previous terms using only the replication
-// count. It must commit at least one entry from its current term first.
-//
-// Raft Section 5.4.2 / Figure 8: "Raft never commits log entries from
-// previous terms by counting replicas. Only log entries from the
-// leader's current term are committed by counting replicas."
+// TestPaper_LeaderOnlyCommitsCurrentTermEntries verifies earlier-term entries commit only via a current-term entry (Raft §5.4.2, Figure 8).
 func TestPaper_LeaderOnlyCommitsCurrentTermEntries(t *testing.T) {
 	// Create a leader with an entry from a previous term in its log.
 	// The log has:
@@ -849,8 +795,7 @@ func TestPaper_LeaderOnlyCommitsCurrentTermEntries(t *testing.T) {
 		t.Fatalf("entry at index 2 has current term %d; test setup must guarantee a previous-term entry", entryTerm)
 	}
 
-	// The commit index should be at most 2 ONLY if the no-op (index 3)
-	// is also replicated. Let's verify the no-op exists.
+	// Commit can reach 2 only once the no-op at index 3 is replicated; check the no-op exists.
 	if noopIndex < 3 {
 		t.Fatalf("expected no-op at index >= 3, got lastIndex=%d", noopIndex)
 	}
@@ -877,13 +822,7 @@ func TestPaper_LeaderOnlyCommitsCurrentTermEntries(t *testing.T) {
 	}
 }
 
-// TestPaper_VoteRejectsLessUpToDateCandidate verifies that a server
-// rejects a vote request from a candidate whose log is less up-to-date
-// than the voter's.
-//
-// Raft Section 5.4.1: "Raft determines which of two logs is more
-// up-to-date by comparing the index and term of the last entries in
-// the logs."
+// TestPaper_VoteRejectsLessUpToDateCandidate verifies a voter refuses a less up-to-date candidate (Raft §5.4.1).
 func TestPaper_VoteRejectsLessUpToDateCandidate(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -963,13 +902,7 @@ func TestPaper_VoteRejectsLessUpToDateCandidate(t *testing.T) {
 // PreVote Extension
 // ==========================================================================
 
-// TestPaper_PreVotePreventsDisruption verifies that the PreVote mechanism
-// prevents a partitioned node from disrupting the cluster when it
-// rejoins. A partitioned node does not increment its term during
-// PreVote elections, so it cannot force the rest of the cluster to
-// step down.
-//
-// Raft PhD thesis Section 9.6 / PreVote extension.
+// TestPaper_PreVotePreventsDisruption verifies a rejoining partitioned node cannot force a step-down (Raft thesis §9.6).
 func TestPaper_PreVotePreventsDisruption(t *testing.T) {
 	// Create a node with PreVote enabled.
 	r := newTestRaft(1) // PreVote enabled by default
@@ -1067,12 +1000,7 @@ func TestPaper_DuelingPreCandidates(t *testing.T) {
 // CheckQuorum
 // ==========================================================================
 
-// TestPaper_FreeStuckCandidateWithCheckQuorum verifies that when
-// CheckQuorum is enabled, a candidate that is stuck can still
-// eventually win an election when the leader steps down due to
-// quorum loss.
-//
-// Raft PhD thesis Section 6.2.
+// TestPaper_FreeStuckCandidateWithCheckQuorum verifies a stuck candidate wins once the leader steps down on quorum loss (Raft thesis §6.2).
 func TestPaper_FreeStuckCandidateWithCheckQuorum(t *testing.T) {
 	// Create a 3-node cluster with CheckQuorum enabled on all nodes.
 	members := map[uint64]string{
@@ -1116,9 +1044,7 @@ func TestPaper_FreeStuckCandidateWithCheckQuorum(t *testing.T) {
 		t.Fatalf("expected leader to step down, got %s", leader1.state)
 	}
 
-	// Node 2 can now retry and should be able to win the election
-	// since the old leader is no longer sending heartbeats.
-	// Restart the candidate's election.
+	// The old leader no longer sends heartbeats, so restart node 2's election.
 	node2.drainMessages()
 	advanceElection(node2)
 	candidateTerm := node2.term

@@ -22,28 +22,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/lockedmem"
 )
 
-// The two sites that fill a sized enclave and then FREEZE it in place.
-//
-// Memory.Freeze mprotects the region the material was written into, so
-// there is one region and no locked-to-locked copy into a second, from-bytes
-// enclave.
-//
-// The PROPERTY these pin: `WithValue` documents the
-// value as read-only, and callers rely on a stray write faulting rather than
-// silently corrupting a share or a reconstructed key. A missing Freeze is
-// invisible to every functional assertion — the share still decodes, the secret
-// still reconstructs — so the kernel's own view of the mapping is the witness.
-//
-// ProtectionOf reads the ADDRESS only and never dereferences it, which is what
-// makes it safe to ask about a region whose protections are the question.
+// The kernel's view of the mapping proves share values and reconstructed secrets are frozen read-only.
 
-// TestSplitProtected_ShareValuesAreFrozen is a mutation target.
-//
-// Verified by mutation: deleting the `freeze(value)` call in
-// SplitProtected fails here with
-//
-//	protected_freeze_linux_test.go:66: share 1's value is mapped "rw-p": it was
-//	handed back WRITABLE, so a stray write corrupts the share instead of faulting
+// TestSplitProtected_ShareValuesAreFrozen fails if SplitProtected stops freezing share values.
 func TestSplitProtected_ShareValuesAreFrozen(t *testing.T) {
 	shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
 	if err != nil {
@@ -76,14 +57,7 @@ func TestSplitProtected_ShareValuesAreFrozen(t *testing.T) {
 	}
 }
 
-// TestCombineProtected_ReconstructedSecretIsFrozen is the other mutation target.
-//
-// Verified by mutation: deleting the `freeze(secret)` call in
-// CombineProtected fails here with
-//
-//	protected_freeze_linux_test.go:106: the reconstructed secret is mapped "rw-p":
-//	CombineProtected returned a WRITABLE region, so a stray write corrupts the
-//	recovered key instead of faulting
+// TestCombineProtected_ReconstructedSecretIsFrozen fails if CombineProtected stops freezing the secret.
 func TestCombineProtected_ReconstructedSecretIsFrozen(t *testing.T) {
 	shares, err := SplitProtected([]byte("a-secret-worth-splitting-32-byte"), 2, 3)
 	if err != nil {

@@ -23,14 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// The removed-identity deny-list on the public Membership view
-//
-// A host classifying a joiner needs two things from the public API: a typed
-// refusal it can match (ErrRemovedMemberIdentity, pinned with the other
-// membership aliases in errors_membership_alias_test.go) and the deny-list
-// itself, so it can answer before proposing. These tests pin the second.
-// ---------------------------------------------------------------------------
+// Tests for the removed-identity deny-list on the public Membership view.
 
 // TestMembership_RemovedIdentitiesSurfaceThroughTheHostAPI drives a committed
 // removal through consensus and checks the public view names the identity the
@@ -102,10 +95,7 @@ func TestProtoMembershipToPublic_RemovedIdentitiesCopied(t *testing.T) {
 	}
 }
 
-// TestShardInfo_IsObserverFollowsTheCommittedMembership: ShardInfo.IsObserver
-// reports the EFFECTIVE role. A single-voter shard's only replica is a voter
-// whatever its Config said, because Config.IsObserver is only the initial
-// hint; the hint is what a shard without a published peer reports.
+// TestShardInfo_IsObserverFollowsTheCommittedMembership verifies ShardInfo.IsObserver reports the effective role.
 func TestShardInfo_IsObserverFollowsTheCommittedMembership(t *testing.T) {
 	h := startSingleVoterShard(t)
 

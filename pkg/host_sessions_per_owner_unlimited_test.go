@@ -23,20 +23,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestHostSessionsPerOwnerUnlimited pins that SessionsPerOwnerUnlimited
-// turns the per-owner cap off without a special case: one owner may fill
-// the shard, and MaxTotalSessions is what stops it.
-//
-// The shard holds DefaultMaxSessionsPerOwner+2 sessions, so the owner's
-// registrations run past the default cap: a runtime that lost the
-// unlimited choice between Config and the session manager (mapping it to
-// DefaultMaxSessionsPerOwner) refuses registration #DefaultMaxSessionsPerOwner+1.
-//
-// The refusal shape is the one the code produces: session.Manager.Register
-// returns ErrSessionLimitExceeded for the shard-wide total, the state
-// machine answers the register with a value other than the client ID, and
-// Host.NewSessionWithOwner reports that as a *SessionError from "register"
-// wrapping ErrInvalidOperation.
+// TestHostSessionsPerOwnerUnlimited pins that SessionsPerOwnerUnlimited removes the per-owner cap, leaving MaxTotalSessions as the limit.
 func TestHostSessionsPerOwnerUnlimited(t *testing.T) {
 	const owner = uint64(0x744)
 	perOwnerDefault := int(config.DefaultMaxSessionsPerOwner)

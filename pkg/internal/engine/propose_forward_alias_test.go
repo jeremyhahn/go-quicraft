@@ -24,8 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// newTestFollowerPeer builds a peer in a 2-replica shard that is a FOLLOWER
-// with a known leader, so Propose is FORWARDED (not appended locally).
+// newTestFollowerPeer builds a follower peer with a known leader, so Propose is forwarded.
 func newTestFollowerPeer(t *testing.T, shardID, replicaID, leaderID uint64) (*raft.Peer, *logdb.LogReader) {
 	t.Helper()
 	ldb := newTestLogDB()
@@ -56,15 +55,7 @@ func newTestFollowerPeer(t *testing.T, shardID, replicaID, leaderID uint64) (*ra
 	return p, lr
 }
 
-// TestStepWorker_CommitPendingProposeBufRecycledAcrossIterations shows that
-// commitProposeBuf is handed back to the proposal queue on the NEXT
-// commit-pending drain while a FORWARDED Propose message still aliases it.
-//
-// A follower forwards Propose to the leader. Propose is NOT a free-order
-// message, so the forwarded message stays in the peer's outbound buffer until
-// the next GetUpdate -- which cannot run while commitPending is true. Two
-// consecutive commit-pending drains therefore recycle the buffer under a live
-// message, and the next client proposal overwrites the entry it carries.
+// TestStepWorker_CommitPendingProposeBufRecycledAcrossIterations shows commitProposeBuf is recycled while a forwarded Propose still aliases it.
 func TestStepWorker_CommitPendingProposeBufRecycledAcrossIterations(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -117,8 +108,7 @@ func TestStepWorker_CommitPendingProposeBufRecycledAcrossIterations(t *testing.T
 	}
 	collect(upd.Messages)
 
-	// C is still sitting in the proposal queue (it was appended AFTER the
-	// second Swap), so the next drain forwards it a SECOND time.
+	// C is still queued, so the next drain forwards it a second time.
 	ws.Notify(1)
 	sw.processReady()
 	upd2, err := peer.GetUpdate(true, 0)

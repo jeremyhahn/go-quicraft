@@ -21,12 +21,7 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// Every read of locked memory in this package is a borrow scoped to the code
-// that uses the bytes: go-enclave hands out no view that outlives a callback.
-// These tests pin the two things that scoping is for — a borrow ends when its
-// callback returns, so the enclave can be frozen or destroyed straight after,
-// and the scratches split and combine borrow are all released by the time they
-// return.
+// Borrows of locked memory end when their callback returns, and split and combine release their scratches before returning.
 
 // TestBorrow_EndsWithTheCallback pins that a borrow holds the enclave only for
 // the callback's duration. A Destroy issued from another goroutine during the
@@ -91,11 +86,7 @@ func TestBorrow_RefusedBorrowIsProtectedMemoryError(t *testing.T) {
 	}
 }
 
-// TestBorrow_CallbackErrorIsNotWrapped pins that an error produced INSIDE the
-// borrow reaches the caller as itself. SplitBytes and CombineBytes return typed
-// *SplitError and *CombineError values from inside their borrows; wrapping them
-// in a locked-memory failure would misreport a malformed share as a refused
-// lock.
+// TestBorrow_CallbackErrorIsNotWrapped pins that an error from inside a borrow reaches the caller unwrapped.
 func TestBorrow_CallbackErrorIsNotWrapped(t *testing.T) {
 	e, err := enclave.NewMemorySized(8)
 	if err != nil {

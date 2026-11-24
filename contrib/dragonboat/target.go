@@ -12,32 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package dragonboat provides a compatibility adapter that lets existing
-// dragonboat users switch to quicraft with minimal code changes. Error
-// sentinels, configuration types, and API surfaces are mapped to their
-// quicraft equivalents.
-//
-// # Known incompatibilities
-//
-// Client sessions expose a different shape. Dragonboat's client.Session
-// exports ShardID, ClientID, SeriesID and RespondedTo as struct FIELDS.
-// This adapter's client.Session exports only ShardID as a field; ClientID,
-// SeriesID and RespondedTo are METHODS. Code that reads those fields fails
-// to compile (loudly, never silently) and must be changed to method calls.
-//
-// On-disk state machines ignore quicraft's managed snapshot directory.
-// Dragonboat's IOnDiskStateMachine.Open(stopc) takes no directory, so the
-// adapter discards the initialDir quicraft passes; an on-disk state machine
-// keeps managing its own storage paths exactly as it did on dragonboat.
-//
-// Membership changes are pre-validated. Quicraft rejects a change that is
-// invalid against the current membership synchronously, with a nil
-// *RequestState and a non-nil error, where dragonboat would return a
-// RequestState that later resolves as Rejected.
-//
-// Gossip is not supported. NodeHostConfig.Validate rejects a non-empty
-// GossipConfig rather than silently dropping it, because a gossip
-// deployment whose discovery is dropped never forms a cluster.
+// Package dragonboat is a compatibility adapter for dragonboat users; see docs for incompatibilities (Session methods, on-disk SM dirs, pre-validated membership, no gossip).
 package dragonboat
 
 // Target identifies a NodeHost instance by its Raft address string.

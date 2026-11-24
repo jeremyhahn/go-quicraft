@@ -23,19 +23,7 @@ import (
 	"testing"
 )
 
-// requirePrivateWorkflowFile skips t when rel is absent from this tree because
-// .gitattributes export-ignores it, and fails t when rel is absent for any
-// other reason.
-//
-// The private forge and release workflow (the auto-merge workflow and the
-// release trust anchor) is export-ignored: it stays in the
-// private repository and is left out of every published export
-// (docs/release/public-releasability.md). A gate that reads one of those files
-// checks private machinery, so a published export has nothing for it to check,
-// and it says so rather than failing on a file the export left out by design.
-// The .gitattributes entry is matched as written -- the exact
-// `<path> export-ignore` line test/releasability pins -- so this needs no git
-// and works in an extracted archive as well as in a checkout.
+// requirePrivateWorkflowFile skips t when rel is export-ignored in .gitattributes and fails it when rel is missing otherwise.
 func requirePrivateWorkflowFile(t *testing.T, rel string) {
 	t.Helper()
 	_, err := os.Stat(filepath.Join(repoRoot, filepath.FromSlash(rel)))

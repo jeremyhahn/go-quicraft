@@ -20,40 +20,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// Leader-originated messages must be bound to the authenticated sender
-//
-// Replicate and Heartbeat are not TALLIED, so they are not quorum-bearing — but
-// leaving them with no sender binding would be the largest hole in the receive
-// path. handleHeartbeat carries no prevLogIndex, no prevLogTerm and no entries,
-// yet it sets r.leaderID = msg.From and commits up to a Commit index the sender
-// names. Without a binding, any holder of a CA-valid certificate could send one
-// frame claiming to be the leader and commit a follower's minority-replicated
-// tail, which the real leader then truncates: a State Machine Safety
-// violation.
-//
-// The binding is deliberately WEAKER than the quorum-bearing one in exactly one
-// verdict — a sender the committed configuration does not name at all is still
-// admitted, because a lagging replica has not applied the config change that
-// added the current leader, and refusing there is the member allow-list that
-// wedges replicas out of their own shard. Every test below covers
-// both halves: the forgery is refused AND the lagging-replica first contact
-// still works.
-// ---------------------------------------------------------------------------
+// Leader-originated messages are bound to the authenticated sender's committed identity.
 
 // leaderOriginatedTypes are the two message types only an established leader
 // sends. Both install a leader; both can advance the commit index.
 var leaderOriginatedTypes = []uint64{proto.Replicate, proto.Heartbeat}
 
-// TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity is the
-// attacker test. Replica 3 is a genuine authenticated member of shard 1 holding
-// its own valid certificate and its own committed identity. It claims to be
-// replica 2 — the leader — and sends a Heartbeat and a Replicate. Nothing about
-// the connection is forged; only msg.From is.
-//
-// The POSITIVE CONTROL in the same subtest is what makes the assertion mean
-// something: the real replica 2, on a connection carrying replica 2's committed
-// identity, sends the identical message and it must be DELIVERED.
+// TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity verifies a member cannot send leader messages as another replica.
 func TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity(t *testing.T) {
 	const leaderAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5003"
 	ms := proto.Membership{
@@ -97,7 +70,7 @@ func TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity(t *testing
 					got, err, leaderAddr)
 			}
 
-			// POSITIVE CONTROL: the real leader, same message, must get through.
+			// Control: the real leader's message gets through.
 			legit := proto.MessageBatch{
 				SourceAddress: leaderAddr,
 				Requests: []proto.Message{{
@@ -117,20 +90,7 @@ func TestHandleMessage_LeaderOriginatedFromIsBoundToCommittedIdentity(t *testing
 	}
 }
 
-// TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches is the
-// LIVENESS control, and the reason the binding consults the PENDING
-// configuration as well as the committed one.
-//
-// This replica's committed configuration names only replicas 1 and 2. The shard
-// has since added replica 4 and elected it. The AddNode that admits 4 reached
-// this replica from leader 2 and sits in its log, uncommitted — the ordinary
-// state of a lagging follower. Replica 4's Replicate and Heartbeat are the only
-// things that can commit it. If they are refused because the COMMITTED
-// configuration does not name the sender, the replica can never catch up: that
-// is the member allow-list, which can leave a shard permanently leaderless. If
-// they were admitted because NO configuration names the sender, any
-// certificate holder could be replica 4. The pending
-// entry, with the identity it carries, is the fact between the two.
+// TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches verifies a leader named only in the pending configuration still gets through.
 func TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches(t *testing.T) {
 	const selfAddr, knownAddr, newLeaderAddr = "127.0.0.1:5001", "127.0.0.1:5002", "127.0.0.1:5004"
 	const newLeaderID = "spki:4444444444444444444444444444444444444444444444444444444444444444"
@@ -171,14 +131,7 @@ func TestHandleMessage_LeaderOriginatedFromAPendingMemberStillReaches(t *testing
 	}
 }
 
-// TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused covers a shard
-// whose configuration names the leader WITHOUT an identity. There is no
-// fallback to the committed address — a wildcard or shared-SAN certificate
-// would satisfy it for every member at once. Admission requires the identity,
-// and a leader-originated message from an identity-less member is refused
-// whichever certificate carries it: a configuration in this shape was written
-// by a build that did not require identities, and the remedy is re-bootstrap,
-// not a weaker gate.
+// TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused verifies a leader with no committed identity is refused.
 func TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused(t *testing.T) {
 	const leaderAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5003"
 	ms := proto.Membership{Addresses: map[uint64]string{
@@ -228,12 +181,7 @@ func TestHandleMessage_LeaderOriginatedIdentitylessMemberIsRefused(t *testing.T)
 	}
 }
 
-// TestHandleMessage_RemovedReplicaCannotForgeALeaderPush is defect 3's residual,
-// pinned to what actually remains. The deny-list is evaluated on the CLAIMED
-// From, so a replica the shard removed evades it by naming a live member's ID.
-// What it CANNOT do any more is have that message accepted: the leader-originated
-// binding checks the authenticated identity, and a removal deletes the removed
-// replica's identity, so it can never present the victim's.
+// TestHandleMessage_RemovedReplicaCannotForgeALeaderPush verifies a removed replica claiming a live member's ID is refused.
 func TestHandleMessage_RemovedReplicaCannotForgeALeaderPush(t *testing.T) {
 	const leaderAddr, removedAddr = "127.0.0.1:5002", "127.0.0.1:5009"
 	ms := proto.Membership{
@@ -267,22 +215,9 @@ func TestHandleMessage_RemovedReplicaCannotForgeALeaderPush(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Routing overwrite must be keyed on the AUTHENTICATED identity (defect 3)
-// ---------------------------------------------------------------------------
+// Routing overwrites are keyed on the authenticated identity.
 
-// TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity is the
-// exfiltration test. If learnFromSource allowed an OVERWRITE whenever the
-// CLAIMED msg.From named a member, any authenticated peer could re-point a
-// member's routing entry at itself. That is not a black-hole corrected by the
-// next config change; it is worse than that. The attacker holds
-// a CA-valid certificate, so this host's outbound dial to the poisoned entry
-// SUCCEEDS, and it then receives the victim's Replicate frames — committed log
-// entries streamed to a replica the configuration never named.
-//
-// A message type with NO sender binding at all is used deliberately (RequestVote
-// is exempt for a real liveness reason and cannot be gated), so the test proves
-// the LEARNING gate, not the acceptance gate.
+// TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity verifies only the committed identity can re-point a member's address.
 func TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity(t *testing.T) {
 	const victimAddr, attackerAddr = "127.0.0.1:5002", "127.0.0.1:5003"
 	ms := proto.Membership{
@@ -317,11 +252,7 @@ func TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity(t *testing.T) 
 			got, err, victimAddr)
 	}
 
-	// POSITIVE CONTROL: replica 2 itself, recovered at a NEW address, must still
-	// be able to re-point its own entry. Its identity is unchanged by the move,
-	// which is exactly why the identity is the right key: this is the liveness
-	// case the overwrite exists for, and it must survive during quorum loss when
-	// no config change can commit the new address.
+	// Control: replica 2 at a new address can re-point its own entry.
 	const victimNewAddr = "127.0.0.1:6002"
 	if err := handler.HandleMessage(proto.MessageBatch{
 		SourceAddress: victimNewAddr,
@@ -338,14 +269,7 @@ func TestLearnSourceAddress_OverwriteRequiresTheCommittedIdentity(t *testing.T) 
 	}
 }
 
-// TestLearnSourceAddress_IdentitylessMemberCannotBeRepointed: on a shard whose
-// configuration holds no identity for a member, letting ANY certificate holder
-// naming that member re-point its routing entry would let it receive its share
-// of the shard's Replicate traffic. The overwrite requires the committed
-// identity;
-// with none committed, nobody may replace the entry, and the member that moved
-// is reached again through the config change that commits its identity and new
-// address, which is the same remedy an identity-less shard needs anyway.
+// TestLearnSourceAddress_IdentitylessMemberCannotBeRepointed verifies a member without an identity cannot be re-pointed.
 func TestLearnSourceAddress_IdentitylessMemberCannotBeRepointed(t *testing.T) {
 	const victimAddr, victimNewAddr = "127.0.0.1:5002", "127.0.0.1:6002"
 	ms := proto.Membership{Addresses: map[uint64]string{

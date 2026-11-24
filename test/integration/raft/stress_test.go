@@ -22,24 +22,13 @@ import (
 	"testing"
 )
 
-// stressWrite is one key/value pair whose proposal COMMITTED AND APPLIED on
-// the leader. Only these are asserted on afterwards: a proposal that was
-// merely accepted into the pipeline proves nothing about replication.
+// stressWrite is a key/value pair whose proposal committed and applied on the leader.
 type stressWrite struct {
 	key   string
 	value string
 }
 
-// TestStress_MultiNode_ConcurrentProposals verifies that concurrent
-// proposals from multiple goroutines to a multi-node cluster leader
-// are all replicated without loss.
-//
-// Two things make this test non-vacuous. First, the success floor is
-// proportional to the configured workload rather than "at least one": a run
-// in which 49 of 50 writes failed is a broken cluster, not a passing stress
-// test. Second, replication is verified by looking up every committed
-// key/value pair on every replica, not by comparing map sizes — a replica
-// holding a completely different set of keys has the same Len().
+// TestStress_MultiNode_ConcurrentProposals: concurrent proposals replicate without loss, with a success floor proportional to the workload and every committed pair looked up on every replica.
 func TestStress_MultiNode_ConcurrentProposals(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -73,18 +62,7 @@ func TestStress_MultiNode_ConcurrentProposals(t *testing.T) {
 				key := fmt.Sprintf("multi-g%d-p%d", goroutineID, p)
 				value := fmt.Sprintf("mval-%d-%d", goroutineID, p)
 
-				// tryProposeToLeader waits for the apply result, so a bare
-				// accepted-but-never-committed proposal is not counted as a
-				// success. It also re-resolves the leader per attempt: pinning
-				// the index sampled before the goroutines started sent every
-				// write to a deposed replica after any re-election, which
-				// failed the 90% floor below on a cluster that was never
-				// faulted.
-				//
-				// Recorded, not t.Fatal'd: this runs off the test goroutine,
-				// where t.Fatal only calls runtime.Goexit on this goroutine and
-				// lets the test continue with partial results. Failures are
-				// reported by the test goroutine after wg.Wait below.
+				// tryProposeToLeader waits for the apply result and re-resolves the leader per attempt; failures are recorded and reported by the test goroutine after wg.Wait.
 				_, propErr := tryProposeToLeader(cluster, 1, encodeKVPut(key, value), defaultTimeout)
 				if propErr != nil {
 					mu.Lock()

@@ -137,18 +137,7 @@ func assertApplyOrder(t *testing.T) {
 type kvStateMachine struct {
 	mu   sync.RWMutex
 	data map[string]string
-	// prevIndex is the raft index of the previously applied entry. Every
-	// entry handed to Update must carry a STRICTLY greater index: an index
-	// that repeats or moves backward means the entry was applied twice or
-	// replayed, which no amount of state comparison can detect afterwards on
-	// a last-write-wins store. RecoverFromSnapshot is the only legal reset
-	// point.
-	//
-	// Note: consecutive indices are NOT required. The user state machine only
-	// ever sees user commands; the engine legitimately consumes indices for
-	// the initial-membership entry, each leader's no-op entry, config changes
-	// and session register/unregister entries, so gaps are expected and are
-	// counted rather than failed. See applyGaps.
+	// prevIndex is the index of the previous applied entry; each Update must carry a strictly greater one, gaps allowed. See applyGaps.
 	prevIndex uint64
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
@@ -283,10 +272,7 @@ func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, st
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// This is the only point at which the applied-index expectation may be
-	// reset, and the reset must still move the replica FORWARD: installing a
-	// snapshot older than what this replica already applied would silently
-	// roll the state machine back.
+	// The only reset point, and it must move forward.
 	indexBuf := make([]byte, 8)
 	if _, err := io.ReadFull(r, indexBuf); err != nil {
 		return err
@@ -466,13 +452,7 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
 		MaxApplyWorkers:       1,
-		// The WAL still writes every record through the real segment code;
-		// only the fdatasync is skipped. Raft persists term and vote before a
-		// RequestVote or vote grant leaves the node, so once every sync on the
-		// shared disk takes longer than the 0.5-1s election timeout no
-		// election can finish and the shard stays leaderless (#362, #360).
-		// Every host here gets fresh directories and none is reopened, so
-		// durability across a restart is not what this suite checks.
+		// Skip fdatasync so a slow shared disk cannot stall elections; no host here is reopened.
 		NoSyncWAL: true,
 		TransportConfig: config.TransportConfig{
 			MTLSConfig: mtls,
@@ -528,8 +508,7 @@ type smKey struct {
 	replicaID uint64
 }
 
-// smTracker tracks kvStateMachine instances created by the factory
-// so tests can assert on internal state.
+// smTracker tracks the kvStateMachine instances the factory creates.
 type smTracker struct {
 	mu       sync.Mutex
 	machines map[smKey]*kvStateMachine
@@ -622,28 +601,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Raft timing, and the election budgets derived from it
-//
-// Every election budget below is DERIVED from the shard configuration these
-// tests actually start, and the config builders are written in terms of the
-// same constants: testHostConfig reads testRTTMillisecond, and testShardConfig
-// leaves ElectionRTT to config.Config.SetDefaults, which is the value
-// testElectionRTT names rather than restates. Neither side can be changed
-// without the other following, and TestBudgetsDescribeTheClusterTheyBudgetFor
-// pins that they still agree.
-//
-// A budget written as a literal is a value that is not pinned treated as
-// though it were — a recurring flake class. Elsewhere the unpinned value is a
-// leader index or a replica ID; here it is the shard configuration the
-// budget is supposed to describe. A literal cannot follow a config change and
-// gives no signal when it stops matching; a derivation cannot drift at all.
-//
-// The derivation is the one contrib/dragonboat and test/integration/e2e use,
-// mirrored on purpose: the suites
-// keep separate copies because each owns its own helpers and its own config
-// builders; the shape is shared, the constants are not.
-// ---------------------------------------------------------------------------
+// Election budgets are derived from the constants the config builders use; TestBudgetsDescribeTheClusterTheyBudgetFor pins that they agree.
 
 // defaultTimeout is the standard budget for a single Raft operation that is
 // NOT an election: a proposal round trip, a lookup, a membership query. It is
@@ -657,22 +615,13 @@ const defaultTimeout = 10 * time.Second
 // milliseconds per tick.
 const testRTTMillisecond = 50
 
-// testElectionRTT is the number of ticks a follower waits without hearing from
-// a leader before it stands for election.
-//
-// testShardConfig does not set ElectionRTT, so Config.SetDefaults supplies it.
-// This reads THAT value rather than restating it, so the budgets below follow
-// the default if it ever moves.
+// testElectionRTT is the default ElectionRTT that testShardConfig leaves to Config.SetDefaults.
 const testElectionRTT = config.DefaultElectionRTT
 
 // raftTick is one Raft tick in wall-clock time.
 const raftTick = testRTTMillisecond * time.Millisecond
 
-// The election budgets are test/electionbudget's, derived from this suite's
-// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
-// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
-// live in that package; the pin test below is the half that cannot move,
-// because it reads THIS suite's config builders.
+// The election budgets come from test/electionbudget with this suite's constants.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -682,40 +631,14 @@ var (
 // the suites' log lines keep naming the round count.
 const coldStartElectionRounds = electionbudget.ColdStartRounds
 
-// pollInterval is the cadence of every retry loop in this file that waits on
-// something outside its own goroutine. It is one constant, and a ticker rather
-// than a sleep, because the suite does not use time.Sleep and because a single
-// cadence is one thing to change when a runner turns out to be slower than
-// this. waitForLeader, waitForApplied and waitForCondition keep their own
-// tighter cadences: they poll cheap in-process state, not a network round trip
-// or a directory walk.
+// pollInterval is the cadence of this file's retry loops that wait on outside state.
 const pollInterval = 20 * time.Millisecond
 
 // ---------------------------------------------------------------------------
 // Linearizable read assertions
 // ---------------------------------------------------------------------------
 
-// syncReadExact performs a LINEARIZABLE read of key through h (ReadIndex plus
-// a state machine lookup at the confirmed read index) and asserts the value is
-// exactly want.
-//
-// h is PINNED on purpose: the assertion is about THAT replica's own applied
-// state (Leader Completeness), so re-resolving would test something else. That
-// is proposer.Pinned's whole reason for existing, and quicraft.Temporary is the
-// retryable a pinned caller passes — its remedy is "wait, and ask the same
-// replica again", which fixes exactly the conditions Temporary names: right
-// after an election the new leader briefly rejects ReadIndex while it commits
-// its no-op entry.
-//
-// It goes through proposer.TryReadWith rather than writing that loop out by
-// hand, so the pinned-retry loop has ONE home, as the propose and election
-// budgets do.
-//
-// A read that SUCCEEDS with the wrong value is never retried and fails
-// immediately — an entry that was committed before the read cannot legally
-// change or disappear, so retrying would only hide the violation behind a
-// timeout message. That check lives here, after the loop, which is why it
-// cannot be folded into the retryable.
+// syncReadExact performs a linearizable read of key through the pinned host h, retrying Temporary errors, and fails at once on a wrong value.
 func syncReadExact(t *testing.T, h *quicraft.Host, shardID uint64, key, want string, timeout time.Duration) {
 	t.Helper()
 	start := time.Now()
@@ -752,31 +675,7 @@ func assertSMHasExact(t *testing.T, machine *kvStateMachine, label, key, want st
 	}
 }
 
-// proposeCommitted proposes a put through h and waits for it to be COMMITTED
-// AND APPLIED: RequestState.Result resolves from the state machine apply
-// callback, whereas a bare Propose followed by Release proves only that the
-// proposal entered the pipeline. Every write a test later makes an assertion
-// about goes through here.
-//
-// h is the caller's chosen replica and is NOT re-resolved — that is the whole
-// reason this helper exists alongside proposeToLeader, whose callers mean
-// "whoever leads right now". Pinning still commits through a replica that has
-// since lost leadership, because Host.Propose forwards to the leader once the
-// local replica knows who it is.
-//
-// Only errors quicraft.Temporary reports true for are retried: the conditions
-// that clear on their own while the caller waits and asks the same replica
-// again — a shard still coming up, a momentarily busy pipeline, the window
-// after an election before this replica learns the new leader. Everything else
-// fails on its FIRST occurrence, naming the error. Under a blanket retry an
-// ErrDiskFull or an ErrInvalidOperation would be retried for the full budget
-// and then reported as "timed out", which reads as a slow cluster
-// rather than the deterministic rejection it is. See proposer.TryWith for why
-// this set and proposeToLeader's differ.
-//
-// Retrying is safe because a put is idempotent under last-write-wins, which
-// matters: a temporary error can arrive after the entry already reached the log
-// (quicraft.MaybeApplied), so a retry may apply the command twice.
+// proposeCommitted proposes a put through h and waits until it is applied, retrying only Temporary errors.
 func proposeCommitted(t *testing.T, h *quicraft.Host, shardID uint64, key, value string, timeout time.Duration) {
 	t.Helper()
 	start := time.Now()
@@ -808,10 +707,7 @@ func abbrev(value string) string {
 	return value[:max] + fmt.Sprintf("...(%d bytes)", len(value))
 }
 
-// proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
-// OF THE CALL and returns the committed result. See package
-// test/proposer for why observing a leader does not pin it, and for the
-// callers that must NOT use this.
+// proposeToLeader proposes cmd to whichever node leads shardID at the call and returns the result; see test/proposer.
 func proposeToLeader(
 	t *testing.T,
 	cluster *testCluster,
@@ -849,16 +745,7 @@ func (a snapshotArtifact) String() string {
 	return fmt.Sprintf("index=%d size=%d path=%s", a.index, a.size, a.path)
 }
 
-// findSnapshotArtifacts walks dir and returns every snapshot.dat written for
-// shardID/replicaID, with the index decoded from the enclosing
-// snapshot-<020d index> directory (see snapshotSaveDir in
-// pkg/internal/engine/snapshot_pool.go). A recursive walk is used rather than
-// a hardcoded path so the assertion survives layout changes above the
-// shard-<n>/replica-<n>/snapshot-<index> suffix.
-//
-// The artifact is the only durable proof that a snapshot was actually taken:
-// a state machine that merely holds the expected keys is equally explained by
-// plain log replay.
+// findSnapshotArtifacts walks dir for snapshot.dat files of shardID/replicaID, decoding each index from its snapshot directory.
 func findSnapshotArtifacts(t *testing.T, dir string, shardID, replicaID uint64) []snapshotArtifact {
 	t.Helper()
 
@@ -938,11 +825,7 @@ func waitForSnapshotArtifact(t *testing.T, dir string, shardID, replicaID, index
 	}
 }
 
-// awaitSnapshot issues a snapshot request on h, WAITS for its result (the
-// request is asynchronous, so a bare Release waits for nothing at all), and
-// asserts the reported snapshot index is non-zero and covers everything the
-// replica had applied when the request was made. It then asserts the matching
-// durable artifact exists under nodeHostDir and returns the snapshot index.
+// awaitSnapshot requests a snapshot on h, waits for its result, checks the index covers the applied state and the artifact exists, and returns the index.
 func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, replicaID uint64) uint64 {
 	t.Helper()
 
@@ -958,11 +841,7 @@ func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, 
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout*3)
 	defer cancel()
 
-	// The snapshot pool releases a shard's snapshotting slot only AFTER the
-	// completion callback has run (see snapshot_pool.go), so a request issued
-	// immediately after a previous snapshot resolved can still be rejected.
-	// That is a scheduling artifact, not a snapshot failure, so it is retried;
-	// every other error is fatal.
+	// A request right after a previous snapshot may be rejected while the slot is released; retry it.
 	var rs *quicraft.RequestState
 	submitDeadline := time.Now().Add(defaultTimeout)
 	retry := time.NewTicker(pollInterval)
@@ -1006,16 +885,7 @@ func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, 
 	}
 }
 
-// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation beside the
-// budgets to the configuration the suite actually starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives testShardConfig an explicit ElectionRTT, or
-// hands testHostConfig a different RTTMillisecond, electionRound silently
-// starts describing a cluster that no longer exists and every budget built on
-// it is wrong by that factor — which is exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
-// TestHarness_WALSyncMode pins this suite's mode.
+// TestBudgetsDescribeTheClusterTheyBudgetFor verifies the budget constants match the configuration the suite starts.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	cfg := testHostConfig(t, "127.0.0.1:1", nil)
 	if got := cfg.RTTMillisecond; got != testRTTMillisecond {
@@ -1031,10 +901,7 @@ func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	}
 }
 
-// TestHarness_WALSyncMode pins this suite to NoSyncWAL whatever the
-// QUICRAFT_IT_WAL_SYNC switch says: a stalled fdatasync holds every election
-// past its timeout (#362), and only the linearizability and e2e harnesses
-// size their elections for WAL-sync mode (make integration-test-walsync).
+// TestHarness_WALSyncMode verifies this suite runs with NoSyncWAL whatever QUICRAFT_IT_WAL_SYNC says.
 func TestHarness_WALSyncMode(t *testing.T) {
 	for _, v := range []string{"", "0", "1"} {
 		t.Setenv("QUICRAFT_IT_WAL_SYNC", v)

@@ -81,13 +81,7 @@ func TestGetHash_CrossStoreEquality(t *testing.T) {
 	}
 }
 
-// TestConcurrentStore_GetHash_AtomicUnderWrites exercises GetHash racing
-// with Update. GetHash holds all bucket read locks for the whole
-// computation, so every observed hash must equal the hash of a state that
-// existed atomically: here each Update batch overwrites both keys to the
-// same generation value, so a hash mixing two generations (the old
-// two-phase bug) would match neither pre-state nor post-state. The race
-// detector additionally validates the locking discipline.
+// TestConcurrentStore_GetHash_AtomicUnderWrites: GetHash racing Update always hashes a state that existed atomically. Run with -race.
 func TestConcurrentStore_GetHash_AtomicUnderWrites(t *testing.T) {
 	cs := NewConcurrentStore()
 	applyPut(t, cs.Update, "k1", "gen-0")

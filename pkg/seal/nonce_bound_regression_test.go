@@ -100,8 +100,7 @@ func TestNonceTrackerBoundedPastCeiling(t *testing.T) {
 	if !nt.Saturated() {
 		t.Fatal("tracker must saturate at the ceiling instead of growing without limit")
 	}
-	// The bound that matters is on MEMORY: the nonce that crossed the ceiling
-	// is rolled back, so the tracked set never exceeds maxTracked.
+	// The nonce that crossed the ceiling is rolled back, so the set never exceeds maxTracked.
 	if got := nt.Count(); got != 4 {
 		t.Fatalf("tracked count past the ceiling = %d, want it pinned at the ceiling (4)", got)
 	}
@@ -113,13 +112,7 @@ func TestNonceTrackerBoundedPastCeiling(t *testing.T) {
 	}
 }
 
-// TestNonceTrackerSaturatedStillDetectsRetainedReuse pins the half of the
-// degradation that is free: past the ceiling the tracker stops ADMITTING
-// nonces, because admission is what consumes memory, but a lookup costs
-// nothing. A repeat of a nonce it already holds must therefore still be
-// rejected. Abandoning the check as well turned a bounded loss of coverage into
-// a total one — a tracker that answers "no reuse" about a nonce sitting in its
-// own map.
+// TestNonceTrackerSaturatedStillDetectsRetainedReuse: past the ceiling the tracker stops admitting but still rejects a nonce it holds.
 func TestNonceTrackerSaturatedStillDetectsRetainedReuse(t *testing.T) {
 	captureLogs(t)
 
@@ -137,7 +130,7 @@ func TestNonceTrackerSaturatedStillDetectsRetainedReuse(t *testing.T) {
 		t.Fatal("tracker must be saturated after crossing the ceiling")
 	}
 
-	// Catastrophic reuse of a RETAINED nonce must still fail closed.
+	// Reuse of a retained nonce must still fail closed.
 	if err := nt.CheckAndRecordNonce(nonceN(0)); !errors.Is(err, ErrNonceReuse) {
 		t.Fatalf("reuse of a retained nonce while saturated returned %v, want ErrNonceReuse: "+
 			"the covered prefix stopped being checked", err)
@@ -156,12 +149,7 @@ func TestNonceTrackerSaturatedStillDetectsRetainedReuse(t *testing.T) {
 	}
 }
 
-// TestNonceTrackerCountAndContainsReportTrueState pins metric honesty. Were
-// Count and Contains gated on the enabled flag, a saturated tracker — one
-// holding maxTracked nonces with detection degraded to a prefix — would report
-// "0 tracked" and "false" for nonces sitting in its own map. That is
-// the same reading as a tracker that was never enabled, which is the one
-// conclusion an operator must not draw from it.
+// TestNonceTrackerCountAndContainsReportTrueState: a saturated tracker still reports its real count and contents.
 func TestNonceTrackerCountAndContainsReportTrueState(t *testing.T) {
 	captureLogs(t)
 
