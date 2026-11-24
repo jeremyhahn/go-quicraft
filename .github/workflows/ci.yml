@@ -1623,7 +1623,7 @@ jobs:
           print(f"OK: {len(files)} workflow file(s); every job that names `release` runs only on {ALLOWED}, and every other job on a standard GitHub-hosted image or with a hardware or oversize reason")
           PY
 
-      # LOCAL: the two template test scripts for the steps above run here on
+      # LOCAL: the template test scripts for the steps above run here on
       # every CI run, with python3, so they are a required check. Their Go
       # wrappers in test/buildgates skip where python3 is absent (the
       # toolchain image has none).
@@ -1632,6 +1632,9 @@ jobs:
           set -euo pipefail
           python3 -I test/buildgates/testdata/runner-labels-tests.py
           python3 -I test/buildgates/testdata/runner-select-tests.py
+          # LOCAL: the Row job's cases (R0-R13) run here too; their Go
+          # wrapper skips in the toolchain image, which has no python3.
+          python3 -I test/buildgates/testdata/row-job-tests.py .github/workflows/ci.yml
 
       - name: Is every changed file docs or markdown?
         id: diff
