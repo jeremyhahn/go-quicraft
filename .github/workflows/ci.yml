@@ -3417,7 +3417,8 @@ jobs:
                   with urllib.request.urlopen(req, timeout=20) as r:
                       labels = {l["name"] for l in json.load(r)}  # LOCAL (R13): the live set replaces the event's
               except Exception as e:
-                  print(f"::warning::Row: the live labels could not be read ({type(e).__name__}); the event's labels are used")
+                  labels = set()  # LOCAL (R14): fail closed, no event-label exemption on a failed lookup
+                  print(f"::warning::Row: the live labels could not be read ({type(e).__name__}); the event's labels are discarded and the branch is checked against SPEC")
           hit = sorted(labels & exempt)
           if hit:
               print(f"Row: exempt label '{hit[0]}'; no row is required")
