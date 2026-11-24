@@ -1,12 +1,12 @@
 # quicraft benchmark run
 # generated:     2026-08-04T19:32:33Z
 # mode:          baseline
-# run-host:      omega  (PERF_HOST=user@bench-host.example)
+# run-host:      bench-02  (PERF_HOST=user@bench-host.example)
 # cpu-model:     Intel(R) Core(TM) i9-9900X CPU @ 3.50GHz
 # cpu-count:     20
 # governor:      powersave
 # loadavg:       0.57 0.63 0.35  (at start of run)
-# build-host:    vm-host-1
+# build-host:    build-host
 # go-version:    go version go1.26.5 linux/amd64
 # current-ref:   64bc2882844a4109c698b99ef022ef9219a391ef  [clean (pinned to HEAD (64bc288))]
 # packages:      ./pkg/internal/raft/ ./pkg/internal/engine/
@@ -17,7 +17,7 @@
 #
 # Raw samples follow in Go benchmark format. Diff a future run against
 # this file with:
-#   benchstat test/performance/baselines/omega-64bc288-hotpath.txt build/bench-compare/<run>/current.txt
+#   benchstat test/performance/baselines/bench-02-64bc288-hotpath.txt build/bench-compare/<run>/current.txt
 #
 goos: linux
 goarch: amd64

@@ -15,7 +15,7 @@ to put a result, and no command will invent a profile for you.
 
 | Profile | Machine | State |
 |---|---|---|
-| [`profiles/ci-node-2`](profiles/ci-node-2/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-10-04, all four systems | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
+| [`profiles/bench-01`](profiles/bench-01/) | Dual-socket server-grade box (2x Xeon Gold 6258R, 112 threads, 372 GiB) | Measured 2026-10-04, all four systems |
 | [`profiles/omega`](profiles/omega/) | Single-socket desktop-grade box | Measured 2026-08-17, etcd not measured | <!-- lab-string-ok: benchmark provenance: profile names record which machine measured the numbers -->
 | [`profiles/r640`](profiles/r640/) | Dual-socket server-grade box | Baseline of 2026-03-18, preserved as rendered tables |
 
