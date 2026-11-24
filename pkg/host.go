@@ -4830,15 +4830,6 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	}
 	runStartClaimHook()
 
-	// Hold the shard's import lock for the whole start, before its durable
-	// state is read. An import records a snapshot and removes the log beneath
-	// it; one that passed its stopped-shard check and is still writing would
-	// otherwise commit underneath the node this call is about to build from
-	// the OLD log, leaving raft, the log reader, the record and the compaction
-	// floor mutually inconsistent. The import re-checks that the shard is not
-	// running once it holds this lock, so it sees this start and refuses. It
-	// is only TRIED: a start must not queue behind a multi-gigabyte restore,
-	// and the caller retries the identical call.
 	// Another start of this shard is in progress. It may still fail, so this
 	// is not ErrShardAlreadyExists — a caller that reads that as "running"
 	// would never start the shard — but the transient ErrShardNotReady: the
@@ -4864,6 +4855,15 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	if _, closing := h.closingShards.Load(cfg.ShardID); closing {
 		return ErrShardNotReady
 	}
+	// Hold the shard's import lock for the whole start, before its durable
+	// state is read. An import records a snapshot and removes the log beneath
+	// it; one that passed its stopped-shard check and is still writing would
+	// otherwise commit underneath the node this call is about to build from
+	// the OLD log, leaving raft, the log reader, the record and the compaction
+	// floor mutually inconsistent. The import re-checks that the shard is not
+	// running once it holds this lock, so it sees this start and refuses. It
+	// is only TRIED: a start must not queue behind a multi-gigabyte restore,
+	// and the caller retries the identical call.
 	releaseImportLock, importIdle := h.tryAcquireImportLock(cfg.ShardID)
 	if !importIdle {
 		return ErrImportInProgress
@@ -6233,8 +6233,10 @@ lookup:
 //
 // See SyncReadBuf for usage details and the pooling contract.
 func (h *Host) StaleReadBuf(ctx context.Context, shardID uint64, key []byte) (result []byte, release func(), err error) {
-	// Same already-cancelled guard as the other read paths. NALookupBuf takes
-	// no context, so this is the only place the cancellation can be honoured.
+	// Same already-cancelled guard as the other read paths. NALookupBufContext
+	// checks ctx only while it waits behind an Update: with the guard free it
+	// runs the lookup without checking ctx, so an already-cancelled read is
+	// refused here.
 	if err := ctx.Err(); err != nil {
 		return nil, nopHostRelease, mapContextError(err)
 	}
