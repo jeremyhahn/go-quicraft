@@ -722,7 +722,7 @@ jobs:
     # v1.52 (Tenant Agent order): a pull request from a fork (its head
     # repository is not this one) takes ubuntu-latest whatever the variable
     # holds; a fork never reaches a self-hosted runner.
-    runs-on: ${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
+    runs-on: ${{ github.server_url == 'https://github.com' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -875,11 +875,11 @@ jobs:
       # hosted default with a ::warning). Hosted use is H/HS; self-hosted use
       # is the larger of S1/C1 and S2/C2. Then:
       #   - both below their limit: the lower use wins, compared by
-      #     cross-multiplication (self-hosted wins only when S1*HS < H*C1 and
-      #     S2*HS < H*C2); a tie goes hosted;
+      #     cross-multiplication (self-hosted wins when S1*HS <= H*C1 and
+      #     S2*HS <= H*C2); a tie goes self-hosted;
       #   - one pool full (H >= HS; or S1 >= C1 or S2 >= C2): the other pool;
       #   - both full: the pool with fewer queued jobs (bigdisk and
-      #     bigdisk-docker together for the Dells); a tie goes hosted.
+      #     bigdisk-docker together for the Dells); a tie goes self-hosted.
       # The units are shared across repositories, so C1 and C2 can overstate
       # this repository's free room: when they are busy elsewhere its jobs
       # queue, S1 or S2 rises, and its runs go hosted.
@@ -896,7 +896,8 @@ jobs:
       # v1.52 (Tenant Agent order, kept): on a pull request whose head
       # repository is not this repository (a fork, or a fork since deleted),
       # it makes no call and outputs the hosted default with a ::notice: a
-      # fork never reaches a self-hosted runner. Its tests:
+      # fork never reaches a self-hosted runner. Any event but a push to main or a pull request gets the hosted default.
+      # Its tests:
       # test/buildgates/testdata/runner-select-tests.py.
       - name: Balanced runner pool (ruling 1137)
         id: runner
@@ -904,6 +905,7 @@ jobs:
           SERVER: ${{ github.server_url }}
           EVENT: ${{ github.event_name }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
           API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
           RUN_ID: ${{ github.run_id }}
@@ -938,6 +940,14 @@ jobs:
                 emit "$HOSTED" "$HOSTED"
                 exit 0
               fi ;;
+          esac
+          # The self-hosted runners refuse every event but a push to main and a pull request.
+          case "$EVENT:$REF" in
+            push:refs/heads/main | pull_request:*) ;;
+            *)
+              echo "::notice::runner selection: event $EVENT on $REF is not a push to main or a pull request, which the self-hosted runners refuse; every job of this run takes the GitHub-hosted default, ubuntu-latest"
+              emit "$HOSTED" "$HOSTED"
+              exit 0 ;;
           esac
           # whole <value>: a whole number above 0, at most 6 digits.
           whole() { [[ "$1" =~ ^[0-9]{1,6}$ ]] && [ "$((10#$1))" -gt 0 ]; }
@@ -1015,15 +1025,15 @@ jobs:
           [ "$H" -lt "$HS" ] || hfull=1
           { [ "$S1" -lt "$C1" ] && [ "$S2" -lt "$C2" ]; } || sfull=1
           if [ "$hfull" = 1 ] && [ "$sfull" = 1 ]; then
-            [ "$SQ" -lt "$HQ" ] && pick=self
+            [ "$SQ" -le "$HQ" ] && pick=self
             why="both pools full: hosted $HQ queued, self-hosted $SQ queued"
           elif [ "$hfull" = 1 ]; then
             pick=self; why="the hosted pool is full ($H of $HS)"
           elif [ "$sfull" = 1 ]; then
             why="the self-hosted pool is full (bigdisk $S1 of $C1, bigdisk-docker $S2 of $C2)"
           else
-            # self-hosted use, max(S1/C1, S2/C2), below hosted use H/HS.
-            [ $((S1 * HS)) -lt $((H * C1)) ] && [ $((S2 * HS)) -lt $((H * C2)) ] && pick=self
+            # self-hosted use, max(S1/C1, S2/C2), at or below hosted use H/HS.
+            [ $((S1 * HS)) -le $((H * C1)) ] && [ $((S2 * HS)) -le $((H * C2)) ] && pick=self
             why="use hosted $H/$HS, bigdisk $S1/$C1, bigdisk-docker $S2/$C2"
           fi
           if [ "$pick" = self ]; then
@@ -2064,7 +2074,7 @@ jobs:
   # entry, whose result is success only when every shard succeeded.
   unit:
     name: Unit tests [-race, coverage, shard ${{ matrix.shard }}/4]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     needs: [preflight]
     if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60
@@ -2169,7 +2179,7 @@ jobs:
   # shard. `code` tier, like the shards.
   coverage:
     name: Coverage [merge, threshold]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     needs: [preflight, unit]
     if: ${{ needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' }}
     timeout-minutes: 60      # hosted runner: a cold toolchain image build, then the merge (6 h cap)
@@ -2623,7 +2633,7 @@ jobs:
   # bounds the volumes on every host they reach.
   netfault:
     name: Network partitions [build tag quicraft_netfault, toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
     # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
     # PR skips it, and CI Gate reads it as `code`.
@@ -2697,7 +2707,7 @@ jobs:
   # The WAL under injected I/O failures.
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
     # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
     # PR skips it, and CI Gate reads it as `code`.
@@ -2766,7 +2776,7 @@ jobs:
   # The 0-RTT replay policy, the one suite run without -race.
   zero-rtt:
     name: 0-RTT replay policy [no -race, toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
     # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
     # PR skips it, and CI Gate reads it as `code`.
@@ -2908,7 +2918,7 @@ jobs:
   # FreeBSD runner exists and QEMU would multiply every test's wall clock.
   cross-arch:
     name: Cross-architecture build (${{ matrix.goos }}/${{ matrix.goarch }}, toolchain image)
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
     # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
     # PR skips it, and CI Gate reads it as `code`.
@@ -2993,7 +3003,7 @@ jobs:
   # Every module in the tree, discovered rather than declared.
   modules:
     name: Nested module build, vet and test [toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
     # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
     # PR skips it, and CI Gate reads it as `code`.
@@ -3065,7 +3075,7 @@ jobs:
   # The Dragonboat-compatible API module, its own Go module.
   contrib-dragonboat:
     name: contrib/dragonboat [unit + integration, toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
     # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
     # PR skips it, and CI Gate reads it as `code`.
@@ -3146,7 +3156,7 @@ jobs:
   # The Makefile's two-tier FIPS verification (moved from nightly.yml in #293).
   fips:
     name: FIPS [toolchain image]
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as integration
     # v1.26: never on a draft PR. v1.29.3, v1.30: only on the schedule
     # guard's `run`. v1.41 (ruling 742 (2)): every PR, as main; a docs-only
     # PR skips it, and CI Gate reads it as `code`.
