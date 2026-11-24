@@ -33,7 +33,12 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// TestHostAPI_CARollover_ThreeNode runs the docs/quic-transport/ca-rollover.md runbook on a live 3-node shard with no restarts and continuous commits.
+// TestHostAPI_CARollover_ThreeNode runs the CA-rollover runbook
+// (docs/quic-transport/ca-rollover.md) against a live 3-node shard: trust
+// old+new, re-issue every leaf from the new CA on the same key, drop the old
+// CA. No node restarts, and a proposer running throughout must never go a
+// proposal timeout without a commit. After each step a fresh handshake to
+// every node proves what it now presents and accepts.
 func TestHostAPI_CARollover_ThreeNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })

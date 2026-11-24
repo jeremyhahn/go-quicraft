@@ -12,7 +12,69 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package membership applies a membership change through whichever replica leads at each attempt, accepting an "already exists" or "not found" only after a submitted attempt and a linearizable read showing the requested state.
+// Package membership applies a test's membership change through whichever
+// replica leads the shard AT THE MOMENT OF EACH ATTEMPT, and does not mistake
+// the retry of a change that already committed for a failure.
+//
+// # Why this exists
+//
+// A config change has TWO values a test is tempted to pin and must not.
+//
+// The first is leadership. A test that writes
+//
+//	leaderIdx := cluster.waitForClusterLeader(shardID, timeout)
+//	...
+//	cluster.hosts[leaderIdx].SyncRequestRemoveNode(ctx, shardID, id, 0)
+//
+// has read a value that was true when it looked and treated it as fixed.
+// Package test/proposer records that class for proposals; a membership change
+// addressed the same way is refused the same way.
+//
+// The second is WHETHER THE CHANGE COMMITTED. A config change is submitted,
+// leadership moves before the response, and the caller sees a
+// *quicraft.MaybeAppliedError wrapping a *quicraft.NotLeaderError — or an
+// ErrTimeout, which Sync{Add,Delete}Node can only return after the entry was
+// handed to the engine. A loop that retries either has read "no answer" as
+// "did not happen". The entry is in the log and can still commit under the
+// new leader (Leader Completeness guarantees it if it reached a quorum), so
+// the retry is then refused CORRECTLY with "already exists" or "not found"
+// while the test reports a failure the cluster never had.
+//
+// # What the loop does, and deliberately does not do
+//
+// "already exists in membership" and "target node not found" are never
+// swallowed on their own. Drive accepts them only when BOTH hold:
+//
+//  1. an earlier attempt in the SAME loop was actually submitted to Raft:
+//     quicraft.MaybeApplied(err), or an ErrTimeout that can only be produced
+//     after delivery. A pre-flight refusal (not leader, shard not ready, rate
+//     limited, pending config change) submits nothing and never sets this bit;
+//     and
+//  2. a LINEARIZABLE read of the membership shows the exact change asked for:
+//     for an add, the replica present as a full voter at the address this call
+//     requested; for a remove, the replica holding no role at all.
+//
+// An "already exists" for a different address, for a replica in the wrong
+// role, or with no prior in-flight submission still fails. So does a change
+// that never lands: (2) is a positive observation of the requested state, not
+// the absence of an error. Nor is a failed read the absence of the change:
+// after a submission, a refusal fails only once a read has SUCCEEDED and shown
+// the change not in effect. Until then the loop keeps reading within its
+// budget, because on a loaded cluster the read after an "already exists" can
+// time out or meet a leader change exactly as the submission did.
+//
+// The address half of AddNodeLanded is load-bearing. Peer.validateAddNode
+// answers ErrNodeAlreadyExists from the replica ID alone, so "already exists"
+// is also what a genuine replica-ID collision looks like; confirming the ID
+// without the address would turn that membership bug into a green test.
+//
+// # Why it is one package and not one copy per suite
+//
+// The e2e, host and linearizability suites all need the same decision core,
+// and a copy per suite would drift. test/proposer is the precedent: the suites
+// share nothing but a way to name the current leader, so that is all this
+// package asks for — the same proposer.Resolver. Every suite binds this package
+// to its own resolver.
 package membership
 
 import (
@@ -26,16 +88,34 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
-// AttemptTimeout bounds one membership RPC, shorter than the budget for the whole loop.
+// AttemptTimeout bounds ONE membership RPC.
+//
+// It is deliberately shorter than any budget a suite hands Drive, which is the
+// budget for the whole loop. When the two were the same value an attempt that
+// ran to its deadline consumed the entire budget and the "retry" loop got
+// exactly one attempt. A config change commits in milliseconds when it commits
+// at all; what the remainder of the budget buys is the retries.
 const AttemptTimeout = 10 * time.Second
 
 // RetryInterval is how long Drive waits before re-attempting.
 const RetryInterval = 50 * time.Millisecond
 
-// Confirm reports whether the requested change is present in m; a non-nil conflict is a hard failure.
+// Confirm answers "is the change I asked for present in m?" against a
+// membership snapshot.
+//
+// It returns three distinguishable outcomes, and the third is the point of the
+// type: landed with a nil conflict (the requested state is there), not landed
+// with a nil conflict (not there yet — keep trying), and a non-nil conflict,
+// meaning the membership holds something INCOMPATIBLE with the request. A
+// conflict is a hard failure and must never be retried away: it is what
+// separates "my change landed" from "somebody else's change occupies the
+// replica ID I asked for".
 type Confirm func(m *quicraft.Membership) (landed bool, conflict error)
 
-// ConflictError reports a replica ID held in a state incompatible with the requested add, naming the address holding it.
+// ConflictError reports a replica ID that is present in the membership in a
+// state INCOMPATIBLE with the add that requested it: a voter at a different
+// address, or a non-voting role. It names the address actually holding the ID
+// so a replica-ID collision is diagnosable from the failure alone.
 type ConflictError struct {
 	ReplicaID uint64
 	// Role is the role the replica ID currently holds: "voting member",
@@ -94,7 +174,8 @@ const (
 	roleWitness  = "witness"
 )
 
-// AddNodeLanded confirms an AddNode: replicaID must be a full voter at exactly addr; any other occupant is a ConflictError.
+// AddNodeLanded confirms an AddNode: replicaID must be a FULL VOTER at exactly
+// addr. Any other occupant of the replica ID is a ConflictError.
 func AddNodeLanded(replicaID uint64, addr string) Confirm {
 	return func(m *quicraft.Membership) (bool, error) {
 		if m == nil {
@@ -116,7 +197,8 @@ func AddNodeLanded(replicaID uint64, addr string) Confirm {
 	}
 }
 
-// AddObserverLanded confirms an AddNonVoting: replicaID must be an observer at exactly addr; any other occupant is a ConflictError.
+// AddObserverLanded confirms an AddNonVoting: replicaID must be an OBSERVER at
+// exactly addr. Any other occupant of the replica ID is a ConflictError.
 func AddObserverLanded(replicaID uint64, addr string) Confirm {
 	return func(m *quicraft.Membership) (bool, error) {
 		if m == nil {
@@ -138,7 +220,11 @@ func AddObserverLanded(replicaID uint64, addr string) Confirm {
 	}
 }
 
-// PromoteNodeLanded confirms promoting an observer to a full voter at addr; the observer at addr reads as not landed yet.
+// PromoteNodeLanded confirms the AddNode that promotes an observer: replicaID
+// must be a FULL VOTER at exactly addr. It differs from AddNodeLanded in one
+// state only — the observer being promoted, at the same address, is the state
+// the change STARTS from, so it reads as "not landed yet" rather than as a
+// conflict. An observer at a different address, or a witness, still conflicts.
 func PromoteNodeLanded(replicaID uint64, addr string) Confirm {
 	voter := AddNodeLanded(replicaID, addr)
 	return func(m *quicraft.Membership) (bool, error) {
@@ -174,7 +260,24 @@ func DeleteNodeLanded(replicaID uint64) Confirm {
 	}
 }
 
-// WasSubmitted reports whether err's config change had reached Raft: quicraft.MaybeApplied or ErrTimeout, never ErrCanceled.
+// WasSubmitted reports whether err's config change had already been delivered
+// to Raft when it failed, so the entry may still commit.
+//
+// Two errors carry that meaning and no others:
+//
+//   - anything quicraft.MaybeApplied answers true for. The engine wraps
+//     precisely the post-delivery failures in *MaybeAppliedError; the
+//     pre-flight refusals that are otherwise textually identical are not
+//     wrapped. This is the engine's own bit, not a guess made out here.
+//   - ErrTimeout. Sync{Add,Delete}Node return it only from the select on
+//     ctx.Done() after RequestX returned a live RequestState, or when the
+//     host's deadline sweep completes an already-registered pending proposal.
+//     Both are strictly after DeliverProposal succeeded.
+//
+// ErrCanceled is deliberately NOT here. requestConfigChange refuses a context
+// that is already done BEFORE submitting anything, and Drive cancels an
+// attempt's context only after that attempt has returned, so a cancellation
+// seen here submitted nothing.
 func WasSubmitted(err error) bool {
 	if err == nil {
 		return false
@@ -185,7 +288,19 @@ func WasSubmitted(err error) bool {
 	return errors.Is(err, quicraft.ErrTimeout)
 }
 
-// retryableSentinels are the errors that clear on their own; ErrRejected here means a pending config change.
+// retryableSentinels are the errors one more attempt can change the answer
+// to. Every one of them clears on its own: an election completes, a pipeline
+// drains, a shard finishes loading, a deadline that was too short gets a fresh
+// one, a pending config change commits.
+//
+// ErrRejected is here for membership calls specifically. On this path it has
+// one producer, raft.ErrPendingConfigChange, which Host.translateProposalError
+// documents as retryable in the same breath as it maps it: nothing entered the
+// log, so re-proposing once the pending change commits succeeds. A suite that
+// issues a remove and an add back to back routinely has the add arrive while
+// the remove is still committing. It is NOT retryable on the propose path,
+// where ErrRejected is also what an expired client session maps to, which is
+// why this set is this package's and not test/proposer's.
 var retryableSentinels = [...]error{
 	quicraft.ErrNotLeader,
 	quicraft.ErrSystemBusy,
@@ -193,13 +308,24 @@ var retryableSentinels = [...]error{
 	quicraft.ErrCanceled,
 	quicraft.ErrShardNotReady,
 	quicraft.ErrRejected,
-	// A leadership transfer in flight refuses work before the log; matched by sentinel.
+	// A leadership transfer is in flight, so the leader is deliberately not
+	// accepting work it may be about to hand off. It clears when the transfer
+	// completes or times out. It is matched by sentinel, never by its text:
+	// the engine returns it for EVERY proposal, config changes included, and before the entry enters the
+	// log, so it is retryable and never counts as a submission.
 	quicraft.ErrTransferInProgress,
 	context.DeadlineExceeded,
 	context.Canceled,
 }
 
-// IsRetryable reports whether another membership attempt is worth making after err; validation refusals are not.
+// IsRetryable reports whether one more attempt at a membership change is
+// worth making after err.
+//
+// The set is narrow on purpose. A refusal the membership validation produces —
+// already exists, not found, would remove the last voter, an invalid address —
+// is a real answer and must reach the test unless Drive's submission-and-
+// confirmation gate has established that the change in question is this
+// loop's own, already committed.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false
@@ -212,7 +338,17 @@ func IsRetryable(err error) bool {
 	return false
 }
 
-// Drive runs attempt until the change is in effect, the budget runs out or a non-retryable error returns; readMembership is a linearizable read.
+// Drive runs attempt until the requested membership change is in effect, the
+// budget runs out, or something non-retryable comes back.
+//
+// It is separated from the cluster it usually drives so the decision logic can
+// be tested directly — see membership_test.go, which is where the "already
+// exists for a DIFFERENT address must still fail" mutation is pinned.
+//
+// attempt performs one membership RPC. readMembership performs one
+// LINEARIZABLE membership read. Both resolve the leader themselves at the
+// point of use, and both may report a transient error, which is treated as
+// "ask again".
 func Drive(
 	desc string,
 	budget time.Duration,
@@ -337,7 +473,13 @@ func resolved(
 	return attempt, read
 }
 
-// TryAddNode adds replicaID as a voter at addr with identity through the current leader, returning nil once a linearizable read shows it.
+// TryAddNode adds replicaID as a voting member at addr, committing identity
+// as its node identity (the value the new node reports from Host.NodeIdentity;
+// required on a host with a transport, see config.Config.RequireMemberIdentities),
+// through whichever replica leads shardID at each attempt, and returns nil once
+// a linearizable read of the membership shows it there. It is AddNode's
+// error-returning form, for callers with resources to release before failing
+// the test.
 func TryAddNode(resolve proposer.Resolver, shardID, replicaID uint64, addr, identity string, budget time.Duration) error {
 	attempt, read := resolved(resolve, shardID, func(ctx context.Context, h *quicraft.Host) error {
 		return h.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, addr, identity, 0) //quicraft:direct-config-change the single attempt Drive is built from

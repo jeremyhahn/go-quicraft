@@ -29,7 +29,18 @@ import (
 // path here joins on a channel, and nothing waits for the clock.
 const handshakeDeadline = 30 * time.Second
 
-// handshakeWithCurves runs one mutual TLS 1.3 handshake with the given curve lists over loopback TCP (net.Pipe deadlocks on HelloRetryRequest) and returns the first error.
+// handshakeWithCurves completes one TLS 1.3 mutually-authenticated handshake
+// between a client offering clientCurves and a server offering serverCurves,
+// and returns the first error either side reported.
+//
+// It runs over a loopback TCP listener rather than net.Pipe. A pipe is
+// synchronous and unbuffered, and when the two curve lists differ the server
+// answers with a HelloRetryRequest — an extra flight, alongside the TLS 1.3
+// middlebox-compatibility ChangeCipherSpec records, that stops the exchange
+// being strictly alternating. On a pipe both ends then block in Write and the
+// test hangs; the kernel's socket buffers make the same exchange complete. The
+// asymmetric case is the one these tests exist for, so the harness has to
+// survive it.
 func handshakeWithCurves(t *testing.T, clientCurves, serverCurves []tls.CurveID) error {
 	t.Helper()
 
@@ -43,7 +54,9 @@ func handshakeWithCurves(t *testing.T, clientCurves, serverCurves []tls.CurveID)
 		t.Fatal("AppendCertsFromPEM: CA bundle not accepted")
 	}
 
-	// Both configs mirror buildMTLSTLS; only the curve lists differ.
+	// Both configs mirror buildMTLSTLS: TLS 1.3 floor, mutual authentication
+	// against the same pool, ALPN pinned. Only the curve lists differ between
+	// the two roles, which is the thing under test.
 	serverCfg := &tls.Config{
 		Certificates:     []tls.Certificate{cert},
 		ClientCAs:        pool,
@@ -104,7 +117,20 @@ func handshakeWithCurves(t *testing.T, clientCurves, serverCurves []tls.CurveID)
 	return clientHandshakeErr
 }
 
-// TestHandshakeCurves_InteroperateAcrossBuilds: the fips and standard lists intersect, so a cluster can convert to FIPS node by node; otherBuildCurves mirrors the other build's pinned list.
+// TestHandshakeCurves_InteroperateAcrossBuilds is the rolling-upgrade claim
+// that justifies both curve lists holding more than one group.
+//
+// A `-tags fips` build cannot offer X25519 and a standard build wants to, so
+// the two lists are not equal — and TLS 1.3 needs a NON-EMPTY INTERSECTION,
+// not equality. If either list were trimmed to a single group the intersection
+// would be empty and every cross-build handshake would fail with
+// `tls: no supported elliptic curves for ECDHE`, which would mean a cluster
+// could only be converted to FIPS by stopping all of it at once.
+//
+// otherBuildCurves is the list the OTHER build offers, written literally
+// because one binary can only compile one of the two. It cannot drift
+// unnoticed: it is the same literal assertHandshakeCurves pins in that build's
+// file, so changing one list fails this repository's tests under the other tag.
 func TestHandshakeCurves_InteroperateAcrossBuilds(t *testing.T) {
 	for _, tc := range []struct {
 		name           string

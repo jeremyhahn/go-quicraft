@@ -42,7 +42,13 @@ func (db *erroringSnapshotLogDB) GetSnapshot(shardID, replicaID uint64) (logdb.S
 	return db.snapshotTestLogDB.GetSnapshot(shardID, replicaID)
 }
 
-// TestHandleRequest_PreRestoreErrorDoesNotLatch checks an error before RecoverFromSnapshot rejects the recovery once without tripping the latch.
+// TestHandleRequest_PreRestoreErrorDoesNotLatch: a recovery that fails with an
+// error in a step before the state machine's RecoverFromSnapshot is invoked has
+// not touched the state machine, exactly like one that panics there
+// (TestHandleRequest_PreRestorePanicDoesNotLatch). It is settled the same way:
+// the failure latch stays open, OnShardFailed and OnSnapshotCompleted do not
+// fire, OnSnapshotRejected fires once, the recovering gate comes down, the
+// slots are released, and the next recovery of the snapshot succeeds.
 func TestHandleRequest_PreRestoreErrorDoesNotLatch(t *testing.T) {
 	const index, term = uint64(100), uint64(3)
 	dataPath := func(baseDir string) string {

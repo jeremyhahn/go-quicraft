@@ -16,7 +16,10 @@ package rsm
 
 import "errors"
 
-// rsm sentinel errors, separate from the quicraft package to avoid an import cycle.
+// RSM-specific sentinel errors. These are independent of the quicraft
+// package to avoid import cycles (quicraft imports rsm, rsm must not
+// import quicraft). The quicraft package defines equivalent errors for
+// the public API; these are the rsm-internal variants.
 var (
 	// ErrInvalidSMType is returned when a CreateFunc returns an object
 	// that does not implement any known state machine interface.
@@ -30,9 +33,22 @@ var (
 	// when the state machine has been closed.
 	ErrClosed = errors.New("rsm: state machine is closed")
 
-	// ErrApplyGap is returned by Apply when a batch does not start at lastApplied+1.
+	// ErrApplyGap is returned by Apply when the offered batch does not
+	// continue exactly where the previous one stopped. It mirrors the
+	// engine-level ErrApplyGap one layer down and exists because the state
+	// machine keeps its OWN applied counter: a batch that starts above
+	// lastApplied+1 means either committed entries were dropped or the
+	// counter was never seeded from the recovered index, and both make the
+	// session expiry checkpoint walk run against a different entry sequence
+	// than every other replica ran it against.
 	ErrApplyGap = errors.New("rsm: committed entry gap before apply")
 
-	// ErrSessionPolicyMismatch is returned when local session settings disagree with the shard's committed session policy.
+	// ErrSessionPolicyMismatch is returned when this node's configured session
+	// settings (config.Config SessionExpiryEntries, MaxTotalSessions,
+	// MaxResponsesPerSession, MaxSessionsPerOwner) disagree with the session
+	// policy the shard committed at bootstrap (proto.SessionPolicy). The
+	// error wraps it with the first disagreeing setting's name and both
+	// values. The quicraft package re-exports it as its public
+	// ErrSessionPolicyMismatch, hence the public prefix.
 	ErrSessionPolicyMismatch = errors.New("quicraft: configured session settings disagree with the shard's committed session policy")
 )

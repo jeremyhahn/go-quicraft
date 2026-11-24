@@ -24,7 +24,27 @@ import (
 	"testing"
 )
 
-// syncAccountingFS wraps the real filesystem and records which paths were flushed, with Sync and SyncMetadata counted separately; TestOSFileSyncIssuesRealSyscall covers the syscall itself.
+// syncAccountingFS delegates every call to the REAL production filesystem and
+// records which paths were flushed, how, and in what order.
+//
+// It exists because "the WAL flushed before it acknowledged" and "the WAL
+// flushed the DIRECTORY with the call that carries metadata" are the two
+// durability facts nothing else in this package can observe. crashFS models
+// the consequences of a missing flush but is entirely in memory, and the
+// error-injection doubles can only intercept a call that FAILS — a flush that
+// was never issued produces no failing call to intercept.
+//
+// Sync and SyncMetadata are counted separately and never conflated. On Linux
+// File.Sync is fdatasync, which is specified to skip metadata the data does
+// not need; a directory's metadata IS its content, so a directory flushed with
+// Sync is not durable on every filesystem even though it happens to be on
+// ext4. That difference is invisible in the return value and visible here.
+//
+// What it cannot observe is whether osFile.Sync issues a syscall at all: it
+// counts calls at the File interface, one level ABOVE the implementation, so
+// an osFile.Sync stubbed to return nil still increments these counters. That
+// gap is closed by TestOSFileSyncIssuesRealSyscall in fs_sync_test.go, and the
+// two together are what make a deleted fsync detectable.
 type syncAccountingFS struct {
 	FS
 
@@ -196,7 +216,15 @@ func activeSegmentFile(t *testing.T, shardDir string) string {
 	return filepath.Join(shardDir, segmentFilename(ids[0]))
 }
 
-// TestSaveEntries_SyncsTheSegmentBeforeAcknowledging: SaveEntries flushes the file the record was written to before returning.
+// TestSaveEntries_SyncsTheSegmentBeforeAcknowledging asserts the flush that
+// makes an acknowledgement true actually happens, and happens on the file the
+// record was written to.
+//
+// SaveEntries returning nil is a promise that the entries survive a power
+// loss. Nothing else in this package checks that the promise is backed by a
+// flush of the RIGHT file: the crash model can only show the consequence of a
+// missing flush in a simulated filesystem, and the error-injection suites can
+// only intercept flushes that are attempted.
 func TestSaveEntries_SyncsTheSegmentBeforeAcknowledging(t *testing.T) {
 	const (
 		shardID   = uint64(5)
@@ -227,7 +255,17 @@ func TestSaveEntries_SyncsTheSegmentBeforeAcknowledging(t *testing.T) {
 	}
 }
 
-// TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto: the marker's directory is flushed with SyncMetadata, not Sync, after the rename.
+// TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto asserts the
+// second half of the atomic-publication sequence.
+//
+// The WAL format marker is published by rename precisely so a reader can never
+// see a half-written marker, and a rename is a DIRECTORY metadata change: it
+// is durable only once the directory holding it is flushed with the call that
+// carries metadata. fdatasync is specified to skip metadata the file's data
+// does not need, so flushing the directory with Sync leaves the publication
+// unproven on any filesystem that takes that liberty — and the return value is
+// identical either way, which is exactly why this has to be asserted on the
+// call and not on the outcome.
 func TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wal")
 	ffs := newSyncAccountingFS()
@@ -256,7 +294,22 @@ func TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto(t *testing.
 	}
 }
 
-// TestEnsureActiveSegment_FsyncsShardDirParent: lazily creating a shard directory metadata-syncs the WAL root, measured as a delta after Open's own marker sync.
+// TestEnsureActiveSegment_FsyncsShardDirParent is a regression test. When a
+// shard directory is lazily created on first write, its PARENT (the WAL root)
+// must be fsynced so the shard directory's own entry is durable — otherwise a
+// crash on a non-journaled filesystem can lose the entire shard directory even
+// though SaveState fsynced the segment and returned success.
+//
+// The flush must be a METADATA sync: a dirent create is metadata, and it is
+// what fdatasync is permitted to leave behind.
+//
+// The count is measured as a DELTA across the lazy creation, not as an absolute
+// total. Open publishes the format marker by rename and metadata-syncs the WAL
+// root to make that publication durable (see
+// TestOpen_MetadataSyncsTheDirectoryTheFormatMarkerWasRenamedInto), so the root
+// already carries a nonzero SyncMetadata count before the first write ever
+// happens. Asserting `> 0` therefore asserted the format marker's flush and
+// nothing else: deleting the fsync this test is named for left it green.
 func TestEnsureActiveSegment_FsyncsShardDirParent(t *testing.T) {
 	dir := t.TempDir() + "/wal"
 	ffs := newSyncAccountingFS()
@@ -268,7 +321,8 @@ func TestEnsureActiveSegment_FsyncsShardDirParent(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Baseline after Open, so the counts below are the lazy creation alone.
+	// Baseline AFTER Open: everything below is attributable to the lazy
+	// creation alone.
 	before := ffs.metaSyncCount(dir)
 
 	const shardID = uint64(5)

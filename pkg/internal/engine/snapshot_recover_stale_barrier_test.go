@@ -25,7 +25,23 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt verifies an encrypted stale recovery is declined before decryption, with a positive control.
+// TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt settles
+// a question about the barrier snapshot tests: is the stale
+// refusal on the ENCRYPTED recovery path a different error, or wrapped such
+// that the engine's decline branch is bypassed?
+//
+// It is neither. recoveryBlockedByLog runs BEFORE the snapshotter is touched
+// and before the decrypt-to-scratch step, so an encrypted artifact and a
+// plaintext one produce the SAME *SnapshotRecoveryStaleError from the same
+// line, unwrapped. The barrier changes nothing about the refusal, which is why
+// the engine's stale-recovery decline covers it; the host's handling of the
+// decline lives in hostEngineCallback.OnSnapshotCompleted (see
+// TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotAShardFailure).
+//
+// The positive control in the second half is what makes the first half mean
+// anything: the very same artifact, offered to a state machine that is
+// genuinely behind it, decrypts and restores. So the refusal is about the
+// index, not about a fixture the barrier path could not read.
 func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *testing.T) {
 	const (
 		shardID       = uint64(10)
@@ -35,7 +51,9 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 		snapshotTerm  = uint64(4)
 	)
 
-	// Register wg.Wait first so it runs after close(stopC).
+	// Deferred calls run LIFO, so wg.Wait is registered FIRST in order to run
+	// LAST -- after close(stopC). The pool workers only return once stopC is
+	// closed, so the other order deadlocks the test.
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	stopC := make(chan struct{})
@@ -92,7 +110,13 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 			"the barrier did not encrypt it", len(ciphertext))
 	}
 
-	// The stale offer: a replica already past the snapshot is asked to recover from it.
+	// ---------------------------------------------------------------------
+	// The stale offer: a replica already past the snapshot is asked to recover
+	// from it. This is the shape a leader's InstallSnapshot takes after a
+	// rejection walk-down drives remote.next below the follower's real
+	// progress -- raft rejects the snapshot itself, but the host queues the
+	// state-machine recovery on DELIVERY, so the pool still sees the request.
+	// ---------------------------------------------------------------------
 	const appliedAhead = snapshotIndex + 50
 	recoverSM := newSnapshotTestSnapshotter(0)
 	recoverSM.state.Store(appliedAhead)
@@ -148,7 +172,12 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 	}
 	assertNoPlaintextScratch(t, filepath.Dir(dataPath), plaintext[:])
 
-	// Positive control: the same artifact restores on a state machine that is behind it.
+	// ---------------------------------------------------------------------
+	// Positive control: the SAME artifact, offered to a state machine that is
+	// genuinely behind it, decrypts and restores. Without this the assertions
+	// above would also pass against a barrier that could not read its own
+	// output.
+	// ---------------------------------------------------------------------
 	behindSM := newSnapshotTestSnapshotter(0)
 	behindNode, behindPeer := newRecoveryTestNode(t, shardID, replicaID, behindSM)
 	installSnapshotIntoLog(t, behindNode, behindPeer, snapshotIndex, snapshotTerm)
@@ -169,7 +198,10 @@ func TestSnapshotPool_StaleRecovery_BarrierArtifact_DeclinedBeforeDecrypt(t *tes
 	}
 }
 
-// assertNoPlaintextScratch fails if any file in dir other than the data file holds the snapshot plaintext.
+// assertNoPlaintextScratch fails if any file in dir other than the canonical
+// data file holds the snapshot's plaintext. The recovery path decrypts to a
+// throwaway SIBLING file, so a decrypt that ran despite the refusal leaves its
+// evidence next to the artifact.
 func assertNoPlaintextScratch(t *testing.T, dir string, plaintext []byte) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)

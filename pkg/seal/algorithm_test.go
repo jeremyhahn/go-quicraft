@@ -100,7 +100,9 @@ func TestNewAEADForAlgorithm(t *testing.T) {
 
 func TestNewAEADForAlgorithm_InvalidKeySize(t *testing.T) {
 	for _, tc := range knownAlgorithms {
-		// A key length valid for another algorithm, so the registry's exact-length check rejects it.
+		// A key length that is valid for SOME algorithm but not this one, so
+		// the rejection comes from the registry's exact-length check rather
+		// than from the underlying cipher refusing a nonsense length.
 		wrong := 16
 		if tc.keySize == 16 {
 			wrong = 32
@@ -124,7 +126,15 @@ func TestNewAEADForAlgorithm_InvalidKeySize(t *testing.T) {
 	})
 }
 
-// TestUnregisteredAlgorithmsAreRefused verifies an algorithm absent from the registry is refused everywhere.
+// TestUnregisteredAlgorithmsAreRefused is the assertion that makes the fips
+// build tag mean something. In a FIPS build the ChaCha20 family is defined as a
+// wire identifier but has no entry in algorithmRegistry, because
+// algorithm_chacha.go is not compiled; every accessor must therefore treat it
+// exactly as it treats an identifier nobody has ever defined (unknownAlg) and
+// the zero value, and newAEADForAlgorithm must refuse rather than construct.
+//
+// In a non-FIPS build unregisteredAlgorithms is empty, so only unknownAlg and
+// the zero value run: nothing is excluded there.
 func TestUnregisteredAlgorithmsAreRefused(t *testing.T) {
 	var zero SymmetricAlgorithm
 	cases := append(append([]SymmetricAlgorithm{}, unregisteredAlgorithms...), unknownAlg, zero)

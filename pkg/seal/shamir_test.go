@@ -38,7 +38,12 @@ func splitForResult(t *testing.T, threshold, total int) []*shamir.ProtectedShare
 	return shares
 }
 
-// Destroy must wipe the protected shares themselves, not just clear result.Shares.
+// Destroy is the whole reason the field holds protected shares: a result that dropped its
+// references without wiping would leave all N shares — the point of widest
+// exposure in the scheme — readable until the GC ran, which is exactly what the
+// []string it replaced did. The assertion is on the SHARES, deliberately, and
+// not on result.Shares being nil: clearing the slice is the cheap half, and a
+// Destroy that only did that would pass a nil check while wiping nothing.
 func TestShamirInitResult_DestroyWipesEveryShare(t *testing.T) {
 	shares := splitForResult(t, 2, 3)
 	result := ShamirInitResult{Shares: shares, Threshold: 2, TotalShares: 3}
@@ -79,7 +84,11 @@ func TestShamirInitResult_DestroyIsSafeOnNilAndRepeated(t *testing.T) {
 	empty.Destroy()
 }
 
-// Protected shares encode as the same objects shamir.ProtectedShare produces, adding no new format.
+// Protected shares change what "shares" is on the wire: an array of share OBJECTS
+// rather than an array of bare values. This pins that it is the SAME object
+// encoding shamir.ProtectedShare produces on its own — the shape the rest of the
+// stack already persists and distributes shares in — so the protected types
+// introduce no third format for a consumer to special-case.
 func TestShamirInitResult_JSONMatchesTheShareObjectShape(t *testing.T) {
 	// plainShare is the share-object shape, spelled out with encoding/json
 	// tags so the yardstick does not reuse the type under test.
@@ -127,7 +136,19 @@ func TestShamirInitResult_JSONMatchesTheShareObjectShape(t *testing.T) {
 	}
 }
 
-// ShamirInitResult.UnmarshalJSON decodes shares through the bounded shamir.UnmarshalShareSet, refusing an oversized set before locking any memory.
+// Protected shares make the DEFAULT decoder a denial-of-service path: decoding
+// a []*shamir.ProtectedShare through encoding/json locks a page per element as
+// the elements are visited, so an oversized "shares" array chooses how much of
+// the process-wide locked-memory budget to take from every other caller. This
+// pins that ShamirInitResult.UnmarshalJSON routes the set
+// through the bounded shamir.UnmarshalShareSet, which refuses the set BEFORE it
+// locks anything.
+//
+// The mutant this kills is a reversion to `json.Unmarshal(data, &plainStruct)`:
+// the generic decoder accepts 256 well-formed elements (nothing bounds the
+// count during decode), so an oversized document would decode "successfully"
+// having allocated 256 locked buffers. The bounded path rejects it with no
+// error swallowed and no share retained.
 func TestShamirInitResult_UnmarshalRejectsOversizedShareSetBeforeAllocation(t *testing.T) {
 	// maxShares is 255; 256 well-formed elements exceed the count bound, which
 	// UnmarshalShareSet checks on the undecoded document before the first lock.

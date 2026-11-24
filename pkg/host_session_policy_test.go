@@ -27,7 +27,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestStartShard_SeedsSessionPolicyIntoMembership pins that bootstrap commits the founder's session policy into membership.
+// TestStartShard_SeedsSessionPolicyIntoMembership pins that the shard's session
+// policy — the three limits the deterministic apply path reads — reaches
+// REPLICATED state at bootstrap, from the founder's Config and from nowhere
+// else.
+//
+// The seed is the whole mechanism: the apply path reads the committed value, so
+// a bootstrap that failed to write it would leave every replica applying on its
+// own configuration, which is the divergence being closed. The assertion is
+// therefore on the committed membership, not on any node-local field.
 func TestStartShard_SeedsSessionPolicyIntoMembership(t *testing.T) {
 	h := newTestHost(t)
 
@@ -62,7 +70,17 @@ func TestStartShard_SeedsSessionPolicyIntoMembership(t *testing.T) {
 	}
 }
 
-// TestStartShard_RefusesConfigThatDisagreesWithSessionPolicy checks a restart with different session limits is refused, naming the setting and both values.
+// TestStartShard_RefusesConfigThatDisagreesWithSessionPolicy is the end-to-end
+// half, and the one that pins the check.
+//
+// A shard is bootstrapped with a session policy, stopped, and restarted with a
+// DIFFERENT local configuration — the disagreement an edited config file or a
+// binary with new defaults produces. A replica applying its own limits would
+// admit registrations its peers refuse and the two state machines would part
+// company with every Raft invariant intact; one silently adopting the
+// committed limits would run on values it was not configured with. StartShard
+// refuses it, naming the setting and both values, and a restart with the
+// shard's values then starts and enforces them.
 func TestStartShard_RefusesConfigThatDisagreesWithSessionPolicy(t *testing.T) {
 	h := newTestHost(t)
 

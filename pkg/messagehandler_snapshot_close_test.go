@@ -22,7 +22,17 @@ import (
 	"testing"
 )
 
-// The snapshot receive path must return a failed Close, where deferred write errors surface.
+// A dropped Close on the snapshot receive path
+//
+// Sync flushes what this process wrote; Close is where a file system reports a
+// write error it deferred — a full or quota-exceeded volume, a network file
+// system's delayed error — and on some platforms it is the only place that error
+// is ever delivered. The receive path logged both of its Closes at Debug and
+// carried on. For snapshot.dat that meant SaveSnapshot recorded a possibly-short
+// artifact as this replica's durable snapshot, and RemoveEntriesTo then DELETED
+// the log entries the snapshot subsumes: the entries are gone and the snapshot
+// cannot replace them. For snapshot.meta it meant a truncated record, which the
+// DEK purge floor scans for the epoch the artifact needs.
 
 var errTestSnapshotCloseFailed = errors.New("test fs: close refused")
 

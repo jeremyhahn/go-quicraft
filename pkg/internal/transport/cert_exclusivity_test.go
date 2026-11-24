@@ -32,7 +32,10 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// sharedSANMTLSConfig builds an mTLS identity whose leaf carries the given DNS SANs plus loopback.
+// sharedSANMTLSConfig builds an mTLS identity whose LEAF carries the given
+// DNS SANs in addition to loopback. This is the shape of a cluster issued one
+// wildcard certificate, or one certificate carrying every node's SAN: both are
+// routine operational practice and both validate perfectly against the CA.
 func sharedSANMTLSConfig(t *testing.T, dnsNames ...string) *MTLSConfig {
 	t.Helper()
 
@@ -102,7 +105,18 @@ func leafOf(t *testing.T, mtls *MTLSConfig) *x509.Certificate {
 	return leaf
 }
 
-// TestInboundAuthorizedFor_WildcardCertCoversEveryPeer shows the in-band gate authorizes any address a wildcard certificate covers.
+// TestInboundAuthorizedFor_WildcardCertCoversEveryPeer characterises the ACTUAL
+// strength boundary of the in-band authorization gate, which the existing tests
+// do not: they only ever present a certificate that does NOT cover the claimed
+// address (TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored uses a
+// TEST-NET-1 host), so they prove the gate rejects what it obviously must while
+// saying nothing about what it accepts.
+//
+// inboundAuthorizedFor asks only whether the claimed host is PRESENT in the
+// sender's certificate. Under one wildcard certificate the answer is yes for
+// EVERY peer address, so the peer authenticated on this connection is
+// authorized to speak for a third party. That is the collapse the startup
+// exclusivity check (TestVerifyPeerAddressExclusivity_*) exists to prevent.
 func TestInboundAuthorizedFor_WildcardCertCoversEveryPeer(t *testing.T) {
 	// One wildcard identity shared by the whole cluster, plus loopback so the
 	// test can complete a real handshake over 127.0.0.1.
@@ -139,7 +153,8 @@ func TestInboundAuthorizedFor_WildcardCertCoversEveryPeer(t *testing.T) {
 		t.Fatalf("dialConnection failed: %v", dialErr)
 	}
 
-	// A third party's address, which the gate still authorizes.
+	// A THIRD party's address. The peer on this connection has no relationship
+	// to it whatsoever, yet the gate authorizes it.
 	const victim = "node-victim.raft.test:5000"
 	if !t1.inboundAuthorizedFor(conn, victim) {
 		t.Fatalf("expected the wildcard certificate to authorize %q "+
@@ -155,7 +170,9 @@ func TestInboundAuthorizedFor_WildcardCertCoversEveryPeer(t *testing.T) {
 	}
 }
 
-// TestVerifyPeerAddressExclusivity_WildcardRejected verifies the startup check refuses a wildcard certificate covering every member.
+// TestVerifyPeerAddressExclusivity_WildcardRejected proves the startup check
+// fails CLOSED for the exact deployment the gate above cannot defend: one
+// wildcard certificate covering every member.
 func TestVerifyPeerAddressExclusivity_WildcardRejected(t *testing.T) {
 	mtls := sharedSANMTLSConfig(t, "*.raft.test")
 	tr, err := NewQUICTransport(Config{
@@ -246,7 +263,10 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 	}{
 		{
 			name: "co-located peers on our own host are not flagged",
-			// Replicas differing only by port cannot be told apart by certificate, so they are exempt.
+			// A certificate is matched on HOST alone, so replicas separated
+			// only by port cannot be told apart by any certificate policy.
+			// Flagging them would fail every single-machine deployment while
+			// telling the operator nothing actionable.
 			leaf:     wildcard,
 			self:     "127.0.0.1:5000",
 			peers:    []string{"127.0.0.1:5001", "127.0.0.1:5002"},
@@ -282,7 +302,11 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 			wantFail: false,
 		},
 
-		// The skip must compare hosts as x509.VerifyHostname does: case, trailing dot and IP form.
+		// The SKIP used a raw, case-sensitive string compare while the
+		// MATCH used x509.VerifyHostname, which lower-cases names, tolerates
+		// the trailing-dot FQDN form and canonicalises IP literals. Every row
+		// below is a legitimate deployment that the mismatch REJECTED at
+		// startup, with no configuration override available.
 		{
 			name: "co-located peer written in a different case",
 			leaf: perNode,
@@ -300,7 +324,9 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 		},
 		{
 			name: "this node's OWN entry listed by IP while RaftAddress is a hostname",
-			// A member listed by IP while RaftAddress is a name must not flag itself.
+			// The members map routinely lists nodes by IP while RaftAddress is
+			// a name. The raw compare made the node flag ITSELF and refuse to
+			// start.
 			leaf:     perNode,
 			self:     "node-a.raft.test:5000",
 			peers:    []string{"127.0.0.1:5000"},
@@ -340,7 +366,10 @@ func TestVerifyCertificateExclusivity_Table(t *testing.T) {
 		},
 		{
 			name: "a non-loopback IP peer is still checked",
-			// Only loopback implies co-location; another covered IP is an exclusivity failure.
+			// Only LOOPBACK implies co-location. Any other IP the certificate
+			// covers is a real exclusivity failure and must not be skipped
+			// just because it is an IP literal. The test leaf carries :: in
+			// its IPAddresses SANs.
 			leaf:     perNode,
 			self:     "node-a.raft.test:5000",
 			peers:    []string{"[::]:5000"},
@@ -396,7 +425,14 @@ func TestBuildMTLSTLS_PopulatesLeaf(t *testing.T) {
 	}
 }
 
-// TestEvictStaleOutboundOnRecv_EvictionBudget verifies one peer cannot force unbounded connection teardowns.
+// TestEvictStaleOutboundOnRecv_EvictionBudget proves one authenticated peer
+// cannot force an unbounded number of connection teardowns.
+//
+// Past the supersededEpochRing hysteresis, a peer stamping a fresh SourceEpoch
+// on every batch could otherwise force a full QUIC handshake plus stream-pool
+// teardown PER BATCH — arbitrary attacker-driven work, aimed at whichever address the
+// certificate covers. The budget caps that at evictionBudget per window; beyond
+// it the hint is ignored and recovery degrades to the QUIC MaxIdleTimeout path.
 func TestEvictStaleOutboundOnRecv_EvictionBudget(t *testing.T) {
 	mtls := testMTLSConfig(t)
 
@@ -428,7 +464,9 @@ func TestEvictStaleOutboundOnRecv_EvictionBudget(t *testing.T) {
 
 	target := t2.Addr().String()
 
-	// Loopback is covered by the test certificate, so only the budget limits teardowns.
+	// The inbound the "peer" speaks on. Loopback IS covered by the shared test
+	// certificate, so every claim below is authorized: the budget is the ONLY
+	// thing standing between the peer and unbounded teardown work.
 	inbound, dialErr := t1.dialForTest(target)
 	if dialErr != nil {
 		t.Fatalf("dialConnection(inbound) failed: %v", dialErr)
@@ -486,7 +524,16 @@ func TestEvictStaleOutboundOnRecv_EvictionBudget(t *testing.T) {
 	}
 }
 
-// The eviction budget is keyed per peer address.
+// TG-26. The eviction budget must be keyed PER PEER ADDRESS.
+//
+// The budget bounds attacker-driven teardown work, but its OTHER job is
+// isolation: a peer stuck in a crash loop — or one deliberately manufacturing
+// epochs — exhausts its own budget and nothing else. A single global counter
+// would satisfy every existing assertion about the cap while letting one
+// flapping peer consume the budget every other peer needs to recover from its
+// own genuine restart, converting a one-node fault into a cluster-wide
+// reconnection stall. That is precisely the cascade the epoch mechanism exists
+// to prevent, re-introduced by its own defence.
 func TestAllowEviction_BudgetIsPerPeerAddress(t *testing.T) {
 	tr := &QUICTransport{peerEpoch: make(map[string]*peerIncarnation)}
 	now := time.Now()
@@ -505,7 +552,8 @@ func TestAllowEviction_BudgetIsPerPeerAddress(t *testing.T) {
 			"granted one", evictionBudget, evictionWindow)
 	}
 
-	// A different peer restarting gets its own full budget.
+	// A DIFFERENT peer restarts once, legitimately. It must get its own full
+	// budget: the first peer's abuse is not charged to it.
 	for i := 0; i < evictionBudget; i++ {
 		if !tr.allowEviction(healthy, now) {
 			t.Fatalf("eviction %d of %d refused for a second, healthy peer: one "+
@@ -529,7 +577,21 @@ func TestAllowEviction_BudgetIsPerPeerAddress(t *testing.T) {
 	}
 }
 
-// TestPeerCertificateExclusivity_RefusesWildcardPeer verifies the receiver refuses a peer certificate that also covers this host.
+// TestPeerCertificateExclusivity_RefusesWildcardPeer is the RECEIVE-side half
+// of the promiscuous-certificate control, and it is the half that is an attack
+// control at all.
+//
+// The startup checks (TestVerifyPeerAddressExclusivity_* and the two in Host)
+// inspect the LOCAL node's own certificate against addresses an operator handed
+// the local API. A malicious joiner never calls them — it simply connects. Only
+// a check on what ARRIVES can refuse it, and this is that check.
+//
+// What makes the case concrete: the peer presents a *.raft.example.com
+// certificate, which covers this node's own host. A certificate that covers
+// THIS member covers every member, so its holder can satisfy the
+// committed-address binding for any replica of any shard and have forged
+// quorum-bearing responses counted. The connection is refused before it can
+// open a single stream.
 func TestPeerCertificateExclusivity_RefusesWildcardPeer(t *testing.T) {
 	wildcard := leafOf(t, sharedSANMTLSConfig(t, "*.raft.example.com"))
 	perNode := leafOf(t, sharedSANMTLSConfig(t, "node-b.raft.example.com"))
@@ -560,7 +622,13 @@ func TestPeerCertificateExclusivity_RefusesWildcardPeer(t *testing.T) {
 	}
 }
 
-// TestPeerCertificateExclusivity_ExemptsCoLocatedPeers verifies co-located peers are exempt, using isCoLocatedCertHost.
+// TestPeerCertificateExclusivity_ExemptsCoLocatedPeers pins the exemption the
+// refusal must keep, using the SAME predicate the startup check uses
+// (isCoLocatedCertHost). A certificate is matched on host alone, so a peer
+// sharing this machine cannot be issued one that excludes this node's host.
+// Refusing it would break every single-machine and every loopback deployment —
+// including the test suite — while telling the operator nothing they could act
+// on.
 func TestPeerCertificateExclusivity_ExemptsCoLocatedPeers(t *testing.T) {
 	wildcard := leafOf(t, sharedSANMTLSConfig(t, "*.raft.example.com"))
 
@@ -584,7 +652,12 @@ func TestPeerCertificateExclusivity_ExemptsCoLocatedPeers(t *testing.T) {
 	}
 }
 
-// TestNodeIdentityFromCertificate_StableAcrossRenewal verifies two certificates over one keypair yield the same identity.
+// TestNodeIdentityFromCertificate_StableAcrossRenewal pins the property that
+// made SPKI the identity rather than a certificate fingerprint or serial: two
+// certificates issued over the SAME keypair — a routine renewal — yield the
+// SAME identity, so a renewal does not require a config change to re-commit it.
+// Two DIFFERENT keypairs yield different identities, which is what makes the
+// value an identity at all.
 func TestNodeIdentityFromCertificate_StableAcrossRenewal(t *testing.T) {
 	original := sharedSANMTLSConfig(t, "node-a.raft.example.com")
 	leaf := leafOf(t, original)
@@ -658,7 +731,14 @@ func renewLeafOnSameKey(t *testing.T, mtls *MTLSConfig) *x509.Certificate {
 	return renewed
 }
 
-// TestUnnameableCertSelfHost_Table checks which advertised hosts leave the promiscuous-certificate refusal nothing to check.
+// TestUnnameableCertSelfHost_Table pins which advertised hosts leave the
+// promiscuous-certificate refusal with no question to ask.
+//
+// The distinction matters in both directions. Classifying a real host as
+// unnameable would silently disable a live security control; classifying a
+// loopback host as unnameable would confuse "this deployment is exempt" (a
+// documented property of co-located replicas) with "this control cannot run",
+// which is what the operator warning is about.
 func TestUnnameableCertSelfHost_Table(t *testing.T) {
 	tests := []struct {
 		host string
@@ -681,12 +761,22 @@ func TestUnnameableCertSelfHost_Table(t *testing.T) {
 	}
 }
 
-// TestPeerCertificateExclusivity_InertOnWildcardBind shows the refusal admits a promiscuous certificate on a wildcard bind without AdvertiseAddress.
+// TestPeerCertificateExclusivity_InertOnWildcardBind MEASURES the premise
+// behind the operator warning: on a wildcard bind with no AdvertiseAddress, the
+// promiscuous-certificate refusal admits the very certificate it exists to
+// refuse.
+//
+// This is not an assertion that the behaviour is desirable — failing closed
+// here would take down every wildcard-bound deployment on upgrade, which is an
+// operator's decision. It pins the fact so the warning
+// (reportPromiscuousCertCoverage) cannot be deleted as redundant, and so that a
+// later change to fail closed shows up here as a deliberate edit rather than as
+// a silent behaviour change.
 func TestPeerCertificateExclusivity_InertOnWildcardBind(t *testing.T) {
 	wildcard := leafOf(t, sharedSANMTLSConfig(t, "*.raft.example.com"))
 	const peerAddr = "10.20.30.40:41000"
 
-	// Control: with a real advertised host the same certificate is refused.
+	// CONTROL: with a real advertised host the same certificate IS refused.
 	if err := peerCertificateExclusivity(wildcard, "node-a.raft.example.com:5001", peerAddr); err == nil {
 		t.Fatal("the control case admitted a wildcard certificate; the " +
 			"measurement below would say nothing about the wildcard BIND")

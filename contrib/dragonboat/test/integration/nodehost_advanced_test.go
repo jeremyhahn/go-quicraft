@@ -142,7 +142,24 @@ func TestIntegration_DB_TimeoutCanBeReturned(t *testing.T) {
 	t.Logf("SyncPropose with expired context returned: %v", propErr)
 }
 
-// TestIntegration_DB_RegisterSessionTwice verifies a duplicate registration is reported through ResultC as a non-completed result.
+// TestIntegration_DB_RegisterSessionTwice verifies ProposeSession behavior
+// when called on an already-registered session.
+//
+// In quicraft, after SyncGetSession the session's SeriesID is
+// SeriesIDFirstProposal (normal proposal range), not SeriesIDForRegister.
+// The adapter's ProposeSession routes based on SeriesID:
+//   - SeriesIDForRegister   -> register the session (client ID preserved)
+//   - SeriesIDForUnregister -> close/unregister the session
+//   - any other value       -> rejected with ErrInvalidSession
+//
+// To simulate "register twice", we manually prepare the session for
+// registration. The register path is asynchronous: the duplicate
+// registration is reported through the RequestState's ResultC as a
+// non-completed result rather than as an immediate error.
+//
+// Matches dragonboat's TestRegisterASessionTwiceWillBeReported in spirit:
+// both verify that ProposeSession on an already-registered session is
+// reported and does not produce undefined behavior.
 func TestIntegration_DB_RegisterSessionTwice(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
@@ -360,7 +377,12 @@ func TestIntegration_DB_SnapshotRecoveryAfterRestart(t *testing.T) {
 		len(expected), time.Since(recoveryStarted).Round(time.Millisecond))
 }
 
-// TestIntegration_DB_SnapshotIndex_RawValueOnRegularResult verifies SnapshotIndex returns the raw result value, also on a regular proposal.
+// TestIntegration_DB_SnapshotIndex_RawValueOnRegularResult verifies the
+// adapter's documented SnapshotIndex() behavior: quicraft delivers the
+// snapshot index in the result's Value field, so SnapshotIndex() returns
+// the raw result value. It is only meaningful for snapshot-related
+// results; on a regular proposal it simply mirrors GetResult().Value
+// (dragonboat panics on such misuse, the adapter does not).
 func TestIntegration_DB_SnapshotIndex_RawValueOnRegularResult(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()

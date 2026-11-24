@@ -157,7 +157,12 @@ func TestStaleReadNoQuorum(t *testing.T) {
 	}
 }
 
-// proposeOnLeader commits one proposal on the leader; assertNoQuorumReads checks a cut-off replica's StaleRead answers and SyncRead refuses.
+// proposeOnLeader commits one proposal through whichever host leads.
+// assertNoQuorumReads checks, on a replica cut off from its quorum, that
+// StaleRead answers the applied count within 1s and that SyncRead with a
+// 500ms deadline refuses: with ErrTimeout or ErrCanceled when the wait for a
+// quorum runs out, or with ErrNotLeader when the replica steps down during
+// the read or already knows no leader. It never answers a value.
 func assertNoQuorumReads(t *testing.T, h *Host, phase string, want uint64, allowNotLeader bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)

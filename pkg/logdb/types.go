@@ -23,7 +23,20 @@ import (
 // persistence layer. These are separate from proto types to maintain a
 // clean boundary between the serialization format and storage format.
 
-// Entry is a Raft log entry; the session fields and OwnerID must be persisted for dedup and the per-owner session cap.
+// Entry represents a single Raft log entry.
+//
+// The session fields (Key, ClientID, SeriesID, RespondedTo, OwnerID) MUST be
+// persisted: at-most-once delivery depends on them surviving crash
+// recovery. ClientID=0 means "not session-managed", so dropping these
+// fields on the WAL round-trip would silently disable session dedup for
+// every entry replayed after a restart.
+//
+// OwnerID is in that set for a related but distinct reason: it is the input to
+// a deterministic apply-path decision (the per-owner session cap, see
+// proto.SessionPolicy.MaxSessionsPerOwner). OwnerID=0 means "no owner", which
+// is also what a dropped field decodes to — so losing it on the round-trip does
+// not fail, it just silently lifts the cap on every entry replayed after a
+// restart, and the replica then admits registrations its peers refuse.
 type Entry struct {
 	// Index is the log position of this entry.
 	Index uint64
@@ -70,13 +83,27 @@ type Membership struct {
 	// RequireFullReplicaMajority is the shard's replicated
 	// full-replica-majority witness policy.
 	RequireFullReplicaMajority bool
-	// SessionExpiryEntries, MaxTotalSessions, MaxResponsesPerSession and MaxSessionsPerOwner are the replicated session policy and must survive this round-trip.
+	// SessionExpiryEntries, MaxTotalSessions, MaxResponsesPerSession and
+	// MaxSessionsPerOwner are the shard's replicated SESSION POLICY (see
+	// proto.SessionPolicy). They must
+	// survive this round-trip for the same reason Identities must: they enter
+	// membership through the log — the EntryInitialMembership at index 1 — so
+	// a replica that rebuilds its configuration from a SNAPSHOT whose log has
+	// been compacted past that entry has only this record to relearn them
+	// from.
+	//
+	// A backend that drops them does not fail. The replica comes back with an
+	// unset policy, falls back to its own Config, and expires sessions on a
+	// schedule its peers do not share — a state-machine divergence with every
+	// Raft invariant intact and no error raised anywhere.
 	SessionExpiryEntries uint64
 	// MaxTotalSessions is the replicated cap on registered sessions. It is
 	// non-zero in every committed policy and is therefore the field that says
 	// whether a policy was recorded at all: see proto.SessionPolicy.IsSet.
 	MaxTotalSessions uint64
-	// MaxResponsesPerSession is the per-session response-cache depth; see proto.SessionPolicy.
+	// MaxResponsesPerSession is the replicated RESPONSE-CACHE DEPTH: the number
+	// of cached results one session retains, not a session count. See
+	// proto.SessionPolicy.MaxResponsesPerSession.
 	MaxResponsesPerSession uint64
 	// MaxSessionsPerOwner is the replicated cap on concurrent sessions per
 	// declared owner; 0 disables it. See proto.SessionPolicy.MaxSessionsPerOwner.
@@ -95,9 +122,42 @@ type Membership struct {
 	Witnesses map[uint64]string
 	// Removed tracks replica IDs that have been removed from the cluster.
 	Removed map[uint64]bool
-	// Identities maps replica IDs to committed node identities (proto.Membership.Identities) and must survive the snapshot-metadata round-trip.
+	// Identities maps replica IDs to the committed cryptographic node
+	// identity the receive-side gate authorizes a claimed msg.From against
+	// (see proto.Membership.Identities). It is a single map spanning every
+	// role, and on a shard bootstrapped behind a transport it is complete: a
+	// replica with no entry has every message refused.
+	//
+	// It MUST survive the snapshot-metadata round-trip, for the same reason
+	// the session fields on Entry must survive the WAL one. Identities reach
+	// membership through the log — the EntryInitialMembership at index 1 and
+	// every EntryConfigChange — so a replica that rebuilds its configuration
+	// from a SNAPSHOT whose log has been compacted past those entries has
+	// only this record to learn them from. A backend that drops the field
+	// therefore does not fail at the storage layer; the replica comes back
+	// with an identity-free configuration, the receive-side gate refuses every
+	// message from every member — a missing entry is never a permission — and
+	// the shard stops making progress.
 	Identities map[uint64]string
-	// RemovedIdentities maps removed replica IDs to their identity at removal (the receive-side deny-list) and must survive this round-trip; its keys are a subset of Removed.
+	// RemovedIdentities maps a REMOVED replica ID to the identity the
+	// configuration held for it when the removal committed (see
+	// proto.Membership.RemovedIdentities). It is the deny-list the receive-side
+	// gate evaluates against the AUTHENTICATED connection identity, rather than
+	// against the claimed msg.From that a removed replica can simply change.
+	//
+	// It must survive this round-trip for a sharper reason than Identities. A
+	// dropped Identities map stops the shard; a dropped RemovedIdentities map
+	// REVOKES A REVOCATION. The replica comes
+	// back having forgotten which keypairs it ejected, so a decommissioned node
+	// that still holds its certificate is readmitted — silently, with no error
+	// anywhere, and precisely on the restart an operator performs after
+	// removing it. Certificate revocation is the only remaining control at that
+	// point, and it is opt-in.
+	//
+	// Its key set is a strict subset of Removed's: an entry appears only when a
+	// removal commits for a member that had a committed identity. A backend
+	// that persists Removed and drops this map is therefore internally
+	// inconsistent, not merely lossy.
 	RemovedIdentities map[uint64]string
 }
 
@@ -118,11 +178,20 @@ type Snapshot struct {
 	// Epoch is the barrier encryption epoch used when this snapshot was
 	// saved. Zero indicates no encryption (plaintext snapshot).
 	Epoch uint64
-	// Compression is the algorithm the snapshot data file was written through; recovery reads it from here, not from Config.
+	// Compression is the algorithm the snapshot data file was written
+	// through. It describes the ARTIFACT, not the writer's configuration:
+	// every recovery path must build its reader chain from this field, not
+	// from the local Config.SnapshotCompressionType, which is per-shard,
+	// mutable across restarts, and independent on every host. The zero
+	// value is config.NoCompression, which matches both the package default
+	// and every record written before this field existed.
 	Compression config.CompressionType
 }
 
-// CheckBounds is proto.Snapshot.CheckBounds for the storage type.
+// CheckBounds is proto.Snapshot.CheckBounds for the storage-layer type: it
+// refuses a position at or above proto.MaxLogIndex / proto.MaxTerm with the
+// same sentinels, so a LogDB can apply the one protocol bound before a
+// snapshot becomes durable without converting the type to do it.
 func (s *Snapshot) CheckBounds() error {
 	return (&proto.Snapshot{Index: s.Index, Term: s.Term}).CheckBounds()
 }
@@ -137,7 +206,21 @@ type Bootstrap struct {
 	Join bool
 	// Type identifies the state machine type for this shard.
 	Type uint64
-	// DataDir is the shard's Config.DataDir, "" for the host's NodeHostDir; every bootstrap record states it.
+	// DataDir is the shard's Config.DataDir, empty when the shard roots its
+	// on-disk tree under the host's NodeHostDir.
+	//
+	// It is recorded because the shard's snapshot tree — the tree snapshot
+	// garbage collection and, critically, the DEK purge-floor scan enumerate —
+	// hangs off it, and operations that run while the shard is STOPPED
+	// (Host.ImportSnapshot) have no other way to learn it. Writing a snapshot
+	// artifact outside that tree leaks it and, because the purge floor is
+	// computed by SCANNING the tree, lets the next PurgeEpochsBefore destroy
+	// the DEK the artifact needs.
+	//
+	// DataDir "" is a meaningful VALUE: the shard's tree is rooted under the
+	// host's NodeHostDir. A backend therefore persists DataDir in every
+	// bootstrap record, so a record always states it; a record that cannot
+	// state it is not a valid record and is refused, never read as "".
 	DataDir string
 }
 
@@ -156,7 +239,24 @@ type Update struct {
 	Snapshot Snapshot
 }
 
-// CopyEntryCmd returns e with a private per-entry copy of its Cmd payload, so callers cannot write into the stored log.
+// CopyEntryCmd returns e with its Cmd payload replaced by a private copy, or
+// unchanged when there is no payload to copy.
+//
+// It is the READ-side counterpart of the deep copy every LogDB already performs
+// on the write side, and it exists for the same reason pointed the other way.
+// A backend stores entries in memory and serves them from there; returning the
+// stored Entry by value copies the slice HEADER but not the bytes, so the
+// caller and the store end up sharing one payload array. Nothing stops the
+// caller writing through it — and what it would be writing into is the live log
+// this replica serves to its followers, and replays to itself on restart. The
+// corruption would be silent, unattributable, and would differ per replica,
+// which is the worst shape a consensus bug can take.
+//
+// Copying per entry rather than once per batch is deliberate. One shared
+// backing array would save allocations, but a caller that retains a SINGLE
+// entry's Cmd — a state machine storing a value, say — would then pin the whole
+// batch's payloads for as long as it holds that one entry. Per-entry copies
+// make the retained memory exactly what was retained.
 func CopyEntryCmd(e Entry) Entry {
 	if len(e.Cmd) == 0 {
 		return e

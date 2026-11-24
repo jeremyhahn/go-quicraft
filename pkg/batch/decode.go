@@ -23,7 +23,19 @@ import (
 // prefix in the batch wire format (4 bytes, big-endian uint32).
 const lengthPrefixSize = 4
 
-// EncodeBatch joins commands as [len:4 BE][data]...; a command over math.MaxInt32 bytes is an EncodeError, matching what decoding rejects.
+// EncodeBatch combines multiple command payloads into a single batch.
+// Format: [cmd1_len:4 BE][cmd1_data][cmd2_len:4 BE][cmd2_data]...
+//
+// Each command is prefixed with its length as a 4-byte big-endian uint32.
+// An empty slice produces a zero-length output.
+//
+// A command longer than math.MaxInt32 is rejected with an EncodeError rather
+// than encoded. Both decode paths refuse a length prefix above MaxInt32 (it
+// wraps negative on a 32-bit int and panics the slice expression), so encoding
+// one would produce a payload that this package can never read back — and the
+// aggregator's payload is a committed Raft entry, so the whole batch would be
+// permanently undecodable on every replica. The write side must reject exactly
+// what the read side rejects.
 func EncodeBatch(cmds [][]byte) ([]byte, error) {
 	totalSize := 0
 	for _, cmd := range cmds {
@@ -45,7 +57,11 @@ func EncodeBatch(cmds [][]byte) ([]byte, error) {
 	return buf, nil
 }
 
-// DecodeBatch splits a batch into commands; malformed data is a DecodeError and empty input returns nil.
+// DecodeBatch splits a batch payload into individual commands.
+// Returns a DecodeError if the data is malformed (truncated length prefix
+// or command data extending beyond the payload boundary).
+//
+// An empty or nil input returns a nil slice with no error.
 func DecodeBatch(data []byte) ([][]byte, error) {
 	if len(data) == 0 {
 		return nil, nil
@@ -114,7 +130,10 @@ func countCommands(data []byte) (int, error) {
 	return count, nil
 }
 
-// fits reports whether n bytes at off lie within total, without forming off+n.
+// fits reports whether a span of n bytes starting at off lies within a
+// payload of total bytes. It compares against the remainder rather than
+// forming off+n, which overflows int for values near math.MaxInt (a length
+// prefix near MaxInt32 on a 32-bit build) and would accept the span.
 func fits(off, n, total int) bool {
 	return off >= 0 && n >= 0 && off <= total && n <= total-off
 }

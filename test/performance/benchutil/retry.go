@@ -19,7 +19,10 @@ package benchutil
 
 import "time"
 
-// Warmup retry budget shared by every engine, so each tolerates startup errors equally.
+// Warmup retry budget shared by every engine's warmup proposals. Transient
+// startup errors (connection establishment, shard readiness) are expected
+// during warmup; each engine must tolerate them with the SAME budget so no
+// engine's suite is discarded for a flake another engine would survive.
 const (
 	// WarmupAttempts is the total number of attempts per warmup operation.
 	WarmupAttempts = 4

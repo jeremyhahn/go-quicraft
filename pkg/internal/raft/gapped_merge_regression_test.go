@@ -62,7 +62,16 @@ func staleTailLog(t *testing.T) (*raftLog, *logdb.LogReader) {
 	return l, reader
 }
 
-// TestRaftLogTermRejectsIndexAboveLastIndex checks raftLog.term returns no term above lastIndex.
+// TestRaftLogTermRejectsIndexAboveLastIndex pins the invariant the log itself
+// already claims: nothing above raftLog.lastIndex() has a term.
+//
+// raftLog.term falls back to the LogReader whenever the in-memory buffer cannot
+// answer, with no upper bound. Above the in-memory tail the LogReader is not
+// authoritative -- it holds a suffix that a conflicting append has already
+// removed from the log -- so the fallback resolves a term for an index the log
+// does not hold. That makes term() and lastIndex() contradict each other, and
+// matchTerm inherits the contradiction: the Log Matching check passes against
+// an entry this replica threw away.
 func TestRaftLogTermRejectsIndexAboveLastIndex(t *testing.T) {
 	l, _ := staleTailLog(t)
 
@@ -85,7 +94,19 @@ func TestRaftLogTermRejectsIndexAboveLastIndex(t *testing.T) {
 	}
 }
 
-// TestRaftLogTryAppendPastInMemoryTailRejected checks tryAppend rejects a prevLogIndex above the truncated in-memory tail.
+// TestRaftLogTryAppendPastInMemoryTailRejected drives the whole follower path
+// with the message shape observed in production: prevLogIndex above the
+// truncated in-memory tail, carrying the single entry that follows it.
+//
+// matchTerm passes on the superseded LogReader term, getConflictIndex reports
+// the new entry as the conflict, and tryAppend then asks inMemory.merge to
+// place it past the in-memory tail -- a hole in the log. merge asserts against
+// exactly that ("gapped merge past in-memory tail"), so on the unfixed code
+// this panics on the step worker rather than returning.
+//
+// The assertion here is on the observed condition -- tryAppend must REJECT --
+// not on the absence of a panic; the recover only reports the panic in terms of
+// what caused it.
 func TestRaftLogTryAppendPastInMemoryTailRejected(t *testing.T) {
 	l, _ := staleTailLog(t)
 

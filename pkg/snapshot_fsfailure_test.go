@@ -112,7 +112,11 @@ var (
 // decryptSnapshotToAnonymousScratch
 // ---------------------------------------------------------------------------
 
-// TestDecryptSnapshotToAnonymousScratch_FilesystemFailures verifies every filesystem failure in recovery decrypt fails closed, leaving no scratch and the snapshot untouched.
+// TestDecryptSnapshotToAnonymousScratch_FilesystemFailures verifies that every
+// filesystem failure on StartShard's recovery decrypt fails CLOSED: the caller
+// is told which operation failed, no scratch name survives, and the canonical
+// encrypted snapshot is never modified — that untouched ciphertext is what
+// makes the recovery retryable once the fault clears.
 func TestDecryptSnapshotToAnonymousScratch_FilesystemFailures(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -170,7 +174,12 @@ func TestDecryptSnapshotToAnonymousScratch_FilesystemFailures(t *testing.T) {
 	}
 }
 
-// TestDecryptSnapshotToAnonymousScratch_FailedUnlinkFailsClosed verifies a refused scratch unlink fails before any plaintext is written.
+// TestDecryptSnapshotToAnonymousScratch_FailedUnlinkFailsClosed verifies that
+// a scratch whose immediate unlink is refused fails StartShard's recovery
+// decrypt before a byte of plaintext is written: no file is handed back, the
+// name that survives the best-effort removal is EMPTY and counted as
+// unreclaimed, and the canonical encrypted snapshot is untouched, so the
+// recovery can be retried.
 func TestDecryptSnapshotToAnonymousScratch_FailedUnlinkFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.dat")

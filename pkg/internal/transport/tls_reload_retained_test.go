@@ -109,7 +109,10 @@ func (d *caDrop) assertDroppedCARefused(t *testing.T) {
 
 // TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP checks the sweep keeps a session whose issuer CA left the bundle.
 func TestReloadMTLS_CADropKeepsSessionUnderEnforcedOCSP(t *testing.T) {
-	// OCSP CertID is SHA-1 (RFC 6960 4.1.1), refused under fips140=only; see the FIPS exemption in docs/quic-transport/architecture.md.
+	// An OCSP request's CertID is SHA-1 (RFC 6960 section 4.1.1), which
+	// GODEBUG=fips140=only refuses at use. ModeOCSP is outside the
+	// approved-only recipe; see the FIPS 140-3 exemption record in
+	// docs/quic-transport/architecture.md. Every other run executes this test.
 	if fips140.Enforced() {
 		t.Skip("ModeOCSP builds a SHA-1 CertID, which fips140=only refuses (FIPS 140-3 exemption record)")
 	}

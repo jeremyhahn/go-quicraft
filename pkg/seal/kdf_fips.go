@@ -16,5 +16,8 @@
 
 package seal
 
-// defaultStandardKDFVersion is PBKDF2-SHA256 in a FIPS build.
+// defaultStandardKDFVersion is PBKDF2-SHA256 in a FIPS build. There is no
+// "standard mode" distinct from FIPS mode here: Argon2id is not compiled in
+// (see kdf_argon2.go), so the approved KDF is the only one DefaultKDFVersion
+// can name, whatever the GOFIPS140 environment says.
 func defaultStandardKDFVersion() KDFVersion { return KDFPbkdf2SHA256 }

@@ -63,7 +63,18 @@ type shardMetrics struct {
 	snapshotsBytesRecv prometheus.Observer
 }
 
-// PrometheusMetricsCollector implements MetricsCollector with client_golang on a dedicated registry.
+// PrometheusMetricsCollector implements MetricsCollector using Prometheus
+// client_golang. All metrics are registered with a custom registry to avoid
+// polluting the global default registry.
+//
+// This implementation uses pre-bound metrics per shard for maximum performance.
+// Call RegisterShard when a shard starts and UnregisterShard when it stops.
+// The hot-path metric methods use O(1) sync.Map lookup instead of expensive
+// WithLabelValues calls that involve hashing and map operations.
+//
+// Transport message metrics (IncMessagesSent/IncMessagesReceived) use simple
+// atomic counters by default for performance. Set EnablePerMessageMetrics=true
+// for detailed per-shard/target/type breakdown (impacts performance).
 type PrometheusMetricsCollector struct {
 	// Registry is the custom Prometheus registry holding all metrics.
 	// Expose this via promhttp.HandlerFor(collector.Registry, ...) to
@@ -78,10 +89,19 @@ type PrometheusMetricsCollector struct {
 	// Pre-bound metrics per shard for O(1) hot-path access.
 	shardMetrics sync.Map // map[uint64]*shardMetrics
 
-	// unregisteredShards tombstones shards whose series UnregisterShard deleted, so a late sample cannot re-create them.
+	// unregisteredShards tombstones every shard whose child series
+	// UnregisterShard deleted, so a residual in-flight sample cannot
+	// re-create them through the fallback path. It holds only shard IDs that
+	// have been registered and then unregistered — exactly the set that would
+	// otherwise leak a full set of Prometheus child series each — so it
+	// replaces per-shard histogram series with a single map key.
 	unregisteredShards sync.Map // map[uint64]struct{}
 
-	// perShard mirrors MetricsConfig.PerShardMetrics: true populates the *Vec fields, false the host-level fields.
+	// perShard mirrors config.MetricsConfig.PerShardMetrics. It selects which
+	// of each aggregatable metric's two representations below is populated:
+	// when true the *Vec field is built and the host-level field is nil, and
+	// when false the reverse. Exactly one of the pair is ever registered, so a
+	// metric name never carries a shard_id label in one scrape and not another.
 	perShard bool
 
 	// Raft metric vectors (for registration and pre-binding). The aggregatable
@@ -97,7 +117,12 @@ type PrometheusMetricsCollector struct {
 	snapshotsVec         *prometheus.CounterVec
 	piggybackCommitsVec  *prometheus.CounterVec
 
-	// Host-level aggregates, populated only when perShard is false, with the vector names minus shard_id.
+	// Host-level aggregates, populated only when perShard is false. They carry
+	// the SAME metric names as the vectors they replace, minus the shard_id
+	// label, so a recording rule written as sum without(shard_id)(...) is
+	// correct in both modes. Their Help text states that they are aggregated,
+	// and quicraft_metrics_per_shard_enabled reports the mode as a gauge so a
+	// dashboard can detect it without reading the config.
 	proposalLatencyHost    prometheus.Histogram
 	commitLatencyHost      prometheus.Histogram
 	applyLatencyHost       prometheus.Histogram
@@ -134,7 +159,11 @@ type PrometheusMetricsCollector struct {
 	snapshotsReceivedVec  *prometheus.CounterVec
 	snapshotsBytesRecvVec *prometheus.HistogramVec
 
-	// Transport drop counters, not pre-bound per shard.
+	// Transport drop counters. Error-path events, so they are not pre-bound
+	// per shard: the reason label would multiply every shard's pre-bound set
+	// by the reason cardinality for series that are idle in a healthy
+	// cluster. They still honor the tombstone and are deleted by
+	// UnregisterShard like every other per-shard series.
 	snapshotsRejectedVec *prometheus.CounterVec
 	messagesDroppedVec   *prometheus.CounterVec
 
@@ -143,7 +172,10 @@ type PrometheusMetricsCollector struct {
 	unauthorizedSnapshotsVec *prometheus.CounterVec
 }
 
-// aggregatedHelp marks a Help string as aggregated without the shard_id label.
+// aggregatedHelp annotates a Help string for a metric whose per-shard
+// breakdown has been collapsed into a single host-level series, so the
+// scrape itself records that the shard_id label is absent by configuration
+// rather than missing by accident.
 func aggregatedHelp(help string) string {
 	return help + " Aggregated across all shards on this host; enable MetricsConfig.PerShardMetrics for a shard_id breakdown."
 }
@@ -196,12 +228,27 @@ func newShardCounterVec(subsystem, name, help string) *prometheus.CounterVec {
 	}, []string{"shard_id"})
 }
 
-// NewPrometheusMetricsCollector creates a collector on a dedicated prometheus.Registry; expose it with promhttp.HandlerFor.
+// NewPrometheusMetricsCollector creates a PrometheusMetricsCollector with all
+// metrics registered on a dedicated prometheus.Registry. The caller should
+// expose the Registry via promhttp.HandlerFor for scraping.
+//
+// It uses the zero config.MetricsConfig, so per-shard metrics are OFF and the
+// volume-and-latency telemetry aggregates to host level. Use
+// NewPrometheusMetricsCollectorWithConfig to opt in to a shard_id breakdown.
+//
+// By default, per-message transport metrics are disabled for performance.
+// Set EnablePerMessageMetrics=true after creation to enable detailed
+// per-shard/target/type message metrics.
 func NewPrometheusMetricsCollector() *PrometheusMetricsCollector {
 	return NewPrometheusMetricsCollectorWithConfig(config.MetricsConfig{})
 }
 
-// NewPrometheusMetricsCollectorWithConfig creates a collector whose label cardinality follows cfg.
+// NewPrometheusMetricsCollectorWithConfig creates a PrometheusMetricsCollector
+// whose label cardinality follows cfg. See config.MetricsConfig for the cost of
+// PerShardMetrics and for which metrics keep a shard_id label regardless.
+//
+// The mode is fixed for the life of the collector: a Prometheus vector's label
+// set is decided when the vector is built, so it cannot be changed afterwards.
 func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *PrometheusMetricsCollector {
 	reg := prometheus.NewRegistry()
 
@@ -209,7 +256,11 @@ func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *Promethe
 		Registry: reg,
 		perShard: cfg.PerShardMetrics,
 
-		// Raft metrics that keep shard_id in both modes: dropped proposals and elections.
+		// --- Raft metrics that keep shard_id in BOTH modes ---
+		// A dropped proposal is a per-shard fault an operator alerts on, and
+		// an election identifies WHICH shard changed leader. Aggregating
+		// either would remove the only label that makes the alert actionable,
+		// and both are one series per shard, not one per histogram bucket.
 		proposalDroppedVec: newShardCounterVec("raft", "proposals_dropped_total",
 			"Total number of dropped proposals."),
 
@@ -302,7 +353,12 @@ func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *Promethe
 			Help:      "Total messages received per shard, source, and message type (detailed, optional).",
 		}, []string{"shard_id", "from", "msg_type"}),
 
-		// Transport drop counters; reason is a closed set and the target replica is not a label.
+		// Transport drop counters. The reason label is a closed set fixed by
+		// the transport (see TransportMetrics), so its cardinality is bounded.
+		// The dropped message's target replica id is deliberately NOT a label:
+		// it would multiply the series count by the shard's membership size
+		// for no diagnostic gain the reason does not already carry, and it is
+		// available in the drop log line.
 		snapshotsRejectedVec: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "quicraft",
 			Subsystem: "transport",
@@ -317,7 +373,16 @@ func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *Promethe
 			Help:      "Raft messages discarded by the transport per shard and reason.",
 		}, []string{"shard_id", "reason"}),
 
-		// Security metrics, low-frequency, looked up without pre-binding.
+		// Security metrics. Low-frequency by design (every increment is a
+		// rejected injection attempt or a misconfiguration), so plain
+		// WithLabelValues lookups are fine — no per-shard pre-binding.
+		// Keyed by shard_id ONLY. The dropped "from" replica id is, by
+		// definition, a value that is NOT a current member and is carried
+		// unauthenticated in the inbound message, so an attacker can emit
+		// arbitrarily many distinct values. Using it as a label would create
+		// unbounded, never-reclaimed Prometheus child series — a persistent
+		// memory/TSDB-cardinality DoS. The "from" is still available in the
+		// drop log line for forensics.
 		unauthorizedMessagesVec: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "quicraft",
 			Subsystem: "security",
@@ -359,7 +424,10 @@ func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *Promethe
 		c.perShardEnabled,
 	}
 
-	// Build only the selected shape of each aggregatable metric.
+	// The aggregatable metrics exist in exactly one of two shapes. Building
+	// both and registering one would be wasteful but harmless; building only
+	// the selected shape keeps the nil *Vec fields as the single source of
+	// truth the fallback helpers branch on.
 	if c.perShard {
 		c.perShardEnabled.Set(1)
 
@@ -447,7 +515,10 @@ func NewPrometheusMetricsCollectorWithConfig(cfg config.MetricsConfig) *Promethe
 // Shard Registration (pre-binding for hot-path performance)
 // ---------------------------------------------------------------------------
 
-// RegisterShard pre-binds the shard's metrics; call it when a shard starts.
+// RegisterShard pre-binds all per-shard metrics for the given shardID.
+// This MUST be called when a shard starts to enable fast metric access.
+// Without registration, metrics for the shard will fall back to slow
+// WithLabelValues lookup.
 func (c *PrometheusMetricsCollector) RegisterShard(shardID uint64) {
 	sid := strconv.FormatUint(shardID, 10)
 
@@ -494,7 +565,18 @@ func (c *PrometheusMetricsCollector) RegisterShard(shardID uint64) {
 	c.shardMetrics.Store(shardID, sm)
 }
 
-// UnregisterShard deletes the shard's pre-bound metrics and child series; call it when a shard stops.
+// UnregisterShard removes the pre-bound metrics for the given shardID. Call this
+// when a shard stops. It deletes both the local cache entry AND the underlying
+// per-shard Prometheus child series: dropping only the cache (as before) left
+// every per-shard series registered forever, so a host that starts and stops
+// shards over time (tenant churn, rebalancing) accumulated unbounded series —
+// a memory/TSDB-cardinality leak.
+//
+// The shard is tombstoned first: once the pre-bound cache entry is gone, a
+// hot-path sample still in flight on the engine apply goroutine (an OnApplied
+// racing StopShard) would otherwise take the fallback and RE-CREATE the very
+// child series this method deletes, reinstating the leak permanently. The
+// tombstone makes those residual samples drop instead.
 func (c *PrometheusMetricsCollector) UnregisterShard(shardID uint64) {
 	c.unregisteredShards.Store(shardID, struct{}{})
 	c.shardMetrics.Delete(shardID)
@@ -505,7 +587,10 @@ func (c *PrometheusMetricsCollector) UnregisterShard(shardID uint64) {
 	c.proposalDroppedVec.DeleteLabelValues(sid)
 	c.electionsVec.DeleteLabelValues(sid)
 
-	// Only the per-shard vectors are deleted; host-level series outlive every shard.
+	// Shard-labelled only when PerShardMetrics is on. In the aggregated mode
+	// these vectors do not exist; the host-level series they were replaced by
+	// outlive every shard and must NOT be deleted, or a host that stops one
+	// shard would reset counters that describe all the others.
 	if c.perShard {
 		c.proposalLatencyVec.DeleteLabelValues(sid)
 		c.commitLatencyVec.DeleteLabelValues(sid)
@@ -535,7 +620,11 @@ func (c *PrometheusMetricsCollector) getShard(shardID uint64) *shardMetrics {
 	return nil
 }
 
-// fallbackAllowed reports whether an unbound shard's sample may create its series; false only after UnregisterShard.
+// fallbackAllowed reports whether a sample for a shard with no pre-bound
+// metrics may create its child series through WithLabelValues. It is false
+// only for shards UnregisterShard has torn down; a shard that was simply
+// never registered still records, so an embedder that does not call
+// RegisterShard is not silently unmetered.
 func (c *PrometheusMetricsCollector) fallbackAllowed(shardID uint64) bool {
 	_, tombstoned := c.unregisteredShards.Load(shardID)
 	return !tombstoned
@@ -715,7 +804,10 @@ func (c *PrometheusMetricsCollector) ObserveSendLatency(d time.Duration) {
 	c.sendLatency.Observe(d.Seconds())
 }
 
-// IncMessagesSent counts a sent message, and per type when EnablePerMessageMetrics is set.
+// IncMessagesSent increments the counter for messages sent.
+// By default, this increments an aggregate counter for performance.
+// If EnablePerMessageMetrics is true, it also updates the detailed
+// per-shard/target/type counter (slower).
 func (c *PrometheusMetricsCollector) IncMessagesSent(shardID, to uint64, msgType uint64) {
 	c.messagesSentTotal.Inc()
 
@@ -728,7 +820,10 @@ func (c *PrometheusMetricsCollector) IncMessagesSent(shardID, to uint64, msgType
 	}
 }
 
-// IncMessagesReceived counts a received message, and per type when EnablePerMessageMetrics is set.
+// IncMessagesReceived increments the counter for messages received.
+// By default, this increments an aggregate counter for performance.
+// If EnablePerMessageMetrics is true, it also updates the detailed
+// per-shard/source/type counter (slower).
 func (c *PrometheusMetricsCollector) IncMessagesReceived(shardID, from uint64, msgType uint64) {
 	c.messagesReceivedTotal.Inc()
 
@@ -771,7 +866,11 @@ func (c *PrometheusMetricsCollector) IncSnapshotsReceived(shardID uint64, bytes 
 	observerFor(c.snapshotsBytesRecvVec, c.snapshotsBytesRecvHost, shardID).Observe(float64(bytes))
 }
 
-// IncSnapshotsRejected counts an inbound snapshot discarded before the state machine, by reason.
+// IncSnapshotsRejected counts an inbound snapshot transfer discarded before it
+// reached the state machine, bucketed by the transport's fixed reason set.
+// Rejections are an error path, so the series is looked up rather than
+// pre-bound; it still respects the shard tombstone so a sample racing
+// UnregisterShard cannot re-create a deleted series.
 func (c *PrometheusMetricsCollector) IncSnapshotsRejected(shardID uint64, reason string) {
 	if !c.fallbackAllowed(shardID) {
 		return
@@ -789,7 +888,13 @@ func (c *PrometheusMetricsCollector) IncMessagesDropped(shardID, _ uint64, reaso
 	c.messagesDroppedVec.WithLabelValues(strconv.FormatUint(shardID, 10), reason).Inc()
 }
 
-// IncUnauthorizedMessageDropped counts an inbound message dropped by shard-membership authorization, by reason; the sender is not a label.
+// IncUnauthorizedMessageDropped counts an inbound Raft message dropped for
+// failing shard-membership authorization, bucketed by the handler's fixed
+// reason set. The from replica id is intentionally NOT used as a metric label
+// (unbounded attacker-controlled cardinality); it is retained in the parameter
+// list for the interface and logged by the caller. reason is safe as a label
+// for the opposite reason: it is a closed set the handler chooses, never a
+// value the sender supplies.
 func (c *PrometheusMetricsCollector) IncUnauthorizedMessageDropped(shardID, _ uint64, reason string) {
 	c.unauthorizedMessagesVec.WithLabelValues(strconv.FormatUint(shardID, 10), reason).Inc()
 }
@@ -805,7 +910,17 @@ func (c *PrometheusMetricsCollector) IncUnauthorizedSnapshotDropped(shardID, _ u
 // SampledMetricsCollector - Ultra-high-performance variant
 // ---------------------------------------------------------------------------
 
-// SampledMetricsCollector wraps a MetricsCollector and samples histogram observations only; counters are forwarded exactly.
+// SampledMetricsCollector wraps a MetricsCollector and samples expensive
+// HISTOGRAM observations (commit latency, apply latency) to reduce overhead
+// in ultra-high-throughput scenarios. Sampling a histogram thins its
+// resolution but keeps its distribution representative.
+//
+// COUNTERS are never sampled: a sampled prometheus.Counter.Inc() would make
+// every *_total series under-report by SampleRate, so every rate()/increase()
+// built on it would be off by orders of magnitude. Message send/receive
+// counts therefore forward every call to the wrapped collector (a counter
+// increment is a cheap atomic add). Less frequent metrics (elections,
+// snapshots) are always recorded.
 type SampledMetricsCollector struct {
 	MetricsCollector
 
@@ -813,7 +928,11 @@ type SampledMetricsCollector struct {
 	// record 1 in 100 observations. Default: 100.
 	SampleRate uint64
 
-	// Each sampled metric owns its counter, so the sampling of one does not depend on another's call pattern.
+	// Each sampled metric owns its counter. A single shared counter makes
+	// the sampling decision depend on the INTERLEAVING of the metrics: with
+	// an even SampleRate and a strictly alternating call pattern, every
+	// multiple of SampleRate lands on the same metric, which is then sampled
+	// always while the other is sampled never.
 	commitCounter atomic.Uint64
 	applyCounter  atomic.Uint64
 }
@@ -850,12 +969,14 @@ func (s *SampledMetricsCollector) ObserveApplyLatency(shardID uint64, d time.Dur
 	}
 }
 
-// IncMessagesSent forwards every send to the wrapped collector.
+// IncMessagesSent forwards EVERY send to the wrapped collector. Counters
+// must be exact; see the SampledMetricsCollector doc comment.
 func (s *SampledMetricsCollector) IncMessagesSent(shardID, to uint64, msgType uint64) {
 	s.MetricsCollector.IncMessagesSent(shardID, to, msgType)
 }
 
-// IncMessagesReceived forwards every receive to the wrapped collector.
+// IncMessagesReceived forwards EVERY receive to the wrapped collector.
+// Counters must be exact; see the SampledMetricsCollector doc comment.
 func (s *SampledMetricsCollector) IncMessagesReceived(shardID, from uint64, msgType uint64) {
 	s.MetricsCollector.IncMessagesReceived(shardID, from, msgType)
 }

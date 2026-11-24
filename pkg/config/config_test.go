@@ -108,7 +108,18 @@ func TestConfig_SetDefaults(t *testing.T) {
 	})
 }
 
-// TestConfig_SetDefaults_SnapshotEntries checks the field's three states (unset, explicit value, disabled) stay distinct.
+// TestConfig_SetDefaults_SnapshotEntries pins the field's tri-state.
+//
+// If zero meant "never snapshot", "never" would be the DEFAULT — the one
+// configuration a practical Raft deployment cannot run in (Ongaro, "Consensus:
+// Bridging Theory and Practice", ch. 5 treats compaction as a requirement, not
+// a feature). In this implementation it would also silently disable three
+// things that advance only inside saveSnapshot: the snapshot-directory GC, the
+// epoch purge floor, and the at-rest barrier — the last of which would leave
+// barrier end-to-end tests asserting nothing at all.
+//
+// Three states, three distinct meanings, and the test asserts each separately
+// because collapsing any two of them is exactly the defect.
 func TestConfig_SetDefaults_SnapshotEntries(t *testing.T) {
 	t.Run("unset takes the default rather than meaning disabled", func(t *testing.T) {
 		c := Config{}
@@ -678,7 +689,16 @@ func TestConfig_Validate_LeaseReadRequiresCheckQuorum(t *testing.T) {
 	})
 }
 
-// TestConfig_Validate_LeaseReadRequiresElectionRTT calls validateLeaseRead directly; validateTiming makes it unreachable through Validate.
+// TestConfig_Validate_LeaseReadRequiresElectionRTT covers the second lease-read
+// precondition: the lease timeout is ElectionRTT-2 ticks, so an ElectionRTT
+// below 5 leaves a lease window too short to be useful (and, at ElectionRTT<=2,
+// non-positive).
+//
+// validateLeaseRead is exercised directly here because validateTiming already
+// rejects ElectionRTT < 5 for every configuration and runs first in Validate,
+// making this check unreachable through the public API. It is kept as
+// defense-in-depth: the lease-read requirement is independent of the general
+// timing floor and must survive a relaxation or reordering of validateTiming.
 func TestConfig_Validate_LeaseReadRequiresElectionRTT(t *testing.T) {
 	t.Run("LeaseRead with ElectionRTT below 5 is rejected", func(t *testing.T) {
 		c := validConfig()

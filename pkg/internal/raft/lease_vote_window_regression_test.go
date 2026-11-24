@@ -24,7 +24,22 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// A read lease rests only on acknowledgements whose vote window the replica promises, across restarts.
+// Regression: a read lease must rest only on acknowledgements whose vote
+// window the acknowledging replica actually promises — and keeps across a
+// restart.
+//
+// The lease is sound while every ack it counts comes from a replica that will
+// help elect no one else until the lease has ended. If that promise were
+// assumed from the LEADER's configuration, and kept by the follower's own
+// configuration and, after a restart, by a hold-down sized from the
+// configuration it restarted into, a follower configured with a shorter
+// election timeout, a shorter tick, no CheckQuorum or no LeaseRead — while
+// running, or only after a restart — would make a weaker promise than the
+// leader counted on, and a new leader could be elected inside the old one's
+// lease. So every ack states its window (voteWindow), the leader counts only acks
+// whose window covers its lease span (ackBacksLease), and the window is
+// recorded in the hard state before any ack makes it, so a restarted replica
+// honours it whatever it restarted into (armVoteHoldDown).
 
 // promisedAck steps a heartbeat from leader 1 into follower f and returns
 // f's HeartbeatResp to it.
@@ -530,7 +545,12 @@ func TestLeaseRead_ForfeitForTheTermOnceTimeoutNowIsSent(t *testing.T) {
 	}
 }
 
-// TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease verifies a stale TimeoutNow cannot elect inside a later lease.
+// TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease drives
+// the reported scenario: L starts a transfer to A, the TimeoutNow is
+// delayed, the transfer times out, heartbeats overtake it and L's followers
+// promise again; then the stale TimeoutNow arrives, A campaigns with the
+// transfer hint and B's promise to L at that term releases its vote. No
+// replica but L may lead while L holds a valid lease.
 func TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease(t *testing.T) {
 	s := leaderLeasingOnF1(t, nil)
 	l := s.nodes[1]

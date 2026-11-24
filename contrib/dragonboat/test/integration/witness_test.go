@@ -44,7 +44,9 @@ func TestIntegration_DB_SyncRequestAddWitness(t *testing.T) {
 		t.Fatalf("expected 0 witnesses initially, got %d", len(membership.Witnesses))
 	}
 
-	// Add witness 30 through the leader and confirm it as a witness at that address.
+	// Add witness replica 30 at a dummy address, through the current leader,
+	// and confirmed by a linearizable read showing it as a WITNESS at that
+	// address -- a voter or a non-voting member at the same ID is a conflict.
 	cluster.addWitnessToLeader(t, 1, 30, "127.10.0.1:59990", dbIdentityFor(30), membership.ConfigChangeID, membershipTimeout)
 
 	// Re-read membership and verify witness replica 30 is present.

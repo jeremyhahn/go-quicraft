@@ -19,7 +19,11 @@ import (
 	"fmt"
 )
 
-// Session sentinel errors, kept here to avoid an import cycle; the quicraft package translates them.
+// Session-specific sentinel errors. These are independent of the quicraft
+// package to avoid import cycles (quicraft imports session transitively
+// via rsm, session must not import quicraft). The quicraft package
+// defines equivalent errors for the public API; these are the
+// session-internal variants.
 var (
 	// ErrSessionLimitExceeded is returned when the total session limit
 	// for a shard has been reached.
@@ -37,7 +41,11 @@ var (
 	// cache exceeds the configured maximum, indicating a misbehaving client.
 	ErrResponseLimitExceeded = errors.New("session: response limit exceeded")
 
-	// ErrResponseEvicted is returned by CheckDuplicate when seriesID was completed and its cached response evicted.
+	// ErrResponseEvicted is returned by CheckDuplicate when the
+	// seriesID has already been completed and its cached response was
+	// evicted (seriesID <= respondedTo). Re-applying this entry would
+	// violate at-most-once semantics. Per Raft PhD Figure 6.1 step 3,
+	// the caller should treat this the same as SESSION_EXPIRED.
 	ErrResponseEvicted = errors.New("session: response already evicted")
 
 	// ErrSnapshotCorrupted is the sentinel for BoundsError, enabling
@@ -45,7 +53,10 @@ var (
 	ErrSnapshotCorrupted = errors.New("session: snapshot data corrupted or malicious")
 )
 
-// maxResponseDataSize bounds one response payload during unmarshal.
+// maxResponseDataSize is the maximum allowed size for a single response
+// data payload during unmarshal. This prevents OOM from corrupted or
+// malicious snapshots that specify huge data lengths. 64 MiB matches
+// the default MaxEntrySize used by the Raft layer.
 const maxResponseDataSize = 64 << 20 // 64 MiB
 
 // BoundsError is returned during snapshot unmarshal when a decoded count

@@ -153,7 +153,16 @@ func usedIdentifiers(t *testing.T) (tree, local map[string]bool, decls []exporte
 	return tree, local, decls
 }
 
-// TestExportedErrors_DocumentedAndReferenced requires every exported Err* value in errors.go to be documented and referenced (directly or as a re-exported sentinel), or allowlisted.
+// TestExportedErrors_DocumentedAndReferenced lists every exported Err* value
+// in errors.go by parsing the file (no hand-written list to drift) and fails
+// unless each one has a doc comment and is live, or is allowlisted in
+// unreferencedExportedErrors with a reason. A value is live when a non-test
+// file of package quicraft references it outside the var declarations of
+// errors.go (returned, wrapped, or matched by a typed error's Is method), or
+// when it re-exports a sentinel that a non-test file of the pkg tree
+// references outside its declaration: callers match such a value with
+// errors.Is against what the lower package returns. The re-export check is
+// by name, so it is an approximation where two packages share a name.
 func TestExportedErrors_DocumentedAndReferenced(t *testing.T) {
 	tree, local, decls := usedIdentifiers(t)
 	if len(decls) == 0 {

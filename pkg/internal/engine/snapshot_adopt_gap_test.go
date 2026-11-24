@@ -22,14 +22,29 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Between a snapshot install and its recovery, raft offers entries from snapshotIndex+1 while lastApplied lags; extracting them fails the shard with ErrApplyGap.
+// The window this file pins: raftLog.restore moves committed AND processed to
+// the snapshot index the instant the step worker steps an InstallSnapshot, but
+// the state machine only adopts that index when the snapshot pool — a separate
+// goroutine, which cannot even raise the recovering gate until it OBSERVES the
+// install (awaitRecoverableLog) — finishes RecoverFromSnapshot and seeds
+// lastApplied. Every entry raft offers in between starts at snapshotIndex+1
+// over a lastApplied that is still behind, which is the ErrApplyGap shape:
+//
+//	ERROR committed entry gap before apply shard=1 replica=4
+//	      last_applied=0 batch_first_index=54
+//
+// A replica that hits it stops applying for good, having just joined.
 
 const (
 	adoptSnapIndex = uint64(100)
 	adoptSnapTerm  = uint64(7)
 )
 
-// installAndCommitNext delivers an InstallSnapshot and the Replicate committing the next entry to node's inbox.
+// installAndCommitNext delivers, to node's INBOX, the InstallSnapshot a leader
+// streams to a joining replica followed by the Replicate that commits the next
+// entry — the two messages that produce the gap, in the order the leader sends
+// them. Nothing here touches the state machine: lastApplied stays where it was,
+// exactly as it does in production until the snapshot pool runs.
 func installAndCommitNext(t *testing.T, node *Node) {
 	t.Helper()
 	if !node.DeliverLocal(installSnapshotMessage(node, adoptSnapIndex, adoptSnapTerm)) {
@@ -76,7 +91,13 @@ func assertLogIsAheadOfStateMachine(t *testing.T, node *Node, peer *raft.Peer) {
 	}
 }
 
-// TestProcessReady_WithholdsCommittedEntriesUntilSnapshotAdopted covers the step worker's extraction gate.
+// TestProcessReady_WithholdsCommittedEntriesUntilSnapshotAdopted covers the
+// step worker's extraction gate. A batch extracted in this window reaches the
+// apply worker starting at snapshotIndex+1 with lastApplied still behind, and
+// the apply worker — correctly — refuses it with ErrApplyGap and fails the
+// shard. The entries must stay in the log instead: extraction is the only
+// thing that advances the processed marker, so withholding them re-offers the
+// same batch once recovery seeds lastApplied.
 func TestProcessReady_WithholdsCommittedEntriesUntilSnapshotAdopted(t *testing.T) {
 	commitC := make(chan *commitItem, 16)
 	stopC := make(chan struct{})
@@ -128,7 +149,12 @@ func TestProcessReady_WithholdsCommittedEntriesUntilSnapshotAdopted(t *testing.T
 	}
 }
 
-// TestCommitUpdateLocked_WithholdsPiggybackUntilSnapshotAdopted covers the commit worker's piggyback half of the gate.
+// TestCommitUpdateLocked_WithholdsPiggybackUntilSnapshotAdopted covers the
+// commit worker's half of the same gate. The update that carries the snapshot
+// has no committed entries of its own, so Peer.Commit is followed by the
+// piggyback extraction — which reaches straight past the un-adopted snapshot
+// index and hands the apply worker the same gapped batch the step worker was
+// stopped from producing.
 func TestCommitUpdateLocked_WithholdsPiggybackUntilSnapshotAdopted(t *testing.T) {
 	node, peer := newRecoveryTestNode(t, 1, 1, newSnapshotTestSnapshotter(0))
 

@@ -38,7 +38,12 @@ func (f *failingSyncFile) Sync() error {
 	return f.File.Sync()
 }
 
-// TestFsyncFailurePoisonsDB checks a failed sync poisons the DB: the write and every later one return ErrDBPoisoned.
+// TestFsyncFailurePoisonsDB verifies the fail-stop contract: when the
+// sync phase of a batched write fails, the DB is poisoned — the failing
+// write returns ErrDBPoisoned (with the underlying cause preserved) and
+// every subsequent write is refused with ErrDBPoisoned. Retrying after a
+// failed fdatasync has undefined durability semantics (fsyncgate), so a
+// retryable error here would be a correctness bug.
 func TestFsyncFailurePoisonsDB(t *testing.T) {
 	dir := t.TempDir()
 	// NoSync must be OFF so the sync phase actually runs.

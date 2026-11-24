@@ -22,7 +22,19 @@ import (
 	"time"
 )
 
-// TestStopReplica_StopsLikeStopShardAndRestartsWithState checks the StopReplica contract in docs/multi-group-host/api.md on a real Host.
+// TestStopReplica_StopsLikeStopShardAndRestartsWithState pins the documented
+// StopReplica contract (docs/multi-group-host/api.md, Replica management;
+// docs/membership-changes/api.md, local destructive replica operations) on a
+// real Host with a real WAL:
+//
+//   - a replica ID other than the loaded one returns *ReplicaNotFoundError and
+//     leaves the shard running;
+//   - the loaded replica ID stops the shard exactly like StopShard, keeps the
+//     replica's bootstrap record (HasNodeInfo), and a second stop returns
+//     ErrShardNotFound;
+//   - StartShard of the same replica on the same Host recovers its state from
+//     the log;
+//   - a closed Host returns ErrClosed.
 func TestStopReplica_StopsLikeStopShardAndRestartsWithState(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithoutTransport(), WithoutEncryption())

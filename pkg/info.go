@@ -43,7 +43,11 @@ const (
 	// a state machine failure or LogDB failure.
 	ShardError
 
-	// ShardRecovering means the state machine is being replaced by a received snapshot; the replica votes and replicates but applies nothing.
+	// ShardRecovering indicates the shard's state machine is being
+	// replaced by a received snapshot (RecoverFromSnapshot). The replica
+	// keeps participating in Raft — it votes and replicates — but applies
+	// nothing and serves no up-to-date local read until recovery
+	// completes, which takes as long as the user state machine needs.
 	ShardRecovering
 
 	// ShardSnapshotting indicates the shard is capturing a consistent
@@ -62,7 +66,13 @@ func (h ShardHealth) MarshalJSON() ([]byte, error) {
 	return json.Marshal(h.String())
 }
 
-// UnmarshalJSON decodes a ShardHealth string, rejecting an unknown one with *InvalidShardHealthError.
+// UnmarshalJSON decodes a JSON string back into a ShardHealth value.
+//
+// An unrecognized string is rejected with *InvalidShardHealthError and leaves
+// the receiver untouched. It is NOT decoded to ShardHealthy: that is the zero
+// value and the most reassuring state this type has, so defaulting to it would
+// report a shard as healthy on the strength of a typo, a truncated payload, or
+// a health state a newer binary knows and this one does not.
 func (h *ShardHealth) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -98,7 +108,10 @@ var shardHealthNames = map[ShardHealth]string{
 	ShardSnapshotting: "snapshotting",
 }
 
-// ShardInfo is a point-in-time copy of a shard's status.
+// ShardInfo provides a point-in-time snapshot of a shard's status.
+// The returned ShardInfo is a copy and is NOT live-updated. Fields like
+// LeaderID and Pending reflect the state at call time and may be stale
+// by the time the caller inspects them.
 type ShardInfo struct {
 	// ShardID is the unique identifier for this shard.
 	ShardID uint64 `json:"shard_id"`
@@ -109,13 +122,19 @@ type ShardInfo struct {
 	// LeaderID is the current leader's replicaID. 0 if no leader is known.
 	LeaderID uint64 `json:"leader_id"`
 
-	// Term is the term of the last published leadership change, not the current Raft term.
+	// Term is the term of the last leadership change this replica
+	// published, not its current Raft term. It does not advance while no
+	// leader is known, so during split-vote churn it stands still while the
+	// replica's real term climbs.
 	Term uint64 `json:"term"`
 
 	// IsLeader is true if this replica is the current leader.
 	IsLeader bool `json:"is_leader"`
 
-	// IsObserver is true if this replica is a non-voting observer in the committed membership.
+	// IsObserver is true if this replica is currently a non-voting observer.
+	// It follows the committed membership, not Config.IsObserver: an observer
+	// whose promotion to voter has been applied on this host reports false
+	// without a restart.
 	IsObserver bool `json:"is_observer"`
 
 	// IsWitness is true if this replica is a voting witness without a
@@ -146,10 +165,25 @@ type ShardInfo struct {
 	// been applied yet.
 	ConfigChangeIndex uint64 `json:"config_change_index"`
 
-	// Paused is true between Host.PauseShard and Host.ResumeShard; a paused replica reports no leader.
+	// Paused is true while the replica is paused by Host.PauseShard and
+	// not yet resumed by Host.ResumeShard. A pause is not persisted: a
+	// restarted replica reports false. A paused replica neither leads nor
+	// follows, so it reports LeaderID 0, IsLeader false and Health
+	// ShardNoLeader until ResumeShard; Term keeps its last published value.
 	Paused bool `json:"paused"`
 
-	// Replicas reports each remote member's replication as this leader sees it, tagged with its Role; nil on a follower.
+	// Replicas reports how far each remote member has replicated, as this
+	// leader understands it: voters, observers (learners) and witnesses, each
+	// tagged with its Role. Callers that want voters only, for quorum or
+	// health arithmetic, must filter on ReplicaProgress.Role. It is empty on a follower, which tracks no such state,
+	// and empty on the first call for a shard because publication is opt-in
+	// and the next tick has not run yet.
+	//
+	// This is what answers "which replica is behind, and why". Before it
+	// existed the same information was reachable only by parsing the
+	// DiagRemotes debug string, so it was available to a human reading a log
+	// line and to nothing else — not to an operator dashboard, not to an
+	// alerting rule, not to a pre-upgrade safety check.
 	Replicas []ReplicaProgress `json:"replicas,omitempty"`
 }
 
@@ -168,7 +202,12 @@ const (
 	ReplicaRoleWitness ReplicaRole = "witness"
 )
 
-// ReplicaProgress is one remote member's replication position as the leader believes it; Role says whether it is a voter, observer or witness.
+// ReplicaProgress is one remote member's replication position from the
+// leader's point of view. The member may be a voter, an observer or a witness;
+// Role says which, and callers that only care about voters filter on it. Every field is the leader's local belief, which is precisely
+// what makes it useful when diagnosing a stall: a follower stuck in probe with
+// a stale match index is a different problem from one that is merely behind,
+// and one pinned at the inflight limit is flow-controlled rather than slow.
 type ReplicaProgress struct {
 	// ReplicaID identifies the member.
 	ReplicaID uint64 `json:"replica_id"`
@@ -190,7 +229,10 @@ type ReplicaProgress struct {
 	// inflight window is full or a probe is awaiting its response.
 	Paused bool `json:"paused"`
 
-	// Active is true if the follower responded within the election timeout; an inactive follower does not count toward a live quorum.
+	// Active is true if the follower has responded within the election
+	// timeout. An inactive follower still counts in the configuration but
+	// not toward a live quorum — the distinction that decides whether it is
+	// safe to take another replica down.
 	Active bool `json:"active"`
 
 	// Inflights is the number of unacknowledged messages in the window.
@@ -259,24 +301,45 @@ type RaftStateDiag struct {
 	// PendingMessages is the number of outbound raft messages not yet sent.
 	PendingMessages int `json:"pending_messages"`
 
-	// State is the replica's role with its timers, such as "leader(hb=1 et=4)", with " self-removed" when absent from the configuration.
+	// State is the replica's role with its timers, for example
+	// "leader(hb=1 et=4)" or "follower(et=7)", followed by " self-removed"
+	// when the replica is absent from the current configuration and by
+	// " unreadable-log-denials=N" when N votes were denied because its own
+	// last log term could not be read. Before the first publication it is
+	// "(diagnostics warming up)". It is for humans; do not parse it.
 	State string `json:"state"`
 }
 
 // RemotesDiag is the leader's view of its remotes, returned by
 // Host.DiagRemotes for debugging commit stalls.
 type RemotesDiag struct {
-	// Text renders each remote as "r<id>[role= match= next= state= paused= active= inflights=]" in replica-ID order, or "not leader".
+	// Text renders each remote as
+	// "r<id>[role= match= next= state= paused= active= inflights=]",
+	// space-separated in replica-ID order. It is "not leader" on a replica
+	// that tracks no remotes and "(diagnostics warming up)" before the first
+	// publication. It is for humans; ShardInfo.Replicas carries the same
+	// state structured.
 	Text string `json:"text"`
 }
 
 // HealthStatus describes the overall health of a Host instance. The Status
 // field is one of "ok", "degraded", "sealed", or "unhealthy".
 type HealthStatus struct {
-	// Status is the aggregate verdict: "ok", "degraded", "not-ready", "sealed" or "unhealthy"; "not-ready" means a started shard has been leaderless past its election window.
+	// Status is the aggregate health verdict: "ok", "degraded",
+	// "not-ready", "sealed", or "unhealthy". "not-ready" means at least one
+	// started, unpaused shard has had no known leader for longer than its
+	// election window, 3 * ElectionRTT * RTTMillisecond (the largest
+	// randomized election timeout, 2*ElectionRTT, plus one election timeout
+	// for the campaign), so it cannot commit a write; NotReadyShards names
+	// those shards. The window starts when the shard starts, loses its
+	// leader, or is resumed from a pause, so a normal election does not flap
+	// health.
 	Status string `json:"status"`
 
-	// NotReadyShards lists, ascending, the shards leaderless past their election window, whatever Status is; omitted when empty.
+	// NotReadyShards lists, in ascending order, the IDs of the shards that
+	// have had no known leader for longer than their election window.
+	// Omitted when empty. It is filled whatever Status is, so a "degraded"
+	// or "sealed" host still names its leaderless shards.
 	NotReadyShards []uint64 `json:"not_ready_shards,omitempty"`
 
 	// BarrierSealed is true when the barrier is configured and sealed.
@@ -291,7 +354,14 @@ type HealthStatus struct {
 	// Shards contains per-shard health information. Omitted when empty.
 	Shards []ShardInfo `json:"shards,omitempty"`
 
-	// DiagnosticsDropped is the number of library log records dropped since process start because the slog handler was not taking them.
+	// DiagnosticsDropped is the number of library log records dropped since
+	// the process started because the handler installed through
+	// slog.SetDefault was not taking them: the library emits its diagnostics
+	// through one bounded queue, never blocking the goroutine that produced
+	// them, and drops a record when that queue is full. A rising count means
+	// the handler is blocking or far slower than the process logs. The count
+	// is process-wide, as the default handler is, so every Host in a process
+	// reports the same value. It does not affect Status.
 	DiagnosticsDropped uint64 `json:"diagnostics_dropped"`
 }
 

@@ -20,7 +20,20 @@ import (
 	"testing"
 )
 
-// TestCombineRejectsZeroXCoordinate pins that a share with x = 0 is rejected; it would dictate the reconstructed secret.
+// TestCombineRejectsZeroXCoordinate pins the rule that makes reconstruction's
+// output un-choosable.
+//
+// Deleting the x == 0 branch from parseRawShare left the whole package suite
+// green — the duplicate-x and format-version guards beside it are both tested,
+// only this one was not.
+//
+// Why it matters: reconstruction evaluates the Lagrange basis at x = 0. For a
+// share whose own x-coordinate IS 0, the basis coefficient is
+// Π(x_m / (0 ⊕ x_m)) = 1, while every OTHER share's basis contains a factor
+// evaluated at x_m = 0, which is 0 in GF(2^8). The interpolation therefore
+// returns exactly that share's y bytes as the "reconstructed secret",
+// regardless of the genuine shares supplied alongside it. One crafted share
+// dictates the output of a recovery ceremony.
 func TestCombineRejectsZeroXCoordinate(t *testing.T) {
 	secret := []byte("root-key-material-32-bytes-long!")
 	values := splitValues(t, secret, 2, 3)

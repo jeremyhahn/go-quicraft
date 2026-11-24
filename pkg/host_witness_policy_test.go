@@ -30,7 +30,15 @@ const (
 	witnessPolicyRTTMs = uint64(20)
 )
 
-// witnessPolicyCluster is three running Hosts on one shard plus spare Hosts whose identities admit never-running witnesses.
+// witnessPolicyCluster is three real Hosts running one shard over mTLS, plus
+// spare Hosts whose identities and addresses witness replicas are admitted
+// under. A witness is admitted by membership only: it never runs, and the
+// three full replicas hold the quorum by themselves for every membership
+// this test builds (at most two witnesses, so quorum 3 of 5).
+//
+// newExecCluster (leaderexec_test.go) never starts its engines, so no config
+// change can commit through it; this cluster is built the way
+// newFailoverCluster builds its own.
 type witnessPolicyCluster struct {
 	t       *testing.T
 	hosts   []*Host
@@ -212,7 +220,12 @@ func (c *witnessPolicyCluster) updatePolicy(max int, rfrm bool) error {
 	})
 }
 
-// TestWitnessPolicy_UpdateReplicatesSurvivesRestartAndRefusesAViolatedPolicy checks the witness policy contract in docs/membership-changes.
+// TestWitnessPolicy_UpdateReplicatesSurvivesRestartAndRefusesAViolatedPolicy
+// checks docs/membership-changes (Change the witness policy): the policy is
+// replicated state every replica reports through ShardMembership, a witness
+// add the policy forbids and a tightening the membership already violates are
+// refused with ErrTooManyWitnesses, a stale configChangeIndex is refused, and
+// a restarted replica recovers the policy.
 func TestWitnessPolicy_UpdateReplicatesSurvivesRestartAndRefusesAViolatedPolicy(t *testing.T) {
 	c := newWitnessPolicyCluster(t, 2)
 

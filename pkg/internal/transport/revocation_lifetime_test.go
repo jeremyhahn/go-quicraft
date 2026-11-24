@@ -20,7 +20,19 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport/revocation"
 )
 
-// transportPairWithRevocation builds a connected pair with a soft-fail checker on the dialing transport.
+// transportPairWithRevocation builds a connected pair and attaches a checker
+// to the DIALING transport.
+//
+// The checker is attached directly rather than through Config.RevocationConfig
+// because that path requires a CRL file or an OCSP responder, and neither is
+// needed here: the unit under test is revokeCheckConnections, and
+// AddRevokedSerial is the checker's own admin entry point. Going through the
+// config would test config validation, not connection eviction.
+//
+// The checker opts into soft-fail for the same reason. revokeCheckConnections
+// treats a checker ERROR as grounds to close, so an enforcing checker with no
+// source would tear the connection down for the missing source and the test
+// would pass without the revocation having done anything.
 func transportPairWithRevocation(t testing.TB) (*QUICTransport, *QUICTransport, func()) {
 	t.Helper()
 	t1, t2, cleanup := transportPairWith(t, 42, newTestHandler(), newTestHandler())

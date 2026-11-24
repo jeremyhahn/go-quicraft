@@ -16,7 +16,15 @@
 
 package transport
 
-// netFaultEnabled is a constant false so netFaultEnabled && netFaultDrop(...) folds away in normal builds.
+// netFaultEnabled is a compile-time constant so that every
+//
+//	if netFaultEnabled && netFaultDrop(...)
+//
+// site in the send path folds away entirely in a normal build: the compiler
+// proves the condition false, drops the call, and the shipped binary is
+// identical to one written without the hook. This is the same discipline the
+// quicraft_errfs and quicraft_fuzz suites use — the injection point costs
+// production nothing, and the test build pays for it alone.
 const netFaultEnabled = false
 
 // netFaultDrop is the no-op stand-in. It is never called in this build; it

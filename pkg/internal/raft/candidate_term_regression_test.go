@@ -6,7 +6,16 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestStepCandidate_LocalInstallSnapshotDoesNotRegressTerm verifies a term-less local install cannot lower a candidate's term or clear its vote.
+// TestStepCandidate_LocalInstallSnapshotDoesNotRegressTerm asserts that a
+// term-less local message cannot drive a candidate's term backwards.
+//
+// The snapshot receive path builds InstallSnapshot with Term 0 (it is injected
+// in-process, so there is no term to carry), and becomeFollower assigned
+// msg.Term unconditionally. A follower that is catching up by snapshot and
+// whose election timer fires mid-transfer becomes a candidate at term N; the
+// install then lands on that candidate and dropped it to term 0, clearing its
+// vote. It would grant votes again in terms it had already voted in — two
+// leaders in one term, an Election Safety violation.
 func TestStepCandidate_LocalInstallSnapshotDoesNotRegressTerm(t *testing.T) {
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfg(1, 1)

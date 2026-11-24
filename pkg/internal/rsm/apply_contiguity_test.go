@@ -27,7 +27,25 @@ import (
 // checkpoint sequence a contiguous log would produce.
 const maxBridgedEntries = 1 << 21
 
-// applyContiguous applies entries against a contiguous log, filling index gaps with empty entries or resuming at the index for very large gaps.
+// applyContiguous applies entries the way the engine's apply worker does: against a
+// CONTIGUOUS committed log.
+//
+// A raft log has no holes, so entries[0].Index is always lastApplied+1 in
+// production and Apply rejects anything else (see the contiguity guard in
+// Apply). Tests, though, routinely jump the index to make a session look idle
+// for hundreds of entries without writing hundreds of entries, and that jump is
+// not the condition the guard exists to catch. applyContiguous closes the gap the same
+// way the log would: with the empty EntryNormal entries raft commits between
+// two user commands, which the classification loop skips, which reach no user
+// state machine, and which drive EXACTLY the expiry checkpoints a single sparse
+// Apply would drive. The observable behaviour of the call is therefore the
+// same; only the index stream is made legal.
+//
+// A hole too large to bridge (a test reaching for 1<<40 to prove a threshold is
+// unreachable) is closed by RESUMING the state machine at that index, which is
+// what Host.StartShard does for a restarted replica. That skips the intervening
+// checkpoints, so it is used only where the test's own threshold makes them
+// vacuous.
 func applyContiguous(t *testing.T, s *StateMachine, entries []proto.Entry, results []sm.Result) error {
 	t.Helper()
 	if len(entries) == 0 {

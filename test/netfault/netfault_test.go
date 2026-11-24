@@ -12,7 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// No build tag: the injector's own logic is tested in an ordinary build.
+// This file deliberately carries NO build tag, unlike the suites that drive the
+// injector. The injector's own logic must be tested in an ordinary build,
+// because a defect in it does not produce a failure — it produces a partition
+// test that passes against a perfectly healthy cluster. That is the exact class
+// of vacuous gate this package was written to eliminate, so leaving the
+// eliminator itself untested would be self-defeating.
 package netfault
 
 import (
@@ -95,7 +100,11 @@ func TestIsolateCutsBothDirections(t *testing.T) {
 	}
 }
 
-// TestPartitionCutsAcrossAndNotWithin checks each side of a partition stays connected while nothing crosses it.
+// TestPartitionCutsAcrossAndNotWithin is what makes a split-brain test mean
+// anything: each side must remain internally connected so it can elect among
+// itself, while nothing crosses the cut. A partition that also severed traffic
+// WITHIN a side would prevent either side from electing, and a
+// "minority cannot elect" test would pass for the wrong reason.
 func TestPartitionCutsAcrossAndNotWithin(t *testing.T) {
 	reset(t)
 	left, right := []uint64{1, 2}, []uint64{3, 4, 5}

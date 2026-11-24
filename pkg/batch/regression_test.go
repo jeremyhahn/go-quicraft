@@ -117,7 +117,19 @@ func (r *recordingProposer) awaitCall(t *testing.T, within time.Duration, what s
 	}
 }
 
-// TestSubmit_CopiesCallerBuffer checks Submit copies the caller's buffer, so refilling it before the flush cannot change the replicated command.
+// TestSubmit_CopiesCallerBuffer is the regression test for the retained-buffer
+// defect. Submit stored the caller's slice BY REFERENCE, and the bytes were
+// not read until the flush encoded the batch — up to FlushInterval later, on
+// another goroutine. A caller that recycles a pooled buffer once Submit has
+// returned (its own deadline expiring is the ordinary way that happens) then
+// had the buffer's LATER contents encoded and replicated: every replica
+// applies the same wrong command, so there is no divergence to detect it — a
+// silently, permanently wrong committed write.
+//
+// The test pins the ownership property itself rather than one timing window:
+// the buffer is refilled while the proposal is provably still in the unflushed
+// batch, and the flush is then triggered deterministically. If Submit retains
+// the caller's array, the recycled contents reach the proposer.
 func TestSubmit_CopiesCallerBuffer(t *testing.T) {
 	const (
 		original  = "ORIGINAL-COMMAND"
@@ -173,7 +185,13 @@ func TestSubmit_CopiesCallerBuffer(t *testing.T) {
 	}
 }
 
-// TestSubmit_TimedOutCallerBufferIsNotReplicated checks a timed-out caller's refilled buffer is never encoded: the flush sees the original bytes or nothing.
+// TestSubmit_TimedOutCallerBufferIsNotReplicated is the same defect in the
+// shape it was found in: a caller with a 25ms deadline gets DeadlineExceeded
+// back while the batch is still unflushed, refills its pooled buffer, and the
+// flush encodes whatever is in it at that point. Two independent fixes have to
+// hold for this to be safe — Submit must not retain the buffer, and a proposal
+// whose caller has already given up must not be carried into the batch at all
+// — so what the flush sees must be either the original bytes or nothing.
 func TestSubmit_TimedOutCallerBufferIsNotReplicated(t *testing.T) {
 	const (
 		original  = "ORIGINAL-COMMAND"
@@ -217,7 +235,21 @@ func TestSubmit_TimedOutCallerBufferIsNotReplicated(t *testing.T) {
 	}
 }
 
-// TestSubmitNoCopy_DoesNotCopy checks by backing-array identity, while the proposal is still unflushed, that SubmitNoCopy does not copy.
+// TestSubmitNoCopy_DoesNotCopy pins the other half of the ownership contract:
+// SubmitNoCopy is the documented zero-copy path, so it must NOT copy. Without
+// this the "copy in Submit" fix could be satisfied by copying everywhere,
+// silently removing the escape hatch the doc promises.
+//
+// The check is an IDENTITY check on the backing array of the slice the
+// aggregator stored, not a comparison of bytes. Its previous shape said in a
+// comment that "comparing the bytes cannot tell a copy from the original, so
+// compare identity" and then compared the bytes anyway — through the proposer,
+// which never sees the caller's slice at all because EncodeBatch copies every
+// command into a fresh payload. Making SubmitNoCopy copy left it passing.
+//
+// The proposal is inspected while it is still in the unflushed batch, which is
+// the only point at which the aggregator's own reference to the caller's array
+// is observable.
 func TestSubmitNoCopy_DoesNotCopy(t *testing.T) {
 	p := newRecordingProposer()
 	agg, err := NewAggregator(p,
@@ -283,7 +315,12 @@ func batchedDataOf(t *testing.T, a *Aggregator, i int) []byte {
 	return data
 }
 
-// TestFlush_CancelledProposalIsNotReplicated checks a cancelled proposal's bytes are dropped from the encoded batch.
+// TestFlush_CancelledProposalIsNotReplicated is the regression test for the
+// carried-along payload. proposeContext only chose which context to propose
+// UNDER; it never removed a dead proposal's bytes from the encoded batch. A
+// caller told context.Canceled — which reads as a DEFINITE rejection, not an
+// indeterminate outcome — still had its command replicated on the back of
+// whichever proposal in the batch was still live.
 func TestFlush_CancelledProposalIsNotReplicated(t *testing.T) {
 	const (
 		cancelled = "CANCELLED-WRITE"
@@ -329,7 +366,12 @@ func TestFlush_CancelledProposalIsNotReplicated(t *testing.T) {
 	}
 }
 
-// TestProposeContext_DoesNotAdoptShortestCallerDeadline checks one caller's short deadline does not govern the whole batch.
+// TestProposeContext_DoesNotAdoptShortestCallerDeadline is the regression test
+// for one submitter's deadline governing the whole batch. A 200ms caller that
+// landed in the batch first made the batch's propose expire after 200ms, so a
+// 30s caller sharing it got FlushError{Indeterminate} with 29.8s of its budget
+// unspent — and the only remedy the aggregator offers, an at-least-once retry,
+// duplicates every command in the batch.
 func TestProposeContext_DoesNotAdoptShortestCallerDeadline(t *testing.T) {
 	p := newRecordingProposer()
 	p.hold = 400 * time.Millisecond
@@ -384,7 +426,13 @@ func TestProposeContext_DoesNotAdoptShortestCallerDeadline(t *testing.T) {
 	}
 }
 
-// TestProposeContext_CapsLongCallerDeadline checks ProposeTimeout also caps a caller's long deadline, so the flush loop cannot wedge.
+// TestProposeContext_CapsLongCallerDeadline is the test for the other
+// direction. If ProposeTimeout applied ONLY when the caller supplied no
+// deadline of its own, a caller passing a legitimate one-hour deadline would
+// bypass it entirely: flush runs on the single flush loop and waits for the
+// shard goroutines, so the aggregator would stop flushing FOR EVERY SHARD and
+// Close would block behind wg.Wait — exactly the wedge ProposeTimeout exists to
+// prevent.
 func TestProposeContext_CapsLongCallerDeadline(t *testing.T) {
 	p := &ctxBoundProposer{entered: make(chan struct{})}
 	agg, err := NewAggregator(p,
@@ -492,7 +540,15 @@ func TestProposeContext_UnrelatedShardKeepsFlushing(t *testing.T) {
 	}
 }
 
-// TestAwaitResult_PrefersDeliveredResultOverContextError checks a delivered result wins over a simultaneously expired context.
+// TestAwaitResult_PrefersDeliveredResultOverContextError is the regression test
+// for the 50/50 select. When the batch result and the caller's context become
+// ready together, Go's select chooses uniformly, so a COMMITTED write was
+// reported as a timeout half the time. The caller's only recourse is to retry
+// a batch of up to MaxBatchSize commands through a path with no at-most-once
+// guarantee, so every such report is a potential duplicate application.
+//
+// Both cases are made ready before the select is evaluated, and the check is
+// repeated: an unfixed build fails within the first handful of iterations.
 func TestAwaitResult_PrefersDeliveredResultOverContextError(t *testing.T) {
 	agg, err := NewAggregator(&mockProposer{},
 		WithConfig(Config{MaxBatchSize: 1000, FlushInterval: time.Hour, QueueSize: 10}),
@@ -518,7 +574,12 @@ func TestAwaitResult_PrefersDeliveredResultOverContextError(t *testing.T) {
 	}
 }
 
-// TestFlush_ByteCapSplitsBatch checks the byte cap splits a batch that would exceed the single-entry limit.
+// TestFlush_ByteCapSplitsBatch is the regression test for the missing byte
+// cap. Only the proposal COUNT triggered a flush, so MaxBatchSize commands of
+// a few KiB each build a batch far past the single-entry limit; the host
+// rejects the whole batch as EntryTooLarge, the aggregator has no
+// split-and-retry, and the next batch forms identically — writes that
+// individually succeed fail forever.
 func TestFlush_ByteCapSplitsBatch(t *testing.T) {
 	const (
 		capBytes = 1024
@@ -636,7 +697,15 @@ func TestEncodeBatch_RejectsOverMaxInt32(t *testing.T) {
 	}
 }
 
-// TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotOverflowBound checks both decode paths refuse a near-MaxInt32 length prefix with a DecodeError.
+// TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotOverflowBound pins the bound check
+// that follows the uint32-to-int narrowing of a length prefix. A prefix of
+// exactly MaxInt32 passes the MaxInt32 guard, and on a 32-bit build the sum
+// off+cmdLen then overflows int to a negative value that slips past an
+// off+cmdLen > len(data) comparison and panics the slice expression. Both
+// decode paths must refuse it with a DecodeError on every platform; EncodeBatch
+// never writes a prefix larger than the bytes that follow it. These inputs can
+// only overflow a 32-bit int; TestFits_NoOverflowNearMaxInt drives the shared
+// bound helper past a 64-bit int too.
 func TestDecodeBatch_LengthPrefixNearMaxInt32DoesNotOverflowBound(t *testing.T) {
 	inputs := map[string][]byte{
 		"first prefix":  {0x7f, 0xff, 0xff, 0xff},

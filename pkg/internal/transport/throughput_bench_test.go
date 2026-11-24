@@ -26,7 +26,52 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// End-to-end transport throughput over a real QUIC connection.
+// End-to-end transport throughput.
+//
+// Every other benchmark in this package measures serialization in isolation.
+// This one pushes real replication-shaped traffic through a live pair of QUIC
+// endpoints over loopback (mTLS, the production frame/marshal/stream path) and
+// reports sustained MB/s via b.SetBytes, so a change to the QUIC flow-control
+// windows is observable rather than invisible.
+//
+// The connection receive window is varied through the PRODUCTION derivation in
+// connectionReceiveWindow(MaxMessageReceiveMemory, MaxIncomingConnections)
+// rather than through a test-only seam. MaxMessageReceiveMemory is held at
+// benchRecvBudget (so the application-level receive budget, and the per-peer
+// quarter-budget cap derived from it, are identical in every variant) and
+// MaxIncomingConnections alone selects the window:
+//
+//	1 GB / 128 conns =  8 MB  (the floor, and the default outcome)
+//	1 GB /  64 conns = 16 MB
+//	1 GB /  32 conns = 32 MB  (maxConnectionReceiveWindowCeiling)
+//
+// The budget is twice the 512 MB default because this benchmark keeps up to 16
+// ~1 MB frames from ONE peer in flight, and each is charged at
+// proto.MaxDecodeMemoryFactor: 16 x 8 MB fills the default per-peer quarter
+// exactly, and the frame overhead tips it over, so the default would measure
+// receive-budget drops instead of flow control. Production pools carry at most
+// 15 data streams (StreamPoolSize 16).
+//
+// MaxIncomingConnections otherwise only sizes the accept semaphore, and the
+// benchmark uses a single connection, so it has no other effect here.
+//
+// Concurrency is varied by sending on distinct shard IDs, which getStream maps
+// to distinct QUIC streams on the one connection. This is the case the 8 MB
+// floor is suspected to hurt: the connection window then EQUALS the per-stream
+// window (maxStreamReceiveWindow), so N streams share a budget that a single
+// stream could already claim alone.
+//
+// WHAT THIS BENCHMARK CANNOT SHOW. It runs over loopback, where the RTT is
+// ~0.05 ms. A receive window bounds throughput at window/RTT, so even the 8 MB
+// floor permits ~160 GB/s here — three orders of magnitude above what the
+// transport achieves. Flow control is therefore NOT the binding constraint in
+// this measurement and no window difference can appear; the result is bounded
+// by per-byte CPU (marshal, AEAD, the receive path's bulk Cmd copy). The
+// streams=1 point is an internal control: with one stream the in-flight
+// capacity is min(stream window, connection window) = 8 MB in EVERY variant,
+// so its variant-to-variant delta is pure measurement noise and calibrates how
+// large a delta elsewhere must be before it means anything. Judging the window
+// on bandwidth-delay-product grounds requires a link with real RTT.
 const (
 	// benchEntryBytes is one replication entry payload, in the size range
 	// raft's replication chunking actually produces.
@@ -42,7 +87,10 @@ const (
 	// iteration, split evenly across the concurrent streams.
 	benchTotalBytes = 256 << 20
 
-	// benchWarmupFrames is the frames sent down each stream before the timer starts, excluding connection and congestion ramp-up.
+	// benchWarmupFrames is the number of frames pushed down EACH stream
+	// before the timer starts, so connection setup, stream opening, QUIC
+	// congestion-control ramp, and flow-control autotuning are excluded from
+	// the measured region.
 	benchWarmupFrames = 16
 
 	// benchStreamPoolSize must exceed the highest concurrency level by more
@@ -190,7 +238,12 @@ func benchmarkThroughput(b *testing.B, incomingConns int, wantWindow uint64, str
 		entries[i] = proto.Entry{Term: 1, Index: uint64(i + 1), Cmd: payload}
 	}
 
-	// burst pushes framesPerStream frames down each concurrent stream, one shard ID per goroutine.
+	// burst pushes framesPerStream frames down each of the concurrent streams.
+	// Each goroutine uses a distinct shard ID, which getStream maps to a
+	// distinct stream on the single connection. sendBatch blocks in
+	// stream.Write when QUIC flow control is exhausted, so this applies
+	// backpressure rather than dropping, which is what makes the transfer
+	// measurable end to end.
 	burst := func(framesPerStream int) {
 		var wg sync.WaitGroup
 		wg.Add(streams)

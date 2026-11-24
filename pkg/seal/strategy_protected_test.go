@@ -24,20 +24,28 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// protectedRootKey returns a 32-byte root key in locked memory and the test's own plaintext copy.
+// protectedRootKey returns a 32-byte root key already in locked memory, plus
+// the plaintext copy the test compares against. The comparison copy is the
+// TEST's own material, deliberately outside the enclave: a yardstick read back
+// out of the thing under test would move with it.
 func protectedRootKey(t *testing.T) (enclave.ByteAccess, []byte) {
 	t.Helper()
 	want := make([]byte, rootKeySize)
 	if _, err := rand.Read(want); err != nil {
 		t.Fatalf("rand.Read: %v", err)
 	}
-	// NewMemory freezes the key and wipes its source, so want is copied first.
+	// Frozen by construction: NewMemory freezes as the material moves in,
+	// which is the shape a CALLER of the protected pair would use for a key it
+	// already has. (A key it is about to produce belongs in a sized enclave that
+	// is filled and then Frozen; both end read-only.) want is copied first
+	// because this constructor wipes its source.
 	enc := mustFromBytes(t, append([]byte(nil), want...))
 	destroyOnCleanup(t, enc)
 	return enc, want
 }
 
-// assertEnclaveHolds compares an enclave's contents inside the borrow.
+// assertEnclaveHolds compares an enclave's contents INSIDE the borrow, so the
+// assertion never makes its own unprotected copy of the key it is checking.
 func assertEnclaveHolds(t *testing.T, enc enclave.ByteAccess, want []byte) {
 	t.Helper()
 	if err := enc.WithBytes(func(got []byte) error {
@@ -67,7 +75,9 @@ func TestSoftwareStrategy_ProtectedSealUnsealRoundTrip(t *testing.T) {
 		t.Fatalf("expected strategy=%q, got %q", StrategyPassphrase, sealed.Strategy)
 	}
 
-	// Sealing borrows the caller's key without consuming it.
+	// Sealing BORROWS the caller's key; it does not consume it. A strategy that
+	// destroyed the enclave would break a caller that seals under two strategies
+	// in turn, which is exactly what a rekey does.
 	assertEnclaveHolds(t, rootKey, want)
 
 	recovered, err := s.UnsealRootKeyProtected(context.Background(), sealed, Credentials{})
@@ -170,7 +180,15 @@ func TestSoftwareStrategy_ProtectedUnsealKeyIsDestroyable(t *testing.T) {
 	}
 }
 
-// TestSoftwareStrategy_ProtectedUnsealRefusesAnUnauthenticatedLength verifies an oversized length is refused with ErrInvalidSealedKey before any allocation or decrypt.
+// The plaintext length is a function of a blob nobody has authenticated yet, and
+// the enclave allocation is sized from it, so an oversized blob is a remote way
+// to drain a process-wide resource unless the length is refused BEFORE anything
+// is locked.
+//
+// The ORDERING is what this test pins, not merely the refusal: the payload here
+// is zeroes, so a check placed after the decrypt would report
+// ErrDecryptionFailed. Reading ErrInvalidSealedKey instead is the evidence that
+// the length was judged first — and the allocation sits between the two.
 func TestSoftwareStrategy_ProtectedUnsealRefusesAnUnauthenticatedLength(t *testing.T) {
 	ctx := context.Background()
 	s, err := newTestStrategy([]byte("oversized-blob-passphrase"))
@@ -247,7 +265,8 @@ func TestSoftwareStrategy_SealRootKeyProtectedErrors(t *testing.T) {
 			t.Fatalf("Close: %v", err)
 		}
 		rootKey, _ := protectedRootKey(t)
-		// Reported before the size check: a closed strategy seals nothing.
+		// Reported BEFORE the size check, matching the string-typed path: a
+		// closed strategy cannot seal anything, whatever it is handed.
 		if _, err := s.SealRootKeyProtected(ctx, rootKey, Credentials{}); !errors.Is(err, ErrStrategyClosed) {
 			t.Fatalf("SealRootKeyProtected on a closed strategy = %v, want ErrStrategyClosed", err)
 		}
@@ -364,7 +383,8 @@ func TestDeferredSoftwareStrategy_ProtectedPathUsesCallTimeCredentials(t *testin
 	defer recovered.Destroy()
 	assertEnclaveHolds(t, recovered, want)
 
-	// The credentials belong to the caller and are released by its Clear.
+	// The credentials are the CALLER's: many calls, one enclave.Sealed, released
+	// by the caller's own Clear and never by the strategy.
 	again, err := s.UnsealRootKeyProtected(ctx, sealed, creds)
 	if err != nil {
 		t.Fatalf("second UnsealRootKeyProtected: %v", err)

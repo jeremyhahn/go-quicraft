@@ -161,7 +161,12 @@ func TestValidateFrameHeaderAcceptsLengthBounds(t *testing.T) {
 	}
 }
 
-// TestReadFrameHeaderLengthBoundsIntConversion verifies the frame length bound makes int(length) exact on every platform.
+// TestReadFrameHeaderLengthBoundsIntConversion pins the bound that makes the
+// receive path's int(length) (handleMessageFrame's getRecvBuf, recv.go) and
+// the snapshot chunk allocation exact on every platform: the wire length is a
+// uint32 read from peer bytes, and ValidateFrameHeaderWindow rejects anything
+// above MaxFrameSize before either conversion runs. MaxFrameSize must stay
+// within int32, or int(length) could wrap negative on a 32-bit build.
 func TestReadFrameHeaderLengthBoundsIntConversion(t *testing.T) {
 	const maxInt32 = 1<<31 - 1
 	if uint64(MaxFrameSize) > maxInt32 {
@@ -354,9 +359,19 @@ func TestFrameConstantValues(t *testing.T) {
 	}
 }
 
-// Frame version validation is exact.
+// ---------------------------------------------------------------------------
+// Frame version validation is EXACT
+// ---------------------------------------------------------------------------
 
-// TestValidateFrameHeaderVersionIsExact verifies only WireVersion of the 256 version values is accepted.
+// TestValidateFrameHeaderVersionIsExact sweeps every one of the 256 values the
+// version byte can hold and asserts that exactly one of them — WireVersion — is
+// accepted.
+//
+// The exhaustive form is the point. A gate reading
+// `buf[2] < 1 || buf[2] > WireVersion` is the same test as equality
+// while WireVersion is 1 and becomes a compatibility WINDOW the moment the
+// constant moves. A table of hand-picked values passes against both shapes; a
+// sweep that asserts a single accepted value cannot.
 func TestValidateFrameHeaderVersionIsExact(t *testing.T) {
 	accepted := 0
 	for v := 0; v < 256; v++ {
@@ -392,14 +407,29 @@ func TestValidateFrameHeaderVersionErrorIsUnchanged(t *testing.T) {
 		t.Fatalf("ValidateFrameHeader returned %v (%T), want the ErrUnsupportedVersion "+
 			"sentinel itself", err, err)
 	}
-	// The magic is checked before the version.
+	// The magic is checked BEFORE the version, so a header that is wrong in
+	// both ways still reports the magic. That ordering is what makes a probe
+	// from an unrelated protocol distinguishable from a version skew.
 	bad := [FrameHeaderSize]byte{0x00, 0x00, WireVersion + 1, 0x00, 0, 0, 0, 10}
 	if err := ValidateFrameHeader(bad[:]); !errors.Is(err, ErrInvalidMagic) {
 		t.Fatalf("ValidateFrameHeader on a bad magic AND a bad version = %v, want ErrInvalidMagic", err)
 	}
 }
 
-// TestValidateFrameHeaderVersionGateIsNotARange fails if the version gate's source uses a relational operator.
+// TestValidateFrameHeaderVersionGateIsNotARange reads the gate's SOURCE and
+// fails if the version byte is compared with a relational operator.
+//
+// A behavioural test cannot separate the two shapes while WireVersion is 1:
+// `buf[2] < 1 || buf[2] > WireVersion` and `buf[2] != WireVersion` accept
+// exactly the same single value today, so every input-driven assertion passes
+// against both. The difference is entirely in what happens at the FIRST bump —
+// the range form silently becomes a compatibility window admitting every
+// version below the new one, which is the drift the pinning policy exists to
+// prevent, and it does so with no test failing to announce it.
+//
+// So the invariant is pinned where it actually lives, in the form of the
+// expression. This mirrors TestMembershipVersionNotDerivedFromWireVersion in
+// pkg/proto, which guards a rule with the same shape for the same reason.
 func TestValidateFrameHeaderVersionGateIsNotARange(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "config.go", nil, 0)

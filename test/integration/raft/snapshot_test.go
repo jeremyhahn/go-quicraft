@@ -21,7 +21,20 @@ import (
 	"testing"
 )
 
-// TestIntegration_Snapshot_MultiNode_ConsistentState checks a requested snapshot covers the applied state, exists on disk, and all nodes hold identical state.
+// TestIntegration_Snapshot_MultiNode_ConsistentState creates a 3-node
+// cluster, writes entries to the leader, waits for replication, takes a
+// snapshot on the leader, and verifies all nodes hold identical state.
+//
+// The snapshot itself is verified, not merely requested: RequestSnapshot is
+// asynchronous, so the result is awaited and required to report a non-zero
+// index that covers the applied state, and the durable snapshot.dat artifact
+// is required to exist on disk. Without those checks the whole test reduces
+// to "the nodes replicated some keys", which plain log replay satisfies
+// equally and which no snapshot code path is needed for.
+//
+// Automatic snapshots cannot interfere: Config.SnapshotEntries has no default
+// (SetDefaults never assigns it) and testShardConfig leaves it at 0, so the
+// only snapshot in this test is the one requested below.
 func TestIntegration_Snapshot_MultiNode_ConsistentState(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()

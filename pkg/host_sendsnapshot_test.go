@@ -375,7 +375,10 @@ func TestTransportSender_BarrierFor(t *testing.T) {
 // doSendSnapshot
 // ---------------------------------------------------------------------------
 
-// TestDoSendSnapshot_PlaintextSendFailureRejects checks a failed delivery reports the transfer as rejected with this attempt's sequence.
+// TestDoSendSnapshot_PlaintextSendFailureRejects verifies that when the
+// transport cannot deliver the snapshot the leader is told the transfer was
+// REJECTED, carrying the transfer sequence of this attempt. Without the
+// rejection the follower stays pinned in snapshot state forever.
 func TestDoSendSnapshot_PlaintextSendFailureRejects(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.dat")
@@ -524,7 +527,13 @@ func (s unlinkRefusingSpyFS) Remove(name string) error {
 	return s.namedWriteSpyFS.Remove(name)
 }
 
-// TestDoSendSnapshot_FailedScratchUnlinkFailsTheSend checks the send fails before writing plaintext when the decrypt scratch cannot be unlinked.
+// TestDoSendSnapshot_FailedScratchUnlinkFailsTheSend: when the decrypt
+// scratch cannot be unlinked, the send fails before a byte of plaintext is
+// written into it — the leader gets a rejected SnapshotStatus and retries
+// later — so no named file ever holds the plaintext, not even for the life of
+// the send. The best-effort removal that follows reclaims the name; a name
+// that survives it too is empty, left in the replica's swept directory, and
+// counted.
 func TestDoSendSnapshot_FailedScratchUnlinkFailsTheSend(t *testing.T) {
 	for _, tc := range []struct {
 		name   string

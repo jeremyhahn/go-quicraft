@@ -44,7 +44,29 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// Raft timing and derived election budgets: the config builders and budgets read the same constants (testRTTMillisecond, testElectionRTT), pinned by TestBudgetsDescribeTheClusterTheyBudgetFor; contrib/dragonboat and e2e mirror the derivation.
+// ---------------------------------------------------------------------------
+// Raft timing, and the election budgets derived from it
+//
+// Every election budget below is DERIVED from the shard configuration these
+// tests actually start, and the config builders are written in terms of the
+// same constants: hostConfigAt (behind testHostConfig, newTestClusterWithRestart
+// and restartNode) reads testRTTMillisecond, and testShardConfig /
+// testShardConfigWithSnapshot leave ElectionRTT to config.Config.SetDefaults,
+// which is the value testElectionRTT names rather than restates. Neither side
+// can be changed without the other following, and
+// TestBudgetsDescribeTheClusterTheyBudgetFor pins that they still agree.
+//
+// A budget written as a literal is a value that is not pinned treated as
+// though it were — a recurring flake class. Elsewhere the unpinned value is a
+// leader index or a replica ID; here it is the shard configuration the
+// budget is supposed to describe. A literal cannot follow a config change and
+// gives no signal when it stops matching; a derivation cannot drift at all.
+//
+// The derivation is the one contrib/dragonboat and test/integration/e2e use,
+// mirrored on purpose: the suites keep separate copies because each
+// owns its own helpers and its own config builders; the shape is shared, the
+// constants are not.
+// ---------------------------------------------------------------------------
 
 // defaultTimeout is the standard budget for a single Raft operation that is
 // NOT an election: a proposal round trip, a lookup, a membership query. It is
@@ -58,13 +80,22 @@ const defaultTimeout = 10 * time.Second
 // tick.
 const testRTTMillisecond = 50
 
-// testElectionRTT is the follower's election timeout in ticks, read from Config.SetDefaults since testShardConfig leaves it unset.
+// testElectionRTT is the number of ticks a follower waits without hearing from
+// a leader before it stands for election.
+//
+// testShardConfig does not set ElectionRTT, so Config.SetDefaults supplies it.
+// This reads THAT value rather than restating it, so the budgets below follow
+// the default if it ever moves.
 const testElectionRTT = config.DefaultElectionRTT
 
 // raftTick is one Raft tick in wall-clock time.
 const raftTick = testRTTMillisecond * time.Millisecond
 
-// The election budgets come from test/electionbudget, derived from testElectionRTT and testRTTMillisecond.
+// The election budgets are test/electionbudget's, derived from this suite's
+// testElectionRTT and testRTTMillisecond. The derivation and the reasoning
+// behind it — why twice ElectionRTT, why thirty rounds, what was measured —
+// live in that package; the pin test below is the half that cannot move,
+// because it reads THIS suite's config builders.
 var (
 	electionRound         = electionbudget.Round(testElectionRTT, testRTTMillisecond)
 	leaderElectionTimeout = electionbudget.LeaderElection(testElectionRTT, testRTTMillisecond)
@@ -172,7 +203,11 @@ type kvStateMachine struct {
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
 	applied   atomic.Uint64
-	// recoveries counts RecoverFromSnapshot calls, the evidence of snapshot catch-up.
+	// recoveries counts RecoverFromSnapshot calls. It is the only direct
+	// evidence a replica caught up by INSTALLING A SNAPSHOT rather than by
+	// replaying the log: a test that claims snapshot-based catch-up and only
+	// checks that the keys arrived proves nothing, because log replay puts
+	// exactly the same keys in exactly the same place.
 	recoveries atomic.Uint64
 }
 
@@ -309,7 +344,10 @@ func (kv *kvStateMachine) RecoverFromSnapshot(_ context.Context, r io.Reader, st
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// The only reset point for the applied index, and it must still move forward.
+	// This is the only point at which the applied-index expectation may be
+	// reset, and the reset must still move the replica FORWARD: installing a
+	// snapshot older than what this replica already applied would silently
+	// roll the state machine back.
 	indexBuf := make([]byte, 8)
 	if _, err := io.ReadFull(r, indexBuf); err != nil {
 		return err
@@ -480,7 +518,16 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 	t.Helper()
 	assertApplyOrder(t)
 	cfg := hostConfigAt(t.TempDir(), t.TempDir(), listenAddr, mtls)
-	// Skip fdatasync for these never-reopened hosts, since slow syncs on a shared disk stall elections; restarted hosts (hostConfigAt) keep the real sync.
+	// The WAL still writes every record through the real segment code; only
+	// the fdatasync is skipped. Raft persists term and vote before a
+	// RequestVote or vote grant leaves the node, so once every sync on the
+	// shared disk takes longer than the 0.5-1s election timeout no election
+	// can finish: candidates time out, re-campaign at a higher term and the
+	// shard stays leaderless (#362, the same stall #360 measured at 2.5-4.6s
+	// on the CI runner). These hosts get fresh directories and are never
+	// reopened, so durability is not what they check. Hosts that ARE
+	// restarted on their own directories (newTestClusterWithRestart,
+	// readyCluster) build from hostConfigAt and keep the real sync.
 	cfg.NoSyncWAL = true
 	return cfg
 }
@@ -537,10 +584,15 @@ type testCluster struct {
 	// nodeHostDirs records each node's NodeHostDir so snapshot tests can
 	// assert that a snapshot artifact really landed on disk.
 	nodeHostDirs []string
-	// ca issues every leaf; leaves holds each host's own leaf (its node identity) for restarts. See test/testpki.
+	// ca issues every host's leaf; leaves holds each host's own leaf — its
+	// own KEYPAIR, and so its own node identity — so a restart can present
+	// the identity the shard committed for it. See test/testpki.
 	ca     *testpki.CA
 	leaves []*config.MTLSConfig
-	// ids holds each host's node identity, which survives restarts; Config.MemberIdentities must name every member, stopped ones included.
+	// ids holds each host's node identity, recorded when the host was first
+	// built. It is a property of the leaf, so it survives a stop and a
+	// restart, and a founder's Config.MemberIdentities has to name EVERY
+	// member of the shard — stopped ones included.
 	ids []string
 	t   *testing.T
 }
@@ -798,7 +850,17 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	waitForConditionDiag(t, timeout, desc, predicate, nil)
 }
 
-// waitForConditionDiag is waitForCondition plus a diagnostic callback run once on timeout and appended to the failure.
+// waitForConditionDiag is waitForCondition with a diagnostic callback that is
+// invoked ONCE, on timeout, and appended to the failure message.
+//
+// A replication wait that expires says only that some node did not reach some
+// state within N seconds, which is the same message whether the cluster is
+// leaderless, wedged behind a stuck replication window, or merely slow on a
+// loaded machine. When that happened on a release runner the log gave no way
+// to tell those apart, and the failure did not reproduce in thirty local runs
+// under deliberate CPU contention — so the one observation that existed had to
+// be thrown away. The diagnostic runs only on the failing path, so it costs
+// nothing when the suite is green.
 func waitForConditionDiag(
 	t *testing.T,
 	timeout time.Duration,
@@ -828,7 +890,14 @@ func waitForConditionDiag(
 	}
 }
 
-// shardStateDump renders each live node's leader, term, applied index, log span and queue for one shard; read errors are reported inline.
+// shardStateDump renders the raft state of every live node for one shard: who
+// each node believes the leader is, the term it is in, how far it has applied,
+// what its local log actually spans, and how much is still queued. A node that
+// is behind, a node that disagrees about the leader, and a node whose log stops
+// short all look different here, which is the whole point.
+//
+// It never fails the test: it runs while a test is already failing, so an error
+// reading one node is reported inline and the remaining nodes still print.
 func shardStateDump(cluster *testCluster, shardID uint64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "shard %d state at failure:\n", shardID)
@@ -934,7 +1003,14 @@ func waitForStateMachine(t *testing.T, cluster *testCluster, trackers []*smTrack
 	return machine
 }
 
-// waitForReplication waits for key to hold the expected value on every live node and fails unless it checked them all.
+// waitForReplication waits for a key to appear with the expected value in the
+// state machine of EVERY live node, and fails if it did not actually check
+// every one of them.
+//
+// The count is the point. The previous version skipped any node whose index was
+// past the end of the caller's trackers slice and any node whose state machine
+// had not registered yet, silently and without a word in the log — so a node
+// that never came up at all was reported as verified.
 func waitForReplication(t *testing.T, cluster *testCluster, trackers []*smTracker, shardID uint64, key, expectedVal string, timeout time.Duration) {
 	t.Helper()
 
@@ -1129,7 +1205,10 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 	}
 }
 
-// proposeToLeader proposes cmd to the current leader of shardID and returns the committed result. See test/proposer.
+// proposeToLeader proposes cmd to whichever node leads shardID AT THE MOMENT
+// OF THE CALL and returns the committed result. See package
+// test/proposer for why observing a leader does not pin it, and for the
+// callers that must NOT use this.
 func proposeToLeader(
 	t *testing.T,
 	cluster *testCluster,
@@ -1152,7 +1231,11 @@ func tryProposeToLeader(
 	return proposer.Try(cluster.leaderHost, shardID, cmd, timeout)
 }
 
-// readFromLeader reads query linearizably from shardID's current leader and returns the value (see test/proposer); a site that means one replica keeps a direct SyncRead with a quicraft:direct-read marker.
+// readFromLeader issues a linearizable read of query against whichever node
+// leads shardID AT THE MOMENT OF THE CALL and returns the value. See package
+// test/proposer for why observing a leader does not pin it, and for the
+// callers that must NOT use this — those keep a direct SyncRead and carry a
+// quicraft:direct-read marker saying why the addressed replica is the subject.
 func readFromLeader(
 	t *testing.T,
 	cluster *testCluster,
@@ -1209,7 +1292,13 @@ func proposeNEntries(
 	return expected
 }
 
-// verifyAllData checks every expected pair on every live node and fails unless it checked them all.
+// verifyAllData verifies that every KV pair in expected is present on the
+// state machine of EVERY live node, and fails if it did not actually check
+// every one of them.
+//
+// Like waitForReplication, it must not skip a node whose state machine has not
+// registered — the exact symptom of a node that failed to start or to recover —
+// while the caller logs that all nodes were verified.
 func verifyAllData(
 	t *testing.T,
 	cluster *testCluster,
@@ -1267,7 +1356,21 @@ func waitForMembershipSize(
 	)
 }
 
-// waitForMembershipConverged waits until every live replica reports exactly wantNodes as voters and at least wantRemoved as removed.
+// waitForMembershipConverged waits until EVERY live replica reports exactly
+// wantNodes as its voting members and at least wantRemoved as removed.
+//
+// waitForMembershipSize above asks ONE host — in practice the leader, which is
+// the replica that proposed the change and therefore the one guaranteed to have
+// applied it. The failure worth catching is the opposite: a config change that
+// commits and applies on the leader but never lands on a follower. That
+// follower goes on sizing quorums over a configuration the shard has left,
+// which is how a minority comes to believe it has a majority. A single-replica
+// assertion cannot see it.
+//
+// Convergence rather than instantaneous agreement is the property: followers
+// apply the change when the entry commits on them, a replication round trip
+// behind the leader. The timeout is what distinguishes trailing from diverged.
+// Stopped replicas are skipped — a dead node holds no configuration.
 func waitForMembershipConverged(
 	t *testing.T,
 	cluster *testCluster,
@@ -1316,7 +1419,18 @@ func membershipDivergence(
 		if h == nil || cluster.stopped[i].Load() {
 			continue
 		}
-		// Replicas in wantRemoved are excluded; every replica still in the configuration must converge.
+		// A replica that is itself in wantRemoved is excluded. Convergence is a
+		// property of the CURRENT configuration, and a removed replica is
+		// outside it: once the removal commits the leader stops replicating to
+		// it, so whether it ever learns of its own eviction depends on where it
+		// happened to be in the replication stream when the entry committed.
+		// Requiring it to agree asserts on a race, not on a property — and
+		// asserting on a race is how a suite ends up with a test that fails a
+		// few times in a hundred and gets dismissed as flaky.
+		//
+		// Every replica still IN the configuration is required to converge.
+		// That is the divergence being hunted: a config change that applies on
+		// the leader and silently fails on a follower.
 		if slices.Contains(wantRemoved, uint64(i+1)) {
 			continue
 		}
@@ -1517,10 +1631,33 @@ func waitForNodeData(
 // cannot notice the code writing somewhere else entirely.
 const snapshotDataFileName = "snapshot.dat"
 
-// publishedSnapshotDirPrefix names a finished snapshot directory: snapshot-<020d index>.
+// publishedSnapshotDirPrefix is the name a snapshot directory carries once the
+// artifact in it is FINISHED: snapshot-<020d index> (engine snapshotSaveDir).
 const publishedSnapshotDirPrefix = "snapshot-"
 
-// Staging directory prefixes a writer uses before renaming onto snapshot-<index>, restated from engine: .recv- (receive), .import- (ImportSnapshot), .save- (local save).
+// The three names a snapshot directory can carry BEFORE it is published. Each is
+// a directory a writer creates for itself, fills, and then renames onto the
+// canonical snapshot-<index> name in one step, so the canonical name only ever
+// holds a complete artifact. Both are deliberately unparsable as
+// snapshot-<index> so that the engine's own listSnapshotDirs, snapshot GC and
+// DEK purge-floor scan skip them; this scan must skip them for the same reason.
+//
+// The set is the one Host.StartShard's sweeps recognise, restated from
+// pkg/internal/engine/snapshot_pool.go rather than imported (the package is
+// internal to pkg/, and a scan that borrowed the writer's matcher could not
+// notice the writer staging under a name it does not sweep):
+//
+//   - engine.RecvStageDirPrefix, ".recv-": the InstallSnapshot RECEIVE path
+//     (pkg/messagehandler.go) stages here, encrypting inline from the
+//     in-memory chunks, and publishes by rename. Swept by
+//     engine.SweepStaleRecvStageDirs.
+//   - engine.ImportStageDirPrefix, ".import-": Host.ImportSnapshot stages
+//     here and publishes by rename. Swept by engine.SweepStaleImportStageDirs.
+//   - engine.SaveStageDirPrefix, ".save-": a LOCAL snapshot save stages here
+//     — the capture, snapshot.meta, the export — and publishes by rename
+//     under the node's write lease. Swept by engine.SweepStaleSaveStageDirs.
+//     A save in progress when a scan runs is therefore found here, never as
+//     an unfinished snapshot.dat inside a published directory.
 const (
 	recvStageDirPrefix   = ".recv-"
 	importStageDirPrefix = ".import-"
@@ -1538,7 +1675,21 @@ func isSnapshotStagingDir(name string) bool {
 		strings.HasPrefix(name, saveStageDirPrefix)
 }
 
-// snapshotArtifacts returns every published snapshot.dat under dir, skipping staging directories only.
+// snapshotArtifacts returns the path of every PUBLISHED snapshot data file
+// under dir.
+//
+// A snapshot artifact lives at
+// <snapshotDir>/shard-<N>/replica-<N>/snapshot-<020d index>/snapshot.dat
+// (pkg/internal/engine/snapshot_pool.go, snapshotSaveDir), and snapshotDir is
+// rooted under the host's NodeHostDir. Walking the whole NodeHostDir keeps the
+// check independent of that layout.
+//
+// The walk does not descend into a staging directory (isSnapshotStagingDir):
+// a receive or import in flight is by design not an artifact yet, and every
+// caller of this scan polls, so skipping the directory now and finding the
+// published one on a later poll IS waiting the staging out. Nothing else is
+// skipped. In particular a payload under any OTHER unexpected directory name
+// is still returned, so snapshotArtifactIndexes still rejects it.
 func snapshotArtifacts(t *testing.T, dir string) []string {
 	t.Helper()
 	var found []string
@@ -1643,7 +1794,18 @@ func assertSnapshotArtifact(t *testing.T, dir string, minIndex uint64, timeout t
 	}
 }
 
-// requestSnapshotIndex requests a snapshot on host and returns the index the engine reported; index 0 (a skipped save) is a failure.
+// requestSnapshotIndex requests a snapshot on host and returns the index the
+// engine reported.
+//
+// RequestSnapshot is asynchronous: it returns as soon as the request is
+// queued. Releasing the RequestState without reading its result asserts
+// nothing beyond "the
+// request was accepted", and in particular does not wait for the snapshot to
+// be taken or notice that it failed.
+//
+// A snapshot whose index does not advance past the recorded one is a no-op
+// that reports index 0 (snapshot_pool.go), so callers must make the applied
+// index advance before asking; a zero index here is treated as a failure.
 func requestSnapshotIndex(t *testing.T, host *quicraft.Host, shardID uint64) uint64 {
 	t.Helper()
 
@@ -1676,7 +1838,11 @@ func requestSnapshotIndex(t *testing.T, host *quicraft.Host, shardID uint64) uin
 			t.Fatalf("snapshot on shard %d did not complete: %v", shardID, resErr)
 		}
 		if result.Value == 0 {
-			// Index 0 means a skipped save; retry, since a concurrent no-op can resolve this request.
+			// Index 0 is what a SKIPPED save reports. Retry rather than fail
+			// on the first one: the host completes every pending snapshot
+			// request for a shard from any one completion, so a concurrent
+			// automatic no-op can resolve this request. An engine that never
+			// snapshots reports 0 every time and still fails below.
 			t.Logf("snapshot on shard %d reported index 0 (skipped save), retrying (attempt %d/%d)",
 				shardID, attempt+1, maxAttempts)
 			retryTimer := time.NewTimer(retryInterval)
@@ -1697,7 +1863,15 @@ func requestSnapshotIndex(t *testing.T, host *quicraft.Host, shardID uint64) uin
 // Leader Transfer Helpers
 // ---------------------------------------------------------------------------
 
-// transferLeadershipTo asks the leader to transfer to targetIdx and re-requests until that node leads or the deadline expires.
+// transferLeadershipTo asks the current leader to hand leadership to the node
+// at targetIdx and waits until that node — the REQUESTED one, not merely some
+// node — reports itself leader.
+//
+// Leadership transfer is a hint: the leader aborts it if the target does not
+// campaign within an election timeout, and the caller learns nothing from the
+// nil error RequestLeaderTransfer returns. Re-requesting until the target
+// actually takes over (or the deadline expires) is what makes "leadership moved
+// to the target" an assertion instead of a hope.
 func transferLeadershipTo(t *testing.T, cluster *testCluster, shardID uint64, targetIdx int, timeout time.Duration) {
 	t.Helper()
 
@@ -1822,7 +1996,8 @@ func restartNode(
 		old.Close()
 	}
 
-	// Reuse the data directories, address and leaf, whose keypair is the replica's committed identity.
+	// Create a new host reusing the same data directories, address and LEAF:
+	// the identity the shard committed for this replica is the leaf's keypair.
 	h, err := quicraft.NewHost(hostConfigAt(nc.walDir, nc.nodeHostDir, nc.addr, cluster.leaves[idx]), quicraft.WithoutEncryption())
 	if err != nil {
 		t.Fatalf("restartNode[%d] NewHost failed: %v", idx, err)
@@ -1883,7 +2058,16 @@ func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 		raftTick, electionRound, leaderElectionTimeout, coldStartElectionRounds, failoverTimeout)
 }
 
-// TestSnapshotScanJudgesOnlyPublishedArtifacts: over a hand-built engine layout, staging directories are skipped and a published directory with a malformed name is still judged.
+// TestSnapshotScanJudgesOnlyPublishedArtifacts pins the two halves of the
+// artifact scan against each other over a tree laid out the way the engine
+// lays one out: a staging directory mid-flight is not an artifact and is not
+// judged, while a PUBLISHED directory under a malformed name still is.
+//
+// The tree is built by hand rather than by driving a cluster into an
+// InstallSnapshot, because the window in which a .recv-<n> directory exists is
+// the length of one receive and cannot be held open from a test; the layout is
+// the engine's documented one (engine.RecvStageDirPattern,
+// engine.ImportStageDirPattern, snapshotSaveDir).
 func TestSnapshotScanJudgesOnlyPublishedArtifacts(t *testing.T) {
 	root := t.TempDir()
 	replica := filepath.Join(root, "snapshots", "shard-1", "shard-1", "replica-2")
@@ -1915,7 +2099,8 @@ func TestSnapshotScanJudgesOnlyPublishedArtifacts(t *testing.T) {
 		t.Fatalf("indexes = %v, want [42]", got)
 	}
 
-	// A malformed published directory is still returned by the walk and rejected.
+	// A malformed PUBLISHED directory is still a finding. It is not a staging
+	// name, so the walk returns it, and the judgement rejects it.
 	for _, dir := range []string{
 		"snapshot-",            // no index at all
 		"snapshot-notanumber",  // unparsable index

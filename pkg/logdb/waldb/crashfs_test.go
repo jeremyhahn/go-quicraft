@@ -26,7 +26,33 @@ import (
 	"time"
 )
 
-// crashFS is an in-memory FS with POSIX crash semantics: Sync makes file data durable, a parent fsync makes entries durable, and Crash reverts to the durable image.
+// crashFS is an in-memory FS that models POSIX crash semantics rather than
+// I/O errors. Every other test double in this package injects an error, which
+// can only exercise error HANDLING: a missing fsync produces no failing call
+// to intercept, and a SIGKILL leaves write(2) data alive in the page cache, so
+// neither can detect a deleted flush. crashFS closes that gap.
+//
+// The model:
+//
+//   - Each file carries a LIVE image and a DURABLE image. Write/WriteAt/
+//     Truncate/PreAllocate mutate LIVE only. Sync promotes LIVE to DURABLE.
+//   - A directory entry (file or subdirectory creation, and file removal)
+//     becomes durable only when the PARENT directory is fsynced, matching the
+//     production syncDirFS discipline.
+//   - Crash discards all LIVE state: every surviving file reverts to its
+//     DURABLE image, creations never covered by a parent fsync disappear
+//     together with everything beneath them, and removals never covered by a
+//     parent fsync are resurrected at their DURABLE content.
+//
+// The whole image lives in the crashFS value, so reopening a DB over the same
+// crashFS after Crash sees exactly the post-crash filesystem.
+//
+// Faithfulness constraint: this model observes durability only through
+// File.Sync. That is sound for waldb because every production flush — segment
+// data (segment.Sync, DiscardPending, truncateCorruptSegment,
+// truncateClosedSegment, truncateOrphanToZero) and directory entries
+// (syncDirFS) — goes through the File interface. osFile.Sync is the only
+// caller of the raw fdatasync/fsync syscall wrapper.
 type crashFS struct {
 	mu    sync.Mutex
 	gen   uint64
@@ -38,7 +64,9 @@ type crashFS struct {
 	// wb, when set, replaces the all-or-nothing loss of unsynced bytes with a
 	// per-page verdict; see crashWriteback.
 	wb atomic.Pointer[crashWriteback]
-	// The write log records WriteAt ranges so a test can choose pages to lose; off by default.
+	// The write log records the byte ranges handed to WriteAt, so a test can
+	// find out WHERE an in-flight batch landed and name the pages it wants the
+	// crash to swallow. It is off by default and costs nothing when off.
 	wlogMu sync.Mutex
 	wlogOn bool
 	wlog   []crashWrite
@@ -82,11 +110,18 @@ const (
 	crashOpSync
 	crashOpDirSync
 	crashOpRemove
-	// crashOpWriteAtDone fires after a WriteAt applies; every other op fires before.
+	// crashOpWriteAtDone fires AFTER a WriteAt has applied. Every other op
+	// fires before, which is what a hook wanting to cut power mid-operation
+	// needs; a hook wanting to model writeback flushing what was just written
+	// needs the opposite, and firing before would flush the state as it was one
+	// write earlier.
 	crashOpWriteAtDone
 )
 
-// crashHook runs just before the intercepted operation, outside the lock; if it calls Crash the operation fails with errCrashedFS.
+// crashHook runs immediately BEFORE the intercepted operation applies, and
+// outside the crashFS lock, so a hook may call Crash to cut power in the
+// middle of a write path. The operation that fired the hook then fails with
+// errCrashedFS, exactly as if it had never reached the medium.
 type crashHook struct {
 	fn func(op crashOp, path string)
 }
@@ -188,7 +223,12 @@ func (c *crashFS) Crash() {
 	for _, path := range doomed {
 		delete(c.nodes, path)
 	}
-	// The post-crash image becomes both live and durable, so a later crash cannot resurrect older content.
+	// The post-crash image becomes BOTH the live and the durable image. A real
+	// medium has no second copy: what survived the power loss is what is on the
+	// disk, so a LATER crash with no intervening Sync restores exactly this and
+	// not some earlier state. Leaving durable behind would let a second crash
+	// resurrect content the first one had already overwritten or discarded,
+	// which is the model lying in the direction that hides bugs.
 	wb := c.wb.Load()
 	for path, n := range c.nodes {
 		n.durable = postCrashImage(path, n, wb)
@@ -203,7 +243,19 @@ func (c *crashFS) Crash() {
 	c.tombs = make(map[string]*crashNode)
 }
 
-// postCrashImage computes a file's content after a crash, whole-file or page by page under a writeback model.
+// postCrashImage computes what a file reads back as after power is cut.
+//
+// With no writeback model installed this is the whole-file rule crashFS has
+// always applied: every unsynced byte is gone and the file reverts to its
+// durable image. With one installed the verdict is taken page by page, so a
+// dirty page that reached the medium survives even when the page below it did
+// not — the interleaving a real page-cache flush is free to produce, and the
+// one the durability sequence exists to classify.
+//
+// A page that did not reach the medium keeps whatever the DURABLE image held
+// there, which is what a real lost writeback leaves behind. Where the durable
+// image does not reach, it reads as zeros, because nothing was ever written
+// there: that is the hole a surviving higher page then sits above.
 func postCrashImage(path string, n *crashNode, wb *crashWriteback) []byte {
 	if n.dir || wb == nil {
 		return append([]byte(nil), n.durable...)
@@ -252,7 +304,17 @@ func (c *crashFS) entryChainDurableLocked(path string) bool {
 	}
 }
 
-// Writeback promotes a file's live image to durable without fsync, modelling page-cache writeback at an arbitrary earlier moment.
+// Writeback promotes a file's current LIVE image to DURABLE without any fsync,
+// modelling the page cache writing dirty pages back on its own schedule.
+//
+// It is the event crashWriteback cannot express. crashWriteback is a verdict
+// applied AT the crash, computed from the live image as it stands then; real
+// writeback happens at an arbitrary EARLIER moment, and what it wrote stays on
+// the medium even if the file is subsequently truncated. That ordering is
+// exactly what makes a rollback's fsync load-bearing: bytes a failed batch
+// wrote can reach the disk on their own, so truncating them out of the live
+// image is not enough — the truncation itself has to be made durable, or the
+// crash brings them back.
 func (c *crashFS) Writeback(path string) {
 	name := filepath.Clean(path)
 	c.mu.Lock()
@@ -420,7 +482,12 @@ func (c *crashFS) Remove(name string) error {
 	return nil
 }
 
-// Rename implements FS with rename(2) atomicity; the new entry is durable only after a parent fsync.
+// Rename implements FS. It models rename(2)'s atomicity: the destination name
+// refers to the source's node, or to whatever it referred to before, and never
+// to anything in between. The moved node's ENTRY durability is reset, because
+// the new dirent is exactly as unfsynced as a freshly created one — which is
+// what makes a crash between a rename and the parent fsync lose the new name
+// and restore the old, the behaviour the WAL format marker is published under.
 func (c *crashFS) Rename(oldpath, newpath string) error {
 	from, to := filepath.Clean(oldpath), filepath.Clean(newpath)
 	gen := c.generation()
@@ -588,7 +655,8 @@ func (f *crashFile) Truncate(size int64) error {
 	return nil
 }
 
-// PreAllocate models fallocate(2) mode 0 as a live write that grows the file.
+// PreAllocate models fallocate(2) with mode 0, which grows the file's visible
+// size. The reservation is LIVE state like any other write.
 func (f *crashFile) PreAllocate(size int64) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
@@ -617,7 +685,8 @@ func (f *crashFile) Stat() (fs.FileInfo, error) {
 	}, nil
 }
 
-// Sync makes this file's live image durable, or a directory's pending entries, like syncDirFS.
+// Sync promotes this file's LIVE image to DURABLE. On a directory it instead
+// makes the directory's pending entries durable, mirroring syncDirFS.
 func (f *crashFile) Sync() error {
 	if f.node.dir {
 		f.fs.fire(crashOpDirSync, f.path)

@@ -74,7 +74,12 @@ func makeKVCmd(key []byte) []byte {
 // the start of the value padding.
 const requestIDBytes = 8
 
-// makeRequestCmd builds a proposalBytes-sized Put whose value starts with id, so the apply loop can match the proposal.
+// makeRequestCmd builds a proposalBytes-sized Put command, like makeKVCmd, and
+// writes id into the first requestIDBytes of the value padding. Raw etcd/raft
+// has no per-proposal acknowledgement, so the id is how the apply loop tells
+// a proposer that THIS entry, not merely some entry, has been applied. The
+// wire size and layout are unchanged: the id occupies bytes the other engines
+// fill with zero padding.
 func makeRequestCmd(key []byte, id uint64) []byte {
 	cmd := makeKVCmd(key)
 	binary.BigEndian.PutUint64(cmd[3+len(key):], id)

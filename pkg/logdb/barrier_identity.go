@@ -16,7 +16,21 @@ package logdb
 
 import "reflect"
 
-// SameBarrier reports whether a and b are the same barrier by pointer identity; non-pointer or nil handles match nothing. It never panics; never compare handles with == or use them as map keys.
+// SameBarrier reports whether a and b are the same barrier. It is the one
+// identity rule for barrier handles, used by the host, the snapshot pool and
+// waldb, and the rule every implementation of PerBarrierEpochAwareLogDB and
+// BarrierShardEnumerator must apply to its barrier argument.
+//
+// Identity is pointer identity. A handle whose dynamic value is a non-nil
+// pointer is the same barrier as another handle exactly when both hold the
+// same pointer of the same type. A handle of any other kind (nil, a typed nil
+// pointer, or a non-pointer value) matches nothing, not even a copy of itself,
+// so SameBarrier(b, b) reports whether b has an identity at all.
+//
+// No barrier interface requires a comparable dynamic value, so a handle must
+// never be compared with == or used as a map key: either panics when the value
+// holds a slice, map or func. SameBarrier never panics, whatever the dynamic
+// types.
 func SameBarrier(a, b any) bool {
 	pa, ok := barrierPointer(a)
 	if !ok {

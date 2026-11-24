@@ -1,5 +1,30 @@
 #!/usr/bin/env bash
-# Usage: scripts/trim-ci-caches.sh <prefix> <image> [max-gib]; removes the largest unused CI cache volumes while their total exceeds max-gib (CI_CACHE_MAX_GIB, default 32). REAP_DRY_RUN=1 only prints.
+# Bound the size of this repo's CI cache volumes on the runner host.
+#
+#   usage: scripts/trim-ci-caches.sh <prefix> <image> [max-gib]
+#   e.g.   scripts/trim-ci-caches.sh go-quicraft-ci- "$TOOLCHAIN_IMAGE"
+#
+# v1 (ci-template v1.22, Company Agent m616 item 2). in-toolchain-image.sh v2
+# keeps the build, golangci-lint and module caches in named volumes,
+# <prefix>cache-<class>-{gobuild,golangci,gomod}, on the Docker host the job
+# talks to (ci-standard.md §6). Go trims its build cache of entries unused for
+# five days, but nothing trims the module cache, so the volumes would grow
+# without bound. This measures them and, while their total is over <max-gib>,
+# removes the largest one no container is using. A removed volume comes back
+# empty at the next stage, which costs one cold build, never a wrong one.
+#
+# Sizes are measured by `du` in <image> (the toolchain image the job just
+# built: it has du, and it is already on the host), run as IN_IMAGE_UID (the
+# volumes' owner, default 10001) with no network, no capability and the volume
+# read-only. A volume any container (running or
+# stopped) mounts is never removed; `docker volume rm` refuses one in use in any
+# case.
+#
+# <max-gib> defaults to CI_CACHE_MAX_GIB, else 32: the bound for this repo's
+# volumes, both trust classes together, on one host.
+#
+# A failed measurement or removal is reported and skipped: this never fails
+# the job. REAP_DRY_RUN=1 prints what would be removed and removes nothing.
 set -u
 
 prefix=${1:-}

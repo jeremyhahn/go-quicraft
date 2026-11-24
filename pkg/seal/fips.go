@@ -24,7 +24,43 @@ const (
 	envGOFIPS140 = "GOFIPS140"
 )
 
-// FIPSEnabled reports whether FIPS 140 mode is in effect (crypto/fips140, else GOFIPS140 other than "off"); it selects PBKDF2 and AES-256-GCM. Use BarrierConfig.RequireFIPS to require it, or -tags fips to remove the other algorithms.
+// FIPSEnabled reports whether FIPS 140 mode is in effect. Detection is
+// keyed primarily off the Go runtime's FIPS 140-3 module state
+// (crypto/fips140.Enabled), with the GOFIPS140 environment variable as a
+// fallback for deployments that signal FIPS intent via the environment;
+// the explicit value "off" is honored as disabled rather than being
+// misread as enabled.
+//
+// When enabled, FIPS mode constrains BOTH the KDF and the data-path cipher:
+//
+//   - KDF: DefaultKDFVersion selects PBKDF2-SHA256, and DeriveKey (plus the
+//     software-strategy constructors) REFUSE Argon2id with
+//     ErrKDFNotFIPSApproved — including the explicitly-Argon2id constructor
+//     NewSoftwareStrategyWithParams. See kdf.go.
+//   - Cipher: SelectOptimalAlgorithm returns AES-256-GCM unconditionally, and
+//     BarrierConfig.Validate rejects the ChaCha20/XChaCha20 algorithms, which
+//     are not FIPS-approved.
+//
+// Detection is ENVIRONMENTAL, so a false return means either "FIPS was not
+// requested" or "FIPS was requested but this binary has no module" — and the
+// second would otherwise fail open onto Argon2id and ChaCha20-Poly1305. A
+// deployment that requires FIPS must say so with BarrierConfig.RequireFIPS,
+// which turns that ambiguity into a refusal at NewBarrier.
+//
+// THIS FUNCTION IS THE RUNTIME POLICY, NOT THE STRONGEST FORM. Everything it
+// governs is a check standing between a caller and an algorithm that is still
+// compiled into the binary. A build with -tags fips removes the algorithms
+// instead: Argon2id (kdf_argon2.go) and the ChaCha20 family
+// (algorithm_chacha.go) are excluded from compilation, so neither this
+// detection nor any configuration can reach them, and the refusals become
+// ErrKDFUnsupportedVersion and ErrUnsupportedAlgorithm. The EXPORTED SURFACE
+// does not move with the tag — NewSoftwareStrategyWithParams still exists in a
+// FIPS build and still compiles at every call site; it simply cannot succeed,
+// because the deriver it names is not there. The AES-GCM data path is FIPS-approved in EVERY
+// build — newAESGCM uses cipher.NewGCMWithRandomNonce unconditionally, because
+// a module-generated IV is required (SP 800-38D) and costs a non-FIPS
+// deployment nothing. See docs/seal-barrier/engineering.md ("FIPS: runtime mode
+// vs. build tag").
 func FIPSEnabled() bool {
 	if fips140.Enabled() {
 		return true

@@ -21,7 +21,27 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Removing the current leader (Raft §6): checkLeaderSelfRemoval steps down at commit; startElection and handleTimeoutNow bar the removed replica.
+// Removing the CURRENT LEADER.
+//
+// Raft §6: "the leader steps down once Cnew is committed if it is not part of
+// the new configuration." Three production sites implement it and each one is
+// load-bearing on its own:
+//
+//	Peer.checkLeaderSelfRemoval  the step-down itself, at commit time
+//	raft.startElection           the selfRemoved bar on the timeout path
+//	raft.handleTimeoutNow        the selfRemoved bar on the transfer path,
+//	                             which bypasses startElection entirely
+//
+// Every multi-node membership test removes a FOLLOWER, so the leader case was
+// exercised only by the single-Peer path. The failure it guards is a two-leader
+// term: a removed replica's remotes are rebuilt from the surviving
+// configuration, so it computes quorum over a voting set it is not in, counts
+// its own vote, and can declare itself leader for a term the real configuration
+// is simultaneously electing in.
+//
+// leaderPeerRemovingItself drives the whole production path — propose, replicate,
+// commit — rather than poking membership directly, so the commit-time hook is
+// the thing under test.
 func leaderPeerRemovingItself(t *testing.T) *Peer {
 	t.Helper()
 	p := newTestMultiNodeLeaderPeer(t)
@@ -74,7 +94,11 @@ func TestPeer_LeaderSelfRemoval_StepsDownOnCommit(t *testing.T) {
 	}
 }
 
-// TestPeer_LeaderSelfRemoval_CannotWinASubsequentElection: a removed leader can never lead again, by timeout or TimeoutNow.
+// TestPeer_LeaderSelfRemoval_CannotWinASubsequentElection is the safety half:
+// after the step-down the replica must never come BACK as leader. It exercises
+// both campaign entry points — the election timeout and TimeoutNow, which
+// bypasses startElection — and then hands the replica a full set of vote grants
+// to prove that even a cooperative (or malicious) peer cannot resurrect it.
 func TestPeer_LeaderSelfRemoval_CannotWinASubsequentElection(t *testing.T) {
 	p := leaderPeerRemovingItself(t)
 	termAfterRemoval := p.r.term
@@ -98,7 +122,9 @@ func TestPeer_LeaderSelfRemoval_CannotWinASubsequentElection(t *testing.T) {
 		t.Fatalf("a removed replica sent %d RequestPreVote messages", len(pre))
 	}
 
-	// 2. The TimeoutNow path skips startElection, so handleTimeoutNow repeats the bar.
+	// 2. The TimeoutNow path. A leadership transfer that was already in flight
+	//    when the removal committed campaigns IMMEDIATELY and skips
+	//    startElection, so the bar has to be repeated in handleTimeoutNow.
 	p.r.drainMessages()
 	mustHandle(t, p, proto.Message{
 		Type: proto.TimeoutNow,
@@ -139,7 +165,11 @@ func TestPeer_LeaderSelfRemoval_CannotWinASubsequentElection(t *testing.T) {
 	}
 }
 
-// TestPeer_RemovedFollower_ButNotTheLeader_KeepsCampaigning is the liveness control: the bars key on this replica's own removal.
+// TestPeer_RemovedFollower_ButNotTheLeader_KeepsCampaigning is the liveness
+// control for the two tests above: the bars must key on THIS replica's removal,
+// not on any committed RemoveNode. A leader that removes a FOLLOWER keeps its
+// leadership, and a replica still in the configuration keeps campaigning — an
+// over-broad bar would silently disable a healthy voter.
 func TestPeer_RemovedFollower_ButNotTheLeader_KeepsCampaigning(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
 

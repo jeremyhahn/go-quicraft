@@ -45,7 +45,17 @@ func newTestPeerForDiag(t *testing.T) *Peer {
 	return newTestPeer(t, raftTestCfg(1, 1), proto.State{}, threeNodeMembership())
 }
 
-// TestHandleVoteRequest_UnreadableLogDenialIsReported checks a vote denied for an unreadable local log is logged, counted and shown in diagnostics.
+// TestHandleVoteRequest_UnreadableLogDenialIsReported pins that the fail-closed
+// vote denial is reported rather than silent.
+//
+// isUpToDate must refuse a vote it cannot justify — granting on a fabricated
+// term 0 would make every candidate look up to date and break Leader
+// Completeness — but the refusal is caused by LOCAL storage and applies to
+// every candidate equally. Hit a majority of replicas and the shard cannot
+// elect a leader while every node is up, reachable, and reporting nothing at
+// all. Its sibling check in startElection warns; without a log, a counter and
+// a diagnostic field here, the only observable would be a leaderless shard
+// with quorum apparently intact.
 func TestHandleVoteRequest_UnreadableLogDenialIsReported(t *testing.T) {
 	buf, cleanup := captureSlog(slog.LevelWarn)
 	defer cleanup()
@@ -144,7 +154,16 @@ func TestDiagRaftState_ReportsUnreadableLogDenials(t *testing.T) {
 	}
 }
 
-// TestSetSelfMembership_RemovalIsReported checks self-removal is reported in diagnostics.
+// TestSetSelfMembership_RemovalIsReported covers the other permanently
+// unelectable state.
+//
+// selfRemoved makes startElection return immediately, and nothing this replica
+// does can clear it — only a config change that re-adds it, applied from a
+// leader it may never hear from. That is a terminal condition, and it is
+// EXPECTED for a replica that was just removed but a serious fault for one
+// that was not (an empty or truncated membership restored from a damaged
+// snapshot). Only an operator can tell those apart, and Debug-level logging
+// with no diagnostic field gave them nothing to tell them apart with.
 func TestSetSelfMembership_RemovalIsReported(t *testing.T) {
 	buf, cleanup := captureSlog(slog.LevelWarn)
 	defer cleanup()

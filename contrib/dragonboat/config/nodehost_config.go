@@ -74,16 +74,25 @@ type NodeHostConfig struct {
 	// quicraft are always available via the metrics package.
 	EnableMetrics bool
 
-	// MaxSendQueueSize is accepted for dragonboat compatibility and ignored; quicraft sizes send queues internally.
+	// MaxSendQueueSize is the maximum outbound message queue size.
+	// NOT supported by quicraft: accepted for dragonboat API
+	// compatibility only and ignored by ToQuicraft. Quicraft sizes its
+	// transport send queues internally.
 	MaxSendQueueSize uint64
 
-	// MaxReceiveQueueSize is accepted for dragonboat compatibility and ignored; quicraft sizes receive queues internally.
+	// MaxReceiveQueueSize is the maximum inbound message queue size.
+	// NOT supported by quicraft: accepted for dragonboat API
+	// compatibility only and ignored by ToQuicraft. Quicraft sizes its
+	// transport receive queues internally.
 	MaxReceiveQueueSize uint64
 
 	// NotifyCommit enables WAL-durable early notification.
 	NotifyCommit bool
 
-	// DefaultNodeRegistryEnabled is accepted for dragonboat compatibility and ignored; peers resolve from membership addresses.
+	// DefaultNodeRegistryEnabled enables dragonboat's gossip-based
+	// default node registry. NOT supported by quicraft: accepted for
+	// dragonboat API compatibility only and ignored by ToQuicraft.
+	// Quicraft resolves peers from shard membership addresses.
 	DefaultNodeRegistryEnabled bool
 
 	// RaftEventListener receives Raft protocol event notifications.
@@ -92,10 +101,17 @@ type NodeHostConfig struct {
 	// SystemEventListener receives system-level event notifications.
 	SystemEventListener raftio.ISystemEventListener
 
-	// Gossip is not supported: Validate rejects a non-empty GossipConfig.
+	// Gossip configures the gossip protocol for node discovery.
+	// NOT supported by quicraft: gossip absence changes cluster
+	// behavior, so Validate rejects a non-empty GossipConfig rather
+	// than silently dropping it.
 	Gossip GossipConfig
 
-	// Expert maps Engine.ExecShards and Engine.ApplyShards to worker counts; other Engine fields and LogDB.Shards are ignored.
+	// Expert holds advanced tuning parameters. Engine.ExecShards and
+	// Engine.ApplyShards are mapped to quicraft worker counts by
+	// ToQuicraft; the remaining Engine fields and LogDB.Shards are NOT
+	// supported (quicraft uses a fixed internal WAL shard count) and
+	// are ignored.
 	Expert ExpertConfig
 }
 
@@ -200,7 +216,8 @@ type LogDBFactory interface {
 	Name() string
 }
 
-// LogDBFactoryFunc matches dragonboat v4's deprecated LogDBFactoryFunc signature.
+// LogDBFactoryFunc is a function type matching the LogDB factory Create
+// signature. This matches dragonboat v4's deprecated LogDBFactoryFunc.
 type LogDBFactoryFunc func(NodeHostConfig, LogDBCallback, []string, []string) (raftio.ILogDB, error)
 
 // RaftRPCFactoryFunc creates Raft RPC transport instances. This matches
@@ -223,7 +240,11 @@ type NodeRegistryFactory interface {
 	Create(nhid string, streamConnections uint64, v TargetValidator) (raftio.INodeRegistry, error)
 }
 
-// IsValidAddress reports whether addr is hostname-or-IPv4:port with a port in [1, 65535], as dragonboat validates it.
+// IsValidAddress returns true when addr is in valid host:port format.
+// It mirrors dragonboat's validator: exactly one colon separating a
+// non-empty host from a numeric port in [1, 65535], where the host is
+// either a hostname or an IPv4 literal. IPv6 literals are rejected,
+// as they are by dragonboat.
 func IsValidAddress(addr string) bool {
 	in := strings.TrimSpace(addr)
 	host, port, found := strings.Cut(in, ":")
@@ -369,7 +390,10 @@ func (c NodeHostConfig) Validate() error {
 	return nil
 }
 
-// ToQuicraft converts the config to a quicraft HostConfig, reading the mTLS files when MutualTLS is true.
+// ToQuicraft converts the dragonboat-compatible NodeHostConfig to a
+// quicraft HostConfig. When MutualTLS is true, the CA, certificate,
+// and key files are read from disk and populated into the transport
+// MTLSConfig. Returns an error if file reading fails.
 func (c NodeHostConfig) ToQuicraft() (qcConfig.HostConfig, error) {
 	hc := qcConfig.HostConfig{
 		WALDir:         c.WALDir,
@@ -412,7 +436,10 @@ func (c NodeHostConfig) ToQuicraft() (qcConfig.HostConfig, error) {
 	return hc, nil
 }
 
-// ReadMutualTLS reads the CA, certificate and key files into an MTLSConfig, returning a *FileReadError for the first unreadable file.
+// ReadMutualTLS reads the CA, certificate and key files into a quicraft
+// MTLSConfig. ToQuicraft calls it at start and NodeHost.ReloadMutualTLS
+// calls it again to pick up files an operator has replaced. Returns a
+// *FileReadError naming the first file that cannot be read.
 func (c NodeHostConfig) ReadMutualTLS() (*qcConfig.MTLSConfig, error) {
 	caCert, err := os.ReadFile(c.CAFile)
 	if err != nil {

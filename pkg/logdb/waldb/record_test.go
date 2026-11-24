@@ -189,7 +189,16 @@ func TestDecodeBadTypeInRecord(t *testing.T) {
 	}
 }
 
-// TestRecordHeaderSize checks the on-disk header is [CRC32:4][Length:2][Type:1][DurSeq:4][GenStart:4] = 15 bytes.
+// TestRecordHeaderSize confirms the header size constant matches the spec:
+// [CRC32:4] + [Length:2] + [Type:1] + [DurSeq:4] + [GenStart:4] = 15 bytes.
+//
+// The constant is pinned rather than derived because it IS the on-disk format:
+// changing it leaves every already-written segment unreadable. Under the
+// pre-release pinning policy that is a permitted change and walFormatVersion
+// does NOT move for it — the framing changes in place at version 1 and every
+// dev directory is wiped. What this test protects is that the change is
+// deliberate: an accidental edit to recordHeaderSize would silently make this
+// build unable to read segments it wrote an hour ago.
 func TestRecordHeaderSize(t *testing.T) {
 	if recordHeaderSize != 15 {
 		t.Fatalf("recordHeaderSize = %d, want 15", recordHeaderSize)
@@ -230,7 +239,23 @@ func crc32Checksum(data []byte) uint32 {
 	return crc32.Checksum(data, crc32Table)
 }
 
-// TestDecodeRecord_CRCMismatch flips each checksummed byte in turn and checks ErrCorruptedRecord, pinning that type, durability sequence and payload are covered.
+// TestDecodeRecord_CRCMismatch reaches ErrCorruptedRecord the way the medium
+// actually produces it: a bit flip in a well-formed record.
+//
+// The other ErrCorruptedRecord tests reach it through the FRAMING checks — a
+// buffer shorter than a header, and a length field pointing past the buffer —
+// which are reached before the checksum is ever computed. Neither exercises the
+// CRC comparison, so the whole reason the checksum exists had no unit-level
+// test at all: replacing the comparison with `computed != computed` would have
+// left this file green.
+//
+// Every byte of the checksummed region is flipped in turn, so the test also
+// pins WHAT the CRC covers. The header's own length and CRC fields sit outside
+// it (a flip there is caught by the framing checks or by the comparison itself),
+// but type, durability sequence and payload must every one of them be inside:
+// a durability sequence outside the covered region could be flipped to move a
+// record into another generation, which is exactly the evidence recovery uses
+// to decide whether truncating destroys acknowledged data.
 func TestDecodeRecord_CRCMismatch(t *testing.T) {
 	data := []byte("payload-under-checksum")
 	buf := make([]byte, recordHeaderSize+len(data))
@@ -269,7 +294,16 @@ func TestDecodeRecord_CRCMismatch(t *testing.T) {
 	}
 }
 
-// TestRecordDurabilitySequenceOnDisk checks the durability sequence's on-disk position and encoding.
+// TestRecordDurabilitySequenceOnDisk pins the durability sequence's on-disk
+// position and encoding.
+//
+// It is the value recovery reads to decide whether truncating a damaged segment
+// destroys records this node already acknowledged, and nothing asserted its
+// concrete bytes: every other test either round-trips it through
+// encode/decode — which agrees with itself whatever the layout is — or discards
+// it at the call site. Moving the field, or writing it big-endian, would leave
+// this package green and make every existing WAL's evidence read as a different
+// generation.
 func TestRecordDurabilitySequenceOnDisk(t *testing.T) {
 	const durSeq = uint32(0x0A0B0C0D)
 	data := []byte("x")
@@ -300,7 +334,24 @@ func TestRecordDurabilitySequenceOnDisk(t *testing.T) {
 	}
 }
 
-// TestEntryOverheadBytesTracksTheRecordHeader checks logdb.EntryOverheadBytes equals entryRecordHeaderSize; only this package sees both.
+// TestEntryOverheadBytesTracksTheRecordHeader pins the two constants that must
+// agree across a package boundary they cannot see each other over.
+//
+// logdb.EntryOverheadBytes is the per-entry overhead every LogDB charges
+// against the IterateEntries maxSize budget, and its documentation states it
+// MUST equal waldb's entryRecordHeaderSize — the bytes this package actually
+// writes per entry. They are separate constants only because pkg/logdb cannot
+// import this one (waldb imports logdb, so the dependency runs the other way),
+// which means the compiler cannot hold them together and only a test can.
+//
+// Drift is not cosmetic. waldb charges what it really wrote (indexEntry.Size)
+// while memdb and every caller computing a budget charge EntryOverheadBytes, so
+// the same maxSize admits a different set of entries depending on the backend —
+// and a replication batch sized against the wrong figure either overshoots the
+// transport's limit or ships short reads forever.
+//
+// This assertion lives here because this is the only package where both names
+// are in scope.
 func TestEntryOverheadBytesTracksTheRecordHeader(t *testing.T) {
 	if entryRecordHeaderSize != logdb.EntryOverheadBytes {
 		t.Fatalf("waldb.entryRecordHeaderSize = %d but logdb.EntryOverheadBytes = %d.\n\n"+

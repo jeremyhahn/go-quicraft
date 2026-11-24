@@ -14,7 +14,23 @@
 
 package proto
 
-// Snapshot is a shard's snapshot metadata: [ShardID:8][ReplicaID:8][Index:8][Term:8][Membership:var][Filepath:len+data][FileSize:8][OnDiskIndex:8][Epoch:8][Compression:8]. An empty Filepath means metadata only; integrity rests on TLS in transit and barrier AEAD at rest.
+// Snapshot represents snapshot metadata for a Raft shard. It contains
+// fixed fields for identification and state, an inline Membership, and
+// one variable-length field, Filepath. The wire format is:
+//
+//	[ShardID:8][ReplicaID:8][Index:8][Term:8][Membership:var]
+//	[Filepath:len+data][FileSize:8]
+//	[OnDiskIndex:8][Epoch:8][Compression:8]
+//
+// An empty Filepath marks a metadata-only snapshot (a witness target, or a
+// state machine that saved nothing); every consumer acts on whether there is
+// payload to stream. The state machine kind is a property of the local process,
+// not of the snapshot.
+//
+// The format carries no checksum. Snapshot integrity rests on TLS in transit
+// and barrier AEAD at rest, so a shard configured with a plaintext barrier
+// (seal.None) has no at-rest integrity check on its snapshot artifacts: silent
+// bit rot or a truncated artifact is recovered into the state machine.
 type Snapshot struct {
 	// ShardID identifies the Raft shard this snapshot belongs to.
 	ShardID uint64
@@ -32,21 +48,42 @@ type Snapshot struct {
 	FileSize uint64
 	// OnDiskIndex is the index tracked for on-disk state machines.
 	OnDiskIndex uint64
-	// Epoch is the barrier encryption epoch the snapshot was saved under; zero means plaintext.
+	// Epoch is the barrier encryption epoch used when this snapshot was
+	// saved. Zero indicates no encryption (plaintext snapshot). This field
+	// must be propagated through the snapshot transfer pipeline so the
+	// receiver can decrypt barrier-encrypted snapshot data.
 	Epoch uint64
-	// Compression is the config.CompressionType the data file was written with, widened to uint64; recovery reads it from the artifact.
+	// Compression is the algorithm the snapshot data file was written with,
+	// as a config.CompressionType value widened to uint64 (this package
+	// cannot import config — config imports it).
+	//
+	// It is a property of what the WRITER did, not of the reader's own
+	// configuration, so a recovery must take it from the artifact's record.
+	// Without the field on this type, every snapshot record built by
+	// converting a proto.Snapshot recorded NoCompression whatever the data
+	// actually was — and a compressed artifact read as uncompressed is fed to
+	// the state machine as garbage.
 	Compression uint64
 }
 
 // Size returns the total marshaled size of the snapshot in bytes.
 func (s *Snapshot) Size() int {
-	// ShardID, ReplicaID, Index, Term; Membership; Filepath (4-byte len + data); FileSize; OnDiskIndex, Epoch, Compression.
+	// 4 fixed uint64 fields at start: ShardID, ReplicaID, Index, Term
+	// Membership (variable)
+	// Filepath: 4-byte len + data
+	// FileSize: 8
+	// OnDiskIndex, Epoch, Compression: 3 * 8
 	return 4*8 + s.Membership.Size() +
 		(4 + len(s.Filepath)) + 8 +
 		3*8
 }
 
-// MarshalTo writes the snapshot into buf (at least Size() bytes) and returns bytes written; it applies the read-side limits (ErrBufferTooSmall, ErrFilepathTooLong, Membership's).
+// MarshalTo writes the snapshot metadata into buf and returns bytes written.
+// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
+// short, ErrFilepathTooLong if Filepath exceeds MaxFilepathLen, or whatever
+// the embedded Membership's own write-side limits report — the read side's
+// checks applied on write, so this type cannot emit metadata it refuses to
+// read back.
 func (s *Snapshot) MarshalTo(buf []byte) (int, error) {
 	if len(s.Filepath) > MaxFilepathLen {
 		return 0, ErrFilepathTooLong
@@ -119,12 +156,25 @@ func (s *Snapshot) UnmarshalFrom(buf []byte) (int, error) {
 	return offset, nil
 }
 
-// IsEmpty reports whether Index and Term are both zero; Message.MarshalTo uses it as the snapshot presence flag.
+// IsEmpty returns true if the snapshot has no meaningful content
+// (zero Index and zero Term).
+//
+// The log POSITION is the whole test, and that is a deliberate semantic the rest
+// of the engine depends on: a snapshot is identified by the (Index, Term) it
+// covers, and one that covers nothing is not a snapshot regardless of what else
+// happens to be filled in. Message.MarshalTo uses it as the presence flag for
+// the embedded snapshot, so it also decides whether those other fields cross the
+// wire at all — see hasContentBeyondPosition, which exists so that combination
+// is refused rather than silently dropped.
 func (s *Snapshot) IsEmpty() bool {
 	return s.Index == 0 && s.Term == 0
 }
 
-// CheckBounds returns ErrLogIndexOutOfRange or ErrTermOutOfRange when Index or Term is at or above MaxLogIndex or MaxTerm, else nil.
+// CheckBounds reports whether the snapshot's log position lies inside the
+// range the protocol can do arithmetic on: ErrLogIndexOutOfRange when Index is
+// at or above MaxLogIndex, ErrTermOutOfRange when Term is at or above MaxTerm,
+// nil otherwise. It is the one predicate every snapshot admission path applies
+// (see MaxTerm); a zero position is not its concern — IsEmpty answers that.
 func (s *Snapshot) CheckBounds() error {
 	if s.Index >= MaxLogIndex {
 		return ErrLogIndexOutOfRange
@@ -135,7 +185,10 @@ func (s *Snapshot) CheckBounds() error {
 	return nil
 }
 
-// hasContentBeyondPosition reports whether any field besides Index and Term is set.
+// hasContentBeyondPosition reports whether any field other than Index and Term
+// is populated. Together with IsEmpty it identifies the one contradictory shape
+// this type can hold: content with no log position, which the containing
+// Message cannot encode and would otherwise discard in silence.
 func (s *Snapshot) hasContentBeyondPosition() bool {
 	return s.ShardID != 0 || s.ReplicaID != 0 || s.Filepath != "" ||
 		s.FileSize != 0 || s.OnDiskIndex != 0 ||

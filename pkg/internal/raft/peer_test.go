@@ -44,7 +44,13 @@ func mustCommit(t *testing.T, p *Peer, update proto.Update) {
 	}
 }
 
-// runUpdateCycles drives GetUpdate and Commit until the peer has no pending update, as the engine workers do.
+// runUpdateCycles drives the GetUpdate→Commit contract until the peer
+// reports no pending update, mirroring the engine's step/commit worker
+// loop. Commit fires the persistence-edge commit re-evaluation, so a
+// proposal takes one cycle to persist its entries and a second cycle to
+// surface them as committed entries. Returns every committed entry
+// observed across the cycles so callers can assert on what reached the
+// apply stage.
 func runUpdateCycles(t *testing.T, p *Peer) []proto.Entry {
 	t.Helper()
 	var committed []proto.Entry
@@ -218,7 +224,12 @@ func TestPeer_NewPeer_Success(t *testing.T) {
 	if p.r.term != 5 {
 		t.Fatalf("expected term 5, got %d", p.r.term)
 	}
-	// The persisted vote is restored and kept: the term does not advance.
+	// The persisted vote is restored too, and is NOT reset. becomeFollower
+	// clears the vote only on term ADVANCEMENT (Raft Figure 2), and newRaft
+	// calls it with the term it just restored, so the term does not change and
+	// the vote survives. Preserving it is what stops a replica that restarts
+	// inside a term from voting a second time in that term. See
+	// persisted_vote_regression_test.go for the double-vote scenario.
 	if p.r.vote != 2 {
 		t.Fatalf("expected persisted vote 2 to be restored, got %d", p.r.vote)
 	}
@@ -1000,7 +1011,14 @@ func TestPeer_HasUpdate_EntriesToSave(t *testing.T) {
 	}
 }
 
-// TestPeer_RemoteProgress_ReportsWhichFollowerIsBehind verifies the per-remote progress report.
+// TestPeer_RemoteProgress_ReportsWhichFollowerIsBehind pins the structured
+// answer to "which replica is lagging, and why".
+//
+// Before this existed the information was reachable only by parsing the
+// DiagRemotes debug string, which made it available to a human reading a log
+// line and to nothing else — not to ShardInfo, not to an operator dashboard,
+// not to a pre-upgrade check asking whether it is safe to take another replica
+// down.
 func TestPeer_RemoteProgress_ReportsWhichFollowerIsBehind(t *testing.T) {
 	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, threeNodeMembership())
 	p.r.becomeCandidate()
@@ -1107,7 +1125,20 @@ func TestPeer_RemoteProgress_NilOnFollower(t *testing.T) {
 
 // --- GetUpdate ---
 
-// TestPeer_LostUpdate_ForcesHardStateBackThroughTheWAL verifies an extracted but unpersisted update is persisted again.
+// TestPeer_LostUpdate_ForcesHardStateBackThroughTheWAL pins the recovery from
+// an update that was extracted but never persisted.
+//
+// GetUpdate advances prevState when it hands an update out, not when the engine
+// writes it. That is an optimistic claim, and when it is wrong — the step
+// worker panics between extraction and SaveState — prevState asserts a term and
+// vote are on disk that never got there. Because ReadOnly is computed from
+// exactly that diff, the NEXT update is then classified ReadOnly and skips the
+// WAL too, so the hard state is never written at all: the node answers
+// RequestVote from memory, restarts with no record of the grant, and can grant
+// the same term to a second candidate.
+//
+// GetPiggybackUpdate was already fixed for this by not advancing prevState (see
+// NotePiggybackPersisted); the main extraction path was not.
 func TestPeer_LostUpdate_ForcesHardStateBackThroughTheWAL(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, threeNodeMembership())
 
@@ -1500,7 +1531,12 @@ func TestPeer_Commit_LastAppliedTruncatesOnlyAppliedEntries(t *testing.T) {
 	}
 }
 
-// TestPeer_Commit_MultipleConfigChangesInBatch verifies Commit processes several config changes in one batch.
+// TestPeer_Commit_MultipleConfigChangesInBatch verifies that Commit
+// processes multiple config change entries in a single committed batch
+// without panicking. This scenario occurs when a follower catches up
+// via log replication and receives entries from multiple leader rounds
+// in one batch (e.g., a RemoveNode followed by an AddNode that were
+// committed separately on the leader).
 func TestPeer_Commit_MultipleConfigChangesInBatch(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
 	p.r.log.inmem.merge([]proto.Entry{
@@ -2183,7 +2219,8 @@ func TestPeer_Handle_RejectedReplicateDoesNotApplyConfigChange(t *testing.T) {
 		t.Fatalf("failed to marshal config change: %v", err)
 	}
 
-	// A Replicate with a wrong prevLogTerm is rejected; its config change must not apply.
+	// Send a Replicate with a WRONG prevLogTerm so the append is rejected.
+	// The entries contain a config change that should NOT be applied.
 	msg := proto.Message{
 		Type:     proto.Replicate,
 		From:     2,
@@ -2260,7 +2297,8 @@ func TestPeer_Handle_FollowerUpdatesRemotesOnConfigChange(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Config changes take effect when the committed entry flows through Peer.Commit.
+	// Config changes take effect at COMMIT time: membership mutates only
+	// when the committed entry flows through Peer.Commit.
 	if _, ok := p.GetMembership().Addresses[4]; ok {
 		t.Fatal("membership must not change before the update cycle commits the entry")
 	}
@@ -2774,7 +2812,21 @@ func TestPeer_IsMember_RemovedNotMember(t *testing.T) {
 	}
 }
 
-// TestPeer_Authorization_IsADenyListNotAnAllowList verifies the per-shard authorization predicate denies only removed replicas.
+// TestPeer_Authorization_IsADenyListNotAnAllowList pins the per-shard
+// authorization predicate.
+//
+// A replica's configuration is replicated state that LAGS BY DESIGN, so it
+// cannot serve as an allow-list: a replica that has not yet applied the config
+// change adding the current leader would reject that leader's Replicate,
+// Heartbeat and InstallSnapshot — including the very messages that would bring
+// it up to date — and wedge itself out of the shard permanently.
+//
+// The removed set is monotone: entries are only ever added by a committed config
+// change, so a stale replica's failure mode is not yet knowing about a removal,
+// which the next committed entry repairs. That is the only membership-derived
+// fact safe to enforce on the receive path. Same model as etcd
+// (EtcdServer.Process rejects only "message from removed member") and
+// hashicorp/raft (no sender-membership test on appendEntries at all).
 func TestPeer_Authorization_IsADenyListNotAnAllowList(t *testing.T) {
 	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, proto.Membership{
 		Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
@@ -3028,7 +3080,12 @@ func TestPeer_AppliedToTerm_ZeroBeforeAnyApply(t *testing.T) {
 // handleSnapshot retains membership when entries are retained
 // ---------------------------------------------------------------------------
 
-// TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership verifies a matching snapshot with a newer membership is adopted.
+// TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership verifies the
+// commit-time-membership requirement that a matching-log snapshot whose
+// membership is strictly newer IS adopted. The matching branch advances the
+// processed marker to the snapshot index, so config changes below it are
+// never emitted as CommittedEntries and never reach processConfigChanges —
+// without adoption this replica would compute quorum over a stale voting set.
 func TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
@@ -3077,7 +3134,12 @@ func TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership(t *testing.T) {
 }
 
 func TestPeer_Handle_InstallSnapshot_MatchRetainsMembership(t *testing.T) {
-	// A matching snapshot whose membership is not newer leaves the local membership in place.
+	// When a snapshot matches (same index+term in the log) and its
+	// membership is NOT strictly newer (equal ConfigChangeID here), the
+	// local membership wins: an equal ID means the same configuration, and
+	// a locally-higher ID means config changes were already applied above
+	// the snapshot index. A strictly newer snapshot IS adopted — see
+	// TestPeer_Handle_InstallSnapshot_MatchAdoptsNewerMembership.
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)
 	initialMs := proto.Membership{
@@ -3095,7 +3157,9 @@ func TestPeer_Handle_InstallSnapshot_MatchRetainsMembership(t *testing.T) {
 		p.r.log.inmem.merge([]proto.Entry{{Index: i, Term: 2}})
 	}
 
-	// A matching snapshot at index 10 with a different membership keeps entries 11-12 and the membership.
+	// Install a snapshot at index 10 with term 2 (matches) but with
+	// a DIFFERENT membership (only 2 nodes). Since the log matches,
+	// entries 11-12 are retained and membership should NOT be overwritten.
 	snap := proto.Snapshot{
 		Index: 10,
 		Term:  2,
@@ -3214,7 +3278,16 @@ func captureSlog(level slog.Level) (*bytes.Buffer, func()) {
 	return &buf, func() { slog.SetDefault(prev) }
 }
 
-// TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard verifies an undecodable config change faults the shard.
+// TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard pins the runtime
+// decode site as fail-CLOSED.
+//
+// Logging and skipping an undecodable committed config entry, and carrying on
+// with the entries after it, is not a tolerant no-op — a config change that commits and is then dropped on one
+// replica leaves that replica computing quorum over a membership the rest of the
+// shard does not hold, and a peer that catches up by SNAPSHOT instead of by log
+// replay gets the change, so the two genuinely diverge. Recovery already refuses
+// these bytes (ReconstructMembership / bootstrap.go); the runtime failing open
+// while recovery fails closed over the same input would be the inconsistency.
 func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) {
 	logBuf, cleanup := captureSlog(slog.LevelDebug)
 	defer cleanup()
@@ -3223,7 +3296,8 @@ func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) 
 	ms := singleNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
 
-	// A valid change after the corrupt one shows the scan stops.
+	// A valid change AFTER the corrupt one, so the test can also show the scan
+	// stops rather than folding past a membership it cannot reconstruct.
 	ccBuf := marshalConfigChange(t, proto.ConfigChange{
 		Type: proto.AddNode, ReplicaID: 7, Address: "addr7",
 	})
@@ -3250,7 +3324,11 @@ func TestPeer_processConfigChanges_UndecodableEntryFaultsTheShard(t *testing.T) 
 	}
 }
 
-// TestPeer_processConfigChanges_DeterministicRefusalIsStillIgnored verifies an apply refusal is still ignored.
+// TestPeer_processConfigChanges_DeterministicRefusalIsStillIgnored is the
+// control. The fault above must key on the DECODE, not on "membership.apply
+// returned an error": an apply refusal is evaluated identically by every replica
+// (a Removed tombstone re-add here), so it is agreement rather than corruption,
+// and faulting on it would kill shards over an outcome the whole cluster shares.
 func TestPeer_processConfigChanges_DeterministicRefusalIsStillIgnored(t *testing.T) {
 	logBuf, cleanup := captureSlog(slog.LevelDebug)
 	defer cleanup()
@@ -3313,7 +3391,15 @@ func TestPeer_processConfigChanges_SkipsEmptyCmd(t *testing.T) {
 	}
 }
 
-// testConfigChangeCmd returns a valid marshaled ConfigChange for tests of propose-time bookkeeping.
+// testConfigChangeCmd returns a VALID marshaled ConfigChange payload, for tests
+// whose subject is the propose-time bookkeeping (pendingConfigChange, batch
+// rejection, entry-type masking) rather than the change itself.
+//
+// It exists because handleLeaderPropose REJECTS a config-change payload that
+// does not decode (raft.validateProposedConfigChange), so placeholder bytes like
+// []byte("cc1") cannot stand in for one. Passing such a payload through would
+// let a wire-forwarded Propose put a membership change nobody had validated
+// into the log of every replica.
 func testConfigChangeCmd(replicaID uint64) []byte {
 	cc := proto.ConfigChange{
 		Type:      proto.AddNode,
@@ -3339,7 +3425,18 @@ func marshalConfigChange(t *testing.T, cc proto.ConfigChange) []byte {
 
 // --- Config Change Rollback on Log Truncation (MC1) ---
 
-// TestPeer_Handle_ConfigChangeRollbackOnTruncation verifies config changes in truncated entries are rolled back.
+// TestPeer_Handle_ConfigChangeRollbackOnTruncation verifies that when a
+// new leader overwrites log entries via conflict resolution, config
+// changes from the truncated entries are rolled back. Per PhD thesis
+// 4.1: "a log entry for a configuration change can be removed (if
+// leadership changes); in this case, a server must be prepared to fall
+// back to the previous configuration in its log."
+// TestPeer_Handle_UncommittedConfigChangeNotApplied verifies commit-time
+// membership semantics on a follower: a config change entry that is
+// appended but not committed never mutates membership or remote tracking,
+// so log truncation that overwrites it requires no rollback. When a
+// replacement config change commits, membership reflects only the
+// replacement.
 func TestPeer_Handle_UncommittedConfigChangeNotApplied(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()
@@ -3426,7 +3523,9 @@ func TestPeer_Handle_UncommittedConfigChangeNotApplied(t *testing.T) {
 	}
 }
 
-// TestPeer_Handle_CommittedConfigChangeSurvivesTruncation verifies a committed change survives later conflicts and an uncommitted one never applies.
+// TestPeer_Handle_CommittedConfigChangeSurvivesTruncation verifies that a
+// COMMITTED config change is applied to membership and survives later log
+// conflicts, while an uncommitted one in the same batch is never applied.
 func TestPeer_Handle_CommittedConfigChangeSurvivesTruncation(t *testing.T) {
 	cfg := testConfig()
 	ms := threeNodeMembership()
@@ -3706,7 +3805,11 @@ func contiguousEntries(last uint64) []proto.Entry {
 	return entries
 }
 
-// newTestPeerWithLog builds a peer over a LogReader that holds the entries the hard state claims.
+// newTestPeerWithLog builds a peer over a LogReader that actually HOLDS the
+// entries the recovered hard state claims. A hard state whose Commit runs
+// past the last recovered entry is a corrupt/incomplete recovery and is
+// clamped by newRaftLog, so a fixture that omits the entries does not test
+// what it appears to.
 func newTestPeerWithLog(t *testing.T, cfg config.Config, entries []proto.Entry, state proto.State, ms proto.Membership) *Peer {
 	t.Helper()
 	lr := newTestLogReader(entries, state)
@@ -4346,7 +4449,12 @@ func TestPeer_NewPeer_VolatileStateReinitialized(t *testing.T) {
 		t.Fatalf("failed to create peer: %v", err)
 	}
 
-	// Term and vote are restored; the vote is kept because the term does not advance.
+	// Persisted state: term and vote are restored from stable storage.
+	// newRaft sets r.term from state first, then calls becomeFollower with the
+	// SAME term, and becomeFollower clears the vote only on term advancement
+	// (Raft Figure 2), so the vote is NOT cleared. Both halves are asserted:
+	// asserting only the term is what let a mutation of the vote-recovery line
+	// pass the whole suite.
 	if p.r.term != 5 {
 		t.Fatalf("expected persisted term 5 to be restored, got %d", p.r.term)
 	}
@@ -4396,7 +4504,12 @@ func TestPeer_NewPeer_VolatileStateReinitialized(t *testing.T) {
 	}
 }
 
-// TestPeer_RequestLeaderTransfer_BlockedDuringPendingConfigChange verifies leader transfer and pending config changes interact correctly.
+// TestPeer_RequestLeaderTransfer_BlockedDuringPendingConfigChange verifies
+// the interaction between leader transfer and pending config changes.
+// Per the Raft implementation, leader transfer checks are independent of
+// config change state at the Peer level. The raft state machine does not
+// block leader transfers due to pending config changes; these are separate
+// protocol mechanisms. This test documents that behavior.
 func TestPeer_RequestLeaderTransfer_BlockedDuringPendingConfigChange(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
 
@@ -4455,7 +4568,12 @@ func TestPeer_RequestLeaderTransfer_BlockedDuringPendingConfigChange(t *testing.
 	}
 }
 
-// TestPeer_ProposeConfigChange_BlockedDuringLeaderTransfer verifies config changes are refused during a transfer.
+// TestPeer_ProposeConfigChange_BlockedDuringLeaderTransfer verifies that
+// config change proposals are rejected while a leadership transfer is in
+// progress. The raft state machine's handleLeaderPropose rejects ALL
+// proposals (including config changes) with ErrTransferInProgress when
+// transferTarget is set. This prevents config mutations during the handoff
+// window where the new leader may not have the config change in its log.
 func TestPeer_ProposeConfigChange_BlockedDuringLeaderTransfer(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
 
@@ -4565,7 +4683,12 @@ func TestPeer_SyncRaftRemotes_ClearsTransferTargetOnRemoval(t *testing.T) {
 	}
 }
 
-// TestPeer_SyncRaftRemotes_PreservesRemoteOnObserverPromotion verifies a promoted observer keeps its remote state.
+// TestPeer_SyncRaftRemotes_PreservesRemoteOnObserverPromotion verifies that
+// promoting an observer to voter moves its existing remote struct into the
+// voter set instead of creating a fresh one. The observer's remote carries
+// live replication progress — possibly a snapshot transfer or its ack wait —
+// and recreating it at next=lastIndex+1 would immediately probe a
+// still-restoring node into a redundant full snapshot re-send.
 func TestPeer_SyncRaftRemotes_PreservesRemoteOnObserverPromotion(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
 
@@ -4903,10 +5026,17 @@ func TestPeer_ValidateConfigChange_RemoveLastVoter(t *testing.T) {
 	}
 }
 
-// TestPeer_ValidateConfigChange_ExceedsCap verifies a 65th full replica or witness is refused with ErrTooManyVotingMembers.
+// TestPeer_ValidateConfigChange_ExceedsCap builds a membership at the
+// 64-voting-member cap and verifies that ValidateConfigChange rejects both a
+// 65th full replica and a 65th witness with ErrTooManyVotingMembers — the
+// check the Host membership API relies on to avoid the rebuildReplicaToBit
+// invariant panic. An observer add (which does not affect quorum) is still
+// accepted at the cap.
 func TestPeer_ValidateConfigChange_ExceedsCap(t *testing.T) {
 	cfg := testConfig()
-	// Distinct addresses per member: one address may name only one member.
+	// Distinct addresses per member: one address may name only one member of a
+	// shard (see membership.addressHolder), so a fixture that reuses one string
+	// would be rejected for THAT reason and prove nothing about the cap.
 	addrs := make(map[uint64]string, maxVotingMembers)
 	for id := uint64(1); id <= maxVotingMembers; id++ {
 		addrs[id] = fmt.Sprintf("addr%d", id)
@@ -4941,11 +5071,19 @@ func TestPeer_ValidateConfigChange_Valid(t *testing.T) {
 	}
 }
 
-// TestLeaderAndTermIsAConsistentPair verifies leader and term are read as a pair that held together.
+// TestLeaderAndTermIsAConsistentPair pins that the leader and term are readable
+// together as a combination that actually held.
+//
+// They are two independent atomic words. A reader loading them separately can
+// straddle a syncLeaderID and observe a (leaderID, term) pair that never
+// existed, which reported through OnLeaderUpdated tells a listener that a
+// replica led in a term it never led. The seqlock on syncLeaderID is what makes
+// the pair atomic.
 func TestLeaderAndTermIsAConsistentPair(t *testing.T) {
 	p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, threeNodeMembership())
 
-	// Leader N holds term N here, so any mismatch is a torn read.
+	// Every leadership change advances BOTH fields together: leader N holds
+	// term N here, so any mismatch is a torn read.
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)

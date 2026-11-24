@@ -53,7 +53,20 @@ func ciJobs(t *testing.T, body string) []string {
 	return jobs
 }
 
-// TestCIGateDependsOnEveryJobAndChecksEveryDependency verifies CI Gate needs and checks every job.
+// TestCIGateDependsOnEveryJobAndChecksEveryDependency is the gate's own gate.
+//
+// Branch protection can require exactly ONE status context, so `CI Gate` speaks
+// for the whole pipeline. Two ways that claim rots, both silent:
+//
+//   - a NEW JOB is added and not wired into `needs`. The gate goes green while
+//     that job is red, which is worse than having no gate: the rollup's whole
+//     value is that a reader can trust one context.
+//   - a job IS in `needs` but has no `check` line. `needs` only orders
+//     execution; with `if: always()` the gate runs regardless of the
+//     dependency's result, so an unchecked dependency is decorative.
+//
+// The second is the nastier one, because the job appears in the workflow and
+// appears in the gate, and still gates nothing.
 func TestCIGateDependsOnEveryJobAndChecksEveryDependency(t *testing.T) {
 	raw, err := os.ReadFile(ciWorkflowPath)
 	if err != nil {
@@ -126,7 +139,12 @@ func TestCIGateDependsOnEveryJobAndChecksEveryDependency(t *testing.T) {
 	}
 }
 
-// TestCIGateRunsEvenWhenADependencyFails verifies the gate carries if: always().
+// TestCIGateRunsEvenWhenADependencyFails pins `if: always()`.
+//
+// Without it the gate is SKIPPED when any dependency fails. A skipped job never
+// publishes its status, so a required `CI Gate` context would simply never
+// arrive and the merge would block on silence rather than fail on a verdict —
+// from the outside, identical to a pipeline that never ran.
 func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 	raw, err := os.ReadFile(ciWorkflowPath)
 	if err != nil {
@@ -210,7 +228,14 @@ func jobCondition(job string) (string, bool) {
 	return c, true
 }
 
-// TestCIGateTiersMatchTheJobs verifies the gate's tier tags match the jobs' conditions.
+// TestCIGateTiersMatchTheJobs pins the three tiers to the gate.
+//
+// ci-gate passes a skipped job only when its check line tags it `full` and
+// the run did not select the full tier, or tags it `nightly` and the run is
+// neither scheduled nor dispatched. Two drifts would break that: a job tagged
+// `full` or `nightly` whose `if:` differs from the gate's expression, so the
+// gate excuses a skip in a run that should have executed it; and a PR-tier
+// job that gains an `if:`, so it skips on some event and fails the gate there.
 func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	raw, err := os.ReadFile(ciWorkflowPath)
 	if err != nil {

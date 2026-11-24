@@ -35,9 +35,14 @@ func bootstrapEntryForTest(t *testing.T, voters map[uint64]string) proto.Entry {
 	return proto.Entry{Index: 1, Term: 1, Type: proto.EntryInitialMembership, Cmd: buf}
 }
 
-// TestReconstructShardMembership_ClampsToRecoveredLastIndex: a commit index past the recovered entries still yields the index-1 bootstrap entry.
+// TestReconstructShardMembership_ClampsToRecoveredLastIndex pins the torn-tail
+// case: the recovered HardState.Commit can outrun the recovered
+// entry range (the state record survived while later entries were lost).
+// Reconstruction must still yield the bootstrap entry at index 1, not ask for a
+// range past the log's end — which returns ErrUnavailable before index 1 and
+// silently falls back to re-seeding membership from the local members map.
 func TestReconstructShardMembership_ClampsToRecoveredLastIndex(t *testing.T) {
-	// A cache-only LogReader holding only the bootstrap entry at index 1.
+	// A LogReader (cache-only) holding ONLY the bootstrap entry at index 1.
 	lr := logdb.NewLogReader(1, 1, nil)
 	if err := lr.Append([]proto.Entry{bootstrapEntryForTest(t, map[uint64]string{1: "a", 2: "b", 3: "c"})}); err != nil {
 		t.Fatalf("Append: %v", err)
@@ -73,7 +78,16 @@ func (c *countingReadLogDB) IterateEntries(entries []logdb.Entry, size, shardID,
 	return entries, size, logdb.ErrUnavailable
 }
 
-// TestReconstructShardMembership_ReadsOnlyTheBootstrapEntry pins that restart reads exactly one entry.
+// TestReconstructShardMembership_ReadsOnlyTheBootstrapEntry pins the cost of
+// restart membership recovery. Scanning the ENTIRE committed log — every data
+// entry, from disk, on every restart of a shard that never compacts
+// (SnapshotEntries=0) — delays StartShard enough that a restarted replica cannot
+// catch up under sustained load; the 10m rolling-restart soak fails with such a
+// scan and passes without it.
+//
+// The bootstrap entry lives at a known index, and every membership change above
+// it is folded by the ordinary commit-time replay, so exactly one entry must be
+// read no matter how large the log is.
 func TestReconstructShardMembership_ReadsOnlyTheBootstrapEntry(t *testing.T) {
 	ldb := &countingReadLogDB{}
 	lr := logdb.NewLogReader(1, 1, ldb)
@@ -106,7 +120,12 @@ func (e *iterateErrorLogDB) IterateEntries(entries []logdb.Entry, size, shardID,
 	return entries, size, e.err
 }
 
-// TestReconstructShardMembership_FailsClosedOnReadError pins that a genuine log read error aborts StartShard.
+// TestReconstructShardMembership_FailsClosedOnReadError pins that a genuine log
+// read error during config-in-log reconstruction ABORTS StartShard rather than
+// silently returning "no bootstrap found" and letting the caller re-seed
+// membership from its local members map. ErrCompacted/ErrUnavailable are benign
+// scan boundaries; anything else (a corrupt/gapped read) must fail closed, like
+// every other step in recoverLogReader.
 func TestReconstructShardMembership_FailsClosedOnReadError(t *testing.T) {
 	ldb := &iterateErrorLogDB{err: logdb.ErrLogGapDetected}
 	lr := logdb.NewLogReader(1, 1, ldb)
@@ -177,7 +196,16 @@ func TestConfigInLog_BootstrapWritesInitialMembershipEntry(t *testing.T) {
 	}
 }
 
-// TestConfigInLog_MembershipReconstructsFromLogOnRestart: on restart membership comes from the log, not the members map.
+// TestConfigInLog_MembershipReconstructsFromLogOnRestart is the definitive
+// config-in-log property test: on restart, membership comes from the committed
+// LOG, not from the members map the caller passes to StartShard. It is proven by
+// restarting with a DELIBERATELY WRONG members map and asserting the recovered
+// membership matches the log, not the map.
+//
+// Before config-in-log, StartShard re-seeded membership from its members
+// argument on every start, so a caller that passed a different map on restart
+// would have silently changed the shard's membership. Now the map is ignored on
+// restart (nothingRecovered is false) and the index-1 entry is authoritative.
 func TestConfigInLog_MembershipReconstructsFromLogOnRestart(t *testing.T) {
 	const shardID, replicaID uint64 = 71, 1
 	const trueAddr = "127.0.0.1:6101"
@@ -204,7 +232,10 @@ func TestConfigInLog_MembershipReconstructsFromLogOnRestart(t *testing.T) {
 		t.Fatalf("StopShard: %v", err)
 	}
 
-	// Restart on the same log with a wrong members map: a different address for voter 1 and a phantom voter 99.
+	// Restart on the SAME durable log, but hand StartShard a WRONG members map:
+	// a different address for voter 1 and a phantom voter 99. If membership were
+	// still seeded from this map, the recovered shard would contain voter 99 and
+	// the wrong address for 1.
 	wrongMap := map[uint64]string{1: "127.0.0.1:9999", 99: "127.0.0.1:6199"}
 	if err := h.StartShard(wrongMap, false, create, testShardConfig(shardID, replicaID)); err != nil {
 		t.Fatalf("StartShard 2 (restart): %v", err)

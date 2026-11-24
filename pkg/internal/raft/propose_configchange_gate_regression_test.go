@@ -21,7 +21,32 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// A wire-forwarded Propose must pass the full membership validator at the leader's propose gate; the apply path never re-validates.
+// The wire-forwarded Propose was the unvalidated path into the membership
+//
+// proto.Propose is exempt from the transport's sender binding — a follower
+// legitimately forwards client work to the leader — so a Propose reaches
+// handleLeaderPropose with msg.From whatever the sender chose, and r.send
+// rewrites From to the forwarding replica's own ID on the way, so a forged one
+// arrives wearing an honest follower's identity.
+//
+// handleLeaderPropose sanitised the entry TYPE and enforced the one-pending-
+// config-change rule, then ran validateConfigChangePolicy: the voting-member cap
+// and the witness policy. Nothing else. No duplicate identity, no duplicate
+// address, no Removed tombstone, no empty address. And an undecodable payload
+// logged a warning and returned nil, so it entered the log having been judged by
+// nothing at all.
+//
+// Duplicate identity is the sharpest of these. committedSenderBinding
+// authenticates purely on peer.Identity == binding.Identity, so two replica IDs
+// bound to ONE identity are both satisfiable by one keypair: one physical node
+// then holds two votes and two match indices in a quorum that believes they are
+// independent, and quorum intersection — the property every Raft safety argument
+// rests on — is gone.
+//
+// The fix is the leader's propose-time gate running the FULL membership
+// validator, and nowhere else. It must NOT move to the apply path: handleAddNode
+// deliberately does not re-validate, because refusing an already-committed
+// config change makes replicas diverge.
 
 // leaderPeerWithMembership returns a single-voter Peer that has been elected
 // leader, seeded with ms. A single-voter shard elects itself, which keeps these
@@ -53,7 +78,23 @@ func proposeConfigChangeOverTheWire(t *testing.T, p *Peer, cc proto.ConfigChange
 	})
 }
 
-// TestWirePropose_InvalidConfigChangeIsRefused verifies each invalid change is refused with the log and pendingConfigChange unchanged.
+// TestWirePropose_InvalidConfigChangeIsRefused steps one wire-forwarded
+// config change per membership rule and requires the leader to refuse it,
+// leave its log as it was and leave pendingConfigChange unarmed: a rejected
+// change that armed it would wedge every later membership change.
+//
+//   - duplicate_identity is the quorum-forgery case. The configuration already
+//     binds "identity-1" to replica 1; adding replica 7 with the SAME identity
+//     lets one keypair authenticate as two independent members of the quorum.
+//   - duplicate_address is the address-path equivalent: a certificate is
+//     matched on the address alone, so two active replicas at one committed
+//     address let the single host behind it speak as both.
+//   - removed_replica is the tombstone. The Removed set is the per-shard
+//     DENY-list; re-adding a tombstoned replica un-removes it on every
+//     replica, because the apply path converges on the committed entry.
+//   - empty_address is the structural rule: an AddNode with no address commits
+//     a voter nothing can reach, changing the quorum denominator with no way
+//     to satisfy it.
 func TestWirePropose_InvalidConfigChangeIsRefused(t *testing.T) {
 	quietLogs(t)
 
@@ -148,7 +189,12 @@ func TestWirePropose_UndecodablePayloadIsRefused(t *testing.T) {
 	}
 }
 
-// TestWirePropose_LegitimateConfigChangeStillCommits verifies a valid forwarded config change commits.
+// TestWirePropose_LegitimateConfigChangeStillCommits is the POSITIVE CONTROL. A
+// wire-forwarded Propose is how a client's config change reaches the leader when
+// it contacted a follower, and it must keep working — otherwise the gate has
+// removed the feature rather than secured it. This is also the answer to
+// "should EntryConfigChange in a wire-origin Propose be refused outright?": no,
+// because this is the legitimate path it would break.
 func TestWirePropose_LegitimateConfigChangeStillCommits(t *testing.T) {
 	quietLogs(t)
 
@@ -204,7 +250,14 @@ func TestWirePropose_NormalEntriesAreUntouched(t *testing.T) {
 	}
 }
 
-// TestApplyPath_StillAcceptsACommittedDuplicateIdentity verifies the apply path accepts a committed change the propose gate would refuse.
+// TestApplyPath_StillAcceptsACommittedDuplicateIdentity is the divergence
+// control, and it is the reason the fix lives at the propose gate and NOWHERE
+// else. Once an entry is COMMITTED it is agreed replicated state: a replica that
+// refuses it holds a membership the rest of the shard does not, and nothing
+// later repairs it (configChangeID never advances past a skipped entry). The
+// apply path must therefore stay convergent even for a change the propose gate
+// would have rejected — an older leader, a rolling upgrade, or a log written
+// before the gate existed can all produce one.
 func TestApplyPath_StillAcceptsACommittedDuplicateIdentity(t *testing.T) {
 	quietLogs(t)
 

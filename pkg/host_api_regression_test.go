@@ -36,7 +36,15 @@ import (
 // Close reports the real shutdown outcome to every caller
 // ---------------------------------------------------------------------------
 
-// TestClose_SecondCallerGetsTheSameError pins that a repeated Close reports the shutdown's actual outcome.
+// TestClose_SecondCallerGetsTheSameError pins that a repeated Close reports
+// the shutdown that actually happened.
+//
+// Close's own doc says a nil return means every step succeeded, and the
+// closed-flag CAS made the SECOND caller return nil unconditionally — before
+// the first caller's shutdown had even started. The caller most likely to hit
+// that is a supervisor whose deferred Close races the explicit one in its
+// shutdown path, so the one report that reached the operator was the fabricated
+// one.
 func TestClose_SecondCallerGetsTheSameError(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -66,7 +74,11 @@ func TestClose_SecondCallerGetsTheSameError(t *testing.T) {
 	}
 }
 
-// TestClose_ConcurrentCallersAllWaitAndReport pins that a racing Close blocks until shutdown finishes and reports the same outcome.
+// TestClose_ConcurrentCallersAllWaitAndReport covers the racing form: the
+// second Close arrives while the first is still tearing down. It must BLOCK
+// until the shutdown finishes and then report the same outcome, because a
+// caller that returns early goes on to release resources the shutdown is
+// still using.
 func TestClose_ConcurrentCallersAllWaitAndReport(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -117,7 +129,16 @@ func TestClose_ConcurrentCallersAllWaitAndReport(t *testing.T) {
 // Snapshot error translation
 // ---------------------------------------------------------------------------
 
-// errApplyRowInner is the state machine error in TestTranslateSnapshotError's *engine.ApplyError row.
+// TestTranslateSnapshotError pins that the engine's internal snapshot errors
+// reach a SyncRequestSnapshot caller with an identity that caller can match.
+//
+// Before this translation the snapshot RequestState carried the engine error
+// verbatim. engine is an internal package, so no consumer of the library could
+// write an errors.Is against any of these — and the public sentinels that
+// describe these exact conditions (ErrStopped, ErrSnapshotRecoveryFailed) had
+// no producer anywhere in the library as a result.
+// errApplyRowInner is the state machine error carried by the *engine.ApplyError
+// row of TestTranslateSnapshotError.
 var errApplyRowInner = errors.New("quicraft_test: state machine refused the entry")
 
 func TestTranslateSnapshotError(t *testing.T) {
@@ -140,13 +161,20 @@ func TestTranslateSnapshotError(t *testing.T) {
 			want: ErrStopped,
 		},
 		{
-			// *engine.SMPanicError is the only engine type matching engine.ErrShardFailed.
+			// *engine.SMPanicError is the ONLY type the engine constructs that
+			// matches engine.ErrShardFailed (apply.go builds one in the apply
+			// worker's recover block). *engine.ApplyError, the other terminal
+			// apply error, carries no Is method and so reaches the caller as
+			// itself — see the ApplyError row below.
 			name: "a latched shard becomes the public ErrShardFailed",
 			in:   &engine.SMPanicError{ShardID: 1, ReplicaID: 1, Value: "apply"},
 			want: ErrShardFailed,
 		},
 		{
-			// A returned state machine error passes through in its *engine.ApplyError.
+			// The counterpart of the row above: a state machine that RETURNS an
+			// error is not remapped. Its *engine.ApplyError wraps the state
+			// machine's own error, which is strictly more informative than the
+			// sentinel, so translateSnapshotError passes it through.
 			name: "an apply failure keeps the state machine's own error",
 			in:   &engine.ApplyError{ShardID: 1, ReplicaID: 1, Err: errApplyRowInner},
 			want: errApplyRowInner,
@@ -219,7 +247,12 @@ func TestTranslateSnapshotError(t *testing.T) {
 	}
 }
 
-// TestTranslateSnapshotError_SaveFailureClaimsNoRecoverySentinel pins that a save failure does not match ErrSnapshotRecoveryFailed.
+// TestTranslateSnapshotError_SaveFailureClaimsNoRecoverySentinel pins the
+// deliberate asymmetry: a SAVE failure must NOT match
+// ErrSnapshotRecoveryFailed. The two are opposite directions — one writes an
+// artifact, the other installs one over the live state machine — and a caller
+// that retries a failed save on being told "recovery failed" would be acting on
+// the wrong half of the API.
 func TestTranslateSnapshotError_SaveFailureClaimsNoRecoverySentinel(t *testing.T) {
 	got := translateSnapshotError(&engine.SnapshotError{
 		ShardID: 2, ReplicaID: 1, Save: true, Err: errors.New("disk full"),
@@ -236,7 +269,11 @@ func TestTranslateSnapshotError_SaveFailureClaimsNoRecoverySentinel(t *testing.T
 	}
 }
 
-// TestTranslateSnapshotError_BarrierSentinelsPassThrough pins that public engine sentinels are not re-mapped.
+// TestTranslateSnapshotError_BarrierSentinelsPassThrough pins that the
+// translation does NOT re-map the failures the engine already fails with by
+// PUBLIC identity. Those sentinels are declared in the engine precisely so the
+// engine paths and the host paths produce one identity for one condition;
+// re-mapping them here would undo that.
 func TestTranslateSnapshotError_BarrierSentinelsPassThrough(t *testing.T) {
 	for _, sentinel := range []error{
 		ErrShardBarrierUnresolved,
@@ -283,7 +320,15 @@ func TestTranslateSnapshotSubmitError(t *testing.T) {
 // Config changes are refused while draining
 // ---------------------------------------------------------------------------
 
-// TestRequestConfigChange_DrainingRejected pins that a config change is refused once the host is draining.
+// TestRequestConfigChange_DrainingRejected pins that a QUORUM CHANGE is
+// refused once the host has entered drain.
+//
+// Propose, ReadIndex and the session path all refuse here; the config-change
+// funnel did not, so a membership change submitted during drain was either
+// accepted and abandoned when the drain deadline expired, or completed with
+// ErrClosed by the Close sweep. Either way the caller could not tell whether
+// the voting set had changed — the one question a config change exists to
+// answer.
 func TestRequestConfigChange_DrainingRejected(t *testing.T) {
 	h := newTestHost(t)
 
@@ -333,7 +378,16 @@ func TestRequestConfigChange_DrainingRejected(t *testing.T) {
 // OnApplied survives a short results slice
 // ---------------------------------------------------------------------------
 
-// TestOnApplied_ShortResultsSliceDoesNotPanic pins that a short results slice does not panic and lastApplied still advances.
+// TestOnApplied_ShortResultsSliceDoesNotPanic pins that a results slice
+// shorter than entries is contained.
+//
+// OnApplied indexed results[i] while ranging entries. The apply worker slices
+// results to len(entries) before calling, so a short slice is an engine
+// invariant violation — but the consequence of indexing past it is a panic
+// INSIDE the apply worker's callback, which the worker recovers as a worker
+// panic and which therefore costs every shard that worker serves, not the one
+// shard with the bad batch. lastApplied must still advance, because the
+// entries were applied whatever the results slice says.
 func TestOnApplied_ShortResultsSliceDoesNotPanic(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -347,7 +401,9 @@ func TestOnApplied_ShortResultsSliceDoesNotPanic(t *testing.T) {
 		{Index: 12, Key: 3},
 	}
 
-	// Register a pending proposal for every entry so the results index is evaluated.
+	// A pending proposal for EVERY entry. Without one the results index is
+	// never evaluated, so a test that skips this registration passes against
+	// the unguarded code and proves nothing.
 	states := make([]*RequestState, len(entries))
 	for i, entry := range entries {
 		rs := newRequestState(ns.requestPool, entry.Key, time.Time{}, false)
@@ -405,7 +461,15 @@ func (c *cancelOnFirstWrite) Write(p []byte) (int, error) {
 	return c.buf.Write(p)
 }
 
-// TestExportSnapshot_EncryptedPathHonoursContext pins that an encrypted export stops when ctx is cancelled.
+// TestExportSnapshot_EncryptedPathHonoursContext pins that an ENCRYPTED export
+// stops when the caller gives up.
+//
+// ExportSnapshot has two bodies. The plaintext one copied through
+// copyWithContext and stopped promptly; the encrypted one ran
+// decryptSnapshotFrames, which has no context parameter, and so read,
+// authenticated and re-emitted every frame of a multi-gigabyte artifact with
+// nothing looking at ctx — the LONGER of the two paths was the one that could
+// not be interrupted.
 func TestExportSnapshot_EncryptedPathHonoursContext(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -468,7 +532,14 @@ func (r *cancelAfterFirstRead) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// TestWriteImportedSnapshotData_HonoursContext pins that the import's bulk write stops when ctx is cancelled.
+// TestWriteImportedSnapshotData_HonoursContext pins that the import's bulk
+// write stops when the caller gives up.
+//
+// This is the single longest step of an import — it writes the whole artifact,
+// which for a disaster-recovery restore is measured in gigabytes — and it used
+// io.Copy, which cannot be interrupted at all. An operator who spotted a wrong
+// artifact had to wait for it to finish being written before the staging
+// directory was discarded.
 func TestWriteImportedSnapshotData_HonoursContext(t *testing.T) {
 	h := &Host{}
 	dataPath := filepath.Join(t.TempDir(), "snapshot.dat")
@@ -507,7 +578,17 @@ func (e *fixedEntropy) Read(p []byte) (int, error) {
 	return copy(p, d), nil
 }
 
-// TestNewClientID_RejectsTheReservedZero pins that a minted session never carries proto.NotSessionManagedClientID.
+// TestNewClientID_RejectsTheReservedZero pins that a minted session never
+// carries proto.NotSessionManagedClientID.
+//
+// Zero is the value that marks an entry as carrying NO session, and the failure
+// it produced was silent in both directions: the registration entry fails
+// Entry.IsNewSessionRequest, so the state machine skips it and returns an empty
+// result, and NewSession's own check is `result.Value != clientID` — which
+// 0 != 0 satisfies. The call therefore REPORTED SUCCESS and handed back a
+// session whose every later proposal is unsessioned, silently turning off
+// at-most-once delivery for that client. RegisterSession already rejects a zero
+// client ID; the minting side did not.
 func TestNewClientID_RejectsTheReservedZero(t *testing.T) {
 	zero := make([]byte, 8)
 	good := []byte{1, 0, 0, 0, 0, 0, 0, 0}

@@ -25,7 +25,16 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// overlapDetectorSM is a lock-free sm.StateMachine that fails if Update and Lookup ever overlap.
+// overlapDetectorSM is a basic sm.StateMachine written EXACTLY to the contract
+// its interface publishes: "QuicRaft serializes all method calls -- Update and
+// Lookup are never called concurrently." It therefore holds no lock of its own.
+//
+// Instead of guarding state, it reports whether the contract was honoured. A
+// counter is raised on entry to Update and lowered on exit; Lookup and GetHash
+// record a violation if they ever observe it raised. Every reference state
+// machine in this repository happens to hold an internal mutex, which is why a
+// racing basic-tier SM has never had a representative in the corpus and why
+// -race alone could not catch this: -race only reports on code that runs.
 type overlapDetectorSM struct {
 	inUpdate   atomic.Int32
 	violations atomic.Int64
@@ -77,7 +86,14 @@ func (o *overlapDetectorSM) RecoverFromSnapshot(_ context.Context, r io.Reader, 
 
 func (o *overlapDetectorSM) Close(_ context.Context) error { return nil }
 
-// TestApplyExcludesLookupOnBasicTier verifies Apply never overlaps Lookup or GetHash on a basic state machine.
+// TestApplyExcludesLookupOnBasicTier pins the contract sm.StateMachine
+// publishes. It fails if Apply and Lookup/GetHash can overlap on the user
+// state machine.
+//
+// Fail-before-fix, observed: with Apply holding readGuard.RLock instead of
+// Lock (the shape at v0.5.1-alpha), this reports violations, because two
+// RLocks do not exclude each other — readGuard excluded Close and nothing
+// else. With Apply holding the write lock it reports none.
 func TestApplyExcludesLookupOnBasicTier(t *testing.T) {
 	detector := &overlapDetectorSM{spin: 2000}
 	createFn := func(uint64, uint64) interface{} { return detector }

@@ -22,7 +22,27 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// A restarting replica must not campaign against its base configuration before the committed tail is folded.
+// ---------------------------------------------------------------------------
+// A restarting replica must not campaign against its BASE configuration
+// ---------------------------------------------------------------------------
+//
+// Membership is config-in-log. A restart recovers a BASE configuration — the
+// snapshot record's membership, or the founding EntryInitialMembership at index
+// 1, which is the single entry Host.reconstructShardMembership reads — and
+// learns every change above it by re-applying committed entries through the
+// ordinary pipeline. The replica is live and TICKING throughout that replay, so
+// its election timer can fire while its voting set is still the superseded one.
+//
+// Host.StartShard reaches this state on the most ordinary restart there is: an
+// in-memory state machine on a shard that has never snapshotted. It calls
+// peer.SetProcessedIndex — the only other place the tail is folded — only when
+// recoveredIndex > 0, which requires either a durable on-disk marker or a
+// recovered snapshot record. Neither exists here, so nothing folds the tail
+// before the first Tick.
+//
+// The fixtures below construct exactly that peer: a committed log whose index-1
+// bootstrap entry names the base voters, config changes above it, and a
+// recovered membership holding only the base.
 
 // staleRestartPeer builds a peer in the post-restart, pre-replay state: the
 // recovered membership is base, the committed log is base plus tail.
@@ -46,7 +66,8 @@ func staleRestartPeer(t *testing.T, self uint64, base map[uint64]string,
 	commit := entries[len(entries)-1].Index
 
 	lr := newTestLogReader(entries, proto.State{Term: 1, Commit: commit})
-	// Recovery hands the peer the base only; deltas arrive by replay.
+	// Exactly what recovery hands the peer: the BASE only. Host reads index 1
+	// and stops; the deltas are supposed to arrive later, by replay.
 	lr.membership = proto.Membership{
 		Addresses: maps(base),
 	}
@@ -88,7 +109,11 @@ func tickToCampaign(t *testing.T, p *Peer) []uint64 {
 	return targets
 }
 
-// TestRestartStaleConfig_GrownConfigurationIsNotCampaignedAgainst checks a base-quorum majority cannot elect when the tail added voters.
+// TestRestartStaleConfig_GrownConfigurationIsNotCampaignedAgainst is the
+// SAFETY case: the committed tail ADDED voters, so the base quorum is a
+// MINORITY of the real configuration. A replica that campaigns against the
+// base wins on 2 votes out of a 5-voter shard — in a term the real
+// configuration can elect a different leader in, from the disjoint remainder.
 func TestRestartStaleConfig_GrownConfigurationIsNotCampaignedAgainst(t *testing.T) {
 	quietLogs(t)
 
@@ -125,7 +150,8 @@ func TestRestartStaleConfig_GrownConfigurationIsNotCampaignedAgainst(t *testing.
 			"remainder can elect a second leader in the same term", got, got)
 	}
 
-	// Two grants, a majority of the base, must not be enough.
+	// The decisive observable: two grants — a majority of the BASE — must not
+	// be enough. This is what the bug produced and what the fix must prevent.
 	term := p.r.term
 	for _, from := range []uint64{2, 3} {
 		if err := p.Handle(proto.Message{
@@ -160,7 +186,11 @@ func preVoteTermBump(p *Peer) uint64 {
 	return 0
 }
 
-// TestRestartStaleConfig_ShrunkConfigurationIsNotCampaignedAgainst checks a shard whose tail removed voters can still elect.
+// TestRestartStaleConfig_ShrunkConfigurationIsNotCampaignedAgainst is the
+// LIVENESS case: the committed tail REMOVED voters. A replica campaigning
+// against the base needs 3 of 5 votes while only 3 replicas still exist, and
+// two of the replicas it solicits are gone — so a shard with a perfectly
+// healthy quorum cannot elect.
 func TestRestartStaleConfig_ShrunkConfigurationIsNotCampaignedAgainst(t *testing.T) {
 	quietLogs(t)
 
@@ -192,7 +222,11 @@ func TestRestartStaleConfig_ShrunkConfigurationIsNotCampaignedAgainst(t *testing
 	}
 }
 
-// TestRestartStaleConfig_SelfRemovedInTailDoesNotCampaign checks the configuration resolves before the selfRemoved decision (Raft thesis 4.2.2).
+// TestRestartStaleConfig_SelfRemovedInTailDoesNotCampaign covers the gate
+// ORDER. The base names this replica as a voter; the committed tail removes it.
+// Resolving the configuration has to happen BEFORE the selfRemoved decision, or
+// that decision is taken against a configuration the shard has left and a
+// removed replica campaigns (Raft thesis 4.2.2).
 func TestRestartStaleConfig_SelfRemovedInTailDoesNotCampaign(t *testing.T) {
 	quietLogs(t)
 
@@ -231,7 +265,9 @@ func TestRestartStaleConfig_SelfRemovedInTailDoesNotCampaign(t *testing.T) {
 	}
 }
 
-// TestRestartStaleConfig_TimeoutNowResolvesBeforeCampaigning checks TimeoutNow also resolves the configuration first.
+// TestRestartStaleConfig_TimeoutNowResolvesBeforeCampaigning covers the OTHER
+// campaign entry point. TimeoutNow bypasses startElection and bypasses PreVote,
+// so a stale voting set there is decided in a single round.
 func TestRestartStaleConfig_TimeoutNowResolvesBeforeCampaigning(t *testing.T) {
 	quietLogs(t)
 
@@ -269,9 +305,20 @@ func TestRestartStaleConfig_TimeoutNowResolvesBeforeCampaigning(t *testing.T) {
 	}
 }
 
-// The gate must never suppress an election without reason: each replica below may campaign.
+// ---------------------------------------------------------------------------
+// The gate must never suppress an election it has no reason to
+// ---------------------------------------------------------------------------
+//
+// A previous attempt at this bug gated campaigning on a replay FLOOR and was
+// reverted because it suppressed elections outright. The tests below are the
+// ones that attempt would have failed: each is a replica that has every right
+// to campaign, and each carries a non-zero recovered commit index, which is the
+// condition that arms the watermark.
 
-// TestRestartStaleConfig_SingleMemberRestartStillElectsItself checks a one-voter shard elects itself with no external help.
+// TestRestartStaleConfig_SingleMemberRestartStillElectsItself is the sharpest
+// of them. A one-voter shard has nobody to hear from, so if the gate depends on
+// ANYTHING external — an apply pipeline, a peer, a caller invoking
+// SetProcessedIndex — the shard is dead for the life of the process.
 func TestRestartStaleConfig_SingleMemberRestartStillElectsItself(t *testing.T) {
 	quietLogs(t)
 
@@ -408,7 +455,8 @@ type failingReadLogReader struct {
 	*testLogReader
 	failing bool
 	reads   int
-	// readLows records the low bound of every GetRange.
+	// readLows records the low bound of every GetRange, which is how a test
+	// sees WHICH part of the log a fold actually pulled off disk.
 	readLows []uint64
 }
 
@@ -463,7 +511,9 @@ func TestRestartStaleConfig_UnreadableTailSuppressesOnlyWhileUnreadable(t *testi
 		t.Fatal("fixture: the fold never attempted a read")
 	}
 
-	// The fault clears; the next election timeout must campaign against the resolved configuration.
+	// The fault clears. Nothing else changes: no leader appears, no entry is
+	// applied, no caller intervenes. The very next election timeout must
+	// campaign, against the RESOLVED configuration.
 	lr.failing = false
 	targets := tickToCampaign(t, p)
 	if p.r.state == follower {

@@ -152,7 +152,20 @@ func waitAutoSnap(ctx context.Context, t *testing.T, what string, cond func() bo
 	}
 }
 
-// settleAutoSnap waits until at least minSaves saves are taken and the latest has completed.
+// settleAutoSnap waits until at least minSaves saves have been taken and the
+// latest one has completed: the node's last snapshot index has reached the
+// index the save captured, and the node's in-flight snapshotting flag has
+// been released (the pool clears it only after persistence, compaction and
+// the completion report). It returns every save so far, none still pending.
+//
+// SaveSnapshot records its index before the snapshot is persisted, and while
+// the flag is held the apply path skips the automatic trigger, so a test that
+// drives the next threshold, or compares a save with LogRange, before this
+// returns can race the save still in flight.
+//
+// The flag is probed by claiming it and clearing it at once. Callers settle
+// only while no proposal is in flight and the applied index is below the next
+// threshold, so no automatic trigger can be refused during the probe.
 func settleAutoSnap(ctx context.Context, t *testing.T, h *Host, s *autoSnapSM, minSaves int) []uint64 {
 	t.Helper()
 	node := h.engine.GetNode(autoSnapShardID)

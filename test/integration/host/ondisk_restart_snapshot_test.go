@@ -33,7 +33,14 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// appliedIndexDiskSM is an on-disk state machine that durably records the last index its Update saw and recovers to it.
+// appliedIndexDiskSM is an on-disk state machine that durably records the
+// index of the last entry its Update saw, the way a database-backed state
+// machine stores its applied index beside its data. Open reports that index,
+// so it is exactly what Host.StartShard recovers to.
+//
+// Entries the host applies without calling Update (the leader's no-op,
+// config changes, session register/unregister) never reach this record,
+// which is what #363 is about.
 type appliedIndexDiskSM struct {
 	mu      sync.Mutex
 	dir     string

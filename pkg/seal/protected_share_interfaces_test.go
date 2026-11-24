@@ -25,7 +25,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/crypto/shamir"
 )
 
-// Fixture implementations pin the ProtectedShareSplitter and ProtectedShareAccumulator contracts without strings in the custody path.
+// Nothing in this module implements ProtectedShareSplitter or
+// ProtectedShareAccumulator — custody lives in go-qrdb, and these are shapes an
+// embedder satisfies. That is exactly why the contract is pinned here: a
+// signature drifting away from what consumers implement would otherwise be
+// invisible from inside this repository until it broke their build.
+//
+// The fixtures below also demonstrate, by construction rather than in prose,
+// that a consumer can implement the custody interfaces without ever
+// materialising a share as a string. There is no `string` anywhere in this
+// file's custody path, and there is no string-valued interface for one to leak
+// through.
 
 // protectedSplitter implements ProtectedShareSplitter by delegating to the
 // primitive. Share values go from the polynomial straight into locked memory.
@@ -51,7 +61,15 @@ func (a *protectedAccumulator) AddProtectedShare(_ context.Context, share *shami
 	if share == nil {
 		return nil, errors.New("nil share")
 	}
-	// Destroy a rejected share, and on expiry release every held share.
+	// Ownership transferred: a rejected share must still be destroyed here, or
+	// it leaks a locked allocation for the life of the process.
+	//
+	// And on expiry the accumulator releases EVERYTHING it holds, not merely
+	// the share being refused. The contract makes it responsible for accepted
+	// shares "whether or not the quorum ever completes", and a timed-out
+	// ceremony is the main way one does not complete — leaving the earlier
+	// shares locked until some caller remembers to Reset would be exactly the
+	// leak this type exists to prevent.
 	if a.Expired() {
 		share.Destroy()
 		a.Reset()

@@ -16,7 +16,12 @@ package config
 
 import "testing"
 
-// TestValidateRejectsEnforcedRevocationWithoutSource pins that fail-closed revocation with no source is rejected at configuration time.
+// TestValidateRejectsEnforcedRevocationWithoutSource pins that enabling
+// revocation with the fail-closed default and no source is rejected at
+// configuration time. RevocationConfig{} selects the "any" mode, which names
+// no specific source, so the per-mode source checks never fire: the checker
+// consults nothing and admits every revoked certificate for the process
+// lifetime with no error, no log and no metric.
 func TestValidateRejectsEnforcedRevocationWithoutSource(t *testing.T) {
 	for _, mode := range []string{"", "any"} {
 		tc := TransportConfig{TransportDisabled: true}

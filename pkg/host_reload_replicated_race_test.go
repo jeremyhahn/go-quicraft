@@ -28,7 +28,14 @@ func (c *hostLogs) conflictReports() int {
 	return n
 }
 
-// TestHostReloadMTLS_SerializedWithReplicatedPublication races a certificate reload against a committed address publication; the conflict is always reported.
+// TestHostReloadMTLS_SerializedWithReplicatedPublication races a certificate
+// reload against the apply of a committed AddNonVoting entry that publishes
+// a peer address the new certificate covers. The committed entry always
+// applies. Either the reload saw the address and was refused, or it was
+// installed first and the apply, checking under the same lock, reported the
+// conflict. The apply used to register the address with no lock and no
+// check, so a reload could read the registry before it, install a covering
+// certificate after it, and leave the conflict silent.
 func TestHostReloadMTLS_SerializedWithReplicatedPublication(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

@@ -45,7 +45,13 @@ func forwardTestConfigChange(t *testing.T, key, replicaID uint64) proto.Message 
 	}
 }
 
-// TestRaft_BoundConfigChangeNotForwarded: after leadership moves a bound config change fails with ErrStaleConfigChange; unbound ones are forwarded.
+// TestRaft_BoundConfigChangeNotForwarded: the binding of a bound config change
+// (index 0 with MustMatchConfigChangeID) lives only on the replica that
+// proposed it, and the encoded entry carries index 0. Once leadership has
+// moved, forwarding the entry to the new leader would commit it as an
+// unbound add, so the former leader refuses it locally with
+// ErrStaleConfigChange, forwards nothing and forgets the binding. An unbound
+// config change is still forwarded.
 func TestRaft_BoundConfigChangeNotForwarded(t *testing.T) {
 	members := map[uint64]string{1: "a1", 2: "a2", 3: "a3"}
 	r1 := newTestRaftWithMembers(1, members)

@@ -80,7 +80,16 @@ func writeSuiteJSON(t *testing.T, dir, system string) {
 	}
 }
 
-// TestGenerateFailsWhenRequestedSystemMissing: generation with a requested system's results absent must not report completion or exit zero.
+// TestGenerateFailsWhenRequestedSystemMissing is the regression test for the
+// smoke run that lost dragonboat and then printed
+//
+//	report: etcd.md
+//	report: openraft.md
+//	Generation complete.
+//
+// A three-way comparison rendered as two reports must not be announced as
+// complete, and must not exit zero. Generation is asked here for all four known
+// systems with dragonboat's results absent, exactly as after that run.
 func TestGenerateFailsWhenRequestedSystemMissing(t *testing.T) {
 	profileDir := newProfileDir(t, "quicraft", "etcd", "openraft")
 
@@ -213,7 +222,12 @@ func TestRunBenchmarksFailsWhenSystemProducesNoResults(t *testing.T) {
 	}
 }
 
-// TestRunContainerPreservesTheWholeConsole: the container's console is kept verbatim and the caller still gets the stdout it parses.
+// TestRunContainerPreservesTheWholeConsole pins what makes a perf failure
+// diagnosable: capturing the container's stdout only to parse the JSON out of
+// it would leave the run log of a failing container with no "--- FAIL:", no
+// "=== RUN" and no "ok".
+// The container's console must survive verbatim, and the caller must still get
+// the stdout it parses.
 func TestRunContainerPreservesTheWholeConsole(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skipf("no shell to stand in for a container: %v", err)
@@ -347,7 +361,12 @@ func TestExtractDiagnosticTruncates(t *testing.T) {
 	}
 }
 
-// TestExtractDiagnosticKeepsTheVerdictUnderAFloodOfDetail: the --- FAIL: verdict survives truncation of the relayed detail before it.
+// TestExtractDiagnosticKeepsTheVerdictUnderAFloodOfDetail pins the verdict
+// budget. `go test` prints every relayed b.Errorf BEFORE the "--- FAIL:" naming
+// the benchmark, so a summary that kept the first maxDiagnosticLines matches and
+// stopped cut off at precisely the line the operator needed: the dragonboat run
+// relayed 40 tolerated propose errors and then said "(diagnostic truncated)".
+// The verdict is not expendable; the detail is.
 func TestExtractDiagnosticKeepsTheVerdictUnderAFloodOfDetail(t *testing.T) {
 	lines := []string{"=== RUN   BenchmarkProposeThroughput_5N_Dragonboat"}
 	for i := 0; i < 200; i++ {
@@ -437,7 +456,18 @@ func (f *failAfterWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestConsoleLogKeepsDrainingAndReportsTheFailure: the console tee never short-writes, so the container never blocks, and still reports a log write error.
+// TestConsoleLogKeepsDrainingAndReportsTheFailure pins two properties of the
+// console tee.
+//
+// A short write from the log would stop os/exec's copier for that stream, and
+// a container with nobody reading its pipe blocks -- so a full log disk would
+// turn into a hung benchmark. And a write error would be reported nowhere:
+// os/exec drops a copier's error when the process exits non-zero, and a
+// deferred Close drops its own always, so a console truncated exactly where
+// the late `--- FAIL:` lines land would be presented as complete.
+//
+// The writer must therefore do two things that pull in opposite directions:
+// never short-write (keep draining), and never hide the failure (report it).
 func TestConsoleLogKeepsDrainingAndReportsTheFailure(t *testing.T) {
 	diskFull := fmt.Errorf("write: no space left on device")
 	sink := &failAfterWriter{n: 10, err: diskFull}
@@ -488,7 +518,10 @@ func TestRunContainerReportsAnIncompleteLog(t *testing.T) {
 	}
 }
 
-// TestModuleAuthIsTheSectionSixPayload: an injected environment becomes the four K='V' lines, a pre-composed GOMODAUTH passes through, and nothing yields no secret.
+// TestModuleAuthIsTheSectionSixPayload pins the three shapes: a runner-injected
+// environment becomes the four K='V' lines the Dockerfile sources, a
+// pre-composed GOMODAUTH passes through untouched, and nothing means nothing --
+// the public build must not receive a secret made of empty strings.
 func TestModuleAuthIsTheSectionSixPayload(t *testing.T) {
 	const token = "9f3c0deadbeef"
 	runner := map[string]string{

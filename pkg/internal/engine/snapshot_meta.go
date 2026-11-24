@@ -28,22 +28,79 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// ErrSnapshotMetaTooLarge is returned for a snapshot.meta longer than any valid record; the purge floor treats it as unreadable.
+// ErrSnapshotMetaTooLarge is returned when a snapshot.meta file is longer than
+// any record this format can produce. It is treated as unreadable (unevaluable)
+// by the DEK purge floor, never parsed: reading a multi-GB foreign file as a
+// metadata record would defeat the parser's bounded-before-alloc discipline
+// inside the per-save purge-floor scan, which walks every snapshot directory on
+// the host.
 var ErrSnapshotMetaTooLarge = errors.New(
 	"engine: snapshot metadata file exceeds the maximum record size")
 
-// maxSnapshotMetaFileLen bounds how many bytes readSnapshotEpoch reads from a snapshot.meta file.
+// maxSnapshotMetaFileLen bounds how many bytes readSnapshotEpoch reads from a
+// snapshot.meta file. The largest record this format writes is the header plus a
+// body no larger than maxSnapshotMetaBodyLen; a file longer than that is foreign
+// or corrupt, so it is rejected rather than slurped whole.
 const maxSnapshotMetaFileLen = snapshotMetaHeaderSize + maxSnapshotMetaBodyLen
 
-// snapshot.meta: 16-byte header (magic QRSNAPMD, uint16 version, uint16 reserved, uint32 body length), then little-endian uint64 Index, Term, ShardID, ReplicaID, CreatedAt, Epoch, Compression, DataLen, DataHash; fields past the body are absent, a record without the magic is corrupt.
+// snapshot.meta is the record written beside every snapshot artifact. A
+// snapshot directory MUST describe itself: it outlives its LogDB record (up to
+// maxSnapshotsRetained directories are retained while only the newest is
+// recorded), and the DEK purge floor is computed by SCANNING these directories
+// and reading the Epoch field back as fact.
+//
+// # Layout
+//
+// The record is SELF-DESCRIBING. A 16-byte header precedes a body of
+// little-endian uint64 fields:
+//
+//	off  size  field
+//	  0     8  magic "QRSNAPMD"
+//	  8     2  version (uint16, format version of the BODY)
+//	 10     2  reserved (uint16, 0)
+//	 12     4  body length (uint32, bytes of body that follow)
+//	 16     8  Index
+//	 24     8  Term
+//	 32     8  ShardID
+//	 40     8  ReplicaID
+//	 48     8  CreatedAt (unix seconds)
+//	 56     8  Epoch
+//	 64     8  Compression
+//	 72     8  DataLen (bytes of snapshot.dat as written)
+//	 80     8  DataHash (xxhash64 of snapshot.dat as written)
+//
+// # Evolution rule
+//
+// snapshotMetaVersion is pinned at its current value until the first stable
+// v1 release, like every format version in this repository. Until then a
+// layout change is made IN PLACE, with every writer and reader updated in
+// lockstep and development data directories wiped rather than migrated; the
+// version is not incremented to record pre-release churn.
+//
+// The reader is driven by the recorded body length, not by the version: a
+// field whose offset lies past the end of the body is reported ABSENT (its
+// *Recorded flag false), and fields past the last one this binary knows are
+// ignored. Because the body length is recorded, a reader can always tell a
+// field that is absent from a record that is CORRUPT (a truncated or foreign
+// record) — the distinction the magic/length prefix exists to make.
+//
+// # Compatibility
+//
+// A record that does not begin with the magic is refused with
+// ErrSnapshotMetaCorrupt, whatever its size: there is no positional decode of
+// headerless layouts. The remedy for such a directory is to wipe it and
+// re-sync from peers.
 const (
 	// snapshotMetaMagic identifies a self-describing snapshot.meta record.
 	snapshotMetaMagic = "QRSNAPMD"
 
-	// snapshotMetaVersion is the body version this binary writes.
+	// snapshotMetaVersion is the body version this binary WRITES.
 	snapshotMetaVersion uint16 = 1
 
-	// previousSnapshotMetaVersion is the previous minor release's body version; before a previous release it equals snapshotMetaVersion.
+	// previousSnapshotMetaVersion is the second member of the closed read
+	// window (docs/compatibility, "The accept sets"): the body version the
+	// previous MINOR release wrote. v1.0 has no previous release, so it
+	// equals snapshotMetaVersion and the set has one member.
 	previousSnapshotMetaVersion = snapshotMetaVersion
 )
 
@@ -80,11 +137,31 @@ const (
 	// snapshotMetaSize is the total size of a record this binary writes.
 	snapshotMetaSize = snapshotMetaHeaderSize + snapshotMetaBodySize
 
-	// maxSnapshotMetaBodyLen caps the declared body length so it can never overflow int on 32-bit platforms.
+	// maxSnapshotMetaBodyLen bounds the body length a record may DECLARE.
+	//
+	// The declared length is a uint32 read from a file and is used to slice the
+	// body, so it must be bounded before it is converted to any narrower type:
+	// on a 32-bit GOARCH a declared length of 2^31 or more becomes a NEGATIVE
+	// int, "claims more body than the file holds" is then false, and the slice
+	// panics — inside the DEK purge-floor scan, which walks every snapshot
+	// directory on the host and whose entire input is bytes on disk. Rejecting
+	// above this cap makes that truncation UNREACHABLE by construction rather
+	// than merely unreached on a 64-bit build, so the guarantee does not
+	// depend on the width of int.
+	//
+	// 64 KiB is 8192 uint64 body fields against the current 9, so no
+	// legitimate record can approach it; anything that does is corruption or
+	// a foreign file.
+	// The same bounded-then-parsed shape waldb's replayBootstrap uses.
 	maxSnapshotMetaBodyLen = 1 << 16
 )
 
-// SnapshotMeta is a decoded snapshot.meta record; a false *Recorded flag means the field is unknown, not zero.
+// SnapshotMeta is the decoded content of a snapshot.meta record.
+//
+// The *Recorded flags distinguish a field the record actually CARRIED from one
+// that was absent because the record's body ended before it. A zero Epoch with
+// EpochRecorded false means UNKNOWN, not plaintext — the two are opposite in
+// consequence for DEK purging, so they must never be conflated.
 type SnapshotMeta struct {
 	Index       uint64
 	Term        uint64
@@ -104,15 +181,39 @@ type SnapshotMeta struct {
 	// field.
 	CompressionRecorded bool
 
-	// DataLen and DataHash are the length and xxhash64 of snapshot.dat as written, after compression and encryption.
+	// DataLen and DataHash are the length and xxhash64 of snapshot.dat AS
+	// WRITTEN — after compression and after encryption. They are the only
+	// at-rest integrity check a snapshot has when no barrier is configured:
+	// with a barrier, per-frame AEAD covers it, but a plaintext deployment had
+	// nothing at all, and a single flipped byte inside a serialized value
+	// leaves the file length unchanged so no structural check trips. The
+	// replica then recovers the corrupt value into the state machine and
+	// serves it, diverging from its peers at the same log index with every
+	// Raft invariant intact.
+	//
+	// Hashing the FINAL bytes (rather than the pre-encryption ones) is what
+	// makes one value verifiable by all three consumers — recovery, the
+	// streamed receive path and ImportSnapshot — without any of them needing a
+	// key.
 	DataLen  uint64
 	DataHash uint64
 
-	// DataHashRecorded reports whether the record carried DataLen and DataHash; recovery refuses a record without them.
+	// DataHashRecorded reports whether the record carried DataLen/DataHash.
+	// Every current writer stamps them, so a record that leaves it false
+	// cannot vouch for its artifact, and recovery
+	// refuses it (see VerifySnapshotArtifact). The purge-floor scan, which
+	// reads only Epoch, still accepts such a record.
 	DataHashRecorded bool
 }
 
-// MarshalSnapshotMeta encodes m at the current version with every field; CreatedAt defaults to now.
+// MarshalSnapshotMeta encodes m as a snapshot.meta record at the current
+// format version. It is the single encoder for every writer of a snapshot
+// directory — the save path, the receive path and the operator import path —
+// so no writer can produce a record the purge-floor scan cannot read.
+//
+// CreatedAt is stamped with the current wall clock when m.CreatedAt is 0. The
+// Version and *Recorded fields of m are ignored: the output is always written
+// at snapshotMetaVersion with every field present.
 func MarshalSnapshotMeta(m SnapshotMeta) []byte {
 	buf := make([]byte, snapshotMetaSize)
 	copy(buf[snapshotMetaMagicOff:], snapshotMetaMagic)
@@ -137,7 +238,16 @@ func MarshalSnapshotMeta(m SnapshotMeta) []byte {
 	return buf
 }
 
-// ParseSnapshotMeta decodes a snapshot.meta image; records without the magic are ErrSnapshotMetaCorrupt, and callers acting on Epoch must check EpochRecorded.
+// ParseSnapshotMeta decodes a snapshot.meta image.
+//
+// It accepts a record carrying the magic whose declared body holds at least the
+// identity fields (see the evolution rule: fields are read by body length).
+// Anything else, a record without the magic included, is rejected with
+// ErrSnapshotMetaCorrupt rather than parsed positionally: reading foreign bytes
+// as an epoch would feed a fabricated value to the DEK purge floor.
+//
+// A field the record does not carry is left zero and its *Recorded flag is
+// false. Callers that act on Epoch MUST consult EpochRecorded.
 func ParseSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	if len(data) >= snapshotMetaHeaderSize &&
 		string(data[snapshotMetaMagicOff:snapshotMetaMagicOff+len(snapshotMetaMagic)]) == snapshotMetaMagic {
@@ -146,7 +256,19 @@ func ParseSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	return SnapshotMeta{}, ErrSnapshotMetaCorrupt
 }
 
-// parseVersionedSnapshotMeta decodes a record with the magic, bounding the declared body length first and comparing unsigned.
+// parseVersionedSnapshotMeta decodes a record carrying the magic. The declared
+// body length — not len(data) — bounds every field read, so a record whose
+// body was truncated after the header is rejected instead of read past its end.
+//
+// The declared length is bounded by maxSnapshotMetaBodyLen FIRST, and every
+// comparison is then made in unsigned arithmetic. Both matter: converting the
+// uint32 to int before the bounds check is safe only where int is 64 bits, and
+// on a 32-bit GOARCH a declared length of 2^31 or more becomes NEGATIVE, the
+// "claims more body than the file holds" guard is false, and body[:bodyLen]
+// panics — inside the DEK purge-floor scan, which walks every snapshot
+// directory on the host and is driven by bytes on disk. The cap makes that
+// value unrepresentable here on every GOARCH; the unsigned comparison keeps the
+// remaining check honest. waldb's replayBootstrap has the same shape.
 func parseVersionedSnapshotMeta(data []byte) (SnapshotMeta, error) {
 	version := binary.LittleEndian.Uint16(data[snapshotMetaVersionOff:])
 	if !acceptsSnapshotMetaVersion(version) {
@@ -217,7 +339,11 @@ const (
 	// directory is gone), so the directory imposes no floor.
 	snapshotEpochKnown snapshotEpochStatus = iota
 
-	// snapshotEpochLegacy is a well-formed record whose body ends before Epoch; the epoch is unknown, so the caller must not purge.
+	// snapshotEpochLegacy means the record was RECOGNISED but its declared
+	// body ends before the Epoch field, so the artifact's epoch is unknown. Unknown is not "no
+	// floor": the artifact may be ciphertext at any epoch, so the caller must
+	// not purge. It is reported separately from snapshotEpochUnknown because
+	// the record itself is well formed rather than damaged.
 	snapshotEpochLegacy
 
 	// snapshotEpochUnknown means the record could not be read at all: an I/O
@@ -240,7 +366,38 @@ func (s snapshotEpochStatus) String() string {
 	}
 }
 
-// readSnapshotEpoch returns a directory's artifact epoch and whether it is known; legacy or unknown means do not purge, and a missing record is known-0 only when the artifact is gone too.
+// readSnapshotEpoch reads the epoch a snapshot directory's artifact was
+// encrypted under, together with how much that answer can be trusted:
+//
+//   - (epoch, snapshotEpochKnown)  — the record was read and carries the field.
+//     epoch == 0 means the artifact is unencrypted and imposes no floor;
+//     epoch > 0 pins the floor at that epoch. A missing metadata file reports
+//     (0, known) ONLY when the ARTIFACT is missing too (see below).
+//   - (0, snapshotEpochLegacy)     — a recognised record without Epoch. The
+//     epoch is unknown; the caller must fail safe.
+//   - (0, snapshotEpochUnknown)    — unreadable, corrupt, or absent beside an
+//     artifact that is still there. The epoch is unknown; the caller must fail
+//     safe.
+//
+// The two failing statuses have IDENTICAL consequences for purging and differ
+// only in what they tell an operator. Dropping either from the floor would
+// over-purge a DEK the artifact may still need.
+//
+// # Why a missing record is not by itself a "no floor" answer
+//
+// The GC race the missing-file case exists for is real — a directory can be
+// removed between enumeration and this read — but observing that the METADATA
+// is absent is strictly weaker than observing that the ARTIFACT is. Half-built
+// snapshot directories with snapshot.dat present and snapshot.meta not yet
+// written are producible by any crash between the two writes, on the receive
+// path and on the local save path alike, and such a directory holds ciphertext
+// at an epoch nobody can name. Answering "imposes no floor" for it is the exact
+// inversion purgeOldEpochs warns about: "cannot be evaluated" can only mean "do
+// not purge"; it can never mean "this directory imposes no floor".
+//
+// So the artifact is what decides. Absent artifact: the directory really is
+// gone or was reclaimed, and there is nothing to protect. Present artifact with
+// no record: unknown, fail safe.
 func readSnapshotEpoch(dir string) (uint64, snapshotEpochStatus) {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	data, err := readBoundedSnapshotMeta(metaPath)
@@ -262,7 +419,13 @@ func readSnapshotEpoch(dir string) (uint64, snapshotEpochStatus) {
 	return meta.Epoch, snapshotEpochKnown
 }
 
-// readBoundedSnapshotMeta reads snapshot.meta up to one byte past the largest valid record; larger is ErrSnapshotMetaTooLarge.
+// readBoundedSnapshotMeta reads a snapshot.meta file, refusing to read more than
+// one byte past the largest record this format can produce. os.ReadFile would
+// slurp a corrupt or substituted multi-GB file whole — inside the per-save DEK
+// purge-floor scan that walks every snapshot directory on the host — defeating
+// the parser's own bounded-before-alloc discipline. A file that yields more than
+// the maximum is foreign and is rejected with ErrSnapshotMetaTooLarge; the
+// caller treats that identically to any other unreadable record (fail safe).
 func readBoundedSnapshotMeta(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -285,7 +448,12 @@ func readBoundedSnapshotMeta(path string) ([]byte, error) {
 	return data, nil
 }
 
-// missingMetaEpochStatus classifies a directory without snapshot.meta by whether its artifact still exists; a stat error is unknown.
+// missingMetaEpochStatus classifies a snapshot directory whose snapshot.meta
+// does not exist, by looking at whether the ARTIFACT it would describe is still
+// there.
+//
+// A stat error other than not-exist leaves the artifact's presence unknown,
+// which is the same operational state as an unreadable record: fail safe.
 func missingMetaEpochStatus(dir string) (uint64, snapshotEpochStatus) {
 	if _, err := os.Stat(filepath.Join(dir, snapshotDataFile)); err != nil {
 		if os.IsNotExist(err) {
@@ -309,10 +477,32 @@ func missingMetaEpochStatus(dir string) (uint64, snapshotEpochStatus) {
 // Snapshot frame context-AAD
 // ---------------------------------------------------------------------------
 
-// snapshotAADMagic tags the context-AAD scheme inside the authenticated context, so it cannot be rewritten.
+// snapshotAADMagic tags the context-AAD scheme. It is part of the authenticated
+// context rather than a byte on disk, so the scheme identifies ITSELF: a frame
+// sealed under a future layout can never authenticate against this one, and
+// there is no unauthenticated version marker for an attacker to rewrite.
 const snapshotAADMagic = "QRSNAP1"
 
-// SnapshotFrameAADLen is the frame context length: magic QRSNAP1, big-endian uint64 ShardID, ReplicaID, SnapshotIndex, ChunkSeq, then a Final byte that detects truncation.
+// SnapshotFrameAADLen is the exact length of the context every snapshot frame
+// is bound to: the magic, four big-endian uint64 fields, and the terminal
+// flag. Every field is fixed width, so no delimiter is needed and no two
+// distinct positions can produce the same bytes.
+//
+//	off  size  field
+//	  0     7  magic "QRSNAP1"
+//	  7     8  ShardID
+//	 15     8  ReplicaID
+//	 23     8  SnapshotIndex
+//	 31     8  ChunkSeq (0-based ordinal within snapshot.dat)
+//	 39     1  Final (1 on the artifact's last frame, 0 on every other)
+//
+// Final is what makes TAIL TRUNCATION detectable. The ordinal alone binds a
+// frame to its position, but a shortened artifact is still a sequence of
+// frames at consecutive ordinals, every one of which authenticates. With the
+// flag, exactly one frame was sealed as the last, and a reader that decrypts
+// the frame it finds last under Final=1 fails authentication whenever frames
+// after it were dropped. Appending a frame after the terminal one fails the
+// same way in reverse.
 const SnapshotFrameAADLen = len(snapshotAADMagic) + 4*8 + 1
 
 const (
@@ -323,26 +513,63 @@ const (
 	snapshotAADFinalOff   = snapshotAADSeqOff + 8
 )
 
-// noContextAADOnce limits the capability warning to once per process.
+// noContextAADOnce bounds the capability warning to a single record per
+// process. The condition is a DEPLOYMENT property (the barrier delegates to an
+// encryptor that cannot bind context, or encrypts nothing at all, for its whole
+// life), not a per-artifact or per-frame one, so repeating it per snapshot would
+// say nothing new.
 var noContextAADOnce sync.Once
 
-// contextAADBarrier reports whether a barrier can authenticate caller-supplied context.
+// contextAADBarrier is the capability NewSnapshotAAD asks of the sealing
+// barrier: can it ACTUALLY authenticate a caller-supplied context? A barrier
+// that cannot must not be handed one — it fails the write closed rather than
+// silently dropping the binding.
 type contextAADBarrier interface {
 	SupportsContextAAD() bool
 }
 
-// plaintextModeReporter optionally tells no-encryption mode apart from an encryptor that cannot bind context; only the warning text differs.
+// plaintextModeReporter is an OPTIONAL capability a barrier may implement to
+// distinguish the two reasons it cannot bind a context: no-encryption mode,
+// where there is no AEAD and therefore nothing a position could be bound to,
+// versus a delegated encryptor that IS protecting the data but cannot
+// authenticate where it belongs. Only the second is a security limitation, and
+// only the warning text differs. A barrier that does not implement this is
+// reported as the latter, which is the conservative reading.
 type plaintextModeReporter interface {
 	IsPlaintextMode() bool
 }
 
-// SnapshotAAD builds the positional context for one artifact's frames on both encrypt and decrypt sides; there is no weaker fallback.
+// SnapshotAAD builds the per-frame positional context every snapshot frame is
+// bound to. One SnapshotAAD belongs to one snapshot artifact; Frame stamps the
+// chunk ordinal into a reused scratch buffer, so a multi-gigabyte snapshot
+// costs exactly one allocation for the whole file rather than one per frame.
+//
+// The SAME builder type is used on the encrypt and the decrypt side, which is
+// what makes the two sets of bytes incapable of drifting apart.
+//
+// The context is UNCONDITIONAL: there is no on-disk version marker and no
+// weaker-AAD retry. A reader that fails to authenticate a frame fails — it
+// never falls back to an epoch-only AAD, because that fallback IS the
+// vulnerability the context closes (a frame could then be replayed at another
+// ordinal, another snapshot index, or another shard). The scheme is fixed by
+// code and artifact class alone.
 type SnapshotAAD struct {
 	buf      [SnapshotFrameAADLen]byte
 	suppress bool
 }
 
-// NewSnapshotAAD returns the context builder for one artifact; it builds no context when the barrier cannot authenticate AAD.
+// NewSnapshotAAD returns the context builder for one snapshot artifact,
+// identified by the shard, replica and snapshot index its frames belong to.
+//
+// barrier decides whether the context is built at all. A barrier that cannot
+// authenticate caller-supplied AAD — a delegated encryptor that does not
+// implement seal.AADSymmetricEncrypter, or no-encryption mode — returns
+// seal.ErrHardwareMode for ANY non-empty context, so the builder suppresses the
+// context and the frames keep only whatever binding the barrier applies on its
+// own. That is a capability of the DEPLOYMENT's barrier, resolved once here; it
+// is NEVER selected per artifact and NEVER reached by way of a decryption
+// failure. A barrier that CAN bind context gets the positional binding whether
+// it encrypts in software or delegates to hardware.
 func NewSnapshotAAD(shardID, replicaID, index uint64, barrier contextAADBarrier) *SnapshotAAD {
 	suppress := barrier == nil || !barrier.SupportsContextAAD()
 	a := &SnapshotAAD{suppress: suppress}
@@ -371,7 +598,15 @@ func NewSnapshotAAD(shardID, replicaID, index uint64, barrier contextAADBarrier)
 	return a
 }
 
-// Frame returns the context for frame seq, valid until the next call, or nil when the barrier cannot bind context.
+// Frame returns the context for the frame at 0-based ordinal seq; final
+// reports whether it is the artifact's last frame. The returned slice aliases
+// the builder's scratch buffer and is only valid until the next call; the
+// barrier folds it into the AEAD AAD and never retains it.
+//
+// It returns nil when the barrier cannot bind context, which is byte-identical
+// to what that barrier does with no context at all. Such a deployment gets no
+// positional binding and therefore no truncation detection beyond the
+// structural rule that an artifact holds at least one frame.
 func (a *SnapshotAAD) Frame(seq uint64, final bool) []byte {
 	if a.suppress {
 		return nil

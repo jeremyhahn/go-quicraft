@@ -23,7 +23,21 @@ import (
 	"github.com/cespare/xxhash/v2"
 )
 
-// snapshotArtifactTrailerMagic opens the trailer at the end of every exported artifact, which binds the payload length and the xxhash64 of header plus payload; an artifact without it is refused.
+// snapshotArtifactTrailerMagic opens the trailer that ends every exported
+// snapshot artifact. It is distinct from snapshotArtifactMagic so a reader
+// can tell the trailer from the payload it follows.
+//
+// The trailer binds the whole artifact: the payload's length, and the
+// xxhash64 of the header followed by the payload, as the exporter wrote them.
+// The header is inside the hash because its fields are as consequential as
+// the payload's bytes — a flipped Index, Term or Membership byte would import
+// a sound payload at the wrong log position or into the wrong configuration. The artifact header carries no length, so the trailer
+// is found by position — it is the last snapshotArtifactTrailerSize bytes of
+// the stream — and the magic is what makes that position self-checking. An
+// artifact without a trailer ends in payload bytes, so its "trailer" fails
+// the magic and the artifact is refused as invalid rather than accepted
+// unverified. The header layout and its version are unaffected; the trailer's
+// own magic is what distinguishes the two layouts.
 var snapshotArtifactTrailerMagic = [8]byte{'Q', 'R', 'S', 'N', 'T', 'R', 'L', 'R'}
 
 // snapshotArtifactTrailerSize is the encoded size of the artifact trailer:
@@ -31,7 +45,12 @@ var snapshotArtifactTrailerMagic = [8]byte{'Q', 'R', 'S', 'N', 'T', 'R', 'L', 'R
 //	magic[8] | payloadLen:u64 | hash:u64
 const snapshotArtifactTrailerSize = 8 + 8 + 8
 
-// snapshotArtifactTrailer ends an exported artifact: the payload length and the xxhash64 of the header and plaintext payload.
+// snapshotArtifactTrailer is the integrity record that ends an exported
+// artifact: the length of the payload between the header and the trailer,
+// and the xxhash64 of every byte before the trailer — header, then payload.
+// The payload is the artifact's own bytes — the PLAINTEXT ExportSnapshot
+// wrote — not the source snapshot's at-rest form, so an importer checks
+// exactly what it is about to adopt.
 type snapshotArtifactTrailer struct {
 	PayloadLen uint64
 	Hash       uint64
@@ -46,7 +65,10 @@ func (t snapshotArtifactTrailer) marshal() []byte {
 	return buf
 }
 
-// parseSnapshotArtifactTrailer decodes snapshotArtifactTrailerSize bytes; without the magic it returns *SnapshotArtifactError.
+// parseSnapshotArtifactTrailer decodes the trailer from exactly
+// snapshotArtifactTrailerSize bytes. A buffer without the trailer magic is
+// refused with *SnapshotArtifactError: it is a truncated artifact, trailing
+// garbage, or an artifact from a build that wrote no trailer.
 func parseSnapshotArtifactTrailer(b []byte) (snapshotArtifactTrailer, error) {
 	if len(b) != snapshotArtifactTrailerSize || !bytesEqual(b[0:8], snapshotArtifactTrailerMagic[:]) {
 		return snapshotArtifactTrailer{}, &SnapshotArtifactError{Reason: "missing or malformed trailer"}
@@ -57,7 +79,10 @@ func parseSnapshotArtifactTrailer(b []byte) (snapshotArtifactTrailer, error) {
 	}, nil
 }
 
-// check compares the trailer with n payload bytes read and sum; a mismatch is *SnapshotArtifactError wrapping ErrSnapshotCorrupt.
+// check compares the trailer against what an importer actually read: n
+// payload bytes, and sum over the header and those bytes.
+// A mismatch is *SnapshotArtifactError wrapping ErrSnapshotCorrupt, so a
+// caller can match either the artifact failure or the corruption.
 func (t snapshotArtifactTrailer) check(n, sum uint64) error {
 	if t.PayloadLen != n {
 		return &SnapshotArtifactError{
@@ -71,7 +96,11 @@ func (t snapshotArtifactTrailer) check(n, sum uint64) error {
 	return nil
 }
 
-// artifactPayloadWriter records the length and hash (seeded with the header) of the payload bytes the writer accepted.
+// artifactPayloadWriter is the export side of the trailer. Every payload byte
+// ExportSnapshot emits passes through it, and it records the length and hash
+// of what the underlying writer ACCEPTED, so the trailer describes the bytes
+// that are in the artifact rather than the bytes that were offered. The hash
+// is seeded with the artifact header.
 type artifactPayloadWriter struct {
 	w      io.Writer
 	digest *xxhash.Digest
@@ -104,12 +133,24 @@ func (a *artifactPayloadWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// trailer returns the encoded trailer; write it only after the export passed every check.
+// trailer returns the encoded trailer for everything written so far. It
+// must be written only once the export has passed every check: without it
+// the artifact is refused on import, which is what makes an export that
+// failed part-way — having already handed w some of its payload — harmless.
 func (a *artifactPayloadWriter) trailer() []byte {
 	return snapshotArtifactTrailer{PayloadLen: a.n, Hash: a.digest.Sum64()}.marshal()
 }
 
-// artifactPayloadReader yields the payload while hashing it and checks the withheld trailer at end of stream; it never returns bytes together with an error.
+// artifactPayloadReader is the import side of the trailer. It yields the
+// artifact's payload — every byte after the header EXCEPT the trailing
+// snapshotArtifactTrailerSize — hashing it as it goes, and at the end of the
+// stream checks what it yielded against the trailer it withheld. The check
+// runs inside the stream, so a mismatch fails the copy that writes the
+// staged snapshot.dat, before anything is published or recorded.
+//
+// It never returns payload bytes together with an error: a Read either
+// yields bytes or reports the outcome, so a consumer that stops at the first
+// error has written nothing the verdict applies to.
 type artifactPayloadReader struct {
 	r      io.Reader
 	buf    []byte // read from r, not yet yielded; its last trailer-size bytes are withheld

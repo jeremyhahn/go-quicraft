@@ -20,7 +20,14 @@ import (
 	"testing"
 )
 
-// TestGCSnapshotDirs_RefusesToDeleteTheRecordedDirectory pins that GC never deletes the directory LogDB records.
+// TestGCSnapshotDirs_RefusesToDeleteTheRecordedDirectory pins the guard
+// the save path has always had (now in publishStagedSave) and GC did not.
+//
+// GC selects victims by INDEX ORDER alone. Higher-indexed directories that are
+// unusable — partial receives left by a crash, for instance — therefore push
+// the directory LogDB actually records into the removal window, and deleting
+// it leaves the durable record pointing at nothing while every surviving
+// directory is a partial.
 func TestGCSnapshotDirs_RefusesToDeleteTheRecordedDirectory(t *testing.T) {
 	base := t.TempDir()
 	const shardID, replicaID = 1, 1

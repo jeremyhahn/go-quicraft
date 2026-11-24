@@ -25,7 +25,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// startLogReaderViewShard starts single-replica shard 1 and waits for its current-term no-op to apply.
+// startLogReaderViewShard starts a single-replica shard 1 and waits for it
+// to elect itself and apply its current-term no-op.
+//
+// waitForLeader is not used: it syncs the host's cached leader with term 0
+// (host_test.go), which would make LeaderIDAndTerm report term 0 for the
+// rest of the test and the term assertion below meaningless. This waits for
+// the host to learn the leader and its term from the engine instead.
 func startLogReaderViewShard(t *testing.T) *Host {
 	t.Helper()
 	h := newTestHost(t)

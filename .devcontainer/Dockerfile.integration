@@ -1,4 +1,7 @@
-# Dockerfile.integration builds the integration test binary, then runs it in a second stage.
+# Dockerfile.integration - Multi-stage build for integration testing.
+#
+# Stage 1 (builder): compiles the integration test binary.
+# Stage 2 (test-runner): runs the compiled integration test binary.
 
 # ---------------------------------------------------------------------------
 # Stage 1: Build
@@ -7,7 +10,13 @@ FROM golang:1.27.4-bookworm AS builder
 
 WORKDIR /app
 
-# Module download layer; forge credentials come only from the optional gomodauth BuildKit secret, never a layer.
+# Download the module cache in its own layer. Credentials for the project
+# forge arrive as the optional gomodauth BuildKit secret (the K=V lines of
+# .devcontainer/.env), mounted for this RUN only: sourced, never written to a
+# layer or a command line. With no secret, modules resolve from the public
+# proxy, so a module only the forge serves (go-enclave) fails the build here,
+# loudly. This RUN is byte-identical in every image that downloads such a
+# module (test/buildgates/module_download_test.go). Requires BuildKit.
 COPY go.mod go.sum* ./
 RUN --mount=type=secret,id=gomodauth \
     set -eu; \
@@ -22,7 +31,13 @@ RUN --mount=type=secret,id=gomodauth \
 # Copy the full source tree and build.
 COPY . .
 
-# Build the integration test binary; a failed or empty compile must fail the build.
+# Build the integration test binary. -c compiles without running, and
+# -tags=integration selects the integration test files.
+#
+# No fallback and no suppressed stderr: a failed compile must fail the build.
+# `go test -c` on a package with no test files writes nothing and exits 0, so
+# `test -s` catches an empty build and `-test.list` proves the binary contains
+# tests.
 RUN set -eux; \
     go test -c -o /integration-tests -tags=integration ./test/integration/e2e/...; \
     test -s /integration-tests; \

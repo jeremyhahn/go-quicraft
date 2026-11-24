@@ -1,5 +1,8 @@
 self-hosted-runner:
   labels:
-    # Only the code-review workflow's runners are self-hosted; every other job runs on ubuntu-latest.
+    # Only the code-review workflow's runners are self-hosted
+    # (workflows/code-review.yml): Codex reviews on `codex`, the advisory
+    # opencode review on `qwen` (CUSTOMIZE). Every other job runs on
+    # GitHub-hosted ubuntu-latest.
     - codex
     - qwen

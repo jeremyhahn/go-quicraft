@@ -28,7 +28,34 @@ import (
 	"sync/atomic"
 )
 
-// The retired-replica registry durably records every (shardID, replicaID) RemoveNodeData removed.
+// The retired-replica registry: the durable record of every (shardID,
+// replicaID) that RemoveNodeData has removed, and so retired for good.
+//
+// Raft never lets a removed replica ID return: its term, vote and owed lease
+// vote window went with its data, and a replica started again without them
+// could vote twice in one term. The retirement must therefore outlive every
+// record the replica ever wrote, and those records live in WAL segments that
+// the shard shares with other Raft groups and that garbage collection reclaims
+// only when nothing else pins them. A retirement kept AS a WAL record — the
+// old RemoveNode tombstone — had to pin its own segment forever to stay ahead
+// of them: a whole segment (64 MiB by default) retained per removed replica.
+//
+// The registry keeps the retirement beside the WAL instead, in one small file
+// in the WAL root: 16 bytes per retired replica. Replay drops every record of
+// a retired replica wherever it is found (purgeRetired), so nothing in the
+// segments needs pinning, and the removed replica's segments become ordinary
+// garbage. The file is rewritten whole on each retirement and published the
+// way the format marker is (writeWALFormat): a fsynced temporary file renamed
+// over the name, then the directory fsynced, so the name only ever refers to a
+// complete registry. Retirements are rare and the file is small; a whole
+// rewrite keeps it a single self-checking value with no log to replay.
+//
+// Layout (little-endian, like the record format):
+//
+//	magic "QRRETIRE"[8] | count:u64 | count × (shardID:u64 | replicaID:u64) | crc32c:u32
+//
+// The CRC covers every byte before it. Entries are sorted, so the file is a
+// function of the set.
 const (
 	retiredFilename     = "RETIRED"
 	retiredTempFilename = "RETIRED.tmp"
@@ -38,10 +65,17 @@ const (
 	retiredTrailerSize  = 4
 )
 
-// ErrRetiredRegistryMalformed is returned by Open when the retired-replica registry does not parse.
+// ErrRetiredRegistryMalformed is returned by Open when the retired-replica
+// registry exists but does not parse: a wrong length, magic or checksum. It
+// fails the open rather than being ignored — a registry that cannot be read is
+// a set of retirements that cannot be enforced, and opening without it would
+// hand retired replica IDs back.
 var ErrRetiredRegistryMalformed = errors.New("waldb: retired-replica registry is malformed")
 
-// retiredRegistry is the in-memory registry; a retirement is published to disk before the set.
+// retiredRegistry is the in-memory copy of the registry file. Reads take mu
+// for reading, behind a lock-free empty fast path; a retirement is serialized
+// by writeMu, published to disk first and only then to the set, so a reader
+// never sees a retirement that is not durable.
 type retiredRegistry struct {
 	writeMu sync.Mutex
 	mu      sync.RWMutex

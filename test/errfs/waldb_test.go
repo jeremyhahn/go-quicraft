@@ -14,7 +14,34 @@
 
 //go:build quicraft_errfs
 
-// Package errfs_test injects WAL I/O errors through ErrorFS and verifies errors propagate and committed data survives recovery.
+// Package errfs_test exercises WAL I/O error injection scenarios using
+// ErrorFS. Each test opens a waldb.DB with an ErrorFS delegate, injects a
+// failure at a precise operation number, and then verifies that:
+//
+//   - The error is correctly surfaced to the caller (no swallowing, no panic).
+//   - The DB can be re-opened against the same directory using the real FS.
+//   - Data written before the failure is intact; data written during or after
+//     the failure is absent (no phantom reads).
+//
+// # Injection strategy
+//
+// The ErrorFS counter is shared across all FS and File operations. To target
+// a specific write-path operation we use a sweep approach: iterate injectAt
+// from 1 upward using a FRESH COPY of the baseline directory for each attempt.
+// This ensures the directory state is identical for every injection target and
+// the op count is reproducible.
+//
+//   - copyDir creates a complete recursive copy of the source directory.
+//   - sweepUntilOpError finds the first injectAt that causes a fault on one of
+//     the operations the test NAMES, and returns the operation it fired on so
+//     the test can assert it. An unconstrained sweep would settle on whichever
+//     operation happened to fail first and prove nothing about the path under
+//     test.
+//
+// The tests use the quicraft_errfs build tag so they are excluded from the
+// default test run and can be targeted explicitly with:
+//
+//	go test -tags quicraft_errfs ./test/errfs/...
 package errfs_test
 
 import (
@@ -31,6 +58,22 @@ import (
 )
 
 // errInjectedIO is the failure every injection in this suite reports.
+//
+// It is deliberately NOT io.ErrUnexpectedEOF, which this suite injected until
+// three of its tests started failing on it. A short read is a legitimate,
+// non-error outcome for several WAL read paths: readWALFormat reads the
+// geometry marker with io.ReadFull and treats an EOF-family error as "these
+// bytes are not a marker", i.e. absent, because a zero-length marker is the
+// residue of a stamp that never delivered its content and must be re-stamped
+// rather than refused. Injecting an error that unwraps to io.ErrUnexpectedEOF
+// therefore hands production a value it is entitled to read as DATA, and the
+// injection is silently absorbed — the three tests saw ErrWALFormatMissing
+// instead of the fault they armed.
+//
+// A real filesystem reports EIO or ENOSPC here, and no waldb path treats those
+// as content. errInjectedIO models that: an error value with no meaning to any
+// production classifier, so an assertion that it reached the caller is an
+// assertion about error propagation and nothing else.
 var errInjectedIO = errors.New("errfs_test: injected I/O failure")
 
 // walBlockSize is the WAL block size used throughout these tests.
@@ -46,7 +89,16 @@ const largeCmdSize = walBlockSize + 64
 // compactionEntryPayload is the Cmd size of each entry the compaction fault tests write into a 2 KiB segment.
 const compactionEntryPayload = 768
 
-// maxSweepOps is the most injection targets a sweep tries before failing.
+// maxSweepOps is the maximum number of injection targets to try in a sweep
+// before declaring failure. It is intentionally generous to handle machines
+// with many open-phase ops.
+//
+// It has to cover the PRODUCTION operation stream. Every phase here runs with
+// fsync enabled, so the counter also advances through the segment flushes and directory metadata
+// syncs that WithNoSync skipped entirely — and under WithNoSync no injection
+// target could ever land on a flush at all, which made the whole fsync surface
+// unreachable from a suite whose job is to fault every filesystem call the WAL
+// makes.
 const maxSweepOps = 900
 
 // --- helpers ---
@@ -170,7 +222,9 @@ func copyDir(src, dst string) error {
 	})
 }
 
-// walWriteOps are the operations a WAL record write issues.
+// walWriteOps are the operations a WAL record write actually issues. Naming
+// them is what turns a sweep into a test of the write path rather than a test
+// that SOMETHING under the filesystem can fail.
 var walWriteOps = []string{errfs.OpWriteAt, errfs.OpWrite}
 
 // walSyncOps is the flush an acknowledgement rests on.
@@ -211,7 +265,12 @@ func sweepUntilOpError(
 	return 0, ""
 }
 
-// injectOnOps builds an ErrorFS that fires at target on ops only, the filter the sweep used.
+// injectOnOps builds an ErrorFS that fires at target, on ops only.
+//
+// The injection phase MUST carry the same filter the sweep used. Without it the
+// counter lands on whatever operation happens to sit at that ordinal, which is
+// not necessarily the one the sweep found — OnlyOps defers the fault to the
+// next matching operation, so the two ordinals do not correspond.
 func injectOnOps(target int64, ops []string) *errfs.ErrorFS {
 	return errfs.New(waldb.DefaultFS(), target, errInjectedIO).OnlyOps(ops...)
 }
@@ -947,7 +1006,11 @@ func TestErrorFS_WAL_Compaction_RemoveFailure(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	// Open disarmed and arm afterwards, so the fault hits the call under test.
+	// Open with the injection DISARMED and arm it afterwards. Armed from op 1
+	// the fault lands on whichever Remove the open path happens to make first,
+	// which is not the call under test and leaves the assertion below
+	// unreached; Reset after Open puts the next Remove — GarbageCollect's —
+	// first in line.
 	efs := errfs.New(waldb.DefaultFS(), 0, errInjectedIO).OnlyOps(errfs.OpRemove)
 
 	db, openErr := waldb.Open(injectDir,
@@ -1053,7 +1116,10 @@ func TestErrorFS_WAL_Compaction_ReadDirFailure(t *testing.T) {
 		t.Fatalf("copyDir: %v", err)
 	}
 
-	// Open disarmed and arm afterwards, so the fault reaches Compact.
+	// Open with the injection DISARMED and arm it afterwards. Open reads every
+	// shard directory, so a fault armed from op 1 fires there and the test
+	// returns before Compact — "passing" without ever reaching the garbage
+	// collector it names.
 	efs := errfs.New(waldb.DefaultFS(), 0, errInjectedIO).OnlyOps(errfs.OpReadDir)
 
 	db, openErr := waldb.Open(injectDir,
@@ -1216,13 +1282,29 @@ func TestErrorFS_WAL_StatFailureDuringReplay(t *testing.T) {
 		}
 		mustClose(t, db)
 
-		// Open survived this target; keep sweeping the other stats.
+		// Open survived this target. That is NOT a reason to stop: the open
+		// path stats several different things — the WAL root, the format
+		// marker, each shard directory — and only some of them are load-bearing.
+		// Breaking the moment an injection fired without failing the open
+		// would give up at whichever tolerated stat came first and never reach
+		// the ones this test is about — and with fsync enabled, which changes
+		// which stat the counter lands on first, the sweep would quit at target
+		// 1 having proved nothing.
+		//
+		// Not firing at all is the real stop condition: it means the open path
+		// has no stats left above this target.
 		if !efs.Injected() {
 			break
 		}
 	}
 
-	// A failed stat must fail the open, not be read as an absent directory.
+	// Open stats the WAL root and each shard directory to decide whether it
+	// exists, and mistaking an unreadable directory for an absent one is how a
+	// populated WAL gets stamped with the wrong format. The failure must
+	// therefore reach the caller from at least one target in the sweep; a
+	// sweep that finds none means those stats are being swallowed, which is
+	// the defect this test exists to catch and not an acceptable outcome to
+	// log and pass over.
 	if !foundError {
 		t.Fatalf("no Stat injection target in %d attempts made Open fail: path-stat errors "+
 			"during the open path are being read as an absent directory", maxSweepOps)

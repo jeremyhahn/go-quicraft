@@ -14,12 +14,25 @@
 
 package waldb
 
-// Options mirrors the functional Options Open accepts; each field maps to a With* option, and DefaultOptions supplies defaultDBOptions' defaults.
+// Options is the declarative mirror of the functional Option values Open
+// accepts. Open does NOT take an Options: a caller translates each field into
+// the corresponding With* Option (WithBlockSize, WithMaxFileSize, WithNoSync)
+// after SetDefaults and Validate have vetted it. DefaultOptions is also the
+// single source of the defaults defaultDBOptions installs, so the two surfaces
+// cannot drift on values that both carry.
+//
+// Every field below therefore has a With* counterpart.
 type Options struct {
 	// WALDir is the directory where WAL segment files are stored.
 	WALDir string
 
-	// BlockSize is the WAL block size in bytes; larger records are split into block-sized chunks. Default: 32KB.
+	// BlockSize is the WAL block size in bytes. Records cannot cross block
+	// boundaries; large records are split into chunks that each fit within a
+	// single block. Default: 32KB.
+	//
+	// For optimal I/O alignment, set this to match the filesystem block size
+	// (typically 4096 for ext4, 512 for direct I/O). Larger values reduce
+	// syscall overhead but may increase write amplification.
 	BlockSize int
 
 	// MaxFileSize is the maximum segment file size in bytes before rotation.
@@ -46,7 +59,11 @@ func (o *Options) SetDefaults() {
 	}
 }
 
-// Validate checks that all options are within valid ranges; validateOpenOptions applies the same checks to Open's options.
+// Validate checks that all options are within valid ranges.
+//
+// validateOpenOptions applies the same invariants to the functional options
+// Open actually receives, so a caller that skips Options entirely is still
+// vetted.
 func (o *Options) Validate() error {
 	if o.WALDir == "" {
 		return ErrEmptyWALDir

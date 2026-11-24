@@ -30,7 +30,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Critical windows: user code that panics or calls runtime.Goexit between a state advance and its settlement must not prevent the settlement.
+// ---------------------------------------------------------------------------
+// Critical windows: user code between a state advance and its settlement
+//
+// Each test drives one window with user code — a slog handler, an
+// EventListener callback — that panics or calls runtime.Goexit, and checks
+// that what the window had advanced was settled all the same.
+// ---------------------------------------------------------------------------
 
 // newStartedTransport builds and starts a loopback transport, stopped when the
 // test ends unless the test stops it itself.
@@ -94,7 +100,14 @@ func (t *QUICTransport) dialForTest(target string) (*quic.Conn, error) {
 	return conn, err
 }
 
-// TestAcceptRejection_SettlesBeforeLogging verifies a refused connection is closed and its per-IP and global slots restored whatever the log handler does.
+// TestAcceptRejection_SettlesBeforeLogging: a connection refused at admission —
+// over its address's per-IP limit, or for a promiscuous certificate — is
+// closed and leaves the per-IP tracker and the global semaphore exactly as it
+// found them, whatever the rejection's log handler does. The per-IP warning
+// used to run before the close, leaking the accepted connection outside
+// MaxIncomingConnections and inboundConns; the promiscuous-certificate warning
+// ran after the per-IP slot was taken and before it was released, leaking the
+// address's quota for good.
 func TestAcceptRejection_SettlesBeforeLogging(t *testing.T) {
 	type branch struct {
 		record string
@@ -175,7 +188,12 @@ func TestAcceptRejection_SettlesBeforeLogging(t *testing.T) {
 	}
 }
 
-// TestCleanStaleConnections_SettlesEveryDeadTarget verifies every dead target is evicted and notified even when a callback exits abnormally.
+// TestCleanStaleConnections_SettlesEveryDeadTarget: the cleanup sweep evicts
+// every dead target's streams, and delivers OnConnectionFailed for every one,
+// when the first target's callback panics or calls runtime.Goexit. The sweep
+// used to evict and notify target by target, so an abnormal exit lost the
+// remaining targets' stream eviction and callbacks; their connections were
+// already out of the pool, so no later sweep would find them again.
 func TestCleanStaleConnections_SettlesEveryDeadTarget(t *testing.T) {
 	for exitName, exit := range hostileLogExits {
 		t.Run(exitName, func(t *testing.T) {
@@ -258,7 +276,12 @@ func TestCleanStaleConnections_SettlesEveryDeadTarget(t *testing.T) {
 	}
 }
 
-// TestSnapshotStreamRefusal_ReleasesItsSlotOnce verifies a refused snapshot stream releases its slot exactly once.
+// TestSnapshotStreamRefusal_ReleasesItsSlotOnce: a snapshot stream refused for
+// the per-connection snapshot limit gives its data-stream slot back exactly
+// once, whatever the refusal's log handler does. The slot was released before
+// the warning and marked released only after it, so an abnormal exit made the
+// stream's deferred cleanup release it a second time: it blocked forever on
+// the empty semaphore, and Stop waited on that goroutine for good.
 func TestSnapshotStreamRefusal_ReleasesItsSlotOnce(t *testing.T) {
 	for exitName, exit := range hostileLogExits {
 		t.Run(exitName, func(t *testing.T) {
@@ -282,7 +305,12 @@ func TestSnapshotStreamRefusal_ReleasesItsSlotOnce(t *testing.T) {
 			if err != nil {
 				t.Fatalf("getConnection: %v", err)
 			}
-			// refusable marks a stream the receiver may refuse mid-write; that cancel is the refusal, any other write error fails.
+			// refusable marks a stream the receiver may refuse. The receiver
+			// decides on the frame header alone and cancels the stream at
+			// once, so its STOP_SENDING can land between the header's two
+			// writes (WriteFrame writes the frame header, then the payload)
+			// and fail the second one. That cancel is the refusal itself, not
+			// a test failure; any other write error still is.
 			openSnapshot := func(refusable bool) *quic.Stream {
 				s, err := conn.OpenStreamSync(context.Background())
 				if err != nil {

@@ -2,7 +2,15 @@ package main
 
 import "strings"
 
-// semverCompare orders two module versions by SemVer 2.0 precedence, returning -1, 0 or +1.
+// semverCompare orders two module versions by SemVer 2.0 precedence and
+// returns -1, 0 or +1. The leading "v" and any +build metadata are ignored.
+// MAJOR.MINOR.PATCH compare numerically; a version with a prerelease sorts
+// before the same version without one; prerelease identifiers compare
+// left to right, numeric ones numerically and below alphanumeric ones,
+// alphanumeric ones in ASCII order, and a shorter run of equal identifiers
+// first. A Go pseudo-version is a SemVer prerelease of its base, so it
+// orders after the tag it was cut from (vX.Y.(Z+1)-0.timestamp-hash or
+// vX.Y.Z-pre.0.timestamp-hash) and before the next tag.
 func semverCompare(a, b string) int {
 	ac, ap := splitSemver(a)
 	bc, bp := splitSemver(b)

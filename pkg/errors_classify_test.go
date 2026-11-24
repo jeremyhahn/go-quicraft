@@ -55,7 +55,9 @@ func sentinelTable() []sentinelClassification {
 		// identical leader-executed request then reaches it.
 		{"ErrNoLeader", ErrNoLeader, true},
 		{"ErrLeadershipChanged", ErrLeadershipChanged, true},
-		// Temporary and never MaybeApplied: produced before the entry enters the log.
+		// Temporary: the transfer completes or times out on its own and the
+		// identical request then succeeds. Produced BEFORE the entry enters
+		// the log, so it is never MaybeApplied.
 		{"ErrTransferInProgress", ErrTransferInProgress, true},
 		{"ErrSnapshotInProgress", ErrSnapshotInProgress, true},
 		{"ErrImportInProgress", ErrImportInProgress, true},
@@ -118,7 +120,10 @@ func sentinelTable() []sentinelClassification {
 		{"ErrTooManyWitnesses", ErrTooManyWitnesses, false},
 		{"ErrBreaksFullReplicaMajority", ErrBreaksFullReplicaMajority, false},
 		{"ErrRemoveLastFullReplica", ErrRemoveLastFullReplica, false},
-		// Membership validation rejections describe the request itself, so the identical request fails forever.
+		// Membership validation rejections. Every one describes the request
+		// itself, not a condition on this host, so the IDENTICAL request fails
+		// forever: the caller must re-read the membership and build a
+		// different one.
 		{"ErrNodeNotFound", ErrNodeNotFound, false},
 		{"ErrNodeAlreadyExists", ErrNodeAlreadyExists, false},
 		// Permanent: a removed member's identity is banned from the shard for
@@ -166,7 +171,8 @@ func sentinelTable() []sentinelClassification {
 		{"ErrScratchNotUnlinked", ErrScratchNotUnlinked, false},
 		{"ErrUnsupportedSnapshotCompression", ErrUnsupportedSnapshotCompression, false},
 		{"ErrCorruptConfigEntry", ErrCorruptConfigEntry, false},
-		// A failing system CSPRNG is permanent, like ErrEntropyDegenerate.
+		// The system CSPRNG failing is not a condition a retry loop should
+		// paper over, for the reason ErrEntropyDegenerate is permanent.
 		{"ErrEntropyUnavailable", ErrEntropyUnavailable, false},
 		{"ErrCACertificateParse", ErrCACertificateParse, false},
 		{"ErrInvalidCertKeyPair", ErrInvalidCertKeyPair, false},
@@ -192,7 +198,16 @@ func TestTemporary_Sentinels(t *testing.T) {
 	}
 }
 
-// declaredSentinels returns the exported Err* variables declared in every non-test file of this package, mapped to their file.
+// declaredSentinels parses every non-test source file of THIS package and
+// returns the exported Err* package-level variables it declares, mapped to the
+// file that declares them.
+//
+// It reads the whole package, not errors.go alone. Sentinels are declared next
+// to what produces them — ErrSessionsUnsupportedOnDisk and the two snapshot
+// barrier re-exports live in host.go, ErrInvalidSnapshotOption in
+// snapshot_option.go — and a check scoped to one file simply cannot see them.
+// Four exported sentinels were unclassified for exactly that reason: the test
+// reported complete coverage of a set it had defined to exclude them.
 func declaredSentinels(t *testing.T) map[string]string {
 	t.Helper()
 
@@ -263,7 +278,17 @@ func TestTemporary_ClassifiesEverySentinel(t *testing.T) {
 	}
 }
 
-// TestTemporary_ImplementationMatchesTheDecision compares the temporaryErrors list against the independently written classification table.
+// TestTemporary_ImplementationMatchesTheDecision compares the temporaryErrors
+// LIST — the implementation — against the classification table — the recorded
+// decision. They are written independently and must agree.
+//
+// Without it the suite only ever asserted the list against itself: sentinelTable
+// says "temporary" exactly where temporaryErrors has an entry, and Temporary
+// answers from temporaryErrors, so TestTemporary_Sentinels passes for any list
+// the table was copied from. Appending a sentinel to temporaryErrors and
+// nothing else — silently making a permanent failure retried forever — was
+// invisible. Here it is not: the sentinel becomes temporary while the table
+// still says permanent.
 func TestTemporary_ImplementationMatchesTheDecision(t *testing.T) {
 	byIdentity := make(map[error]string, len(sentinelTable()))
 	wantTemporary := make(map[string]bool, len(sentinelTable()))
@@ -342,7 +367,27 @@ func TestNotLeader(t *testing.T) {
 	})
 }
 
-// TestTransferInProgress_IsTemporaryAndNotMaybeApplied pins that ErrTransferInProgress matches by sentinel, is Temporary, and is not MaybeApplied.
+// TestTransferInProgress_IsTemporaryAndNotMaybeApplied pins the public
+// classification of ErrTransferInProgress.
+//
+// raft.handleLeaderPropose returns ErrTransferInProgress for EVERY proposal
+// type while a leadership transfer is in flight, and handleReadIndex returns it
+// for linearizable reads. It lives in an internal package, so without the
+// re-export no caller could match it with errors.Is and would resort to
+// strings.Contains(err.Error(), "transfer in progress") — string matching on
+// error text, the shape to avoid.
+//
+// The three properties a caller depends on, pinned here so a future change to
+// the classification has to be deliberate:
+//
+//   - it is matchable by sentinel, wrapped or not;
+//   - Temporary is TRUE — the transfer completes or times out with no operator
+//     or caller action, and the identical request then succeeds;
+//   - MaybeApplied is FALSE — raft returns it before the entry enters the log,
+//     so nothing was submitted and nothing can commit later. A caller that
+//     treated it as maybe-applied would go looking for an entry that does not
+//     exist, which on the config-change path is how "already exists" gets
+//     misread as success.
 func TestTransferInProgress_IsTemporaryAndNotMaybeApplied(t *testing.T) {
 	if !errors.Is(ErrTransferInProgress, raft.ErrTransferInProgress) {
 		t.Fatal("the exported sentinel must BE the engine's error, not a copy of " +

@@ -33,7 +33,10 @@ import (
 var suite = newQuicRaftSuite()
 
 func newQuicRaftSuite() *perfresult.BenchmarkSuite {
-	// The version is the VERSION file, stamped by the Dockerfile or read from the repository.
+	// The version is the project's VERSION file -- stamped in by the
+	// Dockerfile, read from the repository for a bare run -- never a
+	// placeholder: a result recorded as "0.0.0" measured nothing anyone can
+	// name.
 	version, err := benchutil.ProjectVersion()
 	if err != nil {
 		log.Fatal(err)

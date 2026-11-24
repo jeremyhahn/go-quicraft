@@ -331,7 +331,27 @@ func FuzzFrameWithPayload(f *testing.F) {
 	})
 }
 
-// FuzzMessageFrameDecode fuzzes the message-frame receive path.
+// FuzzMessageFrameDecode fuzzes the message-frame RECEIVE path -- the
+// transport's actual adversarial surface -- rather than the frame header
+// round trip the other targets in this file cover.
+//
+// One fuzzer-supplied payload and flag byte are pushed straight into
+// handleMessageFrame, and every batch that survives the decode is checked
+// against the receive path's contract: deployment isolation, the reserved
+// ShardID, the batch and entry count limits, a balanced receive-memory
+// budget, and -- the property raft's process-local gate rests on -- that a
+// message reconstructed from bytes is always stamped proto.OriginRemote.
+//
+// The harness, the assertions and the structured seed corpus live in
+// adversarial_test.go, which carries NO build tag: the seeds are replayed by
+// TestAdversarialMessageFrameSeeds and mutated by
+// TestAdversarialMessageFrameSweep on every ordinary `go test ./pkg/...`.
+//
+// Run:
+//
+//	make fuzz-transport
+//	go test -tags=quicraft_fuzz -run=Fuzz -fuzz=FuzzMessageFrameDecode \
+//	    -fuzztime=120s ./pkg/internal/transport/
 func FuzzMessageFrameDecode(f *testing.F) {
 	quietTransportLogs(f)
 	for _, seed := range adversarialFrameSeeds(f) {

@@ -55,7 +55,10 @@ func (e *LogValidationError) Error() string {
 	return fmt.Sprintf("config: invalid LogConfig.%s: %s (got %q)", e.Field, e.Message, e.Value)
 }
 
-// MaxProposalPayloadSizeExceededError is returned when MaxProposalPayloadSize exceeds the protocol's MaxEntrySize.
+// MaxProposalPayloadSizeExceededError is returned when the configured
+// MaxProposalPayloadSize exceeds the wire protocol's compile-time
+// MaxEntrySize. The protocol maximum is the hard ceiling enforced
+// during deserialization; the config value must be at or below it.
 type MaxProposalPayloadSizeExceededError struct {
 	Configured      uint64
 	ProtocolMaximum uint64
@@ -69,7 +72,11 @@ func (e *MaxProposalPayloadSizeExceededError) Error() string {
 	)
 }
 
-// MaxApplyEntrySizeExceededError is returned when MaxApplyEntrySize exceeds what the transport can frame.
+// MaxApplyEntrySizeExceededError is returned when the configured
+// MaxApplyEntrySize exceeds what the transport can frame. Raft uses this
+// value to size replication batches, so a larger setting produces batches
+// that are dropped at marshal time and rebuilt identically forever, leaving
+// a lagging follower permanently unable to catch up.
 type MaxApplyEntrySizeExceededError struct {
 	Configured   uint64
 	FrameMaximum uint64
@@ -84,7 +91,11 @@ func (e *MaxApplyEntrySizeExceededError) Error() string {
 	)
 }
 
-// MaxEntrySizeExceededError is returned when MaxEntrySize exceeds the protocol's MaxEntrySize.
+// MaxEntrySizeExceededError is returned when the configured MaxEntrySize
+// exceeds the wire protocol's compile-time MaxEntrySize. MaxEntrySize is
+// also the decompression ceiling on the apply path, so a value above the
+// protocol maximum would let a compressed entry expand past what the
+// deserializer will ever accept.
 type MaxEntrySizeExceededError struct {
 	Configured      uint64
 	ProtocolMaximum uint64
@@ -98,7 +109,10 @@ func (e *MaxEntrySizeExceededError) Error() string {
 	)
 }
 
-// KeyRotationIntervalTooSmallError is returned when KeyRotationInterval is non-zero but under 1 second.
+// KeyRotationIntervalTooSmallError is returned when the configured
+// KeyRotationInterval is non-zero but less than the minimum of 1 second.
+// Sub-second rotation intervals would cause excessive key churn and
+// associated storage overhead.
 type KeyRotationIntervalTooSmallError struct {
 	Configured time.Duration
 	Minimum    time.Duration
@@ -112,7 +126,10 @@ func (e *KeyRotationIntervalTooSmallError) Error() string {
 	)
 }
 
-// SessionExpiryEntriesTooSmallError is returned when SessionExpiryEntries is non-zero but under 100.
+// SessionExpiryEntriesTooSmallError is returned when the configured
+// SessionExpiryEntries is non-zero but less than the minimum of 100.
+// Values below 100 would aggressively expire sessions and cause
+// excessive re-registrations.
 type SessionExpiryEntriesTooSmallError struct {
 	Configured uint64
 	Minimum    uint64
@@ -126,7 +143,11 @@ func (e *SessionExpiryEntriesTooSmallError) Error() string {
 	)
 }
 
-// MaxMessageReceiveMemoryTooSmallError is returned when MaxMessageReceiveMemory cannot hold one maximum-size frame's charge.
+// MaxMessageReceiveMemoryTooSmallError is returned when an explicit
+// TransportConfig.MaxMessageReceiveMemory cannot hold one maximum-size frame.
+// Such a budget drops every peer's largest legal frame on arrival, so the
+// value is rejected at startup instead. Minimum is the receive charge of one
+// maximum-size frame.
 type MaxMessageReceiveMemoryTooSmallError struct {
 	Configured int64
 	Minimum    int64
@@ -164,7 +185,10 @@ func (e *MTLSConfigRequiredError) Is(target error) bool {
 // Use errors.Is to match.
 var ErrNoSyncWALOutsideTest = &NoSyncWALOutsideTestError{}
 
-// NoSyncWALOutsideTestError is returned when NoSyncWAL is set outside a test binary.
+// NoSyncWALOutsideTestError is returned by HostConfig.Validate when
+// NoSyncWAL is true in a binary that is not a test binary. NoSyncWAL
+// disables the WAL fdatasync that makes an acknowledged entry durable, so
+// it is allowed only under `go test` (including benchmarks).
 type NoSyncWALOutsideTestError struct{}
 
 // Error returns a human-readable description naming the NoSyncWAL field.
@@ -182,7 +206,11 @@ func (e *NoSyncWALOutsideTestError) Is(target error) bool {
 // LeaseReadRequiresCheckQuorumError. Use errors.Is to match.
 var ErrLeaseReadRequiresCheckQuorum = &LeaseReadRequiresCheckQuorumError{}
 
-// LeaseReadRequiresCheckQuorumError is returned when LeaseRead is enabled without CheckQuorum (Raft thesis 6.4).
+// LeaseReadRequiresCheckQuorumError is returned when LeaseRead is enabled
+// but CheckQuorum is disabled. Without CheckQuorum, a partitioned leader
+// cannot detect quorum loss and will continue serving lease-based reads
+// indefinitely, violating linearizability. Per Raft PhD thesis Section 6.4,
+// lease reads require the leader to maintain quorum contact.
 type LeaseReadRequiresCheckQuorumError struct{}
 
 // Error returns a human-readable description of the safety violation.

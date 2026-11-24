@@ -43,7 +43,13 @@ func (readFailingSnapshotFile) Read([]byte) (int, error) { return 0, errTestRead
 
 var _ snapshotFS = readFailingSnapshotFS{}
 
-// TestWriteReceivedSnapshotMetadata_HashFailureWritesNoRecord: a snapshot.dat hash failure writes no record.
+// TestWriteReceivedSnapshotMetadata_HashFailureWritesNoRecord is the
+// regression guard for the receive and import paths' copy of the save path's
+// defect: a failure to hash snapshot.dat was logged and the record written
+// anyway. The encoder always emits the integrity fields, so that record
+// claimed DataLen 0 and DataHash 0 as fact, the caller went on to publish and
+// record the snapshot, and every later recovery refused it. The write must now
+// fail before any record exists, so the caller discards its unpublished stage.
 func TestWriteReceivedSnapshotMetadata_HashFailureWritesNoRecord(t *testing.T) {
 	cases := []struct {
 		name    string

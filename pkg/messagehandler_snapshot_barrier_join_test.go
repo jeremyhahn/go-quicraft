@@ -82,7 +82,13 @@ func snapshotChunkFor(shardID, replicaID, from, index, term uint64,
 	}}
 }
 
-// TestHandleSnapshot_SealedBarrierFailsClosed: a sealed barrier refuses the snapshot rather than persisting plaintext; a nil barrier still works.
+// TestHandleSnapshot_SealedBarrierFailsClosed pins the receive half of the
+// plaintext-downgrade defect. The bytes on the wire are plaintext, so a
+// receiver that treats a SEALED barrier the same as an ABSENT one persists
+// them unencrypted at rest — durable, restart-surviving, exportable plaintext
+// for a shard configured to be encrypted, created at the exact moment an
+// operator sealed the host. The nil-barrier case is asserted alongside it: a
+// plaintext deployment must keep working.
 func TestHandleSnapshot_SealedBarrierFailsClosed(t *testing.T) {
 	const payload = "received-snapshot-payload"
 
@@ -157,7 +163,18 @@ func newJoiningEngineNode(t *testing.T, shardID, replicaID uint64) *engine.Node 
 	return engine.NewNode(peer, nil, lr, cfg, nil, t.TempDir(), nil)
 }
 
-// TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot: a joining shard admits a sender named by its join anchor (Config.MemberIdentities) with the bound identity; the window closes on the first accepted snapshot.
+// TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot pins the join
+// bootstrap window. A shard started with join=true and empty initial members
+// holds no membership, so the committed-membership binding rejects the
+// leader's bootstrap snapshot — the only message that can deliver the
+// membership — and blocks catch-up permanently.
+//
+// What the window authorizes, and nothing more: for a shard the Host itself
+// marked joining, a sender named by the JOIN ANCHOR the operator started the
+// shard with (Config.MemberIdentities) is admitted when the connection's
+// authenticated identity is the one the anchor binds it to. The snapshot's own
+// membership is not consulted — consulting it would let any certificate holder
+// bootstrap a joiner. The window closes on the first accepted snapshot.
 func TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot(t *testing.T) {
 	const leaderAddr = "127.0.0.1:7001"
 	const leaderID = "spki:1111111111111111111111111111111111111111111111111111111111111111"
@@ -205,7 +222,14 @@ func TestHandleSnapshot_JoiningShardAcceptsBootstrapSnapshot(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_NonJoiningShardRequiresCommittedMembership: a normal shard rejects a sender its committed membership does not name, whatever the snapshot claims.
+// TestHandleSnapshot_NonJoiningShardRequiresCommittedMembership pins the
+// negative: taking the sender's address from the snapshot's OWN membership is
+// reachable ONLY for a shard the Host marked joining and that raft also
+// considers incomplete. On a normally started shard, a sender the COMMITTED
+// membership does not name is rejected even though the snapshot claims an
+// address the connection's certificate covers — otherwise every established
+// replica would accept a state-machine replacement from any certificate holder
+// willing to name itself in the membership it ships.
 func TestHandleSnapshot_NonJoiningShardRequiresCommittedMembership(t *testing.T) {
 	const leaderAddr, strangerAddr = "127.0.0.1:7001", "127.0.0.1:7009"
 

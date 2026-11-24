@@ -27,32 +27,79 @@ var (
 	// file size.
 	ErrSegmentFull = errors.New("waldb: segment full")
 
-	// ErrRecordTooLarge is returned when one record's framed size exceeds the segment size; the caller must split it.
+	// ErrRecordTooLarge is returned when a single record's framed size exceeds
+	// the segment size limit, so it can never fit in any segment. Unlike
+	// ErrSegmentFull this is permanent: rotating to a fresh segment will not
+	// help, and the caller must split the record into smaller writes.
 	ErrRecordTooLarge = errors.New("waldb: record exceeds maximum segment size")
 
 	// ErrClosed is returned when an operation is attempted on a closed segment.
 	ErrClosed = errors.New("waldb: segment closed")
 
-	// ErrBarrierContextUnsupported is returned by Open when the configured barrier cannot bind caller context into its AAD (walContextBarrier).
+	// ErrBarrierContextUnsupported is returned by Open when a barrier is
+	// configured but cannot bind caller context into its AEAD AAD (see
+	// walContextBarrier). Every encrypted WAL record is positionally bound, so
+	// there is nothing to fall back to: accepting such a barrier would write
+	// records an at-rest attacker could reorder or splice undetected.
 	ErrBarrierContextUnsupported = errors.New(
 		"waldb: barrier does not support context-bound encryption")
 
-	// ErrBarrierContextBindingUnreportable is returned by Open for a context-binding barrier without ContextBindingResolved. See docs/compatibility/architecture.md.
+	// ErrBarrierContextBindingUnreportable is returned by Open for a barrier
+	// that DOES implement context-bound encryption but not
+	// ContextBindingResolved, the method walContextBarrier requires so the WAL
+	// can tell "cannot bind" apart from "cannot say yet".
+	//
+	// The interface is asserted on the dynamic type, so a barrier that lacks the
+	// method compiles and then fails at Open. It gets its own error because the
+	// generic one — "does not support context-bound encryption" — is false here
+	// and sends the reader looking for a missing capability instead of a
+	// missing method. See docs/compatibility/architecture.md.
 	ErrBarrierContextBindingUnreportable = errors.New(
 		"waldb: barrier is missing ContextBindingResolved() bool, required since the " +
 			"WAL must distinguish a barrier that cannot bind context from one that is " +
 			"merely still sealed; add the method (return true whenever the barrier is " +
 			"unsealed and its encryptor is installed)")
 
-	// ErrBarrierContextUnresolved is returned by Open when the barrier is still sealed, so its context-binding capability is unknown; unseal it before opening the WAL.
+	// ErrBarrierContextUnresolved is returned by Open when a barrier is
+	// configured but is not unsealed, so its context-AAD capability has no
+	// answer yet (see walContextBarrier.ContextBindingResolved).
+	//
+	// The WAL resolves that capability once and writes every record of the
+	// process against it, so it must not be resolved against a barrier that has
+	// merely not been unsealed: a node started sealed would latch "cannot bind"
+	// and keep writing epoch-only records after the operator unseals, with no
+	// error and no log line — a silent, permanent downgrade of exactly the
+	// positional binding this package fails closed to obtain.
+	//
+	// The downgrade is reachable because a sealed barrier reports
+	// ContextBindingUnresolved, which is what distinguishes "no" from "cannot
+	// say yet". This guard and that state in pkg/seal/barrier_binding.go are a
+	// matched pair: the state is what makes the guard necessary, and the guard
+	// is what makes the state safe.
+	//
+	// Fail closed at setup instead. A sealed barrier cannot serve the WAL
+	// anyway: replay decrypts every record at open and encryption fails on
+	// every write, so the only case this refuses is a fresh directory that
+	// would have been downgraded. Unseal the barrier before opening the WAL.
 	ErrBarrierContextUnresolved = errors.New(
 		"waldb: barrier is not unsealed, so its context-binding capability cannot be resolved; unseal before opening the WAL")
 
-	// ErrBarrierContextBindingChanged is returned when a barrier latched at open as unable to bind context later reports that it can; restart against the intended strategy.
+	// ErrBarrierContextBindingChanged is returned when a barrier that was
+	// resolved at open as UNABLE to authenticate a caller context later reports
+	// that it can. The capability is a deployment property the WAL latches
+	// once, so the change means the barrier was sealed and unsealed underneath
+	// it with a different strategy. Continuing would keep writing unbound
+	// records against a barrier that would bind them — a silent downgrade —
+	// while the segment's earlier records are bound differently. Fail closed
+	// and let the operator restart the process against the intended strategy.
 	ErrBarrierContextBindingChanged = errors.New(
 		"waldb: barrier context-binding capability changed after open; restart required")
 
-	// ErrLandingSegmentOverflow is returned when a record pre-fitted to its segment overflows it: a broken segment.CanFit/segment.Write invariant.
+	// ErrLandingSegmentOverflow is returned when a record that was pre-fitted
+	// to its landing segment nevertheless overflows it. It signals a broken
+	// invariant between segment.CanFit and segment.Write, never a condition a
+	// caller can provoke: the alternative — moving a positionally sealed record
+	// to a different segment — would make it permanently undecryptable.
 	ErrLandingSegmentOverflow = errors.New(
 		"waldb: record overflowed its pre-resolved landing segment")
 
@@ -76,7 +123,11 @@ var (
 	// name (see record.go).
 	ErrInvalidMaxFileSize = errors.New("waldb: max file size must be positive and at most 4 GiB - 1")
 
-	// ErrSegmentTooSmallForEntry is returned when a segment spans fewer than two blocks and can hold nothing.
+	// ErrSegmentTooSmallForEntry is returned when a segment spans fewer than
+	// two blocks, leaving no usable record payload at all. A large BATCH is
+	// split across records and a lone oversized entry fails at the write with
+	// ErrRecordTooLarge, so this rejects only the geometry where nothing can
+	// ever be written.
 	ErrSegmentTooSmallForEntry = errors.New(
 		"waldb: max file size must span at least two blocks")
 
@@ -84,19 +135,41 @@ var (
 	// exceeded the configured maximum disk usage threshold.
 	ErrDiskFull = errors.New("waldb: disk full")
 
-	// ErrCmdTooLarge is returned when an entry's Cmd exceeds maxCmdLen; fatal during replay (wrapped in RecoveryError).
+	// ErrCmdTooLarge is returned when a single entry's Cmd exceeds maxCmdLen.
+	// The write path enforces it so the WAL never contains an entry that
+	// recovery would reject, keeping the two sides of the format symmetric;
+	// during replay it is fatal (wrapped in RecoveryError) because a stored
+	// oversized length can only be corruption.
 	ErrCmdTooLarge = errors.New("waldb: entry Cmd exceeds maximum entry size")
 
-	// ErrMembershipTooLarge is returned when a membership or bootstrap address map exceeds maxMembershipMapEntries, which replay would reject.
+	// ErrMembershipTooLarge is returned when a snapshot's membership maps or a
+	// bootstrap's address map declare more than maxMembershipMapEntries
+	// entries. Replay rejects such a record as corruption and fails the whole
+	// recovery, so the write path must refuse it: a record that is durable but
+	// unreadable makes the node permanently unopenable. Same symmetry rule as
+	// ErrCmdTooLarge.
 	ErrMembershipTooLarge = errors.New("waldb: membership exceeds maximum entry count")
 
-	// ErrTruncatedEntryRecord is returned when replay finds an entry batch record ending mid-entry; recovery fails.
+	// ErrTruncatedEntryRecord is returned when WAL replay finds an entry
+	// batch record that ends mid-entry. The batch was written as a single
+	// CRC-protected record, so a mid-record decode failure is corruption
+	// that CRC did not explain; skipping the remainder would leave a hole
+	// in the replayed log that reads would serve as a silently shortened
+	// range (Log Matching violation), so recovery fails instead.
 	ErrTruncatedEntryRecord = errors.New("waldb: entry batch record truncated mid-entry")
 
-	// ErrTruncatedStateRecord is returned when replay finds a hard-state record of the wrong length; fatal, since skipping it could regress Term/Vote.
+	// ErrTruncatedStateRecord is returned when WAL replay finds a hard-state
+	// record whose length does not match the fixed on-disk layout. It is
+	// fatal: skipping the record lets an OLDER state record win
+	// last-writer-wins replay, regressing Term/Vote so the node can vote
+	// twice in one term (Election Safety violation).
 	ErrTruncatedStateRecord = errors.New("waldb: state record malformed")
 
-	// ErrTruncatedSnapshotRecord is returned when replay cannot parse a snapshot record; fatal.
+	// ErrTruncatedSnapshotRecord is returned when WAL replay cannot parse a
+	// snapshot record: a short header, a filepath length past the record end,
+	// a missing or malformed membership section, or trailing bytes. It is
+	// fatal because a skipped snapshot record boots the node with empty
+	// membership and no snapshot metadata.
 	ErrTruncatedSnapshotRecord = errors.New("waldb: snapshot record malformed")
 
 	// ErrTruncatedBootstrapRecord is returned when WAL replay cannot parse a
@@ -104,13 +177,27 @@ var (
 	// parse failure is corruption or a format skew.
 	ErrTruncatedBootstrapRecord = errors.New("waldb: bootstrap record malformed")
 
-	// ErrTruncatedCompactionRecord is returned when replay finds a compaction marker of the wrong length; fatal.
+	// ErrTruncatedCompactionRecord is returned when WAL replay finds a
+	// compaction marker whose length does not match the fixed on-disk layout.
+	// Fatal: a lost marker resets compactedTo to 0, so reads below the true
+	// floor return empty instead of ErrCompacted.
 	ErrTruncatedCompactionRecord = errors.New("waldb: compaction record malformed")
 
-	// ErrUnknownPayloadType is returned when replay finds a payload type this package does not write, such as a keyed WAL opened without a barrier; fatal.
+	// ErrUnknownPayloadType is returned when WAL replay finds a record whose
+	// payload type byte is not written by this package. Payload types are
+	// CRC-protected, so an unknown type is corruption or a configuration
+	// skew — most importantly a KEYED WAL opened with barrier==nil, where
+	// every ciphertext record's leading epoch byte decodes as type 0x00.
+	// Skipping such records booted the node as an empty replica with no
+	// memory of prior votes, so replay fails-stop instead.
 	ErrUnknownPayloadType = errors.New("waldb: unknown WAL record payload type")
 
-	// ErrDBPoisoned is returned by every write after an fsync failure fail-stopped the database; only a restart and crash recovery are safe.
+	// ErrDBPoisoned is returned by every write operation after an fsync
+	// failure has fail-stopped the database. Once fdatasync fails, the
+	// kernel may mark dirty pages clean without persisting them
+	// (fsyncgate), so retrying writes has undefined durability semantics
+	// and ghost records could surface at recovery. The only safe path is
+	// a process restart followed by WAL crash recovery.
 	ErrDBPoisoned = errors.New(
 		"waldb: database poisoned after fsync failure; restart required for crash recovery")
 )
@@ -180,7 +267,10 @@ func (e *WALDecryptError) Unwrap() error {
 	return e.Err
 }
 
-// SegmentReadError is returned when reading a segment block fails during recovery; it carries the file offset and is wrapped in a RecoveryError.
+// SegmentReadError is returned when reading a block of a WAL segment fails
+// during recovery. It carries the file offset of the failed read so an
+// operator can locate the bad region on the medium. It is always wrapped in a
+// RecoveryError, which supplies the segment ID.
 type SegmentReadError struct {
 	Offset int64
 	Err    error
@@ -249,7 +339,10 @@ func (e *BatchWriteError) Error() string {
 	return msg
 }
 
-// Unwrap returns the write error and every rollback failure, so ErrDBPoisoned is visible to errors.Is.
+// Unwrap returns the original write error followed by every rollback
+// failure, so errors.Is/errors.As traverse the full chain — in particular,
+// a rollback that fail-stopped the DB surfaces ErrDBPoisoned to callers of
+// SaveState via one of the DiscardErrors.
 func (e *BatchWriteError) Unwrap() []error {
 	errs := make([]error, 0, 1+len(e.DiscardErrors))
 	errs = append(errs, e.WriteErr)
@@ -273,7 +366,10 @@ func (e *DiskUsageError) Unwrap() error {
 	return e.Err
 }
 
-// WriteBootstrapBatchModeError is returned when writeBootstrap is called in batchMode, a programming error.
+// WriteBootstrapBatchModeError is returned when writeBootstrap is called in
+// batchMode. Bootstrap writes must use non-batch mode (with inline fsync) to
+// ensure the in-memory update is safe. This error indicates a programming
+// mistake in the call path.
 type WriteBootstrapBatchModeError struct{}
 
 // Error implements the error interface.
@@ -281,7 +377,17 @@ func (e *WriteBootstrapBatchModeError) Error() string {
 	return "waldb: writeBootstrap called in batchMode; bootstrap writes require inline fsync"
 }
 
-// IsCleanRefusal reports whether err from SaveState is a refusal caused by cause that left the log unchanged, so the updates can be retried; an error carrying a disk fault is never clean.
+// IsCleanRefusal reports that err, returned by SaveState, is a refusal caused
+// by cause that left the log exactly as it was before the call: the write was
+// refused before any byte of it was durable and the rollback completed, so the
+// same updates can be retried unchanged.
+//
+// The answer depends only on the error's shape, never on how many updates the
+// call carried: SaveState refuses a batch and a single update with the same
+// error (rollbackBatch returns the originating error when the rollback
+// completes), and an error that also carries a disk fault is never clean — a
+// poisoned DB (failed fsync, failed rollback), a rollback that did not
+// complete (BatchWriteError) or a failed segment recovery (WALWriteError).
 func IsCleanRefusal(err, cause error) bool {
 	if !errors.Is(err, cause) || errors.Is(err, ErrDBPoisoned) {
 		return false

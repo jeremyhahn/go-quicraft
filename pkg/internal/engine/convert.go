@@ -21,7 +21,15 @@ import (
 	"path/filepath"
 )
 
-// protoEntryToLogDB copies every proto.Entry field, session fields included; add new fields here in the same change.
+// protoEntryToLogDB converts a proto.Entry to a logdb.Entry. All fields
+// are copied, including the session fields (Key, ClientID, SeriesID,
+// RespondedTo, OwnerID): they must survive the WAL round-trip or session dedup
+// (at-most-once delivery) silently breaks across crash recovery.
+//
+// This function is field-by-field and therefore does NOT fail to compile when a
+// field is added to either type — a new field simply stops being written, and
+// the omission surfaces only as a behaviour change after a restart. Every
+// addition to proto.Entry must be added here in the same change.
 func protoEntryToLogDB(e *proto.Entry) logdb.Entry {
 	return logdb.Entry{
 		Index:       e.Index,
@@ -48,7 +56,16 @@ func protoStateToLogDB(s *proto.State) logdb.State {
 
 // protoMembershipToLogDB converts a proto.Membership to a logdb.Membership.
 func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
-	// Witness and session policy are replicated state and must survive the snapshot round-trip.
+	// MaxWitnesses and RequireFullReplicaMajority are replicated membership
+	// state, not local config: dropping them here would persist every
+	// snapshot with a zeroed witness policy, so a restarted replica would
+	// compute a different witness quorum than its peers.
+	//
+	// The session policy is replicated state for the same reason and is
+	// dropped just as silently. A snapshot persisted without it comes back
+	// unset, the recovering replica falls back to its own Config, and it
+	// expires sessions at log indexes its peers do not — a state-machine
+	// divergence, not a recoverable error. See proto.SessionPolicy.
 	result := logdb.Membership{
 		ConfigChangeID:             m.ConfigChangeID,
 		MaxWitnesses:               m.MaxWitnesses,
@@ -86,14 +103,21 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 			result.Removed[k] = v
 		}
 	}
-	// Identities must be persisted, or a reload authorizes by address alone.
+	// Identities is the WRITE side of the snapshot-metadata round-trip: this
+	// is the conversion a replica's own snapshot save goes through, so
+	// dropping it here leaves nothing for recovery to read back and the
+	// reloaded configuration silently authorizes by address alone. See
+	// logdb.Membership.Identities.
 	if len(m.Identities) > 0 {
 		result.Identities = make(map[uint64]string, len(m.Identities))
 		for k, v := range m.Identities {
 			result.Identities[k] = v
 		}
 	}
-	// RemovedIdentities must be persisted so a removed node cannot rejoin under another replica ID.
+	// RemovedIdentities is the identity half of the removal deny-list. Dropping
+	// it here would revoke a revocation: the snapshot this save produces is what
+	// a restart reads back, and a replica that comes up without its tombstone
+	// identities can be evaded by a removed node claiming another replica ID.
 	if len(m.RemovedIdentities) > 0 {
 		result.RemovedIdentities = make(map[uint64]string, len(m.RemovedIdentities))
 		for k, v := range m.RemovedIdentities {
@@ -103,7 +127,15 @@ func protoMembershipToLogDB(m *proto.Membership) logdb.Membership {
 	return result
 }
 
-// snapshotRecordPath converts a snapshot's data-file path to the directory a LogDB record names.
+// snapshotRecordPath converts a proto snapshot's Filepath, which names the
+// artifact's DATA FILE (<dir>/snapshot.dat, the file the send path opens), to
+// the DIRECTORY a LogDB snapshot record names; every reader of a record joins
+// snapshot.dat back on. The receive path records the directory itself, and
+// before the receive became two-phase its record was always written first, so
+// the one this conversion produced from raft's Update was discarded as out of
+// date. Now it can be written first, and a record naming the file makes every
+// reader open <dir>/snapshot.dat/snapshot.dat. A path that does not name the
+// data file is already a directory and is kept.
 func snapshotRecordPath(protoPath string) string {
 	if filepath.Base(protoPath) == snapshotDataFile {
 		return filepath.Dir(protoPath)
@@ -111,7 +143,15 @@ func snapshotRecordPath(protoPath string) string {
 	return protoPath
 }
 
-// protoSnapshotToLogDB converts a proto.Snapshot to a logdb.Snapshot, including its compression.
+// protoSnapshotToLogDB converts a proto.Snapshot to a logdb.Snapshot.
+//
+// Compression is carried, and it could not be until proto.Snapshot grew the
+// field: every record this conversion produced therefore said NoCompression
+// whatever the artifact actually was. That is the one field here whose loss is
+// not merely descriptive — recovery builds its reader chain from it, so a
+// snappy artifact recorded as uncompressed is handed to the state machine as
+// garbage. The direct receive path and the import path set it correctly, which
+// is what kept the gap from showing.
 func protoSnapshotToLogDB(s *proto.Snapshot) logdb.Snapshot {
 	return logdb.Snapshot{
 		Index:       s.Index,
@@ -125,7 +165,18 @@ func protoSnapshotToLogDB(s *proto.Snapshot) logdb.Snapshot {
 	}
 }
 
-// protoUpdatesToLogDBReuse converts updates into dst and one flat entry buffer, both returned for reuse.
+// protoUpdatesToLogDBReuse converts proto updates reusing both the
+// destination update slice and a single flat entry buffer. Instead of
+// maintaining per-update entry slices (which require N slice headers
+// and N capacity checks), all entries across the batch are written into
+// one contiguous []logdb.Entry and each logdb.Update receives a
+// sub-slice. This reduces allocation pressure from O(N) to O(1) in
+// steady state, improves cache locality for sequential LogDB writes,
+// and eliminates per-update capacity bookkeeping.
+//
+// The flat buffer grows on demand and is returned for reuse by the
+// caller. The returned dst and flatBuf should be passed back on the
+// next call.
 func protoUpdatesToLogDBReuse(
 	dst []logdb.Update,
 	flatBuf []logdb.Entry,

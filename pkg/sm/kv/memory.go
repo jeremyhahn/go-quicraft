@@ -45,7 +45,13 @@ func handlePut(m *MemoryStore, cmd Command) sm.Result {
 	return sm.Result{Value: uint64(len(cmd.Value))}
 }
 
-// handlePutIfAbsent stores the value only when the key is absent, decided against replicated state; declining is reported through Result.Value, not an error.
+// handlePutIfAbsent stores the value only when the key is absent.
+//
+// The existence check runs here, inside Update, so it is evaluated against the
+// replicated state at this log position on every replica — the same input
+// producing the same decision everywhere, which is what keeps the replicas
+// identical. Declining is a normal outcome reported through Result.Value, not
+// an error: a caller losing the race has received a correct answer.
 func handlePutIfAbsent(m *MemoryStore, cmd Command) sm.Result {
 	if _, exists := m.data[string(cmd.Key)]; exists {
 		return sm.Result{Value: ResultNotStored}
@@ -66,7 +72,17 @@ func handleDelete(m *MemoryStore, cmd Command) sm.Result {
 	return sm.Result{Value: 1}
 }
 
-// MemoryStore is an in-memory KV state machine; a RWMutex guards data and cmds, as defence in depth beside the RSM adapter's readGuard and for use outside a shard.
+// MemoryStore is a simple in-memory KV state machine. A RWMutex protects the
+// data map and the cmds scratch slice.
+//
+// Inside a shard the mutex is not what separates reads from applies: QuicRaft
+// serializes Update against Lookup on this tier, and the RSM adapter enforces
+// that by holding its readGuard for writing across Apply and for reading across
+// Lookup/NALookup/NALookupBuf/GetHash. SaveSnapshot on this tier likewise runs
+// with applies drained under the engine's saving gate. The mutex is kept
+// because MemoryStore is an exported type usable outside a shard, because it
+// lets SaveSnapshot deep-copy under a read lock rather than serializing to the
+// writer under one, and as defence in depth if the adapter's guard changes.
 type MemoryStore struct {
 	mu   sync.RWMutex
 	data map[string][]byte
@@ -82,7 +98,15 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{data: make(map[string][]byte)}
 }
 
-// Update applies committed entries deterministically: an undecodable payload yields sm.ResultInvalidCommand, and all entries decode before any mutation.
+// Update applies committed entries to the in-memory store.
+//
+// The entries are committed Raft log entries: they MUST be applied
+// deterministically on every replica, so a payload that fails to decode
+// produces the reserved sm.ResultInvalidCommand result for that entry
+// rather than an Update error (the engine treats an Update error as
+// terminal for the shard). All entries are decoded before any mutation,
+// so no error return can occur after the first write and the
+// all-or-nothing contract of sm.StateMachine.Update holds.
 func (m *MemoryStore) Update(_ context.Context, entries []sm.Entry, results []sm.Result) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -173,7 +197,10 @@ func (m *MemoryStore) BytesLookup(key []byte) ([]byte, error) {
 	return cp, nil
 }
 
-// BytesLookupInto implements sm.NALookupInto, appending key's value into dst and returning it; do not retain dst across calls.
+// BytesLookupInto implements sm.NALookupInto. It copies the value for key
+// into dst, growing it via append if necessary, and returns the populated
+// sub-slice. The caller owns the returned slice and MUST NOT retain dst
+// across a subsequent call that may use the same backing array.
 func (m *MemoryStore) BytesLookupInto(key, dst []byte) ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -208,7 +235,13 @@ func (m *MemoryStore) GetHash() (uint64, error) {
 	return h.Sum64(), nil
 }
 
-// hashLenPrefixed writes a key-value pair into h with uint64 little-endian length prefixes so concatenations are unambiguous; shared by both stores' GetHash.
+// hashLenPrefixed writes one key-value pair into h with a fixed-width
+// uint64 little-endian length prefix before the key and before the value.
+// Without the prefixes the concatenated stream is ambiguous —
+// {"user":"1"} and {"use":"r1"} would hash identically, so genuine
+// divergence could go undetected by the very API that exists to detect it.
+// Shared by MemoryStore.GetHash and ConcurrentStore.GetHash so both stores
+// produce the same hash for the same logical contents.
 func hashLenPrefixed(h *xxhash.Digest, key string, val []byte) error {
 	var lenBuf [8]byte
 	binary.LittleEndian.PutUint64(lenBuf[:], uint64(len(key)))
@@ -228,7 +261,11 @@ func hashLenPrefixed(h *xxhash.Digest, key string, val []byte) error {
 	return nil
 }
 
-// SaveSnapshot writes [count:4 LE] then [keyLen:4 LE][key][valLen:4 LE][val] per pair, from a deep copy taken under a read lock.
+// SaveSnapshot serializes all key-value pairs to the writer.
+// Format: [count:4 LE] then for each pair: [keyLen:4 LE][key][valLen:4 LE][val].
+//
+// A deep copy of the data map is taken under a read lock so that
+// serialization proceeds without blocking concurrent Update calls.
 func (m *MemoryStore) SaveSnapshot(_ context.Context, w io.Writer, stopper <-chan struct{}) error {
 	// Deep-copy under read lock.
 	m.mu.RLock()
@@ -244,7 +281,13 @@ func (m *MemoryStore) SaveSnapshot(_ context.Context, w io.Writer, stopper <-cha
 	if err := binary.Write(w, binary.LittleEndian, count); err != nil {
 		return err
 	}
-	// Serialise in key order so identical state yields identical snapshot bytes.
+	// Serialise in key order. Ranging the map directly emits pairs in Go's
+	// randomised iteration order, so two replicas holding IDENTICAL state
+	// produce different snapshot bytes — and so does one replica snapshotting
+	// the same state twice. That defeats every byte-level comparison a
+	// consensus engine wants to make of a snapshot: divergence detection,
+	// deduplication, and any digest an operator compares across replicas. The
+	// decoder is order-independent, so this changes only what is written.
 	keys := make([]string, 0, len(clone))
 	for k := range clone {
 		keys = append(keys, k)
@@ -282,7 +325,12 @@ func (m *MemoryStore) RecoverFromSnapshot(_ context.Context, r io.Reader, stoppe
 		return err
 	}
 
-	// count is untrusted: cap the map size hint and let the map grow.
+	// count is an untrusted length prefix from a peer snapshot. Do NOT size the
+	// map directly from it: a hostile/corrupt count (up to ~4 billion) would
+	// trigger a multi-GB map preallocation before a single record is read.
+	// Cap the hint; if the snapshot really has more entries the map grows
+	// organically, and a count larger than the actual stream simply ends the
+	// loop early when io.ReadFull hits EOF.
 	hint := int(count)
 	if hint > maxSnapshotMapHint {
 		hint = maxSnapshotMapHint

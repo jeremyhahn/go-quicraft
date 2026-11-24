@@ -55,14 +55,37 @@ var (
 	// or equal to the currently recorded snapshot.
 	ErrSnapshotOutOfDate = errors.New("logdb: snapshot out of date")
 
-	// ErrLogGapDetected is returned when the stored log has a hole; a gap is never served as a shortened result.
+	// ErrLogGapDetected is returned when a hole in the stored log is
+	// detected: SetRange sees new entries that are not contiguous with the
+	// existing range, EntryRange finds an entry count that does not match
+	// the first..last index span, or IterateEntries finds that the stored
+	// range does not begin at the requested index. A gap indicates a bug in
+	// the entry persistence pipeline or on-disk corruption; it must never
+	// be served as a silently shortened result (Log Matching violation).
 	ErrLogGapDetected = errors.New("logdb: gap detected in log entries")
 
-	// ErrEntriesBelowCompactionFloor is returned by SaveState when an Update carries entries at or below the node's compaction floor; the write is refused, not clamped.
+	// ErrEntriesBelowCompactionFloor is returned by SaveState when an Update
+	// carries entries at or below the node's compaction floor.
+	//
+	// Those indexes are provably applied and already deleted, so the write can
+	// only be a caller bug — raft sends a lagging follower an InstallSnapshot,
+	// never entries beneath its own floor, and a local proposer never proposes
+	// below its applied index. The write is refused rather than clamped because
+	// every other outcome is worse. Storing it destroys the live suffix above
+	// the floor (truncate-and-append semantics replace everything from the
+	// first new index onward) and leaves EntryRange reporting a first index
+	// that IterateEntries then rejects as ErrCompacted, so the log describes
+	// itself inconsistently. Clamping silently discards entries the caller was
+	// told were persisted. Failing loudly is the only response that neither
+	// loses data nor lies about it.
 	ErrEntriesBelowCompactionFloor = errors.New("logdb: entries at or below the compaction floor")
 )
 
-// EntriesBelowCompactionFloorError reports the node and indexes refused; it wraps ErrEntriesBelowCompactionFloor.
+// EntriesBelowCompactionFloorError reports which node and which indexes were
+// refused, so the caller bug can be located rather than merely observed.
+//
+// It wraps ErrEntriesBelowCompactionFloor, so errors.Is against the sentinel
+// holds for every backend.
 type EntriesBelowCompactionFloorError struct {
 	// ShardID and ReplicaID identify the node whose write was refused.
 	ShardID   uint64

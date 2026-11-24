@@ -32,7 +32,18 @@ import (
 // Speculative address pre-registration must restore, not delete
 // ---------------------------------------------------------------------------
 
-// TestRequestConfigChange_RollbackRestoresPriorAddress verifies a rolled-back promotion restores the replica's prior registry address.
+// TestRequestConfigChange_RollbackRestoresPriorAddress is the regression
+// test. Observer -> voter promotion targets a replicaID that ALREADY has a
+// live registry entry. requestConfigChange pre-registers the new address
+// speculatively (Register is a Swap), so a rollback that unconditionally
+// Removed the entry deleted the address of a replica that is still a member
+// and still being replicated to. A follower/observer never initiates traffic,
+// so learnSourceAddress cannot heal the deletion: the replica falls behind
+// until the next committed config change, a snapshot recovery, or a restart.
+//
+// The rollback must restore the PRIOR address instead. This exercises the
+// failure-completion wiring too: the config change is appended but never
+// commits (the leader is deposed), and failPendingRequests runs the hook.
 func TestRequestConfigChange_RollbackRestoresPriorAddress(t *testing.T) {
 	h := newTestHost(t)
 
@@ -52,7 +63,12 @@ func TestRequestConfigChange_RollbackRestoresPriorAddress(t *testing.T) {
 	}
 	waitForLeader(t, h, shardID)
 
-	// Commit a second, nonexistent voter so quorum is 2 and later entries never commit.
+	// Commit a second voter so quorum becomes 2. This entry commits under
+	// the OLD single-voter config, but from here on nothing else can commit:
+	// replica 2 does not exist, so no further entry ever reaches quorum.
+	// That makes "appended but never committed" DETERMINISTIC — without it
+	// the shard is single-node, the config change below commits immediately,
+	// and the rollback under test never runs.
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer seedCancel()
 	if err := h.SyncRequestAddNode(seedCtx, shardID, 2, "127.0.0.1:7001", 0); err != nil {
@@ -123,7 +139,13 @@ func TestRequestConfigChange_RollbackRemovesFirstTimeAdd(t *testing.T) {
 	}
 	waitForLeader(t, h, shardID)
 
-	// Commit a second, nonexistent voter so quorum is 2 and the add below never commits.
+	// Commit a second voter so quorum becomes 2. This entry commits under
+	// the OLD single-voter config, but from here on nothing else can commit:
+	// replica 2 does not exist, so no further entry ever reaches quorum.
+	// That makes "appended but never committed" DETERMINISTIC — without it
+	// the shard is single-node and the add below can commit before
+	// failPendingRequests runs (observed flaking in CI). Mirrors the
+	// sibling promotion-rollback test above.
 	seedCtx, seedCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer seedCancel()
 	if err := h.SyncRequestAddNode(seedCtx, shardID, 2, "127.0.0.1:7001", 0); err != nil {
@@ -165,7 +187,15 @@ func TestRequestConfigChange_RollbackRemovesFirstTimeAdd(t *testing.T) {
 // Rollbacks must claim the pending entry before releasing references
 // ---------------------------------------------------------------------------
 
-// TestRequestSnapshot_RollbackDoesNotDoubleReleaseOnConcurrentCompletion verifies the submit-failure rollback does not release an entry a completion already released.
+// TestRequestSnapshot_RollbackDoesNotDoubleReleaseOnConcurrentCompletion is
+// the regression test for the snapshot path. OnSnapshotCompleted drains
+// the ENTIRE pendingSnapshots map on any completion for the shard, so a
+// completion can complete, remove and release an entry between the Store in
+// RequestSnapshot and its submit-failure rollback. An unconditional
+// releaseRef there drove outstanding to -1, which permanently fails
+// tryRecycle's outstanding==0 check (the object never returns to the pool),
+// and double-counted completePendingOp so Drain could close drainC with work
+// still in flight.
 func TestRequestSnapshot_RollbackDoesNotDoubleReleaseOnConcurrentCompletion(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -270,7 +300,12 @@ func TestReadIndex_QueueFullRollbackReleasesCallerReference(t *testing.T) {
 // ShardError/ShardLagging/ShardNoLeader must actually be reported
 // ---------------------------------------------------------------------------
 
-// TestShardHealth_DerivesLiveState verifies error, no-leader and lagging states are derived from the engine node.
+// TestShardHealth_DerivesLiveState is the regression test. ns.health only
+// records the coarse lifecycle state (healthy once started, unloaded once
+// stopped), so ShardError, ShardNoLeader and ShardLagging were never assigned
+// and HealthCheck's "degraded" branch was dead code: a wedged shard still
+// reported ok/200 and orchestrators kept routing writes to it. The live
+// conditions are derived from the engine node instead.
 func TestShardHealth_DerivesLiveState(t *testing.T) {
 	h := newTestHost(t)
 
@@ -292,7 +327,17 @@ func TestShardHealth_DerivesLiveState(t *testing.T) {
 		t.Errorf("health of a led, caught-up shard = %v, want ShardHealthy", got)
 	}
 
-	// A state machine far behind commit is lagging; re-inject the committed backlog each tick until it is observed.
+	// A state machine far behind the committed index is lagging.
+	//
+	// This backlog has to be injected on the COMMITTED side: the threshold is
+	// a thousand entries and a freshly elected single-node shard has applied
+	// one, so there is no room to move the applied marker back instead (which
+	// is what the follower-read fixtures do — see injectApplyLag). The step
+	// worker republishes the real committed index from the raft log on EVERY
+	// tick (Node.publishLogMarkers), so an injected value survives at most one
+	// tick interval. Re-inject until the derivation is observed rather than
+	// racing that window once: the loop can only ever end by shardHealth
+	// actually returning ShardLagging for an injected backlog.
 	engNode := h.engine.GetNode(shardID)
 	if engNode == nil {
 		t.Fatal("engine node missing")
@@ -344,7 +389,13 @@ func TestHealthCheck_ReportsDegradedForErroredShard(t *testing.T) {
 // ExportSnapshot must pin the in-flight epoch while it decrypts
 // ---------------------------------------------------------------------------
 
-// TestExportSnapshot_PinsInFlightEpoch verifies ExportSnapshot pins the epochs it reads against a concurrent purge.
+// TestExportSnapshot_PinsInFlightEpoch is the regression test.
+// decryptSnapshotForSend and ReencryptSnapshotFile both pin the epochs they
+// read, but ExportSnapshot decrypted with no pin at all: a long multi-GB
+// export racing keyRotationLoop -> rotateBarrierKey -> PurgeEpochsBefore
+// could have mid-stream frames fail AEAD, because GlobalSafePurgeFloor does
+// not account for an in-progress export. The operator's disaster-recovery
+// export would silently fail.
 func TestExportSnapshot_PinsInFlightEpoch(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -402,7 +453,14 @@ func containsEpoch(epochs []uint64, want uint64) bool {
 	return false
 }
 
-// TestImportSnapshot_PinsInFlightEpoch verifies ImportSnapshot pins its epoch against a concurrent rotate and purge.
+// TestImportSnapshot_PinsInFlightEpoch is the regression test for the one at-rest
+// persistence path that pinned nothing. ImportSnapshot re-encrypts the imported
+// plaintext under the shard's barrier at the current epoch and records that epoch
+// in LogDB — but the shard is STOPPED during the import, so the purge-floor scan
+// (which counts only LOADED nodes) contributes zero floor for it. Without a pin,
+// a concurrent Rotate + purge on another shard sharing the barrier can drop the
+// epoch's DEK between the re-encryption and the SaveSnapshot, leaving the recorded
+// snapshot permanently undecryptable — total loss of a disaster-recovery restore.
 func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := newMockLogDB()
@@ -479,7 +537,8 @@ func TestImportSnapshot_PinsInFlightEpoch(t *testing.T) {
 		t.Fatalf("deregistered epochs = %v, want epoch %d released after the import",
 			deregistered, snap.Epoch)
 	}
-	// The pin must be armed before re-encryption.
+	// The pin must be armed BEFORE re-encryption, not only after: a rotate+purge
+	// landing mid-loop would otherwise strand frames sealed under a dropped DEK.
 	pinning.mu.Lock()
 	sawEarly := pinning.sawEncryptBeforePin
 	pinning.mu.Unlock()
@@ -525,7 +584,13 @@ func TestSnapshotTooLargeError_MatchesSentinel(t *testing.T) {
 // FollowerRead's slow path must observe shutdown
 // ---------------------------------------------------------------------------
 
-// pollReachedCtx closes reached on its first Done call, which FollowerRead makes only in its slow-path poll loop.
+// TestFollowerRead_SlowPathExitsOnShardStop pins the shutdown exit. A poll loop
+// with no terminator other than ctx.Done() would let a caller with a
+// deadline-less context on a partitioned follower spin at 1000Hz forever, and
+// Host.Close could not interrupt it.
+// pollReachedCtx closes reached on its first Done call. FollowerRead calls
+// Done only inside its slow-path poll loop, so reached marks the reader's
+// arrival there.
 type pollReachedCtx struct {
 	context.Context
 	once    sync.Once
@@ -549,7 +614,10 @@ func TestFollowerRead_SlowPathExitsOnShardStop(t *testing.T) {
 
 	ns := testLoadNode(h, shardID)
 
-	// Force the slow path by injecting lag on the applied side; see injectApplyLag.
+	// Force the slow path. The lag is injected on the APPLIED side: an injected
+	// committed index is republished from the raft log on the next step-worker
+	// tick, after which the read completes on the FAST path and the shutdown
+	// exit this test exists for is never reached. See injectApplyLag.
 	proposeCtx, proposeCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer proposeCancel()
 	if _, err := h.SyncPropose(proposeCtx, shardID, []byte("committed-write")); err != nil {
@@ -609,9 +677,22 @@ func TestNewHost_ExportedTransportDisabledSkipsTransport(t *testing.T) {
 	}
 }
 
-// TestProposalKeysAreUniqueAcrossTheShard pins that proposal keys are unique across replicas and incarnations.
+// TestProposalKeysAreUniqueAcrossTheShard pins the identity of a proposal key.
+//
+// entry.Key is how an applied entry is matched back to the pending RequestState
+// that proposed it, and the key travels through the raft log to every replica.
+// A per-host counter collides by construction: every replica minted 1, 2, 3, so
+// replica B -- with its own request pending under key 7 -- completed that caller
+// the moment it applied replica A's unrelated entry also carrying key 7. B's
+// client received a success and A's RESULT VALUE for an operation it never
+// issued, and B's real entry later found no pending proposal at all.
 func TestProposalKeysAreUniqueAcrossTheShard(t *testing.T) {
-	// Three hosts stand for replicas A, B and A's next incarnation; keys are random, so no state is needed.
+	// Three hosts stand in for replicas A and B and for A's next incarnation
+	// -- a new Host under the same replica ID, the case a deterministic key
+	// scheme gets wrong. Keys are random draws, so uniqueness across hosts and across
+	// incarnations is the same property, and neither the replica ID nor a
+	// persisted counter is involved: a Host literal with no state at all
+	// mints keys as well as a started one.
 	hosts := map[string]*Host{"A": {}, "B": {}, "A-restarted": {}}
 	seen := map[uint64]string{}
 	for range 1 << 16 {
@@ -641,7 +722,20 @@ func TestConfigRejectsReplicaIDThatWouldTruncateTheProposalKey(t *testing.T) {
 	}
 }
 
-// TestProposeRejectsAlreadyCanceledContext verifies submission refuses a done context deterministically and appends nothing.
+// TestProposeRejectsAlreadyCanceledContext verifies that the submission entry
+// points refuse a context that is already done, deterministically, and that
+// nothing reaches the raft log when they do.
+//
+// The previous behaviour was a coin flip. SyncPropose selects over the result
+// channel and ctx.Done(); when a single-node shard commits before the
+// cancellation is observed BOTH cases are ready, and Go chooses among ready
+// cases uniformly at random. TestSyncPropose_CancelReturnsCanceled therefore
+// failed on a loaded CI runner and passed 40 consecutive runs locally, which is
+// exactly the signature of a test whose subject is nondeterministic rather than
+// a test that is flaky.
+//
+// Asserting on the log range is the half that has teeth: returning ErrCanceled
+// while still appending the entry would satisfy the error check alone.
 func TestProposeRejectsAlreadyCanceledContext(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -689,7 +783,21 @@ func TestProposeRejectsAlreadyCanceledContext(t *testing.T) {
 	}
 }
 
-// TestCancelledConfigChange_SubmitsNothing verifies a cancelled config change returns ErrCanceled and leaves log and membership unchanged.
+// TestCancelledConfigChange_SubmitsNothing is the membership counterpart to
+// TestSyncPropose_CancelReturnsCanceled.
+//
+// requestConfigChange checked closed, leader, config-change staleness and the
+// rate limiter — but never the context. A caller that cancelled before calling
+// received ErrCanceled while the membership change committed and applied, so
+// it could not tell whether the voting set had changed. Retrying after that
+// answer issues a duplicate or conflicting change against a configuration it
+// has mis-read.
+//
+// The pre-existing cancellation tests could not catch this: they accept ANY
+// non-nil error and never look at the log or the membership afterwards. This
+// one asserts both halves — the exact error, and that nothing moved — on a
+// single-node shard where a config change WOULD commit (quorum of one), so a
+// missing guard is observable rather than masked by an uncommittable shard.
 func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 	h := newTestHost(t)
 
@@ -704,7 +812,13 @@ func TestCancelledConfigChange_SubmitsNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ShardMembership: %v", err)
 	}
-	// Take the baseline from a published diagnostics snapshot; the first DiagRaftState call only arms publication.
+	// The baseline has to come from a PUBLISHED diagnostics snapshot. The first
+	// DiagRaftState call merely arms publication and returns zeros until the
+	// next tick, so reading it directly recorded lastIdxBefore=0 and then found
+	// the real index (2: bootstrap plus the leader's no-op) afterwards — a
+	// "cancelled config change appended to the log" that was nothing of the
+	// kind. On a loaded host the arming tick is slower, which is why this only
+	// ever failed in the full suite.
 	waitForDiagLive(t, h, 1)
 	rsBefore, err := h.DiagRaftState(1)
 	if err != nil {

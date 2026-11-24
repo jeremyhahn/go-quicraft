@@ -42,7 +42,12 @@ const (
 	goldenPlaintext    = "golden barrier frame plaintext"
 )
 
-// fixedNonceAEAD writes fixtures in production AES-GCM's shape (NonceSize() 0, nonce prepended) but with a fixed nonce.
+// fixedNonceAEAD is the test-only seam the encrypted fixtures are written
+// through. Production AES-GCM draws its nonce inside the FIPS module
+// (cipher.NewGCMWithRandomNonce), reports NonceSize() == 0 and prepends the
+// nonce to its Seal output. This wrapper has that exact shape but prepends a
+// fixed nonce, so the bytes it writes are the bytes production writes, minus
+// the randomness.
 type fixedNonceAEAD struct {
 	gcm   cipher.AEAD
 	nonce []byte

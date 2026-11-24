@@ -29,7 +29,12 @@ import (
 // LogDB.SaveState before giving up.
 const saveStateMaxRetries = 5
 
-// saveStateBackoff is the wait between the saveStateMaxRetries SaveState attempts, about 760ms in total.
+// saveStateBackoff defines the exponential backoff schedule between SaveState
+// attempts. There are saveStateMaxRetries (5) attempts and therefore at most
+// saveStateMaxRetries-1 (4) inter-attempt waits — the schedule is sized to that,
+// so no element is dead. Total pre-failure grace: ~760ms (10ms + 50ms + 200ms +
+// 500ms). retryWait indexes it by attempt (0..3); the final attempt is not
+// followed by a wait.
 var saveStateBackoff = [saveStateMaxRetries - 1]time.Duration{
 	10 * time.Millisecond,
 	50 * time.Millisecond,
@@ -45,14 +50,42 @@ type applyItem struct {
 	node   *Node
 }
 
-// shardMembership is one ordered load/unload notification for the commit worker; one channel keeps them FIFO, and done closes once it is applied between batches.
+// shardMembership is a single ordered load/unload notification for the
+// commit worker. unload marks the shard retired (Peer.Commit is skipped
+// for it); clearing unload re-admits it.
+//
+// Both directions travel on ONE channel because select chooses uniformly
+// at random among ready cases: with a separate unloadC and reloadC, an
+// UnloadNode followed by a LoadNode for the same shard could be applied
+// in reverse, leaving the shard permanently in the unloaded set. The
+// commit worker would then skip Peer.Commit forever, so the restarted
+// replica would persist and vote (even win elections) while applying
+// nothing. A single channel makes the sequence FIFO by construction.
+//
+// done, when set, is closed once the commit worker goroutine has applied the
+// change. The goroutine applies membership only BETWEEN batches, so a closed
+// done also proves that no batch in progress when it was sent is still running.
 type shardMembership struct {
 	shardID uint64
 	unload  bool
 	done    chan struct{}
 }
 
-// commitWorker batches Updates into SaveState calls and sends the deferred ordered messages only after they are durable (Raft thesis 10.2.1).
+// commitWorker writes Updates to LogDB using a drain-then-batch pattern
+// for maximum write throughput. Multiple updates arriving while the
+// worker is fsync'ing are batched into a single SaveState call.
+//
+// After receiving the first item from commitC, the worker yields via
+// runtime.Gosched() to allow other goroutines (step workers) to
+// produce additional items before draining. This micro-batch
+// accumulation window increases average batch size under load without
+// adding latency when the system is idle (Gosched returns immediately
+// when no other goroutines are runnable).
+//
+// After successful SaveState, the commit worker sends ordered messages
+// (VoteResp, HeartbeatResp, etc.) that were deferred by the step
+// worker. Per Raft PhD thesis 10.2.1, these messages must not be sent
+// until the corresponding state change is durable on stable storage.
 type commitWorker struct {
 	workerID   int
 	logdb      logdb.LogDB
@@ -61,10 +94,22 @@ type commitWorker struct {
 	batch      []proto.Update
 	batchNodes []*Node // parallel slice: batchNodes[i] owns batch[i]
 
-	// batchUnpersisted reports the batch holds updates whose SaveState has not completed; an abnormal exit then gives their claim back.
+	// batchUnpersisted reports that the current batch holds updates whose
+	// SaveState has not completed — from the moment the batch is gathered
+	// until SaveState succeeds or failBatchSaveState settles it. Its updates
+	// are owed a durable hard-state write GetUpdate already claimed (it
+	// advanced prevState at extraction), so an abnormal exit in that window
+	// gives the claim back (recoverAbnormalExit), as the step worker's
+	// discardExtractedUpdate does. Their entries were never marked stable, so
+	// the next GetUpdate re-derives them.
 	batchUnpersisted bool
 
-	// handoffNode and handoffUpdate hold an update whose Peer.Commit ran but whose entries have not reached apply; an abnormal exit fails the shard. Commit-worker goroutine only.
+	// handoffNode and handoffUpdate are the update whose Peer.Commit has
+	// advanced raft's processed marker but whose committed entries have not
+	// yet reached the apply worker. They exist nowhere else in that window,
+	// and user code — the OnCommitted callback, a logger — runs inside it, so
+	// an abnormal exit fails the shard (recoverAbnormalExit). Written and
+	// read only on the commit-worker goroutine.
 	handoffNode   *Node
 	handoffUpdate proto.Update
 	logdbBuf      []logdb.Update
@@ -75,10 +120,20 @@ type commitWorker struct {
 	callback      Callback
 	stopC         chan struct{}
 
-	// applyStopC is the apply tier's stop channel; forwards give up only when it closes (nil in unit tests, see forwardGiveUpC).
+	// applyStopC is the APPLY tier's stop channel (applyStopC in the engine),
+	// distinct from this worker's own stopC (commitStopC). The forward to the
+	// apply worker gives up only when the apply tier is actually gone: during
+	// ordered shutdown commitStopC closes in Stop step 3 while the apply tier
+	// stays live until step 4, so guarding the forward on stopC would abandon a
+	// WAL-persisted, Commit-advanced item on a coin-flip select. Nil in unit
+	// tests, where the forward falls back to stopC (see forwardGiveUpC).
 	applyStopC chan struct{}
 
-	// orderedMsgsBuf holds, per shard, the messages to send after SaveState completes; cleared each batch.
+	// orderedMsgsBuf accumulates ordered messages from commitItems
+	// during batch draining. These are messages that must be sent
+	// AFTER SaveState completes (e.g., VoteResp, HeartbeatResp).
+	// Keyed by shardID to support per-shard send ordering. Cleared
+	// each batch cycle.
 	orderedMsgsBuf map[uint64][]proto.Message
 
 	// freeOrderBuf and orderedMsgSplitBuf are pre-allocated buffers
@@ -109,14 +164,22 @@ type commitWorker struct {
 	// commitItem for commit latency measurement. Cleared each batch.
 	commitTimes map[uint64]time.Time
 
-	// unloaded holds shard IDs removed by UnloadNode; Peer.Commit is skipped for them.
+	// unloaded tracks shard IDs that have been unloaded via
+	// UnloadNode. The commit worker skips Peer.Commit for shards
+	// in this set, mirroring the apply worker's unloaded guard.
+	// Without this, an in-flight commitItem could call Peer.Commit
+	// on a node that has already been torn down.
 	unloaded *unloadedSet
 
 	// membershipC receives ordered unload/reload notifications. See
 	// shardMembership for why both directions share one channel.
 	membershipC chan shardMembership
 
-	// sealHold, held and sealWakeC park shards whose log write the sealed barrier refused; run joins every waiter before returning. saveErrs is holdSealedBatch's per-update result.
+	// sealHold, held and sealWakeC park shards whose log write the sealed
+	// barrier refused (see SealHold). held is owned by the run loop; each
+	// entry's waiter goroutine wakes the loop through sealWakeC (buffered,
+	// coalescing), and run joins every waiter (sealWaiters) before it
+	// returns. saveErrs is holdSealedBatch's reusable per-update result.
 	sealHold    SealHold
 	held        []*heldShard
 	sealWakeC   chan struct{}
@@ -124,7 +187,10 @@ type commitWorker struct {
 	saveErrs    []error
 }
 
-// newCommitWorker creates a commit worker; sender delivers ordered messages after WAL persistence and may be nil in memory mode.
+// newCommitWorker creates a commit worker. The sender parameter is used
+// to deliver ordered messages (VoteResp, HeartbeatResp, etc.) after
+// successful WAL persistence. It may be nil when running in memory mode
+// (where the commit worker is bypassed entirely).
 func newCommitWorker(
 	workerID int,
 	ldb logdb.LogDB,
@@ -163,7 +229,13 @@ func newCommitWorker(
 	}
 }
 
-// run is the commit worker loop: it waits for an item, yields to gather a batch, processes it, and drains commitC on shutdown.
+// run is the main loop for the commit worker. It blocks until the first
+// commitItem arrives, then yields via runtime.Gosched() to let other
+// step workers produce additional items before draining. This micro-
+// batch accumulation window increases batch size under concurrent load
+// without adding latency when the system is idle. On shutdown, it
+// drains all remaining items from commitC to ensure committed entries
+// are persisted and forwarded to the apply worker.
 func (w *commitWorker) run() {
 	for {
 		// Drain unload/reload requests before blocking on commitC.
@@ -171,7 +243,12 @@ func (w *commitWorker) run() {
 		select {
 		case <-w.stopC:
 			w.drainAndProcess()
-			// Every waiter selects on stopC, so this returns promptly and leaves no node marked sealHeld after shutdown.
+			// Every waiter selects on stopC, so this returns promptly —
+			// including for a shard the drain above held again — and leaves
+			// every held entry woken, so releaseWoken empties held. The step
+			// tier stopped first (Engine.stop), so the release hands nothing
+			// back to a running step worker; it only leaves no node marked
+			// sealHeld once the engine is down.
 			w.sealWaiters.Wait()
 			w.releaseWoken()
 			return
@@ -198,7 +275,11 @@ func (w *commitWorker) run() {
 	}
 }
 
-// drainAndProcess drains commitC without blocking and processes the remaining items at shutdown.
+// drainAndProcess non-blocking drains all remaining items from commitC
+// and processes them as final batches. Called during shutdown to ensure
+// all committed entries produced by step workers (which stopped first
+// in the ordered shutdown) are persisted and forwarded to the apply
+// worker (which is still running at this point).
 func (w *commitWorker) drainAndProcess() {
 	for {
 		select {
@@ -231,7 +312,24 @@ func (w *commitWorker) drainCommitC() {
 	}
 }
 
-// admit adds item to the batch, or drops it when its node is unloaded (Node.isUnloaded), so an unloaded incarnation never writes LogDB after UnloadNode returns.
+// admit adds one commitItem to the batch, or drops it when it belongs to an
+// unloaded shard incarnation.
+//
+// Dropping is what keeps an unloaded incarnation from writing LogDB after
+// UnloadNode returns. The unload fence (requestUnload) proves only that no
+// SaveState of the stopped incarnation is running or will run in the current
+// batch; an item still queued in commitC is admitted later, and by then a new incarnation of the same shard
+// may have loaded. Its update was never made durable, so dropping it is
+// exactly a crash before the fsync: its ordered messages — the ones that
+// promise durability, such as a vote grant — are dropped with it and never
+// sent, and the free-order ones already sent promise nothing. The check is at
+// admission rather than beside the post-SaveState guards because ordered
+// messages are gathered per shard ID here, where an old and a new
+// incarnation's would otherwise merge.
+//
+// The test is Node.isUnloaded, not the node's stopC: Engine.Stop stops every
+// node long before the commit tier exits, and no incarnation can follow a
+// shutdown, so the shutdown drain keeps persisting.
 func (w *commitWorker) admit(item *commitItem) {
 	if item.node.isUnloaded() {
 		slog.Warn("update dropped for unloaded shard incarnation",
@@ -260,7 +358,11 @@ func (w *commitWorker) captureOrderedMsgs(item *commitItem) {
 	}
 }
 
-// sendOrderedMessages sends the messages that must follow durable state, with the step worker's InstallSnapshot routing.
+// sendOrderedMessages delivers ordered messages via the transport layer.
+// Ordered messages include VoteResp, HeartbeatResp, ReplicateResp, etc.
+// that must not be sent until the corresponding state is durable on
+// stable storage. This method reuses the same InstallSnapshot routing
+// logic as the step worker's sendMessages.
 func (w *commitWorker) sendOrderedMessages(msgs []proto.Message) {
 	hasSnapshot := false
 	for i := range msgs {
@@ -287,7 +389,12 @@ func (w *commitWorker) sendOrderedMessages(msgs []proto.Message) {
 	}
 }
 
-// forwardGiveUpC returns applyStopC, or stopC when applyStopC is nil (unit tests).
+// forwardGiveUpC returns the channel whose close means "stop trying to forward
+// committed items to the apply tier". In production this is applyStopC: the apply
+// tier is live until Stop step 4, so a full applyC during ordered shutdown (step
+// 3) must be waited out, not abandoned. In unit tests applyStopC is nil, so it
+// falls back to the worker's own stopC, preserving the original single-channel
+// behavior.
 func (w *commitWorker) forwardGiveUpC() <-chan struct{} {
 	if w.applyStopC != nil {
 		return w.applyStopC
@@ -295,7 +402,20 @@ func (w *commitWorker) forwardGiveUpC() <-chan struct{} {
 	return w.stopC
 }
 
-// forwardToApply hands ai to the apply worker, applying membership requests while blocked; false means it gave up because the apply tier is stopping.
+// forwardToApply hands ai to the apply worker. It returns false, having
+// delivered nothing, when it gave up because the apply tier is stopping.
+//
+// The common case is a non-blocking send. While the send blocks — the apply
+// dispatcher backpressured on some shard's full per-shard channel — the
+// worker keeps applying unload/reload requests. An unload waits on this
+// worker (requestUnload is a fence), and StopShard of one shard must not wait
+// out another shard's busy state machine: the dispatcher answers its own
+// membership requests while backpressured, and this send is where the
+// commit tier would otherwise stall them. Applying membership mid-batch is
+// safe. The batch's SaveState, and any piggyback SaveState of the item being
+// forwarded, have already completed, and every later item in the batch
+// re-checks the unloaded set and its node's unloaded mark before it is
+// committed or persisted.
 func (w *commitWorker) forwardToApply(ai *applyItem) bool {
 	select {
 	case w.applyC <- ai:
@@ -315,7 +435,14 @@ func (w *commitWorker) forwardToApply(ai *applyItem) bool {
 	}
 }
 
-// retryWait waits for attempt's backoff and returns true if stopC closed; noRetryDelay and retryHookForTest are test hooks.
+// retryWait waits for the SaveState retry backoff delay for the given
+// attempt index, or returns early if the stop channel is closed.
+// Returns true if the stop channel was closed (caller should return),
+// false if the delay elapsed normally.
+//
+// In tests, noRetryDelay skips the timer entirely for fast-path
+// coverage. retryHookForTest, when non-nil, is called before waiting
+// to allow tests to inject panics and exercise panic recovery.
 func (w *commitWorker) retryWait(attempt int) (cancelled bool) {
 	if w.retryHookForTest != nil {
 		w.retryHookForTest(attempt)
@@ -357,7 +484,10 @@ func (w *commitWorker) processBatch() {
 		}
 	}
 
-	// Convert and persist only when LogDB is configured.
+	// Only convert and persist when LogDB is configured. In memory
+	// mode (logdb == nil), skip the conversion entirely to avoid
+	// allocating logdb.Entry slices and copying fields that will
+	// never be persisted.
 	var saveErr error
 	if w.logdb != nil {
 		w.logdbBuf, w.flatBuf = protoUpdatesToLogDBReuse(w.logdbBuf, w.flatBuf, w.batch)
@@ -373,7 +503,14 @@ func (w *commitWorker) processBatch() {
 			}
 			if attempt < saveStateMaxRetries-1 {
 				if cancelled := w.retryWait(attempt); cancelled {
-					// Shutdown during backoff: the batch was never persisted, so clear commitPending and fail its proposals.
+					// Shutdown fired during the retry backoff. The batch
+					// was never persisted, so its committed entries will
+					// never reach the apply worker. Clear commitPending
+					// and fail pending proposals for every node in the
+					// batch before returning, mirroring the saveErr
+					// cleanup path below. Without this, callers block
+					// until their context deadline and the nodes are left
+					// stuck with commitPending=true.
 					w.failBatchSaveState(saveErr)
 					observe()
 					return
@@ -402,7 +539,12 @@ func (w *commitWorker) processBatch() {
 	// completion; it is reported only once the batch is settled (observe).
 	persistedAt = time.Now()
 
-	// Send ordered messages only now that state is durable (Raft thesis 10.2.1).
+	// Send ordered messages now that state is persisted to stable
+	// storage. These include VoteResp, HeartbeatResp, ReplicateResp,
+	// etc. that must not be sent until the corresponding state change
+	// (vote grant, term update, log append acknowledgment) is durable.
+	// Per Raft PhD thesis section 10.2.1, sending these before persist
+	// can cause split-brain (e.g., vote grant then crash then re-vote).
 	if w.sender != nil {
 		for _, msgs := range w.orderedMsgsBuf {
 			if len(msgs) > 0 {
@@ -411,7 +553,11 @@ func (w *commitWorker) processBatch() {
 		}
 	}
 
-	// Notify locally proposed entries of this batch that they are WAL-durable, per update.
+	// WAL-durable notification: after successful SaveState, signal
+	// committed proposals before forwarding to the apply worker. Only
+	// entries from this batch that were proposed locally (Key > 0) are
+	// notified. This fires per-update so the callback receives entries
+	// scoped to a single shard.
 	if w.callback != nil {
 		for i, u := range w.batch {
 			node := w.batchNodes[i]
@@ -421,10 +567,27 @@ func (w *commitWorker) processBatch() {
 		}
 	}
 
-	// Commit each update to its own node (batchNodes[i]), not by shardID, under raftMu, and forward to apply.
+	// Commit peer state and forward to apply workers. The raftMu lock
+	// serializes Commit with the step worker's Tick() call, which runs
+	// even when commitPending=true to maintain leader heartbeat liveness
+	// (only a sealHeld node is not ticked). The lock is per-node and
+	// sub-microsecond.
+	//
+	// Each update is committed to its owning node (batchNodes[i]),
+	// NOT resolved by shardID. This is critical for correctness
+	// during rapid shard stop/restart: the batch may contain updates
+	// from both the old and new shard incarnation for the same
+	// shardID. Using a shardID-keyed map would clobber the old
+	// node pointer with the new one, causing the old update's
+	// committed entries to be applied to the new Peer (whose
+	// committed index may be lower), violating the appliedTo
+	// invariant.
 	for i, u := range w.batch {
 		stop := w.commitBatchItem(w.batchNodes[i], u)
-		// The item reached its terminal hand-off, so retire it from the batch.
+		// The item reached its terminal hand-off — the apply worker owns it,
+		// or it was failed, skipped or released — so it is retired from the
+		// batch: a later abnormal exit must not touch its node, whose
+		// commitPending may already belong to the apply worker.
 		w.batchNodes[i] = nil
 		if stop {
 			w.abandonBatchTail(i + 1)
@@ -437,7 +600,18 @@ func (w *commitWorker) processBatch() {
 	w.clearBatch()
 }
 
-// commitBatchItem commits one persisted update to its own node and hands its entries on; stop reports the worker is shutting down.
+// commitBatchItem commits one persisted batch update to its owning node and
+// hands its committed entries on, reporting stop when the worker is shutting
+// down and the rest of the batch must be abandoned. It runs every terminal
+// outcome for the item itself, so the caller can retire it.
+//
+// Each update is committed to its owning node (batchNodes[i]), NOT resolved by
+// shardID. This is critical for correctness during rapid shard stop/restart:
+// the batch may contain updates from both the old and new shard incarnation
+// for the same shardID. Using a shardID-keyed map would clobber the old node
+// pointer with the new one, causing the old update's committed entries to be
+// applied to the new Peer (whose committed index may be lower), violating the
+// appliedTo invariant.
 func (w *commitWorker) commitBatchItem(node *Node, u proto.Update) (stop bool) {
 	// Skip Peer.Commit for shards that have been unloaded. An in-flight
 	// commitItem may have been enqueued before the unload was processed.
@@ -452,7 +626,13 @@ func (w *commitWorker) commitBatchItem(node *Node, u proto.Update) (stop bool) {
 		return false
 	}
 
-	// Incarnation guard: skip an item whose node UnloadNode is tearing down (Node.isUnloaded).
+	// Incarnation guard, mirroring the apply dispatcher. The unloaded set is
+	// shardID-keyed and cannot distinguish a stale old-incarnation item from
+	// a fresh one after a rapid StopShard->StartShard. The node's own stopC
+	// can: an item whose node UnloadNode has begun tearing down belongs to a
+	// torn-down incarnation, and Commit on its peer would race the teardown.
+	// A node stopped only by Engine.Stop is not unloaded, so the shutdown
+	// drain keeps committing (see Node.isUnloaded).
 	if node.isUnloaded() {
 		slog.Warn("commit skipped for stopped shard incarnation",
 			"worker", w.workerID,
@@ -470,7 +650,10 @@ func (w *commitWorker) commitBatchItem(node *Node, u proto.Update) (stop bool) {
 		failCommit(node, w.callback, u, err)
 		return false
 	case commitRecovering:
-		// A snapshot recovery owns the state machine: clear commitPending and re-notify; entries are re-offered later.
+		// A snapshot recovery owns the state machine, so nothing was
+		// extracted for the apply worker (see commitUpdateLocked). Clear
+		// commitPending and re-notify: the entries stay in the log and are
+		// re-offered once the gate clears.
 		node.commitPending.Store(false)
 		w.workSignal.Notify(node.shardID)
 		return false
@@ -484,7 +667,11 @@ func (w *commitWorker) commitBatchItem(node *Node, u proto.Update) (stop bool) {
 			w.workSignal.Notify(node.shardID)
 			return false
 		}
-		// Piggyback path, run with raftMu released; false on shutdown abandons the rest of the batch.
+		// Piggyback path: persist updated state, send messages, apply. It
+		// takes raftMu itself, in short bursts, and must therefore run with
+		// the lock released — which is why commitUpdateLocked returns the
+		// piggyback instead of executing it. On shutdown mid-delivery it
+		// returns false and the rest of the batch is abandoned.
 		if !w.executePiggyback(node, piggyback) {
 			node.commitPending.Store(false)
 			return true
@@ -492,7 +679,10 @@ func (w *commitWorker) commitBatchItem(node *Node, u proto.Update) (stop bool) {
 		return false
 	}
 
-	// commitApply: the update carries committed entries; the blocking forward to apply must not run under raftMu.
+	// commitApply: the update carries committed entries. The forward below is
+	// a BLOCKING channel send to the apply worker and must never run under
+	// node.raftMu — the apply worker's own progress depends on the commit and
+	// step workers being able to take it.
 	w.handoffNode, w.handoffUpdate = node, u
 	ai := w.applyPool.Get().(*applyItem)
 	ai.update = u
@@ -524,13 +714,45 @@ const (
 	// commitFailed means Peer.Commit returned an error, carried in the
 	// accompanying error value. Nothing was extracted.
 	commitFailed
-	// commitRecovering: no entries, and the state machine cannot take any yet (recovery or an un-adopted snapshot).
+	// commitRecovering means the update committed with no entries and the
+	// state machine is not ready to receive any: either a snapshot recovery
+	// owns it, or a received snapshot is installed in the log and not yet
+	// adopted by it. No piggyback was attempted.
 	commitRecovering
-	// commitPiggyback: no entries and a piggyback update was requested; the error is GetPiggybackUpdate's.
+	// commitPiggyback means the update committed with no entries and a
+	// piggyback update was requested. The piggyback out-parameter holds it and
+	// the accompanying error is GetPiggybackUpdate's, which may be nil with an
+	// empty piggyback (the common no-op case).
 	commitPiggyback
 )
 
-// commitUpdateLocked commits update to its node's Peer under raftMu (released by defer) and may fetch a piggyback; failure handling, piggyback execution and the apply forward stay outside the lock.
+// commitUpdateLocked commits one update to its owning node's Peer with
+// node.raftMu held, and — when the update committed nothing to apply — asks the
+// peer for a piggyback update while still under the same lock, writing it to
+// the piggyback out-parameter. raftMu serializes all of this with the step
+// worker's Tick(), which runs even while commitPending is set (but not while
+// the node is sealHeld).
+//
+// Everything else processBatch does with the outcome stays in the caller,
+// outside the lock, and that placement is load-bearing rather than tidiness:
+//
+//   - failCommit enters the host callback and fails every pending proposal for
+//     the shard, which is unbounded user work.
+//   - executePiggyback fsyncs, sends messages and forwards to the apply worker,
+//     and takes raftMu itself in short bursts — running it here would
+//     self-deadlock on a non-reentrant sync.Mutex.
+//   - the applyC forward is a BLOCKING channel send; holding raftMu across it
+//     would let a full apply queue stall the step worker's Tick and, with it,
+//     leader heartbeats for every shard this worker owns.
+//
+// The lock is released by a defer, so a panic inside Peer.Commit (a corrupt
+// log, a torn-down peer) cannot leak node.raftMu. A leaked lock would be fatal:
+// the commit worker recovers and restarts, the restarted worker blocks forever
+// on Lock(), and every shard it owns stops committing, taking Host.Close (which
+// joins the same worker) with it.
+//
+// The update is taken by pointer purely to avoid copying a proto.Update on the
+// commit hot path; it is neither retained nor mutated here.
 func commitUpdateLocked(node *Node, u *proto.Update, piggyback *proto.Update) (commitStatus, error) {
 	node.raftMu.Lock()
 	defer node.raftMu.Unlock()
@@ -540,7 +762,23 @@ func commitUpdateLocked(node *Node, u *proto.Update, piggyback *proto.Update) (c
 	}
 
 	if len(u.CommittedEntries) == 0 {
-		// No extraction while a snapshot recovery owns the state machine or a received snapshot awaits adoption.
+		// A snapshot recovery owns the state machine: extracting
+		// committed entries here would advance raft's processed marker
+		// and hand the batch to an apply worker that must park it on the
+		// recovering gate, holding commitPending — and with it every
+		// ordered response, including vote grants — for the whole
+		// unbounded recovery. The step worker suppresses the same
+		// extraction (GetUpdate moreEntriesToApply=false); entries stay
+		// in the log and are re-offered once the gate clears.
+		//
+		// snapshotAdoptionPending covers the window BEFORE that gate goes
+		// up. THIS is the update that carries a received snapshot — it has
+		// no committed entries of its own, so it lands here — and the
+		// Peer.Commit above has just handed that snapshot to the LogReader.
+		// The state machine adopts it only when the snapshot pool seeds
+		// lastApplied, so a piggyback extracted now reaches past the
+		// un-adopted snapshot index and produces exactly the gapped batch
+		// the step worker was stopped from producing.
 		if node.IsRecovering() || node.snapshotAdoptionPending() {
 			return commitRecovering, nil
 		}
@@ -559,7 +797,20 @@ func commitUpdateLocked(node *Node, u *proto.Update, piggyback *proto.Update) (c
 	return commitApply, nil
 }
 
-// abandonBatchTail releases items from start onwards at shutdown: clears commitPending and returns their pooled entry slices; restart re-derives them from LogDB.
+// abandonBatchTail releases the batch items from index start onwards, which
+// processBatch's shutdown early-returns would otherwise leave behind. Those
+// items were persisted by SaveState but never reached Peer.Commit, so their
+// nodes still hold commitPending: without this the step worker never produces
+// another update for them and Engine.Stop returns with the shards wedged —
+// permanently, since the flag survives into the next batch cycle if the
+// worker keeps running.
+//
+// Dropping the entries is safe on exactly this path: nothing advanced raft's
+// processed marker for them (Peer.Commit never ran), they are durable in the
+// WAL, and the engine is shutting down — restart re-derives the apply
+// frontier from LogDB, the same rationale as the apply worker's shutdown
+// drop. Their pooled committed-entry slices are returned so a shutdown does
+// not drain proto's entry pool.
 func (w *commitWorker) abandonBatchTail(start int) {
 	for i := start; i < len(w.batch); i++ {
 		node := w.batchNodes[i]
@@ -576,7 +827,17 @@ func (w *commitWorker) abandonBatchTail(start int) {
 	}
 }
 
-// piggybackFailures counts GetPiggybackUpdate errors process-wide; the log record is rate-limited.
+// piggybackFailures counts GetPiggybackUpdate errors process-wide. A failure
+// here is not terminal for the shard — the commit worker falls back to the
+// skip-apply path and the entries are re-offered on a later cycle — but it
+// PERMANENTLY degrades the multi-node fast path for as long as the underlying
+// condition persists, turning every two-phase proposal back into a full extra
+// pipeline cycle. A repeated Warn is not something an operator can alert on, so
+// the condition is counted as well and the log record is rate-limited.
+//
+// It is a package counter rather than a RaftMetrics method because RaftMetrics
+// is implemented outside this package; adding a method to that interface is a
+// change to its implementor, not to the engine.
 var piggybackFailures atomic.Uint64
 
 // piggybackReportInterval bounds how often the degradation is logged. The
@@ -612,7 +873,31 @@ func notePiggybackFailure(shardID, replicaID uint64, err error) {
 		"total_failures", total, "error", err)
 }
 
-// failBatchProposals fails every pending proposal in an abandoned batch, the union of EntriesToSave and CommittedEntries deduplicated on (Index, Term).
+// failBatchProposals completes every pending proposal carried by a batch that
+// is being abandoned, so callers get an immediate error instead of blocking to
+// their context deadline.
+//
+// BOTH entry sets have to be reported, because the proposals waiting on them
+// are resolved at different stages and the abandoned batch strands both:
+//
+//   - EntriesToSave are freshly proposed entries. On a leader this is where a
+//     client's proposal FIRST appears; it is not yet committed, so it is absent
+//     from CommittedEntries. Reporting only committed entries therefore left the
+//     common case — a proposal accepted into a batch that then failed to persist
+//     — with no completion at all.
+//   - CommittedEntries are resolved on apply, which will never run for this
+//     batch.
+//
+// The node is marked permanently failed by both callers, so no later batch can
+// complete either set.
+//
+// The two sets overlap whenever a shard commits in the same round it appends (a
+// single-node shard always does), so they are unioned into ONE call rather than
+// reported separately. Callback is an exported interface: reporting the same
+// entry twice would silently require every external implementation to be
+// idempotent, which its contract does not promise. Entries are deduplicated on
+// (Index, Term), which identifies an entry uniquely within a single update.
+// The allocation is confined to this terminal path — the node is already failed.
 func failBatchProposals(callback Callback, u proto.Update, err error) {
 	if callback == nil {
 		return
@@ -646,7 +931,26 @@ func failBatchProposals(callback Callback, u proto.Update, err error) {
 	callback.OnProposalFailed(u.ShardID, all, err)
 }
 
-// failBatchSaveState handles a terminal SaveState failure: clears commitPending, marks each node permanently failed, reports SaveStateError and fails the batch's proposals.
+// failBatchSaveState handles a terminal SaveState failure (either the
+// retry budget was exhausted or shutdown fired during the retry backoff)
+// for the current batch. The batch's committed entries were already
+// extracted via GetUpdate but never persisted, so they will never reach
+// the apply worker.
+//
+// For every node in the batch it clears commitPending (so the node is not
+// stuck forever), marks the node failed, reports a SaveStateError, and
+// fails the batch's pending proposals so callers see an immediate error
+// instead of blocking until their context deadline. Finally it clears the
+// batch buffers for reuse.
+//
+// Nodes are marked as permanently failed with no automatic reset: their
+// internal Raft state has diverged from stable storage (entries were
+// extracted, advancing prevState, but never written to WAL). Allowing
+// such a node to continue would violate Raft's durability invariant — it
+// could acknowledge entries to the leader that were never persisted,
+// causing silent data loss on crash. Recovery is to unload and reload the
+// shard, reconstructing Raft state from the last consistent WAL
+// checkpoint.
 func (w *commitWorker) failBatchSaveState(saveErr error) {
 	for i, u := range w.batch {
 		w.failSaveState(w.batchNodes[i], u, saveErr)
@@ -667,11 +971,26 @@ func (w *commitWorker) failSaveState(node *Node, u proto.Update, saveErr error) 
 	// The latch is tripped before commitPending is cleared, so the step
 	// worker never steps the node again.
 	node.commitPending.Store(false)
-	// Return the pooled committed-entries slice after the callback.
+	// Return the pooled committed-entries slice after the callback (which
+	// must not retain them). clearBatch only zeroes the slot, so without
+	// this every failed batch permanently removes a slice from proto's
+	// entry-slice pool and degrades the apply hot path.
 	u.ReleaseCommittedEntries()
 }
 
-// failCommit treats a Peer.Commit failure as terminal: the node is marked failed, commitPending cleared, the error reported and the batch's proposals failed.
+// failCommit handles a terminal Peer.Commit failure for one update.
+//
+// Peer.Commit advances the raft log's processed marker (and applies committed
+// config changes) BEFORE its fallible LogReader steps (ApplySnapshot, Append).
+// Once it returns an error, entriesToApply can never re-offer this batch, so
+// the state machine is permanently missing committed entries. A shard that
+// kept running would keep acking the leader and keep serving reads from that
+// divergent state machine — a state-machine-safety violation. It is therefore
+// treated exactly like a terminal SaveState failure: the node is marked failed
+// (no automatic reset; recovery is unload/reload or snapshot recovery),
+// commitPending is cleared, the error is reported, and pending proposals for
+// the batch are failed so callers see an error instead of blocking to their
+// deadline.
 func failCommit(node *Node, callback Callback, u proto.Update, err error) {
 	commitErr := &CommitError{
 		ShardID:   u.ShardID,
@@ -691,7 +1010,21 @@ func failCommit(node *Node, callback Callback, u proto.Update, err error) {
 	u.ReleaseCommittedEntries()
 }
 
-// clearBatchCommitPending clears commitPending for the batch's nodes only and wakes their step workers; panic recovery only, on the commit worker goroutine.
+// clearBatchCommitPending releases the pipeline ownership of every node in
+// the current batch and wakes its step worker. It is called ONLY from the
+// commit worker's panic recovery, where the batch's updates die with the
+// panic and would otherwise leave their nodes wedged with commitPending set
+// forever.
+//
+// It is scoped to the batch on purpose: the batch's commitItems have
+// already been consumed from commitC and copied into w.batch, so their
+// per-shard slots are free and a fresh GetUpdate for them is correct. Nodes
+// OUTSIDE the batch either have no update in flight or have one the step
+// worker is still enqueueing, and clearing those would let the step worker
+// re-extract committed entries raft has not marked processed yet.
+//
+// Must run on the (unwinding) commit worker goroutine: nothing else owns
+// the batch buffers at that point.
 func (w *commitWorker) clearBatchCommitPending(workSignal *WorkSignal) {
 	for i := range w.batchNodes {
 		node := w.batchNodes[i]
@@ -724,16 +1057,28 @@ func (w *commitWorker) clearBatch() {
 	clear(w.orderedMsgsBuf)
 }
 
-// recoverAbnormalExit settles the batch a panic or Goexit cut short, on the unwinding worker goroutine.
+// recoverAbnormalExit settles the batch a panic or runtime.Goexit cut short,
+// before the worker is restarted. cause is the *WorkerPanicError the
+// recovery built. It runs on the unwinding worker goroutine, which owns the
+// batch.
 func (w *commitWorker) recoverAbnormalExit(cause error, workSignal *WorkSignal) {
-	// SaveState had not completed: give back the hard-state durability claim so the next GetUpdate persists it again.
+	// A batch whose SaveState had not completed: GetUpdate already claimed its
+	// hard state durable, so the claim is given back, and the next GetUpdate
+	// carries the hard state through SaveState again instead of classifying
+	// the update ReadOnly — a vote or term that never reached disk is never
+	// treated as persisted. Its entries were never marked stable and are
+	// re-derived. The shards keep running, as the batch's commitPending is
+	// cleared below.
 	if w.batchUnpersisted {
 		w.batchUnpersisted = false
 		for _, node := range w.batchNodes {
 			invalidatePersistedStateLocked(node)
 		}
 	}
-	// Peer.Commit ran but the entries never reached apply: fail the shard and its proposals (maybe-applied).
+	// An update whose Peer.Commit advanced raft's processed marker without
+	// its committed entries reaching the apply worker: they can never be
+	// re-offered, so the shard is failed and their proposals with it
+	// (maybe-applied).
 	if node := w.handoffNode; node != nil {
 		u := w.handoffUpdate
 		w.handoffNode, w.handoffUpdate = nil, proto.Update{}
@@ -742,13 +1087,41 @@ func (w *commitWorker) recoverAbnormalExit(cause error, workSignal *WorkSignal) 
 		node.commitPending.Store(false)
 		u.ReleaseCommittedEntries()
 	}
-	// Do not drain commitC (its items belong to other shards); clear commitPending only for the batch's own nodes.
+	// commitC is deliberately NOT drained here, for the same reason as the
+	// step-worker recovery: a shard has at most ONE item in flight
+	// (commitPending gates the step worker from producing a second), so no
+	// shard can have both an item in w.batch and an item in commitC. Clearing
+	// a batch node's commitPending therefore cannot hand the step worker a
+	// slot whose pointer is still queued, and the items that ARE queued
+	// belong to other shards, which the restarted worker processes normally.
+	// Draining them instead failed those unrelated healthy shards permanently.
+	//
+	// Unwedge exactly the nodes whose updates died with the batch. A blanket
+	// clear over every node this worker owns would also clear nodes the STEP
+	// worker is mid-enqueueForCommit for: that worker sets commitPending
+	// before its commitC send, so clearing it lets the very next processReady
+	// call GetUpdate again while the first update is still in flight. Raft's
+	// processed marker has not advanced yet, so the same committed entries are
+	// extracted TWICE (double Peer.Commit, double apply, double
+	// ReleaseCommittedEntries on one pooled slice), and getCommitSlot hands
+	// back the SAME *commitItem that is still queued — one pointer enqueued
+	// twice. Items in the batch have already been consumed from commitC and
+	// copied into w.batch, so clearing them is safe.
 	w.clearBatchCommitPending(workSignal)
-	// Clear the batch buffers so the restarted worker never sends this batch's ordered messages after another batch's SaveState.
+	// The exit may have unwound out of processBatch before clearBatch ran,
+	// leaving orderedMsgsBuf holding this batch's VoteResp/HeartbeatResp and
+	// batch/commitTimes holding its updates. The restarted worker would append
+	// the NEXT batch's messages to those survivors and send them after that
+	// unrelated batch's SaveState — sending a vote grant whose HardState was
+	// never persisted (Raft PhD 10.2.1). Safe to touch here: the worker
+	// goroutine is unwinding, so nothing else owns the batch.
 	w.clearBatch()
 }
 
-// invalidatePersistedStateLocked gives back GetUpdate's hard-state durability claim for node, with raftMu held.
+// invalidatePersistedStateLocked gives back the hard-state durability claim
+// GetUpdate took for node's extracted update, with node.raftMu held: the
+// commit worker reaches the Peer only under it. A node without a Peer has no
+// claim to give back.
 func invalidatePersistedStateLocked(node *Node) {
 	if node == nil || node.peer == nil {
 		return
@@ -773,7 +1146,11 @@ func (w *commitWorker) applyMembership(m shardMembership) {
 	}
 }
 
-// drainUnloadReload applies pending unload and reload requests in send order without blocking.
+// drainUnloadReload non-blocking drains all pending unload and reload
+// requests. Called at the top of each run loop iteration to process
+// requests that arrived while the worker was busy with SaveState or
+// message sending. Requests are applied in the order they were sent
+// because they share a single channel.
 func (w *commitWorker) drainUnloadReload() {
 	for {
 		select {
@@ -806,7 +1183,11 @@ func (w *commitWorker) awaitMembership(done <-chan struct{}) {
 	}
 }
 
-// requestReload readmits a shard, ordered behind any earlier requestUnload.
+// requestReload clears a shard from the unloaded set, allowing the
+// commit worker to process Peer.Commit for the shard again. It is
+// ordered behind any earlier requestUnload for the same shard because
+// both travel on the membership channel. Safe for concurrent use by the
+// Host goroutine.
 func (w *commitWorker) requestReload(shardID uint64) {
 	select {
 	case w.membershipC <- shardMembership{shardID: shardID, unload: false}:
@@ -816,7 +1197,15 @@ func (w *commitWorker) requestReload(shardID uint64) {
 
 // executePiggyback sends free messages, persists the commit index (hard state only, no entries), sends ordered responses and forwards entries to apply; false means shutdown.
 func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool {
-	// Free-order messages go now; ordered ones after the hard state is durable.
+	// Split messages: free-order may go immediately (they do not depend on
+	// commit-index durability); ordered responses go AFTER the commit index
+	// is durable. Reuse pre-allocated buffers.
+	//
+	// The ordered half is empty by construction whenever the peer still holds
+	// unsaved entries — GetPiggybackUpdate leaves those messages in r.msgs
+	// because this function fsyncs hard state only. The split is still needed
+	// for the case it does receive: ordered messages backed purely by the
+	// term/vote/commit written below.
 	w.freeOrderBuf = w.freeOrderBuf[:0]
 	w.orderedMsgSplitBuf = w.orderedMsgSplitBuf[:0]
 	if len(piggyback.Messages) > 0 {
@@ -832,16 +1221,55 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		}
 	}
 
-	// Persist the clamped commit index before applying or sending ordered responses, keeping lastApplied <= committed.
+	// Persist the advanced commit index (hard state) BEFORE applying or
+	// sending ordered responses. The entries this piggyback APPLIES are
+	// already fsynced — GetPiggybackUpdate clamps them to the peer's durable
+	// marker — but the commit-index advance was not part of any earlier
+	// SaveState. Skipping it would let a crash leave an on-disk state machine
+	// whose durable lastApplied exceeds the recovered HardState.Commit — violating lastApplied <= committed and risking
+	// re-apply. piggyback.State is that same clamped hard state, so persisting
+	// it never advertises a commit past the durable log.
 	if w.logdb != nil {
 		saveErr := w.savePiggybackState(&piggyback)
 		if saveErr != nil && w.isSealedSaveErr(saveErr) {
-			// Sealed: hold the shard until unseal, requeueing the ordered messages with the rewind.
+			// Sealed: the same self-healing settlement as below, except that
+			// the step worker would re-derive this update at once and be
+			// refused again. The shard is held until the unseal instead.
+			// The ordered half is NOT always empty here — a VoteResp backed
+			// only by this hard state reaches it — so holdSealed requeues it
+			// with the rewind, as the failure path below does.
 			w.holdSealed(node, piggyback, w.orderedMsgSplitBuf)
 			return true
 		}
 		if saveErr != nil {
-			// Self-healing, not a shard failure: release the entries, clear commitPending, requeue the ordered messages and wake the step worker; prevState stays unpersisted so the next update carries the hard state again.
+			// Terminal for this cycle, but SELF-HEALING — NOT a shard failure.
+			// The piggyback's entries were already fsynced by the batch that
+			// produced them; only this cycle's hard-state advance failed to
+			// persist. Commit has not run yet (it is below), so the processed
+			// marker has not moved and the entries are re-offered on a later
+			// cycle. Do NOT fail the shard (no handleError/OnShardFailed for a
+			// transient disk hiccup): release the un-applied entries, clear
+			// commitPending, and wake the step worker to retry. The error is
+			// typed *SaveStateError because this WAS a SaveState failure, not a
+			// Commit failure.
+			//
+			// Self-healing is a property of the RAFT STATE too, but only
+			// because of the two steps below; it was NOT free.
+			//
+			//  1. prevState is untouched — NotePiggybackPersisted runs only
+			//     after a successful save. hasStateChanged() therefore still
+			//     reports this term/vote/commit as unpersisted, so the next
+			//     update is not ReadOnly and carries the hard state back
+			//     through SaveState. Advancing prevState here (the old
+			//     behavior, done inside GetPiggybackUpdate) made a vote granted
+			//     in this window invisible, and a later ReadOnly update could
+			//     then transmit its RequestVoteResp with no WAL write at all.
+			//  2. The ordered messages this cycle drained are handed back to
+			//     the peer instead of being dropped. They were withheld
+			//     precisely because they depend on this failed write; the next
+			//     cycle that persists releases them. Dropping a ReplicateResp
+			//     only costs a retransmit, but dropping a VoteResp stalls an
+			//     election for a full timeout.
 			slog.Warn("piggyback commit-index persist failed after retries",
 				"shard", piggyback.ShardID, "replica", piggyback.ReplicaID,
 				"error", &SaveStateError{
@@ -861,7 +1289,12 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 		}
 	}
 
-	// Record the written, commit-clamped hard state as durable and advance the processed markers.
+	// Record the hard state as durable and advance the processed markers
+	// (in-memory). NotePiggybackPersisted is what GetPiggybackUpdate stopped
+	// doing: prevState may only claim a state that has actually reached stable
+	// storage, and reaching this line is the proof. It takes the Update's
+	// State — the commit-clamped one that was written — not the peer's current
+	// hard state, which the step worker may already have moved on.
 	pbCommitErr := commitPiggybackLocked(node, &piggyback)
 
 	if pbCommitErr != nil {
@@ -904,7 +1337,10 @@ func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool
 	return true
 }
 
-// savePiggybackState persists the piggyback's hard state with the batch backoff, never retrying a sealed-barrier refusal.
+// savePiggybackState persists the piggyback's hard state. It retries with the
+// same backoff schedule as the batch path — a transient fsync hiccup should
+// not give up on the first attempt — but never retries the sealed barrier's
+// refusal, which no retry can clear before the unseal.
 func (w *commitWorker) savePiggybackState(piggyback *proto.Update) error {
 	stateUpdate := []logdb.Update{{
 		ShardID:   piggyback.ShardID,
@@ -926,14 +1362,35 @@ func (w *commitWorker) savePiggybackState(piggyback *proto.Update) error {
 	return saveErr
 }
 
-// requeueMessagesLocked hands ordered messages back to the peer under raftMu, unlocked by defer.
+// requeueMessagesLocked hands ordered messages back to the peer with
+// node.raftMu held, so the requeue cannot race the step worker's Tick.
+//
+// It exists as a function so the unlock is deferred. RequeueMessages appends to
+// the peer's message buffer, and a panic there (an oversized buffer, a
+// torn-down peer) on the SaveState-failure path would strand node.raftMu at
+// precisely the worst moment: the shard is already retrying, and the restarted
+// commit worker would block on Lock() forever instead of draining the retry.
 func requeueMessagesLocked(node *Node, msgs []proto.Message) {
 	node.raftMu.Lock()
 	defer node.raftMu.Unlock()
 	node.peer.RequeueMessages(msgs)
 }
 
-// commitPiggybackLocked marks the piggyback hard state durable and commits it under raftMu as one critical section; everything after runs unlocked.
+// commitPiggybackLocked records the piggyback's hard state as durable and
+// commits it to the peer with node.raftMu held, returning Peer.Commit's error.
+//
+// The two calls belong to one critical section: NotePiggybackPersisted may only
+// claim a state that reached stable storage, and Commit advances the processed
+// markers derived from it, so the step worker must not observe the pair
+// half-applied. Everything after it in executePiggyback — the ordered message
+// send, the OnCommitted callback, the metrics update and the BLOCKING applyC
+// forward — runs with the lock released, exactly as the explicit unlock left
+// it: the applyC send can block until the apply worker drains, and raftMu held
+// across it would stall the step worker's Tick and the leader heartbeats it
+// drives for every shard this worker owns.
+//
+// The piggyback is taken by pointer to avoid copying a proto.Update on the
+// commit hot path; it is neither retained nor mutated here.
 func commitPiggybackLocked(node *Node, piggyback *proto.Update) error {
 	node.raftMu.Lock()
 	defer node.raftMu.Unlock()

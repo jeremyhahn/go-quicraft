@@ -250,7 +250,12 @@ func TestDiskCeiling_RefusesProposalsFiresOnceAndKeepsAcknowledgedEntries(t *tes
 	}
 }
 
-// TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth pins that proposals racing recovery cannot leave the host refusing.
+// TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth pins that once the
+// proposal gate has tripped and usage drops, proposals racing the recovery
+// cannot leave the Host refusing: a refusal sampled before the recovery must
+// not be republished after it. Each round trips the gate, starts concurrent
+// proposalDiskFull callers, drops usage while they run, and checks that the
+// Host then admits proposals and HealthCheck reports DiskOK true.
 func TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth(t *testing.T) {
 	const (
 		maxBytes = uint64(1000)

@@ -278,7 +278,15 @@ func warmupPropose(ctx context.Context, h *quicraft.Host, shardID uint64, cmd []
 // and runs in addition, inside the commit-latency scenarios.
 const setupWarmupProposals = 10
 
-// verifyClusterReady warms up the benchmark shard (quicraftShardID) with setupWarmupProposals proposals and one linearizable read on the shared retry budget, leaving nothing in flight.
+// verifyClusterReady runs the setup warmup on the benchmark shard
+// (quicraftShardID) of a freshly elected group of any
+// size (a single-node group included): setupWarmupProposals proposals, then
+// one linearizable read, each on the shared warmup retry budget. It
+// establishes the peer QUIC connections and primes the propose and ReadIndex
+// paths so the first timed operation pays no one-time initialization. Both
+// calls return only once their own operation has completed (applied, or the
+// read index confirmed and reached), so nothing is left in flight that would
+// need a settle delay before the timer starts.
 func verifyClusterReady(b *testing.B, hosts []*quicraft.Host, leaderIdx int) {
 	b.Helper()
 

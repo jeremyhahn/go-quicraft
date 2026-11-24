@@ -60,7 +60,14 @@ func epochFiveBarrier(t *testing.T) (*Barrier, *SoftwareStrategy, []*SealedRootK
 	return b, s, blobs
 }
 
-// TestSealedStateMAC_RejectsEpochRewrite: a persisted blob whose plaintext epoch metadata is rewritten to an earlier epoch fails the StateMAC and cannot be used.
+// TestSealedStateMAC_RejectsEpochRewrite pins the epoch-rewrite rejection: a
+// barrier live at epoch 5 with KnownEpochs [1..5] has its persisted blob
+// rewritten to Epoch 2 / KnownEpochs [1,2] — touching nothing the root-key AEAD
+// covers, since its AAD is the constant strategy name. Were the doctored blob
+// to load and unseal cleanly, the barrier would resume encrypting under epoch 2's
+// already-spent DEK with a counter freshly seeded from zero and a nonce tracker
+// with no memory of the first lifetime's nonces — two independent random-nonce
+// sequences under one key, which is precisely what the invocation cap bounds.
 func TestSealedStateMAC_RejectsEpochRewrite(t *testing.T) {
 	b, s, _ := epochFiveBarrier(t)
 	genuine := b.SealedRootKeyData()
@@ -68,7 +75,8 @@ func TestSealedStateMAC_RejectsEpochRewrite(t *testing.T) {
 		t.Fatal("Rotate must stamp a metadata MAC into the persisted blob")
 	}
 
-	// The forgery rewrites only plaintext metadata; Ciphertext and StateMAC are unchanged.
+	// The forgery: rewrite ONLY plaintext metadata, leave Ciphertext and
+	// StateMAC byte-identical.
 	forged := cloneSealedRootKey(genuine)
 	forged.Epoch = 2
 	forged.KnownEpochs = []uint64{1, 2}
@@ -88,7 +96,8 @@ func TestSealedStateMAC_RejectsEpochRewrite(t *testing.T) {
 	if !errors.Is(err, ErrSealedStateUnauthenticated) {
 		t.Fatalf("Unseal(forged epoch rewrite) = %v, want ErrSealedStateUnauthenticated", err)
 	}
-	// The barrier must not be usable at the rolled-back epoch.
+	// Assert the ACTUAL consequence the probe measured, not just the error: the
+	// barrier must not be usable at the rolled-back epoch.
 	if !b2.IsSealed() {
 		t.Fatal("barrier must remain sealed after a failed metadata authentication")
 	}
@@ -198,7 +207,13 @@ func TestSealedStateMAC_AbsentTagFailsClosed(t *testing.T) {
 	}
 }
 
-// TestSealedEpochRollback_ReplayFloor: replaying an older authenticated blob is rejected only by the embedder's MinEpoch floor.
+// TestSealedEpochRollback_ReplayFloor covers what a MAC provably cannot: the
+// replay of an OLDER, genuinely authenticated blob. The attacker keeps the
+// epoch-2 state the barrier itself persisted and restores it over epoch 5; its
+// MAC verifies, because the barrier really did write it. Only a floor the
+// embedder derives from state the attacker would have to roll back in the same
+// step — the highest epoch a live WAL segment or retained snapshot still
+// references — can reject it.
 func TestSealedEpochRollback_ReplayFloor(t *testing.T) {
 	b, s, blobs := epochFiveBarrier(t)
 	current := b.SealedRootKeyData()
@@ -247,7 +262,16 @@ func TestSealedEpochRollback_ReplayFloor(t *testing.T) {
 
 // --- NonceTracking's zero value must not disable detection ---
 
-// TestNonceTracking_ZeroValueDefaultsOn: a hand-built BarrierConfig gets a nonce tracker by default, and it rejects a repeat.
+// TestNonceTracking_ZeroValueDefaultsOn pins that the hand-built config an
+// embedder writes when it pins Algorithm and DeploymentID explicitly —
+// seal.NewBarrier(seal.BarrierConfig{Algorithm: ..., DeploymentID: 7}) —
+// produces a barrier WITH a nonce tracker. Were the field a plain bool
+// documented as "Default: true", that config would pass Validate and produce a
+// barrier with nonceTracker == nil, since only DefaultBarrierConfig writes
+// true.
+//
+// It asserts the ACTUAL tracker, not a proxy for it, and then that the tracker
+// actually rejects a repeat.
 func TestNonceTracking_ZeroValueDefaultsOn(t *testing.T) {
 	b, err := NewBarrier(BarrierConfig{Algorithm: AlgAES256GCM, DeploymentID: 7})
 	if err != nil {
@@ -288,7 +312,15 @@ func TestNonceTracking_ZeroValueDefaultsOn(t *testing.T) {
 	}
 }
 
-// TestNonceTracking_CeilingIsDocumentedAndAdjustable: past the ceiling the tracker stops admitting nonces but still checks those it holds; SetMaxTrackedNonces adjusts it.
+// TestNonceTracking_CeilingIsDocumentedAndAdjustable pins the second half of
+// the nonce-tracking contract: detection is NOT unconditional for the life of
+// the epoch. Past the ceiling the tracker saturates — it admits nothing
+// further — and the only lever is SetMaxTrackedNonces.
+//
+// Saturation semantics: the tracker does not clear its enabled flag at the
+// ceiling, because that would conflate an operator's switch with
+// a memory bound and make a saturated tracker report "off, zero tracked". What
+// it stops is ADMISSION; the nonces it already holds stay checked.
 func TestNonceTracking_CeilingIsDocumentedAndAdjustable(t *testing.T) {
 	nt := NewNonceTracker(true)
 	if got := nt.MaxTrackedNonces(); got != DefaultMaxTrackedNonces {
@@ -306,7 +338,8 @@ func TestNonceTracking_CeilingIsDocumentedAndAdjustable(t *testing.T) {
 	if got := nt.Count(); got != 2 {
 		t.Fatalf("tracked count = %d past the ceiling, want it pinned at 2", got)
 	}
-	// A nonce beyond the covered prefix is not recorded, so its repeat is not detected.
+	// The documented consequence: a nonce OUTSIDE the covered prefix is no
+	// longer recorded, so its later repeat cannot be detected.
 	uncovered := []byte{9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 	if err := nt.CheckAndRecordNonce(uncovered); err != nil {
 		t.Fatalf("post-ceiling CheckAndRecordNonce = %v, want nil (outside the covered prefix)", err)
@@ -330,7 +363,10 @@ func TestNonceTracking_CeilingIsDocumentedAndAdjustable(t *testing.T) {
 
 // --- The context-AAD capability must be measured, not declared ---
 
-// lyingAADEncryptor implements AADSymmetricEncrypter but ignores the aad, which a type assertion cannot detect.
+// lyingAADEncryptor implements AADSymmetricEncrypter and IGNORES the aad,
+// exactly what that interface's doc comment begs implementers not to do — and
+// exactly what a structural type assertion cannot detect, because its method
+// set is identical to an honest implementation's.
 type lyingAADEncryptor struct{ aead cipher.AEAD }
 
 func newLyingAADEncryptor(t *testing.T) *lyingAADEncryptor {
@@ -408,7 +444,14 @@ func (e *honestAADEncryptor) DecryptWithAAD(ciphertext, aad []byte) ([]byte, err
 	return e.aead.Open(nil, ciphertext[:n], ciphertext[n:], aad)
 }
 
-// TestContextBinding_ProbeCatchesLyingEncryptor: context binding is established by a behavioural probe, so an encryptor that drops the aad is not ContextBindingDelegated.
+// TestContextBinding_ProbeCatchesLyingEncryptor pins that context binding is
+// established by a behavioural probe, not a Go METHOD SET. Were a method set
+// enough, an encryptor that accepted the aad and dropped it would report
+// ContextBindingDelegated, callers would stop suppressing their positional
+// context, and RequireContextAAD — which is documented as refusing a
+// misconfigured deployment "before it writes a single unbound byte" — would
+// pass at startup. The implementations live in another
+// repository, so the interface's warning comment was the entire enforcement.
 func TestContextBinding_ProbeCatchesLyingEncryptor(t *testing.T) {
 	ctx := context.Background()
 
@@ -495,7 +538,11 @@ func TestVerifyAADBinding_Stages(t *testing.T) {
 
 // --- FIPS mode must constrain the KDF, and must be requestable ---
 
-// TestFIPS_ConstrainsKDF: FIPS mode selects PBKDF2-SHA256 over Argon2id and constrains the data-path cipher.
+// TestFIPS_ConstrainsKDF pins that FIPS mode constrains BOTH the KDF
+// (PBKDF2-SHA256 instead of Argon2id) and the data-path cipher, as fips.go
+// states. If DeriveKey ignored FIPS, or NewSoftwareStrategyWithParams hardcoded
+// Argon2id, a FIPS-140 deployment would wrap its root key under a non-approved
+// KDF with no error and no warning.
 func TestFIPS_ConstrainsKDF(t *testing.T) {
 	salt := make([]byte, 32)
 	pass := []byte("a-passphrase-for-the-kdf")
@@ -560,7 +607,14 @@ func TestRequireFIPS_FailsClosedWhenUnavailable(t *testing.T) {
 
 // --- What positional binding does and does not deliver ---
 
-// TestContextAAD_ResistsReorderAndSpliceButNotTruncation characterizes positional AAD: reorder and splice are caught, truncation is not; the frame owner must bind the frame count.
+// TestContextAAD_ResistsReorderAndSpliceButNotTruncation is a CHARACTERIZATION
+// test. The positional AAD prevents an at-rest attacker from reordering or
+// splicing same-epoch frames, but not from TRUNCATING them, and nothing in this
+// package can make it, because nothing in the AAD names the number of frames
+// or the total length. Truncation resistance is a design the frame owner must
+// implement — and this test is what keeps EncryptWithContext's doc comment
+// honest: it asserts each half, including the negative one, so a future reader
+// can see the gap rather than infer protection from a sentence.
 func TestContextAAD_ResistsReorderAndSpliceButNotTruncation(t *testing.T) {
 	b, _ := testInitializedBarrier(t)
 
@@ -578,11 +632,11 @@ func TestContextAAD_ResistsReorderAndSpliceButNotTruncation(t *testing.T) {
 		artifact[i] = ct
 	}
 
-	// Reorder is caught: frame 2 does not open at position 1.
+	// REORDER is caught: frame 2 does not open at position 1.
 	if _, err := b.DecryptWithContext(nil, artifact[2], frameAAD(7, 1)); !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("reordered frame = %v, want ErrDecryptionFailed", err)
 	}
-	// Splice from another artifact is caught.
+	// SPLICE from another artifact is caught.
 	foreign, err := b.EncryptWithContext(nil, []byte("x"), frameAAD(9, 1))
 	if err != nil {
 		t.Fatalf("EncryptWithContext(foreign): %v", err)
@@ -591,7 +645,10 @@ func TestContextAAD_ResistsReorderAndSpliceButNotTruncation(t *testing.T) {
 		t.Fatalf("spliced frame = %v, want ErrDecryptionFailed", err)
 	}
 
-	// Truncation is not caught: every surviving frame still authenticates at its position.
+	// TRUNCATION is NOT caught. Drop the tail and every surviving frame still
+	// authenticates perfectly at its own position; a reader that stops at EOF
+	// sees a complete, shorter artifact. The doc comment makes no claim of
+	// truncation resistance.
 	truncated := artifact[:2]
 	for i, ct := range truncated {
 		got, err := b.DecryptWithContext(nil, ct, frameAAD(7, i))
@@ -618,7 +675,25 @@ func TestContextAAD_ResistsReorderAndSpliceButNotTruncation(t *testing.T) {
 
 // --- The single-writer contract on persisted barrier state ---
 
-// TestTwoLiveBarriersOverOneBlobGoStale: two live barriers over one persisted state are unsupported; after either rotates the other fails with ErrDecryptionFailed. Use one barrier per blob, reloaded after other writers.
+// TestTwoLiveBarriersOverOneBlobGoStale states, as an executable contract, that
+// a second live Barrier over the SAME persisted state is not a supported
+// configuration: once either one rotates, the other holds an epoch set that no
+// longer covers the data being written, and its reads fail with the generic
+// ErrDecryptionFailed.
+//
+// This is not new with the restart-rotation, and the test proves it by rotating
+// EXPLICITLY: it fails identically on a barrier that never restarts. What
+// changed is only how easy the condition is to reach — restoring persisted
+// state now rotates, so any holder of a pre-restore barrier object goes stale
+// immediately rather than at the embedder's next scheduled rotation.
+//
+// The correct pattern is one barrier per process over one blob, re-loaded from
+// that blob after any other process may have written it. Deriving an unknown
+// epoch's DEK on demand would paper over this and must not be done: the epoch
+// in a ciphertext header is unauthenticated, so on-demand derivation is an
+// unbounded HKDF/AEAD/mlock amplifier driven by attacker bytes, and it would
+// silently undo PurgeEpochsBefore's capability revocation by making every
+// purged epoch decryptable again.
 func TestTwoLiveBarriersOverOneBlobGoStale(t *testing.T) {
 	cfg := testBarrierConfig(1)
 	first := MustNewBarrier(cfg)

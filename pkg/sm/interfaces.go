@@ -19,15 +19,54 @@ import (
 	"io"
 )
 
-// StateMachine is the in-memory state machine interface; calls are serialized, and Update MUST be deterministic, since Raft cannot detect divergence (see Hasher).
+// StateMachine is the basic in-memory state machine interface. All state
+// fits in memory and snapshots serialize the full state. QuicRaft serializes
+// all method calls -- Update and Lookup are never called concurrently.
+//
+// All methods accept context.Context for cancellation propagation, deadline
+// enforcement, and distributed tracing.
+//
+// # Determinism (mandatory)
+//
+// Update MUST be a pure function of (current state, entries). Every replica
+// applies the identical entry sequence and MUST reach byte-identical state.
+// In particular Update MUST NOT read wall-clock time, math/rand, environment
+// variables, host identity, GOMAXPROCS or any other per-node value, and MUST
+// NOT let Go's randomized map-iteration order affect the state it produces or
+// the Results it returns.
+//
+// A violation is NOT detected by Raft. Consensus continues to agree on the
+// log while replicas silently diverge in the state they derive from it, and
+// the first symptom is usually a linearizable read returning different values
+// depending on which replica served it. Implement Hasher and compare replicas
+// (Host.StateMachineHash) if you need to detect it.
+//
+// The same requirement applies to ConcurrentStateMachine and DiskStateMachine.
 type StateMachine interface {
-	// Update applies committed entries all-or-nothing, writing results[i] for each entries[i]; it returns an error only for fatal failures.
+	// Update applies committed entries to the state machine. The results
+	// slice is pre-allocated by QuicRaft with len(results) == len(entries).
+	// The state machine MUST write results[i] for each entries[i].
+	//
+	// Update MUST be all-or-nothing: either all entries are applied and all
+	// results written, or the state machine reverts to its pre-call state
+	// and returns an error. Partial application is not supported.
+	//
+	// Returns error only for fatal, non-recoverable failures.
 	Update(ctx context.Context, entries []Entry, results []Result) error
 
-	// Lookup reads state locally without Raft, serialized with Update; pointer queries avoid boxing allocations.
+	// Lookup reads state without going through Raft (local read).
+	// For StateMachine, Lookup is serialized with Update by QuicRaft.
+	//
+	// Performance note: use pointer types as queries to avoid heap
+	// allocation from interface boxing on hot paths.
 	Lookup(ctx context.Context, query interface{}) (interface{}, error)
 
-	// SaveSnapshot writes the full state to w; ignoring stopper delays StopShard and Host.Close.
+	// SaveSnapshot writes the entire state machine state to the writer.
+	// The stopper channel signals cancellation; the implementation should
+	// periodically check it and return early if closed. Stopping the shard
+	// cannot close the state machine while a save is still streaming, so an
+	// implementation that ignores the stopper delays StopShard and Host.Close
+	// for as long as it runs.
 	SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
 
 	// RecoverFromSnapshot restores the state machine state from the reader,
@@ -38,7 +77,14 @@ type StateMachine interface {
 	Close(ctx context.Context) error
 }
 
-// ConcurrentStateMachine allows Lookup during Update, with its own synchronization; PrepareSnapshot captures the state SaveSnapshot writes.
+// ConcurrentStateMachine is for state machines that support concurrent
+// read access during writes. Lookup may be called from any goroutine
+// while Update runs on the apply worker. The state machine is responsible
+// for its own internal synchronization (e.g., sync.RWMutex, COW snapshots).
+//
+// PrepareSnapshot captures a point-in-time snapshot context that is later
+// passed to SaveSnapshot. This two-phase approach allows the snapshot to
+// proceed without blocking Update.
 type ConcurrentStateMachine interface {
 	// Update applies committed entries (all-or-nothing semantics).
 	// Must be safe to call concurrently with Lookup.
@@ -49,10 +95,17 @@ type ConcurrentStateMachine interface {
 	// The state machine must handle its own synchronization.
 	Lookup(ctx context.Context, query interface{}) (interface{}, error)
 
-	// PrepareSnapshot returns a point-in-time context for SaveSnapshot, called on the apply worker while Update is paused.
+	// PrepareSnapshot returns an opaque context capturing a point-in-time
+	// view of the state machine for snapshot purposes. The returned value
+	// is passed to SaveSnapshot. This method is called on the apply worker
+	// goroutine while Update is paused.
 	PrepareSnapshot() (interface{}, error)
 
-	// SaveSnapshot writes the state PrepareSnapshot captured; ignoring stopper delays StopShard and Host.Close.
+	// SaveSnapshot writes the state captured by PrepareSnapshot to the writer.
+	// The snapshotCtx parameter is the value returned by PrepareSnapshot.
+	// The stopper channel signals cancellation; as for the regular form, an
+	// implementation that ignores it delays StopShard and Host.Close for as
+	// long as it runs.
 	SaveSnapshot(ctx context.Context, snapshotCtx interface{}, w io.Writer, stopper <-chan struct{}) error
 
 	// RecoverFromSnapshot restores state from the reader, replacing all
@@ -63,9 +116,35 @@ type ConcurrentStateMachine interface {
 	Close(ctx context.Context) error
 }
 
-// DiskStateMachine manages its own persistent storage and must apply idempotently; its shards support no client sessions (ErrSessionsUnsupportedOnDisk).
+// DiskStateMachine is for state machines backed by their own persistent
+// storage (e.g., PebbleDB, SQLite). Snapshots transfer the database files.
+// The state machine manages its own persistence; QuicRaft manages consensus.
+//
+// On-disk state machines may receive entries that were already applied before
+// a crash. The implementation MUST handle this idempotently.
+//
+// # Client sessions are not available
+//
+// A shard backed by a DiskStateMachine supports no client sessions. Every
+// session-managed entry point on the host — NewSession,
+// NewSessionWithOwner, RegisterSession, ProposeWithSession,
+// SyncProposeWithSession, CloseSession — refuses the shard with
+// ErrSessionsUnsupportedOnDisk, and idempotent operations proposed without a
+// session (Propose, SyncPropose) are the supported substitute.
+//
+// The reason is Open. The session table is replicated state that travels only
+// inside the snapshot stream, so it is restored by RecoverFromSnapshot — and a
+// DiskStateMachine that reports a non-zero applied index from Open never takes
+// that path on restart, because recovering would replace its database files and
+// roll it back to the snapshot index. The replica would come up with the right
+// data and no sessions at all, then answer ResultSessionExpired for entries its
+// peers apply normally: a permanent, silent divergence. The same constraint
+// applies to dragonboat's IOnDiskStateMachine.
 type DiskStateMachine interface {
-	// Open initializes the state machine in initialDir and returns the last applied index, 0 for a fresh start.
+	// Open initializes the state machine and returns the last applied index.
+	// If this is a fresh start, returns 0. The initialDir is the working
+	// directory assigned by QuicRaft for persistent storage. The stopper
+	// channel signals cancellation.
 	Open(ctx context.Context, initialDir string, stopper <-chan struct{}) (uint64, error)
 
 	// Update applies committed entries (all-or-nothing semantics).
@@ -98,7 +177,16 @@ type DiskStateMachine interface {
 	Close(ctx context.Context) error
 }
 
-// Hasher computes an order-independent hash of whole-batch state; concurrent and on-disk implementations must synchronize GetHash with Update.
+// Hasher computes a deterministic hash of state machine state for
+// cross-replica consistency verification. Detected via type assertion.
+//
+// The hash must be order-independent, and it must cover WHOLE batches. On a
+// StateMachine, QuicRaft never calls GetHash concurrently with Update. On a
+// ConcurrentStateMachine or DiskStateMachine it may, exactly as Lookup may,
+// so GetHash must synchronize with Update and hash the state either before or
+// after a batch, never part-way through one. A hash of a half-applied batch
+// reports a divergence between replicas that does not exist. kv.ConcurrentStore
+// does this by holding every bucket lock across both Update and GetHash.
 type Hasher interface {
 	// GetHash returns a hash of the state machine's current state.
 	GetHash() (uint64, error)
@@ -112,7 +200,14 @@ type NALookup interface {
 	BytesLookup(key []byte) ([]byte, error)
 }
 
-// NALookupInto is NALookup into a caller buffer: copy into dst, return the sub-slice, retain nothing.
+// NALookupInto is an optional extension to NALookup that allows the caller
+// to provide a destination buffer. The implementation MUST copy the value
+// into dst (growing it via append if necessary) and return the populated
+// sub-slice. Ownership of the returned slice belongs to the caller; the
+// implementation MUST NOT retain a reference to it after returning.
+//
+// When implemented alongside NALookup, the RSM adapter prefers this method
+// on the pooled read path to eliminate per-call heap allocation.
 type NALookupInto interface {
 	NALookup
 	// BytesLookupInto copies the value stored under key into dst and

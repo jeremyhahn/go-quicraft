@@ -70,7 +70,20 @@ func (h *gatedHandler) received() []uint64 {
 	return append([]uint64(nil), h.terms...)
 }
 
-// TestEvictStaleOutboundOnRecv_LiveOutboundDrainsWrittenVote: an evicted live outbound leaves the pool at once but still delivers what was written to it.
+// TestEvictStaleOutboundOnRecv_LiveOutboundDrainsWrittenVote pins #309: an
+// epoch-driven eviction must not destroy messages already written to a
+// LIVE outbound.
+//
+// A restarted candidate dials a peer it has never heard from, so the outbound
+// is stamped with epoch 0, and writes a RequestVote on it. The peer's reply
+// (on the peer's own connection, carrying its epoch) then reaches the
+// candidate before the vote request has been read on the far side. The stamp
+// cannot be attributed to that epoch, so the outbound is evicted; closing it
+// on the spot discarded the vote request, and a candidate does not resend a
+// vote request within a term, so each loss cost a whole election term.
+//
+// The eviction must take the outbound out of the pool at once (no new traffic
+// may use it) and still deliver what was already written to it.
 func TestEvictStaleOutboundOnRecv_LiveOutboundDrainsWrittenVote(t *testing.T) {
 	h2 := newGatedHandler()
 	t1, t2, cleanup := transportPairWith(t, 42, newTestHandler(), h2)

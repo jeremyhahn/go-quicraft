@@ -19,7 +19,15 @@ import (
 	"testing"
 )
 
-// TestSnapshotChunkRejectsChunkSizeMismatch: a ChunkSize header that disagrees with the payload is rejected.
+// TestSnapshotChunkRejectsChunkSizeMismatch pins the only thing stopping a
+// peer from advertising a ChunkSize header that disagrees with the payload it
+// actually sent.
+//
+// The guard had NO test anywhere in the repository — neutering it left the
+// whole package suite green — while the decoder's own comment states that
+// consumers must not trust the header for allocation or offset math. Twenty of
+// the twenty-five mutations run against this package were killed, which is why
+// this one stood out.
 func TestSnapshotChunkRejectsChunkSizeMismatch(t *testing.T) {
 	sc := SnapshotChunk{BinVer: WireVersion, ChunkSize: 4, Data: []byte("data")}
 	buf := make([]byte, sc.Size())

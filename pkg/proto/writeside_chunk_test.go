@@ -20,7 +20,15 @@ import (
 	"testing"
 )
 
-// TestSnapshotChunkMarshalMirrorsItsOwnReadBounds: SnapshotChunk refuses on marshal what its decoder rejects.
+// TestSnapshotChunkMarshalMirrorsItsOwnReadBounds pins the write/read symmetry
+// every other type in this package already had.
+//
+// SnapshotChunk was the one encoder that could emit frames its own decoder
+// rejects: an overlong Filepath, oversized Data, or a ChunkSize disagreeing
+// with len(Data) all marshalled cleanly and failed on unmarshal. A producer
+// whose values drift out of bounds then emits chunks every peer rejects, and
+// at the sender a rejection is indistinguishable from a broken connection —
+// the exact failure the other seven types were changed to prevent.
 func TestSnapshotChunkMarshalMirrorsItsOwnReadBounds(t *testing.T) {
 	cases := []struct {
 		name string

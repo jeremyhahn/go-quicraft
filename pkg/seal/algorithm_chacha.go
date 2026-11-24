@@ -14,14 +14,23 @@
 
 //go:build !fips
 
-// The ChaCha20-Poly1305 family is not FIPS-approved, so this file and its dependency are excluded under -tags fips.
+// The ChaCha20-Poly1305 family is not FIPS-approved, so this file — and with it
+// the golang.org/x/crypto/chacha20poly1305 dependency — is excluded from a
+// binary built with -tags fips. Nothing about that exclusion is advisory: the
+// algorithms are absent from algorithmRegistry, which is the only place a
+// SymmetricAlgorithm becomes an executable cipher, so a FIPS build CANNOT
+// perform ChaCha20-Poly1305 rather than merely declining to. That is the whole
+// point of the tag over a runtime check — a runtime check leaves the primitive
+// in the shipped artefact and asks an auditor to trust a branch.
 
 package seal
 
 import "golang.org/x/crypto/chacha20poly1305"
 
 const (
-	// maxPlaintextChaCha is x/crypto's ~256 GiB plaintext limit for both nonce sizes.
+	// maxPlaintextChaCha is the ChaCha20-Poly1305 ceiling used by x/crypto for
+	// BOTH the 12-byte-nonce and the extended-nonce (X) construction, ~256 GiB.
+	// x/crypto panics with "chacha20poly1305: plaintext too large" beyond it.
 	maxPlaintextChaCha uint64 = (1 << 38) - 64
 )
 

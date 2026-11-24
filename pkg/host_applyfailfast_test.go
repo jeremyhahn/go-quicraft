@@ -34,7 +34,22 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// The apply path is fail-fast: a refused committed entry is offered once, then the shard latches failed; the attempt count makes the test non-vacuous.
+// ---------------------------------------------------------------------------
+// The apply path is unconditionally FAIL-FAST
+//
+// A state machine that refuses a committed entry gets ONE chance at it. The
+// shard latches failed on that first refusal and goes offline until it is
+// reloaded or recovered from a snapshot; lastApplied is not advanced. That is
+// forced by Raft's state-machine safety property, not a tuning choice: a
+// deterministic apply failure cannot be made to succeed by retrying, and
+// advancing lastApplied past a batch this replica skipped would diverge it from
+// its peers.
+//
+// The attempt COUNT below is what makes this test non-vacuous. Nothing about
+// the engine's current shape is asserted second-hand — the state machine itself
+// records every offer of the poisoned entry, so a retry loop introduced later
+// drives the count above one and fails here on a number.
+// ---------------------------------------------------------------------------
 
 // errPoisonedApply is the failure a poisonApplySM reports for the one command
 // the test feeds it.
@@ -45,7 +60,12 @@ var errPoisonedApply = errors.New("quicraft_test: poisoned apply")
 // normally and only the test's own proposal trips the latch.
 var poisonCmd = []byte("poison-this-apply")
 
-// poisonApplySM fails Update for one command and counts how often that command is offered.
+// poisonApplySM fails Update for exactly one command and counts how many times
+// that command is offered to it.
+//
+// The count is the whole assertion. A fail-fast apply path offers the poisoned
+// entry ONCE; a retrying apply path re-offers the same entry, so the count rises
+// and the test fails on a number rather than passing quietly.
 type poisonApplySM struct {
 	// panicOnPoison selects HOW the state machine refuses the entry: false
 	// returns errPoisonedApply, true panics. The engine builds a different
@@ -66,7 +86,10 @@ func (p *poisonApplySM) Update(_ context.Context, entries []sm.Entry, results []
 	for i := range entries {
 		if bytes.Equal(entries[i].Cmd, poisonCmd) {
 			p.poisonApplies.Add(1)
-			// Park the poison apply so a test can hold a read pending across the halt.
+			// A test that needs a read PENDING ACROSS the halt parks the
+			// poison apply here: the entry is committed (so a later read
+			// index lands past it) but not yet failed, and the read waits
+			// on lastApplied, which this entry will never advance.
 			if p.holdPoison != nil {
 				if p.poisonHeld != nil {
 					close(p.poisonHeld)
@@ -101,7 +124,20 @@ func (p *poisonApplySM) Close(_ context.Context) error { return nil }
 
 var _ sm.StateMachine = (*poisonApplySM)(nil)
 
-// TestApplyFailureFailsTheShardWithoutRetrying pins one offer of the poisoned entry, a failed proposal and a latched shard.
+// TestApplyFailureFailsTheShardWithoutRetrying pins the fail-fast apply policy:
+// the poisoned entry is offered to the state machine exactly once, the proposal
+// that carried it fails, and the shard latches.
+//
+// Each assertion closes a way the others could pass for the wrong reason:
+//
+//   - "exactly one offer" is the property under test. Zero offers would also
+//     satisfy "no retries", so the proposal is required to FAIL — a proposal
+//     that succeeded, or one still in flight at its deadline, means the entry
+//     never reached apply and the count of 0 says nothing.
+//   - one offer is also what a retry that has not run its second attempt YET
+//     looks like, so OnShardFailed is required to fire. The latch is terminal:
+//     once it is set the shard is offline, which is only reachable if the single
+//     attempt was the last one.
 func TestApplyFailureFailsTheShardWithoutRetrying(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -209,7 +245,19 @@ func TestApplyFailureFailsTheShardWithoutRetrying(t *testing.T) {
 	}
 }
 
-// TestProposalsAfterTheLatchAreRefusedImmediately pins that a latched shard refuses proposals quickly without applying them.
+// TestProposalsAfterTheLatchAreRefusedImmediately pins the propose-time gate.
+//
+// The latch is terminal, and the step worker skips a failed node from then on.
+// Without a gate the proposal is still accepted, registered in the pending map
+// and delivered to an inbox nothing drains, so it is answered only when the
+// sweeper reclaims it at its deadline: every call after the failure blocks for
+// its full timeout and presents as a slow shard rather than a dead one.
+//
+// Two things make this non-vacuous. The deadline is generous relative to the
+// assertion — the call must return in a small fraction of it, so a regression
+// that reinstates the wait fails on elapsed time rather than passing slowly.
+// And the state machine's counter must not move, which distinguishes "refused
+// before proposing" from "proposed, applied, and refused again".
 func TestProposalsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 	cfg := testHostConfig(t)
 	failed := make(chan config.ShardFailedInfo, 4)
@@ -287,7 +335,23 @@ func TestProposalsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 	}
 }
 
-// Reads against a latched shard fail fast; the tests assert latency as well as the error.
+// ---------------------------------------------------------------------------
+// Reads against a latched shard fail fast too
+// ---------------------------------------------------------------------------
+//
+// The read path needs the same gate as the propose path above. A linearizable
+// read completes only when lastApplied reaches its read index, and a halted
+// shard never applies again — so without the gate a SyncRead against a latched
+// shard would be accepted, confirmed by a leader that is still perfectly
+// healthy, and then wait for an apply that cannot come, returning at the
+// caller's deadline with ErrTimeout (5m6s under the default). That message
+// points at consensus, the network or a lost leader; the cause is an Apply
+// that failed earlier, on a healthy key, on the same replica.
+//
+// Both tests assert on LATENCY and not only on the error, for the reason the
+// issue gives: a message-only assertion passes against the old behaviour right
+// up until the deadline expires. The budget-fraction bound is what fails
+// decisively if the read goes back to waiting out its deadline.
 
 // latchTheShard trips the failure latch on shard 1 through a poisoned
 // proposal and waits for the host to report it. Shared by the two read tests.
@@ -305,7 +369,13 @@ func latchTheShard(t *testing.T, h *Host, failed <-chan config.ShardFailedInfo) 
 	}
 }
 
-// parkPoison arms the park and returns its release, also registered with t.Cleanup so a failed test cannot hang Close.
+// parkPoison arms the state machine to park on the poison entry and returns
+// the release. The release is ALSO registered with t.Cleanup, because a test
+// that fails an assertion while the apply is parked has left a goroutine
+// blocked on holdPoison inside SM.Update -- and h.Close in the host's own
+// cleanup then waits on that apply forever, turning an ordinary test failure
+// into a hang until the suite timeout. The Once makes
+// the explicit release and the cleanup release safe together.
 func parkPoison(t *testing.T, m *poisonApplySM) (release func()) {
 	t.Helper()
 	m.holdPoison = make(chan struct{})
@@ -346,7 +416,9 @@ func newLatchableHost(t *testing.T) (*Host, *poisonApplySM, chan config.ShardFai
 	return h, machine, failed
 }
 
-// TestReadsAfterTheLatchAreRefusedImmediately covers a read arriving after the halt.
+// TestReadsAfterTheLatchAreRefusedImmediately covers a read that ARRIVES
+// after the halt: the gate in ReadIndex refuses it before anything is
+// registered, so it returns in microseconds naming the cause.
 func TestReadsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 	h, _, failed := newLatchableHost(t)
 
@@ -386,7 +458,20 @@ func TestReadsAfterTheLatchAreRefusedImmediately(t *testing.T) {
 	}
 }
 
-// TestPendingReadsAreFailedWhenTheLatchTrips covers a read already registered when the halt happens; the apply is parked to hold it pending.
+// TestPendingReadsAreFailedWhenTheLatchTrips covers the other half: a read
+// that is already INSIDE — registered and confirmed — when the halt happens.
+// The ReadIndex gate cannot help it. OnShardFailed has to find it in
+// pendingReads and complete it, or it waits for its deadline exactly as
+// before.
+//
+// Getting a read genuinely pending across the halt needs the apply to be held
+// open: on a single replica the poison entry commits and fails in well under a
+// millisecond, and a read issued alongside it simply races it — confirmed
+// before the poison committed, its read index already applied, returning nil
+// and proving nothing. So the state machine parks on the poison entry, the
+// test issues its read once the park is confirmed (the entry is committed, so
+// the read index lands past it and cannot be satisfied), and only then
+// releases the apply to fail.
 func TestPendingReadsAreFailedWhenTheLatchTrips(t *testing.T) {
 	h, machine, failed := newLatchableHost(t)
 	releasePoison := parkPoison(t, machine)
@@ -467,7 +552,20 @@ func TestPendingReadsAreFailedWhenTheLatchTrips(t *testing.T) {
 	}
 }
 
-// TestReadsRacingTheLatchNeverTimeOut requires every read racing the latch to return ErrShardFailed within its budget.
+// TestReadsRacingTheLatchNeverTimeOut hammers the interleaving in which a read
+// passes the IsFailed check at the top of ReadIndex, then has the latch trip BEFORE its pendingReads entry is
+// stored. OnShardFailed scans an empty map and returns; the failed node stops
+// processing its queue; nothing ever completes the read, and it waits for its
+// deadline.
+//
+// The guard is a post-registration re-check with rollback, the same guard
+// ReadIndex already had for close/stop. The window is a few instructions
+// wide, so it cannot be hit on demand without a hook in production code —
+// which is not worth adding for a test. Instead this parks the poison apply,
+// starts many readers that each issue a read the instant the latch is
+// released, and requires EVERY read to come back as ErrShardFailed well
+// inside its budget. Across enough readers the interleaving is exercised; a
+// single ErrTimeout is the defect.
 func TestReadsRacingTheLatchNeverTimeOut(t *testing.T) {
 	h, machine, failed := newLatchableHost(t)
 	releasePoison := parkPoison(t, machine)
@@ -542,7 +640,16 @@ func TestReadsRacingTheLatchNeverTimeOut(t *testing.T) {
 	}
 }
 
-// TestFollowerReadsAgainstALatchedShardFailFast covers FollowerRead arriving after, and waiting during, the halt.
+// TestFollowerReadsAgainstALatchedShardFailFast covers the read path that does
+// not go through ReadIndex. FollowerRead polls lastApplied against
+// CommittedIndex, and a halted shard freezes lastApplied below committed
+// forever, so without its own gate the wait could never end: with a deadline it
+// would return ErrTimeout, and with context.Background() it would never return
+// at all.
+//
+// Both halves are exercised on the one fixture: a read that ARRIVES after
+// the halt is refused before entering the wait, and a read that is already
+// INSIDE the wait when the latch trips leaves it on the next poll.
 func TestFollowerReadsAgainstALatchedShardFailFast(t *testing.T) {
 	h, machine, failed := newLatchableHost(t)
 	releasePoison := parkPoison(t, machine)
@@ -565,7 +672,13 @@ func TestFollowerReadsAgainstALatchedShardFailFast(t *testing.T) {
 		err     error
 		elapsed time.Duration
 	}
-	// Wait until committed is past lastApplied so the read targets the entry that never applies.
+	// FollowerRead captures CommittedIndex at entry and waits for lastApplied
+	// to reach THAT. poisonHeld fires when the apply parks, which is after
+	// the entry was handed to the apply worker but the committed marker can
+	// still be one step behind -- and a read that captures committed=N-1
+	// is legitimately satisfied at N-1 and proves nothing. Wait until the
+	// committed index is past lastApplied, so the read's target is the
+	// entry that will never apply.
 	engNode := h.engine.GetNode(1)
 	ns, err := h.getNode(1)
 	if err != nil {
@@ -614,7 +727,7 @@ func TestFollowerReadsAgainstALatchedShardFailFast(t *testing.T) {
 			"no latch check in the poll loop, the read hangs")
 	}
 
-	// A read arriving after the halt is refused before the wait.
+	// And one that ARRIVES after the halt is refused before the wait.
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	start := time.Now()
@@ -638,7 +751,12 @@ func pendingProposalCount(ns *nodeState) int {
 	return n
 }
 
-// TestProposalRetriedFromItsFailureIsRefusedAtAdmission: a retry issued from the failed proposal's completion is refused with ErrShardFailed.
+// TestProposalRetriedFromItsFailureIsRefusedAtAdmission: the proposal whose
+// apply trips the latch is failed only once the latch has tripped, so a retry
+// issued the instant it is failed — here from inside its own completion, on
+// the apply goroutine — is refused at admission with ErrShardFailed. It is
+// never registered: a halted shard answers nothing it registers, so a
+// registered retry would wait out the pending sweep and report a timeout.
 func TestProposalRetriedFromItsFailureIsRefusedAtAdmission(t *testing.T) {
 	h, machine, failed := newLatchableHost(t)
 	releasePoison := parkPoison(t, machine)
@@ -818,7 +936,12 @@ func (s *heldApplySM) Update(ctx context.Context, entries []sm.Entry, results []
 	return s.poisonApplySM.Update(ctx, entries, results)
 }
 
-// TestProposalDrainedByTheHaltReportsMaybeApplied: a proposal pending at the halt matches ErrShardFailed and reports MaybeApplied.
+// TestProposalDrainedByTheHaltReportsMaybeApplied: a proposal still pending
+// when the shard halts may already be committed — here its entry is committed
+// and mid-apply when the latch trips — and a reload replays and applies it.
+// Its caller must therefore be told the outcome is unknown: the error still
+// matches ErrShardFailed, and MaybeApplied reports true, so an unsessioned
+// caller does not retry a mutation that is going to take effect.
 func TestProposalDrainedByTheHaltReportsMaybeApplied(t *testing.T) {
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -908,7 +1031,13 @@ func awaitProposalErr(t *testing.T, rs *RequestState) error {
 	}
 }
 
-// TestProposalFailuresAfterHandOffReportMaybeApplied: every failure after hand-off to raft reports MaybeApplied.
+// TestProposalFailuresAfterHandOffReportMaybeApplied: every failure delivered
+// to a proposal once it was handed to raft reports MaybeApplied, and still
+// matches its own error and sentinel. A committed entry whose apply or commit
+// failed is replayed by a reload; an entry the leader could not persist may
+// already be on a follower quorum (Replicate is sent before the local
+// persist); a proposal that lost its wait, or that its shard's halt or
+// teardown drained, may have reached the log.
 func TestProposalFailuresAfterHandOffReportMaybeApplied(t *testing.T) {
 	for name, tc := range map[string]struct {
 		fail  func(h *Host, rs *RequestState)
@@ -1045,7 +1174,12 @@ func TestProposalWhoseWaitEndsReportsMaybeApplied(t *testing.T) {
 	})
 }
 
-// TestProposalWaitOnAClosedQueueIsDefinite: a proposal never taken from a closed queue fails definitely.
+// TestProposalWaitOnAClosedQueueIsDefinite: the caller's own wait is
+// classified by the same rule as the drains. A proposal provably never taken
+// from its node's queue, which is now closed, never reached raft, so a wait
+// that ends on it is a definite failure. While the queue is open the step
+// worker could still take it, so the failure stays maybe-applied; that case
+// is TestProposalWhoseWaitEndsReportsMaybeApplied.
 func TestProposalWaitOnAClosedQueueIsDefinite(t *testing.T) {
 	h, _, _ := newLatchableHost(t)
 	closed := registerTestProposal(t, h, time.Now().Add(50*time.Millisecond))
@@ -1067,7 +1201,12 @@ type exitingReadMetrics struct {
 
 func (m exitingReadMetrics) ObserveReadIndexLatency(uint64, time.Duration) { m.exit() }
 
-// TestOnReadyToReadNeverHoldsItsLockAcrossUserCode: reads complete and the lock is released whatever the collector does.
+// TestOnReadyToReadNeverHoldsItsLockAcrossUserCode: the host's OnReadyToRead
+// completes reads under pendingReadsMu. It used to call the metrics collector
+// with the lock held and release it explicitly, so a collector that panicked
+// or called runtime.Goexit left the lock held, and the step worker's recovery
+// — failing the same reads through OnReadIndexFailed — deadlocked on it. The
+// read is completed, and the lock released, whatever the collector does.
 func TestOnReadyToReadNeverHoldsItsLockAcrossUserCode(t *testing.T) {
 	for exitName, exit := range map[string]func(){
 		"panic":  func() { panic("metrics panicked") },
@@ -1301,7 +1440,12 @@ func TestShardHaltFailsPendingRequestsBeforeLogging(t *testing.T) {
 	}
 }
 
-// installDefaultLogger sets handler as the slog default and restores both slog and log package state in t.Cleanup.
+// installDefaultLogger makes handler the process's slog default for the test
+// and restores the previous one in t.Cleanup. slog.SetDefault also points the
+// log package's output and flags at the new handler, and re-installing the
+// previous slog default does not undo that, so both are restored too:
+// otherwise a later log.Printf (quic-go's buffer-size notice) reaches a
+// handler the test meant to be gone.
 func installDefaultLogger(t *testing.T, handler slog.Handler) {
 	t.Helper()
 	prev, prevWriter, prevFlags := slog.Default(), log.Writer(), log.Flags()
@@ -1360,7 +1504,13 @@ func TestProposalFailedWithAPanickingErrorIsStillCompleted(t *testing.T) {
 	}
 }
 
-// TestLeaderChangeLeavesUnhandedProposalsToTheStepWorker: a leader change fails only proposals already handed to raft.
+// TestLeaderChangeLeavesUnhandedProposalsToTheStepWorker: a leadership change
+// fails only the proposals the step worker has already taken from the queue
+// (handed to raft, so maybe-applied). One registered after the leaderless
+// drain and before the new leader is known has not reached raft; the drain
+// leaves it pending, and the step worker resolves it — forwarded to the new
+// leader, or refused definitely through OnProposalRejected — so it never gets
+// a maybe-applied result it does not deserve.
 func TestLeaderChangeLeavesUnhandedProposalsToTheStepWorker(t *testing.T) {
 	h, _, _ := newLatchableHost(t)
 	cb := &hostEngineCallback{h: h}

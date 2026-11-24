@@ -26,7 +26,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestHostClose_CloseInflight_LostQuorum verifies Close ends every request pending on a shard that lost quorum.
+// TestHostClose_CloseInflight_LostQuorum is #796: Close must end every
+// request pending on a shard that has lost quorum. The shard is a
+// single-node leader (CheckQuorum off, so it never steps down) that adds an
+// unreachable voter: from then on quorum is two and nothing commits or
+// confirms, so every Propose, SyncPropose and SyncRead stays pending until
+// Close. Close must return within 5s, every caller must see ErrClosed (or
+// ErrCanceled), and no goroutine may outlive the host.
+//
+// TestPendingRegistration_CloseRace_CallerNeverOrphaned
+// (host_pending_lifecycle_test.go) covers ReadIndex, RequestSnapshot and
+// RequestAddNode racing Close on a live shard; this test adds the lost-quorum
+// case, the three client calls and the error class.
 func TestHostClose_CloseInflight_LostQuorum(t *testing.T) {
 	const callers = 64
 	self := currentGoroutineID()

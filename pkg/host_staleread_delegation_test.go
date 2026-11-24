@@ -21,7 +21,20 @@ import (
 	"time"
 )
 
-// StaleRead delegates to QueryLocalNode; these tests assert the two agree on every branch.
+// ---------------------------------------------------------------------------
+// StaleRead delegates to QueryLocalNode
+//
+// The two name one operation — StaleRead after its guarantee, QueryLocalNode
+// after its mechanism — and StaleRead is now a one-line call into
+// QueryLocalNode so they cannot drift. Individual tests exist for each on its
+// own, which pins each one's behaviour but says nothing about the two agreeing:
+// a re-duplicated body that later grew a guard on one side only would leave
+// every one of those tests green.
+//
+// The tests below assert the AGREEMENT directly, over every branch either
+// function has, and they cover the one branch neither had a test for at all:
+// the already-cancelled context.
+// ---------------------------------------------------------------------------
 
 // staleReadCase is one input both read entry points must answer identically.
 type staleReadCase struct {
@@ -101,7 +114,10 @@ var staleReadDelegationCases = []staleReadCase{
 		wantErr: ErrShardNotReady,
 	},
 	{
-		// An already-cancelled context on a live echoing shard.
+		// Uncovered before this test on BOTH functions. The shard is live and
+		// its state machine echoes the query, so a guard that stopped honouring
+		// an already-cancelled context returns ("echo-me", nil) here and the
+		// case fails on a wrong value rather than passing quietly.
 		name: "context already canceled",
 		host: runningShardHost,
 		ctx: func(t *testing.T) (context.Context, context.CancelFunc) {
@@ -127,7 +143,15 @@ var staleReadDelegationCases = []staleReadCase{
 	},
 }
 
-// TestStaleReadAndQueryLocalNodeAgree requires both entry points to give the same, expected answer on every branch.
+// TestStaleReadAndQueryLocalNodeAgree runs every branch through BOTH entry
+// points and requires the same answer from each, then requires that answer to
+// be the expected one.
+//
+// The second half is what stops the first from being vacuous: two functions
+// that both returned nil, or both returned the wrong sentinel, would agree
+// perfectly. Pinning the expected value as well means a regression has to
+// break both functions in exactly the same way AND land on the right answer to
+// escape.
 func TestStaleReadAndQueryLocalNodeAgree(t *testing.T) {
 	for _, tc := range staleReadDelegationCases {
 		t.Run(tc.name, func(t *testing.T) {

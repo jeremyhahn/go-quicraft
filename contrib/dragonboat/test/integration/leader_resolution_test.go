@@ -22,7 +22,24 @@ import (
 	dbClient "github.com/jeremyhahn/go-quicraft/contrib/dragonboat/client"
 )
 
-// TestIntegration_DB_ProposeSurvivesLeaderLoss proposes between a leader's death and the next election; tryProposeToLeader must re-resolve the leader each attempt.
+// TestIntegration_DB_ProposeSurvivesLeaderLoss proposes into the gap between
+// one leader dying and the next being elected, and requires the entry to land.
+//
+// It guards the RE-RESOLVE inside tryProposeToLeader, which nothing else can.
+// The build gate in the parent module (test/buildgates) enforces that proposals
+// go through these helpers; it cannot tell whether the helper still resolves
+// the leader on every attempt. Hoist that resolve out of the retry loop and
+// every other test in this suite stays green while this one fails.
+//
+// TestIntegration_DB_LeaderFailover covers the neighbouring case and
+// deliberately does not cover this one: it waits for the successor with
+// waitForClusterLeader BEFORE proposing, so it never enters the window.
+//
+// The window is real and wide. Measured on this suite, a host observed while
+// the cluster had a leader refused 1595 consecutive proposals after the
+// incumbent was stopped -- every one of them the not-leader rejection, which
+// this adapter's translateError reports as the bare ErrShardNotReady sentinel
+// with no mention of leadership at all.
 func TestIntegration_DB_ProposeSurvivesLeaderLoss(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
@@ -34,7 +51,9 @@ func TestIntegration_DB_ProposeSurvivesLeaderLoss(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Stop the incumbent and propose at once, without waiting for a successor.
+	// Stop the incumbent and propose at once, WITHOUT waiting for a successor.
+	// Every live replica is now a follower whose leader has gone, and will
+	// refuse the proposal until the election completes.
 	cluster.stopNode(leaderIdx)
 	t.Logf("stopped incumbent node[%d]; proposing without waiting for a successor", leaderIdx)
 

@@ -110,7 +110,10 @@ func TestIntegration_DB_MultiShard(t *testing.T) {
 	}
 	t.Logf("shard independence verified: shard 1 and shard 2 data are completely isolated")
 
-	// Each shard reads only its own data; the leader is resolved per read and per shard.
+	// Cross-verify with a linearizable read that each shard only sees its own
+	// data. The leader is resolved PER READ and per shard: findLeader once per
+	// shard was a value taken before a loop long enough to outlive it, and the
+	// two shards elect independently.
 	for shardID, expected := range map[uint64]map[string]string{1: shard1Expected, 2: shard2Expected} {
 		for key, wantVal := range expected {
 			result := cluster.readFromLeader(t, shardID, encodeKVGet(key), defaultTimeout)

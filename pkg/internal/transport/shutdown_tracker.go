@@ -22,7 +22,23 @@ import (
 // When set, TryAdd returns false and no new operations can begin.
 const shutdownBit int64 = 1 << 62
 
-// shutdownTracker is a lock-free counter (bits 0-61 count, bit 62 shutdown) that refuses new operations after shutdown; the zero value is ready, ShutdownAndWait is called at most once.
+// shutdownTracker is a lock-free reference counter that supports atomic
+// rejection of new operations once shutdown is initiated. It solves the
+// sync.WaitGroup race where Add(1) and Wait() cannot safely overlap.
+//
+// The counter uses an atomic.Int64 with the following layout:
+//   - Bits 0-61: active operation count (up to ~4.6 quintillion)
+//   - Bit 62:    shutdown flag
+//
+// TryAdd atomically increments the count only if the shutdown bit is not
+// set. Done decrements the count and wakes the shutdown waiter when the
+// count reaches zero. ShutdownAndWait sets the shutdown bit and blocks
+// until all in-flight operations complete.
+//
+// Zero value is ready to use. ShutdownAndWait must be called at most
+// once per instance.
+//
+// shutdownTracker is safe for concurrent use by multiple goroutines.
 type shutdownTracker struct {
 	state atomic.Int64
 
@@ -32,7 +48,10 @@ type shutdownTracker struct {
 	done atomic.Pointer[chan struct{}]
 }
 
-// TryAdd registers an in-flight operation unless shutdown has begun; on true the caller must call Done.
+// TryAdd attempts to register a new in-flight operation. It returns true
+// if the operation was registered successfully, or false if shutdown has
+// been initiated. When TryAdd returns true, the caller MUST call Done
+// when the operation completes.
 func (s *shutdownTracker) TryAdd() bool {
 	for {
 		old := s.state.Load()
@@ -45,12 +64,19 @@ func (s *shutdownTracker) TryAdd() bool {
 	}
 }
 
-// Done completes one TryAdd and wakes ShutdownAndWait when the last finishes.
+// Done marks an in-flight operation as complete. It must be called
+// exactly once for each successful TryAdd call. If this was the last
+// in-flight operation and shutdown has been initiated, Done wakes the
+// ShutdownAndWait caller.
 func (s *shutdownTracker) Done() {
 	newVal := s.state.Add(-1)
 	count := newVal &^ shutdownBit
 	if count == 0 && newVal&shutdownBit != 0 {
-		// done is non-nil: ShutdownAndWait publishes it before setting the shutdown bit.
+		// Last operation completed after shutdown. The done channel
+		// is guaranteed to be non-nil here because ShutdownAndWait
+		// publishes it via atomic store BEFORE setting the shutdown
+		// bit (CAS). The CAS in ShutdownAndWait happens-before the
+		// Load in this Add(-1) that observed the shutdown bit.
 		ch := s.done.Load()
 		select {
 		case *ch <- struct{}{}:
@@ -63,7 +89,9 @@ func (s *shutdownTracker) Done() {
 // operations complete. After ShutdownAndWait returns, all future TryAdd
 // calls return false. ShutdownAndWait must be called at most once.
 func (s *shutdownTracker) ShutdownAndWait() {
-	// Publish done before setting the shutdown bit.
+	// Allocate and publish the done channel BEFORE setting the shutdown
+	// bit. This ensures any Done() call that observes the shutdown bit
+	// also sees a valid done channel via the atomic load.
 	ch := make(chan struct{}, 1)
 	s.done.Store(&ch)
 

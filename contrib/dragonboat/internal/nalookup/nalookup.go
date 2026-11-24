@@ -12,7 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package nalookup wraps a NAReadLocalNode query so it reaches the adapter's Lookup through the host's local-read path rather than its []byte fast path.
+// Package nalookup carries a NodeHost.NAReadLocalNode query from the
+// dragonboat NodeHost to the statemachine adapters.
+//
+// The query travels through the host's generic local-read path, so it is
+// served under the same state machine read guard as Lookup. It is not sent
+// as a bare []byte: the host answers a []byte query through its own
+// byte-slice fast path, which would bypass the adapter, and a []byte query
+// from ReadLocalNode must keep reaching the state machine's Lookup.
 package nalookup
 
 // Query is a NAReadLocalNode query. The adapters answer it with the state

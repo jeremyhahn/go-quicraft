@@ -36,7 +36,10 @@ import (
 // fsync contention. ShardID is hashed to one of these shards.
 const DefaultShardCount = 16
 
-// ciphertextEpochSize is the size of the 8-byte big-endian epoch prefix of an encrypted record.
+// ciphertextEpochSize is the byte size of the epoch prefix in an encrypted
+// WAL record. The barrier writes the epoch as an 8-byte big-endian uint64
+// at the start of each ciphertext, enabling epoch extraction without
+// decryption.
 const ciphertextEpochSize = 8
 
 // nodeKey identifies a unique (shardID, replicaID) pair for map lookups.
@@ -45,7 +48,14 @@ type nodeKey struct {
 	ReplicaID uint64
 }
 
-// metaSegments pins, per node, the segments holding its latest State, Snapshot, Bootstrap and Compaction records, each with a presence flag since segment 0 is valid.
+// metaSegments records the segment ID holding the latest durable State,
+// Snapshot, Bootstrap and Compaction-marker record for a single node. These record types are not tracked by any entry index, so the
+// shard pins their segments here to prevent segment garbage collection from
+// deleting the sole durable copy.
+//
+// Each record type carries an explicit presence flag rather than treating a
+// zero ID as "none": segment IDs are 0-based, so segment 0 is a valid pin and
+// must be distinguishable from the absence of a record.
 type metaSegments struct {
 	state        uint64
 	snapshot     uint64
@@ -76,7 +86,22 @@ type WALBarrier interface {
 	CurrentEpoch() uint64
 }
 
-// walContextBarrier is the context-AAD capability the WAL requires of a barrier, asserted at Open on the dynamic type; Open fails with ErrBarrierContextUnsupported without it.
+// walContextBarrier is the context-AAD capability the WAL REQUIRES of any
+// configured barrier. Every encrypted WAL record binds its position — WAL
+// shard, segment and record ordinal — into the AEAD AAD (see
+// walRecordContext), which the plain Encrypt/Decrypt pair cannot express.
+//
+// It is a separate interface asserted at Open rather than extra methods on
+// WALBarrier because WALBarrier is part of the package's published surface and
+// is satisfied structurally by the engine's own Barrier interface; widening it
+// would break every embedder that passes a narrower barrier through. The
+// assertion is on the DYNAMIC type, so the concrete *seal.Barrier every
+// production path supplies satisfies it.
+//
+// The assertion FAILS CLOSED: a configured barrier that cannot bind context
+// makes Open return ErrBarrierContextUnsupported. There is deliberately no
+// epoch-only fallback — silently writing unbound records would reintroduce
+// exactly the splice/reorder exposure the context exists to remove.
 type walContextBarrier interface {
 	// EncryptWithContext seals plaintext with contextAAD folded into the AEAD
 	// AAD alongside the epoch. The context is not stored in the ciphertext.
@@ -91,14 +116,38 @@ type walContextBarrier interface {
 	// SupportsContextAAD is the question the WAL actually needs answered.
 	IsHardwareMode() bool
 
-	// SupportsContextAAD reports whether the barrier authenticates the per-record context; records are position-bound exactly when true.
+	// SupportsContextAAD reports whether the barrier can ACTUALLY authenticate
+	// the per-record context. It is true for a software barrier and for a
+	// delegated encryptor that carries AAD end to end; false for a delegated
+	// encryptor that cannot, and in no-encryption mode. Records are bound to
+	// their (shard, segment, ordinal) position exactly when it is true.
 	SupportsContextAAD() bool
 
-	// ContextBindingResolved reports whether SupportsContextAAD is an answer yet (false while sealed); the WAL latches nothing until it is (ErrBarrierContextUnresolved).
+	// ContextBindingResolved reports whether SupportsContextAAD is currently an
+	// ANSWER rather than the absence of one. It is false while the barrier is
+	// sealed or uninitialized: no encryptor is installed then, so the
+	// capability does not exist yet.
+	//
+	// The WAL resolves the capability ONCE, at open, and every record it writes
+	// for the life of the process depends on that answer. SupportsContextAAD
+	// alone cannot be cached, because false collapses "cannot bind" and "cannot
+	// say yet" into one bit — and caching the second as the first is precisely
+	// how a node that starts sealed ends up writing epoch-only records forever,
+	// even after being unsealed with a fully AAD-capable barrier. The WAL
+	// therefore refuses to latch anything until this is true; see
+	// ErrBarrierContextUnresolved.
 	ContextBindingResolved() bool
 }
 
-// legacyContextBarrier is walContextBarrier without ContextBindingResolved, used to name the missing method; see docs/compatibility/architecture.md.
+// legacyContextBarrier is walContextBarrier without ContextBindingResolved. It
+// exists only to make the assertion failure diagnosable.
+//
+// The assertion is on the dynamic type, so an out-of-tree barrier that
+// implements context-bound encryption but not ContextBindingResolved fails it
+// and gets a hard startup failure. "Barrier does not support context-bound
+// encryption" is actively misleading in that case: the barrier supports it
+// perfectly well and is missing one reporting method. Naming the method turns
+// a mystifying refusal to boot into a one-line fix. See docs/compatibility/architecture.md.
 type legacyContextBarrier interface {
 	EncryptWithContext(dst, plaintext, contextAAD []byte) ([]byte, error)
 	DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error)
@@ -106,7 +155,10 @@ type legacyContextBarrier interface {
 	SupportsContextAAD() bool
 }
 
-// barrierContextAssertionError says whether a barrier is not context-capable or only lacks ContextBindingResolved.
+// barrierContextAssertionError explains why a configured barrier failed the
+// walContextBarrier assertion, distinguishing a barrier that is simply not
+// context-capable from one that only lacks the newly required
+// ContextBindingResolved method.
 func barrierContextAssertionError(barrier WALBarrier) error {
 	if _, ok := barrier.(legacyContextBarrier); ok {
 		return ErrBarrierContextBindingUnreportable
@@ -114,7 +166,13 @@ func barrierContextAssertionError(barrier WALBarrier) error {
 	return ErrBarrierContextUnsupported
 }
 
-// plaintextModeReporter optionally tells no-encryption mode apart from a delegated encryptor that cannot bind position; only the Open warning differs.
+// plaintextModeReporter is an OPTIONAL capability a barrier may implement to
+// distinguish the two reasons it cannot bind a record's position:
+// no-encryption mode, where there is no AEAD and so nothing a position could be
+// bound to, versus a delegated encryptor that IS protecting the records but
+// cannot authenticate where they belong. Only the second is a security
+// limitation; only the Open-time warning differs. A barrier that does not
+// implement this is reported as the latter, the conservative reading.
 type plaintextModeReporter interface {
 	IsPlaintextMode() bool
 }
@@ -122,7 +180,10 @@ type plaintextModeReporter interface {
 // maxCiphertextExpansion bounds the seal envelope's overhead ([epoch:8][algID:1][nonce:<=24] plus a 16-byte tag), used to pick a record's segment before sealing; pinned by TestCiphertextExpansionWithinBound.
 const maxCiphertextExpansion = 8 + 1 + 24 + 16
 
-// LogDBMetrics receives WAL write, fsync and compaction latency and byte counts; nil skips collection.
+// LogDBMetrics is the metrics interface consumed by the WAL DB for write
+// latency, fsync latency, compaction latency, and byte throughput. When nil,
+// all metric collection is skipped. The concrete implementation lives in
+// the public quicraft package to avoid an import cycle.
 type LogDBMetrics interface {
 	// ObserveWriteLatency records the duration of one write.
 	ObserveWriteLatency(d time.Duration)
@@ -180,7 +241,24 @@ func WithNoSync(noSync bool) Option {
 	}
 }
 
-// WithBarrier seals every WAL record with barrier, which must be initialized and unsealed; a StrategyNone barrier is accepted and reported as AtRestHostRouted.
+// WithBarrier routes every WAL record through the given barrier: sealed before
+// writing, opened during recovery. The barrier must be initialized and unsealed
+// before any WAL operations.
+//
+// It does NOT, on its own, mean the records are encrypted. A barrier running
+// StrategyNone installs an identity pass-through, and the records reach the
+// medium as plaintext. That configuration is deliberately still ACCEPTED here
+// rather than refused: no-encryption mode is a supported barrier mode (Open
+// already resolves and announces it -- see resolveBarrierContextBinding), the
+// WAL is not the layer that decides whether a deployment requires at-rest
+// encryption, and refusing it would break every caller that wires one barrier
+// through unconditionally and selects the strategy elsewhere.
+//
+// What the WAL owes such a caller is the truth, not a refusal: AtRestProtection
+// reports AtRestHostRouted, never AtRestBarrierEncrypted, for a plaintext-mode
+// barrier, which is what lets the host's at-rest requirement decide at the layer
+// that actually holds the policy: it accepts the store only as its own
+// host-wide route, under its own barrier.
 func WithBarrier(b WALBarrier) Option {
 	return func(o *dbOptions) {
 		o.barrier = b
@@ -204,14 +282,25 @@ func WithMetrics(m LogDBMetrics) Option {
 	}
 }
 
-// WithFS sets the filesystem used for all file operations; tests inject faults through it.
+// WithFS sets the filesystem implementation used for all file and directory
+// operations. Production code uses the default osFS which delegates to the
+// os package with platform-optimized sync. Test code can inject alternative
+// implementations for error injection and fault simulation.
 func WithFS(fs FS) Option {
 	return func(o *dbOptions) {
 		o.fs = fs
 	}
 }
 
-// DB is the WAL-based LogDB: 16 hash-sharded directories, each with its own segments, index and mutex; reads come from memory and recovery replays the WAL.
+// DB is the WAL-based LogDB implementation. It stores Raft log entries,
+// hard state, bootstrap, and snapshot metadata across sharded WAL directories.
+//
+// Design:
+//   - 16 directory shards based on shardID hash for write parallelism.
+//   - Each shard has its own active segment, entry index, and mutex.
+//   - Entries are serialized using a fixed binary layout.
+//   - The WAL provides durability; in-memory maps serve reads.
+//   - On recovery, all state is reconstructed from WAL replay.
 type DB struct {
 	dir     string
 	opts    dbOptions
@@ -255,7 +344,39 @@ func (db *DB) writeGate() error {
 	return nil
 }
 
-// walShard is one WAL directory shard. mu guards segment state and every write; dataMu guards the in-memory maps readers use. Order is mu then dataMu, and dataMu is never held across I/O.
+// walShard is a single WAL directory shard. Each shard manages its own
+// segment file rotation, in-memory entry store, state, bootstrap, and
+// snapshot metadata.
+//
+// # Locking
+//
+// Two locks split the shard by what they actually protect:
+//
+//   - mu guards the SEGMENT FILE state — activeSegment, activeSegmentID,
+//     nextSegmentID, knownSegments, marshalBuf, batchMode, closed — and
+//     therefore every record write, rotation, fsync and rollback. It is the
+//     writer lock: it makes a SaveState batch atomic per WAL segment across
+//     its whole lifecycle (checkpoint -> write -> fsync -> commit/rollback).
+//   - dataMu guards the IN-MEMORY maps that serve reads: indexes, entries,
+//     states, bootstraps, snapshots, compactedTo, metaSegments,
+//     committedSegmentHWM, minWriteEpoch and segmentEpochs.
+//
+// The split exists so a reader never waits on an fsync. Readers
+// (IterateEntries, ReadState, EntryRange, GetSnapshot, GetBootstrap,
+// CompactedTo, ListNodeInfo, MinLiveEpoch) touch only in-memory maps — never
+// a segment — so they take dataMu.RLock ALONE. With 16 WAL shards serving
+// 10k+ Raft groups, taking mu for a read would stall every group hashing to
+// the shard for the duration of the batch's fdatasync.
+//
+// Every mutator of a dataMu field already holds mu (all of them are commit
+// points of a durable write), so a mutator takes both, and a read performed
+// while holding mu needs no dataMu. dataMu exists purely to exclude the
+// lock-free readers.
+//
+// LOCK ORDER IS ALWAYS mu THEN dataMu, never the reverse: mu is never
+// acquired while dataMu is held. Per-index locks (index.mu) are innermost and
+// are only ever taken under mu and/or dataMu. dataMu is never held across any
+// I/O — no write, fsync, rotation, directory scan or segment deletion.
 type walShard struct {
 	mu sync.Mutex
 
@@ -267,7 +388,11 @@ type walShard struct {
 	dir  string
 	opts dbOptions
 
-	// shardIdx is bound into each record's context AAD so records cannot be spliced between shards.
+	// shardIdx is this shard's index within the owning DB (0..DefaultShardCount).
+	// It is bound into every encrypted record's context-AAD: each shard is its
+	// own directory with an INDEPENDENT segment-ID space while all shards share
+	// ONE barrier, so without it a record could be spliced from shard-3's
+	// 000007.log into shard-9's 000007.log undetected.
 	shardIdx uint64
 
 	barrier WALBarrier
@@ -276,13 +401,25 @@ type walShard struct {
 	// exactly when barrier is nil; openWALShard fails closed otherwise.
 	sealer walContextBarrier
 
-	// noContextBinding records, once at open, that the barrier cannot authenticate a context, so records carry none.
+	// noContextBinding records that the configured barrier cannot authenticate
+	// a caller context — a delegated encryptor without that capability, or
+	// no-encryption mode — so records are sealed and opened with no context.
+	// It is a DEPLOYMENT-time capability limitation resolved once at open and
+	// logged once: never a per-record decision, and never entered because a
+	// decrypt failed.
 	noContextBinding bool
 
-	// bindingDriftLogged limits verifyBindingUnchanged's error to one per shard. Protected by mu.
+	// bindingDriftLogged keeps verifyBindingUnchanged's Error line to one per
+	// shard. The drift it reports is permanent once it starts, and the check
+	// runs on every write, so logging each time would bury the first line —
+	// the only one that carries new information — under the rest.
+	// Protected by mu, like every other write-path field.
 	bindingDriftLogged bool
 
-	// ctxBuf is scratch for walRecordContext; written under mu, read only during recover().
+	// ctxBuf is the reusable scratch buffer for walRecordContext, so building a
+	// record's context-AAD allocates nothing on the write hot path. The write
+	// side uses it under mu; the read side uses it only from recover(), which
+	// runs before the shard is reachable from any DB, so the two never overlap.
 	ctxBuf [walContextSize]byte
 
 	metrics         LogDBMetrics
@@ -320,27 +457,67 @@ type walShard struct {
 	// Per-node compaction markers. Protected by dataMu.
 	compactedTo map[nodeKey]uint64
 
-	// durableFloors is the content of the shard's COMPACTED file. Protected by mu. See compaction_floor.go.
+	// durableFloors is the content of the shard directory's COMPACTED file:
+	// the floors last published outside the WAL, which every segment unlink
+	// waits for. Protected by mu. See compaction_floor.go.
 	durableFloors map[nodeKey]uint64
 
 	// Set of all segment IDs that have ever been created in this shard.
 	// Segment file state: protected by mu.
 	knownSegments map[uint64]bool
 
-	// openCreatedSegment names the segment openWALShard created, so closeAfterFailedOpen can unlink it. Protected by mu.
+	// openCreatedSegment names the segment ensureActiveSegment created during
+	// openWALShard, and openCreatedSegmentValid says whether there is one. If
+	// the Open as a whole then fails, that segment is a brand-new empty file
+	// nobody will ever read; closeAfterFailedOpen unlinks it so repeated failed
+	// opens — the expected experience while an operator works through a
+	// fail-closed condition — do not accumulate one dead file per attempt.
+	// Segment file state: protected by mu.
 	openCreatedSegment      uint64
 	openCreatedSegmentValid bool
 
-	// minWriteEpoch is the minimum barrier epoch across live records in this shard, 0 when none are encrypted. Protected by dataMu.
+	// minWriteEpoch tracks the minimum barrier encryption epoch across
+	// all live (non-garbage-collected) records in this shard. It is
+	// populated during WAL recovery from ciphertext headers and updated
+	// on each encrypted write. After compaction + GC, it is recomputed
+	// from the remaining segment epochs. Zero means no encrypted records
+	// exist in this shard. Protected by dataMu — MinLiveEpoch reads it
+	// without mu.
 	minWriteEpoch uint64
 
-	// segmentEpochs is the minimum epoch per segment, used to recompute minWriteEpoch after GC. Protected by dataMu.
+	// segmentEpochs tracks the minimum epoch written to each segment ID.
+	// This enables efficient recomputation of minWriteEpoch after segment
+	// garbage collection without re-scanning ciphertext headers. Protected
+	// by dataMu, alongside the minWriteEpoch it derives.
 	segmentEpochs map[uint64]uint64
 
-	// metaSegments pins, per node, the segment with its latest State, Snapshot, Bootstrap and Compaction records so GC keeps them. Protected by dataMu.
+	// metaSegments tracks, per node, the segment ID that holds the latest
+	// durable State, Snapshot, Bootstrap and Compaction-marker record. Unlike
+	// entries, these record types are never tracked by any entry index, so
+	// without this pin a segment whose entries have all been compacted away
+	// could be garbage-collected even though it still holds the sole durable
+	// copy of a node's State/Snapshot/Bootstrap/Compact marker. Compact and
+	// the node-removal reclaim (reclaimSegmentsLocked) fold these
+	// IDs into their live-segment set before running GC. A zero ID means no
+	// such record has landed for that node. Last write wins. Protected by
+	// dataMu.
 	metaSegments map[nodeKey]metaSegments
 
-	// committedSegmentHWM is the highest segment fully reflected in the index and pins; GC never deletes above it. Advanced monotonically under mu. Protected by dataMu.
+	// committedSegmentHWM is the highest segment ID whose records are all
+	// reflected in the in-memory index and pins: advanced when a SaveState
+	// batch completes Phase 3 (applyTo), at a non-batch commit
+	// (writeBootstrap), and by recovery for every segment it replays — a
+	// final segment whose torn tail it repaired included. GarbageCollect
+	// refuses to delete any segment ID greater than this mark, so a segment
+	// that is durably written but not yet reflected in the index/pins is
+	// never reclaimed. SaveState holds every touched shard's mu for the whole
+	// batch, so a concurrent Compact cannot observe that state today; the mark
+	// is what keeps GC safe regardless — it was introduced when SaveState
+	// released shard.mu between its durable write and its index update, and a
+	// Compact in that window could delete the just-written segment. Advanced only at the commit
+	// points, monotonically, and always under shard.mu. Protected by dataMu
+	// as well, so it commits atomically with the index/pin updates it
+	// covers.
 	committedSegmentHWM uint64
 
 	// marshalBuf is a reusable buffer for encoding records.
@@ -351,14 +528,31 @@ type walShard struct {
 	// writes completes. This field is protected by mu.
 	batchMode bool
 
-	// closed marks the shard shut down, checked under mu so no writer reaches a segment after close. Protected by mu.
+	// closed marks the shard shut down. DB.Close only samples db.closed
+	// at a writer's entry, so a writer already past that gate can still
+	// reach the segment; this flag is set and checked under mu, making
+	// shutdown atomic with respect to in-flight writers: once close()
+	// holds the lock, no later writer can touch (or recreate) a segment.
+	// Protected by mu.
 	closed bool
 }
 
 // Compile-time interface check.
 var _ logdb.LogDB = (*DB)(nil)
 
-// validateOpenOptions checks option values against Options.Validate's invariants, including a block size above a record header and segments of at least two blocks.
+// validateOpenOptions checks the functional-option values against the same
+// invariants as Options.Validate, before any of them can reach a segment.
+//
+// The block-size check is load bearing beyond hygiene: an unchecked block size
+// smaller than a record header makes segment.bytesNeeded compute a negative
+// payload and loop forever, hanging the commit worker inside SaveState.
+//
+// A segment must also span at least two blocks, or maxRecordPayload is zero and
+// no record can ever be written. Beyond that the geometry is the operator's to
+// choose: a large BATCH is split across records, and a lone entry too big for
+// any record surfaces at the write as the permanent ErrRecordTooLarge.
+// Requiring room for a theoretical maxCmdLen entry here would reject
+// small-segment deployments that never write one.
 func validateOpenOptions(dir string, o dbOptions) error {
 	if dir == "" {
 		return ErrEmptyWALDir
@@ -375,7 +569,18 @@ func validateOpenOptions(dir string, o dbOptions) error {
 	return nil
 }
 
-// resolveBarrierContextBinding decides once per DB, before any shard opens, whether the barrier can bind records, failing closed and warning once.
+// resolveBarrierContextBinding settles, once for the whole DB, whether a
+// configured barrier can positionally bind the records it is about to seal, and
+// announces the answer when it is a limitation.
+//
+// Every encrypted WAL record is positionally bound via context-AAD, so a
+// configured barrier MUST be able to carry a context. This fails closed rather
+// than degrading to epoch-only binding, and emits the hardware-mode warning
+// exactly once per DB instead of once per shard.
+//
+// Called by Open BEFORE any shard is opened, because openWALShard LATCHES the
+// capability into every shard it builds; the refusals below must therefore
+// happen while there is still nothing to latch.
 func resolveBarrierContextBinding(dir string, barrier WALBarrier) error {
 	if barrier == nil {
 		return nil
@@ -384,7 +589,12 @@ func resolveBarrierContextBinding(dir string, barrier WALBarrier) error {
 	if !ok {
 		return barrierContextAssertionError(barrier)
 	}
-	// A sealed barrier has no capability to report yet; refuse before resolving.
+	// A sealed barrier has no encryptor and therefore no capability to report.
+	// Refuse before anything is resolved or announced: latching "cannot bind"
+	// here would silently downgrade every record the node ever writes, and the
+	// warning below would fire against a barrier whose answer is simply not
+	// available yet — noise that teaches operators to ignore the one line that
+	// reports a real limitation.
 	if !cb.ContextBindingResolved() {
 		return ErrBarrierContextUnresolved
 	}
@@ -408,7 +618,19 @@ func resolveBarrierContextBinding(dir string, barrier WALBarrier) error {
 	return nil
 }
 
-// createWALRoot creates the WAL root and fsyncs the parent of every level MkdirAll created; under noSync the root is created on first write.
+// createWALRoot creates the WAL root directory and makes the directory entry of
+// EVERY level MkdirAll created durable.
+//
+// POSIX durability requires fsyncing the parent of each newly created
+// directory, and MkdirAll may create several levels: fsyncing only the root's
+// immediate parent leaves the intermediate dirents un-durable, so a crash after
+// an acked SaveState can take the whole tree with it (the node then boots with
+// no term and no vote). The deepest PRE-EXISTING ancestor is recorded first so
+// the sync walk covers exactly the created chain. Idempotent for an existing
+// WAL.
+//
+// Under noSync the directory is left to be created lazily on first write, which
+// is why a fresh noSync database may have no root to stamp geometry into yet.
 func createWALRoot(o dbOptions, dir string) error {
 	if o.noSync {
 		return nil
@@ -420,7 +642,38 @@ func createWALRoot(o dbOptions, dir string) error {
 	return nil
 }
 
-// establishWALFormat runs when no marker exists: a directory with segments is refused (ErrWALFormatMissing), an empty one gets the marker before any segment; a stamp failure is fatal.
+// establishWALFormat settles what on-disk format a directory without a marker is
+// in, BEFORE this Open writes anything into it. It is called only when Open
+// found no marker.
+//
+// Two outcomes, and no third:
+//
+//   - The directory holds segments. Those bytes were written by a build that
+//     predates the marker, and therefore predates the durability sequence in the
+//     chunk header, so this build cannot parse them. Refuse
+//     (ErrWALFormatMissing) rather than adopt: guessing the record framing
+//     wrong does not produce a detectable mismatch, it produces an empty clean
+//     prefix that the torn-tail repair truncates the whole log to.
+//   - The directory holds no segments. This process defines its format, so the
+//     marker is written NOW, before the first segment exists.
+//
+// The ordering is the point. Stamping after the shards were opened would leave a
+// window — a crash, or merely a failed stamp — in which segments existed with no
+// marker above them, which the rule above then reads as a pre-marker directory
+// and refuses FOREVER. Writing the marker first closes it: either the marker is
+// there and segments may follow, or nothing was written at all.
+//
+// A stamp failure is fatal for the same reason. Refusing an otherwise healthy
+// WAL over a 16-byte metadata file looks like the worse outcome, but the marker
+// records the record framing: proceeding would create segments this build could
+// never prove the format of, bricking the directory on the next Open with no record of
+// why. Failing here leaves the directory empty and names the cause.
+//
+// Under noSync (tests only) createWALRoot leaves the root to be created lazily by
+// the first write, so the directory may not exist yet. The root is created here
+// rather than skipping the stamp: skipping it means a noSync directory carries no
+// format for its whole first life. Only the root is created; the shard
+// directories stay lazy.
 func establishWALFormat(o dbOptions, dir string) error {
 	populated, err := walDirHoldsSegments(o.fs, dir)
 	if err != nil {
@@ -447,7 +700,11 @@ func establishWALFormat(o dbOptions, dir string) error {
 	return nil
 }
 
-// walDirHoldsSegments reports whether any shard directory under dir holds a segment; only not-exist counts as absence.
+// walDirHoldsSegments reports whether any shard directory under dir contains a
+// %06d.log segment file. A WAL root that does not exist, or a shard directory
+// that does not, holds nothing; any OTHER error is returned rather than read as
+// absence, because mistaking an unreadable directory for an empty one is exactly
+// how a populated WAL would get stamped with the wrong format.
 func walDirHoldsSegments(filesystem FS, dir string) (bool, error) {
 	for i := 0; i < DefaultShardCount; i++ {
 		entries, err := filesystem.ReadDir(filepath.Join(dir, shardDirName(i)))
@@ -469,7 +726,16 @@ func walDirHoldsSegments(filesystem FS, dir string) (bool, error) {
 	return false, nil
 }
 
-// Open creates or opens a WAL database in dir with 16 shard directories. It locks the directory, checks format and geometry, and resolves barrier context binding, in that order.
+// Open creates or opens a WAL database at the given directory. The directory
+// structure contains 16 sub-directories (shard-0 through shard-15), each
+// holding its own WAL segment files.
+//
+// The order of the steps below is part of the contract, not an accident: the
+// directory lock is taken before the format is read or recorded, the
+// geometry check runs before any segment is touched, and the barrier's
+// context-binding capability is resolved before any shard exists to latch it
+// into. Both are fixes, not incidental sequencing — see the geometry comment
+// inline below and resolveBarrierContextBinding.
 func Open(dir string, opts ...Option) (*DB, error) {
 	o := defaultDBOptions()
 	for _, opt := range opts {
@@ -496,7 +762,13 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		}
 	}
 
-	// One writer per directory: take the lock before reading or recording the format; every failure below releases it.
+	// One writer per directory: a second Open, in this process or another,
+	// is refused here, before it reads or records the directory's format and
+	// before it replays or repairs a single segment the first is still
+	// writing. Taking the lock any later lets an opener that found the
+	// directory empty, and is then refused, overwrite the format marker the
+	// winner already recorded and is writing segments under. Every failure
+	// below releases the lock.
 	var lock io.Closer
 	if locker, ok := o.fs.(DirLocker); ok {
 		l, err := locker.LockDir(dir, walLockFilename)
@@ -515,7 +787,13 @@ func Open(dir string, opts ...Option) (*DB, error) {
 		}
 	}
 
-	// Refuse a block size or format version that differs from the directory's before touching a segment; see format.go.
+	// Refuse a block size, or an on-disk format version, that differs from the
+	// one this directory was written with, BEFORE touching a single segment.
+	// Neither is recorded in the segments themselves, so getting either wrong
+	// makes ReadAll misparse; that surfaces as CRC failures, and the repair
+	// paths would then either fail-stop or truncate a healthy log. Naming the
+	// real cause here is the difference between a one-line configuration fix (or
+	// a documented upgrade) and a restore-from-peers. See format.go.
 	recordedBlockSize, formatPresent, err := readWALFormat(o.fs, dir)
 	if err != nil {
 		releaseLock()
@@ -589,7 +867,18 @@ func Open(dir string, opts ...Option) (*DB, error) {
 	return db, nil
 }
 
-// purgeRetired drops replayed records of retired replicas and reclaims the segments that frees, each affected shard once.
+// purgeRetired drops, from what replay rebuilt, every record of a replica the
+// registry has retired, and reclaims the segments that leaves unreferenced.
+// Replay found such records only if a removal did not finish reclaiming them —
+// the process stopped between publishing the retirement and collecting its
+// segments, or that collection failed — so this is where it is finished. Any
+// segment still shared with a live node keeps its retired records until
+// garbage collection can take it, and every open drops them again until then.
+//
+// Every retired node is dropped first and each affected shard reclaimed once
+// afterwards: a reclaim scans the shard directory and fsyncs it, and doing it
+// per node would make an open after many interrupted removals cost one scan
+// and one fsync per retired replica.
 func (db *DB) purgeRetired() {
 	var affected [DefaultShardCount]bool
 	for _, key := range db.retired.keys() {
@@ -613,7 +902,10 @@ func (db *DB) purgeRetired() {
 	}
 }
 
-// dropNodeLocked removes every in-memory record of key and its pins, reporting whether any existed. Caller holds s.mu and s.dataMu.
+// dropNodeLocked removes every in-memory record of key — its entry index and
+// entries, hard state, bootstrap, snapshot, compaction floor and the segment
+// pins that kept them durable — and reports whether there was any. Caller
+// holds s.mu and s.dataMu for writing.
 func (s *walShard) dropNodeLocked(key nodeKey) bool {
 	_, hasIndex := s.indexes[key]
 	_, hasState := s.states[key]
@@ -632,7 +924,21 @@ func (s *walShard) dropNodeLocked(key nodeKey) bool {
 	return found
 }
 
-// validateBatchLocked refuses a whole batch that names a retired replica, has an out-of-bounds snapshot, or has entries at or below the compaction floor. Caller holds every touched shard's mu.
+// validateBatchLocked refuses a SaveState batch, whole and before anything is
+// written, that names a retired replica (refuseRetiredBatch), carries a
+// snapshot outside the protocol bounds, or carries entries at or below its
+// node's compaction floor. Caller holds every touched shard's mu.
+//
+// Entries at or below the floor name indexes that are already deleted, and
+// storing them would truncate-and-append over the LIVE suffix above the floor
+// — destroying entries this replica still serves — while leaving EntryRange
+// reporting a first index that IterateEntries then refuses as ErrCompacted. It is always a caller bug: raft sends a lagging
+// follower an InstallSnapshot rather than entries beneath its own floor.
+//
+// Checked here, under every touched shard's mu and before Phase 1, so the
+// rejection costs no WAL write and no rollback. Reading compactedTo under
+// shard.mu alone is sufficient for the same reason RemoveEntriesTo relies
+// on: every mutator of it holds shard.mu as well.
 func (db *DB) validateBatchLocked(updates []logdb.Update) error {
 	if err := db.refuseRetiredBatch(updates); err != nil {
 		return err
@@ -681,7 +987,10 @@ func (db *DB) refuseRetiredBatch(updates []logdb.Update) error {
 	return nil
 }
 
-// refuseRetired returns logdb.ErrReplicaRetired when key was retired by RemoveNodeData; lock-free when nothing was retired.
+// refuseRetired returns logdb.ErrReplicaRetired when key was retired by
+// RemoveNodeData. Every writer checks it: a retired replica never comes back,
+// so no record may be written for it again. The common case — nothing ever
+// retired — takes no lock.
 func (db *DB) refuseRetired(key nodeKey) error {
 	if db.retired.contains(key) {
 		return logdb.ErrReplicaRetired
@@ -689,7 +998,13 @@ func (db *DB) refuseRetired(key nodeKey) error {
 	return nil
 }
 
-// openWALShard opens shard directory idx, recovering existing segments or initializing lazily; idx is bound into record AAD, so it must be the shard's permanent index.
+// openWALShard opens a single WAL shard directory. If the directory exists,
+// existing segments are recovered and in-memory state is rebuilt. If the
+// directory does not exist, the shard is initialized lazily -- no directory,
+// segment file, or marshal buffer is created until the first write.
+// idx is the shard's index in the owning DB and is bound into every encrypted
+// record's context-AAD, so it must be the shard's permanent identity (the same
+// index that names its directory), never a per-open ordinal.
 func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metrics LogDBMetrics) (*walShard, error) {
 	s := &walShard{
 		fs:            opts.fs,
@@ -717,7 +1032,11 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 		if !ok {
 			return nil, barrierContextAssertionError(barrier)
 		}
-		// Never latch an unresolved capability.
+		// Never latch an unresolved capability. Open already refused a sealed
+		// barrier for the whole DB; this repeats the guard because the shard is
+		// where the answer is actually recorded, and a caller reaching
+		// openWALShard by another route must not be able to pin "no binding"
+		// from a barrier that has not been unsealed yet.
 		if !cb.ContextBindingResolved() {
 			return nil, ErrBarrierContextUnresolved
 		}
@@ -725,7 +1044,12 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 		s.noContextBinding = !cb.SupportsContextAAD()
 	}
 
-	// Only ErrNotExist means absence; any other error fails the open.
+	// If the directory exists, recover any existing data. ONLY ErrNotExist may
+	// be read as absence: EACCES, EIO, ENOTDIR, ELOOP or a stale handle leave
+	// the directory (and its segments) in place, so treating them as absence
+	// would skip recovery, leave nextSegmentID at 0, and let the first write
+	// recreate 000000.log with O_TRUNC — erasing the node's term, vote and
+	// entries. Fail the open instead.
 	if _, err := s.fs.Stat(dir); err == nil {
 		if err := s.recover(); err != nil {
 			return nil, err
@@ -736,7 +1060,9 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 			if err := s.ensureActiveSegment(); err != nil {
 				return nil, err
 			}
-			// Remember the created segment so closeAfterFailedOpen can unlink it.
+			// Remember what this open created, so a failure in a LATER shard
+			// can unlink it instead of leaving an empty segment behind. See
+			// closeAfterFailedOpen.
 			s.openCreatedSegment = s.activeSegmentID
 			s.openCreatedSegmentValid = true
 		}
@@ -749,7 +1075,10 @@ func openWALShard(idx int, dir string, opts dbOptions, barrier WALBarrier, metri
 	return s, nil
 }
 
-// corruptionError adds the shard and clean-prefix end to a corruption sentinel and logs the repair triple; see SegmentCorruptionError.
+// corruptionError attaches this shard's identity and the segment's clean-prefix
+// end to a fail-closed corruption sentinel, and logs the repair triple at Error
+// so it is in the node's log even if the caller only prints errors.Is results.
+// See SegmentCorruptionError.
 func (s *walShard) corruptionError(segID uint64, cleanEnd int64, sentinel error) error {
 	err := &SegmentCorruptionError{
 		ShardIndex: int(s.shardIdx),
@@ -767,7 +1096,16 @@ func (s *walShard) corruptionError(segID uint64, cleanEnd int64, sentinel error)
 	return err
 }
 
-// recover replays the shard's segments to rebuild in-memory state; it runs before the shard is reachable, so it takes no locks.
+// recover scans the shard directory for existing segment files and replays
+// their contents to rebuild the in-memory state.
+//
+// Neither lock is taken anywhere below this call: recover runs inside
+// openWALShard, before the shard is reachable from any DB the caller can
+// observe, so the entire replay (and the truncation/orphan-discard repair it
+// may perform) is exclusive by construction. Locking per replayed record
+// would cost a mutex round trip per WAL record on the recovery path and
+// protect nothing. Every mutator reachable from a LIVE shard does take both
+// locks; see the walShard Locking section.
 func (s *walShard) recover() error {
 	dirEntries, err := s.fs.ReadDir(s.dir)
 	if err != nil {
@@ -794,14 +1132,24 @@ func (s *walShard) recover() error {
 		}
 		segIDs = append(segIDs, segID)
 		s.knownSegments[segID] = true
-		// Advance nextSegmentID past every observed segment before replay, so a lingering orphan is never ordered after new segments.
+		// Advance nextSegmentID past EVERY observed segment BEFORE any replay.
+		// Recovery may truncate at a corrupt segment and discard the higher
+		// orphan segments; if nextSegmentID only covered replayed segments,
+		// new records would reuse the orphans' ID range, and any orphan that
+		// lingers on disk (a failed delete, or a deletion resurrected by a
+		// crash before the directory fsync) would be ordered AFTER freshly
+		// written segments on the next recovery — its stale HardState would
+		// win last-writer-wins replay and regress term/vote.
 		if segID >= s.nextSegmentID {
 			s.nextSegmentID = segID + 1
 		}
 	}
 	sort.Slice(segIDs, func(i, j int) bool { return segIDs[i] < segIDs[j] })
 
-	// highest is the highest segment that survives on disk.
+	// Replay each segment to rebuild all in-memory state. highest is the
+	// highest-numbered segment that survives recovery on disk: the last one
+	// replayed clean, or the repaired one recovery stopped at (the segments
+	// above it are discarded).
 	var highest uint64
 	for i, segID := range segIDs {
 		highest = segID
@@ -814,44 +1162,128 @@ func (s *walShard) recover() error {
 				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
 					segID, cleanEnd, ErrRecordSequenceRegression)}
 			}
-			// A non-final segment was fully fdatasynced before rotation, so any damage in it is under acknowledged data.
+			// A segment that is NOT the highest-numbered one was fdatasynced in
+			// full before any higher one was created (rotateSegment), so
+			// damage anywhere in it is under acknowledged data by
+			// construction, whatever the survivors above it say. Named as
+			// such ahead of the evidence-based verdicts: the rotation's
+			// closing sync mark makes those read "acknowledged" too, and the
+			// structural statement is the one an operator can act on.
 			if i != len(segIDs)-1 && isCorruptionVerdict(err) {
 				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
 					segID, cleanEnd, ErrNonFinalSegmentCorruption)}
 			}
-			// Corruption below fdatasync-acknowledged records is never a torn write.
+			// Corruption below records that a completed fdatasync already
+			// acknowledged is never an interrupted write, not even in the final
+			// segment. Handled before the truncation path below so the
+			// "highest-numbered segment" test cannot license destroying data
+			// that provably reached the medium.
 			if errors.Is(err, errMidSegmentCorruption) {
 				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
 					segID, cleanEnd, ErrMidSegmentCorruption)}
 			}
-			// Corruption below the acknowledged end the surviving records name.
+			// Corruption that begins BELOW the acknowledged end the surviving
+			// records name. The survivors are a single unsynced generation —
+			// the shape of an interrupted write — but their generation start
+			// proves the fdatasync that opened it acknowledged bytes inside the
+			// damage. Same posture as the mid-segment case, its own name.
 			if errors.Is(err, errAcknowledgedDataLost) {
 				return &RecoveryError{SegmentID: segID, Err: s.corruptionError(
 					segID, cleanEnd, ErrAcknowledgedDataLost)}
 			}
 			if errors.Is(err, errRecoveryTruncated) {
-				// A torn tail in the final segment: delete higher segments first, then truncate this one to its clean end, so every crash point repeats the same repair.
+				// Prefix-truncation is correct ONLY for a torn tail, which can
+				// exist only in the HIGHEST-numbered segment; the non-final
+				// case was refused above. Corruption in the FINAL segment with
+				// nothing acknowledged decodable after it (the mid-segment
+				// cases were rejected above) is a legal torn tail: this
+				// segment's clean prefix is recovered; do NOT replay higher
+				// segments (prefix-validity rule).
+				//
+				// The repair runs HIGH TO LOW, and the order is a crash-safety
+				// requirement, not a preference.
+				//
+				// Any higher-numbered segments are unreachable under the
+				// prefix-validity rule, so delete them FIRST (and fsync the
+				// directory, which discardSegmentsAbove does and now reports the
+				// failure of). Only then truncate the corrupt segment to its
+				// recovered clean end, with its own fsync last. Every
+				// intermediate crash state is then a valid prefix: the corrupt
+				// segment still carries its damaged tail, so the next recovery
+				// stops at exactly the same offset and repeats exactly the same
+				// repair.
+				//
+				// Truncating first is what a crash cannot survive. Segment K cut
+				// back to the clean end ends at a record boundary — no damage
+				// left to detect — so a restart before the higher segments were
+				// deleted replays K in full and then K+1..N, resurrecting the
+				// very records the prefix rule had just decided must never come
+				// back, with a hole where the cut region was.
+				//
+				// Truncating at all is what stops the corrupt tail being frozen
+				// forever: without it every later restart re-detects the damage,
+				// and the discard deletes every segment written since the
+				// previous restart — committed entries, hard state (term/vote
+				// regression, i.e. a double vote), snapshot metadata and
+				// compaction markers all lost, recurring on every boot.
+				//
+				// A discard failure is fatal: an intact orphan left behind would
+				// replay its stale records on the next restart.
+				//
+				// NOTE: reaching here means i == len(segIDs)-1 (the non-final
+				// check above returned otherwise), so segIDs[i+1:] is always
+				// EMPTY and this discard is a no-op today. It is kept because the
+				// prefix rule and the discard are separate invariants: whatever
+				// set of segments recovery decides is unreachable must be gone
+				// before the low segment is cut, and encoding that here means a
+				// future relaxation of the non-final rule cannot silently skip
+				// it. Repair, which shares this code, does pass a non-empty set.
 				if dErr := s.discardSegmentsAbove(segIDs[i+1:]); dErr != nil {
 					return dErr
 				}
 				if tErr := s.truncateCorruptSegment(segID, cleanEnd); tErr != nil {
 					return &RecoveryError{SegmentID: segID, Err: tErr}
 				}
-				// A second directory fsync proves the repair durable.
+				// The deletions are made durable by discardSegmentsAbove's own
+				// directory fsync and the truncation by the file fsync inside
+				// truncateCorruptSegment, so this is belt and braces rather than
+				// the only proof. It is kept because an unproven repair replays
+				// as corruption again on the next restart, and a second fsync of
+				// an already-clean directory costs one syscall once per boot.
 				if sErr := syncDirFS(s.fs, s.dir); sErr != nil {
 					return &RecoveryError{SegmentID: segID, Err: sErr}
 				}
-				// The repaired segment is committed, so GC may consider it.
+				// The repaired segment's clean prefix is recovered and fully
+				// reflected in memory, like any clean segment's, and nothing is
+				// in flight during recovery: it is committed, and GC may
+				// consider it. Leaving the mark below it would keep a repaired
+				// final segment that holds only dead records — a retired
+				// replica's, say — out of reach of the reclaim that follows
+				// replay (purgeRetired).
 				s.advanceCommittedHWM(segID)
 				break
 			}
 			return err
 		}
-		// Seed the commit high-water mark to the highest replayed segment.
+		// Every segment whose replay completed is fully reflected in the
+		// in-memory index and meta pins, so it is safe for GC to consider.
+		// Seed the commit high-water mark to the highest such segment ID so a
+		// Compact that runs before any new write on a freshly reopened DB is
+		// not over-conservative and can still reclaim dead segments.
 		s.advanceCommittedHWM(segID)
 	}
 
-	// fdatasync the highest clean segment before it becomes non-final, since its last sync mark may only be in the page cache.
+	// The highest segment replayed clean, and the next write will create a
+	// higher one (ensureActiveSegment), making it NON-FINAL — which recovery
+	// holds to be durable end to end. After a PROCESS crash it is not quite:
+	// Sync writes its mark after its fdatasync, so the last acknowledged
+	// batch's mark may still be sitting in the page cache, replayed from
+	// there just now and never fsynced (rotation's idle Sync and
+	// segment.Close cover the paths that go through the writer; this one
+	// does not). A later power loss tearing that mark in its writeback window
+	// would then be refused as ErrNonFinalSegmentCorruption with nothing
+	// acknowledged lost. One fdatasync here, before the segment can become
+	// non-final, closes that; under noSync nothing is durable anyway.
 	if len(segIDs) > 0 && !s.opts.noSync {
 		if err := s.syncSegmentFile(highest); err != nil {
 			return err
@@ -878,7 +1310,42 @@ func (s *walShard) syncSegmentFile(segID uint64) error {
 	return nil
 }
 
-// reconcileCompactionFloors raises a replayed floor below the index start: from the durable COMPACTED file, else firstIndex-1 when a recorded snapshot covers the gap, else unchanged.
+// reconcileCompactionFloors repairs a recovered state whose entry index starts
+// ABOVE the replayed compaction floor: from the durable floor file first, then,
+// when a recorded snapshot explains the gap, from the index; it leaves the
+// floor unchanged otherwise.
+//
+// The WAL marker record is as durable as one block, but its effect — the
+// segment holding the compacted entries being unlinked — is irreversible. Tear
+// the block holding that marker and replay comes back with a LOWER floor (often
+// 0) while the entries it covered are physically gone. The COMPACTED file is
+// what restores it: every unlink waits for the file to cover the floor (see
+// compaction_floor.go), so the higher of the two copies is never below the
+// floor any unlinked entry was compacted under.
+//
+// Without that file the state would FAIL OPEN, which is what makes it dangerous: the index itself is
+// self-consistent (a missing PREFIX keeps span == count, unlike an interior hole),
+// so EntryRange accepts it and the node starts. Reads below the real floor then
+// return ErrLogGapDetected instead of ErrCompacted, and raft would never fall
+// back to InstallSnapshot (see the monotonic guard in RemoveEntriesTo). The regressed floor also defeats that guard, so a LOWER floor
+// can afterwards be accepted and made durable.
+//
+// The floor is re-derived from the REBUILT INDEX (firstIndex-1), never from the
+// snapshot index: the snapshot pool deliberately retains CompactionOverhead
+// entries below the snapshot for cheap follower catch-up, so anchoring at the
+// snapshot would mark live, deliberately-kept entries unreadable and force a full
+// InstallSnapshot on every lagging follower after any restart.
+//
+// The snapshot is the VALIDITY CHECK on that derivation, not its source: the
+// advance is accepted only when a recorded snapshot actually covers the missing
+// prefix. Otherwise the floor is left UNCHANGED: deriving one from the index
+// would let an unexplained missing prefix masquerade as legitimate compaction,
+// so that a replica would acknowledge entries whose state nothing ever
+// captured. It is not an error either, because an absent prefix with no
+// covering snapshot is indistinguishable from a node that legitimately starts
+// at a high index; reads below the first index keep reporting
+// ErrLogGapDetected. A prefix lost to compaction never reaches this case: its
+// floor is in the durable file, which recovery has already applied.
 func (s *walShard) reconcileCompactionFloors() error {
 	// The durable floor file first: it is the proof, and a floor it restores
 	// leaves no missing prefix for the snapshot rule below to consider.
@@ -892,7 +1359,12 @@ func (s *walShard) reconcileCompactionFloors() error {
 		if first.Index <= floor+1 {
 			continue // contiguous with the floor: nothing missing
 		}
-		// Repair a missing prefix only when a recorded snapshot covers it; otherwise the node may legitimately start high.
+		// A prefix is absent. Repair ONLY when a recorded snapshot covers it,
+		// which is the lost-marker case (compaction always follows a snapshot).
+		//
+		// Deliberately NOT an error otherwise: an absent prefix with no snapshot
+		// is INDISTINGUISHABLE from a node that legitimately starts at a high
+		// index, and rejecting it would refuse to start healthy replicas.
 		derived := first.Index - 1
 		snap, ok := s.snapshots[key]
 		if !ok || snap.Index < derived {
@@ -911,7 +1383,28 @@ func (s *walShard) reconcileCompactionFloors() error {
 	return nil
 }
 
-// discardSegmentsAbove removes segments unreachable after prefix truncation, clears their pins and fsyncs the directory; a segment that can be neither removed nor emptied is a fatal RecoveryError.
+// discardSegmentsAbove removes WAL segment files left unreachable after a
+// prefix-truncation recovery. Their IDs are dropped from knownSegments, any
+// meta-segment pin pointing at a discarded ID is cleared, the files are
+// deleted, and the directory is fsynced so the deletions survive a crash.
+//
+// An orphan that can be neither removed nor emptied is fatal (RecoveryError):
+// an intact orphan holds CRC-valid records past the recovered prefix, and if
+// it survives into the next restart its stale HardState replays and can
+// regress term/vote (a node could vote twice in one term). When Remove fails,
+// the fallback truncates the orphan to zero length and fsyncs it — a
+// zero-length segment replays to nothing, which is equivalent to deletion for
+// recovery purposes. recover() advances nextSegmentID past every observed
+// segment before replay, so even a lingering orphan can never be ordered
+// after freshly written segments.
+//
+// Clearing meta pins is purely tidiness. A pin set during replay of a
+// now-discarded higher segment would otherwise survive as a phantom: a
+// non-existent segment ID that addMetaSegmentsToLive folds into liveSegments,
+// where GarbageCollect simply never matches it (no file with that ID exists).
+// rollbackShard does NOT need this same cleanup: meta pins are set only at the
+// Phase-3 commit point, after a successful durable write, so a rolled-back
+// batch never reached the point of setting a pin in the first place.
 func (s *walShard) discardSegmentsAbove(orphans []uint64) error {
 	if len(orphans) == 0 {
 		return nil
@@ -930,7 +1423,14 @@ func (s *walShard) discardSegmentsAbove(orphans []uint64) error {
 			return &RecoveryError{SegmentID: segID, Err: tErr}
 		}
 	}
-	// A directory fsync failure is fatal: the deletions are not durable without it.
+	// The unlinks are not durable until the directory entry updates are, and
+	// this failure is FATAL rather than a warning. recover() happens to repeat
+	// the directory fsync fatally a few lines later, but Repair does not: it
+	// would return a RepairResult naming the segments it deleted while a crash
+	// could still resurrect their directory entries — segments holding CRC-valid
+	// records ABOVE the offset the operator authorized truncating at, which is
+	// the term/vote regression (a node voting twice in one term) that the
+	// directory fsync exists to prevent. Reporting it lets both callers stop.
 	if err := syncDirFS(s.fs, s.dir); err != nil {
 		slog.Error("waldb: could not make the discard of orphaned WAL segments "+
 			"durable; their deletion may not survive a crash",
@@ -940,7 +1440,15 @@ func (s *walShard) discardSegmentsAbove(orphans []uint64) error {
 	return nil
 }
 
-// truncateCorruptSegment truncates a segment to cleanEnd and fsyncs it; never written again, so the end need not be block-aligned.
+// truncateCorruptSegment cuts a segment back to the clean prefix that recovery
+// actually replayed and fsyncs the file, so the corrupt tail is gone from disk.
+// A no-op when the file is already at or below cleanEnd.
+//
+// The segment is never written to again: recover() advances nextSegmentID past
+// every observed segment ID before replay, so ensureActiveSegment always opens
+// a fresh, higher-numbered segment. The truncated end therefore need not be
+// block-aligned — ReadAll strides the block grid from offset 0 and clamps its
+// final read to the file size.
 func (s *walShard) truncateCorruptSegment(segID uint64, cleanEnd int64) error {
 	name := filepath.Join(s.dir, segmentFilename(segID))
 	f, err := s.fs.OpenFile(name, os.O_RDWR, 0600)
@@ -987,7 +1495,10 @@ func (s *walShard) truncateOrphanToZero(name string) error {
 	return f.Close()
 }
 
-// replaySegment replays a segment's records and returns ReadAll's clean-prefix end for repair on errRecoveryTruncated.
+// replaySegment opens a segment file read-only, reads all records, and
+// replays them to rebuild in-memory state. It returns the clean-prefix end
+// offset reported by ReadAll, which recover() uses to repair the segment on
+// disk when the returned error is errRecoveryTruncated.
 func (s *walShard) replaySegment(segID uint64) (int64, error) {
 	name := filepath.Join(s.dir, segmentFilename(segID))
 	f, err := s.fs.Open(name)
@@ -1039,7 +1550,24 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 				}
 			}
 
-			// Rebuild the record's positional AAD from i, the logical record ordinal; no retry without context, and noContextBinding mirrors the write side.
+			// Reproduce the record's positional context-AAD. ReadAll returns
+			// ASSEMBLED LOGICAL records — First/Middle/Last chunks are joined
+			// into one entry before being appended — so i counts exactly what
+			// the write side counted with segment.RecordCount, one per
+			// writeRecord call. ReadAll also stops at the first corrupt record
+			// or zero hole, so the survivors are a clean prefix and no ordinal
+			// is ever skipped.
+			//
+			// There is NO retry without the context if this fails: that
+			// fallback would BE the vulnerability it is here to close. A
+			// context mismatch is reported exactly like any other
+			// authentication failure — fatal, as an undecryptable record
+			// always has been.
+			//
+			// noContextBinding mirrors the write side exactly: a barrier that
+			// cannot authenticate a context sealed these records with none and
+			// must open them with none. That is the SAME open-time decision the
+			// writer made, not a reaction to a failure.
 			var contextAAD []byte
 			if !s.noContextBinding {
 				contextAAD = s.recordContext(segID, uint64(i))
@@ -1054,7 +1582,12 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 			replayData = decrypted
 		}
 
-		// A record that passed CRC but does not decode is an error, never skipped.
+		// Every record here already passed its chunk CRC, so a decode failure
+		// is corruption or a format skew, not something to skip: a dropped
+		// State record lets an OLDER one win last-writer-wins (term/vote
+		// regression => double vote) and a dropped Snapshot record boots the
+		// node with empty membership. replayRecord therefore reports all such
+		// failures as errors and recovery fails loudly.
 		skipped, reason, rerr := s.replayRecord(replayData, segID)
 		if rerr != nil {
 			return cleanEnd, &RecoveryError{SegmentID: segID, Err: rerr}
@@ -1076,22 +1609,40 @@ func (s *walShard) replaySegment(segID uint64) (int64, error) {
 		)
 	}
 
-	// A lower generation above the corruption is foreign bytes, reported on its own sentinel.
+	// A durability generation above the corruption that is lower than the clean
+	// prefix's is not a state any writer of this segment can produce. Reported
+	// on its own sentinel, ahead of the acknowledged-data case, because the
+	// remedy differs: the bytes are foreign, so the question is what put them
+	// there, not which of this node's records were lost.
 	if readSeg.sequenceRegression {
 		return cleanEnd, errRecordSequenceRegression
 	}
 
-	// Records above the corruption span a completed fdatasync, so they were acknowledged: fail-stop.
+	// The records ABOVE the corruption span a completed fdatasync, so they were
+	// acknowledged. The corruption is not this segment's interrupted tail;
+	// signal recover() to fail-stop rather than repair, exactly as for a
+	// non-final segment. Checked before the plain stoppedAtCorruption case
+	// because it is the stricter reading of it.
 	if readSeg.ackedDataAfterCorruption {
 		return cleanEnd, errMidSegmentCorruption
 	}
 
-	// The surviving generation began above the corruption offset, so acknowledged bytes were destroyed: fail-stop.
+	// The records above the corruption are one unsynced generation, but that
+	// generation BEGAN above the corruption offset: the fdatasync that opened
+	// it acknowledged bytes the damage destroyed. Fail-stop, exactly as for
+	// the case above; the sentinel is distinct because the evidence is.
 	if readSeg.acknowledgedDataLost {
 		return cleanEnd, errAcknowledgedDataLost
 	}
 
-	// A torn tail with nothing acknowledged lost: stop the segment loop here so the truncation discards no acknowledged record.
+	// If ReadAll halted at a corrupt/torn record, this segment's clean prefix
+	// has been replayed but everything after the corruption — INCLUDING all
+	// higher-numbered segments — must NOT be replayed (a WAL is valid only as
+	// a prefix). Signal recover() to stop the segment loop here. Reaching this
+	// point means the durability generations either found nothing above the
+	// damage or placed everything there in the segment's final unsynced batch,
+	// AND that batch began at or below the damage, so the truncation recover()
+	// performs provably discards no acknowledged record.
 	if readSeg.stoppedAtCorruption {
 		slog.Warn("waldb: halting recovery after corruption; later segments skipped",
 			"segment_id", segID)
@@ -1115,28 +1666,93 @@ func isCorruptionVerdict(err error) bool {
 // to and including this segment is recovered; no higher segment is replayed.
 var errRecoveryTruncated = errors.New("waldb: recovery truncated at corruption")
 
-// errMidSegmentCorruption signals acknowledged records above a corrupt record; recover() reports ErrMidSegmentCorruption.
+// errMidSegmentCorruption signals that replaySegment halted at a corrupt
+// record above which the surviving records span a completed fdatasync, so they
+// were acknowledged. recover() turns it into ErrNonFinalSegmentCorruption's
+// sibling, ErrMidSegmentCorruption, and fails the open.
 var errMidSegmentCorruption = errors.New("waldb: corruption with acknowledged data after it")
 
-// errAcknowledgedDataLost signals survivors naming an acknowledged end above the corruption; recover() reports ErrAcknowledgedDataLost.
+// errAcknowledgedDataLost signals that replaySegment halted at a corrupt
+// record whose surviving records name an acknowledged end ABOVE the
+// corruption offset. recover() turns it into ErrAcknowledgedDataLost and fails
+// the open.
 var errAcknowledgedDataLost = errors.New("waldb: corruption below the acknowledged end")
 
-// errRecordSequenceRegression signals a lower durability generation above a corruption; recover() reports ErrRecordSequenceRegression.
+// errRecordSequenceRegression signals that replaySegment found, above a
+// corruption, a record whose durability generation is LOWER than one already
+// replayed from the clean prefix. recover() turns it into
+// ErrRecordSequenceRegression and fails the open.
 var errRecordSequenceRegression = errors.New("waldb: record durability sequence regressed")
 
-// ErrNonFinalSegmentCorruption is returned, in a RecoveryError, for corruption in a segment that is not the highest; restore from snapshot or peers.
+// ErrNonFinalSegmentCorruption is returned (wrapped in a RecoveryError) when
+// recovery finds corruption in a segment that is NOT the highest-numbered one.
+// A torn tail can only exist in the final segment — a lower segment was fully
+// fdatasynced before any higher one was created and everything above it is
+// committed — so prefix-truncating it would silently destroy committed entries
+// and regress term/vote. Recovery fails-stop; restore from snapshot/peers.
 var ErrNonFinalSegmentCorruption = errors.New("waldb: corruption in a non-final WAL segment; committed data above it would be lost — restore from snapshot/peers")
 
-// ErrMidSegmentCorruption is returned, in a RecoveryError, for corruption followed by decodable records in the same segment; restore from snapshot or peers.
+// ErrMidSegmentCorruption is returned (wrapped in a RecoveryError) when
+// recovery finds corruption that is followed, in the SAME segment, by records
+// that still decode. Being in the highest-numbered segment is not enough to
+// call corruption a torn tail: a torn write leaves nothing readable behind it,
+// so decodable bytes further down are records the medium accepted and the node
+// acknowledged — bit rot, a misdirected write, a lying fsync or tampering hit
+// the middle of a live segment. Truncating to the clean prefix would discard
+// every one of them plus the newest HardState, so the node would boot with a
+// shorter log than it acknowledged (Log Matching / Leader Completeness) and a
+// stale term/vote it could then cast again (Election Safety). Recovery
+// fail-stops instead; restore from snapshot/peers.
 var ErrMidSegmentCorruption = errors.New("waldb: WAL corruption with acknowledged records after it; not an interrupted write — committed data would be lost — restore from snapshot/peers")
 
-// ErrAcknowledgedDataLost is returned, in a RecoveryError, when the surviving generation starts above the corruption, proving acknowledged bytes were lost; restore or authorize with Repair.
+// ErrAcknowledgedDataLost is returned (wrapped in a RecoveryError) when
+// recovery finds corruption whose surviving records — all of one unsynced
+// generation, the shape of an ordinary interrupted write — carry a generation
+// start ABOVE the corruption offset. Every chunk records the file offset at
+// which its durability generation began, which is the acknowledged end when
+// the fdatasync that closed the previous generation returned; a start above
+// the damage therefore proves that fdatasync acknowledged bytes the damage
+// destroyed. An interrupted write cannot produce this: a lost writeback leaves
+// an fsynced page at its persisted content, so its damage begins at or above
+// the acknowledged end. This is media damage or tampering under acknowledged
+// data. Truncating would bring the node up holding a strictly shorter log than
+// the one it acknowledged to its peers (Log Matching / Leader Completeness)
+// and possibly a stale vote it could cast again (Election Safety), so recovery
+// fail-stops; restore from snapshot/peers, or authorize the loss with Repair.
+//
+// Before the generation start was recorded, this shape was indistinguishable
+// from the leading-page loss of an ordinary power cut, and recovery truncated
+// both while reporting a "residual" for the operator to reconcile by hand.
 var ErrAcknowledgedDataLost = errors.New("waldb: WAL corruption below the acknowledged end; records this node reported durable were destroyed — restore from snapshot/peers")
 
-// ErrRecordSequenceRegression is returned, in a RecoveryError, for a lower durability generation above a corruption; restore or authorize with Repair.
+// ErrRecordSequenceRegression is returned (wrapped in a RecoveryError) when
+// recovery finds, above a corruption, a record whose durability generation is
+// LOWER than one already replayed below it. A segment's generation counter only
+// ever rises, so no writer of this WAL produced that layout: the bytes are a
+// misdirected write from elsewhere on the device, a partial restore of an older
+// file over a newer one, or deliberate tampering. Recovery cannot classify the
+// damage and refuses to guess — truncating could destroy acknowledged records,
+// and replaying could admit records this node never wrote. Restore from
+// snapshot/peers, or authorize the loss explicitly with Repair.
 var ErrRecordSequenceRegression = errors.New("waldb: WAL record durability sequence goes backwards; these bytes were not written by this log — restore from snapshot/peers")
 
-// SegmentCorruptionError gives the shard, segment and offset of a corruption recovery refused to repair, so Repair can be authorized exactly; it unwraps to its sentinel.
+// SegmentCorruptionError carries the exact location of a corruption that
+// recovery refused to repair on its own, so the operator has every value Repair
+// needs without having to find them by hand.
+//
+// This exists because "restore from snapshot/peers" is not a complete answer: on
+// a single-node deployment there are no peers to restore from. The node must
+// therefore be told precisely which shard, which segment and which offset, so
+// that an operator who decides the loss is acceptable can authorize exactly that
+// truncation and nothing wider. It unwraps to the sentinel it was built with, so
+// errors.Is checks against ErrMidSegmentCorruption,
+// ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost and
+// ErrRecordSequenceRegression all work.
+//
+// An ordinary power loss does not reach it: the durability sequence separates
+// a torn multi-block write from rot below acknowledged data, and recovery
+// repairs the torn write itself, so reaching this error means damage that an
+// interrupted write does not explain.
 type SegmentCorruptionError struct {
 	// ShardIndex is the WAL shard directory holding the segment.
 	ShardIndex int
@@ -1169,8 +1785,33 @@ func (e *SegmentCorruptionError) Unwrap() error {
 
 // Payload type bytes that prefix each WAL record to identify its content.
 const (
-	// Retired and never reallocated: 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0c; replayRecord refuses them with ErrUnknownPayloadType.
-	// payloadTypeState is the hard-state format, with the vote window after Term, Vote and Commit (stateRecordSize).
+	// RETIRED, NEVER REALLOCATED: 0x01, 0x02, 0x03, 0x06, 0x07, 0x08, 0x09, 0x0a,
+	// 0x0c.
+	//
+	// 0x0c was the snapshot layout whose membership section closed its
+	// replicated-policy tail without the committed WireVersion.
+	//
+	// 0x06 was the RemoveNode tombstone. A removal is now kept in the
+	// retired-replica registry beside the WAL (retired.go), not as a record.
+	//
+	// Each named an entry, snapshot or hard-state layout whose fields have
+	// since moved. A
+	// record still carrying one cannot be read by the current decoder, and the
+	// danger is not that it fails -- it is that it does not. The offsets shift
+	// rather than run off the end, so a stale record can satisfy every length
+	// check and decode into plausible garbage.
+	//
+	// They are left UNALLOCATED rather than named, so replayRecord's default
+	// case refuses them with the standard ErrUnknownPayloadType. There is no
+	// per-layout error to keep in step with a layout nobody can read: the only
+	// remedy any of them has is to wipe the data directory and re-sync from
+	// peers.
+	//
+	// Reallocating one of these bytes would make a stale record indistinguishable
+	// from a current one, which is exactly how the 0x07 and 0x0a collisions
+	// happened. Take the next free value instead.
+	// payloadTypeState is the current hard-state format, which carries the
+	// vote window after Term, Vote and Commit (stateRecordSize).
 	payloadTypeState     byte = 0x0d
 	payloadTypeBootstrap byte = 0x04
 	payloadTypeCompact   byte = 0x05
@@ -1184,15 +1825,25 @@ const (
 	payloadTypeSnapshot byte = 0x0e
 )
 
-// ErrUnsupportedSnapshotCompression is returned when a snapshot record names a compression this binary cannot decompress.
+// ErrUnsupportedSnapshotCompression is returned when a snapshot record
+// declares a compression algorithm this binary cannot decompress. Recovering
+// the artifact would hand the state machine bytes in an unknown encoding, so
+// replay fails instead.
 var ErrUnsupportedSnapshotCompression = errors.New(
 	"waldb: snapshot record declares an unsupported compression algorithm")
 
-// ErrUnsupportedMembershipVersion is returned when a snapshot's membership section version is not membershipSectionVersion; fatal.
+// ErrUnsupportedMembershipVersion is returned when a current-format
+// snapshot record carries a membership section whose version byte is not
+// membershipSectionVersion. Fatal: the section's fields cannot be located
+// without knowing its layout, and accepting an empty membership instead
+// would strip the node's configuration.
 var ErrUnsupportedMembershipVersion = errors.New(
 	"waldb: snapshot record membership section has unsupported version")
 
-// replayRecord decodes a raw WAL record into in-memory state, returning skipped counts and reason; a non-nil error is fatal to recovery.
+// replayRecord decodes a raw WAL record and updates the in-memory state.
+// Returns the number of individual entries/records skipped due to
+// malformed data, and the reason for any top-level skip. A non-nil error
+// is fatal to recovery (the WAL cannot be replayed safely at all).
 func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason string, err error) {
 	if len(rec) < 1 {
 		return 1, "empty record", nil
@@ -1203,12 +1854,18 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 
 	switch payloadType {
 	case payloadTypeEntries:
-		// A malformed entry batch passed CRC, so it is corruption: fatal.
+		// A malformed entry batch is fatal, not a skip: the record's CRC
+		// already passed, so a mid-record decode failure is corruption
+		// that would otherwise leave a silent hole in the replayed log
+		// while later records still replay (Log Matching violation).
 		if rerr := s.replayEntries(data, segID); rerr != nil {
 			return 0, "", rerr
 		}
 	case payloadTypeState:
-		// A skipped State record would regress Term/Vote: fatal.
+		// Fatal for the same reason as an entry batch, only worse: a skipped
+		// State record lets an OLDER state win last-writer-wins replay,
+		// regressing Term/Vote and allowing a double vote in one term
+		// (Election Safety violation).
 		if rerr := s.replayState(data, segID); rerr != nil {
 			return 0, "", rerr
 		}
@@ -1227,7 +1884,15 @@ func (s *walShard) replayRecord(rec []byte, segID uint64) (skipped int, reason s
 			return 0, "", rerr
 		}
 	default:
-		// An unknown payload type is corruption or format skew, typically a keyed WAL opened without its barrier: fail-stop.
+		// Payload types are written only by this package and are covered by
+		// the chunk CRC, so an unknown type is corruption or a format skew
+		// and must fail-stop. The dominant real-world cause is opening a
+		// KEYED WAL with barrier==nil: barrier ciphertext starts with an
+		// 8-byte big-endian epoch whose first byte is 0x00 for every
+		// realistic epoch, so with no decrypt attempted EVERY record would
+		// decode as payload type 0x00. Skipping them booted the node as a
+		// brand-new empty replica that votes with no memory of prior votes
+		// and accepts a log it had already superseded.
 		return 0, "", ErrUnknownPayloadType
 	}
 	return skipped, "", nil
@@ -1243,10 +1908,25 @@ const entryRecordHeaderSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 4 // 84 by
 // corrupted length prefixes from causing unbounded memory allocation.
 const maxCmdLen = 8 * 1024 * 1024 // 8 MB
 
-// replayEntries rebuilds entries from a batch record; any malformed entry aborts recovery with a typed error.
+// replayEntries rebuilds in-memory entries from a serialized entry batch.
+// Any malformed entry aborts recovery with a typed error: the batch was
+// written as one CRC-protected record, so a mid-record decode failure is
+// corruption the chunk CRC did not explain, and skipping the remainder
+// while later records/segments still replay would leave a silent hole in
+// the log (a Log Matching violation served to followers as a shortened,
+// nil-error range). Entries decoded before the abort may already be stored;
+// that is irrelevant because the caller fails the whole recovery.
 func (s *walShard) replayEntries(data []byte, segID uint64) error {
 	pos := 0
-	// Track the batch's node and span so an overwrite can prune orphaned higher entries, as applyTo does.
+	// Track the batch's node key and index span so a leader-overwrite (the
+	// first replayed index already present in the entry map) can prune the
+	// now-orphaned higher indices after the batch is stored — mirroring the
+	// write path (applyTo). idx.Append already truncates the superseded index
+	// suffix, but the entry MAP would otherwise retain indices above the
+	// overwrite's last index (memory-only, unreachable via the index-driven
+	// range) until compaction. All entries in one record share a single node
+	// key (writeEntryChunk writes one key's batch), so the first entry is
+	// representative.
 	var (
 		batchKey      nodeKey
 		batchStarted  bool
@@ -1276,7 +1956,10 @@ func (s *walShard) replayEntries(data []byte, segID uint64) error {
 		ownerID := binary.LittleEndian.Uint64(data[pos+72:])
 		cmdLen := binary.LittleEndian.Uint32(data[pos+80:])
 
-		// Cap cmdLen as the write path does; a larger value is corruption.
+		// Validate cmdLen against the maximum allowed entry size to
+		// prevent corrupted length prefixes from causing unbounded
+		// memory allocation during recovery. The write path enforces the
+		// same cap (writeEntries), so a stored violation is corruption.
 		if cmdLen > maxCmdLen {
 			slog.Error("waldb: entry cmdLen exceeds maximum during replay",
 				"segment_id", segID,
@@ -1347,7 +2030,10 @@ func (s *walShard) replayEntries(data []byte, segID uint64) error {
 
 		pos += totalSize
 	}
-	// On an overwrite, prune map entries above its last index.
+	// Prune entries above the overwrite's last index. idx.Append already
+	// truncated the superseded index suffix; this keeps the entry map in sync
+	// so a stale range (e.g. entries 61-100 left after a 50-60 conflict
+	// rewrite) does not linger in memory. Runs only on an actual overwrite.
 	if overwrite {
 		nodeEntries := s.entries[batchKey]
 		for k := range nodeEntries {
@@ -1400,13 +2086,34 @@ func (s *walShard) replayState(data []byte, segID uint64) error {
 // [NumRemovedIdentities:4]{ [ReplicaID:8][IdentityLen:4][Identity:N] }...
 const snapshotRecordBaseSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 2 + 4 // 62 bytes
 
-// membershipSectionV1 is the one membership section layout this binary reads and writes; see the compatibility contract in the proto package comment.
+// membershipSectionV1 is the one layout revision this binary reads or writes
+// for the membership section of a snapshot record.
+//
+// It is 1 because the project is PRE-RELEASE and every format in the repository
+// is pinned at 1 until the first production release: a layout change is made in
+// place, the consuming repos are rebuilt to match, and development clusters are
+// wiped and re-synced rather than migrated. See the compatibility contract in the proto package comment.
 const membershipSectionV1 byte = 1
 
-// membershipSectionVersion is the membership section version this binary writes and the only one it reads; it mirrors proto.Membership's version byte.
+// membershipSectionVersion is the layout revision this binary WRITES for the
+// membership section of a snapshot record, stored as the section's first byte,
+// and — replay gating on exact equality — the only one it READS. It mirrors the
+// proto.Membership version byte and moves in lockstep with payloadTypeSnapshot:
+// the payload type discriminates records, this byte discriminates the section
+// within a record.
+//
+// The byte is retained through the pinned period rather than dropped, for the
+// reason the proto package comment gives: a format with no in-band
+// discriminator cannot be superseded at 1.0, and a section that skipped it
+// would begin at ConfigChangeID, whose low byte is indistinguishable from a
+// version. Refusing anything that is not this value turns a commit skew into a
+// clean recovery failure instead of fields read at the wrong offsets.
 const membershipSectionVersion byte = membershipSectionV1
 
-// previousMembershipSectionVersion is the previous minor release's section layout (docs/compatibility, "The accept sets"); equal to membershipSectionVersion at v1.0.
+// previousMembershipSectionVersion is the second member of the closed read
+// window (docs/compatibility, "The accept sets"): the section layout the
+// previous MINOR release wrote. v1.0 has no previous release, so it equals
+// membershipSectionVersion and the set has one member.
 const previousMembershipSectionVersion byte = membershipSectionVersion
 
 // acceptsMembershipSectionVersion reports whether v is in the closed read
@@ -1415,10 +2122,26 @@ func acceptsMembershipSectionVersion(v byte) bool {
 	return v == membershipSectionVersion || v == previousMembershipSectionVersion
 }
 
-// membershipFixedSize is the fixed region: Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1); the session policy is a tail.
+// membershipFixedSize is the size of the membership section's fixed region:
+// Version(1) + ConfigChangeID(8) + MaxWitnesses(8) + PolicyFlags(1).
+//
+// The replicated session policy is a TAIL here and part of the FIXED region in
+// proto.Membership. The two layouts are independent by design (this section
+// carries PolicyFlags as one byte where proto spends eight), and the difference
+// is deliberate: this decoder parses straight-line from a fixed offset, so
+// growing the fixed region moves every map, while appending to the tail does
+// not.
 const membershipFixedSize = 1 + 8 + 8 + 1 // 18 bytes
 
-// minMembershipSize is the smallest well-formed membership section, equal to membershipSize of an empty membership; checked before the version byte.
+// minMembershipSize is the smallest well-formed membership section: the fixed
+// region, six empty map count headers and the session policy. It is the length
+// guard replay applies BEFORE reading the version byte, so that a section too
+// short to hold the layout is reported as a torn record rather than being read
+// past its own end.
+//
+// It equals membershipSize of an empty membership, and must: there is one
+// layout, every field is written unconditionally, and the read floor and the
+// written size are therefore the same number by construction.
 const minMembershipSize = membershipFixedSize + 6*4 + membershipSessionPolicySize // 82 bytes
 
 // membershipAddrMapSize returns the total serialized size for an address map:
@@ -1483,7 +2206,15 @@ func marshalRemovedMap(buf []byte, pos int, m map[uint64]bool) int {
 	return pos
 }
 
-// maxMembershipMapEntries caps a declared membership or bootstrap map count before allocation, mirroring proto.MaxMembershipEntries; larger is corrupt.
+// maxMembershipMapEntries caps the declared entry count of any WAL
+// membership or bootstrap address/removed map before allocation. A
+// membership map can never exceed the cluster size, which is far below
+// this bound; this mirrors proto.MaxMembershipEntries (10000) and prevents
+// a corrupted or tampered count prefix from forcing a multi-GB allocation
+// during recovery. A record whose declared count exceeds this cap is
+// treated as corrupt. The plaintext WAL path relies on this guard because
+// chunk CRC32 only detects accidental corruption; the encrypted path is
+// additionally AEAD-authenticated.
 const maxMembershipMapEntries = 10000
 
 // checkMembershipSize rejects a membership whose any map exceeds
@@ -1494,7 +2225,11 @@ func checkMembershipSize(m logdb.Membership) error {
 		len(m.Observers) > maxMembershipMapEntries ||
 		len(m.Witnesses) > maxMembershipMapEntries ||
 		len(m.Removed) > maxMembershipMapEntries ||
-		// Identities and RemovedIdentities share the per-map cap with the decoder.
+		// Identities and RemovedIdentities are written by the same encoder and
+		// read back through the same per-map cap, so omitting them here broke
+		// the symmetry this function exists to hold: an oversized map produced
+		// a snapshot record that was durable and then rejected as corrupt on
+		// replay.
 		len(m.Identities) > maxMembershipMapEntries ||
 		len(m.RemovedIdentities) > maxMembershipMapEntries {
 		return ErrMembershipTooLarge
@@ -1510,7 +2245,11 @@ const addrMapEntryMinBytes = 12
 // entry: [ReplicaID:8].
 const removedMapEntryMinBytes = 8
 
-// boundedMapHint returns a map size hint no larger than the remaining bytes could hold at perEntryMinBytes each.
+// boundedMapHint returns a map preallocation hint that is never larger than
+// what the remaining record bytes could physically contain. perEntryMinBytes
+// is the smallest valid on-disk size of a single entry, so remaining bytes
+// divided by it is a hard upper bound on the real entry count regardless of
+// the declared count.
 func boundedMapHint(count uint32, remaining, perEntryMinBytes int) int {
 	hint := int(count)
 	if max := remaining / perEntryMinBytes; hint > max {
@@ -1575,7 +2314,10 @@ func unmarshalRemovedMap(data []byte, pos int) (map[uint64]bool, int) {
 	return m, pos
 }
 
-// replaySnapshot rebuilds per-node snapshot metadata; a parse failure returns ErrTruncatedSnapshotRecord and is fatal.
+// replaySnapshot rebuilds per-node snapshot metadata. A parse failure is
+// corruption (the chunk CRC already passed) and returns
+// ErrTruncatedSnapshotRecord; recovery treats it as fatal because a dropped
+// snapshot record boots the node with empty membership.
 func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	if len(data) < snapshotRecordBaseSize {
 		slog.Error("waldb: truncated snapshot record during replay",
@@ -1601,7 +2343,10 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 		return ErrUnsupportedSnapshotCompression
 	}
 
-	// Bound-check in uint64 so 32-bit platforms cannot truncate or wrap fpLen.
+	// Bound-check in uint64: on 32-bit platforms int(fpLen) sign-truncates
+	// for fpLen >= 2^31 and 60+fpLen wraps in uint32, so an int-domain
+	// comparison would pass a corrupt length and panic on the slice below.
+	// Once the guard holds, fpLen fits in int (it is <= len(data)).
 	if uint64(len(data)) < uint64(snapshotRecordBaseSize)+uint64(fpLen) {
 		slog.Error("waldb: snapshot record filepath exceeds record length during replay",
 			"segment_id", segID, "length", len(data), "filepath_len", fpLen)
@@ -1610,14 +2355,22 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	fp := string(data[snapshotRecordBaseSize : snapshotRecordBaseSize+int(fpLen)])
 	pos := snapshotRecordBaseSize + int(fpLen)
 
-	// The membership section is always written; anything shorter than its minimum is a torn record.
+	// Deserialize membership. The writer ALWAYS emits the section, whose
+	// minimum well-formed size is the fixed region plus the six map count
+	// headers and the session policy. Anything shorter — including a wholly
+	// absent section — is a torn record (the chunk CRC should already have
+	// rejected it; this is defense in depth) and must NOT be silently accepted
+	// as an empty membership.
 	var membership logdb.Membership
 	if len(data)-pos < minMembershipSize {
 		slog.Error("waldb: snapshot record missing membership section during replay",
 			"segment_id", segID, "remaining", len(data)-pos, "minimum", minMembershipSize)
 		return ErrTruncatedSnapshotRecord
 	}
-	// Accept only the exact section version this binary writes.
+	// Defense in depth behind the payload-type gate, on EXACT equality: a
+	// section version other than the one this binary writes means the record is
+	// corrupt or was produced by a binary built from a different pre-release
+	// commit, and its fields must not be interpreted at this layout's offsets.
 	sectionVersion := data[pos]
 	if !acceptsMembershipSectionVersion(sectionVersion) {
 		slog.Error("waldb: snapshot record membership section has unsupported version",
@@ -1667,7 +2420,11 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	}
 	pos = ok
 
-	// Check the remaining length before reading the session policy.
+	// The session policy. Its length is checked explicitly rather than leaned
+	// on minMembershipSize, which bounds the section as a whole and not the
+	// remainder at this offset: a record whose maps consumed more than their
+	// share would leave fewer than membershipSessionPolicySize bytes here, and
+	// the fixed-width reads below would slice past the record.
 	if len(data)-pos < membershipSessionPolicySize {
 		slog.Error("waldb: snapshot record membership section is missing its session policy",
 			"segment_id", segID, "remaining", len(data)-pos,
@@ -1681,7 +2438,11 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	membership.WireVersion = binary.LittleEndian.Uint64(data[pos+32:])
 	pos += membershipSessionPolicySize
 
-	// RemovedIdentities closes the section; it is the receive gate's identity deny-list.
+	// RemovedIdentities closes the section. It is the deny-list the receive
+	// gate evaluates against the AUTHENTICATED connection identity, so a
+	// snapshot that lost it would not merely lose information — it would revoke
+	// a revocation, and the replica would come back having forgotten which
+	// keypairs it ejected.
 	membership.RemovedIdentities, ok = unmarshalAddrMap(data, pos)
 	if ok == -1 {
 		return ErrTruncatedSnapshotRecord
@@ -1714,7 +2475,15 @@ func (s *walShard) replaySnapshot(data []byte, segID uint64) error {
 	return nil
 }
 
-// Bootstrap encoding layout: [ShardID:8][ReplicaID:8][Join:1][Type:8][NumAddrs:4], per address [ReplicaID:8][AddrLen:4][Addr:N], then [DataDirLen:4][DataDir:N].
+// Bootstrap encoding layout:
+// [ShardID:8][ReplicaID:8][Join:1][Type:8][NumAddrs:4]
+// For each addr: [ReplicaID:8][AddrLen:4][Addr:N]
+// [DataDirLen:4][DataDir:N]
+//
+// The DataDir field is a TRAILING extension: records written before it existed
+// end at the address map, and replayBootstrap treats that as DataDir "". A
+// record written by this version always carries the length prefix, so a
+// zero-length DataDir is still explicit on the wire.
 const bootstrapRecordBaseSize = 8 + 8 + 1 + 8 + 4 // 29 bytes
 
 // bootstrapDataDirLenSize is the length prefix of the trailing DataDir field.
@@ -1761,7 +2530,13 @@ func (s *walShard) replayBootstrap(data []byte, segID uint64) error {
 		pos += int(addrLen)
 	}
 
-	// DataDir follows the address map, possibly empty; a record without it is truncated, and no bytes may remain.
+	// DataDir follows the address map and every record this build writes
+	// carries it, possibly zero-length (the shard roots its tree under the
+	// host's NodeHostDir). A record that ends at the address map is refused
+	// like any other truncated record: it states nothing about the shard's
+	// snapshot tree, and acting on it as "empty" is what costs an imported
+	// artifact its DEK. The field must parse completely, with no bytes left
+	// over (matching the replaySnapshot trailing-byte check).
 	if len(data)-pos < bootstrapDataDirLenSize {
 		slog.Error("waldb: bootstrap record has no DataDir field during replay",
 			"segment_id", segID, "parsed", pos, "length", len(data))
@@ -1815,7 +2590,12 @@ func (s *walShard) replayCompaction(data []byte, segID uint64) error {
 	compactedTo := binary.LittleEndian.Uint64(data[16:])
 
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
-	// The floor is monotonic during replay: skip a lower marker, keeping the higher one's segment pinned.
+	// The floor is monotonic during replay too: a WAL written by an older
+	// build (or replayed out of segment order) may hold a lower marker after a
+	// higher one, and adopting it would resurrect a hole below entries that
+	// are already gone. Skipping the marker also keeps the HIGHER marker's
+	// segment pinned, so a post-recovery GC cannot reclaim the only record of
+	// the real floor.
 	if cur, ok := s.compactedTo[key]; ok && compactedTo <= cur {
 		return nil
 	}
@@ -1844,7 +2624,10 @@ func (s *walShard) replayCompaction(data []byte, segID uint64) error {
 // On first write to a lazy shard, this also creates the shard directory.
 // Caller must hold s.mu.
 func (s *walShard) ensureActiveSegment() error {
-	// Re-check closed under the lock.
+	// Re-check the shutdown gate under the lock: DB.Close samples
+	// db.closed only at a writer's entry, so a writer that raced past the
+	// entry gate must not resurrect a segment (or write to a recycled fd)
+	// after close() tore the shard down.
 	if s.closed {
 		return logdb.ErrClosed
 	}
@@ -1852,7 +2635,13 @@ func (s *walShard) ensureActiveSegment() error {
 		return nil
 	}
 
-	// Create the shard directory on first write and fsync the WAL root so its entry is durable.
+	// Lazily create shard directory on first write, then fsync its PARENT (the
+	// WAL root) so the shard directory's own entry is durable. The segment
+	// file's dirent inside this shard directory is made durable by the
+	// syncDirFS(s.dir) below; without also persisting the shard directory entry
+	// itself, a crash on a filesystem without a global metadata journal could
+	// lose the whole shard directory (and every Raft group hashing to it) even
+	// though SaveState fsynced the segment and returned success.
 	if err := s.fs.MkdirAll(s.dir, 0700); err != nil {
 		return &DBOpenError{Dir: s.dir, Err: err}
 	}
@@ -1904,10 +2693,19 @@ func (s *walShard) ensureActiveSegment() error {
 	return nil
 }
 
-// rotateSegment syncs and closes the active segment, so a non-final segment carries nothing unsynced, then creates a new one.
+// rotateSegment syncs, closes the current active segment, and creates a new
+// one. The explicit Sync before Close acknowledges every record written to
+// the old segment (fdatasync) and appends the sync mark that closes its last
+// generation; Close then fdatasyncs once more so that mark is on the medium
+// too, because a non-final segment must carry nothing unsynced — recovery
+// refuses damage in one on exactly that guarantee. Without the first, a crash
+// after rotation could lose the old segment's last records that were only
+// in the OS page cache; without the second, a mark torn in its writeback
+// window would make an ordinary crash a refused open.
 func (s *walShard) rotateSegment() error {
 	if s.activeSegment != nil {
-		// Sync before closing; in batchMode this is what makes the old segment durable.
+		// Sync to stable storage BEFORE closing. In batchMode, this is the
+		// path that ensures the old segment's data survives a crash.
 		if !s.opts.noSync {
 			if err := s.activeSegment.Sync(); err != nil {
 				if s.poison != nil {
@@ -1917,7 +2715,16 @@ func (s *walShard) rotateSegment() error {
 			}
 		}
 		if err := s.activeSegment.Close(); err != nil {
-			// Drop the closed segment so the next write creates a new one; a failed closing fdatasync fail-stops like any Sync failure.
+			// segment.Close marks the segment closed before it can fail,
+			// so keeping it installed would wedge the shard: every later
+			// write would hit ErrClosed with no recovery path. Drop the
+			// segment so the next write creates a fresh one via
+			// ensureActiveSegment. The data is already durable from the
+			// Sync above; a failed flush rewrites bytes Sync persisted,
+			// and a failed truncate only leaves pre-allocated zero space,
+			// which replays to nothing. A failed closing fdatasync is the
+			// exception: it is a Sync failure by another name, and gets
+			// the same fail-stop.
 			s.activeSegment = nil
 			if errors.Is(err, errSegmentCloseSync) && s.poison != nil {
 				s.poison(err)
@@ -1946,13 +2753,33 @@ func (s *walShard) getOrCreateIndex(key nodeKey) *index {
 	return idx
 }
 
-// recordLanding is where a written record landed: its segment and ciphertext epoch (0 when unencrypted); the caller applies it at its durability point.
+// recordLanding says where a written record came to rest: the segment it was
+// appended to (post-rotation, so it is the segment that actually holds the
+// bytes) and the barrier epoch its ciphertext header carries. A zero epoch
+// means the record is not encrypted — no barrier is configured — and the
+// landing contributes nothing to the shard's epoch floor.
+//
+// writeRecord returns a landing instead of applying it, so the caller can fold
+// it into the floor at its own DURABILITY point. See applyEpochLocked.
 type recordLanding struct {
 	segID uint64
 	epoch uint64
 }
 
-// applyEpochLocked folds a durable record's epoch into the shard's overall and per-segment epoch floors; not called from writeRecord. Caller holds s.dataMu (and s.mu on a live shard).
+// applyEpochLocked folds a DURABLE record's write epoch into the shard's epoch
+// floor: the minimum epoch overall and the minimum epoch per segment, which is
+// what recomputeMinWriteEpoch re-derives the floor from after segment garbage
+// collection.
+//
+// It is deliberately NOT called from writeRecord. Applying the epoch at the
+// write would record epochs for records that never commit: a batch that rolls
+// back leaves the floor pinned to an epoch no live record was ever encrypted
+// under, because rollbackShard drops segmentEpochs only for the intermediate
+// segments it unlinks and can restore neither minWriteEpoch nor the checkpoint
+// segment's entry. Each writer therefore applies its own landing once its
+// record is durable, and a rolled-back batch applies nothing.
+//
+// Caller must hold s.dataMu for writing (and, on a live shard, s.mu).
 func (s *walShard) applyEpochLocked(l recordLanding) {
 	if l.epoch == 0 {
 		return
@@ -1977,12 +2804,44 @@ func (s *walShard) commitEpoch(l recordLanding) {
 	s.dataMu.Unlock()
 }
 
-// recordContext builds the positional AAD for (segID, recordSeq) in s.ctxBuf, valid until the next call. Caller holds s.mu or owns the shard during recover().
+// recordContext builds the positional context-AAD for a record at (segID,
+// recordSeq) in this shard, reusing the shard's scratch buffer so the WAL write
+// hot path allocates nothing. Both the write side and the replay side call it,
+// which is what keeps the two byte-identical.
+//
+// The returned slice aliases s.ctxBuf and is only valid until the next call.
+// Callers hand it straight to the barrier, which reads it during the AEAD
+// operation and never retains it. Caller must hold s.mu (or, during recover(),
+// own the shard exclusively).
 func (s *walShard) recordContext(segID, recordSeq uint64) []byte {
 	return walRecordContext(s.ctxBuf[:], s.shardIdx, segID, recordSeq)
 }
 
-// verifyBindingUnchanged detects a shard latched to no context binding against a barrier that now resolves as able to bind.
+// verifyBindingUnchanged detects ONE direction of capability drift: a shard
+// that latched "cannot bind context" at open, against a barrier that now says
+// it can. It is called only from that branch of writeRecord and deliberately
+// guards nothing else.
+//
+// The capability is a deployment property, but it is only VALID WHILE THE
+// BARRIER STAYS UNSEALED: Host.EmergencySeal can seal the barrier at runtime,
+// and an operator can unseal it again — potentially under a different strategy
+// with a different capability. A latched "cannot bind" would then keep
+// suppressing the context against a barrier that would have authenticated it,
+// which is a downgrade no error surfaces on its own. That is the entire reason
+// this exists.
+//
+// The OPPOSITE direction — a shard writing WITH context whose barrier stops
+// being able to authenticate one — needs no check here and does not get one:
+// that shard passes a non-empty contextAAD to EncryptWithContext, and a barrier
+// that cannot authenticate a context it was handed fails the call rather than
+// dropping it. The write fails closed on its own, at the only place that could
+// have silently discarded the binding. Adding a symmetric probe would put a
+// barrier interface call on the hot path of every correctly configured
+// deployment to re-detect something already fatal.
+//
+// A barrier that is currently sealed reports nothing (not resolved) and is left
+// to the encrypt call, which fails closed on its own; only a RESOLVED answer
+// that contradicts the latch is treated as drift.
 func (s *walShard) verifyBindingUnchanged() error {
 	if s.sealer == nil || !s.sealer.ContextBindingResolved() {
 		return nil
@@ -1990,7 +2849,10 @@ func (s *walShard) verifyBindingUnchanged() error {
 	if !s.sealer.SupportsContextAAD() {
 		return nil
 	}
-	// Log once; the condition is permanent and the error carries it.
+	// Log once. The condition is permanent for the life of the shard and this
+	// runs on every subsequent write, so logging unconditionally turns one
+	// diagnosis into a flood that buries it. The returned error carries the
+	// same information to every caller regardless.
 	if !s.bindingDriftLogged {
 		s.bindingDriftLogged = true
 		slog.Error("waldb: barrier now authenticates caller context but the WAL "+
@@ -2017,13 +2879,35 @@ func (s *walShard) reserveLanding(framedLen int) error {
 	return s.activeSegment.CanFit(framedLen)
 }
 
-// writeRecord encrypts and writes data to the active segment and returns its landing; only when the inline fdatasync fails is the epoch applied here.
+// writeRecord writes a raw record to the active segment, rotating if the
+// segment is full. On a lazy shard, this triggers directory and segment
+// creation via ensureActiveSegment. When a barrier is configured, the
+// record data is encrypted before writing.
+//
+// It returns where the record landed. The landing is NOT applied to the epoch
+// floor here: the record is not durable yet (in batchMode the fdatasync is the
+// caller's, and even outside it the batch may still roll back), so the caller
+// applies it at its own commit point. See applyEpochLocked.
+//
+// On error the returned landing is zero, with one deliberate exception: when
+// the record was fully written and only the inline fdatasync failed, the epoch
+// is applied here. That record may well be on the medium, and a floor above a
+// record recovery still has to decrypt is the one direction that breaks the
+// node (WALDecryptError at startup) rather than merely retaining a key.
 func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 	if err := s.ensureActiveSegment(); err != nil {
 		return recordLanding{}, err
 	}
 
-	// Resolve the landing segment before sealing, since the AAD binds segment and ordinal.
+	// Resolve the LANDING segment before encrypting. The record's context-AAD
+	// binds the segment ID and the record's ordinal within that segment, so
+	// both must be final at seal time; encrypting first and discovering the
+	// rotation afterwards would bind the record to a segment it never reached.
+	// The framed length is bounded by the plaintext plus the barrier's maximum
+	// envelope expansion, which is all segment.CanFit needs (it is monotonic in
+	// that length), so the fit decision costs no encryption and the record is
+	// sealed exactly once — re-sealing after a rotation would burn a second
+	// nonce against the NIST invocation cap for nothing.
 	framedLen := len(data)
 	if s.barrier != nil {
 		framedLen += maxCiphertextExpansion
@@ -2032,12 +2916,19 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 		return recordLanding{}, err
 	}
 
-	// Encrypt; the epoch comes from the ciphertext prefix and is attributed after the write lands.
+	// Encrypt the record data when a barrier is configured. The write epoch is
+	// parsed out of the ciphertext's own 8-byte big-endian prefix, exactly as
+	// the replay path does, but is attributed to a segment only AFTER the write
+	// lands so recomputeMinWriteEpoch can never purge a DEK a live record still
+	// needs.
 	writeData := data
 	var writeEpoch uint64
 	var positional bool
 	if s.barrier != nil {
-		// No context binding was decided at open (see noContextBinding).
+		// A barrier that cannot authenticate a caller context seals the record
+		// with none, keeping only whatever binding it applies on its own. That
+		// is decided once at open (see noContextBinding), never per record and
+		// never because something failed.
 		var contextAAD []byte
 		if !s.noContextBinding {
 			contextAAD = s.recordContext(s.activeSegmentID, s.activeSegment.RecordCount())
@@ -2059,7 +2950,11 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 	_, err := s.activeSegment.Write(writeData)
 	if errors.Is(err, ErrSegmentFull) {
 		if positional {
-			// Unreachable: reserveLanding over-estimated the length.
+			// Unreachable: reserveLanding pre-checked this exact record against
+			// a length bound that can only over-estimate. Moving the record to
+			// another segment now would store a ciphertext bound to a position
+			// it does not occupy, which recovery could never open — fail
+			// instead of writing an unreadable record.
 			return recordLanding{}, ErrLandingSegmentOverflow
 		}
 		// No context was bound (plaintext, or hardware mode), so these bytes
@@ -2089,7 +2984,10 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 			s.metrics.ObserveFsyncLatency(time.Since(fsyncStart))
 		}
 		if syncErr != nil {
-			// Written but not provably durable: fail-stop (see DB.poison) and keep the epoch.
+			// The record was written but its durability cannot be
+			// established. Fail-stop: see DB.poison. The caller returns
+			// without reaching its commit point, so apply the epoch here —
+			// the record may be on disk and its DEK must stay retained.
 			s.commitEpoch(landing)
 			if s.poison != nil {
 				s.poison(syncErr)
@@ -2100,7 +2998,15 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 	return landing, nil
 }
 
-// syncSegment fsyncs the active segment after a batched write. A failure poisons the DB. Caller holds s.mu.
+// syncSegment flushes the active segment to stable storage. This is the
+// "sync phase" of a batched write, called after all records have been
+// buffered with batchMode enabled. The caller must hold s.mu.
+//
+// A sync failure here poisons the owning DB (fail-stop): the batch's
+// records were already written to the segment, and after a failed
+// fdatasync neither their durability nor the durability of any rollback
+// truncation can be established (fsyncgate). Rolling back is therefore
+// insufficient; the only safe continuation is crash recovery.
 func (s *walShard) syncSegment() error {
 	if s.opts.noSync || s.activeSegment == nil {
 		return nil
@@ -2116,7 +3022,13 @@ func (s *walShard) syncSegment() error {
 	return syncErr
 }
 
-// close closes the active segment under s.mu and sets closed so no later writer recreates it.
+// close closes the active segment and releases resources. It takes s.mu so
+// shutdown serializes with in-flight writers: without the lock, a writer
+// already past DB.writeGate could mutate activeSegment (or race on the
+// segment's plain closed bool) while the segment is being torn down —
+// a torn block write or a WriteAt onto a recycled fd. The closed flag set
+// here keeps any later writer from recreating a segment (see
+// ensureActiveSegment).
 func (s *walShard) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2129,7 +3041,22 @@ func (s *walShard) close() error {
 	return nil
 }
 
-// closeAfterFailedOpen closes a shard from a failed DB open and unlinks the empty segment this open created; failures are logged.
+// closeAfterFailedOpen closes a shard that was opened successfully as part of a
+// DB open that then failed, and unlinks the segment this open created if it
+// holds no records.
+//
+// Without the unlink, every failed Open leaves one empty segment file per shard
+// that got that far, and recovery counts it: nextSegmentID advances past it, so
+// the files accumulate rather than being reused. That was tolerable while a
+// failed Open was rare, but the fail-closed conditions this package now raises
+// (a geometry mismatch, an unresolved barrier binding, mid-segment corruption)
+// are all conditions an operator retries against while diagnosing, which makes
+// repeated failed opens the EXPECTED path rather than the exceptional one.
+//
+// Only a segment created by THIS open and holding zero records is removed, so
+// there is no way for this to touch a segment that carries data. Every failure
+// is logged and swallowed: the DB open is already failing, and a leftover file
+// is a far smaller problem than masking the error the caller needs to see.
 func (s *walShard) closeAfterFailedOpen() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2185,7 +3112,19 @@ func itoa(n int) string {
 	return string(buf[pos:])
 }
 
-// syncDirFS fsyncs directory dir through fsys (SyncMetadata when available) and returns a DirSyncError on failure.
+// syncDirFS fsyncs a directory using the provided FS to make metadata
+// changes (file creates, deletes, renames) durable. Returns a DirSyncError
+// if the directory cannot be opened, synced or closed.
+//
+// The flush is SyncMetadata, NOT Sync, whenever the File provides it (see
+// FileMetadataSyncer); fsutil.SyncDirWith makes that choice. On Linux File.Sync
+// is fdatasync, which is specified to skip metadata not needed to retrieve the
+// data — and for a directory the metadata IS the point. A dirent removal often
+// leaves the directory size unchanged, so XFS can skip the log force that ext4
+// happens to perform anyway, which is why no test catches the difference. The
+// paths that depend on this are rollback segment deletion, orphan discard
+// (whose own comment cites voting twice in one term) and GC — all of them Raft
+// durability.
 func syncDirFS(filesystem FS, dir string) error {
 	if err := fsutil.SyncDirWith(filesystem.Open, dir); err != nil {
 		return &DirSyncError{Dir: dir, Err: err}
@@ -2203,7 +3142,39 @@ func (db *DB) Name() string {
 	return "waldb"
 }
 
-// SaveState persists updates atomically per WAL shard: write all records, fsync dirty shards in parallel, then commit in memory. A write failure rolls back every touched shard; a sync failure poisons the DB.
+// SaveState persists a batch of Updates atomically per shard. Each Update
+// contains entries and/or hard state for a single Raft shard.
+//
+// The method uses a two-phase write strategy to minimize fsync overhead:
+//
+//  1. Write phase: all records are buffered to their respective shard
+//     segments without calling fdatasync (batchMode=true).
+//  2. Sync phase: dirty shards are fsynced in parallel, amortizing the
+//     cost of fdatasync across all shards touched in the batch.
+//
+// This reduces the number of fsyncs from O(records) to O(shards), where
+// shards <= DefaultShardCount.
+//
+// Failure handling:
+//
+//   - A write failure in phase 1 (e.g., writing the 3rd of 5 shard updates
+//     fails) rolls back EVERY shard the batch touched. Each shard's segment
+//     state is checkpointed before its first write, and rollbackBatch rewinds
+//     the segment to that checkpoint (segment.DiscardPending, or a
+//     multi-segment rollback if the batch rotated), so no record of the failed
+//     batch survives for a later Sync to make durable. In-memory state is
+//     untouched, since phase 3 never runs. If a rollback itself fails, the
+//     returned *BatchWriteError carries both the write error and the discard
+//     errors.
+//   - A sync failure in phase 2 poisons the DB and returns ErrDBPoisoned: the
+//     records are written but not provably durable, and a rollback truncation
+//     could not be proven durable either.
+//   - A crash before phase 2 completes loses the batch's unsynced records, and
+//     a crash during it can leave some shards' records durable and others
+//     not: SaveState is NOT a single atomic commit across shards on the
+//     medium. That is safe for Raft because SaveState had not returned
+//     success, so nothing in the batch was acknowledged, and CRC32-framed
+//     records make a torn write detectable on recovery.
 func (db *DB) SaveState(updates []logdb.Update) error {
 	if err := db.writeGate(); err != nil {
 		return err
@@ -2221,13 +3192,32 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 
 	writeStart := time.Now()
 
-	// Per-shard bookkeeping on the stack.
+	// Stack-allocated per-shard bookkeeping, avoiding map allocation on the
+	// hot path. dirtyShards/dirtyCount track shards that took a successful
+	// write (fsync + commit targets); checkpoints capture each touched shard's
+	// pre-batch segment state for rollback; pending stages in-memory updates
+	// applied only after all WAL writes and sync succeed.
 	var dirtyShards [DefaultShardCount]*walShard
 	var checkpoints [DefaultShardCount]shardCheckpoint
 	var pending [DefaultShardCount]pendingMemUpdates
 	dirtyCount := 0
 
-	// Hold every touched shard's mu, in ascending order, for the whole batch so it is atomic per segment.
+	// Lock every WAL shard this batch touches for the ENTIRE batch lifecycle:
+	// checkpoint capture -> record write -> fsync -> in-memory commit (or
+	// rollback). Holding each shard's lock across the whole lifecycle makes the
+	// batch atomic per WAL segment. If SaveState released shard.mu
+	// between its durable write and its rollback, a concurrent same-shard
+	// SaveState (two Raft shards that hash to one WAL shard are served by
+	// different commit workers whenever NumWorkers does not divide
+	// DefaultShardCount) could write, fsync, and COMMIT a record past this
+	// batch's checkpoint; a later partial-failure rollback would then truncate
+	// the shared segment back to this batch's offset and silently erase the other
+	// batch's already-acknowledged committed records. Locks are acquired in
+	// ascending shard-index order so two batches with overlapping shard sets
+	// share a canonical lock order and cannot deadlock; single-shard lockers
+	// (Compact, SaveSnapshot, RemoveEntriesTo, RemoveNodeData) hold at most one
+	// mu and cannot close a cycle. Reads take no mu at all — only dataMu, which
+	// this batch acquires solely inside Phase 3 and always after mu.
 	var touched [DefaultShardCount]bool
 	for i := range updates {
 		touched[uint16(updates[i].ShardID%DefaultShardCount)] = true
@@ -2245,18 +3235,28 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		}
 	}()
 
-	// Refuse the whole batch before writing if validateBatchLocked fails.
+	// Refuse the whole batch, before anything is written, if one Update names
+	// a retired replica or breaks a floor or bound (validateBatchLocked).
+	// Checked under the touched shards' mu, which RemoveNodeData holds while
+	// it retires a node, so a retirement either precedes this check or follows
+	// the whole batch — and then drops it.
 	if err := db.validateBatchLocked(updates); err != nil {
 		return err
 	}
 
-	// Phase 1: write all records without fsync.
+	// Phase 1: Write all records to their shards WITHOUT fsyncing. All touched
+	// shard locks are already held.
 	for i := range updates {
 		u := &updates[i]
 		shardIdx := uint16(u.ShardID % DefaultShardCount)
 		shard := db.shards[shardIdx]
 
-		// Checkpoint before the first write to this shard, flushing the open block (see captureCheckpointAfterEnsure).
+		// Capture the segment checkpoint before the first write to this shard.
+		// For non-lazy shards with an existing active segment, capture now;
+		// lazy shards capture inside saveUpdate after ensureActiveSegment.
+		// Flush the open block first so rollbackShard->DiscardPending can
+		// reliably reload the pre-batch tail from disk (see
+		// captureCheckpointAfterEnsure for the invariant).
 		if !checkpoints[shardIdx].valid && shard.activeSegment != nil {
 			if err := shard.activeSegment.flushBlock(); err != nil {
 				return db.rollbackBatch(&checkpoints, &pending, err)
@@ -2284,7 +3284,11 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		}
 	}
 
-	// Phase 2: fsync dirty shards; a failure has already poisoned the DB.
+	// Phase 2: Sync all dirty shards to stable storage. A failure here has
+	// already poisoned the DB (see syncSegment): the batch's records are
+	// written but not provably durable, and a rollback truncation could not be
+	// proven durable either after a failed fsync. Surface the fail-stop to the
+	// caller alongside the underlying cause.
 	if err := syncDirtyShardsLocked(&dirtyShards, dirtyCount); err != nil {
 		db.poison(err)
 		// Phase 3 never runs, so the batch's staged epochs would be dropped —
@@ -2294,7 +3298,13 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 		return errors.Join(ErrDBPoisoned, err)
 	}
 
-	// Phase 3: commit in memory under each shard's dataMu, with no I/O.
+	// Phase 3: Apply in-memory updates now that all WAL data is durable. This
+	// is the commit point — reads see these changes only after the data is
+	// safely persisted. The shard mu locks are still held, so this commit is
+	// atomic with the durable write relative to any concurrent same-shard
+	// batch. applyTo additionally takes each shard's dataMu, which is what
+	// makes the commit atomic for the lock-free readers; it is the ONLY point
+	// in the batch where a reader can be blocked, and it holds no I/O.
 	for i := range dirtyShards {
 		if dirtyShards[i] != nil {
 			pending[i].applyTo(dirtyShards[i])
@@ -2313,9 +3323,15 @@ func (db *DB) SaveState(updates []logdb.Update) error {
 type shardCheckpoint struct {
 	fileOffset  int64
 	blockOffset int
-	// recordCount is the segment's record ordinal at capture; rollback rewinds it with the offsets (see segment.DiscardPending).
+	// recordCount is the segment's logical-record ordinal at capture time.
+	// Rollback rewinds the segment to it alongside the offsets, so the ordinal
+	// bound into each encrypted record's context-AAD keeps matching the records
+	// actually present in the file. See segment.DiscardPending.
 	recordCount uint64
-	// seg and segID name the active segment at capture, to detect a mid-batch rotation.
+	// seg/segID identify the active segment when the checkpoint was captured.
+	// Rollback compares them against the current active segment to detect a
+	// mid-batch segment rotation, which needs a multi-segment rollback rather
+	// than a simple in-place truncate.
 	seg   *segment
 	segID uint64
 	valid bool
@@ -2369,7 +3385,14 @@ func (p *pendingMemUpdates) stageEpoch(l recordLanding) {
 	p.epochs = append(p.epochs, l)
 }
 
-// applyTo applies the pending in-memory updates under dataMu as one atomic commit for readers, with no I/O. Caller holds shard.mu.
+// applyTo applies all pending in-memory updates to the shard. The caller must
+// hold shard.mu (Phase 3 of a SaveState batch, or a standalone SaveSnapshot).
+//
+// It additionally takes dataMu for the whole application, making the batch's
+// index, entry, state, snapshot, pin and high-water-mark updates a single
+// atomic commit for the lock-free readers: no reader can observe a batch
+// half-applied. The section is pure memory work — no write, fsync or
+// rotation happens under dataMu.
 func (p *pendingMemUpdates) applyTo(s *walShard) {
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
@@ -2379,7 +3402,10 @@ func (p *pendingMemUpdates) applyTo(s *walShard) {
 		idx := s.getOrCreateIndex(eu.key)
 		idx.Append(eu.indexes...)
 
-		// Advance the commit mark to the segment these entries landed in; they share one record.
+		// Advance the commit high-water mark to the segment these entries
+		// landed in. All entries in one pendingEntryUpdate share a single
+		// WAL record and therefore a single segment, so the first index
+		// entry's SegmentID is representative.
 		if len(eu.indexes) > 0 {
 			s.advanceCommittedHWM(eu.indexes[0].SegmentID)
 		}
@@ -2392,7 +3418,11 @@ func (p *pendingMemUpdates) applyTo(s *walShard) {
 		if len(eu.entries) == 0 {
 			continue
 		}
-		// On a leader overwrite, prune orphaned higher entries from the map.
+		// Detect a leader-overwrite (the first new index already has an entry):
+		// the index slice is truncated to the new suffix, but the entry MAP
+		// would otherwise retain the now-orphaned higher indices until
+		// compaction. Prune them so the leak is bounded. The O(n) scan runs
+		// only on actual overwrites (leader churn), not on normal appends.
 		firstIdx := eu.entries[0].Index
 		_, overwrite := nodeEntries[firstIdx]
 		for j := range eu.entries {
@@ -2428,7 +3458,19 @@ func (p *pendingMemUpdates) applyTo(s *walShard) {
 	}
 }
 
-// rollbackBatch rolls back every checkpointed shard in the batch and discards its staged epochs unless the rollback is not provably durable (see commitPendingEpochs). Caller holds every touched shard's mu.
+// rollbackBatch rolls back every shard that captured a checkpoint in the
+// current SaveState batch, discarding this batch's buffered/written records so
+// no ghost records survive on the next successful SaveState. A valid checkpoint
+// is captured before the first write to each shard, so iterating checkpoints
+// covers both the already-written shards and the shard whose write just failed.
+// The caller MUST hold every touched shard's mu (the SaveState batch holds them
+// for its whole lifecycle), so rollbackShard is invoked directly without
+// re-locking. writeErr is the originating Phase 1 failure; if rollback itself
+// fails, both the write error and the discard errors are surfaced.
+//
+// The batch's staged epochs are discarded along with the records they belong
+// to — that is the whole point of deferring them to the commit point — EXCEPT
+// when the rollback could not be proven durable. See commitPendingEpochs.
 func (db *DB) rollbackBatch(
 	checkpoints *[DefaultShardCount]shardCheckpoint,
 	pending *[DefaultShardCount]pendingMemUpdates,
@@ -2452,7 +3494,20 @@ func (db *DB) rollbackBatch(
 	return writeErr
 }
 
-// commitPendingEpochs folds a batch's staged landings into the epoch floors when its records may still replay; a low floor only retains a key longer. Caller holds every touched shard's mu.
+// commitPendingEpochs folds a batch's staged record landings into their shards'
+// epoch floors WITHOUT applying any other in-memory state. It is the
+// conservative fallback for a batch that neither committed nor could prove its
+// records gone: after a failed fdatasync, or a rollback whose truncation could
+// not be made durable, the records may still replay from disk, so the DEKs
+// that decrypt them must stay retained.
+//
+// The asymmetry is deliberate. A floor that is too LOW only holds a key longer
+// than necessary; a floor that is too HIGH lets the engine purge a DEK a
+// surviving record needs, and the next start dies with a fatal
+// WALDecryptError. When in doubt, retain.
+//
+// The caller holds every touched shard's mu, so this observes the mu -> dataMu
+// order and holds no I/O under dataMu.
 func (db *DB) commitPendingEpochs(pending *[DefaultShardCount]pendingMemUpdates) {
 	for i := range pending {
 		if len(pending[i].epochs) == 0 {
@@ -2467,13 +3522,38 @@ func (db *DB) commitPendingEpochs(pending *[DefaultShardCount]pendingMemUpdates)
 	}
 }
 
-// rollbackShard rolls the shard's WAL back to cp, in place or, after a rotation, high to low so every crash point leaves a valid prefix. Caller holds ds.mu.
+// rollbackShard rolls a shard's WAL back to the state captured in cp. The
+// caller must hold ds.mu.
+//
+// Common case: no segment rotation occurred during the batch, so the active
+// segment is the same one the checkpoint was taken against and a single
+// in-place DiscardPending restores it.
+//
+// Rotation case: a write hit ErrSegmentFull mid-batch and rotateSegment
+// installed one or more new segments (the old ones were sync+closed with
+// batch data). DiscardPending with the old checkpoint offsets would truncate
+// the WRONG (new) segment. Instead we work HIGH TO LOW: (1) delete any
+// intermediate segments created entirely from batch data, (2) empty the
+// current active segment, (3) fsync the directory, and only then (4) truncate
+// the checkpoint segment back to its pre-batch durable boundary. This
+// guarantees recovery replays only the pre-batch prefix, and — because the low
+// segment is cut last — that a crash at any point in between leaves a valid
+// prefix rather than a hole. See the ordering note in the body.
 func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
-	// Nothing to undo; an absent active segment after a failed rotation Close is not this case.
+	// Nothing was written against a known position, so there is nothing to
+	// undo. An absent active segment is NOT such a case: rotateSegment drops
+	// the handle when the post-Sync Close fails, and that Sync already made
+	// this batch's records durable in the checkpoint segment.
 	if ds.activeSegment == nil && !cp.valid {
 		return nil
 	}
-	// Any rollback failure is a durability failure: poison the DB.
+	// Every rollback failure is a DURABILITY failure: the truncation that
+	// erases this batch's records could not be proven to have reached the
+	// medium. Leaving the DB writable would let the next batch append past an
+	// un-durable truncation, and a crash would then resurrect records the
+	// caller was already told had FAILED. Poison on any error so the failure
+	// satisfies errors.Is(err, ErrDBPoisoned) all the way up through
+	// BatchWriteError, matching the directory-fsync path below.
 	defer func() {
 		if err == nil || errors.Is(err, ErrDBPoisoned) {
 			return
@@ -2489,7 +3569,20 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 		return ds.activeSegment.DiscardPending(cp.fileOffset, cp.blockOffset, cp.recordCount)
 	}
 
-	// Rotation occurred: delete intermediates, empty the active segment, fsync the directory, then truncate the checkpoint segment.
+	// Rotation occurred. The rollback runs HIGH TO LOW — intermediates deleted,
+	// active segment emptied, directory fsynced, and only then the checkpoint
+	// segment truncated — so that every crash state in between is a valid
+	// prefix of the pre-batch log.
+	//
+	// The reverse order is not: truncating the checkpoint segment first leaves
+	// it ending cleanly at a record boundary with the higher segments still
+	// holding their (fsynced, CRC-valid) batch records, so a crash there is
+	// followed by a recovery that replays the checkpoint segment in full and
+	// then every segment above it — resurrecting the batch records the caller
+	// was told had FAILED, with a hole where the truncated ones were. Crashing
+	// under the order below can only leave batch records in the checkpoint
+	// segment's own tail, which is an ordinary interrupted write and is exactly
+	// what a crash one instruction earlier would have left anyway.
 	cleanEnd := cp.fileOffset + int64(cp.blockOffset)
 
 	// Delete intermediate segments that contain only batch data.
@@ -2506,7 +3599,18 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 		ds.dataMu.Unlock()
 	}
 
-	// Empty the current segment, which holds only batch data; truncate the closed file when rotation dropped the handle.
+	// Empty the current segment (all its content is batch data). It remains
+	// the active segment: a zero-length / all-zero file replays to nothing, so
+	// recovery is correct. Two tolerated side effects: (1) its ID is now
+	// non-contiguous with the checkpoint segment because the intermediates
+	// were deleted — recovery sorts segment IDs, so a gap is fine; (2) the
+	// truncation to 0 drops the fallocate reservation, which DiscardPending
+	// re-takes.
+	//
+	// When the rotation's Close failed, rotateSegment dropped the handle and
+	// left activeSegment nil while activeSegmentID still names the segment on
+	// disk; truncate that closed file to zero instead, so its already-fsynced
+	// batch records cannot replay.
 	switch {
 	case ds.activeSegment != nil:
 		// Every record in this segment is batch data, so its ordinal rewinds to
@@ -2520,7 +3624,15 @@ func rollbackShard(ds *walShard, cp *shardCheckpoint) (err error) {
 		}
 	}
 
-	// Make the deletions durable before cutting the checkpoint segment; failure poisons the DB.
+	// Make the segment-file deletions durable BEFORE the checkpoint segment is
+	// cut. Without a directory fsync a crash right after rollback could
+	// resurrect a deleted intermediate segment's directory entry, and recovery
+	// would replay its (CRC-valid) batch records that were supposed to be
+	// discarded — resurrecting writes the caller was told had failed. A
+	// directory-fsync failure here is therefore fail-stop, exactly like the
+	// data-fsync failures in syncSegment/writeRecord: the rollback cannot be
+	// proven durable, so the DB is poisoned and the error is surfaced through
+	// rollbackBatch to the SaveState caller.
 	if err := syncDirFS(ds.fs, ds.dir); err != nil {
 		if ds.poison != nil {
 			ds.poison(err)
@@ -2557,7 +3669,15 @@ func truncateClosedSegment(ds *walShard, segID uint64, size int64) error {
 	return f.Close()
 }
 
-// syncDirtyShardsLocked fsyncs every dirty shard's segment, concurrently when there are several. Caller holds every dirty shard's mu.
+// syncDirtyShardsLocked fsyncs every dirty shard's active segment to stable
+// storage. The caller MUST already hold every dirty shard's mu (the SaveState
+// batch holds all touched shard locks for its whole lifecycle), so this never
+// re-acquires them — doing so would deadlock. When a single shard is dirty the
+// sync is inline to avoid goroutine overhead. For multi-shard batches the
+// fdatasyncs run concurrently to bound batch latency; each goroutine touches a
+// distinct shard whose lock the caller holds (excluding all other accessors),
+// and the go statement establishes happens-before from the Phase 1 writes, so
+// the concurrent syncSegment calls are race-free.
 func syncDirtyShardsLocked(dirtyShards *[DefaultShardCount]*walShard, dirtyCount int) error {
 	if dirtyCount == 1 {
 		// Fast path: single shard, avoid goroutine overhead.
@@ -2589,7 +3709,13 @@ func syncDirtyShardsLocked(dirtyShards *[DefaultShardCount]*walShard, dirtyCount
 	return nil
 }
 
-// saveUpdate writes u to the WAL and stages its in-memory updates in pending, capturing checkpoint after creating a lazy shard's segment.
+// saveUpdate writes a single Update to this shard's WAL and stages in-memory
+// updates into pending. The caller applies pending updates only after all
+// shards succeed and sync completes, preventing phantom reads on failure.
+//
+// The checkpoint parameter is captured lazily for shards that had no active
+// segment at the start of the batch (lazy shards). After ensureActiveSegment
+// creates the segment, the checkpoint is captured before any data is written.
 func (s *walShard) saveUpdate(u *logdb.Update, pending *pendingMemUpdates, cp *shardCheckpoint) error {
 	key := nodeKey{ShardID: u.ShardID, ReplicaID: u.ReplicaID}
 
@@ -2607,9 +3733,15 @@ func (s *walShard) saveUpdate(u *logdb.Update, pending *pendingMemUpdates, cp *s
 		}
 	}
 
-	// Write the snapshot when Index > 0 and not stale.
+	// Write the snapshot if present and not stale. Presence is keyed on
+	// Index > 0 alone, matching memdb: a zero-index snapshot is no snapshot,
+	// and writing one made GetSnapshot report a snapshot at index 0 and pinned
+	// its segment against garbage collection permanently.
 	if u.Snapshot.Index > 0 {
-		// Compare against stored and pending snapshots; s.mu suffices to read the map.
+		// Check against both persisted snapshots and any pending snapshot
+		// updates in this batch to avoid writing stale data. The snapshots map
+		// is read under s.mu alone: every mutator of it holds s.mu too, so no
+		// dataMu is needed for a read on this side of the lock.
 		stale := false
 		if existing, ok := s.snapshots[key]; ok && u.Snapshot.Index <= existing.Index {
 			stale = true
@@ -2632,9 +3764,17 @@ func (s *walShard) saveUpdate(u *logdb.Update, pending *pendingMemUpdates, cp *s
 	return nil
 }
 
-// writeEntries writes a batch of entries to the WAL and stages the index and entry updates in pending.
+// writeEntries serializes and writes a batch of entries to the WAL, and
+// stages the in-memory updates in pending for deferred application.
+//
+// In-memory state (index, entry map) is staged but NOT applied here.
+// The caller applies pending updates only after all shards succeed and
+// sync completes, preventing phantom reads on mid-batch failure.
 func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries []logdb.Entry, pending *pendingMemUpdates, cp *shardCheckpoint) error {
-	// Enforce replay's per-entry Cmd cap before touching a segment.
+	// Enforce the same per-entry Cmd cap that replay enforces, BEFORE any
+	// segment is touched. Without this write-side check the encoder would
+	// happily store (and uint32-truncate, for >4GiB) a Cmd that recovery
+	// then rejects as corrupt — an entry that is durable but unreadable.
 	for i := range entries {
 		if len(entries[i].Cmd) > maxCmdLen {
 			return ErrCmdTooLarge
@@ -2654,7 +3794,21 @@ func (s *walShard) writeEntries(key nodeKey, shardID, replicaID uint64, entries 
 		return err
 	}
 
-	// Split the batch across records that each fit a segment; they precede the state record, so a torn tail loses state, never entries.
+	// A single WAL record must fit inside one segment, so a large batch is
+	// split across several records. A record spends recordHeaderSize bytes in
+	// every block it spans and may pad the block it starts in, so the usable
+	// payload is strictly LESS than the segment size. Raft's batch cap counts
+	// neither that framing nor the 84-byte per-entry header, so without
+	// splitting a batch raft legitimately produced -- a lagging follower
+	// catching up on many small entries is the realistic case -- would fail
+	// permanently with ErrRecordTooLarge and this node could never persist it.
+	//
+	// Splitting is format-compatible: replay already handles several entry
+	// records per Update. It is also crash-safe, because these records still
+	// precede this Update's state record in log order and the WAL truncates at
+	// a prefix. A torn tail can therefore only lose state while keeping
+	// entries, never the reverse -- which would recover with a commit index
+	// past the last entry.
 	maxPayload := s.maxRecordPayload()
 
 	for start := 0; start < len(entries); {
@@ -2703,7 +3857,15 @@ func (s *walShard) writeEntryChunk(key nodeKey, shardID, replicaID uint64, entri
 	buf[0] = payloadTypeEntries
 	pos := 1
 
-	// Stamp each chunk's SegmentID after writeRecord, since the write may rotate.
+	// Collect index and entry updates to stage into pending. The SegmentID is
+	// filled in AFTER writeRecord succeeds: the write below may hit
+	// ErrSegmentFull and rotate, landing this chunk in a NEW segment.
+	// Capturing s.activeSegmentID beforehand would point the index at the old
+	// segment, and Compact (which builds its live-segment set from index
+	// SegmentIDs) could then GC the segment that actually holds these entries
+	// -- silent data loss on recovery. With chunking, consecutive chunks of
+	// one batch can legitimately land in different segments, so each chunk
+	// must be stamped with its own.
 	stagedIdx := make([]indexEntry, 0, len(entries))
 	stagedEntries := make([]logdb.Entry, 0, len(entries))
 
@@ -2774,7 +3936,12 @@ func (s *walShard) writeEntryChunk(key nodeKey, shardID, replicaID uint64, entri
 	return nil
 }
 
-// captureShardCheckpoint creates a lazy shard's segment and captures its position for a standalone write; pair with DB.rollbackStandalone. Caller holds s.mu.
+// captureShardCheckpoint prepares a standalone (non-batch) record write for
+// rollback: it creates the active segment if the shard is still lazy, then
+// captures the segment position the write starts from. Paired with
+// DB.rollbackStandalone it gives SaveSnapshot/RemoveEntriesTo/SaveBootstrap
+// the same "a failed write leaves nothing durable" guarantee SaveState has.
+// The caller must hold s.mu.
 func captureShardCheckpoint(s *walShard, cp *shardCheckpoint) error {
 	if err := s.ensureActiveSegment(); err != nil {
 		return err
@@ -2782,7 +3949,15 @@ func captureShardCheckpoint(s *walShard, cp *shardCheckpoint) error {
 	return captureCheckpointAfterEnsure(s, cp)
 }
 
-// rollbackStandalone discards a failed standalone write and returns writeErr, in a BatchWriteError if the rollback failed; a poisoned DB is left alone. Caller holds the shard's mu.
+// rollbackStandalone discards a failed standalone record write, returning the
+// original write error (wrapped in a BatchWriteError when the rollback itself
+// failed, so ErrDBPoisoned still reaches the caller). The caller must hold the
+// shard's mu.
+//
+// A poisoned DB is left alone: after a failed fdatasync neither the record nor
+// a rollback truncation can be proven durable (fsyncgate), so crash recovery —
+// not truncation — is the only sound continuation, exactly as in SaveState's
+// sync phase.
 func (db *DB) rollbackStandalone(s *walShard, cp *shardCheckpoint, writeErr error) error {
 	if !cp.valid || db.poisoned.Load() {
 		return writeErr
@@ -2793,7 +3968,17 @@ func (db *DB) rollbackStandalone(s *walShard, cp *shardCheckpoint, writeErr erro
 	return writeErr
 }
 
-// captureCheckpointAfterEnsure flushes the open block and captures a checkpoint for a segment ensureActiveSegment just created.
+// captureCheckpointAfterEnsure captures a checkpoint for a shard that
+// just had its active segment created by ensureActiveSegment. This
+// handles lazy shards that had no segment at batch start. The checkpoint
+// is captured at the segment's current position (before any batch data).
+//
+// It first flushes the open block to disk. rollbackShard -> DiscardPending
+// reloads the pre-batch open-block tail from disk by ReadAt, which is only
+// correct if that tail is actually durable at capture time. Flushing here
+// makes that invariant unconditional rather than relying on a prior Sync
+// having happened to flush the same block, so any future write path that
+// advances blockOffset before a batch cannot silently corrupt the rollback.
 func captureCheckpointAfterEnsure(s *walShard, cp *shardCheckpoint) error {
 	if cp.valid || s.activeSegment == nil {
 		return nil
@@ -2848,7 +4033,10 @@ func (s *walShard) writeState(key nodeKey, shardID, replicaID uint64, state logd
 // including Epoch and full Membership state.
 // The in-memory snapshot update is staged in pending for deferred application.
 func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logdb.Snapshot, pending *pendingMemUpdates, cp *shardCheckpoint) error {
-	// Enforce replay's map-size cap before touching a segment.
+	// Enforce the same map-size cap replay enforces, BEFORE any segment is
+	// touched: replay rejects an oversized map as corruption and fails the
+	// whole recovery, so a record accepted here would be durable, acked and
+	// unreadable — the node could never start again.
 	if err := checkMembershipSize(ss.Membership); err != nil {
 		return err
 	}
@@ -2892,7 +4080,10 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	pos = marshalAddrMap(buf, pos, ss.Membership.Observers)
 	pos = marshalAddrMap(buf, pos, ss.Membership.Witnesses)
 	pos = marshalRemovedMap(buf, pos, ss.Membership.Removed)
-	// Every field is written, so the section length is always membershipSize.
+	// Every remaining field is written unconditionally, so the section length
+	// always matches membershipSize: an empty map is four zero bytes, not an
+	// absent field, and an unset session policy is membershipSessionPolicySize
+	// zero bytes rather than an absent one.
 	pos = marshalAddrMap(buf, pos, ss.Membership.Identities)
 	binary.LittleEndian.PutUint64(buf[pos:], ss.Membership.SessionExpiryEntries)
 	binary.LittleEndian.PutUint64(buf[pos+8:], ss.Membership.MaxTotalSessions)
@@ -2907,7 +4098,20 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 		return err
 	}
 	pending.stageEpoch(landing)
-	// Pin the landing segment, and stage a deep copy so the stored record never aliases the caller's maps.
+	// Capture the segment the record landed in (post-rotation if writeRecord
+	// rotated) so the commit point can pin it against garbage collection.
+	// The snapshot is DEEP-COPIED before it is staged. ss is the caller's
+	// value and its Membership carries six maps; staging it verbatim meant the
+	// in-memory record waldb later serves from GetSnapshot aliased the
+	// caller's maps in both directions, so a later mutation by the owning
+	// layer silently rewrote a record already reported as persisted.
+	//
+	// memdb has done this since it was written (memdb.copyMembership, with a
+	// comment explaining why), and the two are implementations of the SAME
+	// LogDB interface: code correct against the test backend was wrong against
+	// the production one. Identities and RemovedIdentities make it more than a
+	// hygiene issue — they are the authorization state a replica recovering
+	// from a snapshot has no other source for.
 	pending.snapshots = append(pending.snapshots, pendingSnapshotUpdate{
 		key:         key,
 		snapshot:    copySnapshot(ss),
@@ -2916,7 +4120,16 @@ func (s *walShard) writeSnapshot(key nodeKey, shardID, replicaID uint64, ss logd
 	return nil
 }
 
-// writeBootstrap writes bs to the WAL, ending with the DataDir field; call it only outside batchMode, since it updates memory immediately.
+// writeBootstrap serializes and writes bootstrap info to the WAL. The record
+// always ends with the DataDir length prefix and value, which replayBootstrap
+// requires.
+//
+// INVARIANT: This method MUST only be called outside of batchMode (i.e. from
+// SaveBootstrap). In non-batch mode, writeRecord calls fdatasync inline before
+// returning, so the immediate in-memory update below is safe — the data is
+// already durable. If this method were ever called in batchMode, the immediate
+// update would create a phantom read before fsync. Callers adding batch-mode
+// bootstrap support must route through pendingMemUpdates instead.
 func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs logdb.Bootstrap) error {
 	// Guard against accidental batch-mode usage. See invariant above.
 	if s.batchMode {
@@ -2965,9 +4178,19 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	if err != nil {
 		return err
 	}
-	// Commit point: publish the record, pin its segment, raise the commit mark and apply the epoch under dataMu.
+	// Commit point: publish the bootstrap record, pin the segment it landed in
+	// (post-rotation if writeRecord rotated) against garbage collection, raise
+	// the commit high-water mark and lower the epoch floor to this record's
+	// epoch — atomically for readers, under dataMu. The write is already
+	// durable here because non-batch writeRecord fdatasyncs inline.
 	s.dataMu.Lock()
-	// Store a deep copy matching the bytes written.
+	// The in-memory copy must describe the BYTES just written: a GetBootstrap
+	// served before the next restart has to agree with a replay of the very same
+	// record.
+	// Deep-copied for the same reason writeSnapshot is: bs is the caller's
+	// value, its Addresses map is retained here and served from GetBootstrap,
+	// and memdb copies. Storing the reference let the owning layer mutate a
+	// record waldb had already reported as persisted.
 	s.bootstraps[key] = copyBootstrap(bs)
 	s.setBootstrapSegment(key, landing.segID)
 	s.advanceCommittedHWM(landing.segID)
@@ -2992,7 +4215,15 @@ func (s *walShard) getMarshalBuf(size int) []byte {
 	return s.marshalBuf[:size]
 }
 
-// IterateEntries returns entries in [low, high) for the node, up to maxSize bytes, per the LogDB contract; a range not starting at low returns ErrLogGapDetected.
+// IterateEntries returns log entries in the range [low, high) for the given
+// node, up to maxSize bytes total. Results are appended to the entries slice.
+// Error semantics and the maxSize budget (ie.Size == EntryOverheadBytes +
+// len(Cmd) per entry) follow the LogDB interface contract.
+//
+// A stored range that does not begin exactly at low — for example when a
+// compaction marker was lost and low sits below the true compaction floor —
+// returns ErrLogGapDetected instead of silently serving a shifted range with
+// a hole in it.
 func (db *DB) IterateEntries(
 	entries []logdb.Entry, size uint64,
 	shardID, replicaID, low, high, maxSize uint64,
@@ -3007,7 +4238,9 @@ func (db *DB) IterateEntries(
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	// Read-lock dataMu only, so reads never wait on an fsync.
+	// Read lock on the in-memory maps ONLY. This path never touches a segment,
+	// so it must not wait behind a concurrent batch's fdatasync on shard.mu;
+	// dataMu still serializes it against the batch's atomic Phase-3 commit.
 	shard.dataMu.RLock()
 	defer shard.dataMu.RUnlock()
 
@@ -3062,7 +4295,11 @@ func (db *DB) IterateEntries(
 			break
 		}
 
-		// Copy each entry with its own payload (see logdb.CopyEntryCmd).
+		// The stored Entry is copied out with its OWN payload. Appending it as
+		// held would hand the caller a slice header pointing straight at this
+		// shard's in-memory log — the log served to followers and replayed on
+		// restart — and one write-through would corrupt it silently. See
+		// logdb.CopyEntryCmd.
 		entries = append(entries, logdb.CopyEntryCmd(e))
 		totalSize += entryBytes
 		expected++
@@ -3096,7 +4333,14 @@ func (db *DB) ReadState(shardID, replicaID uint64) (logdb.State, logdb.Membershi
 	return state, copyMembership(ss.Membership), nil
 }
 
-// EntryRange returns the first index and contiguous span of the node's entries, (0, 0, nil) when none, and ErrLogGapDetected on a hole.
+// EntryRange returns the first index and the contiguous span of available
+// log entries for the given node. Returns (0, 0, nil) when no entries exist.
+//
+// The length is derived from the first/last indices (last-first+1), never
+// from the raw entry count: a holed index would otherwise yield a short
+// count, LogReader.SetRange would compute a short lastIndex, and the gap
+// would be hidden instead of surfaced. A count/span mismatch returns
+// ErrLogGapDetected.
 func (db *DB) EntryRange(shardID, replicaID uint64) (uint64, uint64, error) {
 	if db.closed.Load() {
 		return 0, 0, logdb.ErrClosed
@@ -3149,7 +4393,16 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 		return err
 	}
 
-	// The compaction floor is monotonic: a lower floor is dropped before reaching the WAL.
+	// The compaction floor is monotonic. Entries below an earlier, HIGHER
+	// floor are already deleted, so a lower floor can never be honoured: reads
+	// between the two floors would see a hard log hole (ErrLogGapDetected)
+	// instead of ErrCompacted and raft would never fall back to
+	// InstallSnapshot. The call is dropped before it reaches the WAL because
+	// persisting the lower marker also re-pins garbage collection to it,
+	// letting the higher marker's segment be reclaimed — the regression would
+	// then survive restart. Callers can lower the floor legitimately only by
+	// removing the node. Reading compactedTo under shard.mu alone is sufficient:
+	// every mutator of it holds shard.mu as well.
 	if cur, ok := shard.compactedTo[key]; ok && index <= cur {
 		return nil
 	}
@@ -3172,7 +4425,17 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 		return db.rollbackStandalone(shard, &cp, err)
 	}
 
-	// Commit point: raise the floor, prune, pin the marker's segment, raise the commit mark and apply the epoch in one dataMu section.
+	// Commit point. Everything below is in-memory state the lock-free readers
+	// consume, so it is applied as one atomic dataMu section: a reader must
+	// never see the raised compaction floor without the matching index/entry
+	// pruning (or the reverse, which reads as a log gap).
+	//
+	// The pin of the segment the compaction marker landed in and the commit
+	// high-water mark mirror writeBootstrap. Without the pin, GC could reclaim
+	// the marker's segment once its entries are compacted away, and compactedTo
+	// would reset to 0 on recovery. The marker's own epoch joins the floor in
+	// the same section. The write is durable here (non-batch writeRecord
+	// fdatasyncs inline).
 	shard.dataMu.Lock()
 	defer shard.dataMu.Unlock()
 
@@ -3213,7 +4476,10 @@ func (db *DB) Compact(shardID, _ uint64) error {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	// The survey reads under s.mu alone; every mutator of these fields holds it.
+	// The live-set survey reads indexes, metaSegments and committedSegmentHWM
+	// without dataMu: every mutator of those fields also holds shard.mu, which
+	// is held here, so mu alone already excludes them. dataMu exists only to
+	// exclude the lock-free readers, which mutate nothing.
 	comp := newCompactor(shard.fs, shard.dir, shard.opts.blockSize)
 	liveSegments := make(map[uint64]bool)
 	for _, idx := range shard.indexes {
@@ -3221,7 +4487,10 @@ func (db *DB) Compact(shardID, _ uint64) error {
 			liveSegments[segID] = true
 		}
 	}
-	// Pin the segments holding the latest State, Snapshot and Bootstrap records.
+	// Pin segments that hold the latest State/Snapshot/Bootstrap records.
+	// These are never tracked by an entry index, so a segment whose entries
+	// have all been compacted away could otherwise be deleted while still
+	// holding the sole durable copy of a node's metadata.
 	shard.addMetaSegmentsToLive(liveSegments)
 
 	// No segment is unlinked until the floors that cover its entries are
@@ -3233,7 +4502,19 @@ func (db *DB) Compact(shardID, _ uint64) error {
 
 	deleted, err := comp.GarbageCollect(liveSegments, shard.activeSegmentID, shard.committedSegmentHWM)
 
-	// Fsync the directory so deletions survive a crash, before the epoch floor is raised below.
+	// Fsync the parent directory so the segment-file deletions survive a
+	// crash. Without this a metadata-lazy filesystem could resurrect a
+	// deleted segment, replaying records that were supposed to be gone.
+	// Best-effort for the deletions themselves: the next compaction retries.
+	//
+	// This MUST precede the epoch-floor recompute below. The recompute raises
+	// the shard's minWriteEpoch on the strength of the unlinks, and the engine
+	// purges the corresponding DEK once MinLiveEpoch reports the higher floor.
+	// If the directory fsync failed (or the process crashed first) the unlink
+	// is not durable, the segment reappears on restart, and replay hits a
+	// fatal WALDecryptError with the DEK already gone — the node cannot start
+	// at all. Deferring the floor raise is always safe; raising it on an
+	// unproven deletion is not.
 	dirSynced := true
 	if deleted > 0 {
 		if syncErr := syncDirFS(shard.fs, shard.dir); syncErr != nil {
@@ -3247,7 +4528,15 @@ func (db *DB) Compact(shardID, _ uint64) error {
 		}
 	}
 
-	// Recompute minWriteEpoch from segments still on disk, only after a successful GC that deleted something under a barrier.
+	// Recompute minWriteEpoch from the segments that actually survived ON
+	// DISK — never from the intended liveSegments set. GC deletes files one at
+	// a time and can abort partway, so a segment absent from liveSegments may
+	// still exist; dropping its segmentEpochs entry would raise the epoch
+	// floor past an epoch that segment still needs. The recompute is skipped
+	// entirely when GC failed (conservative: a too-low floor only defers DEK
+	// purging, never breaks recovery) and only needed when segments were
+	// actually deleted and a barrier is configured (otherwise segmentEpochs is
+	// empty).
 	if err == nil && deleted > 0 && dirSynced && shard.barrier != nil {
 		shard.recomputeMinWriteEpochFromDisk()
 	}
@@ -3270,11 +4559,24 @@ func (db *DB) SaveSnapshot(shardID, replicaID uint64, snapshot logdb.Snapshot) e
 	shard := db.getShard(shardID)
 	key := nodeKey{ShardID: shardID, ReplicaID: replicaID}
 
-	// Refuse a snapshot at index 0, which covers nothing.
+	// A snapshot at index 0 is not a snapshot: index 0 is the empty log, so it
+	// covers nothing and can never be newer than what is stored. The staleness
+	// rule below rejects it whenever a snapshot IS stored, but on a fresh node
+	// there was nothing to compare against and it went straight through —
+	// writing a WAL record, publishing a snapshot GetSnapshot reports as
+	// existing at no index, and pinning the segment it landed in against
+	// garbage collection for as long as no real snapshot replaces it. Extend
+	// the same rule to the fresh node; the SaveState path has always required
+	// Index > 0.
 	if snapshot.Index == 0 {
 		return logdb.ErrSnapshotOutOfDate
 	}
-	// Refuse an index or term at or above proto.MaxLogIndex / proto.MaxTerm before it becomes durable.
+	// The other end of the range: a position at or above proto.MaxLogIndex /
+	// proto.MaxTerm is refused before it can become durable, because raft
+	// restores a saved snapshot on restart and its Index+1 arithmetic wraps
+	// there. Same predicate as raft.handleSnapshot and the chunk validator;
+	// LogDB is the one that makes the poisoning survive a restart, so it
+	// cannot rely on the callers having applied it.
 	if err := snapshot.CheckBounds(); err != nil {
 		return err
 	}
@@ -3322,11 +4624,29 @@ func (db *DB) GetSnapshot(shardID, replicaID uint64) (logdb.Snapshot, error) {
 	if !ok {
 		return logdb.Snapshot{}, logdb.ErrNoSnapshot
 	}
-	// Return a deep copy so callers never mutate the stored record.
+	// Deep-copied on the way OUT as well as in. Returning the stored value
+	// hands the caller waldb's own maps: a caller that mutates the membership
+	// it received — reasonably, since it was handed a value — rewrites the
+	// record waldb still serves to everyone else, with no write and no error.
+	// memdb copies on both sides; these are two implementations of one
+	// interface and must not differ on who owns the memory.
 	return copySnapshot(ss), nil
 }
 
-// RemoveNodeData records the retirement in the retired-replica registry (retired.go), drops the node's in-memory records and reclaims unused segments; a crash after publishing finishes on the next open.
+// RemoveNodeData durably removes all data for the given node and retires its
+// replica ID: the retirement is recorded in the retired-replica registry
+// (retired.go) before anything else changes, so from the moment it returns
+// every writer refuses the node and every replay drops its records. The
+// node's records are then dropped from memory, which releases every segment
+// pin they held, and segment garbage collection reclaims what no surviving
+// node still uses. Nothing is written to the WAL: the registry, not a
+// tombstone record, is what keeps the removal, so no segment has to be kept
+// for it.
+//
+// A crash at any point after the registry is published completes the removal
+// on the next open (purgeRetired). A failure before it changes nothing. A
+// failed directory fsync after it leaves the retirement's durability unknown,
+// the same uncertainty a failed WAL fsync leaves, and fail-stops the DB.
 func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	if err := db.writeGate(); err != nil {
 		return err
@@ -3356,7 +4676,13 @@ func (db *DB) RemoveNodeData(shardID, replicaID uint64) error {
 	return nil
 }
 
-// reclaimSegmentsLocked GCs segments no live node references, fsyncs the directory, then recomputes the epoch floor from disk; best-effort. Caller holds s.mu.
+// reclaimSegmentsLocked garbage-collects the shard's segments that no live
+// node references any more, makes the deletions durable and, only then,
+// recomputes the epoch floor from what survived on disk. It runs after a node
+// is dropped (RemoveNodeData, and purgeRetired at open). Every step is
+// best-effort for the caller: the removal is already durable in the registry,
+// and whatever this leaves behind the next open's purge and reclaim retry.
+// Caller holds s.mu.
 func (s *walShard) reclaimSegmentsLocked(op string, logAttrs ...any) {
 	// Collect the set of segments still referenced by remaining live nodes.
 	liveSegments := make(map[uint64]bool)
@@ -3384,7 +4710,11 @@ func (s *walShard) reclaimSegmentsLocked(op string, logAttrs ...any) {
 			append([]any{"shard_dir", s.dir, "error", gcErr}, logAttrs...)...)
 	}
 
-	// Fsync the directory before the epoch-floor recompute, as in Compact.
+	// Fsync the shard directory to make segment deletions durable. It MUST
+	// run BEFORE the epoch-floor recompute below — see the identical ordering
+	// rationale in Compact: raising the floor on an unlink that a crash can
+	// undo lets the engine purge a DEK the resurrected segment still needs,
+	// and the next restart fails with WALDecryptError.
 	dirSynced := true
 	if err := syncDirFS(s.fs, s.dir); err != nil {
 		dirSynced = false
@@ -3393,7 +4723,17 @@ func (s *walShard) reclaimSegmentsLocked(op string, logAttrs ...any) {
 			append([]any{"shard_dir", s.dir, "error", err}, logAttrs...)...)
 	}
 
-	// Recompute minWriteEpoch from segments on disk, only after a fully successful GC.
+	// Recompute minWriteEpoch from the segments that actually survived ON
+	// DISK, and only after a fully successful GC. Without a recompute, the
+	// minimum live epoch can stay pinned to an epoch whose segments were just
+	// GC'd, indefinitely blocking DEK purging for that epoch. Driving
+	// the recompute from the intended liveSegments set instead of the on-disk
+	// survivors would be unsafe: a GC that failed partway (or whose ReadDir
+	// failed outright) leaves non-live segment files on disk, and dropping
+	// their segmentEpochs entries would raise the floor past an epoch those
+	// segments still need — the engine would purge the DEK and the next
+	// restart would hit a fatal WALDecryptError. Skipping the recompute on GC
+	// failure is conservative: a too-low floor only defers DEK purging.
 	if gcErr == nil && dirSynced && s.barrier != nil {
 		s.recomputeMinWriteEpochFromDisk()
 	}
@@ -3409,7 +4749,10 @@ func (db *DB) NodeRemoved(shardID, replicaID uint64) (bool, error) {
 	return db.retired.contains(nodeKey{ShardID: shardID, ReplicaID: replicaID}), nil
 }
 
-// retireNodes records every key in the registry in one rewrite, for re-encryption migration into an empty destination.
+// retireNodes records every key in the registry in one rewrite, for the
+// re-encryption migration, which carries a whole registry into an empty
+// destination: there is no data to drop, and one publication instead of one
+// per key keeps the migration linear in the registry's size.
 func (db *DB) retireNodes(nodes []logdb.NodeInfo) error {
 	if err := db.writeGate(); err != nil {
 		return err
@@ -3445,7 +4788,9 @@ func (db *DB) ListNodeInfo() ([]logdb.NodeInfo, error) {
 	seen := make(map[nodeKey]bool)
 	for i := 0; i < DefaultShardCount; i++ {
 		shard := db.shards[i]
-		// In-memory read under dataMu; see IterateEntries.
+		// In-memory read only; see IterateEntries for why this takes dataMu,
+		// not mu. It matters most here: this walks EVERY shard, so taking mu
+		// would serialize the scan behind up to DefaultShardCount fdatasyncs.
 		shard.dataMu.RLock()
 		for key := range shard.indexes {
 			seen[key] = true
@@ -3493,7 +4838,14 @@ func (db *DB) saveBootstrap(shardID, replicaID uint64, bootstrap logdb.Bootstrap
 		return err
 	}
 
-	// Checkpoint the standalone bootstrap write so a failure leaves no partial record behind.
+	// Standalone bootstrap write. This was the ONE standalone writer without a
+	// checkpoint — SaveSnapshot and RemoveEntriesTo have both had one — so a failed write left its bytes in the segment and returned an
+	// error the caller reads as "nothing happened". Those bytes are a partial
+	// record, and the next successful write lands directly on top of them: what
+	// recovery then finds is a torn record with valid data above it, in the
+	// middle of a live segment. That is the shape recovery must fail closed on,
+	// so one failed SaveBootstrap could cost the whole shard's WAL on the next
+	// restart.
 	var cp shardCheckpoint
 	if err := captureShardCheckpoint(shard, &cp); err != nil {
 		return err
@@ -3560,7 +4912,12 @@ func (db *DB) SaveEntries(shardID, replicaID uint64, entries []logdb.Entry) erro
 	}})
 }
 
-// GetEntries returns entries in [low, high) up to maxSize, or (nil, nil) for an unknown node or empty range; ErrCompacted and ErrLogGapDetected propagate.
+// GetEntries returns entries in [low, high) up to maxSize bytes. It is a
+// convenience wrapper over IterateEntries with lookup semantics: an unknown
+// node or a range holding no entries yields (nil, nil) so callers can probe
+// for presence without error handling. ErrCompacted and ErrLogGapDetected
+// propagate unchanged — a compacted or holed range must never read as
+// merely absent.
 func (db *DB) GetEntries(shardID, replicaID, low, high, maxSize uint64) ([]logdb.Entry, error) {
 	entries, _, err := db.IterateEntries(nil, 0, shardID, replicaID, low, high, maxSize)
 	if err != nil {
@@ -3592,7 +4949,11 @@ func (db *DB) GetState(shardID, replicaID uint64) (logdb.State, error) {
 	return state, err
 }
 
-// CompactedTo returns the node's durable compaction floor, 0 if never compacted; Reencrypt carries it to the migrated WAL.
+// CompactedTo returns the node's durable compaction floor: the highest log
+// index removed by RemoveEntriesTo (or replayed from its WAL marker). Zero
+// means the node has never been compacted. Reencrypt uses it to carry the
+// floor to a migrated WAL so requests below the floor keep returning
+// ErrCompacted instead of a gapped range.
 func (db *DB) CompactedTo(shardID, replicaID uint64) (uint64, error) {
 	if db.closed.Load() {
 		return 0, logdb.ErrClosed
@@ -3609,7 +4970,14 @@ func (db *DB) CompactedTo(shardID, replicaID uint64) (uint64, error) {
 	return compactedTo, nil
 }
 
-// MinLiveEpoch returns the minimum barrier epoch across live WAL records in all shards, or 0 with no barrier or no encrypted records.
+// MinLiveEpoch returns the minimum barrier encryption epoch across all
+// live WAL records in all shards. Returns 0 when no barrier is configured
+// or no encrypted records exist.
+//
+// This method is used by the snapshot pool's epoch purge logic to prevent
+// premature DEK purging: WAL segments may still contain records encrypted
+// at an older epoch than the oldest retained snapshot. Purging that
+// epoch's DEK would cause WALDecryptError on crash recovery.
 func (db *DB) MinLiveEpoch() (uint64, error) {
 	if db.closed.Load() {
 		return 0, logdb.ErrClosed
@@ -3636,7 +5004,34 @@ func (db *DB) MinLiveEpoch() (uint64, error) {
 	return globalMin, nil
 }
 
-// MinLiveEpochForBarrier returns MinLiveEpoch with known true when barrier is this DB's own (logdb.SameBarrier), else known false.
+// MinLiveEpochForBarrier returns the minimum barrier encryption epoch across
+// all live WAL records in this DB, but only when the given barrier handle is
+// the SAME barrier this DB was opened with. A waldb.DB encrypts every record
+// it stores with exactly one barrier (db.barrier), so it can answer the
+// per-barrier query precisely by identity: when the requested barrier matches,
+// the global MinLiveEpoch is exactly the min-epoch-for-that-barrier; when it
+// does not match (or no barrier is configured), this DB holds no records under
+// that barrier and the floor contribution is 0.
+//
+// This is the single-barrier-per-store building block. A multiplexing LogDB
+// that fans shards across several dedicated WALs (one barrier each) implements
+// PerBarrierEpochAwareLogDB by delegating to whichever underlying DB owns the
+// requested barrier; each such DB answers via this method.
+//
+// The barrier argument is matched by logdb.SameBarrier (pointer identity),
+// never with ==: a barrier's dynamic value need not be comparable, and == on
+// two that are not panics. The match holds whatever static interface type the
+// caller holds (SnapshotBarrier, Barrier, WALBarrier). A barrier whose dynamic
+// value is not a pointer has no identity, so it never matches, not even a copy
+// of the barrier this DB was opened with.
+//
+// The return values follow the fail-safe contract of
+// logdb.PerBarrierEpochAwareLogDB: this DB returns known == true only when the
+// requested barrier is its OWN barrier (identity match), in which case the
+// epoch is its global MinLiveEpoch (possibly 0 = a true non-constraint). For
+// any other barrier — or when this DB has no barrier — it returns known ==
+// false so the caller fails safe instead of mistaking "not my barrier" for
+// "zero live records".
 func (db *DB) MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err error) {
 	if db.closed.Load() {
 		return 0, false, logdb.ErrClosed
@@ -3656,7 +5051,40 @@ func (db *DB) MinLiveEpochForBarrier(barrier any) (epoch uint64, known bool, err
 	return min, true, nil
 }
 
-// AtRestProtection reports AtRestBarrierEncrypted when the barrier encrypts, AtRestHostRouted for a plaintext-mode barrier, and AtRestUnprotected without one.
+// AtRestProtection reports whether this DB's on-disk records are encrypted.
+//
+// A waldb.DB writes every record it accepts to a WAL segment on disk, so the
+// answer turns on whether the configured barrier ACTUALLY ENCRYPTS -- not on
+// whether one was configured. Without a barrier every record, and therefore
+// every user command inside every Raft log entry, lands on disk in cleartext.
+//
+// A barrier running StrategyNone lands them there too. Its "encryptor" is an
+// identity pass-through, so `db.barrier != nil` says nothing about the bytes on
+// the medium: the records are byte-for-byte their plaintext, and a grep over a
+// segment file finds the commands. Answering AtRestBarrierEncrypted for it made
+// the presence of an OBJECT stand in for the presence of ENCRYPTION and handed
+// the host's requireEncryptedLogDB gate -- whose entire purpose is to refuse
+// rather than silently downgrade -- exactly the store it exists to refuse. The
+// barrier already knows the answer and reports it through plaintextModeReporter;
+// this asks.
+//
+// A barrier that does not implement plaintextModeReporter is read as
+// encrypting. That is the conservative direction for THIS question: the
+// optional interface exists to declare an absence of encryption, so its own
+// absence cannot be evidence of one, and treating every barrier that predates
+// the interface as plaintext would refuse working encrypted deployments.
+//
+// A plaintext-mode barrier is reported as AtRestHostRouted, not as
+// AtRestUnprotected: every record still goes through that ONE barrier, which
+// MinLiveEpochForBarrier names by identity. That is what lets a host accept
+// this store exactly as it accepts its own default WAL under its own
+// plaintext-mode barrier (which starts encrypting once EnableEncryption flips
+// it), and only then: the host checks the barrier is its own, so the same
+// store under any other barrier is still refused.
+//
+// This is deliberately NOT answerable by a type assertion on the LogDB: *DB
+// implements PerBarrierEpochAwareLogDB in ALL of these cases, so a caller that
+// treats the interface as evidence of encryption accepts the plaintext store.
 func (db *DB) AtRestProtection() logdb.AtRestProtection {
 	if db.barrier == nil {
 		return logdb.AtRestUnprotected
@@ -3711,7 +5139,14 @@ func (s *walShard) setBootstrapSegment(key nodeKey, segID uint64) {
 	s.metaSegments[key] = m
 }
 
-// setCompactSegment pins segID as holding key's latest compaction marker. Caller holds s.mu and s.dataMu, except during recover().
+// setCompactSegment records segID as the segment holding the latest durable
+// compaction marker for key. A compaction marker is not tracked by any entry
+// index, so without this pin a (rotated, non-active) segment whose entries have
+// all been compacted away could be garbage-collected, discarding the marker —
+// on recovery compactedTo would then reset to 0 and GetEntries/IterateEntries
+// would return empty instead of ErrCompacted for compacted indices. Last write
+// wins. Caller must hold s.mu and s.dataMu for writing, except on the recover()
+// path (see walShard).
 func (s *walShard) setCompactSegment(key nodeKey, segID uint64) {
 	if s.metaSegments == nil {
 		s.metaSegments = make(map[nodeKey]metaSegments)
@@ -3722,7 +5157,13 @@ func (s *walShard) setCompactSegment(key nodeKey, segID uint64) {
 	s.metaSegments[key] = m
 }
 
-// clearMetaSegmentPins removes every pin to a discarded segID, dropping entries left empty; called only from recover().
+// clearMetaSegmentPins removes any State/Snapshot/Bootstrap/Compact pin that
+// points at segID, resetting both the field and its presence flag.
+// Used when a segment is discarded (truncation-recovery cleanup) so no
+// phantom pin to a non-existent segment lingers in metaSegments. An entry
+// whose pins all become absent is removed from the map. Called only from
+// discardSegmentsAbove, i.e. from recover(), where the shard is not yet
+// published and neither lock is required (see walShard).
 func (s *walShard) clearMetaSegmentPins(segID uint64) {
 	for key, m := range s.metaSegments {
 		if m.hasState && m.state == segID {
@@ -3749,14 +5190,23 @@ func (s *walShard) clearMetaSegmentPins(segID uint64) {
 	}
 }
 
-// advanceCommittedHWM raises the commit mark to segID if higher. Caller holds s.mu and s.dataMu, except during recover().
+// advanceCommittedHWM raises the commit high-water mark to segID if segID is
+// higher. The mark is monotonic: a batch that landed in an earlier segment
+// must never lower it below a later batch that already committed. Caller must
+// hold s.mu and s.dataMu for writing, except on the recover() path (see
+// walShard).
 func (s *walShard) advanceCommittedHWM(segID uint64) {
 	if segID > s.committedSegmentHWM {
 		s.committedSegmentHWM = segID
 	}
 }
 
-// addMetaSegmentsToLive adds every pinned metadata segment to liveSegments before GC. Caller holds s.mu.
+// addMetaSegmentsToLive folds every tracked State/Snapshot/Bootstrap/Compact
+// segment ID for all live nodes into liveSegments. These record types are
+// never tracked by an entry index, so they must be pinned explicitly before
+// garbage collection or the sole durable copy of a node's
+// State/Snapshot/Bootstrap/Compact record could be deleted. This only READS metaSegments, and every mutator of it holds s.mu,
+// so holding s.mu alone is sufficient exclusion (see walShard).
 func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 	for _, m := range s.metaSegments {
 		if m.hasState {
@@ -3774,7 +5224,16 @@ func (s *walShard) addMetaSegmentsToLive(liveSegments map[uint64]bool) {
 	}
 }
 
-// recomputeMinWriteEpochFromDisk re-derives the epoch floor from segment files on disk, keeping it on a ReadDir failure. Caller holds s.mu; it takes s.dataMu.
+// recomputeMinWriteEpochFromDisk re-derives the shard's epoch floor from the
+// segment files actually present in the shard directory. The floor must never
+// be driven by the intended live-segment set handed to GarbageCollect: GC
+// deletes files one at a time and can abort partway, so a segment absent from
+// that set may still exist on disk — dropping its segmentEpochs entry would
+// let the engine purge a DEK the surviving segment still needs, making the
+// next restart fail with WALDecryptError. A ReadDir failure keeps the floor
+// unchanged, which is conservative: the floor can only be too LOW, retaining
+// DEKs longer than strictly necessary. Caller must hold s.mu; this takes
+// s.dataMu itself for the map rewrite.
 func (s *walShard) recomputeMinWriteEpochFromDisk() {
 	dirEntries, err := s.fs.ReadDir(s.dir)
 	if err != nil {
@@ -3798,7 +5257,13 @@ func (s *walShard) recomputeMinWriteEpochFromDisk() {
 	s.dataMu.Unlock()
 }
 
-// recomputeMinWriteEpoch recalculates minWriteEpoch from segmentEpochs for the surviving liveSegments plus the active segment. Caller holds s.mu and s.dataMu.
+// recomputeMinWriteEpoch recalculates the shard's minWriteEpoch from the
+// segmentEpochs map after garbage collection removes dead segments.
+// liveSegments contains the set of segment IDs that survived GC. The active
+// segment is always considered live.
+//
+// It rewrites segmentEpochs and minWriteEpoch, so the caller must hold s.mu
+// and s.dataMu for writing.
 func (s *walShard) recomputeMinWriteEpoch(liveSegments map[uint64]bool) {
 	// Remove dead segments from the epoch map.
 	for segID := range s.segmentEpochs {

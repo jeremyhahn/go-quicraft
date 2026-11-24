@@ -24,7 +24,11 @@ import (
 	"testing"
 )
 
-// mockAADEncryptor is a delegated AES-256-GCM encryptor that authenticates caller AAD, standing in for a hardware or KMS encryptor.
+// mockAADEncryptor is a delegated encryptor that DOES authenticate
+// caller-supplied AAD, so it implements AADSymmetricEncrypter. It stands in for
+// a hardware/KMS encryptor whose API carries AAD end to end. The AEAD is real
+// (AES-256-GCM under a fixed test key) precisely so that a wrong AAD fails the
+// way a real one would, instead of being detected by a bespoke comparison.
 type mockAADEncryptor struct {
 	aead cipher.AEAD
 }
@@ -91,7 +95,11 @@ func hwBarrier(t *testing.T, cfg BarrierConfig, enc SymmetricEncrypter) (*Barrie
 
 // --- (a) a capable delegated encryptor carries the context end to end ---
 
-// TestBarrier_HardwareAAD_RoundTripAndMismatch: a hardware barrier with an AADSymmetricEncrypter binds position like a software one; a frame does not open under another context.
+// TestBarrier_HardwareAAD_RoundTripAndMismatch is the point of the whole
+// change: a hardware barrier whose encryptor implements AADSymmetricEncrypter
+// gets the SAME positional binding a software barrier gets. A frame sealed under
+// one context must not open under another, which is what makes moving, splicing
+// or truncating a frame detectable.
 func TestBarrier_HardwareAAD_RoundTripAndMismatch(t *testing.T) {
 	b, err := hwBarrier(t, testBarrierConfig(1), newMockAADEncryptor(t))
 	if err != nil {
@@ -379,7 +387,10 @@ func TestContextBinding_String(t *testing.T) {
 
 // --- (c) RequireContextAAD fails closed at setup, not at first write ---
 
-// TestBarrier_RequireContextAAD_Initialize covers the refusals at Initialize, before any unbound byte is written.
+// TestBarrier_RequireContextAAD_Initialize covers the refusals at Initialize
+// (the satisfying modes Initialize with the flag in the _Unseal subtests). The
+// whole value of the flag is that the refusal happens HERE, before a single
+// unbound byte is written.
 func TestBarrier_RequireContextAAD_Initialize(t *testing.T) {
 	requiring := func() BarrierConfig {
 		cfg := testBarrierConfig(1)
@@ -415,7 +426,8 @@ func TestBarrier_RequireContextAAD_Initialize(t *testing.T) {
 func TestBarrier_RequireContextAAD_Unseal(t *testing.T) {
 	t.Run("incapable hardware refused", func(t *testing.T) {
 		strategy := &hwStrategy{hwEnc: &mockHWEncryptor{prefix: []byte("HW:")}}
-		// Initialize without the requirement, then seal and unseal a barrier that requires it: the restart shape.
+		// Initialize WITHOUT the requirement so the barrier exists, then seal
+		// and unseal a barrier that does require it — the restart shape.
 		b := MustNewBarrier(testBarrierConfig(1))
 		if err := b.Initialize(context.Background(), strategy, Credentials{}); err != nil {
 			t.Fatalf("Initialize failed: %v", err)

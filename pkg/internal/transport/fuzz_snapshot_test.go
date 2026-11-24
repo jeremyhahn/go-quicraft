@@ -182,7 +182,12 @@ func FuzzSnapshotHeaderRoundTrip(f *testing.F) {
 	})
 }
 
-// FuzzSnapshotChunkStreamCrash fuzzes the chunk decoding loop: no panic, balanced budgets, and delivery only for a complete valid stream.
+// FuzzSnapshotChunkStreamCrash feeds arbitrary bytes, as the chunk stream that
+// follows a snapshot header, to the receiver's chunk decoding loop (frame
+// header, chunk unmarshal, chunk validation). It must never panic, must return
+// every byte it reserved from the global and per-peer memory budgets, and may
+// deliver a snapshot only when exactly the declared number of valid chunks
+// arrived, each within the chunk data cap and consistent with the header.
 func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 	hdr := seedSnapshotHeader()
 	valid, err := encodeSnapshotChunkFrames(f, seedSnapshotChunks(hdr))
@@ -252,9 +257,24 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 		h.ChunkCount = uint64(chunkCount % 8)
 		stopC := make(chan struct{})
 
-		// admitted is the sum of frame lengths the budget admits; any allocation before admission lands past allocBound.
+		// admitted is the sum of the frame lengths receiveChunks reserves
+		// against the budget, computed by walking a copy of the stream with
+		// the receiver's own functions. A frame buffer is allocated only
+		// after reserveChunkMemory admits its length (snapshot_recv.go), so
+		// a buffer allocated before that check, or for a frame the budget
+		// refuses, lands past allocBound.
 		admitted, meta := fuzzAdmittedFrameBytes(sr, &h, data)
-		// k is 1 because Data aliases the frame buffer; meta is charged at proto.MaxDecodeMemoryFactor, and allocSlack covers fixed overhead.
+		// k is 1: SnapshotChunk.UnmarshalFromWindow aliases Data into the
+		// frame buffer (pkg/proto getBytes returns a sub-slice) rather than
+		// copying it, so Data costs nothing beyond its frame buffer. The rest
+		// of a decoded frame, meta, is not aliased: Membership maps and
+		// copied strings are built from it, and proto.MaxDecodeMemoryFactor
+		// is the decoder's stated bound on that expansion per wire byte, so
+		// meta is charged at that factor. A frame that fails to decode is
+		// charged its whole length as meta: the decoder may have built the
+		// maps before the failing field. allocSlack covers the chunk
+		// slice, the timer, errors and log records, and stays below every
+		// rejected seed frame's length.
 		const k, allocSlack = 1, 64 << 10
 		allocBound := uint64(k*admitted + proto.MaxDecodeMemoryFactor*meta + allocSlack)
 		var before, after runtime.MemStats
@@ -308,7 +328,19 @@ func FuzzSnapshotChunkStreamCrash(f *testing.F) {
 	})
 }
 
-// fuzzAdmittedFrameBytes walks a copy of the stream with the receiver's steps and returns the admitted frame bytes and the decoder-expanded meta bytes.
+// fuzzAdmittedFrameBytes returns the sum of the frame lengths receiveChunks
+// reserves against its memory budget for data, walking a copy of the stream
+// with the receiver's own header, budget, decode and validation steps. A
+// frame the budget refuses is refused before its buffer exists, so it is not
+// counted; a frame that is admitted and then fails to read, decode or
+// validate is counted and ends the walk.
+//
+// meta is, for each admitted frame that decodes, its length minus
+// len(chunk.Data): the bytes the decoder expands rather than aliases. A
+// frame admitted and then failing to decode is charged its whole length as
+// meta, since UnmarshalFromWindow may build the Membership maps before a
+// later field fails. A frame admitted and then failing to read adds to
+// admitted only.
 func fuzzAdmittedFrameBytes(sr *snapshotReceiver, h *SnapshotHeader, data []byte) (admitted, meta int) {
 	r := bytes.NewReader(data)
 	var charged int64

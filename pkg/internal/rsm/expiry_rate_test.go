@@ -20,7 +20,19 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestMaxExpirePerCheckpoint_ScalesWithTableCapacity: the per-checkpoint expiry cap scales with table capacity and depends only on replicated policy.
+// TestMaxExpirePerCheckpoint_ScalesWithTableCapacity pins the bound on how
+// long a full session table takes to drain.
+//
+// A fixed cap of 64 made the recovery time depend on MaxTotalSessions: at the
+// defaults (16384 sessions, a 100000-entry window) a full table needed 256
+// windows — 25.6 million applied entries — during which every new session
+// registration on the shard failed. A crashed client fleet reaches that state,
+// and the recovery constant was three orders of magnitude larger than the
+// failure.
+//
+// The cap must also stay a pure function of the REPLICATED policy: a
+// node-local input here would expire different sessions on different replicas,
+// which is the divergence the whole expiry design exists to avoid.
 func TestMaxExpirePerCheckpoint_ScalesWithTableCapacity(t *testing.T) {
 	cases := []struct {
 		name          string

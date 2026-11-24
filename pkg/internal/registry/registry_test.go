@@ -184,7 +184,10 @@ func TestAddressInUsePresentAndAbsent(t *testing.T) {
 	}
 }
 
-// TestAddressInUseAfterRemove checks a shared address stays in use until its last member is removed.
+// TestAddressInUseAfterRemove verifies an address shared by several members
+// stays in use until the LAST member mapping to it is removed. This is the
+// property a caller relies on before tearing down the address-keyed connection
+// that all of those members multiplex over.
 func TestAddressInUseAfterRemove(t *testing.T) {
 	r := NewRegistry()
 	const addr = "10.0.0.9:5000"
@@ -257,7 +260,9 @@ func BenchmarkRegistryResolve_Concurrent(b *testing.B) {
 	})
 }
 
-// TestRegisterIfAbsentStoresOnlyWhenAbsent checks the first call stores and a later different address is kept out.
+// TestRegisterIfAbsentStoresOnlyWhenAbsent pins the establish-but-never-replace
+// contract address learning depends on: the first call stores and reports it,
+// a later call with a DIFFERENT address keeps the original and says so.
 func TestRegisterIfAbsentStoresOnlyWhenAbsent(t *testing.T) {
 	r := NewRegistry()
 	got, stored := r.RegisterIfAbsent(1, 2, "a:1")

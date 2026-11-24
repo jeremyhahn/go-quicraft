@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package config provides per-shard (Config), per-host (HostConfig) and transport (TransportConfig) configuration with SetDefaults and Validate.
+// Package config provides configuration types for the QuicRaft Raft library.
+// It includes per-shard configuration (Config), per-host configuration
+// (HostConfig), and transport-layer tuning (TransportConfig). All
+// configuration types support SetDefaults for filling zero-valued fields
+// and Validate for cross-field validation.
 package config
 
 // CompressionType identifies the compression algorithm for Raft entries

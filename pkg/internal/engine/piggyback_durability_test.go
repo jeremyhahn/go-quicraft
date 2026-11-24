@@ -11,7 +11,14 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// maxPersistedEntryIndex returns the highest log index this LogDB has been asked to persist; read it at the moment of interest.
+// maxPersistedEntryIndex returns the highest log index this LogDB has ever been
+// asked to persist. It is the recording half of the durability assertions
+// below: testLogDB.saved accumulates every logdb.Update handed to SaveState, so
+// an index above this watermark exists ONLY in the replica's in-memory log and
+// would not survive a crash.
+//
+// Read it as a number at the moment of interest, never later: the Entries
+// slices in saved alias commitWorker.flatBuf, which processBatch reuses.
 func (t *testLogDB) maxPersistedEntryIndex() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -85,7 +92,29 @@ func replicateTo(t *testing.T, peer *raft.Peer, prevIndex, prevTerm, leaderCommi
 	}
 }
 
-// TestPiggyback_WithholdsAckForUnsavedEntries pins that no ReplicateResp advertises an index above what the LogDB has persisted (Raft figure 2).
+// TestPiggyback_WithholdsAckForUnsavedEntries pins the Figure 2 rule that
+// persistent state is "updated on stable storage before responding to RPCs" on
+// the piggyback fast path.
+//
+// The mechanism it guards: while commitPending is set, processCommitPendingInbox
+// steps inbound Replicate messages (only InstallSnapshot is filtered out), and
+// handleAppend answers each one with an ORDERED ReplicateResp naming the new
+// last index — while the entries themselves are still only in the in-memory
+// log. GetPiggybackUpdate then hands the engine an Update whose SaveState
+// writes hard state ONLY. If that Update carries the ReplicateResp, the
+// follower has told its leader it holds an index that would vanish in a crash,
+// and the leader counts that match toward its commit quorum.
+//
+// The property asserted is an ordering one, not an implementation detail: no
+// ReplicateResp handed to the sender may advertise a log index above the
+// highest index the LogDB has actually been asked to persist. "Not persisted"
+// is established by the recording testLogDB — it keeps every logdb.Update given
+// to SaveState, and entries 4-5 appear in none of them at the moment the
+// piggyback releases its messages.
+//
+// It deliberately drives the REAL producer, Peer.GetPiggybackUpdate, against a
+// real r.msgs and a real non-empty entriesToSave(). A test that hand-builds the
+// proto.Update cannot observe this class of defect at all.
 func TestPiggyback_WithholdsAckForUnsavedEntries(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()
@@ -123,7 +152,9 @@ func TestPiggyback_WithholdsAckForUnsavedEntries(t *testing.T) {
 			"comparison below would prove nothing", durable)
 	}
 
-	// Cycle 2, inside commitPending: the leader commits 3 and replicates 4-5, appended only in memory.
+	// Cycle 2, inside the commitPending window: the leader commits 3 and
+	// replicates 4-5 in the same message. handleAppend appends 4-5 to the
+	// IN-MEMORY log and queues ReplicateResp{LogIndex: 5}.
 	node.commitPending.Store(true)
 	replicateTo(t, peer, 3, 1, 3, []proto.Entry{
 		{Index: 4, Term: 1, Cmd: []byte("d")},
@@ -171,7 +202,10 @@ func TestPiggyback_WithholdsAckForUnsavedEntries(t *testing.T) {
 		}
 	}
 
-	// Withheld, not dropped: the ack travels with the update that persists 4-5.
+	// Withheld, never dropped. The acknowledgement must still be delivered —
+	// by the next cycle, which is the one that actually persists 4-5. Asserting
+	// both facts on the SAME update is the point: the ordered response and the
+	// entries it names travel together through SaveState.
 	if !peer.HasUpdate(node.lastApplied.Load()) {
 		t.Fatal("the withheld ReplicateResp was dropped: the peer reports no " +
 			"further work, so the leader never learns this follower holds 4-5")
@@ -197,7 +231,21 @@ func TestPiggyback_WithholdsAckForUnsavedEntries(t *testing.T) {
 	}
 }
 
-// TestPiggyback_FailedStatePersistKeepsStateUnacknowledged pins that a failed piggyback SaveState keeps the hard state unpersisted and returns the ordered messages.
+// TestPiggyback_FailedStatePersistKeepsStateUnacknowledged pins the two
+// obligations of the piggyback SaveState failure path.
+//
+// The path is documented as SELF-HEALING, and that is true of the entries: the
+// processed marker has not moved, so they are re-offered. It holds for the
+// hard state only if GetPiggybackUpdate does not advance prevState before the
+// engine attempts the persist: otherwise a failed SaveState leaves the peer
+// believing a term/vote it had never written was durable. hasStateChanged() then reported
+// no change, a later update could be ReadOnly, and the step worker's ReadOnly
+// bypass transmits messages with no LogDB write at all — a granted vote leaving
+// the replica with nothing on disk to stop it voting again after a crash.
+// The same failure path also dropped the ordered messages it had drained.
+//
+// Both are asserted through the real producer: a real vote is granted into a
+// real r.msgs, and the real GetPiggybackUpdate drains it.
 func TestPiggyback_FailedStatePersistKeepsStateUnacknowledged(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()
@@ -277,7 +325,18 @@ func TestPiggyback_FailedStatePersistKeepsStateUnacknowledged(t *testing.T) {
 		t.Fatal("executePiggyback reported shutdown")
 	}
 
-	// The ordered messages come back, and ReadOnly is false so the vote response is not sent without a WAL write.
+	// Obligation 1: the ordered messages come back. Dropping a ReplicateResp
+	// costs a retransmit; dropping this VoteResp stalls the candidate for a
+	// full election timeout.
+	//
+	// Obligation 2: ReadOnly must be false. It is the observable form of "the
+	// peer still considers this term/vote unpersisted" — the step worker's
+	// ReadOnly bypass sends an update's messages WITHOUT routing it through the
+	// commit pipeline, so a ReadOnly update carrying a vote response is a vote
+	// leaving this replica with no WAL write behind it. moreEntriesToApply is
+	// false here for the same reason the step worker passes false during a
+	// snapshot: it isolates the hard state as the only thing that could mark
+	// the update non-ReadOnly.
 	after, err := peer.GetUpdate(false, node.lastApplied.Load())
 	if err != nil {
 		t.Fatalf("GetUpdate (after failed persist): %v", err)

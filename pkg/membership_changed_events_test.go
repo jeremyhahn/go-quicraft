@@ -275,7 +275,12 @@ func observerRemoved(m *Membership) error {
 	return nil
 }
 
-// TestMembershipChangedEvents_FiresOncePerReplicaPerChange checks OnMembershipChanged fires once per Host per applied change, never ahead of the served membership.
+// TestMembershipChangedEvents_FiresOncePerReplicaPerChange pins the
+// documented contract of config.EventListener.OnMembershipChanged on a
+// three-Host cluster: ordinary proposals fire nothing; an applied observer
+// add and its removal each fire exactly one callback on every Host, carrying
+// the shard ID and that Host's own replica ID; and the callback never runs
+// ahead of the membership the Host serves.
 func TestMembershipChangedEvents_FiresOncePerReplicaPerChange(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*membershipEventsTimeout)
 	defer cancel()

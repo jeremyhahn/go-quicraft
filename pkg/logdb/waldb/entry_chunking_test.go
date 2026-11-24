@@ -8,7 +8,23 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestSaveState_BatchLargerThanOneRecord verifies a batch larger than one WAL record is split across records and replays live and after reopen.
+// TestSaveState_BatchLargerThanOneRecord verifies that a batch whose framed
+// size exceeds a single WAL record is split across records instead of failing
+// permanently.
+//
+// If one Update always became exactly one record, it would have to fit inside
+// one segment. The usable payload is strictly less than the segment size (a
+// record spends recordHeaderSize in every block it spans), and the WAL adds a
+// 84-byte header per entry that raft's batch cap does not account for. So raft
+// could hand the WAL a batch it would reject with ErrRecordTooLarge -- a
+// PERMANENT error, deliberately not retried or rotated -- and the node could
+// never persist it. A lagging follower catching up on many small entries is
+// the realistic trigger.
+//
+// The split records must also replay: the format tolerates several entry
+// records per Update, which is what makes chunking safe rather than a format
+// change. So the batch is read back twice, from the live store and again
+// after a reopen.
 func TestSaveState_BatchLargerThanOneRecord(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "wal")
 	// A small segment keeps the test fast; the ratio is what matters, not the

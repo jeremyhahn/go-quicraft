@@ -27,7 +27,22 @@ import (
 // The floor scan's diagnostics must be bounded
 // ---------------------------------------------------------------------------
 
-// TestSnapshotFloorScan_BoundsAccumulationAndRateLimitsTheReport: the blocker count is complete, the sample bounded and the record rate-limited.
+// TestSnapshotFloorScan_BoundsAccumulationAndRateLimitsTheReport pins the cost
+// of the scan's operator diagnostics without weakening the property they exist
+// for.
+//
+// The scan deliberately does NOT short-circuit: the verdict is settled by the
+// first unevaluable directory, but it keeps going so one log record can name
+// every blocking directory rather than the operator fixing them one scan at a
+// time. What was unbounded was the ACCUMULATION: one struct and one path string
+// per blocking directory, on a host that can hold thousands of shards, allocated
+// on EVERY snapshot save (purgeOldEpochs runs the scan after each one) — to
+// print at most maxReportedFloorBlockers of them. The warning itself was emitted
+// on every save too, describing a condition that only changes when directories
+// roll off or are repaired.
+//
+// So: the COUNT is complete, the retained sample is bounded, and the record is
+// rate-limited.
 func TestSnapshotFloorScan_BoundsAccumulationAndRateLimitsTheReport(t *testing.T) {
 	baseDir := t.TempDir()
 
@@ -72,7 +87,8 @@ func TestSnapshotFloorScan_BoundsAccumulationAndRateLimitsTheReport(t *testing.T
 			len(scan.blockers), maxReportedFloorBlockers)
 	}
 
-	// The record carries the complete count and is emitted at most once per interval.
+	// The record must carry the COMPLETE count even though the sample is a
+	// slice of it, and must be emitted at most once per interval.
 	buf, restore := captureWarnOutput(t)
 	defer restore()
 	lastFloorReport.Store(0)
@@ -120,7 +136,26 @@ func captureWarnOutput(t *testing.T) (*logCapture, func()) {
 // A declared body length must be compared unsigned
 // ---------------------------------------------------------------------------
 
-// TestParseSnapshotMeta_HugeDeclaredBodyLength pins that the declared body length is capped before it is narrowed to int, on any GOARCH.
+// TestParseSnapshotMeta_HugeDeclaredBodyLength covers a record that declares an
+// absurd body length.
+//
+// The declared length is a uint32 read from a file and is used to SLICE the
+// body. Converting it to int before the bounds check is safe only where int is
+// 64 bits: on a 32-bit GOARCH a declared length of 2^31 or more becomes
+// NEGATIVE, "claims more body than the file holds" is then false, and
+// body[:bodyLen] panics — inside the DEK purge-floor scan, which walks every
+// snapshot directory on the host and whose entire input is bytes on disk.
+//
+// A test that only falsifies the length on a SHORT record cannot see that: on
+// amd64 the signed comparison gives the same answer as the unsigned one, so
+// such a test passes with the bug present and only a 386 build can distinguish
+// them. This one asserts the property that IS architecture-independent —
+// the declared length is capped BEFORE it is narrowed, so a value that could
+// truncate to a negative int is unrepresentable here on any GOARCH — and the
+// oversized_declaration_with_a_body_to_match case makes the cap load-bearing on
+// a 64-bit build: the file really does hold the bytes it declares, so every
+// length-versus-available comparison, signed or unsigned, accepts it and only
+// the cap rejects it.
 func TestParseSnapshotMeta_HugeDeclaredBodyLength(t *testing.T) {
 	t.Run("declared beyond the file", func(t *testing.T) {
 		for _, declared := range []uint32{1 << 31, 1<<32 - 1, 0x8000_0038, maxSnapshotMetaBodyLen + 1} {
@@ -142,7 +177,9 @@ func TestParseSnapshotMeta_HugeDeclaredBodyLength(t *testing.T) {
 		}
 	})
 
-	// The record carries the body it declares, so only the cap rejects it.
+	// The falsifiable half. The record CARRIES the body it declares, so the
+	// "claims more body than the file holds" guard — in either arithmetic — is
+	// false and the parse proceeds unless the declared length is capped.
 	t.Run("oversized declaration with a body to match", func(t *testing.T) {
 		const declared = maxSnapshotMetaBodyLen + 8
 		rec := make([]byte, snapshotMetaHeaderSize+declared)
@@ -160,7 +197,8 @@ func TestParseSnapshotMeta_HugeDeclaredBodyLength(t *testing.T) {
 		}
 	})
 
-	// The cap must accept any record the format can produce, including newer versions'.
+	// The cap must not reject a record this format can actually produce,
+	// including one written by a NEWER version with more body fields.
 	t.Run("a body at the cap is still accepted", func(t *testing.T) {
 		const declared = maxSnapshotMetaBodyLen
 		rec := make([]byte, snapshotMetaHeaderSize+declared)

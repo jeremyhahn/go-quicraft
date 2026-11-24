@@ -20,7 +20,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestProtoMembershipToLogDBCarriesIdentities verifies snapshot metadata keeps member identities.
+// TestProtoMembershipToLogDBCarriesIdentities pins the WRITE side of the
+// snapshot-metadata round-trip.
+//
+// This converter is what a replica's own snapshot save goes through
+// (snapshotPool.save) and what carries an Update's snapshot metadata into
+// LogDB. Identities reach membership only through the log, so if this drops
+// them the record on disk never had them and the recovery path has nothing to
+// read back — the replica returns with an identity-free configuration and
+// silently authorizes every member by address instead.
 func TestProtoMembershipToLogDBCarriesIdentities(t *testing.T) {
 	pm := proto.Membership{
 		ConfigChangeID: 7,

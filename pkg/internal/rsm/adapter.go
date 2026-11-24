@@ -32,7 +32,12 @@ type smWrapper interface {
 	NALookupInto(key, dst []byte) ([]byte, bool, error) // returns (result, supported, error)
 	GetHash() (uint64, bool, error)                     // returns (hash, supported, error)
 	SaveSnapshot(ctx context.Context, w io.Writer, stopper <-chan struct{}) error
-	// saveSnapshotGated writes the SM snapshot, calling afterCapture once after the point-in-time is captured and before streaming.
+	// saveSnapshotGated writes the user SM snapshot and invokes afterCapture
+	// (when non-nil) exactly once after the point-in-time is captured and
+	// before the potentially-long streaming begins. For regular in-memory SMs
+	// the whole save is the capture, so afterCapture fires at the end; for
+	// concurrent/on-disk SMs it fires after PrepareSnapshot, so the caller can
+	// release the apply gate while the immutable snapshot streams.
 	saveSnapshotGated(ctx context.Context, w io.Writer, stopper <-chan struct{}, afterCapture func()) error
 	RecoverFromSnapshot(ctx context.Context, r io.Reader, stopper <-chan struct{}) error
 	Close(ctx context.Context) error
@@ -54,7 +59,10 @@ func naLookup(underlying interface{}, key []byte) ([]byte, bool, error) {
 	return result, true, nil
 }
 
-// naLookupInto looks up into a caller buffer when the SM implements sm.NALookupInto, returning ok=false otherwise.
+// naLookupInto performs a byte-slice lookup into a caller-provided buffer
+// if the underlying state machine implements sm.NALookupInto. Returns
+// (nil, false, nil) if not supported, or (result, true, err) if supported.
+// The returned slice aliases dst when the value fits; dst may be grown.
 func naLookupInto(underlying interface{}, key, dst []byte) ([]byte, bool, error) {
 	na, ok := underlying.(sm.NALookupInto)
 	if !ok {
@@ -126,7 +134,10 @@ func (w *regularSMWrapper) SaveSnapshot(ctx context.Context, wr io.Writer, stopp
 	return w.saveSnapshotGated(ctx, wr, stopper, nil)
 }
 
-// saveSnapshotGated writes the regular SM snapshot; the whole save is the capture, so afterCapture fires after it.
+// saveSnapshotGated writes the regular SM snapshot. A regular SM has no
+// point-in-time prepare and is not safe against a concurrent Update, so its
+// whole (in-memory) save is the consistent capture: afterCapture fires only
+// after the save completes successfully.
 func (w *regularSMWrapper) saveSnapshotGated(ctx context.Context, wr io.Writer, stopper <-chan struct{}, afterCapture func()) error {
 	if err := w.sm.SaveSnapshot(ctx, wr, stopper); err != nil {
 		return err
@@ -197,7 +208,10 @@ func (w *concurrentSMWrapper) SaveSnapshot(ctx context.Context, wr io.Writer, st
 	return w.saveSnapshotGated(ctx, wr, stopper, nil)
 }
 
-// saveSnapshotGated captures via PrepareSnapshot under the apply gate, fires afterCapture, then streams concurrently with Update.
+// saveSnapshotGated captures the concurrent SM's point-in-time via
+// PrepareSnapshot (which must not race Update, so it runs under the caller's
+// apply gate), fires afterCapture to release the gate, then streams the
+// immutable snapshot concurrently with resumed applies.
 func (w *concurrentSMWrapper) saveSnapshotGated(ctx context.Context, wr io.Writer, stopper <-chan struct{}, afterCapture func()) error {
 	snapCtx, err := w.sm.PrepareSnapshot()
 	if err != nil {
@@ -269,7 +283,11 @@ func (w *onDiskSMWrapper) SaveSnapshot(ctx context.Context, wr io.Writer, stoppe
 	return w.saveSnapshotGated(ctx, wr, stopper, nil)
 }
 
-// saveSnapshotGated syncs and captures via PrepareSnapshot under the apply gate, fires afterCapture, then streams concurrently with Update.
+// saveSnapshotGated syncs and captures the on-disk SM's point-in-time via
+// PrepareSnapshot (both run under the caller's apply gate), fires afterCapture
+// to release the gate, then streams the immutable snapshot concurrently with
+// resumed applies — so a large on-disk snapshot does not pause this shard's
+// applies for the duration of the stream.
 func (w *onDiskSMWrapper) saveSnapshotGated(ctx context.Context, wr io.Writer, stopper <-chan struct{}, afterCapture func()) error {
 	if err := w.sm.Sync(); err != nil {
 		return err

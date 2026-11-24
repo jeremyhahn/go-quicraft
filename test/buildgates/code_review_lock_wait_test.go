@@ -89,7 +89,9 @@ type lockWaitRun struct {
 	work   string
 }
 
-// runLockWait runs body after lib.sh's setup with date stubbed to lockWaitNow, writing start to $WORK/job-start unless nil.
+// runLockWait runs body after lib.sh's shell options, die(), JOB_BUDGET
+// and fn, with date stubbed to lockWaitNow. start is written to
+// $WORK/job-start unless it is nil.
 func runLockWait(t *testing.T, lib lockWaitLib, fn string, start *string, body string) lockWaitRun {
 	t.Helper()
 	bash, err := exec.LookPath("bash")

@@ -383,7 +383,12 @@ func TestMembership_MaxResponsesEnforced(t *testing.T) {
 			}
 		}
 
-		// A fourth series without respondedTo is rejected as session expired before the user state machine is touched.
+		// Fourth series without respondedTo hits the capacity gate. Under
+		// the at-most-once fix, the entry is rejected as SESSION_EXPIRED
+		// BEFORE the user SM mutation, so Apply succeeds (no error), the
+		// result carries ResultSessionExpired, and the user SM is NOT
+		// mutated. This is critical: an entry that cannot be cached must
+		// never be applied, otherwise a replay would re-apply it.
 		entries := []proto.Entry{
 			{Index: 4, ClientID: 10, SeriesID: 4, Cmd: makeCmd("mr4", "v")},
 		}

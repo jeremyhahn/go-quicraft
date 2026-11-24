@@ -47,7 +47,30 @@ func (r *shardFailedRecorder) reports() []config.ShardFailedInfo {
 	return append([]config.ShardFailedInfo(nil), r.seen...)
 }
 
-// TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport verifies a failed completion never fires OnShardFailed from the host.
+// TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport pins the HOST half of
+// the OnShardFailed contract for snapshot completions: a failed completion
+// never fires OnShardFailed from here, whatever the error.
+//
+// OnShardFailed reports a tripped failure latch, once. The only snapshot
+// outcome that trips it — a failed RecoverFromSnapshot — is reported by the
+// latch itself (engine.Node.Fail in the snapshot pool, pinned by the engine's
+// TestHandleRequest_PostRestoreErrorLatches), so a report here
+// counts the same failure twice. A failed save does not latch at all; that
+// path is pinned end to end by TestSnapshotSaveFailure_DoesNotReportShardFailed.
+//
+// The declined stale recovery is the case that made this visible first. The
+// engine refuses a recovery whose snapshot is not ahead of the apply frontier
+// and leaves the replica serving, yet the completion still carries that
+// refusal as its error. Reported as a shard failure it failed whole
+// integration runs on a healthy cluster, with the engine's own "snapshot
+// recovery declined" line a few microseconds earlier in the same log:
+//
+//	INFO  snapshot rejected, behind committed index shard=1 replica=4 committed=25
+//	INFO  snapshot recovery declined: the state machine is already past this
+//	      snapshot, and raft rejected it too shard_id=1 replica_id=4
+//	      snapshot_index=25 last_applied=25
+//	FAIL  shard 1 replica 4 failed: engine: snapshot recovery for shard 1
+//	      replica 4 at index 25 is not ahead of applied index 25
 func TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport(t *testing.T) {
 	tests := []struct {
 		name string
@@ -108,7 +131,14 @@ func TestOnSnapshotCompleted_ErrorIsNotAShardFailureReport(t *testing.T) {
 	}
 }
 
-// TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotReportedAsRecovered verifies a declined recovery fires no recovered event.
+// TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotReportedAsRecovered pins
+// the flip side of the same completion: declining is not succeeding either.
+//
+// Suppressing the failure report by zeroing the error instead of by matching it
+// would be the obvious shortcut and is wrong. A nil error on a recovery is the
+// SUCCESSFUL-RECOVERY signal: it fires OnSnapshotRecovered and reconciles the
+// host's routing table from the peer's membership. Doing that for a snapshot
+// nothing ever restored would announce a recovery that did not happen.
 func TestOnSnapshotCompleted_DeclinedStaleRecoveryIsNotReportedAsRecovered(t *testing.T) {
 	var recovered int
 	h := newTestHost(t)

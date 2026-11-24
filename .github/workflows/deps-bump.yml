@@ -1,5 +1,49 @@
-# Daily dependency bump: runs make deps-bump, verifies with deps-check and build, and lands go.mod/go.sum as one signed commit and one PR on ci/deps-bump.
-# The branch is never force-updated; deletions use --force-with-lease against the tip read. A GITHUB_TOKEN PR starts no pull_request run, so the job dispatches ci.yml.
+# deps-bump-template: v1.0.0 — the daily dependency bump PR (ruling 640).
+# v1.0.0 (2026-11-14, ruling 640, owner decision 222 (a); ruling 633 allows
+# the schedule trigger, and no host timer runs it): ci-template v1.39's
+# deps-check fails a library behind its latest release only when a change
+# adds or bumps it, so a lag nobody touches no longer reddens a PR. This
+# workflow carries those lags instead. Once a day, and on workflow_dispatch,
+# it runs the shared depscheck's `make deps-bump` in the toolchain image,
+# verifies with `make deps-check` (the full gate, no base) and `make build`,
+# and lands the go.mod and go.sum changes as ONE commit on the fixed branch
+# ci/deps-bump, with ONE pull request into main labelled `code-review` and
+# `task:ready`, so the normal review and auto-merge land it.
+#
+#   - The commit is written through the git data API with GITHUB_TOKEN
+#     (blobs, a tree on the base commit's tree, a commit), so GitHub signs it
+#     and the Signatures check reads it as a `web-flow` commit.
+#   - With an open PR on the branch, the job first calls
+#     PUT pulls/N/update-branch and builds on the PR's new tip. It never
+#     force-updates a ref: a ref update is a fast-forward, and a branch left
+#     behind by an unmerged closed PR fails the job, for a person to close.
+#     The branch of a merged PR, still at that PR's head, is deleted and
+#     re-created from main, which loses nothing. A branch with no open PR
+#     whose tip is its merge base with main (a placeholder a failed run
+#     created at the base) is reused: the bump builds on its tip. So is
+#     a branch with no open PR whose every commit main lacks is this
+#     workflow's own verified web-flow bump commit (a run that committed
+#     and failed before it opened the PR): the bump builds on its tip and
+#     the PR is opened only while the branch is at the head expected. The
+#     commit step deletes a branch it created when the commit fails. Every
+#     deletion is a push that names the tip read as the expected old value
+#     (--force-with-lease), so a commit pushed since is never removed.
+#   - A govulncheck finding on the standard library, the toolchain or an
+#     indirect-only module is reported, not failed, by deps-check, so it does
+#     not stop the verify: the portfolio-wide toolchain pass carries stdlib.
+#   - A PR or push made with GITHUB_TOKEN starts no pull_request run, so the
+#     job dispatches ci.yml on ci/deps-bump; ci-template v1.39 runs that
+#     dispatch as the PR tier and its CI Gate check attaches to the head.
+#   - OPEN OWNER QUESTION: code-review.yml runs on pull_request_target, which
+#     a GITHUB_TOKEN PR or label change does not start either, so the review
+#     does not begin on its own. code-review.yml is unchanged here; until the
+#     owner rules, a person or agent with its own token re-applies the
+#     `code-review` label to start it.
+#
+# GitHub only (the git data API calls are GitHub's). Copy to
+# .github/workflows/deps-bump.yml. The Makefile needs `deps-bump`, `deps-check`
+# and `build` (handbook templates/deps/depscheck/README.md). CUSTOMIZE: the
+# cron minute, per repository, off 03:00 (nightly), 04:00 (ci) and fuzz.yml's.
 
 name: Deps Bump
 
@@ -45,7 +89,11 @@ jobs:
           owner=${REPO%%/*}
           stale=
           recover=
-          # Succeeds when every commit in $1..$2 is this workflow's verified web-flow bump commit, pinned to the tip read.
+          # Succeeds when every commit in $1..$2 is one this workflow's
+          # commit step makes, read back as that step reads its own commit:
+          # verified, committer noreply@github.com with login web-flow, and
+          # the bump's headline. The list is pinned to the tip read, not
+          # the branch, so a commit pushed since is not vouched for.
           owned() {
             local list n s v ok email login msg
             local -a shas
@@ -90,7 +138,16 @@ jobs:
               closed="repos/$REPO/pulls?state=closed&head=$owner:$BRANCH&base=main&sort=updated&direction=desc"
               merged=$(gh api "$closed" --jq '.[0].merged_at // empty')
               mhead=$(gh api "$closed" --jq '.[0].head.sha // empty')
-              # A branch at its merge base with main is a failed run's placeholder: reuse it; expectedHeadOid makes a concurrent push fail the commit.
+              # A branch whose tip is its merge base with main carries no
+              # commit main lacks: the placeholder a run leaves when it
+              # created the branch at the base and then failed before the
+              # commit (the commit step deletes it, but a cancelled or
+              # killed runner cannot). It is reused, never deleted: the
+              # bump builds on the tip read above, and the commit's
+              # expectedHeadOid is that tip, so a commit pushed since makes
+              # the commit fail instead of being lost. This holds whatever
+              # the last closed PR was: an earlier merged PR does not make a
+              # later run's placeholder anything but a placeholder.
               mbase=$(gh api "repos/$REPO/compare/main...$BRANCH" --jq .merge_base_commit.sha)
               if [ "$tip" = "$mbase" ]; then
                 sha=$tip
@@ -100,7 +157,12 @@ jobs:
                 stale=$tip
                 echo "$BRANCH belonged to a merged PR at $tip: deleted while still there, re-created from main"
               elif [ "$tip" != "$mhead" ] && owned "$mbase" "$tip"; then
-                # Every commit main lacks is this workflow's own: build on the tip and open the missing PR only while the branch is at the expected head.
+                # Every commit main lacks is one this workflow made, and no
+                # PR was ever closed at this tip: a run whose commit landed
+                # and that failed or was cancelled before it opened the PR.
+                # The bump builds on the tip, the commit's expectedHeadOid
+                # is that tip, and the PR step opens the missing PR only
+                # while the branch is still at the head it expects.
                 sha=$tip
                 recover=$tip
                 echo "$BRANCH at $tip has no open PR and carries only this workflow's verified commits: recovered, its PR is opened"
@@ -125,7 +187,10 @@ jobs:
         with:
           ref: ${{ steps.base.outputs.sha }}
 
-      # The push names the tip read as the expected old value, so a commit pushed since is never removed.
+      # The push names the tip the base step read as the ref's expected old
+      # value, which the server checks under the ref lock: the deletion
+      # applies only while the branch is still there, so a commit pushed
+      # since is never removed.
       - name: Delete the merged PR's branch
         if: ${{ steps.base.outputs.stale != '' }}
         env:
@@ -181,7 +246,17 @@ jobs:
           git diff --cached --stat
           echo "CHANGED=$(git diff --cached --name-only | tr '\n' ' ')" >> "$GITHUB_ENV"
 
-      # One commit through GraphQL createCommitOnBranch, so GitHub signs it as web-flow, the identity the Signatures job accepts; expectedHeadOid fails the commit if the branch moved.
+      # One commit through GraphQL createCommitOnBranch. GitHub makes that
+      # commit itself: committer GitHub <noreply@github.com> (login web-flow),
+      # signed with GitHub's key and verified, with the App bot as author.
+      # That is the one GitHub-made identity ci.yml's Signatures job accepts
+      # (committer email noreply@github.com, API verified, committer login
+      # web-flow). The REST git/commits call would make github-actions[bot]
+      # the committer, which the job rejects. The branch is created at the
+      # base when missing; expectedHeadOid makes the commit fail, not race,
+      # if the branch moved since the base was read. The last check reads the
+      # commit back and fails here, not in the dispatched CI, if GitHub ever
+      # makes it otherwise.
       - name: Commit to ci/deps-bump
         if: ${{ env.CHANGED != '' }}
         env:
@@ -200,7 +275,11 @@ jobs:
               deletions=$(jq -c --arg p "$f" '. + [{path: $p}]' <<<"$deletions")
             fi
           done
-          # Delete a branch this run created when the commit fails, only while it is still at BASE_SHA.
+          # A branch this run creates and then fails to commit to is
+          # deleted on the way out, so a failed mutation leaves no
+          # placeholder for the next run's guard. The push names BASE_SHA
+          # as the ref's expected old value, which the server checks under
+          # the ref lock: a branch that moved since is left as it is.
           created=
           cleanup() {
             rc=$?
@@ -247,7 +326,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$PR" ]; then
-            # Check the head before and after opening the PR; a PR opened on a moved head is closed before labelling.
+            # A PR opens on the branch by name, so the head is checked
+            # before and read back after: a branch that moved from the
+            # head this run made or recovered gets no PR, and a PR that
+            # opened on a moved head is closed before it is labelled.
             tip=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq .object.sha)
             if [ "$tip" != "$EXPECT" ]; then
               echo "::error::$BRANCH is at $tip, not at $EXPECT: it moved; no PR opened, close or delete it by hand"

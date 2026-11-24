@@ -15,7 +15,15 @@
 
 package quicraft
 
-// withSnapshotFS routes the host's snapshot persistence I/O through fsys; test-only fault injection.
+// withSnapshotFS routes the host's snapshot persistence I/O through fsys.
+//
+// It lives in a _test.go file rather than beside the other HostOptions
+// because it has no production caller: fault injection is a testing facility
+// and must not appear in the public option set. Keeping it in host.go made it
+// genuinely unused there, which the linter reported correctly — the fix is to
+// put the helper where its only callers are, not to suppress the report.
+//
+// Being in the same package, it still reaches hostOptions' unexported fields.
 func withSnapshotFS(fsys snapshotFS) HostOption {
 	return func(o *hostOptions) {
 		o.fsys = fsys

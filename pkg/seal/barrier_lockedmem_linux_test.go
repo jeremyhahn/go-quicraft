@@ -52,14 +52,31 @@ func vmLockedKB(t *testing.T) int {
 	return 0
 }
 
-// TestInitializeAndUnseal_ReleaseTheirRootKeyEnclave checks VmLck stays flat across cycles, so each root-key enclave is destroyed; Linux only.
+// TestInitializeAndUnseal_ReleaseTheirRootKeyEnclave is the mutation target for
+// the root-key borrow discipline.
+//
+// Initialize and Unseal each hold the root key in a locked enclave for the whole
+// of their body, and each releases it with a single deferred Destroy rather than
+// a hand-written wipe on every error path. A missing Destroy is invisible — it
+// leaks silently, and every functional assertion in this package still passes.
+//
+// So the assertion is on the kernel's own accounting. Each enclave costs one
+// locked PAGE (a 32-byte key is charged 4 KiB), so dropping either Destroy leaks
+// ~4 KiB per cycle and the growth over the loop is unmistakable against the
+// slack allowed below.
+//
+// Linux-only: VmLck is a Linux interface. That is the CI platform, and the test
+// skips rather than failing anywhere it is unavailable.
 func TestInitializeAndUnseal_ReleaseTheirRootKeyEnclave(t *testing.T) {
 	const cycles = 60
 
 	s := newPlainStrategy(t)
 	defer s.Close()
 
-	// Warm up outside the measurement: the first seal and the runtime lock pages once.
+	// Warm-up, OUTSIDE the measurement. go-enclave's process Sealer builds its
+	// root and KEK hierarchy in locked memory on the first seal, and the Go
+	// runtime may lock pages of its own; both are one-time and would otherwise
+	// read as a leak.
 	warm := MustNewBarrier(testBarrierConfig(1))
 	if err := warm.Initialize(context.Background(), s, Credentials{}); err != nil {
 		t.Fatalf("warm-up Initialize: %v", err)

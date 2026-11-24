@@ -24,7 +24,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
-// A replica re-elected at a higher term announces readiness afresh after the new term's first commit; the re-election is built by isolating C, then B, so only A can win.
+// The same replica re-elected at a higher term is a new announcement: its old
+// readiness ends with the step-down's OnLeaderUpdated and the new term's is
+// announced afresh, after the new term's own first commit. OnLeaderLost
+// alone would not tell a consumer — the leader never changed hands.
+//
+// The re-election is constructed, not raced, and it needs isolation rather
+// than a process kill: a stopped replica's peers keep messages queued for it,
+// and a restart delivers them, so it can catch up and win. Here C is cut off,
+// A commits an entry with B that C never receives, then B is cut off too: A
+// loses its quorum and steps down. When C rejoins, A is the only replica that
+// can win — C's log lacks the entry, so A refuses it a vote, and B is
+// unreachable.
 func TestLeaderReady_SameLeaderReelectedAtHigherTerm(t *testing.T) {
 	c := newReadyCluster(t, 3)
 	// Registered after the cluster's cleanup so it runs before it: the

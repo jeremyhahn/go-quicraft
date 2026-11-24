@@ -24,7 +24,27 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// A restarted replica must apply the committed log to the same state as its peers, which needs lastApplied seeded before the expiry checkpoint walk.
+// A restarted replica and a peer that never restarted must apply the identical
+// committed log to the identical state — and the state machine's own applied
+// counter is the input that decides whether they do.
+//
+// rsm.StateMachine.lastApplied is the LOWER BOUND of Apply's session expiry
+// checkpoint walk. RecoverFromSnapshot restores the session table (it travels
+// in the snapshot stream) but not this counter, so a replica that resumes with
+// it at 0 re-walks every checkpoint below the resume index against the RECOVERED
+// table. That would be harmless if ExpireSessions were idempotent, and it is
+// not: it deletes at most defaultMaxExpirePerCheckpoint (64) sessions per call,
+// so each extra checkpoint drains another 64 sessions the peers still hold.
+//
+// The fixture below is sized to make that visible rather than to be small. The
+// shard registers 500 clients across indices 1..500; the capped expiry leaves a
+// backlog of idle-but-live sessions at the cut, and the entry right after the
+// cut touches a client that sits inside that backlog. A peer that walks only the
+// checkpoints above the cut still holds the client and applies the write; a
+// replica that re-walks the checkpoints below it drains the backlog first,
+// deletes that client before the entry is flushed, and answers
+// ResultSessionExpired for a write its peers committed to the user state
+// machine.
 
 const (
 	// seedFixtureClients is the number of clients registered at indices
@@ -42,7 +62,20 @@ const (
 	seedFixtureExpiry = 100
 )
 
-// seedFixturePolicy is the fixture's session policy; 510 keeps the expiry cap at 64 while admitting 500 clients.
+// seedFixturePolicy is the shard's replicated session policy for the fixture.
+//
+// MaxTotalSessions has to admit every client or the registrations themselves
+// would be what differs — but it also SIZES the per-checkpoint expiry cap
+// (StateMachine.maxExpirePerCheckpoint returns MaxTotalSessions/8, floored at
+// defaultMaxExpirePerCheckpoint). This fixture depends on the capped scan
+// leaving a BACKLOG of idle-but-live sessions at the cut: that backlog is the
+// state the restart is supposed to re-walk. A capacity large enough to lift
+// the cap above the floor drains the backlog during the registrations and the
+// fixture stops testing anything, which is what the precondition assertion in
+// the test below catches.
+//
+// 510 is chosen to sit just under 8*defaultMaxExpirePerCheckpoint (512), so
+// the cap floors at 64 while still admitting all 500 clients with margin.
 func seedFixturePolicy() proto.SessionPolicy {
 	return proto.SessionPolicy{
 		ExpiryEntries:          seedFixtureExpiry,
@@ -108,7 +141,12 @@ func registeredClients(s *StateMachine) []uint64 {
 	return held
 }
 
-// restartAt returns a state machine recovered from a snapshot of s, seeded with the applied index when seed is true.
+// restartAt snapshots s at the cut and returns a FRESH state machine recovered
+// from that snapshot — the restart path, modelled exactly: the snapshot stream
+// carries the session table, and nothing in it carries the applied index.
+//
+// When seed is true the caller's applied index is installed with SetLastApplied,
+// which is what Host.StartShard does beside the engine node's SeedLastApplied.
 func restartAt(t *testing.T, s *StateMachine, index uint64, seed bool) *StateMachine {
 	t.Helper()
 	var buf bytes.Buffer
@@ -194,7 +232,14 @@ func TestRestart_SeededReplicaMatchesPeerThatNeverRestarted(t *testing.T) {
 	}
 }
 
-// TestRestart_UnseededReplicaIsRefusedNotDiverged checks an unseeded replica fails with ErrApplyGap.
+// TestRestart_UnseededReplicaIsRefusedNotDiverged pins the other half. A replica
+// resumed WITHOUT its applied index cannot be allowed to apply: the batch leaves
+// a hole covering every index through the snapshot, and Apply must fail with
+// ErrApplyGap rather than walk the checkpoints below the resume index.
+//
+// Reverting the contiguity guard in Apply turns this case back into silent
+// divergence — the same one the test above forbids — which is exactly what the
+// guard exists to convert into a loud failure.
 func TestRestart_UnseededReplicaIsRefusedNotDiverged(t *testing.T) {
 	registrations, tail := seedFixtureRegistrations(), seedFixtureTail()
 

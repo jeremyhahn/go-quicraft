@@ -19,7 +19,12 @@ import (
 	"testing"
 )
 
-// TestMain enables the test-only KDF work-factor bypass; TestKDFParamsBelowFloor checks the floor directly.
+// TestMain enables the test-only KDF work-factor bypass for the whole
+// seal test binary so unit tests can derive keys with the cheap Argon2id
+// / PBKDF2 parameters they rely on (Time=1, Iterations=1000) without
+// tripping the production floor enforced by DeriveKey. The floor itself
+// is verified directly via kdfParamsBelowFloor in
+// TestKDFParamsBelowFloor, independent of this bypass.
 func TestMain(m *testing.M) {
 	allowWeakKDFParams.Store(true)
 	os.Exit(m.Run())

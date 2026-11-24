@@ -76,7 +76,12 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 		newHost.Close()
 	}()
 
-	// Start the new host's shard in join mode before the add, so the leader can reach the fourth member.
+	// Start the shard on the new host in join mode BEFORE requesting
+	// membership addition. This ensures the new node is reachable when
+	// the leader adds it to the cluster. Without this, the leader adds
+	// the 4th member but can't reach it (shard not started), and with
+	// CheckQuorum enabled the leader steps down — deadlocking the
+	// cluster (4 members, 2 live nodes, quorum=3).
 	createFn, newTracker := kvCreateFunc()
 	scfg := testShardConfig(shardID, newReplicaID)
 	scfg.MemberIdentities = cluster.identities()
@@ -85,7 +90,19 @@ func TestE2E_MembershipChange_DuringLeaderElection(t *testing.T) {
 	}
 	t.Logf("new node started in join mode at %s", newAddr)
 
-	// Add the member through the leader at each attempt; syncAddNode accepts an already-exists refusal only after a submitted attempt and a linearizable read showing replica 4 as a voter at newAddr.
+	// Now request membership addition, through whichever node is the leader
+	// AT THE POINT OF EACH ATTEMPT.
+	//
+	// The loop this replaces walked every live host with a two-second call
+	// each and retried transient errors until failoverTimeout. That reads "no
+	// answer" as "did not happen", which is false for a membership change: an
+	// add whose response was lost to a second leadership move had already
+	// committed, the next attempt was refused CORRECTLY with "already exists
+	// in membership", and the loop ran to its deadline reporting a failure
+	// the cluster never had. syncAddNode accepts that refusal
+	// only after an attempt in this same loop was genuinely submitted AND a
+	// linearizable membership read shows replica 4 as a voter at newAddr; an
+	// add that never lands still fails, within the same budget.
 	syncAddNode(t, cluster, shardID, newReplicaID, newAddr, newHost.NodeIdentity(), failoverTimeout)
 	t.Logf("membership change succeeded after leader election")
 
@@ -219,7 +236,12 @@ func TestE2E_MembershipChange_ConcurrentWithProposals(t *testing.T) {
 	t.Logf("concurrent writers completed: %d successful, %d transient errors",
 		numSuccessful, writeErrors.Load())
 
-	// Require at least two thirds of the concurrent writes to land, so a run that wrote nothing fails.
+	// A membership addition does not disturb leadership, so nearly every write
+	// should land; measured at HEAD it is 30 of 30. Without a floor the whole
+	// concurrent phase can contribute ZERO writes and the test still passes,
+	// because every later assertion is over the set of writes that happened to
+	// succeed. Two thirds leaves room for an unlucky election without
+	// admitting a run that wrote nothing.
 	const concurrentWriteFloor = numWriters * writesPerWriter * 2 / 3
 	if numSuccessful < concurrentWriteFloor {
 		t.Fatalf("only %d of %d concurrent writes committed during the membership change (floor %d, %d transient errors)",
@@ -263,7 +285,34 @@ func TestE2E_MembershipChange_ConcurrentWithProposals(t *testing.T) {
 // TestE2E_MultiShardFailover_UnderLoad
 // ---------------------------------------------------------------------------
 
-// TestE2E_MultiShardFailover_UnderLoad kills the leader host of a 3-node, 3-shard cluster under load once every shard has committed a write; each shard may lose at most its in-flight proposal, and all shards recover consistent. Failed proposals are not retried.
+// TestE2E_MultiShardFailover_UnderLoad starts a 3-node cluster with 3
+// shards, runs concurrent proposals on all shards, then kills the leader
+// host. It verifies that all shards elect new leaders, all in-flight
+// proposals either complete or return errors, and after recovery all
+// shards are functional and consistent.
+//
+// # What the write count asserts
+//
+// Each shard has one sequential writer with a budget of writesPerShard. The
+// kill is armed only once EVERY shard has committed a write and is parked, so
+// at the instant the host is stopped all three shards have the same amount of
+// work left and are actively proposing. From there the property is exact: a
+// leader-host kill costs a shard the ONE proposal that was in flight when the
+// host went away, and nothing else -- every later write goes to the shard's
+// new leader and must commit.
+//
+// That is what the per-shard floor of writesPerShard-maxLostPerShard checks. It
+// is a statement about the cluster's recovery, and it holds identically on a
+// fast box and a saturated one.
+//
+// It replaces an aggregate floor of 7-of-30 gated on a 50ms timer, which was a
+// statement about the RUNNER: the writers had whatever fitted into 50ms to
+// commit in, and after the kill every remaining iteration was spent instantly
+// on a nil leader without a proposal being attempted. A slow runner scored
+// 6-of-30 and the gate went red with nothing wrong.
+//
+// A failed proposal is still permanent here. Nothing is re-sent, so the floor
+// cannot be met by retrying past a cluster that has not recovered.
 func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -308,7 +357,12 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 	// Launch concurrent writers on all shards.
 	const writesPerShard = 10
 
-	// maxLostPerShard: a sequential writer has at most one proposal outstanding when the host dies; losing more means the shard did not recover cleanly.
+	// maxLostPerShard is the whole cost a leader-host kill is allowed to have.
+	// Each writer is SEQUENTIAL, so at most one proposal per shard can be
+	// outstanding at the instant the host goes away; every write after it is
+	// submitted to the shard's new leader and has to commit. A shard that lost
+	// more than one write did not recover cleanly, and that is a statement
+	// about the cluster rather than about how fast the runner is.
 	const maxLostPerShard = 1
 
 	type shardWriteResult struct {
@@ -331,7 +385,11 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 	// before the others have started.
 	firstCommits := make(chan uint64, numShards)
 	killArmed := make(chan struct{})
-	// Each shard signals once it has submitted its next proposal; the kill fires on these signals.
+	// One send per shard, the moment that shard has SUBMITTED its next proposal
+	// and is waiting for it to commit. The kill is fired on this signal, so
+	// every shard has a proposal genuinely outstanding when the host goes away
+	// -- which is what "under load" has to mean for the count below to be about
+	// the failover at all.
 	inFlight := make(chan uint64, numShards)
 
 	for i, sid := range shardIDs {
@@ -354,7 +412,13 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 				key := fmt.Sprintf("shard%d-load-%03d", shardID, w)
 				value := fmt.Sprintf("val-shard%d-%03d", shardID, w)
 
-				// Resolve the leader at proposal time and wait for one during an election, so no iteration is spent without a proposal.
+				// Resolve the leader at the point of proposal, and WAIT for one
+				// while the shard is mid-election. Waiting is not a retry: it
+				// refuses to score a write that was never attempted. Spending an
+				// iteration on a nil leader would turn this test's count into
+				// "how many writes fit in the pre-kill window on this machine"
+				// -- during the election every remaining iteration would be
+				// consumed in microseconds without a proposal being made.
 				leaderHost := cluster.awaitLeaderHost(shardID, failoverTimeout)
 				if leaderHost == nil {
 					// The shard never re-elected. Nothing later in this loop can
@@ -417,7 +481,13 @@ func TestE2E_MultiShardFailover_UnderLoad(t *testing.T) {
 		}(i, sid)
 	}
 
-	// Gate the kill on progress: every shard has committed a write, then every shard has a proposal outstanding.
+	// Gate the kill on PROGRESS, not on a clock. A fixed timer as the entire
+	// pre-kill budget would score how much work fitted into a fixed window on
+	// the runner rather than what the cluster did with it.
+	//
+	// Two barriers, because "under load" needs both halves: every shard has
+	// committed a write (so the cluster is warm and the writers are level), and
+	// every shard then has a proposal actually outstanding at the kill instant.
 	close(writerStarted)
 	armGuard := time.NewTimer(failoverTimeout)
 	defer armGuard.Stop()
@@ -693,7 +763,12 @@ func TestE2E_LeaderTransfer_DuringConcurrentWrites(t *testing.T) {
 			numSuccessful, numWriters*writesPerWriter, transferWriteFloor, writeErrors.Load())
 	}
 
-	// Leadership must move to the requested target; re-request the transfer until it does or the budget expires.
+	// Leadership must actually MOVE TO THE REQUESTED TARGET. Accepting "any
+	// stable leader" would be satisfied by the old leader simply keeping the
+	// job -- the exact outcome a broken transfer produces, and the outcome
+	// observed when the sample is taken too early. A transfer
+	// racing an in-flight election is legitimately refused, so the request is
+	// re-issued until the cluster is able to honour it or the budget expires.
 	transferDeadline := time.Now().Add(failoverTimeout)
 	landed := false
 	for time.Now().Before(transferDeadline) {

@@ -389,7 +389,13 @@ func TestBarrier_EncryptDecryptRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBarrier_DecryptTamperedAlgIDDoesNotPanic verifies a tampered algID fails with ErrDecryptionFailed instead of panicking.
+// TestBarrier_DecryptTamperedAlgIDDoesNotPanic is the regression test. The
+// algID header byte is unauthenticated and does not select the cipher (the
+// active AEAD is fixed by the epoch DEK). A tampered algID whose nonce-size
+// class differs from the active 12-byte cipher (0x05 = XChaCha20, 24-byte) or
+// that is invalid would, without the guard, slice a wrong-length nonce and
+// PANIC inside aead.Open, crashing the host on corrupt WAL/snapshot input.
+// Decrypt must instead fail closed with ErrDecryptionFailed.
 func TestBarrier_DecryptTamperedAlgIDDoesNotPanic(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
@@ -937,7 +943,12 @@ func TestBarrier_BruteForceBackoff(t *testing.T) {
 	}
 }
 
-// TestBarrier_BackoffBackwardClockStep verifies a future lastFailedAt does not lock out Unseal.
+// TestBarrier_BackoffBackwardClockStep verifies that a backward clock step
+// (a persisted lastFailedAt in the future) does not permanently lock out
+// Unseal. With a naive elapsed<delay check, a future lastFailedAt yields a
+// negative elapsed that stays below delay forever, returning ErrUnsealBackoff
+// indefinitely. The clamp must treat a non-monotonic clock as satisfying the
+// delay and re-anchor lastFailedAt to now.
 func TestBarrier_BackoffBackwardClockStep(t *testing.T) {
 	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
@@ -954,7 +965,9 @@ func TestBarrier_BackoffBackwardClockStep(t *testing.T) {
 	now := time.Now()
 	b.timeNow = func() time.Time { return now }
 
-	// Past the threshold with lastFailedAt an hour in the future.
+	// Simulate restored state: past the brute-force threshold with a
+	// lastFailedAt stamped one hour in the FUTURE (clock stepped back / state
+	// restored on an earlier-clock host).
 	b.failedAttempts = bruteForceThreshold + 1
 	b.lastFailedAt = now.Add(time.Hour)
 
@@ -1619,7 +1632,16 @@ func TestBarrier_InitializeRandFailSalt(t *testing.T) {
 	}
 }
 
-// TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader verifies the AES-GCM nonce is generated inside the module (SP 800-38D), not from b.randReader.
+// TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader is deliberately phrased
+// as an assertion about where the nonce comes from rather than about an error.
+//
+// Drawing the AES-GCM nonce from b.randReader and handing it to Seal would be a
+// caller-supplied IV, which FIPS 140-3 (SP 800-38D, CMVP IG C.H) forbids: the
+// IV must be generated inside the module. cipher.NewGCMWithRandomNonce
+// generates it,
+// and b.randReader is not on the data path at all — so a reader that cannot
+// produce a single byte must NOT be able to affect Encrypt. If someone
+// reintroduces a caller-supplied IV, this test fails.
 func TestBarrier_EncryptDoesNotDrawTheNonceFromRandReader(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	defer s.Close()
@@ -1972,7 +1994,13 @@ func TestBarrier_PurgeSkipsInFlightEpochs(t *testing.T) {
 	b.DeregisterInFlightEpoch(1)
 }
 
-// TOCTOU second-check tests: hold the write lock, clear unsealed, then release so the waiting RLock hits the second check.
+// --- TOCTOU second-check path simulation ---
+//
+// These tests exercise the second unsealed check inside the RLock of
+// Encrypt/Decrypt/etc. We simulate this by holding the write lock (blocking
+// any RLock acquisition), flipping the unsealed flag to false, then
+// releasing the write lock so the waiting goroutine's RLock proceeds and
+// hits the second check.
 
 func TestBarrier_TOCTOUSecondCheck(t *testing.T) {
 	tests := []struct {
@@ -2877,7 +2905,13 @@ func (m *mockNonceTracker) Close() error {
 	return m.closeErr
 }
 
-// TestBarrier_InvocationCounterResetError_CommitsNewEpoch verifies a failed counter Reset still commits and returns the new epoch.
+// TestBarrier_InvocationCounterResetError_CommitsNewEpoch verifies the
+// commit-first, fail-safe-reset semantics: when the injected invocation
+// counter's Reset returns an error, Rotate has ALREADY committed the new epoch
+// before resetting the trackers, so it must advance to (and return) the new
+// epoch with NO fatal error. A non-reset counter is the conservative direction
+// (the new key re-rotates sooner; it never exceeds its limit), so the barrier
+// must remain fully usable on the new epoch.
 func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 	resetErr := errors.New("persistent reset failed")
 	mock := &mockInvocationCounter{enabled: true, resetErr: resetErr}
@@ -2932,7 +2966,13 @@ func TestBarrier_InvocationCounterResetError_CommitsNewEpoch(t *testing.T) {
 	}
 }
 
-// TestBarrier_NonceClearError_CommitsNewEpoch verifies a failed nonce Clear still commits and returns the new epoch.
+// TestBarrier_NonceClearError_CommitsNewEpoch verifies the commit-first,
+// fail-safe-reset semantics for the nonce tracker: when the injected nonce
+// tracker's Clear fails during Rotate, the new epoch has ALREADY been committed
+// before the clear, so Rotate must advance to (and return) the new epoch with
+// NO fatal error. A non-cleared nonce set is the conservative direction (stale
+// nonces are at worst rejected as false positives; a reused nonce is never
+// accepted), so the barrier must remain fully usable on the new epoch.
 func TestBarrier_NonceClearError_CommitsNewEpoch(t *testing.T) {
 	clearErr := errors.New("persistent nonce clear failed")
 	mock := &mockNonceTracker{enabled: true, clearErr: clearErr}
@@ -3274,7 +3314,7 @@ func TestBarrier_PersistBackoffState_NilSealed(t *testing.T) {
 	}
 }
 
-// Concurrent Seal during Decrypt.
+// --- Concurrent Seal during Decrypt (TOCTOU defensive path) ---
 
 // ---------------------------------------------------------------------------
 // ShouldRotateKey
@@ -3363,7 +3403,14 @@ func TestBarrier_DecryptDuringConcurrentSeal(t *testing.T) {
 
 // --- Invocation budget across restarts (NIST SP 800-38D) ---
 
-// TestBarrier_RestartRotatesRatherThanReGrantingBudget verifies a restart unseal moves to a fresh epoch whose count starts at zero.
+// TestBarrier_RestartRotatesRatherThanReGrantingBudget verifies the NIST
+// SP 800-38D budget is not re-granted on restart.
+//
+// The old behaviour seeded the counter to the ROTATION THRESHOLD (95%) and let
+// the process encrypt through the remaining 5% — 214,748,364 invocations — on
+// every restart, against the SAME epoch DEK, forever. This asserts the
+// replacement: a restart-unseal that cannot prove the loaded epoch's spent
+// budget moves to a FRESH epoch whose count genuinely starts at zero.
 func TestBarrier_RestartRotatesRatherThanReGrantingBudget(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	if _, err := b.Encrypt(nil, []byte("data")); err != nil {
@@ -3394,7 +3441,9 @@ func TestBarrier_RestartRotatesRatherThanReGrantingBudget(t *testing.T) {
 	if ic == nil || !ic.IsEnabled() {
 		t.Fatal("invocation counter must be enabled by default")
 	}
-	// Check the actual counter: the fresh epoch starts at zero.
+	// Assert the ACTUAL counter, not a proxy: the fresh epoch starts at zero,
+	// not 4080218932 of a 4294967296 budget "already spent" on a key that had
+	// in truth performed one encryption.
 	if got := ic.Count(); got != 0 {
 		t.Fatalf("invocation count on the fresh epoch = %d, want 0", got)
 	}
@@ -3412,7 +3461,11 @@ func TestBarrier_RestartRotatesRatherThanReGrantingBudget(t *testing.T) {
 	}
 }
 
-// TestBarrier_RestartWithoutPersisterRefusesToEncrypt verifies a barrier that cannot rotate refuses to encrypt after restart but still decrypts.
+// TestBarrier_RestartWithoutPersisterRefusesToEncrypt is the other half: a
+// barrier that CANNOT rotate (no StatePersister — what DefaultBarrierConfig
+// produces) must refuse to encrypt under the loaded epoch rather than help
+// itself to another slice of that DEK's budget. Decryption stays available, so
+// the node can still read and serve its data.
 func TestBarrier_RestartWithoutPersisterRefusesToEncrypt(t *testing.T) {
 	b := MustNewBarrier(DefaultBarrierConfig(1))
 	s := testStrategy(t)
@@ -3434,7 +3487,8 @@ func TestBarrier_RestartWithoutPersisterRefusesToEncrypt(t *testing.T) {
 		t.Fatalf("Unseal: %v", err)
 	}
 
-	// The counter is seeded to the full limit.
+	// The counter is seeded to the FULL limit, not to the 95% threshold: the
+	// remaining 5% would otherwise be headroom re-granted on every restart.
 	ic := b2.InvocationCounter()
 	if got, limit := ic.Count(), ic.Limit(); got != limit {
 		t.Fatalf("seeded count = %d, want the full limit %d (no re-granted headroom)", got, limit)
@@ -3453,7 +3507,12 @@ func TestBarrier_RestartWithoutPersisterRefusesToEncrypt(t *testing.T) {
 	}
 }
 
-// TestBarrier_SealUnsealInProcessKeepsAuthoritativeCount verifies an in-process seal/unseal keeps the count and does not rotate.
+// TestBarrier_SealUnsealInProcessKeepsAuthoritativeCount pins the boundary: an
+// in-process seal/unseal cycle keeps the SAME counter object, which is still an
+// accurate count for the same epoch, so it must NOT be re-seeded and must NOT
+// force a rotation. A "count == 0 means unseeded" test cannot express this —
+// zero is both "never encrypted" and "fresh process" — which is why the barrier
+// tracks authority explicitly.
 func TestBarrier_SealUnsealInProcessKeepsAuthoritativeCount(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	for i := 0; i < 3; i++ {

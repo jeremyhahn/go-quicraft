@@ -37,7 +37,20 @@ func firstMsgOfType(msgs []proto.Message, t uint64) *proto.Message {
 // Heartbeat commit index must be capped at the peer's known match
 // ---------------------------------------------------------------------------
 
-// TestHeartbeatCommitIsCappedAtPeerMatch checks the heartbeat commit is capped at the peer's match index.
+// TestHeartbeatCommitIsCappedAtPeerMatch protects the min() in
+// sendHeartbeatTo.
+//
+// A heartbeat carries the leader's commit index, and handleHeartbeat commits
+// to min(msg.Commit, follower.lastIndex()) — the follower's OWN last index,
+// with no proof that the entries there came from this leader. A follower that
+// holds a divergent uncommitted tail at those indices would therefore commit
+// and APPLY its own entries at indices the leader is about to truncate: a
+// State Machine Safety violation (two replicas applying different commands at
+// the same index).
+//
+// Capping the advertised commit at the leader's recorded match for that peer
+// is what makes the follower's commit provably about entries the leader
+// replicated to it.
 func TestHeartbeatCommitIsCappedAtPeerMatch(t *testing.T) {
 	leader := newTestRaft(1)
 	leader.becomeCandidate()
@@ -127,9 +140,16 @@ func TestHeartbeatCommitCap_FollowerDoesNotApplyItsOwnDivergentTail(t *testing.T
 	}
 }
 
-// Pending ReadIndex records the committed index, never lastIndex.
+// ---------------------------------------------------------------------------
+// Pending ReadIndex must record the COMMITTED index, never lastIndex
+// ---------------------------------------------------------------------------
 
-// TestReadIndexRecordsCommittedNotLastIndex checks the read index is the commit index at request time (PhD 6.4).
+// TestReadIndexRecordsCommittedNotLastIndex protects PhD 6.4: the read index
+// handed back to a client must be the leader's COMMIT index at request time.
+//
+// lastIndex() includes the uncommitted tail. A read served at an uncommitted
+// index can observe entries that a later leader truncates — the classic dirty
+// read — and the read would be acknowledged as linearizable.
 func TestReadIndexRecordsCommittedNotLastIndex(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeCandidate()
@@ -144,7 +164,7 @@ func TestReadIndexRecordsCommittedNotLastIndex(t *testing.T) {
 	}
 	committed := r.log.committed
 
-	// An uncommitted tail: 5 entries beyond the commit index.
+	// An UNCOMMITTED tail: 5 entries beyond the commit index.
 	r.log.append(makeEntries(r.log.lastIndex()+1, r.log.lastIndex()+5, r.term))
 	if r.log.lastIndex() == committed {
 		t.Fatal("fixture: the log must hold an uncommitted tail")
@@ -168,7 +188,16 @@ func TestReadIndexRecordsCommittedNotLastIndex(t *testing.T) {
 // Lease acks must be reset at each CheckQuorum window
 // ---------------------------------------------------------------------------
 
-// TestLeaseAcksResetEachCheckQuorumWindow checks lease acks reset at each CheckQuorum window, with the clock frozen.
+// TestLeaseAcksResetEachCheckQuorumWindow protects resetLeaseAcks() in
+// tickLeader.
+//
+// The lease must be re-earned every CheckQuorum window, the cadence at which
+// remote activity is re-proven. hasValidLease also ages acks by elapsed real
+// time, so the clock is frozen here: with no time passing, the reset at the
+// window boundary is the only thing that can drop the lease, and this test
+// isolates it. (When the lease was measured in ticks the reset was the only
+// guard: electionTick WRAPS to 0 at the end of the window, and without it
+// every stale ack tick from the previous window looked valid again.)
 func TestLeaseAcksResetEachCheckQuorumWindow(t *testing.T) {
 	cfg := raftTestCfgCheckQuorum(1, 1, true)
 	cfg.LeaseRead = true
@@ -217,7 +246,16 @@ func TestLeaseAcksResetEachCheckQuorumWindow(t *testing.T) {
 // In-flight ReadIndex acks must be re-based when bit positions move
 // ---------------------------------------------------------------------------
 
-// TestRebuildReplicaToBitRebasesInflightReadIndexAcks checks ackBits are re-based when bit positions move.
+// TestRebuildReplicaToBitRebasesInflightReadIndexAcks protects the ackBits
+// re-base in rebuildReplicaToBit.
+//
+// ackBits records WHICH replicas acked a pending ReadIndex, by bit position.
+// rebuildReplicaToBit reassigns those positions on every membership change
+// during leadership (the maps are unordered, so positions move even for
+// replicas that did not change role). A replica whose bit moved can then set
+// a SECOND bit for the same ReadIndex, so ackCount reaches quorum on fewer
+// distinct replicas than quorum requires — leadership is "confirmed" by a
+// sub-quorum and the read can be stale.
 func TestRebuildReplicaToBitRebasesInflightReadIndexAcks(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeCandidate()
@@ -262,7 +300,17 @@ func TestRebuildReplicaToBitRebasesInflightReadIndexAcks(t *testing.T) {
 // The 64 voting member cap
 // ---------------------------------------------------------------------------
 
-// TestVotingMemberCapRejectsSixtyFifthVoter checks the propose gate refuses a 65th voter, including on forwarded proposals.
+// TestVotingMemberCapRejectsSixtyFifthVoter protects the cap in
+// validateConfigChangePolicy.
+//
+// ReadIndex ack tracking is a uint64 bitfield, so only bit positions 0..63
+// exist. rebuildReplicaToBit asserts the cap and PANICS above it — and the
+// committed-replay path deliberately does not re-check (replay must be
+// deterministic). A committed 65th voter therefore panics every node the
+// moment it becomes leader: the shard can never elect again. This propose
+// gate is the last place the entry can be stopped, and it is the ONLY one on
+// a follower-forwarded proposal, which bypasses the Host API's validation
+// entirely.
 func TestVotingMemberCapRejectsSixtyFifthVoter(t *testing.T) {
 	members := make(map[uint64]string, maxVotingMembers)
 	for id := uint64(1); id <= maxVotingMembers; id++ {
@@ -313,7 +361,26 @@ func TestVotingMemberCapRejectsSixtyFifthVoter(t *testing.T) {
 	}
 }
 
-// TestSnapshotMembershipOverVotingCapIsRejected checks a snapshot whose membership exceeds the ackBits word is rejected.
+// TestSnapshotMembershipOverVotingCapIsRejected covers the OTHER way a
+// configuration larger than the ackBits word reaches this replica: not as a
+// proposal it could refuse, but as the membership embedded in a snapshot.
+//
+// handleSnapshot's non-matching branch feeds ss.Membership straight into
+// rebuildRemotesFromMembership, which is the set rebuildReplicaToBit is then
+// computed over. That membership is chosen entirely by the sender: the raw
+// wire InstallSnapshot is blocked by the process-local origin gate, but the
+// snapshot RECEIVE pipeline reassembles the streamed chunks and rebuilds the
+// message locally with `Membership: first.Membership` — the peer's bytes,
+// carrying the peer's map, now stamped OriginLocal. Nothing between the wire
+// and here bounds it: proto's decode limit is MaxMembershipEntries (10000),
+// and the only MaxVotingMembers admission checks in the repository are in
+// StartShard and ImportSnapshot, neither of which is on this path.
+//
+// Before the gate this test pins, that message installed 65 remotes and
+// returned success. The panic came later and somewhere else — in
+// rebuildReplicaToBit, the moment this replica next became leader — which is
+// why it reads as a shard that mysteriously cannot elect rather than as a bad
+// message. This is the one assertion in the package a peer can reach.
 func TestSnapshotMembershipOverVotingCapIsRejected(t *testing.T) {
 	r := newTestRaft(1)
 	r.becomeFollower(1, 2)
@@ -478,7 +545,20 @@ func TestSnapshotMembershipAtVotingCapIsAccepted(t *testing.T) {
 	})
 }
 
-// TestOverCapStoredMembershipRefusesShardStartup checks NewPeer refuses an over-cap stored membership with an error.
+// TestOverCapStoredMembershipRefusesShardStartup covers the DURABLE form of an
+// oversized configuration, which is the one an operator could not escape.
+//
+// StartShard and ImportSnapshot bound the member map at admission, but a
+// configuration that got past them — an older build, or a snapshot accepted
+// before handleSnapshot gained its gate — is written to LogDB and recovered on
+// every start. While rebuildReplicaToBit asserted, that recovery panicked the
+// step worker as soon as the replica campaigned: the shard could not be
+// started, could not be repaired through a running host, and took every other
+// shard owned by the same worker down with it. On every restart, forever.
+//
+// newRaft now refuses to build the replica, so NewPeer returns the error,
+// StartShard reports it as a HostInitError, and the host stays up with its
+// other shards running. This test asserts the NewPeer end of that chain.
 func TestOverCapStoredMembershipRefusesShardStartup(t *testing.T) {
 	overCap := make(map[uint64]string, maxVotingMembers+1)
 	for id := uint64(1); id <= uint64(maxVotingMembers)+1; id++ {
@@ -503,7 +583,22 @@ func TestOverCapStoredMembershipRefusesShardStartup(t *testing.T) {
 	}
 }
 
-// TestCommittedOverCapConfigChangeFailsShardNotWorker checks a committed 65th voter fails the shard, not the step worker.
+// TestCommittedOverCapConfigChangeFailsShardNotWorker covers the other
+// residual: a 65th voter that is already COMMITTED.
+//
+// The propose gate (validateConfigChangePolicy) stops an honest leader
+// producing one, and the committed-replay path deliberately does not
+// re-validate — refusing an already-committed entry there would make replicas
+// diverge. So a compromised or older leader can still land one in the log, and
+// every replica must then do something with an entry this build cannot
+// represent.
+//
+// The answer is to fail THE SHARD, not the worker. Peer.syncRaftRemotes
+// returns the error up through processConfigChanges and Peer.Commit, which is
+// the path the engine's failCommit already treats as terminal: node.failed is
+// set and EventListener.OnShardFailed fires, while the host and every other
+// shard on that step worker keep running, rather than an assertion panicking
+// the worker.
 func TestCommittedOverCapConfigChangeFailsShardNotWorker(t *testing.T) {
 	p := newTestMultiNodeLeaderPeer(t)
 
@@ -530,7 +625,8 @@ func TestCommittedOverCapConfigChangeFailsShardNotWorker(t *testing.T) {
 	remotesAtCap := len(p.r.remotes)
 	bitsAtCap := len(p.r.replicaToBit)
 
-	// The 65th voter as a committed entry: apply does not re-validate.
+	// Now the 65th, as a COMMITTED entry: membership.apply does not
+	// re-validate, by design, so it lands.
 	idx++
 	if err := p.membership.apply(proto.ConfigChange{
 		Type:      proto.AddNode,
@@ -548,7 +644,9 @@ func TestCommittedOverCapConfigChangeFailsShardNotWorker(t *testing.T) {
 			maxVotingMembers+1, err)
 	}
 
-	// Fail closed: the raft mirror stays on the last configuration that fit.
+	// Fail CLOSED. The raft mirror must be left on the last configuration
+	// that fit — not half-synced, and above all not serving ReadIndex out of
+	// a bitmap that cannot address every voter.
 	if len(p.r.remotes) != remotesAtCap {
 		t.Fatalf("remotes = %d, want %d: the oversized configuration was "+
 			"mirrored into the raft layer anyway", len(p.r.remotes), remotesAtCap)
@@ -566,7 +664,21 @@ func TestCommittedOverCapConfigChangeFailsShardNotWorker(t *testing.T) {
 	}
 }
 
-// TestOverCapConfigChangeSurfacesThroughPeerCommit checks the over-cap error leaves Peer.Commit on the Replicate path.
+// TestOverCapConfigChangeSurfacesThroughPeerCommit is the wiring test for the
+// one above, and it exists because the one above does not cover the wiring.
+//
+// TestCommittedOverCapConfigChangeFailsShardNotWorker calls syncRaftRemotes
+// directly, so it proves the guard fires and fails closed but says nothing
+// about whether the error ever LEAVES the raft package. Deleting the
+// `return err` in processConfigChanges — the single line that carries it to
+// the engine — left that test green. Without this one, the shard would be
+// silently unfailed: the engine would commit normally, the operator would get
+// no OnShardFailed, and the replica would carry on with a raft mirror
+// permanently behind its own committed membership.
+//
+// So this drives the real path a follower takes: a committed
+// EntryConfigChange arrives by Replicate, and the error has to come out of
+// Peer.Commit, which is what the engine's failCommit is watching.
 func TestOverCapConfigChangeSurfacesThroughPeerCommit(t *testing.T) {
 	// A follower already at the supported maximum.
 	atCap := proto.Membership{Addresses: make(map[uint64]string, maxVotingMembers)}
@@ -634,7 +746,12 @@ func TestOverCapConfigChangeSurfacesThroughPeerCommit(t *testing.T) {
 	}
 }
 
-// TestBecomeLeaderDeclinesOverCapVotingSet checks leadership is refused over the cap without a panic.
+// TestBecomeLeaderDeclinesOverCapVotingSet pins the backstop directly.
+//
+// Every growth site now checks the bound, so this state is unreachable through
+// the ordinary paths — which is exactly why it is worth a test that constructs
+// it by hand. The requirement is that leadership is REFUSED rather than taken
+// with a truncated bitmap, and that nothing panics.
 func TestBecomeLeaderDeclinesOverCapVotingSet(t *testing.T) {
 	r := newTestRaft(1)
 	for id := uint64(4); id <= uint64(maxVotingMembers)+1; id++ {
@@ -670,7 +787,21 @@ func TestBecomeLeaderDeclinesOverCapVotingSet(t *testing.T) {
 // A joining node's own election timer
 // ---------------------------------------------------------------------------
 
-// TestJoiningNodeElectionTimerIsSuppressed checks a joining node's election timer does not campaign.
+// TestJoiningNodeElectionTimerIsSuppressed protects the joining check in
+// Peer.Tick.
+//
+// A joining node's membership is incomplete by construction: the existing
+// cluster's members were established by the bootstrap confState, not by
+// config change entries, so they are not in the log this node replays. Once
+// it has applied its OWN AddNode it holds a configuration of exactly one
+// replica — itself — and an election it starts is decided by a quorum of one.
+// It would then acknowledge writes the real cluster later discards. Its
+// campaign also carries a term the existing cluster has not reached, which
+// forces the running leader to step down.
+//
+// The TimeoutNow half of this guard (Peer.Handle) is covered elsewhere; this
+// is the election TIMER half, which is the only path that fires without any
+// message arriving at all.
 func TestJoiningNodeElectionTimerIsSuppressed(t *testing.T) {
 	cfg := testConfig()
 	cfg.PreVote = config.BoolPtr(false)

@@ -41,7 +41,14 @@ const (
 	DefaultMaxStreamsPerConnection    int    = 256
 	DefaultStreamReadIdleTimeout             = 30 * time.Second
 
-	// MinMaxSnapshotReceiveRate is the smallest non-zero MaxSnapshotReceiveRate, keeping per-chunk rate-limit sleeps bounded.
+	// MinMaxSnapshotReceiveRate is the smallest accepted non-zero value for
+	// MaxSnapshotReceiveRate. Rates below this floor are rejected by Validate
+	// because the receiver applies rate limiting by sleeping proportional to
+	// chunk size: an absurdly low rate (e.g. a few bytes per second) would
+	// compute a multi-day per-chunk sleep that holds the snapshot concurrency
+	// semaphore and memory budget for the entire duration, stalling
+	// availability. 64 KB/s is the slowest rate that keeps per-chunk sleeps
+	// bounded to a sane range for typical multi-megabyte chunks.
 	MinMaxSnapshotReceiveRate int64 = 64 * 1024 // 64 KB/s
 )
 
@@ -58,11 +65,21 @@ type MTLSConfig struct {
 	// Key is the PEM-encoded private key for this node.
 	Key []byte
 
-	// Certificate, when set, replaces the PEM Cert/Key pair and may hold a hardware crypto.Signer; CACert is still required.
+	// Certificate, when non-nil, supplies a pre-built TLS certificate in place
+	// of the PEM Cert/Key pair. Its PrivateKey may be a hardware-backed
+	// crypto.Signer for a TPM/HSM-resident key that never leaves the device,
+	// which cannot be expressed as PEM Key bytes. When set, Cert/Key may be
+	// empty; CACert is still required for peer verification.
 	Certificate *tls.Certificate
 }
 
-// RevocationConfig enables revoked-certificate rejection in VerifyConnection (which also runs on resumed sessions); CRL files reload from disk.
+// RevocationConfig holds certificate revocation checking configuration.
+// When set on TransportConfig, the transport installs a VerifyConnection
+// callback that rejects revoked peer certificates at TLS handshake time.
+// VerifyConnection rather than VerifyPeerCertificate is deliberate: the
+// latter is skipped on resumed TLS sessions, which would let a peer whose
+// certificate was revoked after its first handshake keep reconnecting. CRL files are periodically reloaded from disk
+// for hot-reload support without requiring a restart.
 type RevocationConfig struct {
 	// CRLPaths are file paths to PEM-encoded CRL files. These files are
 	// watched for content changes on each CheckInterval tick using
@@ -86,10 +103,25 @@ type RevocationConfig struct {
 	// disk. Default: 60s.
 	CheckInterval time.Duration
 
-	// Mode is crl, ocsp, both or any (default); any other value is rejected.
+	// Mode determines the revocation checking strategy:
+	//   "crl"  - CRL files only
+	//   "ocsp" - OCSP responder only
+	//   "both" - consults both sources; revoked by EITHER is revoked
+	//   "any"  - either CRL or OCSP confirms revocation (default)
+	// Any other value is rejected by Validate; a typo must not silently
+	// select the default strategy.
 	Mode string
 
-	// AllowSoftFail admits a peer whose revocation status is unknown; the default fails closed. Revoked always rejects.
+	// AllowSoftFail, when true, admits a peer whose revocation status cannot be
+	// determined (OCSP responder unreachable, CRL stale/unreadable, or no
+	// revocation source configured). The default (false) FAILS CLOSED: for an
+	// intra-cluster mTLS control where the operator owns the CA and responder,
+	// revocation is the only mechanism to evict a compromised-but-unexpired
+	// certificate, so an unknown status must reject rather than admit — an
+	// attacker who got a node revoked could otherwise keep connecting by making
+	// the responder appear unreachable. Set this only when the availability
+	// tradeoff is understood. A definitive "revoked" verdict always rejects
+	// regardless of this flag.
 	AllowSoftFail bool
 
 	// OnCertRevoked is called when a certificate is found to be revoked
@@ -115,7 +147,12 @@ type TransportConfig struct {
 	// multiplexing shard traffic. Default: 16.
 	StreamPoolSize int
 
-	// MaxStreamPoolSize is the upper bound Validate allows for StreamPoolSize. Default: 256.
+	// MaxStreamPoolSize is the upper bound for StreamPoolSize. Default: 256.
+	//
+	// There is no auto-scaling. The pool is fixed at StreamPoolSize for the
+	// lifetime of the connection -- streamIndexFor reads it as a constant --
+	// and this field exists only so Validate can reject a StreamPoolSize
+	// above it.
 	MaxStreamPoolSize int
 
 	// MaxSnapshotReceiveRate is the maximum inbound snapshot bandwidth in
@@ -130,13 +167,45 @@ type TransportConfig struct {
 	// snapshot receives across all connections. Default: 1 GB.
 	MaxSnapshotReceiveMemory int64
 
-	// MaxMessageReceiveMemory bounds decoded inbound frame buffers (charged via proto.FrameDecodeCharge); zero derives it from MessageReceiveBudgetFrames.
+	// MaxMessageReceiveMemory is the total bytes allowed for in-flight inbound
+	// message-frame payload buffers across all connections and streams. It
+	// bounds an OOM DoS where a peer opens many streams that each declare a
+	// large frame length and withhold the body.
+	//
+	// Each frame is charged at proto.MaxDecodeMemoryFactor times its wire
+	// length plus its decompression delta (proto.FrameDecodeCharge), so the
+	// budget bounds decoded heap. One maximum-size frame is charged 128 MB
+	// (16 MB x 8). Zero selects the default, MessageReceiveBudgetFrames such
+	// charges: 512 MB at the defaults. An explicit value wins over the
+	// derivation, and Validate rejects one below a single maximum-size frame's
+	// charge with *MaxMessageReceiveMemoryTooSmallError. One peer may hold at
+	// most a quarter of the budget, and never less than one maximum-size frame.
+	//
+	// It bounds APPLICATION frame buffers only. QUIC additionally buffers
+	// received bytes before the application reads them, up to
+	// MaxIncomingConnections * the per-connection QUIC receive window; that
+	// window is derived from this value, so the total inbound receive
+	// footprint is this budget PLUS the QUIC-level windows.
 	MaxMessageReceiveMemory int64
 
-	// MessageReceiveBudgetFrames sizes the default MaxMessageReceiveMemory in maximum-size frames. Default: 4.
+	// MessageReceiveBudgetFrames is the number of maximum-size frames the
+	// default MaxMessageReceiveMemory admits at once. It sizes the default in
+	// the unit the receive path charges, so the default follows the frame size
+	// and the decode factor instead of drifting from them. Ignored when
+	// MaxMessageReceiveMemory is set. Default: 4.
 	MessageReceiveBudgetFrames int
 
-	// MaxDecompressedSize must equal DefaultMaxDecompressedSize (the transport MaxFrameSize); zero selects it.
+	// MaxDecompressedSize is the maximum allowed size after Snappy
+	// decompression. It must equal DefaultMaxDecompressedSize, which is the
+	// transport's MaxFrameSize; zero selects that value.
+	//
+	// It is the receiving half of the wire contract rather than a local
+	// tunable. The send path admits messages against MaxFrameSize, a
+	// compile-time constant, so a replica configured below it rejects frames
+	// every other node considers valid. The sender treats such a rejection as
+	// a frame-level failure and keeps the connection (so a wire-version
+	// mismatch cannot become a dial storm), which leaves the misconfigured
+	// replica silently unable to replicate. Validate rejects the value instead.
 	MaxDecompressedSize uint32
 
 	// MaxConnectionsPerIP is the maximum number of QUIC connections
@@ -147,28 +216,81 @@ type TransportConfig struct {
 	// QUIC connections. Default: 256.
 	MaxIncomingConnections int
 
-	// MaxStreamsPerConnection caps stream goroutines per inbound connection. Default: 256.
+	// MaxStreamsPerConnection is the maximum number of concurrent
+	// stream-processing goroutines per inbound QUIC connection. Since an
+	// idle stream on a live connection is kept open (see
+	// StreamReadIdleTimeout), each accepted stream holds one goroutine and
+	// one slot of this budget until its connection closes; the worst-case
+	// goroutine count is MaxIncomingConnections * MaxStreamsPerConnection.
+	// Default: 256.
 	MaxStreamsPerConnection int
 
-	// StreamReadIdleTimeout is how long an idle stream read waits before re-checking connection liveness, not a stream lifetime. Default: 30s.
+	// StreamReadIdleTimeout bounds how long an inbound stream read waits
+	// at a clean frame boundary before re-checking its connection's
+	// liveness. It is NOT a stream lifetime: an idle stream on a live
+	// connection is kept open across re-checks (replication streams sit
+	// idle between bursts while heartbeats keep the connection alive).
+	// Only a dead connection or a half-delivered frame stall ends a
+	// stream. Default: 30s.
 	StreamReadIdleTimeout time.Duration
 
-	// SendBatchMaxSize is the initial pooled send-buffer capacity, a sizing hint only. Default: 64 KB.
+	// SendBatchMaxSize is the initial capacity in bytes (plus the frame
+	// header) of each pooled send buffer. It is a sizing hint only: it does
+	// not trigger a flush or cap a batch, and a batch that encodes larger
+	// gets a buffer of the size it needs. Default: 64 KB.
 	SendBatchMaxSize int
 
-	// UDPRecvBufSize is SO_RCVBUF for the UDP socket. Default: 7 MB; negative keeps the OS default.
+	// UDPRecvBufSize is the SO_RCVBUF size for the UDP socket. Larger
+	// buffers prevent packet drops under burst traffic, especially in
+	// multi-node clusters where many QUIC connections share the same
+	// socket. Default: 7 MB; SetDefaults replaces 0 with it. A negative
+	// value leaves SO_RCVBUF unset, so the socket keeps the OS default.
 	UDPRecvBufSize int
 
-	// UDPSendBufSize is SO_SNDBUF for the UDP socket. Default: 7 MB; negative keeps the OS default.
+	// UDPSendBufSize is the SO_SNDBUF size for the UDP socket. Larger
+	// buffers allow more outbound packets to be queued before blocking.
+	// Default: 7 MB; SetDefaults replaces 0 with it. A negative value leaves
+	// SO_SNDBUF unset, so the socket keeps the OS default.
 	UDPSendBufSize int
 
-	// Enable0RTT enables replayable QUIC 0-RTT (RFC 9001 section 8); requires mTLS. Default: off.
+	// Enable0RTT enables QUIC 0-RTT reconnection for reduced latency on
+	// resumed connections. Disabled by default because 0-RTT data is
+	// inherently replayable per RFC 9001 Section 8: an attacker who
+	// captures a 0-RTT flight can replay it to the server.
+	//
+	// Security considerations:
+	//   - Requires MTLSConfig to be set (validated at startup). Without
+	//     mutual TLS, replayed packets could execute unauthenticated
+	//     operations.
+	//   - Raft's internal idempotency provides defense-in-depth against
+	//     replay of internal messages: duplicate message detection, term
+	//     checks, and log index checks cause replayed Raft RPCs to be
+	//     harmlessly discarded. Session deduplication further protects
+	//     client proposals.
+	//   - Enable only in trusted networks where the mTLS + Raft
+	//     idempotency combination provides acceptable replay resistance.
 	Enable0RTT bool
 
-	// DisableCompression turns off Snappy compression of non-heartbeat messages.
+	// DisableCompression disables Snappy compression on the transport
+	// wire. By default, non-heartbeat messages are Snappy-compressed
+	// when the compressed payload is smaller than the original. Set
+	// this to true for localhost benchmarks where compression adds CPU
+	// overhead without bandwidth savings, or when comparing against
+	// systems that do not compress transport messages.
 	DisableCompression bool
 
-	// TransportDisabled skips mTLS validation and transport construction, like WithoutTransport().
+	// TransportDisabled indicates that the transport layer is not used.
+	// When true, MTLSConfig validation is skipped because no QUIC
+	// connections will be established. WithoutTransport() sets this
+	// internally, but the field is exported and honoured when set directly.
+	//
+	// NewHost gates transport creation on
+	// (WithoutTransport() || TransportConfig.TransportDisabled), so setting
+	// this field directly both skips mTLS validation AND prevents the QUIC
+	// transport from being constructed — the same effect as the
+	// WithoutTransport() host option. The two are kept in lockstep on
+	// purpose: skipping the mTLS check without also disabling the transport
+	// would be exactly backwards.
 	TransportDisabled bool
 }
 
@@ -223,7 +345,12 @@ func (tc *TransportConfig) SetDefaults() {
 	}
 }
 
-// Validate returns a *ValidationError for the first violated rule, checking limits, then mTLS, then revocation.
+// Validate checks all transport configuration constraints. Returns a
+// *ValidationError describing the first violated rule, or nil
+// if the configuration is valid.
+//
+// The three groups are checked in a FIXED order — limits, then mTLS material,
+// then revocation — because callers and tests observe the FIRST violated rule.
 func (tc *TransportConfig) Validate() error {
 	if err := tc.validateLimits(); err != nil {
 		return err
@@ -247,7 +374,10 @@ func (tc *TransportConfig) validateLimits() error {
 		return newValidationError("TransportConfig.MaxSnapshotReceiveRate",
 			"must be >= 0")
 	}
-	// A non-zero rate below the floor is rejected; zero takes the default.
+	// A non-zero rate below the floor would make the receiver's
+	// proportional-sleep rate limiter compute multi-day per-chunk sleeps,
+	// holding the snapshot semaphore and memory budget and stalling
+	// availability. Zero is accepted (SetDefaults supplies the default).
 	if tc.MaxSnapshotReceiveRate > 0 && tc.MaxSnapshotReceiveRate < MinMaxSnapshotReceiveRate {
 		return newValidationError("TransportConfig.MaxSnapshotReceiveRate",
 			"must be 0 (use default) or >= 64 KB/s")
@@ -293,7 +423,11 @@ func (tc *TransportConfig) validateLimits() error {
 	return nil
 }
 
-// maxFrameReceiveCharge returns the receive-budget charge of one maximum-size frame.
+// maxFrameReceiveCharge returns what one maximum-size frame reserves against
+// the message-receive budget: proto.FrameDecodeCharge at the transport frame
+// size and MaxDecompressedSize, the same composition the receive path charges
+// a frame. DefaultMaxDecompressedSize is the transport frame size; the
+// transport package asserts the two equal at compile time.
 func (tc *TransportConfig) maxFrameReceiveCharge() int64 {
 	return proto.FrameDecodeCharge(int64(DefaultMaxDecompressedSize), int64(tc.MaxDecompressedSize))
 }
@@ -327,7 +461,11 @@ func (tc *TransportConfig) validateMessageReceiveBudget() error {
 	return nil
 }
 
-// validateMTLS requires mTLS material unless TransportDisabled is set.
+// validateMTLS checks the mandatory mTLS material.
+//
+// When transport is enabled, MTLSConfig must be provided. All QUIC connections
+// require mTLS; there is no insecure fallback. When TransportDisabled is true
+// (set by WithoutTransport()), this validation is skipped.
 func (tc *TransportConfig) validateMTLS() error {
 	if !tc.TransportDisabled {
 		if tc.MTLSConfig == nil {
@@ -344,12 +482,18 @@ func (tc *TransportConfig) validateMTLS() error {
 		if !pool.AppendCertsFromPEM(mtls.CACert) {
 			return newValidationError("TransportConfig.MTLSConfig.CACert", "no valid PEM certificate found")
 		}
-		// The leaf comes from Certificate or the PEM Cert/Key pair; reject only when neither is usable.
+		// The node leaf comes from EITHER a pre-built Certificate (e.g. a
+		// hardware-signer-backed key) OR the PEM Cert/Key pair. Reject only when
+		// neither is usable.
 		if mtls.Certificate != nil {
 			if len(mtls.Certificate.Certificate) == 0 {
 				return newValidationError("TransportConfig.MTLSConfig.Certificate", "must contain at least one certificate")
 			}
-			// A pre-built leaf needs a crypto.Signer private key, or every handshake fails.
+			// A pre-built leaf with no private key produces a Certificate that
+			// passes the length check yet fails every QUIC handshake at runtime.
+			// Require a usable signer here. Accept any crypto.Signer so a
+			// hardware-signer-backed key (TPM/PKCS#11) — whose PrivateKey is an
+			// opaque signer, not raw key bytes — is still allowed.
 			if _, ok := mtls.Certificate.PrivateKey.(crypto.Signer); !ok {
 				return newValidationError("TransportConfig.MTLSConfig.Certificate",
 					"PrivateKey must be a non-nil crypto.Signer")
@@ -405,7 +549,13 @@ func (tc *TransportConfig) validateRevocation() error {
 			return newValidationError("TransportConfig.RevocationConfig.CheckInterval",
 				"must be >= 0 (0 uses the default)")
 		}
-		// Revocation enabled fail-closed with no source would admit every revoked certificate; soft-fail is the opt-out.
+		// The default mode ("any") names no specific source, so the two checks
+		// above cannot catch it. Enabling revocation with the fail-closed
+		// default and nothing to consult admits EVERY revoked certificate for
+		// the process lifetime with no error, no log and no metric — the
+		// failure mode revocation exists to prevent. Soft-fail is the
+		// documented opt-out and explicitly covers "no revocation source
+		// configured", so it is left alone.
 		if !usesCRL && !usesOCSP && !rc.AllowSoftFail &&
 			len(rc.CRLPaths) == 0 && rc.OCSPResponderURL == "" {
 			return newValidationError("TransportConfig.RevocationConfig",

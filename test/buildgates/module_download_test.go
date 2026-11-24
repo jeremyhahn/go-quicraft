@@ -31,7 +31,19 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Every image whose build list holds a forge-only module downloads it through the same RUN instruction and optional BuildKit secret (id=gomodauth).
+// ---------------------------------------------------------------------------
+// One credential mechanism for every image that downloads a private module.
+//
+// The devcontainer images used to run `go mod download 2>/dev/null || true`.
+// For a build list holding a module served only from the project forge
+// (github.com/jeremyhahn/go-enclave), that download failed, the failure was
+// discarded, and the image built anyway -- broken, and reporting nothing until
+// a `make` inside it tried to compile. The benchmark images had already solved
+// the problem with an optional BuildKit secret (id=gomodauth). Every image
+// whose build list holds a forge-only module now runs that one RUN
+// instruction, byte for byte, so one secret, one payload format and one
+// failure behaviour serve them all.
+// ---------------------------------------------------------------------------
 
 // referenceDownloadDockerfile holds the module download RUN instruction every
 // other private-module image must repeat verbatim. Dockerfiles cannot include
@@ -288,7 +300,17 @@ func TestModuleDownloadRunsWithoutCredentials(t *testing.T) {
 	}
 }
 
-// .devcontainer/.env holds the credentials for the build secret and runtime; .env.example must hold placeholders with unquoted values.
+// ---------------------------------------------------------------------------
+// .devcontainer/.env is the single place credentials live.
+//
+// The compose services take the build secret from it and carry the same four
+// variables at run time, so `go` inside a container rewrites
+// github.com/jeremyhahn/* to the forge for anything it fetches later. The
+// committed .env.example documents the format; its values must be
+// placeholders and its lines must read identically to sh (the build secret is
+// sourced), to compose and to `docker run --env-file` (which takes quotes
+// literally), so no line may quote its value.
+// ---------------------------------------------------------------------------
 
 // moduleCredentialVars are the four variables of the handbook's
 // dependency-resolution §6, in the order .env.example lists them.

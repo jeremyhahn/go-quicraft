@@ -55,7 +55,14 @@ func collectSnapshotChunks(msg proto.Message) ([]proto.SnapshotChunk, error) {
 	return chunks, nil
 }
 
-// newMinimalEngineNode returns an engine.Node for inbox-delivery tests, with nil collaborators and a t.TempDir() snapshot root.
+// newMinimalEngineNode creates a minimal engine.Node for tests that only need
+// inbox delivery. Passes nil for peer, sm, logReader, snapshotter, and listener
+// since the test only exercises message delivery.
+//
+// The snapshot root is t.TempDir(), never "". An empty root makes
+// Node.SnapshotSaveDir return the RELATIVE path "shard-<N>/replica-<M>/
+// snapshot-<index>", so anything that touches it writes into the package
+// source directory and leaves committed-looking artifacts behind.
 func newMinimalEngineNode(t *testing.T, shardID, replicaID uint64) *engine.Node {
 	t.Helper()
 	cfg := config.Config{
@@ -560,7 +567,12 @@ func TestDecryptSnapshotForSend_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestSendSnapshot_SurvivesItsDirectoryBeingRemoved: the send reads through open handles, so removing the directory changes nothing.
+// TestSendSnapshot_SurvivesItsDirectoryBeingRemoved: a send that read its
+// artifact by PATH — the decrypt, then every chunk — could have the directory
+// removed underneath it by a newer snapshot's GC, or the next incarnation's, or
+// an offline import's. The send opens the artifact before the
+// hand-off and reads only through handles, decrypting into an anonymous
+// scratch file, so removing the directory after the open changes nothing.
 func TestSendSnapshot_SurvivesItsDirectoryBeingRemoved(t *testing.T) {
 	newArtifact := func(t *testing.T) (string, string) {
 		t.Helper()
@@ -639,7 +651,13 @@ func TestSendSnapshot_SurvivesItsDirectoryBeingRemoved(t *testing.T) {
 	})
 }
 
-// TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly: a witness snapshot is sent as one empty chunk at epoch 0, opening nothing.
+// TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly drives the real
+// SendSnapshot — its goroutine, its source handling, its panic recovery — with
+// a witness's snapshot: no data file, but the encrypted cluster's epoch on the
+// record. It must not reach the decrypt with no source, which would create a
+// scratch file in the process's working directory and panic on a nil read,
+// leaking that descriptor on every send the leader retried. It is metadata only, sent as
+// its single empty chunk at epoch 0; nothing is opened or created.
 func TestSendSnapshot_WitnessInAnEncryptedClusterIsMetadataOnly(t *testing.T) {
 	b := createTestBarrier(t)
 	f := newSnapshotSendFixture(t, b)
@@ -702,7 +720,13 @@ func writeEncryptedSnapshotFile(t *testing.T, b Barrier, path string, plaintext 
 		testSnapShardID, testSnapReplicaID, testSnapIndex)
 }
 
-// writeEncryptedSnapshotFileFor seals a snapshot file under an explicit artifact identity with the production encoder and releases its epoch pins.
+// writeEncryptedSnapshotFileFor is writeEncryptedSnapshotFile under an explicit
+// artifact identity, for tests whose artifact is later read back through a
+// production path that derives the identity from the shard/replica/index it
+// actually holds. It seals through the production encoder, so the fixture is
+// the format the decrypt side reads, terminal frame included, rather than a
+// copy of it. The epochs the seal pinned are released once the file is
+// written, as a caller does once its recorded epoch is durable.
 func writeEncryptedSnapshotFileFor(t *testing.T, b Barrier, path string, plaintext []byte,
 	shardID, replicaID, index uint64) {
 	t.Helper()

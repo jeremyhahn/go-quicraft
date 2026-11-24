@@ -43,7 +43,19 @@ func (r *recordingDeliverer) RequestSnapshotRecovery(_, _ uint64, _ *engine.Node
 	return nil
 }
 
-// TestHostMessageHandler_HandleMessage_ForgedFromDropped checks a message with a forged From from a peer's own certificate is dropped before the inbox.
+// TestHostMessageHandler_HandleMessage_ForgedFromDropped is the regression
+// test: msg.From is the replica ID raft counts toward election/commit quorum,
+// so it must be bound to the authenticated peer. A forged-From injection must be
+// dropped BEFORE it reaches the engine inbox — otherwise any authenticated
+// cluster node could manufacture a false quorum with another member's
+// ReplicateResp/RequestVoteResp.
+//
+// The senderAuthorized closure is per inbound CONNECTION: it answers for the
+// leaf certificate of the peer that opened it. The forger therefore holds its
+// OWN certificate, which is what an authenticated-but-compromised cluster node
+// has. A closure that answers true for the victim's address models an attacker
+// in possession of the victim's private key, which no receive-side check can
+// defend against and which would make this test vacuous.
 func TestHostMessageHandler_HandleMessage_ForgedFromDropped(t *testing.T) {
 	const memberAddr = "127.0.0.1:5002"
 	const forgerAddr = "10.0.0.9:9999"

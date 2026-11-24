@@ -26,7 +26,32 @@ import (
 	"testing"
 )
 
-// The golangci-lint pin gate.
+// ---------------------------------------------------------------------------
+// The golangci-lint pin gate
+//
+// GOLANGCI_VERSION in scripts/tool-pins.sh, which the Makefile includes, is
+// the single source of truth, but
+// .github/workflows/quality.yml and the two devcontainer Dockerfiles cannot
+// read a make variable and each carry a literal pin. They had drifted to THREE
+// versions at once, which is worse than having no analyser: each one gates on a
+// different rule set while reporting that it passed the same gate.
+//
+// `make check-tool-versions` enforces the agreement. Its recipe is shell built
+// on `git grep`, and this package deliberately runs no git, so these tests do
+// not execute the recipe -- they perform the SAME discovery in Go, over the
+// same roots, using the regexes lifted out of the recipe itself. Two
+// consequences worth being explicit about:
+//
+//   - a divergent pin fails here as well as in `make ci`, which is the
+//     behaviour the gate exists for;
+//   - the recipe's own shell is not executed, so a syntax error in it would
+//     still only be caught by running make.
+//
+// Lifting the regexes rather than restating them is what keeps this from
+// becoming a second, silently divergent gate: weakening the recipe's pattern
+// weakens the pattern these tests use, and the fixture cases below then fail
+// because a pattern that finds nothing cannot find the two pins they plant.
+// ---------------------------------------------------------------------------
 
 // pinSearchRoots are the paths the recipe searches. They are asserted against
 // the recipe text rather than trusted, so a root added to or dropped from the

@@ -23,7 +23,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestE2E_Partition_HealAndReconverge checks a cluster reconverges after a partition, healing by adding replacement nodes via membership changes.
+// TestE2E_Partition_HealAndReconverge verifies the full partition
+// lifecycle: form cluster, write data, create partition, write more
+// data through majority, then heal the partition and verify all nodes
+// reconverge with consistent state.
+//
+// Since the e2e test cluster uses ephemeral temp directories (t.TempDir),
+// stopped nodes cannot be restarted with their WAL state. Instead, we
+// simulate partition healing by adding new nodes via membership changes
+// to replace the partitioned nodes. This validates that Raft's membership
+// change and snapshot transfer mechanisms correctly bring new nodes up
+// to date after a partition event.
 func TestE2E_Partition_HealAndReconverge(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()

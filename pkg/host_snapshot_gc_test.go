@@ -29,7 +29,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// The snapshot receive path must GC its directories, or a lagging follower keeps every image and blocks the host-wide DEK purge floor.
+// The snapshot receive path creates one directory per InstallSnapshot and, until
+// it called engine.GCSnapshotDirs, reclaimed none of them: gcSnapshotDirs had a
+// single caller, the engine's own saveSnapshot, and a shard configured with
+// SnapshotEntries == 0 — a supported setting with NO default, so the
+// out-of-the-box state — never runs saveSnapshot at all.
+//
+// A follower that repeatedly falls behind the leader's compaction floor
+// therefore accumulated one full state-machine image per catch-up, forever. The
+// disk cost is the visible half; the other half is that snapshotFloorScan folds
+// EVERY retained directory of EVERY loaded node into the host-wide DEK purge
+// floor, so one such shard's stale directories stop a co-hosted shard from ever
+// purging an epoch key and old key material is never zeroed.
 
 // TestSnapshotReceive_ReclaimsSupersededSnapshotDirectories drives four
 // consecutive snapshot receives — the shape of a follower that keeps falling
@@ -98,7 +109,7 @@ func TestSnapshotReceive_ReclaimsSupersededSnapshotDirectories(t *testing.T) {
 			"disk and pins the host-wide DEK purge floor",
 			len(got), got, len(indices), retained)
 	}
-	// Retention keeps the newest, the one LogDB references.
+	// Retention keeps the NEWEST, and the newest is the one LogDB references.
 	for _, index := range indices[len(indices)-retained:] {
 		if !containsIndex(got, index) {
 			t.Fatalf("snapshot %d is missing from the retained set %v; retention "+

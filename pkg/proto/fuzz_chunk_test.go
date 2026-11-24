@@ -21,7 +21,16 @@ import (
 	"testing"
 )
 
-// FuzzSnapshotChunkUnmarshalCrash fuzzes SnapshotChunk.UnmarshalFrom, the wire decoder for snapshot frames.
+// FuzzSnapshotChunkUnmarshalCrash fuzzes the decoder that parses
+// attacker-supplied snapshot frames off the wire.
+//
+// SnapshotChunk.UnmarshalFrom had ZERO fuzz coverage anywhere in the
+// repository — neither here nor in pkg/internal/transport — while being the
+// most branch-dense network-facing decoder in the package: it parses an
+// embedded Membership, an optional SnapshotFile, a 4096-bounded Filepath, a
+// zero-copy Data payload, a BinVer gate and a ChunkSize cross-check, on a
+// buffer whose length comes from a frame header the peer controls
+// (snapshot_recv.go).
 func FuzzSnapshotChunkUnmarshalCrash(f *testing.F) {
 	sc := SnapshotChunk{
 		BinVer:      WireVersion,

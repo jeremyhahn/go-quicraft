@@ -79,7 +79,9 @@ func TestPropose_RegistersTheFloor(t *testing.T) {
 		t.Fatalf("proposal %d is not pending", rs.key)
 	}
 	pp := v.(*pendingProposal)
-	// The floor is the committed index at registration, at least one here.
+	// The floor is the committed index at registration; a single-node shard
+	// that has already applied entries has committed at least one, and the
+	// poison entry is committed by now (it is parked in APPLY, not commit).
 	if pp.floor == 0 {
 		t.Fatal("Propose registered floor 0 on a shard that has committed entries")
 	}

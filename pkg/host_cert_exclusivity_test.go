@@ -77,7 +77,22 @@ func sanHostConfig(t *testing.T, raftAddress string, dnsNames ...string) config.
 	return cfg
 }
 
-// TestStartShard_RejectsCertificateCoveringPeers verifies a certificate covering other members' hosts is refused.
+// TestStartShard_RejectsCertificateCoveringPeers is the regression guard for the
+// in-band authorization collapse under a shared/wildcard cluster certificate.
+//
+// Three transport controls reduce to "is the claimed host present in the
+// sender's verified certificate": clearing a spoofed SourceAddress, deciding who
+// may mutate peerEpoch and evict a live outbound, and binding a snapshot sender
+// to a shard member. Presence is only an authorization when SANs are EXCLUSIVE
+// per node; under one wildcard certificate every check succeeds for every peer,
+// so one compromised replica can claim any peer's address with a fresh
+// SourceEpoch per batch and drive every node to evict its healthy outbound to a
+// third-party victim.
+//
+// StartShard must therefore refuse to run at all. It fails CLOSED rather than
+// warning: the weakness is invisible from the running cluster, the operator has
+// no signal to act on, and the only remediation (re-issued certificates) has to
+// happen before the cluster carries data.
 func TestStartShard_RejectsCertificateCoveringPeers(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
@@ -97,7 +112,8 @@ func TestStartShard_RejectsCertificateCoveringPeers(t *testing.T) {
 		t.Fatal("StartShard accepted a wildcard certificate covering every peer; " +
 			"a single compromised replica can speak for every node")
 	}
-	// Match through the public re-exports.
+	// Matched through the PUBLIC re-exports, the only names an embedder can
+	// write.
 	if !errors.Is(startErr, ErrSharedPeerCertificate) {
 		t.Fatalf("StartShard error = %v, want ErrSharedPeerCertificate", startErr)
 	}
@@ -135,7 +151,11 @@ func TestStartShard_AcceptsPerNodeCertificate(t *testing.T) {
 	}
 }
 
-// TestStartShard_ColocatedReplicasNotRejected verifies replicas on one host differing only by port are accepted.
+// TestStartShard_ColocatedReplicasNotRejected pins the deliberate carve-out: a
+// certificate is matched on HOST alone, so replicas separated only by port
+// cannot be distinguished by any certificate policy. Rejecting them would break
+// every single-machine deployment (and this package's own test suite) while
+// telling the operator nothing they could act on.
 func TestStartShard_ColocatedReplicasNotRejected(t *testing.T) {
 	cfg := sanHostConfig(t, "127.0.0.1:5000", "*.raft.test")
 
@@ -155,7 +175,15 @@ func TestStartShard_ColocatedReplicasNotRejected(t *testing.T) {
 	}
 }
 
-// A shard grown by join must also be checked when members are added.
+// The grow-by-join flow never evaluated the precondition at all.
+//
+// StartShard checks the INITIAL members map. A cluster grown by join starts
+// its seed node with members={self} — the peer list is empty after
+// self-filtering, so the check returns nil — and every joiner with members={},
+// which returns nil on the len()==0 guard. Under a wildcard certificate the
+// deployment the check exists to refuse therefore comes up entirely clean, and
+// the addresses that DO arrive later, through RequestAddNode, were never
+// looked at.
 func TestRequestAddNode_RejectsCertificateCoveringTheNewPeer(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
@@ -261,7 +289,16 @@ func TestRequestAddNode_ColocatedPeerNotRejected(t *testing.T) {
 // One address may name only one member of a shard
 // ---------------------------------------------------------------------------
 
-// TestStartShard_RejectsDuplicateMemberAddress verifies two replicas at one address are refused.
+// TestStartShard_RejectsDuplicateMemberAddress covers quorum forgery that needs
+// no forged message and no certificate abuse at all.
+//
+// Inbound authorization is replica ID -> committed address -> certificate. Seed
+// two replica IDs at ONE address and the single host behind it legitimately
+// authenticates as both: it sends ReplicateResp{From: 2} and
+// ReplicateResp{From: 3}, both pass every check, both advance a remote match
+// index, and tryCommit counts them as two independent replicas. It also casts
+// two votes. The same rule is enforced on the config-change path by
+// raft.membership.addressHolder; this is the seeding path.
 func TestStartShard_RejectsDuplicateMemberAddress(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
@@ -287,7 +324,15 @@ func TestStartShard_RejectsDuplicateMemberAddress(t *testing.T) {
 	}
 }
 
-// TestStartShard_RejectsSpellingVariantDuplicateAddress verifies case variants of one address are refused.
+// TestStartShard_RejectsSpellingVariantDuplicateAddress closes the residual the
+// literal string compare left in the seeding path.
+//
+// "node-b.raft.test:5000" and "NODE-B.RAFT.TEST:5000" are two distinct strings
+// and ONE host to x509.VerifyHostname, which is what the receive-side gate
+// ultimately matches on. Seeding both is the same quorum forgery as seeding the
+// identical spelling twice — one host, two committed replica IDs, two votes —
+// and the seeding path must refuse it for the same reason
+// raft.membership.addressHolder refuses the config-change form.
 func TestStartShard_RejectsSpellingVariantDuplicateAddress(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "*.raft.test")
 
@@ -313,7 +358,11 @@ func TestStartShard_RejectsSpellingVariantDuplicateAddress(t *testing.T) {
 	}
 }
 
-// TestHostNodeIdentity_ReportsThisNodesOwnIdentity verifies NodeIdentity matches what peers see on its connections.
+// TestHostNodeIdentity_ReportsThisNodesOwnIdentity pins the operator-facing end
+// of the migration: the value a node reports must be the value its PEERS will
+// see on its connections and therefore the value they must commit. If the two
+// were derived differently, committing what a node reports would produce a
+// permanent identity_mismatch on every message it sends.
 func TestHostNodeIdentity_ReportsThisNodesOwnIdentity(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 
@@ -332,7 +381,8 @@ func TestHostNodeIdentity_ReportsThisNodesOwnIdentity(t *testing.T) {
 		t.Fatalf("NodeIdentity = %q, want an spki:-tagged value", identity)
 	}
 
-	// Derived from this host's own leaf certificate.
+	// It must be derived from THIS host's own leaf, which is the certificate
+	// peers verify on its connections.
 	leaf := leafOfPEM(t, cfg.TransportConfig.MTLSConfig.Cert)
 	if want := transport.NodeIdentityFromCertificate(leaf); identity != want {
 		t.Fatalf("NodeIdentity = %q, but this host's leaf yields %q: a peer that "+

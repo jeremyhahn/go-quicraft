@@ -1,4 +1,47 @@
-# When main's full CI tier goes red on a deterministic step and the parent was green, revert the merge by PR and put the change back up as a draft.
+# revert-red-main v1 (ci-template v1.23; owner item 101 as approved, Company
+# Agent m650 item 3, 2026-10-18): "red on main reverts the merge and reopens
+# the PR". Source of truth: software/templates/github-actions/revert-red-main.yml
+# in the handbook. Copy to .github/workflows/revert-red-main.yml beside ci.yml.
+#
+# A PR merges on the PR tier (lint, build, unit test, race); main then runs
+# the full tier (ci-standard.md §8). When main's full tier goes red because
+# of a merge, this workflow:
+#   1. opens a PR `revert/<sha12>` that reverts the merge commit onto main's
+#      tip, as the repository's own agent (AGENT_TOKEN). Every change reaches
+#      main through a PR (sdlc.md §2): nothing is pushed to main and nothing
+#      is force-pushed. automerge.yml merges it when its PR tier is green;
+#   2. puts the change back up for its author, as a draft so automerge does
+#      not merge it again before it is fixed. A merged PR cannot be reopened
+#      on Gitea, so a directly merged PR #N comes back as a new draft PR
+#      `reland/N` from its recorded head, titled "WIP: Reland #N: <title>". A
+#      merge train closes the PRs it carries without merging them, so each
+#      carried PR is reopened itself, its branch restored at the head the
+#      train recorded and its title prefixed "WIP: ";
+#   3. reopens the issues the merged PR closed, and comments on every PR it
+#      touched with the failing run. Every PR it puts back up carries, as the
+#      first line of its body, and every issue it reopens carries, as a
+#      comment, one line naming the red run and the failed job (Company Agent
+#      m700 Q1), so nobody has to find out why it came back.
+#
+# It reverts only a failure it can pin on the merge; anything else is left to
+# the coordinator:
+#   - the run is a push to main (not schedule, dispatch or a PR) whose
+#     conclusion is failure, read again from the API by run id;
+#   - a job failed in a step named in REVERT_STEPS, the deterministic stages.
+#     security, deps-check and trivy can turn red on main with no merge at
+#     fault (a new advisory, a new upstream release), so they never revert;
+#     neither does a failure in a setup step (checkout, image build, reap);
+#   - no failed job's log carries an INFRA_MARKERS line (a runner, Docker,
+#     disk or OOM fault: devops.md §10's "red job, zero findings" is a rerun);
+#   - the parent commit's `CI / CI Gate (push)` is success, so main was green
+#     before this merge and the merge is the culprit;
+#   - the merge is not itself a revert (head branch revert/*), and main does
+#     not already carry a revert of it.
+# A cancelled run never reaches it (conclusion cancelled, not failure).
+#
+# Runs only from the base branch's definition (workflow_run), like
+# automerge.yml; it fetches refs and runs no PR code. Gitea only: the
+# github.com mirror takes no merges.
 
 name: Revert Red Main
 
@@ -37,7 +80,10 @@ jobs:
           RED_RUN: ${{ github.event.workflow_run.id }}
           AGENT_DOMAIN: example.internal
           GATE_CONTEXT: 'CI / CI Gate (push)'
-          # Extended regex over ci.yml step names of the deterministic stages; never a security, deps-check, trivy or setup step.
+          # CUSTOMIZE: the step names of the repo's deterministic stages, an
+          # extended regex over ci.yml's step names. Add the repo's CUSTOMIZE
+          # lint, build, unit, race and integration-class steps; never a
+          # security, deps-check, trivy or setup step.
           REVERT_STEPS: '^(make lint|Assert every build tag selects code|make build|make coverage.*|make integration-test.*|Soak.*|No direct go-objstore import.*|make ci-netfault|make ci-errfs|Run the 0-RTT tests without the race detector|make ci-fuzz-seeds|make ci-cross for .*|make ci-modules|contrib/dragonboat unit tests|contrib/dragonboat integration suite|Compile under the module, tagged and untagged|Approved-only gate|Exempt revocation tree, FIPS mode)$'
           INFRA_MARKERS: 'Cannot connect to the Docker daemon|no space left on device|signal: killed|exit status 137|exit code 137|OOMKilled|toomanyrequests|lost communication with the server|The runner has received a shutdown signal'
         run: |
@@ -176,7 +222,7 @@ jobs:
             git -C "$repo" fetch -q --no-tags "$GIT_URL" "+refs/pull/$n/head:refs/red/c$n" || { echo "cannot fetch #$n"; continue; }
             [ "$(git -C "$repo" rev-parse "refs/red/c$n")" = "$h" ] || { comment "$n" "$note This PR's head moved from $h; not reopened."; continue; }
             if [ "$(jq -r '.merged' /tmp/c.json)" = true ]; then
-              # Merged: it cannot be reopened, so open a new draft PR from its head.
+              # Merged: Gitea cannot reopen it, so a new draft PR from its head.
               git -C "$repo" push -q "$GIT_URL" "$h:refs/heads/reland/$n" || { echo "cannot push reland/$n"; continue; }
               cbody=$(printf '%s\n\nRelands #%s. Fix the failure, then drop the WIP prefix to merge.\n\n%s' \
                 "$why" "$n" "$(jq -r '.body // ""' /tmp/c.json | grep -iE '^(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' || true)")

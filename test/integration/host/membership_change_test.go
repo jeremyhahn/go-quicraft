@@ -25,7 +25,19 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/membership"
 )
 
-// TestHostAPI_MembershipChange_AddAndRemoveNode adds a fourth node, checks it has all data and takes writes, then removes it while the other three keep working.
+// TestHostAPI_MembershipChange_AddAndRemoveNode verifies that a 4th node
+// can be dynamically added to a 3-node cluster via RequestAddNode, receives
+// all replicated data (including data written before it joined), accepts
+// new writes, and then is cleanly removed via RequestDeleteNode while the
+// remaining 3-node cluster continues operating.
+//
+// The test exercises:
+// - Dynamic membership addition via Raft config change
+// - Snapshot or log catch-up to the new node
+// - Continued replication with the expanded 4-node cluster
+// - Dynamic membership removal via Raft config change
+// - Cluster stability after returning to 3 nodes
+// - Linearizable reads (SyncRead) for data verification
 func TestHostAPI_MembershipChange_AddAndRemoveNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -130,7 +142,15 @@ func TestHostAPI_MembershipChange_AddAndRemoveNode(t *testing.T) {
 	t.Logf("phase 5 complete: all %d entries verified via SyncRead on 3 remaining nodes", len(allData))
 }
 
-// TestHostAPI_MembershipChange_AddRemoveWithSnapshot forces compaction (SnapshotEntries=100, CompactionOverhead=10) so a new node catches up by snapshot.
+// TestHostAPI_MembershipChange_AddRemoveWithSnapshot verifies that a
+// newly added node can catch up via snapshot when the log has been
+// compacted. Uses aggressive snapshot settings (SnapshotEntries=100,
+// CompactionOverhead=10) to force compaction before the new node joins.
+//
+// The test exercises:
+// - Log compaction via automatic snapshots
+// - New node catch-up via snapshot transfer (not log replay)
+// - Correct data after snapshot-based recovery
 func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -162,7 +182,10 @@ func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 	leaderIdx = cluster.waitForClusterLeader(shardID, leaderElectionTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 4, membershipTimeout)
 
-	// A snapshot-caught-up joiner rebuilt its configuration from the snapshot; it must match everyone else's.
+	// A joiner that caught up by SNAPSHOT rebuilt its configuration from the
+	// snapshot's membership record rather than by replaying config entries,
+	// which is a second, independent path to the same state. Assert it arrived
+	// at the same configuration as everyone else.
 	waitForMembershipConverged(t, cluster, shardID,
 		[]uint64{1, 2, 3, newReplicaID}, nil, membershipTimeout)
 
@@ -211,7 +234,14 @@ func TestHostAPI_MembershipChange_AddRemoveWithSnapshot(t *testing.T) {
 	t.Logf("membership change with snapshot catch-up complete: all data verified")
 }
 
-// TestHostAPI_MembershipChange_RemoveFollowerFromTwoVoters: removing B from a two-voter shard commits through B's own ack, and the survivor serves alone.
+// TestHostAPI_MembershipChange_RemoveFollowerFromTwoVoters is the regression
+// for an uncommitted removal revoking a current member. In a two-voter shard
+// the RemoveNode(B) the leader appends commits only with B's own ack; had the
+// leader's receive gate honoured the removal before it was committed, that
+// ack would have been refused, the entry could never commit, and the shard
+// would have stayed leaderless — across restarts, since the uncommitted tail
+// is re-seeded. The removal must commit through B's ack, and the survivor
+// must go on serving alone.
 func TestHostAPI_MembershipChange_RemoveFollowerFromTwoVoters(t *testing.T) {
 	cluster := newTestCluster(t, 2)
 	t.Cleanup(func() { cluster.close() })

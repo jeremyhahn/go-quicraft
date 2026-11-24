@@ -1,6 +1,7 @@
 # go-quicraft roadmap
 
 > **Status: REFERENCE** · Owner: Software Department · Last verified: 2026-11-12
+> Per handbook `software/conventions/roadmap.md`: the Software Department refreshes it; the project agent proposes changes by PR.
 
 Every line names the [SPEC](docs/SPEC.md) feature it belongs to. The features
 across Complete, Now, Next, Later and Future are exactly the SPEC feature table.
@@ -43,11 +44,11 @@ The Raft library of the one-product stack: multi-group Raft consensus over QUIC.
 - **read-index-readiness** — a ReadIndex read a new leader cannot serve yet returns `ErrReadIndexNotReady` instead of waiting, on the leader and on a follower that forwarded it — [go-qrdb#668](../../../go-qrdb/issues/668) — done
 - **shard-pause** — `Host.PauseShard`/`ResumeShard`: a paused shard accepts no proposals, reads or applies, keeps its state and resumes after unseal, so go-qrdb can seal a node at runtime without the shard failing — [0.22.0-alpha](../../releases/tag/v0.22.0-alpha) — done
 - **heartbeat-under-fsync** — a follower answers a leader's Heartbeat during an in-flight WAL fsync when the step left its hard state and log unchanged, so CheckQuorum does not depose a leader through a bounded fsync stall; a HeartbeatResp never acknowledges a non-durable index — [0.24.0-alpha](../../releases/tag/v0.24.0-alpha), [#390](../../issues/390) — done
-- **pq-key-exchange** — the handshake offers a post-quantum hybrid first: X25519MLKEM768 then SecP256r1MLKEM768 in the non-FIPS build, SecP256r1MLKEM768 in the FIPS build (the fips140 module accepts it under `only`); P-256 stays the shared classical group — [0.24.0-alpha](../../releases/tag/v0.24.0-alpha), [#412](../../issues/412) — done
+- **pq-key-exchange** — the handshake offers a post-quantum hybrid first: X25519MLKEM768 then SecP256r1MLKEM768 in the non-FIPS build, SecP256r1MLKEM768 in the FIPS build (the fips140 module accepts it under `only`); P-256 stays the shared classical group (owner ruling 2026-10-17, queue 49 option A) — [0.24.0-alpha](../../releases/tag/v0.24.0-alpha), [#412](../../issues/412) — done
 
 ## Now
 
-- **maintenance** — standing row: dependency updates and CI configuration land from one row branch; it carries no milestone and gates no release — [#1202](../../issues/1202) — in progress
+- **maintenance** — standing row (owner ruling 1234): dependency updates and CI configuration land from one row branch; it carries no milestone and gates no release — [#1202](../../issues/1202) — in progress
 
 No other feature in progress. Open in the `v1.0.0 bar` milestone: [#427](../../issues/427) only; it pins the next go-enclave release once go-enclave publishes it.
 

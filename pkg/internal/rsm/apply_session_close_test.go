@@ -170,7 +170,12 @@ func TestApply_OneSessionClosedOneOpenInSameBatch(t *testing.T) {
 	}
 }
 
-// TestApply_CloseThenReRegisterSameClientInSameBatch verifies a close and re-register of one client in a batch.
+// TestApply_CloseThenReRegisterSameClientInSameBatch covers a batch that
+// closes a client's session and re-registers the SAME clientID after an entry
+// was already admitted against the original session. The earlier entry's
+// response must NOT be cached into the replacement session: doing so would
+// deduplicate a future proposal of that series which was never applied to the
+// replacement session's state.
 func TestApply_CloseThenReRegisterSameClientInSameBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {

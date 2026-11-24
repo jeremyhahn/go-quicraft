@@ -22,10 +22,29 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 )
 
-// snapshotFile is the open-handle surface of the snapshot persistence paths, aliased from the engine.
+// snapshotFile is the open-handle surface the snapshot persistence paths use.
+// Seek exists for the frame-epoch prescan in ReencryptSnapshotFile, Stat for
+// the send path's declared-size check, and Name to recover a CreateTemp path.
+//
+// It is the engine's surface, aliased rather than restated, so snapshotFS
+// satisfies engine.ScratchFS and the host's recovery and send create their
+// anonymous decrypt scratch through the one engine.CreateAnonymousScratch.
 type snapshotFile = engine.SnapshotFile
 
-// snapshotFS is the filesystem surface of the snapshot persistence paths; tests inject errors and power loss. It is separate from waldb.FS by design.
+// snapshotFS abstracts exactly the filesystem operations the snapshot
+// persistence paths perform: receive/persist, save, export, import,
+// re-encrypt, and decrypt-for-send. Production always runs on osSnapshotFS,
+// which delegates to the os package; tests substitute an implementation that
+// injects errors and models power loss, so the crash-safety sequence
+// (temp -> fsync -> rename -> directory fsync) is verified rather than
+// assumed.
+//
+// This is deliberately a SECOND, separate abstraction from waldb.FS and must
+// not be unified with it: waldb.FS belongs to one storage backend and carries
+// operations that backend needs (ReadDir, PreAllocate) while lacking the ones
+// here (CreateTemp, Rename, RemoveAll), and the public host layer must not
+// take a dependency on a specific logdb backend's internals. Two narrow
+// consumer-defined interfaces for two different consumers is the intent.
 type snapshotFS interface {
 	OpenFile(name string, flag int, perm fs.FileMode) (snapshotFile, error)
 	Open(name string) (snapshotFile, error)
@@ -74,7 +93,14 @@ func (osSnapshotFS) MkdirAll(path string, perm fs.FileMode) error {
 	return os.MkdirAll(path, perm)
 }
 
-// MkdirTemp creates a new, uniquely named directory in dir and returns its path; it never returns an existing directory.
+// MkdirTemp creates a new directory in dir whose name is guaranteed not to
+// collide with any existing one, and returns its path.
+//
+// The GUARANTEE is the point: unlike MkdirAll, which succeeds on a directory
+// that already exists, this fails rather than hand back a directory holding
+// someone else's data. Every path that writes a snapshot artifact staged for a
+// rename depends on it, because such a path is entitled to delete what it
+// created on failure.
 func (osSnapshotFS) MkdirTemp(dir, pattern string) (string, error) {
 	// The directories made here are staging directories that are published
 	// by rename, so they get the snapshot tree's mode, not MkdirTemp's 0700.

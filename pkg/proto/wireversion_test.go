@@ -26,9 +26,29 @@ import (
 	"testing"
 )
 
-// Version discriminator tests: both pinned at 1, exact-match gates, independent, and byte-stable layouts.
+// Tests for the version discriminators this package carries: that both are
+// pinned at 1 for the pre-release period, that every gate on them is an EXACT
+// match, that they are not derived from one another, and that the layout they
+// name is byte-stable.
 
-// TestWireVersionIsOne checks the transport wire version is 1 and not below the persisted Membership version.
+// TestWireVersionIsOne pins the TRANSPORT wire version at 1.
+//
+// Every format in this repository is pinned at 1 until the first production
+// release: a layout change is made IN PLACE and the consuming repos are
+// rebuilt to match (see the compatibility contract in the package comment). So
+// this test does NOT mean "the transport format has never changed" — it means
+// the number does not move for a pre-release change, and a diff that moves it
+// is either the 1.0 release or a mistake.
+//
+// It deliberately does NOT assert WireVersion == membershipFormatVersion. The
+// two namespaces stay independent so that the first post-1.0 transport-only
+// bump cannot change the version byte expected at log index 1. What it DOES
+// assert is the supremum relation — the transport number must never fall below
+// any persisted layout it carries, because MessageBatch and SnapshotChunk gate
+// on BinVer by exact equality and Membership rides inside both. That relation
+// is also a compile-time constant assertion in membership.go; this is its
+// runtime statement, so a reader of the test file sees why the numbers are what
+// they are.
 func TestWireVersionIsOne(t *testing.T) {
 	if WireVersion != 1 {
 		t.Fatalf("WireVersion = %d, want 1: every format is pinned at 1 until "+
@@ -43,7 +63,16 @@ func TestWireVersionIsOne(t *testing.T) {
 	}
 }
 
-// TestPersistedMembershipVersionPinned checks the persisted Membership format version is 1 and has one value.
+// TestPersistedMembershipVersionPinned pins the persisted Membership format
+// version at 1, and pins that there is exactly ONE of them.
+//
+// The value describes bytes on disk: the WAL, snapshot records, exported
+// artifacts, and the EntryInitialMembership entry at log index 1. Pre-release
+// those bytes are disposable — dev clusters are wiped and re-synced rather than
+// migrated — which is what makes an in-place layout change legitimate and an
+// exact-match decoder correct. From the first production release onward this
+// constant may only be raised together with a decode path for the outgoing
+// layout and a migration story. Neither may track WireVersion.
 func TestPersistedMembershipVersionPinned(t *testing.T) {
 	if membershipFormatVersion != 1 {
 		t.Fatalf("membershipFormatVersion = %d, want 1", membershipFormatVersion)
@@ -54,7 +83,16 @@ func TestPersistedMembershipVersionPinned(t *testing.T) {
 	}
 }
 
-// TestMembershipVersionNotDerivedFromWireVersion parses membership.go and checks neither version constant uses WireVersion.
+// TestMembershipVersionNotDerivedFromWireVersion is a source-level guard: it
+// parses membership.go and asserts that neither version constant is defined
+// in terms of WireVersion.
+//
+// A value check cannot catch this — both namespaces are 1 today, so a
+// contributor who "simplifies" the constant to uint8(WireVersion) leaves every
+// runtime assertion green while arming the defect for 1.0: the first
+// transport-only WireVersion bump would then silently change the version byte
+// expected at log index 1 and leave a released cluster unable to replay its own
+// log.
 func TestMembershipVersionNotDerivedFromWireVersion(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "membership.go", nil, 0)
@@ -100,7 +138,14 @@ func TestMembershipVersionNotDerivedFromWireVersion(t *testing.T) {
 	}
 }
 
-// TestMembershipVersionExactMatch checks only the supported version decodes and every other byte is refused with the typed error.
+// TestMembershipVersionExactMatch exercises the decode gate: the one supported
+// version decodes, EVERY other byte value is refused with the typed error, and
+// the message names both the version found and the version supported.
+//
+// Exact equality is what the pinning policy buys. There is no window to widen
+// and no earlier layout to fall back to, so a section stamped with anything
+// else was written by a binary built from a different pre-release commit and
+// must be refused rather than read at this layout's offsets.
 func TestMembershipVersionExactMatch(t *testing.T) {
 	m := Membership{
 		ConfigChangeID:             9,
@@ -268,7 +313,14 @@ func TestMembershipGoldenEncoding(t *testing.T) {
 	}
 }
 
-// TestMembershipFullRoundTripIsByteIdentical checks a fully populated membership round-trips and re-encodes to the same bytes.
+// TestMembershipFullRoundTripIsByteIdentical is the equivalence statement for
+// the single-version collapse: a membership with all six maps populated, the
+// session policy set and RemovedIdentities non-empty must survive
+// MarshalTo/UnmarshalFrom field for field, and re-encode to the SAME bytes.
+//
+// Re-encoding is the half that catches a decoder which "succeeds" while reading
+// a field at the wrong offset: the value round-trips through a struct
+// comparison only if every offset agreed in both directions.
 func TestMembershipFullRoundTripIsByteIdentical(t *testing.T) {
 	m := Membership{
 		ConfigChangeID:             0xDEADBEEFCAFE,
@@ -339,7 +391,13 @@ func TestSnapshotGoldenEncodingUnchanged(t *testing.T) {
 		"00000000" + "00000000" + // Identities, RemovedIdentities
 		"00000000" + // Filepath length
 		"0000000000000000" + // FileSize
-		// Type, Witness and Imported were removed from this layout, 8 bytes each.
+		// Three fields left this layout, shortening the vector by 8 bytes each:
+		// Type (no writer anywhere and no reader), Witness (written by raft but
+		// never read, and the fact it stated is already carried by the empty
+		// Filepath the same branch produces), and Imported (whose only writer
+		// set it from "this save is an EXPORT" — the opposite of its documented
+		// meaning). Acknowledging the change HERE, deliberately, is exactly what
+		// this golden test exists for.
 		"0000000000000000" + // OnDiskIndex
 		"0000000000000000" + "0000000000000000" // Epoch, Compression
 	if got := hex.EncodeToString(sbuf[:sn]); got != snapGolden {
@@ -430,7 +488,23 @@ func TestSnapshotChunkValidatesBinVer(t *testing.T) {
 	}
 }
 
-// TestConfigChangeRejectsEveryStrictPrefix checks the single fixed ConfigChange layout refuses every truncation.
+// TestConfigChangeRejectsEveryStrictPrefix pins the collapse of ConfigChange to
+// ONE fixed layout, and with it the closure of a real defect.
+//
+// A LENGTH-discriminated decoder, reading "the buffer ended" as a shorter
+// layout rather than as damage, is dangerous at the trailing NodeIdentity: a
+// payload ending where its length prefix begins would decode with err == nil
+// and an EMPTY identity — and an empty identity was then exactly the
+// compatibility state that fell back to the weaker address-based
+// authorization (removed in 0.13.0-alpha). So a truncated
+// ConfigChange was indistinguishable from a legitimate identity-less one, and
+// truncation silently downgraded an authorization check.
+//
+// ConfigChange carries no version byte and still needs none. Under the pinning
+// policy there is one layout and every field in it is mandatory, so there is
+// nothing to discriminate: short is short. An identity-less change is spelled
+// with an explicit zero length prefix, which is what
+// TestConfigChangeWithNoIdentityRoundTrips holds down.
 func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 	full := ConfigChange{
 		ConfigChangeID:             7,
@@ -451,7 +525,10 @@ func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 		t.Fatalf("MarshalTo wrote %d bytes into a %d-byte buffer", n, len(buf))
 	}
 
-	// Every strict prefix is refused; the sweep is exhaustive.
+	// EVERY strict prefix is refused. The sweep is exhaustive rather than
+	// sampled because the dangerous cut is at ONE offset — the byte before the
+	// identity's length prefix — and a hand-picked set of cut points can miss
+	// it.
 	for cut := 0; cut < len(buf); cut++ {
 		var decoded ConfigChange
 		consumed, err := decoded.UnmarshalFrom(buf[:cut])
@@ -470,7 +547,10 @@ func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 		}
 	}
 
-	// A payload ending at the identity's length prefix must not decode with an empty NodeIdentity.
+	// The cut that mattered, called out on its own so a regression names
+	// itself. A payload ending exactly where the identity's length prefix
+	// begins must not decode with err == nil and an EMPTY NodeIdentity, which
+	// would silently drop the identity the receive-side gate checks.
 	beforeIdentityPrefix := len(buf) - (4 + len(full.NodeIdentity))
 	var downgraded ConfigChange
 	if _, err := downgraded.UnmarshalFrom(buf[:beforeIdentityPrefix]); !errors.Is(err, ErrBufferTooSmall) {
@@ -507,7 +587,18 @@ func TestConfigChangeRejectsEveryStrictPrefix(t *testing.T) {
 	}
 }
 
-// TestConfigChangeWithNoIdentityRoundTrips checks a change with an explicitly empty identity still decodes.
+// TestConfigChangeWithNoIdentityRoundTrips is the positive control for the
+// truncation sweep: a change that genuinely carries no identity is a legal,
+// commonly committed payload and must still decode.
+//
+// It is what stops the truncation check from becoming "reject anything
+// without an identity".
+// A shard added without RequestAddNodeWithIdentity commits exactly this, and
+// every RemoveNode and UpdateWitnessPolicy does too, so refusing it would leave
+// nodes unable to replay their own logs. The distinction the layout now draws
+// is between an identity that is EMPTY (a four-byte zero length prefix, chosen
+// by the writer) and one that is ABSENT (the buffer stopped), and only the
+// second is an error.
 func TestConfigChangeWithNoIdentityRoundTrips(t *testing.T) {
 	for _, cc := range []ConfigChange{
 		{ConfigChangeID: 7, Type: AddNode, ReplicaID: 42, Address: "10.0.0.1:9000", Initialize: true},
@@ -579,7 +670,31 @@ func marshalUnversionedMembershipLong(ccID, maxWit uint64, policy bool, addrs ma
 	return buf
 }
 
-// TestMembershipRejectsUnversionedLayout checks a membership section without a version byte is rejected with ErrUnsupportedVersion.
+// TestMembershipRejectsUnversionedLayout verifies that a membership section
+// carrying no version byte is rejected with ErrUnsupportedVersion.
+//
+// The EMPTY cases are the point of the version byte. Before it existed, the
+// decoder discriminated layouts with a heuristic on bytes 16..24 ("must be a
+// bare 0 or 1"), which is undecidable for an empty unversioned section: it
+// encodes those bytes as [WitnessCount:4=0][RemovedCount:4=0], byte-identical
+// to a section with RequireFullReplicaMajority=false. Such a buffer must not
+// parse on and surface as ErrBufferTooSmall / ErrTooManyMembershipEntries — or,
+// embedded in a larger buffer, misparse into a plausible membership.
+//
+// The POPULATED cases use a ConfigChangeID whose low byte is NOT a valid
+// version, and that choice is part of the statement rather than a convenience.
+// An unversioned section's first byte is the ConfigChangeID's low byte, so a
+// section whose ConfigChangeID happened to be congruent to the supported
+// version mod 256 would be byte-indistinguishable from a versioned one and
+// could not be rejected by any decoder. That is the undecidability the version
+// byte exists to end, and it is why the unversioned layouts are unreadable BY
+// CONSTRUCTION rather than merely unsupported.
+//
+// With the version pinned at 1 the colliding set is a single value and no data
+// in that layout exists anywhere — the fixture is built by hand here. What it
+// pins is what the version byte CAN do (reject a section whose leading byte is
+// not the supported one, before a single field is interpreted), not a guarantee
+// it cannot make.
 func TestMembershipRejectsUnversionedLayout(t *testing.T) {
 	addrs := map[uint64]string{1: "10.0.0.1:9000"}
 	// 0x140 = 320: low byte 0x40, not the supported version and not a plausible
@@ -672,7 +787,11 @@ func TestMembershipVersionByteOnWire(t *testing.T) {
 	}
 }
 
-// TestMembershipRejectsTrailingBytesAtCallSite checks Membership consumes exactly its own section.
+// TestMembershipRejectsTrailingBytesAtCallSite pins the property that makes
+// exact-version gating safe for an EMBEDDED section: UnmarshalFrom reports how
+// many bytes it consumed, and the caller — not the decoder — decides whether
+// anything is left over. Membership itself must therefore consume exactly its
+// own section and no more, whatever follows it.
 func TestMembershipRejectsTrailingBytesAtCallSite(t *testing.T) {
 	m := goldenMembershipFixture()
 	m.SetSessionPolicy(goldenMembershipSessionPolicy())

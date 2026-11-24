@@ -46,7 +46,12 @@ func waitUntil(timeout time.Duration, cond func() bool) bool {
 // sweepPendingReads must expire a batch key's unreachable aliases
 // ---------------------------------------------------------------------------
 
-// TestSweepPendingReads_ExpiresUnconfirmedAliasGroup checks expiring an unconfirmed batch key also expires its aliases.
+// TestSweepPendingReads_ExpiresUnconfirmedAliasGroup is a regression
+// test. Coalesced ReadIndex alias keys are reachable ONLY through the batch
+// key's pendingRead: OnReadyToRead looks up the batch key and walks
+// pr.aliases. When the sweeper expires the batch key while the group is
+// unconfirmed, deadline-less aliases would otherwise hang forever and their
+// RequestStates would never return to the pool.
 func TestSweepPendingReads_ExpiresUnconfirmedAliasGroup(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -96,7 +101,11 @@ func TestSweepPendingReads_ExpiresUnconfirmedAliasGroup(t *testing.T) {
 	}
 }
 
-// TestSweepPendingReads_KeepsConfirmedAliases checks confirmed aliases survive their batch key's expiry.
+// TestSweepPendingReads_KeepsConfirmedAliases verifies the alias sweep leaves
+// CONFIRMED aliases in place when their batch key expires: a confirmed
+// alias carries its own readIndex and is independently completable by the
+// OnApplied read scan, so timing it out would discard a read that is about
+// to resolve legitimately.
 func TestSweepPendingReads_KeepsConfirmedAliases(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -152,7 +161,11 @@ func TestSweepPendingReads_KeepsConfirmedAliases(t *testing.T) {
 	aliasRS.Release()
 }
 
-// TestOnReadIndexBatched_BatchKeyAlreadyRemovedFailsAliases checks aliases of an already-swept batch key are failed.
+// TestOnReadIndexBatched_BatchKeyAlreadyRemovedFailsAliases covers the
+// edge where the batch key was swept BEFORE the aliases could attach to it:
+// the raft confirmation arrives keyed by the batch key, so aliases
+// registered against a removed batch entry are unreachable from birth and
+// must be failed rather than left to hang.
 func TestOnReadIndexBatched_BatchKeyAlreadyRemovedFailsAliases(t *testing.T) {
 	h := newTestHost(t)
 	addTestNodeState(h, 1, 1)
@@ -233,7 +246,13 @@ func TestPendingRegistration_CloseRace_CallerNeverOrphaned(t *testing.T) {
 				rs.Release()
 			}()
 		}
-		// ErrShutdownTimeout is an allowed Close result here; any other Close error fails.
+		// Close races in-flight ReadIndex, RequestSnapshot and
+		// RequestAddNode on purpose. When that work outlasts
+		// ShutdownTimeout, Drain returning ErrShutdownTimeout is the
+		// documented contract, not a failure: the property under test is
+		// that no caller is orphaned and every pending registration is
+		// released, which the guard above and the pendingOps check below
+		// assert. Any other Close error still fails the test.
 		if err := h.Close(); err != nil && !errors.Is(err, ErrShutdownTimeout) {
 			t.Fatalf("Close failed: %v", err)
 		}
@@ -267,7 +286,12 @@ func (f *stashBootstrapLogDB) SaveBootstrap(shardID, replicaID uint64, bootstrap
 	return errors.New("bootstrap write failed")
 }
 
-// TestStartShard_BootstrapFailureMarksNodeStateStopped checks ns.stopped is set before the failed node is deleted.
+// TestStartShard_BootstrapFailureMarksNodeStateStopped is a
+// regression test: the SaveBootstrap failure path deletes the node from
+// h.nodes and the deferred rollback closes the state machine. A reader
+// that resolved the nodeState just before the Delete must fail its
+// stopped check instead of calling into the closing state machine, so
+// ns.stopped must be set before the Delete (matching StopShard/Close).
 func TestStartShard_BootstrapFailureMarksNodeStateStopped(t *testing.T) {
 	cfg := testHostConfig(t)
 	db := &stashBootstrapLogDB{mockLogDB: *newMockLogDB()}
@@ -296,7 +320,15 @@ func TestStartShard_BootstrapFailureMarksNodeStateStopped(t *testing.T) {
 // Queue-full rollbacks must claim with LoadAndDelete
 // ---------------------------------------------------------------------------
 
-// TestProposeEntry_QueueFullRollback_RacesSweeper checks exactly one of rollback and sweeper releases the entry, so pool and pendingOps balance.
+// TestProposeEntry_QueueFullRollback_RacesSweeper is a regression
+// test. With an unconditional Delete in the queue-full rollback, when the
+// sweeper has already claimed and completed the entry the rollback still
+// runs releaseRef (driving outstanding negative — the RequestState is
+// permanently lost from the pool) and completePendingOp a second time
+// (undercounting pendingOps so Drain can close early). With the
+// LoadAndDelete claim, exactly one claimant rolls the entry back: the
+// RequestState always returns to the pool with outstanding == 0 and
+// pendingOps always balances back to exactly zero.
 func TestProposeEntry_QueueFullRollback_RacesSweeper(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -318,7 +350,13 @@ func TestProposeEntry_QueueFullRollback_RacesSweeper(t *testing.T) {
 		t.Fatal("engine node should not be nil")
 	}
 
-	// Mark the node recovering so the step worker does not drain the queue between the fill and the proposal.
+	// Park the step worker off this shard. DrainProposals is only ever
+	// called from processReady, and processReady skips a node whose
+	// recovering flag is set (a snapshot recovery owns the state machine).
+	// That is exactly the production state in which the proposal queue
+	// genuinely backs up, and it makes the fill below stick: without it the
+	// worker drains the queue between the fill and the proposal, so the
+	// queue-full rollback is only reached by luck.
 	engNode.SetRecovering(true)
 	defer func() {
 		// Discard the entries the test injected before handing the queue

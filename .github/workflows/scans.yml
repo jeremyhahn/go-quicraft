@@ -1,4 +1,21 @@
-# Scheduled scans on main (make security, trivy image); a finding fails this job and opens or updates one issue, a clean run closes it.
+# scans-template: v1.0.0 (customized) — the scheduled scans on main.
+# ci-template v1.42 makes the CI Gate hermetic (owner ruling 742 (1)), so the
+# checks that fail on the state of the world rather than on a change run on
+# main, never on a pull_request or a push: `make security` (gosec,
+# govulncheck, go mod verify, trivy fs) and `trivy image` of the integration
+# image here, and deps-check's full gate in deps-bump.yml (ruling 640). This
+# workflow is not the one named CI, so a finding never reads as a red main
+# and never blocks a PR. A finding opens or updates ONE issue, found by its
+# fixed title (SCAN_ISSUE_TITLE), with the run link, and fails this job, so
+# the Actions run is red; a run with no finding closes that issue.
+#
+# CUSTOMIZE (go-quicraft), against the template:
+#   - No bump half and no deps-check: deps-bump.yml (deps-bump-template
+#     v1.0.0, customized, with its recovery and its tests in
+#     scripts/depscheck) carries the bump PR and deps-check's full gate.
+#     Folding it into this file is the template's v1.42 adoption, left to the
+#     full catch-up.
+#   - The cron minute: off ci.yml's Thursday 05:00 and deps-bump.yml's 06:19.
 
 name: Scheduled Scans
 
@@ -74,7 +91,9 @@ jobs:
           rm -f "$RUNNER_TEMP/gomodauth.env"
           echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
 
-      # Each check runs to the end; FIRED lists the ones that failed.
+      # The checks that left ci.yml (ruling 742 (1)). Each runs to the end;
+      # FIRED lists the ones that fail, and the step's own log keeps their
+      # output. trivy image keeps ci.yml's former flags (devops.md §8).
       - name: Scans (make security, trivy image)
         id: scans
         if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
@@ -94,7 +113,10 @@ jobs:
           echo "scans: ${fired:-none fired}"
           echo "fired=$fired" >> "$GITHUB_OUTPUT"
 
-      # One issue found by its exact title: created, updated, or closed by a clean run.
+      # ONE issue for the findings, found by its exact title among the open
+      # issues (pull requests excluded): created when none is open, its body
+      # replaced when one is, and closed with a comment by the first run with
+      # no finding.
       - name: Open, update or close the scan issue
         if: ${{ !cancelled() && steps.scans.outcome == 'success' }}
         env:

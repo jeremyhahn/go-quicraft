@@ -603,7 +603,14 @@ func TestRefcount_ReleaseRefBeforeReleaseDefersRecycle(t *testing.T) {
 	}
 }
 
-// pinnedStatePool returns a pool that always yields the same RequestState storage, plus that storage.
+// pinnedStatePool returns a pool that always hands back the same
+// RequestState storage, together with that storage. sync.Pool is free to
+// drop a Put object (per-P caches, GC victim eviction), so a test that
+// hopes the production pool returns the object it just recycled is
+// nondeterministic. Pinning the storage makes the recycle-then-reuse path
+// run on every execution while leaving the production reuse semantics
+// (newRequestState's field reset and channel drain) exactly as they are:
+// the storage itself is built by the production pool's New func.
 func pinnedStatePool() (*sync.Pool, *RequestState) {
 	storage := NewRequestStatePool().Get().(*RequestState)
 	return &sync.Pool{New: func() interface{} { return storage }}, storage

@@ -20,7 +20,26 @@ import (
 	"testing"
 )
 
-// Every limit is enforced on write as well as read, so no Membership or ConfigChange can be committed that replay would refuse.
+// ---------------------------------------------------------------------------
+// Every limit must be enforced on WRITE as well as on READ
+//
+// They were read-only, so MarshalTo emitted values UnmarshalFrom refuses. For a
+// transport-only type that is an asymmetry; for Membership and ConfigChange it
+// is a DURABILITY bug, because both are committed to the raft log:
+//
+//   - Membership is the Cmd of the EntryInitialMembership at log index 1.
+//     Host.StartShard copies the caller's members map into it unchecked, so an
+//     over-length address bootstrapped the shard successfully and then made
+//     every subsequent start fail: reconstructShardMembership decodes that
+//     entry, getMap refuses the value, and the error propagates out of
+//     StartShard. Permanently, on data the shard itself wrote.
+//   - ConfigChange is the Cmd of an EntryConfigChange. An unreadable one is a
+//     committed entry every replica faults on (ErrCorruptConfigEntry).
+//
+// waldb.writeEntries and waldb.checkMembershipSize already refuse to write what
+// their own replay cannot read, calling it "an entry that is durable but
+// unreadable". These are the same rule on this package's formats.
+// ---------------------------------------------------------------------------
 
 // TestMembershipMarshalRefusesOversizedMaps covers the count limit on every map
 // including the two identity maps, and TestMembershipAddressTooLong
@@ -179,7 +198,21 @@ func TestMarshalRefusesWhatUnmarshalRefuses(t *testing.T) {
 // Membership.UnmarshalFrom must be all-or-nothing
 // ---------------------------------------------------------------------------
 
-// TestMembershipUnmarshalLeavesNoPartialState: a failed decode leaves the receiver untouched.
+// TestMembershipUnmarshalLeavesNoPartialState pins that a failed decode leaves
+// the receiver untouched.
+//
+// A decoder that cleared some fields AFTER the field reads and wrote others
+// BEFORE them would leave a mixture of old and new on failure: a decode that
+// failed early would keep a STALE Identities map — which authorizes a replica the decoded
+// configuration never named — and one that failed in the maps left a NEW
+// session policy sitting on an OLD configuration, which the apply path reads.
+// Decoding into a local and assigning the receiver only on success is what
+// removes the whole class.
+//
+// Latent today, because all three call sites abandon the value on error. That
+// is exactly why it needs a test: the invariant is a property of the
+// decoder, and nothing else would notice if a future refactor moved it back
+// into the callers.
 func TestMembershipUnmarshalLeavesNoPartialState(t *testing.T) {
 	// The value the receiver holds before the failed decode. Every field is
 	// distinctive so any survivor is identifiable.
@@ -247,7 +280,20 @@ func TestMembershipUnmarshalLeavesNoPartialState(t *testing.T) {
 	}
 }
 
-// TestMembershipUnmarshalClearsStaleReceiverFields: decoding a section with no identities or session policy clears the receiver's existing ones.
+// TestMembershipUnmarshalClearsStaleReceiverFields is the SUCCESS-path half of
+// the all-or-nothing rule, and the shape the decoder's comment names: a section
+// that carries no identities and no session policy, decoded into a receiver
+// that already holds some, must not leave any of them behind.
+//
+// The fields are absent-as-empty rather than absent-as-missing — the layout
+// always writes all six maps and the policy — so the only way a stale value
+// survives is a decoder that skips a field instead of overwriting it. That
+// distinction is invisible in a fresh-receiver test and load-bearing here: the
+// buffer pools in the receive path hand the same Membership back repeatedly.
+//
+// A surviving Identities map is the dangerous one — it authorizes a replica the
+// decoded configuration never named — and a surviving RemovedIdentities map is
+// the mirror image, denying a sender the decoded configuration never tombstoned.
 func TestMembershipUnmarshalClearsStaleReceiverFields(t *testing.T) {
 	src := Membership{
 		ConfigChangeID: 5,

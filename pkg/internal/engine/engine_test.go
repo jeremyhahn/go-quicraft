@@ -448,7 +448,13 @@ func TestEngine_RequestSnapshot_DuplicateRejected(t *testing.T) {
 	e.Start()
 	defer e.Stop()
 
-	// Park the worker inside the snapshotter so the in-flight marker stays held during the second call.
+	// The dedup this test asserts holds only WHILE the first request is in
+	// flight: the pool worker deletes the in-flight marker as its last act.
+	// With a nil snapshotter the worker rejects the request immediately, so on
+	// a loaded host it could finish before the second call and the second
+	// request would legitimately be accepted — the flake. Park the worker
+	// inside the snapshotter instead: the marker cannot be released until this
+	// test says so, and the assertion no longer depends on scheduling.
 	release := make(chan struct{})
 	defer close(release)
 
@@ -527,7 +533,23 @@ func TestEngine_RequestSnapshotRecovery_Success(t *testing.T) {
 // step-worker panic recovery and clearBatchCommitPending
 // ---------------------------------------------------------------------------
 
-// TestCommitWorker_ClearBatchCommitPending checks a commit-worker panic clears commitPending for its batch only.
+// The two tests that lived here, TestEngine_DrainCommitC and
+// TestEngine_DrainCommitC_NotifiesWorkSignal, asserted that a step-worker panic
+// DRAINS commitC and clears commitPending on every item it wins.
+//
+// That behaviour was the defect, not the contract. commitC is the channel the
+// LIVE commit worker consumes, and it holds up to CommitCBufferSize (64) items
+// belonging to OTHER shards, so a single panic on one shard permanently failed
+// up to 64 unrelated healthy shards — and which ones was a race against the
+// consumer. Engine.drainCommitC is gone; see the rationale on the recovery in
+// runStepWorkerOnce for why the slot-reuse hazard it claimed to prevent is
+// unreachable.
+//
+// These tests are deleted rather than inverted because an inverted version must
+// drive a REAL panic through runStepWorkerOnce to mean anything, and asserting
+// on a hand-rolled stand-in is how a test ends up proving only itself. The
+// behavioural replacement — an unrelated shard's queued item survives a genuine
+// step-worker panic — belongs with the recovery change.
 
 func TestCommitWorker_ClearBatchCommitPending(t *testing.T) {
 	t.Run("clears commitPending for the batch only", func(t *testing.T) {
@@ -868,7 +890,12 @@ func (a *goexitApplier) Apply(entries []proto.Entry, results []sm.Result) error 
 	return nil
 }
 
-// TestEngine_ShardApplyGoexitFailsTheShard: an Apply that calls runtime.Goexit fails the shard with *SMPanicError and its proposals; the goroutine restarts.
+// TestEngine_ShardApplyGoexitFailsTheShard: a state machine whose Apply calls
+// runtime.Goexit leaves the batch's outcome unknown, exactly as a panic does,
+// so the shard is failed with an *SMPanicError and the batch's proposals are
+// failed. Before, recover saw nothing, the batch vanished and the shard's
+// apply goroutine was gone. The goroutine is restarted, so the unload's join
+// still completes.
 func TestEngine_ShardApplyGoexitFailsTheShard(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	defer restore()
@@ -1008,7 +1035,13 @@ var hostileExits = map[string]func(){
 	"Goexit": runtime.Goexit,
 }
 
-// TestEngine_CommitRecoverySettlesBeforeLogging: recovery settles the batch before running any user code, logging included.
+// TestEngine_CommitRecoverySettlesBeforeLogging: a worker's recovery must
+// settle everything structural before it runs any user code, logging
+// included. A commit worker that logged first and whose slog handler then
+// Goexited skipped its settlement: the batch's hard-state claim, commitPending
+// and buffered ordered messages survived, and the next batch's save could
+// release a vote response for a vote never persisted. A handler panic escaped
+// the recovery altogether.
 func TestEngine_CommitRecoverySettlesBeforeLogging(t *testing.T) {
 	for exitName, exit := range hostileExits {
 		t.Run(exitName, func(t *testing.T) {
@@ -1118,7 +1151,9 @@ func TestEngine_DeliverMessage_TypeAssertionFailure(t *testing.T) {
 	if !contains(logOutput, "node lookup type assertion failed") {
 		t.Fatalf("expected type assertion error log, got: %s", logOutput)
 	}
-	// The log must name the entry point, DeliverMessage or DeliverLocal.
+	// The log must still identify WHICH entry point hit it: DeliverMessage and
+	// DeliverLocal share the lookup, and a report that cannot tell them apart
+	// cannot tell a wire delivery from a local injection.
 	if !contains(logOutput, "DeliverMessage node lookup") {
 		t.Fatalf("expected the DeliverMessage caller context in the log, got: %s", logOutput)
 	}
@@ -1170,7 +1205,17 @@ func TestEngine_GetNode_TypeAssertionFailure(t *testing.T) {
 // commit-worker panic recovery: commitPending ownership
 // ---------------------------------------------------------------------------
 
-// TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending verifies a commit-worker panic clears commitPending only for its batch's nodes.
+// TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending verifies that a
+// panicking commit worker unwedges EXACTLY the nodes whose updates died with
+// its batch, and leaves every other node's commitPending alone.
+//
+// The step worker keeps running through a commit-worker panic. It sets
+// commitPending BEFORE its commitC send, so a blanket clear over every node
+// the worker owns steals ownership from an enqueue that is still in flight:
+// the next processReady calls GetUpdate again while raft's processed marker
+// has not advanced, extracting the SAME committed entries twice (double
+// Peer.Commit, double apply, double ReleaseCommittedEntries on one pooled
+// slice) and re-enqueueing the SAME pre-allocated *commitItem pointer.
 func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	defer restore()
@@ -1218,7 +1263,16 @@ func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 // SetSender and SetCallback after Start panics
 // ---------------------------------------------------------------------------
 
-// TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch verifies panic recovery clears the batch buffers so no stale ordered message is sent.
+// TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch verifies the
+// commit-worker panic recovery contract:
+//
+//   - commitC is drained BEFORE commitPending is cleared. The step worker is
+//     still running; once commitPending is false it reuses the very
+//     *commitItem still queued in commitC, so clearing first could enqueue
+//     the same pointer twice (double Peer.Commit, double apply, double
+//     release of the same pooled entry slice).
+//   - the batch buffers are cleared, so the restarted worker cannot send this
+//     batch's ordered messages after an unrelated later batch's fsync.
 func TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch(t *testing.T) {
 	logBuf, restore := captureLogOutput(t)
 	defer restore()
@@ -1277,7 +1331,9 @@ func TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch(t *testing.T) {
 	if node.commitPending.Load() || stale.commitPending.Load() {
 		t.Fatal("commitPending must be cleared on every node owned by the worker")
 	}
-	// A commit-worker panic must not fail the batch's shards; the restarted worker re-derives the entries.
+	// A commit-worker panic must not FAIL the batch's shards. The batch's
+	// entries were never persisted, but nothing was extracted past stable
+	// storage either — the restarted worker re-derives them.
 	if node.IsFailed() || stale.IsFailed() {
 		t.Fatal("a commit worker panic must unwedge its batch's shards, not fail them")
 	}

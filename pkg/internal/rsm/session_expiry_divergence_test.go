@@ -25,11 +25,33 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas checks replicas with different local expiry apply identically under the committed SessionPolicy.
+// TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas is the regression
+// test for a silent state-machine divergence.
+//
+// It replaced a CHARACTERIZATION test that asserted the opposite: that two
+// replicas fed the identical log, differing only in the expiry threshold each
+// was configured with, ended up holding DIFFERENT user data at the same applied
+// index — with the log identical, the commit index identical, and nothing in
+// the protocol able to detect it. That was the cost of
+// Config.SessionExpiryEntries being node-local configuration that the apply
+// path treated as replicated.
+//
+// The threshold is now part of the shard's replicated membership
+// (proto.SessionPolicy), so the two replicas below still differ in their LOCAL
+// configuration — the disagreement a mixed-version cluster or an edited config
+// file produces — and must nevertheless apply identically, because both read
+// the value the shard committed.
+//
+// The two subtests cover both directions. It is not enough that the replicas
+// agree: they must agree on the SHARD's behaviour, so each subtest also pins
+// which behaviour that is. A fix that simply ignored expiry everywhere would
+// pass the first subtest and fail the second.
 func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 	const clientID = 42
 
-	// newReplica builds a state machine with local expiry localExpiry and committed policy replicated, returning it and the user KV.
+	// newReplica builds a state machine whose LOCAL configuration carries
+	// localExpiry and whose shard has committed replicated, and returns it
+	// alongside the user KV so the test can read the applied state.
 	newReplica := func(t *testing.T, localExpiry uint64, replicated proto.SessionPolicy) (*StateMachine, *testKV) {
 		t.Helper()
 		kv := newTestKV()
@@ -50,7 +72,9 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		return rsm, kv
 	}
 
-	// refused asserts a replica whose local expiry disagrees with the committed policy is not built.
+	// refused asserts that a replica whose LOCAL expiry disagrees with the
+	// shard's committed policy is not built at all: it would expire sessions
+	// at log indexes its peers do not.
 	refused := func(t *testing.T, localExpiry uint64, replicated proto.SessionPolicy) {
 		t.Helper()
 		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
@@ -77,7 +101,13 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 		}
 	}
 
-	// Both replicas get: index 1 register client 42; index 200 an unrelated command (expiry 100 checkpoint); index 300 a session write from client 42.
+	// The log both replicas are fed, in the identical order:
+	//
+	//	index 1   register client 42
+	//	index 200 an unrelated command; 199 > 100, so a replica evaluating a
+	//	          threshold of 100 reaches its checkpoint at index 200 and
+	//	          expires client 42
+	//	index 300 a session-managed write from client 42
 	applyLog := func(t *testing.T, replica *StateMachine) {
 		t.Helper()
 		steps := [][]proto.Entry{
@@ -159,7 +189,16 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 	})
 
 	t.Run("shard enabled expiry, one replica configured not to", func(t *testing.T) {
-		// The shard committed expiry=100: both replicas expire client 42 at index 200 and reject the write; local 0 or 1000 is refused.
+		// The mirror image: the shard committed expiry=100, so BOTH replicas
+		// must expire client 42 at the index-200 checkpoint and reject the
+		// write, and one whose local configuration disables expiry is refused.
+		//
+		// A replica configured with 1000 is refused too. Under its local value
+		// no checkpoint falls before index 300, so it would hold the session
+		// and APPLY the write its peers reject: reading the checkpoint interval
+		// from the local configuration inside the segmented walk is the exact
+		// divergence this file exists to prevent, and a local value of the
+		// same magnitude as the shard's would hide it.
 		replicated := proto.SessionPolicy{
 			ExpiryEntries:          100,
 			MaxTotalSessions:       100,
@@ -190,7 +229,17 @@ func TestSessionExpiry_ReplicatedThresholdGovernsBothReplicas(t *testing.T) {
 
 }
 
-// TestSessionPolicy_LocalUsedOnlyWhileShardHasNone checks local config drives apply only until a policy arrives; a disagreeing one fails with ErrSessionPolicyMismatch.
+// TestSessionPolicy_LocalUsedOnlyWhileShardHasNone pins the fallback that keeps
+// a shard bootstrapped before the policy was replicated working.
+//
+// A v3 membership carries no session policy, and a join=true replica has no
+// membership at all until it replicates one. Both yield a policy whose IsSet
+// reports false, and only then may local configuration drive apply. The second
+// half is the part that matters: once a policy arrives, the state machine must
+// check it WITHOUT a restart, because a joiner learns its shard's
+// configuration after its state machine already exists. A policy that agrees
+// is applied on; one that disagrees in any setting fails the batch with
+// ErrSessionPolicyMismatch, which fails the shard.
 func TestSessionPolicy_LocalUsedOnlyWhileShardHasNone(t *testing.T) {
 	local := proto.SessionPolicy{
 		ExpiryEntries:          700,

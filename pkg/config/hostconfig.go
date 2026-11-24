@@ -21,7 +21,10 @@ import (
 	"time"
 )
 
-// isTestBinary reports whether the process is a go test binary; Validate refuses NoSyncWAL otherwise.
+// isTestBinary reports whether the process is a test binary built by
+// `go test` (including benchmark runs). HostConfig.Validate refuses
+// NoSyncWAL when it returns false. It is a variable so unit tests can
+// exercise the non-test-binary path.
 var isTestBinary = testing.Testing
 
 // Default values for HostConfig fields.
@@ -98,13 +101,68 @@ func (lc *LogConfig) Validate() error {
 	return nil
 }
 
-// MetricsConfig sets metric label cardinality at collector construction; the zero value labels only page-worthy signals with shard_id.
+// MetricsConfig controls the label cardinality of the metrics a host exports.
+//
+// It is deliberately NOT a HostConfig field. A Prometheus vector's label set is
+// fixed when the vector is constructed, and the collector is built by the
+// embedder and handed to the host through WithMetrics — by the time a host sees
+// its HostConfig the label sets already exist. The knob therefore belongs to
+// collector construction, where it can still take effect; see
+// quicraft.NewPrometheusMetricsCollectorWithConfig. A HostConfig field would be
+// inert and would imply a control the host does not have.
+//
+// The zero value is the safe value: metrics aggregate to host level and only
+// the shard-scoped signals an operator pages on keep a shard_id label.
 type MetricsConfig struct {
-	// PerShardMetrics labels every metric with shard_id (about 113 series per shard instead of 6); alerting signals keep shard_id either way.
+	// PerShardMetrics labels the full metric set with shard_id, giving a
+	// per-shard breakdown of latency, batch size and snapshot volume.
+	//
+	// It defaults to false because the cost is far higher than the count of
+	// shard-labelled metric NAMES suggests: a Prometheus histogram child is
+	// one series per bucket plus _sum and _count, so a shard's handful of
+	// latency histograms expand into dozens of series. Measured (see
+	// TestPrometheusMetrics_AggregatedModeSeriesBudget), each active shard
+	// costs 113 series with PerShardMetrics on and 6 with it off. At the
+	// 10,000-shard scale this library is designed for that is 1.13M active
+	// series from a single host versus 60k — enough to destabilise a shared
+	// Prometheus, a failure that lands on every other tenant of that
+	// Prometheus and not only on the operator who enabled it.
+	//
+	// Disabling it never costs an alert. The signals worth paging on keep
+	// their shard_id in BOTH modes: elections (leader change), dropped
+	// proposals, transport message and snapshot drops, and every security
+	// counter. What aggregates is the volume-and-latency telemetry, whose
+	// per-shard breakdown is a debugging luxury rather than an alerting
+	// input. Enable it for small deployments or when bisecting a specific
+	// shard's latency.
 	PerShardMetrics bool
 }
 
-// EventListener holds optional callbacks: leader, shard and snapshot notifications run FIFO on a lock-free dispatcher, the rest synchronously and must not block.
+// EventListener holds per-type optional event callbacks. Only non-nil
+// callbacks are invoked. They fall into two classes.
+//
+// Dispatched notifications — OnLeaderUpdated, OnLeaderLost, OnLeaderReady,
+// OnCampaignLaunched, OnShardFailed, OnSnapshotCreated, OnSnapshotCompacted,
+// OnSnapshotRecovered, OnLogCompacted, OnLogDBCompacted and OnSnapshotRejected
+// (whether the snapshot pool or the snapshot receiver rejected) — run on a
+// dedicated dispatcher goroutine that holds no engine lock, so a listener may
+// call any Host API from them, including the synchronous StopShard. They are
+// delivered FIFO by that one goroutine and are therefore ordered per shard.
+// The queue is bounded and never blocks the producer: a refused leader change
+// or readiness is re-published on the next tick, and any other refused
+// notification is dropped and logged.
+//
+// Every other callback runs synchronously with the operation that produced the
+// event, in order, and must not block: connection events and the other
+// snapshot-transfer events (OnSnapshotReceived, OnSnapshotSendStarted and its
+// siblings) for the transport — each on a helper goroutine the transport waits
+// for, so a callback that panics or calls runtime.Goexit ends only itself,
+// never the transport operation or the callbacks after it — disk events on
+// the WAL write path,
+// OnMembershipChanged on the apply path, and OnNodeReady, OnNodeUnloaded,
+// OnNodeDeleted, OnProposalDropped, OnReadIndexDropped and
+// OnNodeHostShuttingDown on the goroutine calling the Host method that caused
+// them. There is no ordering guarantee between the two classes.
 type EventListener struct {
 	// Raft events
 
@@ -114,12 +172,32 @@ type EventListener struct {
 	// OnLeaderLost fires when this replica was the shard's leader and no
 	// longer is.
 	OnLeaderLost func(info EventShardInfo)
-	// OnLeaderReady fires once the leader of info.Term has committed an entry of that term, so ReadIndex is not refused until the next OnLeaderUpdated.
+	// OnLeaderReady fires when the shard's leader for info.Term, as this
+	// replica knows it, has committed an entry of that term — the condition
+	// Raft requires before a leader may serve ReadIndex (§6.4 of the Raft
+	// thesis). From then until the next OnLeaderUpdated for the shard, a
+	// ReadIndex issued on this replica is not refused with
+	// ErrReadIndexNotReady: on the leader it is served, and on a follower or
+	// observer it is forwarded to a leader that will serve it.
+	//
+	// It is delivered after the OnLeaderUpdated carrying the same LeaderID and
+	// Term, with no other OnLeaderUpdated for the shard in between, and at most
+	// once per such announcement. Readiness ends with the next OnLeaderUpdated
+	// for the shard, which always names a different (LeaderID, Term) pair —
+	// a new leader, no leader, or the same leader re-elected at a higher term,
+	// which OnLeaderLost does not report — and with OnShardFailed or the
+	// replica being unloaded. Witnesses cannot serve reads and never receive
+	// it. Host.ShardReadReady answers the same question synchronously.
 	OnLeaderReady func(info LeaderInfo)
 	// OnCampaignLaunched fires when this replica starts an election.
 	OnCampaignLaunched func(info EventShardInfo)
 
-	// OnSnapshotRejected fires when a snapshot request, recovery or inbound transfer is refused or abandoned; info.Err is the cause if known.
+	// OnSnapshotRejected fires when a snapshot is refused or abandoned: a
+	// snapshot request the snapshot pool would not accept, an accepted request
+	// abandoned when the pool stops or failed by a panic mid-save, a recovery
+	// that failed or panicked before the state machine restore began (the
+	// engine re-drives it), or an inbound snapshot transfer the receiver
+	// rejected. info.Err is the cause when one exists, nil otherwise.
 	OnSnapshotRejected func(info SnapshotInfo)
 	// OnProposalDropped fires when a proposal could not be handed to the
 	// shard and was failed with ErrDropped.
@@ -180,7 +258,13 @@ type EventListener struct {
 	// OnLogDBDiskWarning fires when WAL disk usage crosses the warning
 	// threshold of HostConfig.MaxWALDiskSize. It requires MaxWALDiskSize > 0.
 	OnLogDBDiskWarning func(info DiskInfo)
-	// OnLogDBDiskFull fires once at 90% (proposals refused) or 95% (WAL writes refused) of MaxWALDiskSize, and again only after usage drops below.
+	// OnLogDBDiskFull fires once when disk usage reaches a full threshold of
+	// HostConfig.MaxWALDiskSize, whichever is reached first: 90%, where the
+	// host's proposal gate (sampled every 10 proposals) starts refusing new
+	// proposals with ErrDiskFull, or 95%, where the WAL (sampled every 100
+	// writes) refuses writes. It fires again only after usage has dropped
+	// below the threshold and crossed it once more. The warning fires at
+	// 85%. It requires MaxWALDiskSize > 0.
 	OnLogDBDiskFull func(info DiskInfo)
 }
 
@@ -211,7 +295,14 @@ type SnapshotInfo struct {
 	ReplicaID uint64
 	Index     uint64
 	From      uint64
-	// Err is the cause of an OnSnapshotRejected event when one is known, nil otherwise.
+	// Err is the cause of an OnSnapshotRejected event when one is known: the
+	// snapshot pool's refusal (*SnapshotDuplicateError,
+	// *SnapshotPoolBusyError), an abandonment (ErrStopped, a save's
+	// *SnapshotSavePanicError), the error or panic that rejected a recovery
+	// before the state machine restore began, or the error behind an inbound
+	// transfer the receiver rejected. It is nil for every other event, and for
+	// a rejection without an underlying error (an incomplete transfer, a
+	// shutdown or policy refusal).
 	Err error
 }
 
@@ -227,7 +318,10 @@ type DiskInfo struct {
 	WALDir    string
 	UsedBytes uint64
 	MaxBytes  uint64
-	// Shards lists, ascending, the shards whose data is in the WAL when the event fires.
+	// Shards lists, in ascending order, the IDs of the shards whose data is in
+	// the WAL at WALDir when the event fires: every shard loaded on the host,
+	// and every stopped shard whose data RemoveData has not purged. It is
+	// empty when the WAL holds no shard data or cannot list it.
 	Shards []uint64
 }
 
@@ -262,7 +356,17 @@ type HostConfig struct {
 	// RTTMillisecond. Default: 200 (typical WAN). LAN: 1-5.
 	RTTMillisecond uint64
 
-	// DeploymentID is a plaintext cluster identity token, non-zero unless AllowZeroDeploymentID; use per-cluster CAs for cryptographic isolation.
+	// DeploymentID is the cluster identity token. Prevents accidental
+	// cross-cluster communication. Must be non-zero unless
+	// AllowZeroDeploymentID is set.
+	//
+	// Security note: DeploymentID provides application-layer cluster
+	// isolation only. It is transmitted in plaintext within Raft
+	// messages and is not cryptographically bound to TLS certificates.
+	// An attacker with network access could forge the ID. For
+	// cryptographic isolation between clusters, use separate CA
+	// certificates per cluster so that mTLS handshakes reject
+	// cross-cluster connections at the TLS layer.
 	DeploymentID uint64
 
 	// NumWorkers is the number of step/commit/apply workers. 0 means
@@ -278,13 +382,40 @@ type HostConfig struct {
 	// channel. Default: 64.
 	CommitCBufferSize int
 
-	// ShutdownTimeout bounds Drain only (default 30s); Close still waits for every in-flight SM.Apply.
+	// ShutdownTimeout is the maximum time to wait for graceful shutdown.
+	// Default: 30s.
+	//
+	// It bounds Drain ONLY. Host.Close additionally waits, with NO timeout,
+	// for every in-flight SM.Apply to return: the apply worker's shutdown
+	// joins its per-shard goroutines, and one parked inside a user state
+	// machine's Apply never returns. A state machine that blocks in Apply
+	// therefore blocks Close indefinitely, whatever this value is.
+	//
+	// The wait cannot safely be abandoned — dropping it would let Close return
+	// while an apply goroutine still touches state the caller is about to free
+	// — so this is a documented limit rather than a bug to configure around.
+	// The shards still applying at shutdown are logged before the wait begins.
 	ShutdownTimeout time.Duration
 
-	// MaxWALDiskSize is a ceiling on the WALDir filesystem's used bytes: warn at 85%, refuse proposals at 90%, refuse WAL writes at 95%; 0 is unlimited.
+	// MaxWALDiskSize is a disk ceiling in bytes for the filesystem holding
+	// WALDir. It is compared with the used space of that whole filesystem
+	// (statfs on Linux), not with the WAL's own size, so other files on the
+	// volume count against it. Three thresholds apply: at 85% (sampled
+	// every 100 WAL writes) OnLogDBDiskWarning fires; at 90% (sampled every
+	// 10 proposals) new proposals and snapshot imports fail with
+	// ErrDiskFull, OnLogDBDiskFull fires and HealthCheck reports DiskOK false
+	// until a sample sees usage below 90%; at 95% (sampled every 100 WAL
+	// writes) the WAL refuses writes, which fails the shard that issued
+	// the write. 0 means unlimited.
 	MaxWALDiskSize uint64
 
-	// NoSyncWAL skips fdatasync on WAL writes; Validate refuses it outside a test binary (ErrNoSyncWALOutsideTest).
+	// NoSyncWAL disables fdatasync on Raft WAL segment writes. When true,
+	// the WAL does not wait for OS-level write synchronisation. This trades
+	// durability for performance and is appropriate only for testing
+	// environments where overlay2/Docker fdatasync latency causes Raft
+	// proposal timeouts. Validate refuses it with ErrNoSyncWALOutsideTest
+	// unless the process is a test binary (`go test`, including
+	// benchmarks); in a test binary Validate logs a warning instead.
 	NoSyncWAL bool
 
 	// MaxTotalInMemLogSize is the maximum total in-memory log size across
@@ -296,10 +427,17 @@ type HostConfig struct {
 	// development and testing only.
 	AllowZeroDeploymentID bool
 
-	// NotifyCommit makes CommittedC fire after the local WAL persist; use ApplyResultC for read-after-write consistency.
+	// NotifyCommit enables WAL-durable early notification. When true,
+	// CommittedC() returns the committed channel that fires after local
+	// WAL persist (~1-2ms) rather than waiting for full quorum commit
+	// and state machine apply (~10-30ms). Callers who need strong
+	// read-after-write consistency should use ApplyResultC() instead.
 	NotifyCommit bool
 
-	// HostID is the host identifier; empty loads NodeHostDir/host.id or writes a new random 32-hex-character ID there.
+	// HostID is the unique host identifier. When empty, it is loaded from
+	// NodeHostDir/host.id, or, when that file cannot be read (absent,
+	// unreadable or malformed), generated as 16 random bytes hex-encoded (32
+	// characters) and written there, replacing any existing file.
 	HostID string
 
 	// EventListener holds per-type event callbacks. Nil means no events
@@ -310,10 +448,19 @@ type HostConfig struct {
 	// value is valid; all fields have documented defaults.
 	TransportConfig TransportConfig
 
-	// KeyRotationInterval rotates the barrier epoch on a schedule (0 disables; 24h suggested); requires WithBarrier.
+	// KeyRotationInterval is the interval at which the barrier epoch is
+	// rotated on a schedule. When 0 (the default), scheduled rotation is
+	// disabled; invocation-threshold rotation (NIST SP 800-38D AEAD
+	// budget enforcement) still runs whenever a barrier is configured.
+	// A recommended production value is 24 hours. Requires a barrier to
+	// be configured via WithBarrier; ignored otherwise.
 	KeyRotationInterval time.Duration
 
-	// MaxRetainedEpochs is how many old key epochs stay in memory after rotation; 0 retains all.
+	// MaxRetainedEpochs is the maximum number of old encryption key
+	// epochs to retain after rotation. Epochs older than
+	// currentEpoch - MaxRetainedEpochs are purged from memory.
+	// Zero means retain all epochs (no automatic purging).
+	// Default: 0 (no purging for backward compatibility).
 	MaxRetainedEpochs uint64
 
 	// LogConfig controls structured logging format and verbosity.
@@ -407,7 +554,11 @@ func (hc *HostConfig) Validate() error {
 	return nil
 }
 
-// warnDisabledSafetyFlags logs host settings that trade durability or safety for performance.
+// warnDisabledSafetyFlags emits warnings for host settings that trade a
+// durability or safety guarantee for performance. Validate calls it only
+// after refusing NoSyncWAL outside a test binary, so the NoSyncWAL warning
+// fires only in test binaries (unit, integration and benchmark runs), where
+// it still leaves a trace in the logs.
 func (hc *HostConfig) warnDisabledSafetyFlags() {
 	if hc.NoSyncWAL {
 		slog.Warn("NoSyncWAL enabled: Raft WAL writes are not fsynced, committed entries can be lost on power loss or OS crash (testing only)")

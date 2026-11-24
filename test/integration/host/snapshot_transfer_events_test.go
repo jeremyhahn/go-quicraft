@@ -100,7 +100,13 @@ func waitForSnapshotEvent(t *testing.T, rec *snapshotEventRecorder, kind string,
 	}
 }
 
-// TestHostAPI_SnapshotTransferEvents checks the snapshot send and receive events fire with matching shard, index and sender over QUIC.
+// TestHostAPI_SnapshotTransferEvents proves the snapshot-transfer callbacks
+// config.EventListener documents on a real snapshot catch-up over QUIC: a
+// one-voter shard compacts its log, a new replica joins and must catch up by
+// snapshot, and the leader reports OnSnapshotSendStarted then
+// OnSnapshotSent (never OnSnapshotSendAborted) while the joiner reports
+// OnSnapshotReceived, all naming the same shard and snapshot index, and the
+// joiner's event names the leader as its sender (SnapshotInfo.From).
 func TestHostAPI_SnapshotTransferEvents(t *testing.T) {
 	const (
 		shardID         uint64 = 1

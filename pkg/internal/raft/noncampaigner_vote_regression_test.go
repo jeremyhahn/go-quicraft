@@ -20,9 +20,28 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// A non-campaigning replica that counts toward quorum must forget a dead leader, or it refuses the votes the election needs.
+// ---------------------------------------------------------------------------
+// A non-campaigning replica that still counts toward quorum must forget a dead
+// leader, or it stalls the election it is a required part of.
+// ---------------------------------------------------------------------------
+//
+// startElection returns early for observers, witnesses, self-removed replicas,
+// and role-mismatched replicas — none of them campaign. But tickFollower has
+// already zeroed electionTick on the way in, and randomizedElectionTimeout is
+// only redrawn on a role transition (which a non-campaigner never makes). So
+// electionTick cycles 0..randomizedElectionTimeout forever, and if the branch
+// leaves leaderID naming the dead leader, the shared leader-lease test
+// (leaderID != noLeader && electionTick < electionTimeout) stays true for most
+// of every cycle. handleVoteRequest then denies PreVotes and dropHighTermVote
+// silently swallows higher-term RequestVotes.
+//
+// A witness's vote COUNTS toward the unified quorum, so this is not cosmetic:
+// after the only remaining voter's peer dies, the shard needs the witness's
+// vote to elect a new leader. This is the same defect the joining fix closed,
+// on the other non-campaigning branches.
 
-// newWitnessFollowingLeader builds witness 3 of voters {1,2}, following leader 1 with its lease armed.
+// newWitnessFollowingLeader builds replica 3 as a WITNESS of the shard whose
+// voters are {1,2}, currently following leader 1 with its leader lease armed.
 func newWitnessFollowingLeader(t *testing.T) *Peer {
 	t.Helper()
 	cfg := testConfigWithID(1, 3)

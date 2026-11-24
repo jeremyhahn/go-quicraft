@@ -22,7 +22,26 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// msg.From is bound to the peer's authenticated node identity, which defeats promiscuous certificates and shared addresses and admits members at new addresses; tests assert the specific drop reason.
+// ---------------------------------------------------------------------------
+// msg.From is bound to the peer's AUTHENTICATED NODE IDENTITY, not its address
+//
+// The address binding these tests supersede closed registry poisoning but left
+// three holes, and each test below is one of them:
+//
+//  1. A promiscuous certificate (a wildcard SAN, or one certificate carrying
+//     every node's SAN) covers EVERY member's committed address, so its holder
+//     satisfied the address binding for any replica it chose to name.
+//  2. Two replica IDs at one address gave a single host two quorum identities.
+//  3. Address IS NOT IDENTITY: a member that recovered at a NEW address had its
+//     quorum-bearing responses dropped until a config change committed, which
+//     during quorum loss is never.
+//
+// The identity binding closes 1 and 2 outright and turns 3 from a liveness cost
+// into a non-event. What every test here must assert is the DISTINGUISHING
+// observable — which message was refused and with which drop reason — because a
+// test that only asserts "something was dropped" passes against the address
+// binding too, and is therefore worth nothing.
+// ---------------------------------------------------------------------------
 
 // identityRig is fromGateRig with a metrics sink. It returns the recording
 // deliverer, the handler, and the sink the drop reasons land in, because the
@@ -43,7 +62,21 @@ func identityRig(t *testing.T, ms proto.Membership) (
 	return eng, &hostMessageHandler{engine: eng, host: host}, metrics
 }
 
-// TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom: a wildcard certificate covering the victim's address is refused with identity_mismatch.
+// TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom is the
+// central regression for per-member identity binding.
+//
+// The attacker is a GENUINE, authenticated member of the shard whose
+// certificate is a cluster wildcard: it covers replica 2's committed address
+// just as validly as its own. Under the committed-ADDRESS binding that is
+// sufficient — the certificate check is `cert covers committed_address`, and it
+// passes — so every forged ReplicateResp, HeartbeatResp and RequestVoteResp was
+// counted. Under the identity binding the attacker presents ITS OWN keypair,
+// which is not the one committed membership records for replica 2, and every
+// one is refused with identity_mismatch.
+//
+// The fixture is the whole point: peer.AuthorizesAddress returns TRUE for the
+// victim's address. A test that withheld that would prove nothing here — it
+// would pass against the address binding as well.
 func TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom(t *testing.T) {
 	const (
 		victimAddr    = "10.0.0.2:5001"
@@ -98,7 +131,8 @@ func TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom(t *t
 		})
 	}
 
-	// The attacker speaking as itself is admitted.
+	// The attacker speaking as ITSELF is admitted. Without this the test would
+	// pass against a gate that refused everything.
 	t.Run("own_identity_admitted", func(t *testing.T) {
 		eng, handler, _ := identityRig(t, ms)
 		batch := proto.MessageBatch{
@@ -116,7 +150,19 @@ func TestHandleMessage_PromiscuousCertificateCannotAssertAnotherMembersFrom(t *t
 	})
 }
 
-// TestHandleMessage_IdentitySurvivesAnAddressChange: a replica back at a new address keeps its keypair, so its traffic is admitted with no config change.
+// TestHandleMessage_IdentitySurvivesAnAddressChange is the liveness half, and
+// it is the reason identity is the durable fix rather than merely a stronger
+// one.
+//
+// Replica 2 crashes and comes back at a new address — an ephemeral port, a
+// rescheduled container, a replaced machine. Its certificate covers the NEW
+// address and not the committed one, so the committed-address binding drops
+// every quorum-bearing message it sends until a config change carrying the new
+// address commits. During quorum loss no config change CAN commit, so under the
+// address binding the shard does not self-heal.
+//
+// The keypair did not change, so the identity did not change, and the traffic
+// keeps flowing with no config change at all.
 func TestHandleMessage_IdentitySurvivesAnAddressChange(t *testing.T) {
 	const (
 		committedAddr = "10.0.0.2:5001"
@@ -220,7 +266,16 @@ func TestHandleMessage_MissingIdentityIsRefused(t *testing.T) {
 	})
 }
 
-// TestCommittedSenderBinding_IdentityIgnoresAddressEvidence: once an identity is committed, a matching one is admitted and a mismatching one refused whatever the certificate's addresses.
+// TestCommittedSenderBinding_IdentityIgnoresAddressEvidence pins the ranking
+// directly: once an identity is committed, the address stops being an
+// authorization input in BOTH directions. A matching identity is admitted even
+// though the certificate covers nothing, and a mismatching one is refused even
+// though the certificate covers the committed address perfectly.
+//
+// The second half is the one that matters. A gate that checked the identity AND
+// the address would still be defeated by the promiscuous certificate whenever
+// the identity happened to be absent from one side, and a gate that checked the
+// address as a fallback AFTER an identity mismatch would be defeated outright.
 func TestCommittedSenderBinding_IdentityIgnoresAddressEvidence(t *testing.T) {
 	const addr = "10.0.0.2:5001"
 	const committedID = "spki:5555555555555555555555555555555555555555555555555555555555555555"

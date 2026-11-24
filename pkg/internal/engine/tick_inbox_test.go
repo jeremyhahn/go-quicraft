@@ -8,7 +8,19 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestStepWorker_Tick_StepsInboxBeforeCheckQuorum verifies a tick steps queued replies before evaluating CheckQuorum.
+// TestStepWorker_Tick_StepsInboxBeforeCheckQuorum is the regression test for
+// #309: a tick must never evaluate CheckQuorum while a reply that has already
+// reached the leader's inbox sits unprocessed. Before the fix tick() ran
+// before processReady drained the inbox, so a starved leader closed its
+// CheckQuorum window counting a follower inactive although that follower's
+// HeartbeatResp was waiting in the inbox, and stepped down with every replica
+// up.
+//
+// The followers' replies are only ever delivered to the inbox and nothing
+// but tick() runs between deliveries, so the only way the leader can see
+// them is the tick stepping the inbox before it ticks raft. Both inbox paths
+// are covered: the ordinary one, and commitPending, where the commit/apply
+// pipeline owns the peer and processCommitPendingInbox steps the inbox.
 func TestStepWorker_Tick_StepsInboxBeforeCheckQuorum(t *testing.T) {
 	for _, tc := range []struct {
 		name          string

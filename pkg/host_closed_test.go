@@ -135,7 +135,12 @@ var hostClosedContract = map[string]closedKind{
 // blocks after Close fails the test instead of hanging it.
 const closedCallDeadline = 5 * time.Second
 
-// closedArgs builds arguments from parameter types; other types get zero values, since a method must fail with ErrClosed first.
+// closedArgs builds the arguments for a method from its parameter types.
+// The cases are the explicit table of what each parameter type needs: a
+// real context, a shard and replica ID, an address, a key, a session, a
+// reader and a writer. Any other type gets its zero value, which is the
+// least valid input: a method must fail with ErrClosed before it looks at
+// its arguments.
 func closedArgs(ctx context.Context, mt reflect.Type, session *Session) []reflect.Value {
 	n := mt.NumIn()
 	if mt.IsVariadic() {
@@ -505,7 +510,12 @@ func TestHostClosedEmergencySealKeepsRetryingAfterFailedRetry(t *testing.T) {
 // closeDeadline bounds every Close call in the closed-host tests.
 const closeDeadline = 30 * time.Second
 
-// newBoundedHost builds a host whose closer runs Close under closeDeadline and reports whether it blocked.
+// newBoundedHost builds a memory-backed Host without newTestHost's
+// auto-close cleanup, which calls Close synchronously and so would hang on
+// the same stuck stopOnce until the suite timeout. It returns the host and a
+// closer that runs Close in a goroutine under closeDeadline, recovers a
+// panic, and reports a failure with what. The closer returns false when
+// Close blocked; the registered cleanup then skips its own Close.
 func newBoundedHost(t *testing.T) (*Host, func(what string) bool) {
 	t.Helper()
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())

@@ -21,7 +21,29 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Unissued ReadIndex context: a heartbeat response echoing a context above the highest issued must not confirm pending reads.
+// Unissued ReadIndex confirmation context
+//
+// ReadIndex without a lease confirms leadership by counting heartbeat responses
+// that echo the correlation context stamped on the confirming heartbeat round. A
+// response carrying ctx X is evidence of exactly one thing: the peer still
+// regarded this replica as leader at a moment AFTER the read's index was
+// recorded, because the heartbeat bearing X was sent after it. Everything the
+// read's linearizability rests on is in that "after".
+//
+// handleHeartbeatResp took msg.Hint verbatim and acked every pending read with
+// ctx <= it. The <= rule is correct for contexts this leader ISSUED — they are
+// monotone within a tenure — but nothing bounded the value from above.
+// r.readIndexCtx is the highest ever assigned (becomeLeader zeroes it,
+// handleLeaderReadIndex is the only writer and only increments), so a response
+// echoing anything above it corresponds to no heartbeat this leader ever sent,
+// and under <= it acks EVERY pending read from one message — including reads
+// whose confirming heartbeat has not been broadcast yet, since
+// handleLeaderReadIndex defers the broadcast to flushReadIndex.
+//
+// With the leader's own pre-set self-ack, one such response is already a quorum
+// of two in a three-voter shard. The read is then answered at a committed index
+// no heartbeat round validated, which is precisely the guarantee ReadIndex
+// exists to provide and the shape a stale leader serves a stale read through.
 
 // leaderWithUnbroadcastRead builds a three-voter leader holding two pending
 // ReadIndex requests: ctx 1, whose confirming heartbeat HAS been broadcast, and
@@ -100,7 +122,10 @@ func TestReadIndex_UnissuedContextCannotConfirmLeadership(t *testing.T) {
 	}
 }
 
-// TestReadIndex_IssuedContextStillConfirms checks an issued context resolves its read and leaves later ones pending.
+// TestReadIndex_IssuedContextStillConfirms is the primary liveness control, and
+// it is what stops the guard from being a blanket refusal. The response echoes
+// ctx 1 — a context this leader really did broadcast — so the FIRST read must
+// resolve, while the second (ctx 2 > 1) correctly stays pending.
 func TestReadIndex_IssuedContextStillConfirms(t *testing.T) {
 	quietLogs(t)
 

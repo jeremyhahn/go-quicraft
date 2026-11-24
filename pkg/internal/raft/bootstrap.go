@@ -21,7 +21,21 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// The initial configuration is one committed entry at index 1, so membership is a fold over the committed log.
+// Config-in-log bootstrap.
+//
+// Injecting a shard's initial configuration out-of-band (from the caller's
+// members map) would make a replica's membership NOT a function of its durable
+// log: a joining replica could learn it only from a snapshot, and if no
+// snapshot ever arrived it would never learn the full configuration at all.
+// Instead, the initial configuration is written to the log itself as one committed entry at index 1, and every
+// replica reconstructs its membership by replaying the committed log. Membership
+// becomes a pure fold over the log — the property the whole design turns on.
+//
+// A SINGLE entry carrying the full Membership is used rather than one
+// ConfigChange per member (etcd's model) so the initial log occupies exactly
+// index 1 and the first real proposal lands at index 2 — the smallest possible
+// perturbation of the index arithmetic the recovery clamps and marker logic
+// depend on.
 
 const (
 	// BootstrapMembershipIndex is the log index of the initial-membership entry.
@@ -35,7 +49,35 @@ const (
 	bootstrapMembershipTerm uint64 = 1
 )
 
-// BuildInitialMembershipEntry returns the deterministic index-1 entry carrying the initial membership; founders must use identical members and witness policy.
+// BuildInitialMembershipEntry returns the deterministic bootstrap entry that
+// carries the full initial configuration in its Cmd (a marshaled
+// proto.Membership).
+//
+// Given the same membership it produces byte-identical output on every replica:
+// proto.Membership marshals its maps with sorted keys, so there is no
+// map-iteration nondeterminism. That is required — every replica must hold an
+// identical entry at BootstrapMembershipIndex or the Log Matching property is
+// violated the moment two of them compare logs.
+//
+// CONTRACT: every founding member commits this entry at index 1 INDEPENDENTLY,
+// so byte-identity is only a guarantee when every founder is given identical
+// bootstrap INPUT. That input is the whole Membership, not only its address map:
+// MaxWitnesses and RequireFullReplicaMajority come from each founder's local
+// Config.Witness (see Host.StartShard), so founders configured with different
+// witness policy — or different member addresses — produce byte-DIFFERENT index-1
+// entries at the same (index=1, term=1). AppendEntries matches on (index, term)
+// only, so such a divergence is never reconciled and each replica then computes
+// quorum over its own policy. Founders MUST be configured identically (members
+// map AND witness policy); this is the same unenforced operator contract the
+// initial member list has always carried, now extended to the policy fields.
+//
+// The membership's ConfigChangeID is left at 0: the initial configuration
+// predates any config change, so a caller observes ConfigChangeID 0 until the
+// first real membership change — exactly as the previous out-of-band seed
+// reported. Stamping it with the entry's index instead would shift the
+// observable initial value from 0 to 1 and break a compare-and-swap membership
+// change that read 0. It is constant across replicas either way, so determinism
+// is unaffected.
 func BuildInitialMembershipEntry(ms proto.Membership) (proto.Entry, error) {
 	ms.ConfigChangeID = 0
 	buf := make([]byte, ms.Size())
@@ -61,13 +103,55 @@ func initialMembershipFromEntry(e proto.Entry) (proto.Membership, error) {
 	return ms, nil
 }
 
-// ReconstructMembership folds committed config entries in index order into a membership; an undecodable payload is ErrCorruptConfigEntry, an empty one is skipped.
+// ReconstructMembership folds a run of committed config-carrying entries into
+// the membership they define. It is the recovery-time reconstruction of
+// config-in-log: a restarting replica whose membership is not carried by a
+// snapshot rebuilds it from the durable log rather than re-seeding from local
+// config.
+//
+// entries must be in ascending index order. The bootstrap EntryInitialMembership
+// (index 1) is adopted wholesale; each EntryConfigChange above it is applied
+// convergently, exactly as the runtime commit path does, so a deterministic
+// refusal (a Removed tombstone re-add, a role only a committed change could
+// have set) is evaluated identically here and ignored. Non-config entry types
+// are skipped. A run that begins above a compaction floor yields only the
+// changes it contains, which is why the caller prefers a snapshot's membership
+// when one exists.
+//
+// A committed config-carrying entry whose payload does NOT DECODE is fatal, for
+// BOTH entry types: the return is ErrCorruptConfigEntry joined with the decoder's
+// own error, so errors.Is finds the sentinel and the cause alike. This is the
+// same decision the runtime commit path makes (peer.applyMembershipEntry), and
+// the two must agree: the bytes are committed replicated state that every other
+// replica can read, so skipping one here reconstructs a membership that differs
+// from the rest of the shard — a replica computing quorum over its own voting
+// set, silently, and durably once the next snapshot persists it. There is no
+// "recover as much as possible" answer for a configuration; a partial fold is
+// not a degraded membership, it is a DIFFERENT one, and a replica that adopted
+// it could commit on a quorum the real configuration never granted.
+//
+// A ZERO-LENGTH EntryConfigChange payload is deliberately not in that class. It
+// is the silent no-op it has always been on the runtime path too: every replica
+// reads the same nothing and skips identically, so it cannot diverge them, and
+// no legitimate producer emits one (the propose-time gate refuses any payload
+// that does not decode).
+//
+// It does not log the failure: the caller owns the logger. A config change
+// that does not decode names its index and term in the error; the bootstrap
+// entry is always at BootstrapMembershipIndex.
 func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 	m := newMembership(proto.Membership{})
 	for i := range entries {
 		switch entries[i].Type & proto.EntryTypeMask {
 		case proto.EntryInitialMembership:
-			// The founding configuration is valid only at BootstrapMembershipIndex, as on the commit path.
+			// The founding configuration is defined to live at exactly
+			// BootstrapMembershipIndex. Adopting one anywhere else would
+			// REPLACE the whole membership and roll the voting set back to the
+			// founding members — a configuration no live replica shares. The
+			// runtime commit path refuses it (peer.applyMembershipEntry); make
+			// recovery reach the identical decision so the two cannot diverge.
+			// Today's sole caller pre-checks, but the guard must not depend on
+			// a caller-side invariant asserted in another file.
 			if entries[i].Index != BootstrapMembershipIndex {
 				continue
 			}

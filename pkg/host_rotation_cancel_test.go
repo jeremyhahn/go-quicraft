@@ -133,7 +133,10 @@ func TestRotateBarrierKey_LifetimeCancelAbandonsQuietly(t *testing.T) {
 	}
 }
 
-// TestRotateBarrierKey_RealFailureDuringStopStillLogsError pins that a missing persister during shutdown is still logged at ERROR.
+// TestRotateBarrierKey_RealFailureDuringStopStillLogsError pins that the
+// shutdown carve-out is keyed to the CAUSE of the error, not to the context's
+// state: a missing persister that surfaces while the host is closing is still
+// the misconfiguration report, at ERROR.
 func TestRotateBarrierKey_RealFailureDuringStopStillLogsError(t *testing.T) {
 	rb := &cancelAwareHostBarrier{testHostBarrier: newTestHostBarrier(5), rotateFailure: seal.ErrNoStatePersister}
 	h, logs := newRotationLogHost(t, rb, false)

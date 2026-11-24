@@ -91,7 +91,11 @@ func artifactHeaderBytes(membLen uint32) []byte {
 	return buf
 }
 
-// TestImportSnapshot_RejectsMalformedArtifactHeader verifies a bad header is rejected, with the failed check named, before anything is written.
+// TestImportSnapshot_RejectsMalformedArtifactHeader verifies that a foreign or
+// corrupt artifact is rejected by the header parser BEFORE any directory,
+// data file, or LogDB record is created, and that the rejection identifies
+// which check failed. The artifact stream is untrusted input, so a length
+// prefix must be bounded before it is used to size an allocation.
 func TestImportSnapshot_RejectsMalformedArtifactHeader(t *testing.T) {
 	tests := []struct {
 		name       string

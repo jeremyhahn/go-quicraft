@@ -85,7 +85,7 @@ DOCKER_HOST=ssh://user@bench-host.example make docker-make DOCKER_MAKE_TARGET=ci
 make docker-clean                                  # remove this checkout's images
 ```
 
-`.devcontainer/.env` holds your own forge account and access token as the four
+`.devcontainer/.env` holds your own Gitea account and access token as the four
 `GOPRIVATE`/`GIT_CONFIG_*` variables. It is the only place they live: the image
 builds mount it as a BuildKit secret for `go mod download` (never written to a
 layer), and the container and the compose services load it as their

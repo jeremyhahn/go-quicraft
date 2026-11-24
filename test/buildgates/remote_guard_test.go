@@ -25,7 +25,25 @@ import (
 // runRemotePath is the staging script whose active-run guard this file pins.
 var runRemotePath = filepath.Join("..", "performance", "run-remote.sh")
 
-// TestStagingGuardCannotMatchItself verifies run-remote.sh's pgrep pattern is bracketed so it cannot match its own shell.
+// TestStagingGuardCannotMatchItself pins the bracket in the active-run check.
+//
+// run-remote.sh refuses to stage while a benchmark is running, because the
+// rsync --delete that follows would clobber the working tree of a live run.
+// The check is a pgrep executed over ssh, and pgrep -f matches FULL COMMAND
+// LINES -- including the `bash -c '<the check>'` that ssh spawns to run it. A
+// plain `pgrep -f perfcompare` therefore matches itself, fires on every
+// invocation, and makes staging impossible. That is not hypothetical: it is
+// how the guard shipped, and it blocked the first end-to-end run of the remote
+// pipeline.
+//
+// `[p]erfcompare` is a regex matching the text "perfcompare" carried on a
+// command line that does not contain that text, so the check sees real runs
+// and not its own shell. This test fails if the brackets are ever removed as
+// a simplification.
+//
+// It cannot pass vacuously: it asserts the file was read and contains a pgrep
+// at all before judging the pattern, so a moved or renamed script fails here
+// rather than silently passing with nothing to check.
 func TestStagingGuardCannotMatchItself(t *testing.T) {
 	raw, err := os.ReadFile(runRemotePath)
 	if err != nil {

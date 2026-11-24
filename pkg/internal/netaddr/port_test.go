@@ -16,7 +16,17 @@ package netaddr
 
 import "testing"
 
-// TestCanonical_NormalisesPortSpelling checks equivalent port spellings canonicalize to one key, so one host cannot be two replicas.
+// TestCanonical_NormalisesPortSpelling pins the quorum-safety property this
+// package exists for.
+//
+// Canonical lower-cased the host but passed the PORT through verbatim, so
+// "node-b:5001", "node-b:05001" and "node-b:+5001" were three distinct keys.
+// net.ResolveUDPAddr accepts all three and returns the same endpoint, so a
+// single host could be named twice in one configuration: the duplicate-address
+// check in StartShard, the addressHolder guard and the sharedAddresses
+// fail-closed net all key on Canonical, and the receive-side certificate check
+// drops the port entirely. One machine then held two votes and two match
+// indices in a quorum that believed they were independent replicas.
 func TestCanonical_NormalisesPortSpelling(t *testing.T) {
 	want := Canonical("node-b:5001")
 	for _, spelling := range []string{

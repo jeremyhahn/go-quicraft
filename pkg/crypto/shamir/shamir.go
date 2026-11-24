@@ -12,7 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package shamir implements Shamir's M-of-N secret sharing over GF(256), with memory-locked share variants; integrity of the result is the caller's to establish.
+// Package shamir implements Shamir's M-of-N secret sharing over GF(256).
+//
+// SplitBytes divides a secret into share values, any threshold of which
+// CombineBytes reconstructs; fewer reveal nothing about the secret.
+// ProtectedShare, SplitProtected and CombineProtected carry the same share
+// values in memory-locked, wipeable buffers, so share material never becomes
+// an immortal Go string. Shares carry no digest of the secret, and their
+// Threshold and Total are unauthenticated: integrity of a reconstructed
+// secret is the caller's to establish.
 package shamir
 
 import (
@@ -25,25 +33,63 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// Each secret byte is shared with its own random polynomial over GF(2^8); arithmetic is constant-time (gf256.go).
+// This file implements Shamir's Secret Sharing over GF(2^8) (see
+// gf256.go for the constant-time field arithmetic). Every secret byte is
+// shared independently with its own random polynomial of degree
+// threshold-1 whose constant term is the secret byte; share j's value is
+// the polynomial evaluated at the share's non-zero x-coordinate.
+//
+// The implementation is self-contained (no third-party dependency) and
+// constant-time with respect to secret data: secret bytes flow only
+// through branchless GF(2^8) multiplications.
 
-// shareFormatVersion is the first byte of every raw share value.
+// shareFormatVersion is the first byte of every raw share value. It
+// gates the wire format so a future change (or a legacy share produced
+// by the pre-GF(256) implementation) is detected explicitly instead of
+// being misinterpreted.
 const shareFormatVersion = 0x01
 
 // rawShareOverhead is the number of non-payload bytes in a raw share
 // value: [version:1][x:1].
 const rawShareOverhead = 2
 
-// MaxSecretBytes bounds the secret length (64 KiB) so unauthenticated shares cannot force large work; envelope larger payloads under a key.
+// MaxSecretBytes bounds the per-share payload this package will produce or
+// consume, and therefore the secret length.
+//
+// Shamir here is a KEY-custody primitive: the secret it splits is a 32-byte
+// root key, and every larger payload costs O(shares x len) field operations
+// with roughly 1.75x the input held in memory at once while combining. Without
+// a bound, a caller (or an attacker submitting shares to a recovery ceremony)
+// could hand CombineBytes 255 shares of a megabyte each — ~340 MB of input, ~0.75x
+// of it copied, and seconds of CPU — from unauthenticated material, since
+// shares cannot be authenticated before they are combined. 64 KiB is four
+// orders of magnitude above any legitimate key and caps the work at a few
+// megabytes and milliseconds. Split large payloads by enveloping them under a
+// key that IS this size, never by sharing the payload itself.
 const MaxSecretBytes = 64 << 10
 
-// maxShares is 255, the non-zero x-coordinates of GF(2^8).
+// maxShares is the number of distinct shares the scheme can express: the
+// x-coordinate is a non-zero byte, so 255 is a property of GF(2^8), not a
+// policy. Every combine path applies it up front so an oversized share list
+// is rejected before any of it is decoded.
 const maxShares = 255
 
-// randReader is the coefficient randomness source; only testOnlyRandReader swaps it.
+// randReader is the source of cryptographic randomness for polynomial
+// coefficients. It is package-private and swapped ONLY through
+// testOnlyRandReader, which panics outside a test binary: it sits on the
+// root-key path, where a mutable global source of randomness is exactly the
+// thing that must not be reachable from production code.
 var randReader io.Reader = rand.Reader
 
-// testOnlyRandReader replaces randReader and returns a restore function; it panics outside a test binary.
+// testOnlyRandReader replaces the package randomness source and returns a
+// function restoring the previous one. It PANICS outside a test binary.
+//
+// The rest of this codebase carries its randomness in a per-instance field
+// (see seal.Barrier.randReader and seal.SoftwareStrategy.randReader) precisely
+// so that no such global exists. This package's API is a set of free functions
+// with no instance to hang it on, so the global stays — behind a gate that
+// makes it provably unreachable from production, and that no future caller can
+// quietly step around.
 func testOnlyRandReader(r io.Reader) func() {
 	if !testing.Testing() {
 		panic("shamir.testOnlyRandReader: test-only randomness override called outside a test binary")
@@ -53,7 +99,11 @@ func testOnlyRandReader(r io.Reader) func() {
 	return func() { randReader = prev }
 }
 
-// validateSplitParams checks the parameters shared by SplitBytes and SplitProtected.
+// validateSplitParams checks the scheme parameters every generation path
+// shares. It is the single copy of those rules, used by SplitBytes and by
+// SplitProtected, so the plain and protected generation paths cannot drift
+// into accepting different arguments — the same reason parseRawShare is the
+// single copy of the wire-format rules.
 func validateSplitParams(secret []byte, threshold, total int) error {
 	if threshold < 2 {
 		return &SplitError{Reason: fmt.Sprintf("threshold must be at least 2, got %d", threshold)}
@@ -78,7 +128,19 @@ func validateSplitParams(secret []byte, threshold, total int) error {
 	return nil
 }
 
-// SplitBytes divides a secret into N base64 share values in Index order; the caller must wipe the returned buffers.
+// SplitBytes divides a secret into N share VALUES — the base64-encoded
+// [version:1][x:1][y...] payloads that are exactly the bytes of a
+// ProtectedShare's value, where x is the share's field coordinate (equal to
+// its Index) and y has one byte per secret byte. They are
+// returned in Index order, so values[i] is the value of share Index i+1.
+//
+// It is the generation-side counterpart of CombineBytes: the returned buffers
+// are owned by the caller and are wipeable, so share material can be carried in
+// memory-locked buffers from the moment it exists and zeroed the moment it is
+// distributed, never becoming an un-wipeable Go string. SplitProtected is the
+// form that returns them already in protected memory.
+//
+// The caller MUST wipe the returned buffers when done with them.
 func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 	if err := validateSplitParams(secret, threshold, total); err != nil {
 		return nil, err
@@ -91,9 +153,20 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 		return nil, &SplitError{Reason: fmt.Sprintf("reading random coefficients: %v", err)}
 	}
 
-	// Use coefficients verbatim, including a zero top coefficient: resampling would leak information.
+	// The raw crypto/rand coefficients are used verbatim, INCLUDING a zero
+	// top coefficient. Uniform i.i.d. coefficients are what make Shamir
+	// information-theoretically secure: with t-1 shares every candidate
+	// secret byte remains exactly equally likely, and an adversary cannot
+	// distinguish a polynomial whose top coefficient happens to be zero
+	// from any other. Excluding c_{t-1}=0 (as a "degenerate polynomial"
+	// defense) would instead LEAK information — a t-1 coalition could rule
+	// out the one candidate secret consistent with c_{t-1}=0, reducing
+	// per-byte entropy from 8 bits to log2(255). Do not resample.
 
-	// Shares carry no secret digest: it would be an offline oracle for low-entropy secrets.
+	// No secret digest is embedded in shares: storing sha256(secret) per share
+	// is an offline oracle that defeats information-theoretic secrecy for
+	// low-entropy secrets. Integrity is verified out-of-band by the caller (see
+	// CombineBytes).
 	values := make([][]byte, total)
 	coeffs := make([]byte, threshold) // [secret byte, c1..c_{t-1}]
 	for i := 0; i < total; i++ {
@@ -121,7 +194,12 @@ func SplitBytes(secret []byte, threshold, total int) ([][]byte, error) {
 	return values, nil
 }
 
-// parseRawShare validates a [version][x][y...] payload and returns x and y; seenX tracks duplicates, secretLen is -1 until known.
+// parseRawShare validates a decoded [version][x][y...] share payload and
+// returns its x-coordinate and y-payload. It is the single copy of the share
+// wire-format rules shared by CombineBytes and CombineProtected, so the byte
+// and protected reconstruction paths can never diverge on which shares they accept.
+// seenX tracks duplicate x-coordinates across the share set; secretLen is
+// the y-payload length established by share 0, or -1 when not yet known.
 func parseRawShare(raw []byte, i int, seenX map[byte]struct{}, secretLen int) (byte, []byte, error) {
 	if len(raw) < rawShareOverhead+1 {
 		return 0, nil, &CombineError{Reason: fmt.Sprintf("share %d too short (%d bytes)", i, len(raw))}
@@ -130,7 +208,11 @@ func parseRawShare(raw []byte, i int, seenX map[byte]struct{}, secretLen int) (b
 		return 0, nil, &CombineError{Reason: fmt.Sprintf(
 			"share %d has unsupported format version %d (legacy or foreign share)", i, raw[0])}
 	}
-	// Bound the payload on the first share, before the rest of the unauthenticated set is decoded.
+	// Bound the payload BEFORE the caller decodes the rest of the set: shares
+	// arriving at a recovery ceremony are unauthenticated by construction (they
+	// cannot be checked until they are combined), so an oversized submission
+	// must be rejected on the first share rather than after 255 of them have
+	// been decoded and copied. See MaxSecretBytes.
 	if payload := len(raw) - rawShareOverhead; payload > MaxSecretBytes {
 		return 0, nil, &CombineError{Reason: fmt.Sprintf(
 			"share %d payload is %d bytes, exceeding the %d-byte limit", i, payload, MaxSecretBytes)}
@@ -151,7 +233,18 @@ func parseRawShare(raw []byte, i int, seenX map[byte]struct{}, secretLen int) (b
 	return x, y, nil
 }
 
-// interpolateSecretInto reconstructs the secret at x=0 into dst; only gfMul touches secret bytes.
+// interpolateSecretInto reconstructs the secret via GF(2^8) Lagrange
+// interpolation at x=0 from the public x-coordinates and the per-share
+// y-payloads, writing it into dst — which is len(secret) bytes and may be
+// memory-protected storage, so the protected reconstruction path never
+// materializes the secret anywhere else. The basis coefficients depend only on
+// the public x-coordinates and are computed once; secret-dependent y bytes flow
+// only through constant-time gfMul.
+//
+// basis and xs are deliberately ORDINARY heap allocations: an x-coordinate is a
+// share index, published with the share and known to anyone holding one, and
+// the Lagrange basis is a function of those indices alone. Nothing derived from
+// the secret is written outside dst.
 func interpolateSecretInto(dst []byte, xs []byte, ys [][]byte) {
 	basis := gfLagrangeZero(xs)
 	for b := range dst {
@@ -163,7 +256,14 @@ func interpolateSecretInto(dst []byte, xs []byte, ys [][]byte) {
 	}
 }
 
-// accumulateShareInto adds one share's Lagrange term to dst (dst ^= coeff * y); dst starts zeroed.
+// accumulateShareInto adds ONE share's contribution to a partially interpolated
+// secret: dst ^= coeff * y over GF(2^8), where coeff is that share's Lagrange
+// basis value at x=0. It is interpolateSecretInto's inner sum turned inside
+// out, so a caller that cannot afford to hold every decoded y-payload at once
+// (CombineProtected, where each one is locked memory) can fold each share in as
+// it decodes it and reuse the buffer. dst must be zeroed before the first call
+// and is the running total; y must be the same length as dst. Secret-dependent
+// bytes flow only through gfMul, as in interpolateSecretInto.
 func accumulateShareInto(dst, y []byte, coeff byte) {
 	for b := range dst {
 		dst[b] ^= gfMul(y[b], coeff)
@@ -178,7 +278,24 @@ func interpolateSecret(xs []byte, ys [][]byte, secretLen int) []byte {
 	return secret
 }
 
-// CombineBytes reconstructs the secret from threshold-or-more share values without integrity checks; the caller must authenticate the result and wipe the inputs.
+// CombineBytes reconstructs the secret from M-or-more raw share VALUES — the
+// base64-encoded [version][x][y...] payloads that are exactly the bytes of
+// a ProtectedShare's value — WITHOUT integrity verification. It exists so callers that hold
+// share material in wipeable []byte buffers (e.g. memory-locked enclaves) never
+// have to copy it into an immutable, un-wipeable Go string just to reconstruct.
+// threshold is the M of the M-of-N scheme and must be at least 2, matching
+// SplitBytes.
+//
+// It performs NO self-verification of the reconstructed secret. Shares carry
+// no digest of the secret — embedding one would be an offline brute-force
+// oracle that defeats Shamir's information-theoretic secrecy for low-entropy
+// secrets. With fewer-than-threshold genuine shares, or a corrupted or
+// mismatched share, reconstruction yields indistinguishable garbage, NOT an
+// error. The caller MUST authenticate the result out-of-band — for example by
+// using it as the key in an authenticated decrypt that fails on a wrong key.
+// Every decoded buffer — including partially decoded or validation-rejected
+// shares — is wiped on every return path; the caller still owns (and must
+// wipe) the input buffers.
 func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
 	if threshold < 2 {
 		return nil, &CombineError{Reason: fmt.Sprintf("threshold must be at least 2, got %d", threshold)}
@@ -196,7 +313,10 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
 	}
 	xs := make([]byte, len(values))
 	ys := make([][]byte, len(values))
-	// Register each decode buffer before writing to it, so the deferred wipe covers rejected shares too.
+	// Every decode buffer is registered in decoded BEFORE any bytes are
+	// written into it, so the deferred wipe covers partially decoded and
+	// validation-rejected shares too — not just the fully accepted ys. The
+	// reconstructed secret returned to the caller is a separate buffer.
 	decoded := make([][]byte, 0, len(values))
 	defer func() {
 		for _, d := range decoded {
@@ -223,7 +343,13 @@ func CombineBytes(values [][]byte, threshold int) ([]byte, error) {
 	return interpolateSecret(xs, ys, secretLen), nil
 }
 
-// wipe zeroes a byte slice through go-enclave's Wipe, which survives dead-store elimination.
+// wipe zeroes a byte slice. It delegates to go-enclave's Wipe, whose zeroing is
+// resistant to dead-store elimination; a plain range-assign loop over a slice
+// the compiler can prove dead may be optimized away.
+//
+// It is a one-line adapter and stays one deliberately: the package-local name is
+// what every scratch buffer here is wiped through, so the primitive behind it
+// can move without touching forty call sites.
 func wipe(b []byte) {
 	enclave.Wipe(b)
 }

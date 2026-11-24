@@ -26,7 +26,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// shardOpenFailFS fails segment OpenFile under one WAL shard once armed, forcing a Phase-1 SaveState rollback, and yields to widen the race window.
+// shardOpenFailFS fails OpenFile for segment files under one specific WAL shard
+// directory once armed, simulating an I/O error that aborts a SaveState batch
+// in Phase 1 (segment creation) and forces a rollback of the sibling shards
+// already written in the same batch. It yields the scheduler a few times before
+// returning the error to widen the window during which a concurrent committer
+// could land on the shared WAL shard between the failing batch's checkpoint
+// capture and its rollback.
 type shardOpenFailFS struct {
 	FS
 	failDir string // e.g. "shard-1"
@@ -43,7 +49,21 @@ func (f *shardOpenFailFS) OpenFile(name string, flag int, perm fs.FileMode) (Fil
 	return f.FS.OpenFile(name, flag, perm)
 }
 
-// TestSaveStateConcurrentRollbackPreservesCommitted: a rollback on a shared WAL shard never erases another writer's committed records, since SaveState holds the shard lock for the whole batch.
+// TestSaveStateConcurrentRollbackPreservesCommitted is a regression test.
+//
+// Two Raft shards (0 and 16) hash to the SAME WAL shard (0). When NumWorkers
+// does not divide DefaultShardCount they are served by different commit workers,
+// so their SaveState calls run concurrently against the one shared WAL segment.
+// Writer B's batch writes the shared WAL shard 0 and THEN a second WAL shard
+// whose segment open is rigged to fail, forcing a Phase-1 failure and a rollback
+// that truncates WAL shard 0 back to B's pre-batch checkpoint.
+//
+// If SaveState released the shard lock between its durable write and its
+// rollback, writer A could commit a record to WAL shard 0 inside that window
+// and B's absolute-offset rollback would silently erase A's already
+// acknowledged committed record. SaveState holds the WAL-shard lock across the
+// whole batch lifecycle, making each batch atomic per segment. This test asserts
+// that every record A observed as committed survives a reopen + WAL replay.
 func TestSaveStateConcurrentRollbackPreservesCommitted(t *testing.T) {
 	dir := t.TempDir()
 	ff := &shardOpenFailFS{FS: defaultFS(), failDir: shardDirName(1)}
@@ -106,7 +126,9 @@ func TestSaveStateConcurrentRollbackPreservesCommitted(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// Reopen without the fault and replay: every entry A saw committed must be present and contiguous.
+	// Reopen WITHOUT the fault and replay from the WAL. Every entry A observed
+	// as committed must still be present and contiguous; a truncation of the
+	// shared segment below A's tail shows up as missing/gapped entries here.
 	db2, err := Open(dir, WithBlockSize(4096), WithMaxFileSize(256*1024))
 	if err != nil {
 		t.Fatalf("reopen: %v", err)

@@ -24,7 +24,12 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 )
 
-// TestStartShard_RefusesAnElectionTimeoutThatOverflows verifies a shard whose election timeout overflows time.Duration is refused.
+// TestStartShard_RefusesAnElectionTimeoutThatOverflows verifies StartShard
+// refuses a shard whose ElectionRTT, in this host's RTTMillisecond ticks, is
+// not representable as a time.Duration. Each value passes its own bound, but
+// the product wrapped negative and left a LeaseRead replica unable to measure
+// the end of its post-restart vote hold-down, so it refused every vote and
+// campaign for good.
 func TestStartShard_RefusesAnElectionTimeoutThatOverflows(t *testing.T) {
 	cfg := testHostConfig(t)
 	cfg.RTTMillisecond = 60_000

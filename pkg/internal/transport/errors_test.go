@@ -162,7 +162,12 @@ func TestTypedErrorContracts(t *testing.T) {
 // Sentinel identity of the snapshot/frame abort errors
 // ---------------------------------------------------------------------------
 
-// TestSnapshotAbortErrors_SentinelIdentity verifies each abort error matches its own sentinel and no other.
+// TestSnapshotAbortErrors_SentinelIdentity pins the errors.Is contract for the
+// typed abort errors. Callers (and the receive-side rejection accounting)
+// distinguish an abort reason by matching the sentinel, not by string: an
+// error whose Is does not report its own sentinel would be silently
+// misclassified, and one that matched a FOREIGN sentinel would send the caller
+// down the wrong recovery path.
 func TestSnapshotAbortErrors_SentinelIdentity(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -222,7 +227,7 @@ func TestSnapshotAbortErrors_SentinelIdentity(t *testing.T) {
 			if !errors.Is(tc.err, tc.sentinel) {
 				t.Fatalf("errors.Is(%T, %v) = false, want true", tc.err, tc.sentinel)
 			}
-			// Must not match any other sentinel.
+			// Must not answer for any OTHER sentinel.
 			for _, other := range allSentinels {
 				if other == tc.sentinel {
 					continue

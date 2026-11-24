@@ -587,7 +587,7 @@ func TestSnapshot_RecoverReplacesExistingState(t *testing.T) {
 			t.Fatalf("Apply(2) = %v", err)
 		}
 
-		// Recover rsm2 from rsm1's snapshot, replacing rsm2's state.
+		// Recover rsm2 from rsm1's snapshot. This should REPLACE rsm2's state.
 		if err := rsm2.RecoverFromSnapshot(context.Background(), bytes.NewReader(buf.Bytes()), stopper); err != nil {
 			t.Fatalf("RecoverFromSnapshot = %v", err)
 		}

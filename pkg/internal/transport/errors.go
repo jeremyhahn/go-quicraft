@@ -42,7 +42,11 @@ var (
 	// does not match the expected node address from the registry.
 	ErrPeerIdentityMismatch = errors.New("transport: peer identity mismatch")
 
-	// ErrSnapshotNotAccepting marks an AuthorizeSnapshot refusal because the shard failed or is stopping, reported quietly.
+	// ErrSnapshotNotAccepting marks a MessageHandler.AuthorizeSnapshot
+	// refusal that is an ordinary shard state — the shard failed, or is
+	// stopping — rather than an authorization failure. A leader retransmits
+	// to such a replica as a matter of course, so the transport reports it
+	// quietly and apart from unauthorized transfers.
 	ErrSnapshotNotAccepting = errors.New("transport: shard is not accepting snapshots")
 
 	// ErrDecompressedSizeLimitExceeded is returned when the declared
@@ -80,10 +84,18 @@ var (
 	// SharedPeerCertificateError, for errors.Is() matching.
 	ErrSharedPeerCertificate = errors.New("transport: local certificate covers peer addresses")
 
-	// ErrPromiscuousPeerCertificate is the errors.Is sentinel for PromiscuousPeerCertificateError: an inbound peer certificate also covers this node's host.
+	// ErrPromiscuousPeerCertificate is the sentinel for
+	// PromiscuousPeerCertificateError, for errors.Is() matching. It is the
+	// RECEIVE-side counterpart of ErrSharedPeerCertificate: an inbound peer
+	// whose certificate also covers this node's host holds a certificate that
+	// authorizes it to speak for every member, so the connection is refused.
 	ErrPromiscuousPeerCertificate = errors.New("transport: peer certificate covers this node's address")
 
-	// ErrNoLocalCertificate is returned when this node's leaf certificate is needed and unavailable.
+	// ErrNoLocalCertificate is returned when an operation needs this node's own
+	// leaf certificate and it is unavailable. NewQUICTransport rejects an
+	// unparsable leaf, so this only guards against a future construction path
+	// that forgets to populate it — failing CLOSED rather than skipping a
+	// security precondition.
 	ErrNoLocalCertificate = errors.New("transport: local leaf certificate unavailable")
 
 	// ErrMTLSReload is the sentinel form of MTLSReloadError, for errors.Is()
@@ -103,11 +115,19 @@ var (
 	// against CACertificateParseError.
 	ErrCACertificateParse = errors.New("transport: CA certificate parse failed")
 
-	// ErrSnapshotChunkWriteTimeout is the sentinel for SnapshotChunkWriteTimeoutError, returned for any snapshot chunk write failure.
+	// ErrSnapshotChunkWriteTimeout is the sentinel for
+	// SnapshotChunkWriteTimeoutError. Returned when writing a snapshot
+	// chunk fails for any reason: the per-chunk write deadline expiring
+	// (a slow receiver or network stall) is one cause, the receiver
+	// closing the connection or resetting the stream mid-transfer is
+	// another. The wrapped stream error tells them apart.
 	ErrSnapshotChunkWriteTimeout = errors.New("transport: snapshot chunk write deadline exceeded")
 )
 
-// Application-level QUIC error codes; 0x00 is reserved, application codes start at 0x01.
+// Application-level QUIC error codes. QUIC reserves 0x00 for
+// no-error and framework codes; application codes start at 0x01.
+// Using named constants instead of raw 0 values makes CloseWithError
+// calls self-documenting and enables protocol-level error diagnosis.
 const (
 	// QUICErrShutdown indicates a graceful transport shutdown.
 	QUICErrShutdown quic.ApplicationErrorCode = 0x1
@@ -118,7 +138,10 @@ const (
 	// QUICErrIPLimitReached indicates the per-IP connection limit was reached.
 	QUICErrIPLimitReached quic.ApplicationErrorCode = 0x3
 
-	// QUICErrDuplicateDial closes a dialed connection that lost a dial race to the connection cache.
+	// QUICErrDuplicateDial indicates a freshly dialed connection lost a
+	// dial race: another dial to the same target already populated the
+	// connection cache, so the loser is closed instead of leaking alive
+	// on keep-alives outside the cache's bookkeeping.
 	QUICErrDuplicateDial quic.ApplicationErrorCode = 0x4
 
 	// QUICErrPromiscuousCert indicates the inbound peer's certificate also
@@ -136,27 +159,70 @@ const (
 	// reapIdleInboundConns.
 	QUICErrInboundIdle quic.ApplicationErrorCode = 0x7
 
-	// QUICErrPeerRemoved closes the inbound half of a peer whose removal is committed; see closeInboundFromPeer.
+	// QUICErrPeerRemoved is sent to the INBOUND half of a peer whose removal
+	// from membership this node has committed. See closeInboundFromPeer.
 	QUICErrPeerRemoved quic.ApplicationErrorCode = 0x8
 
-	// QUICErrDialIdentity closes an outbound connection whose peer identity membership does not bind to the dialed address or destination; see getConnection.
+	// QUICErrDialIdentity closes an OUTBOUND connection whose peer presents a
+	// node identity membership does not bind to any replica routed to the
+	// dialed address or is not a send's destination. See getConnection.
 	QUICErrDialIdentity quic.ApplicationErrorCode = 0x9
 )
 
-// closeReasonRedacted is the empty CONNECTION_CLOSE reason for authorization verdicts; the reason is logged locally and the error code stays distinct.
+// closeReasonRedacted is the CONNECTION_CLOSE reason phrase used for every
+// close whose cause is an AUTHORIZATION verdict on the peer itself:
+// revocation, certificate policy, membership removal.
+//
+// The reason phrase is transmitted verbatim to the peer — quic-go's
+// PackApplicationClose copies ErrorMessage straight onto the wire, and only
+// TLS-alert (crypto) CONNECTION_CLOSE frames have their reason stripped, so a
+// handshake-stage verdict never travels but every one of these post-handshake
+// verdicts did. A prose phrase is the readable form of the verdict; a peer
+// probing for which of its certificates the cluster still accepts got the
+// answer written out for it. Every one of these closes logs its precise reason
+// LOCALLY, which is where an operator diagnosing the cluster reads it.
+//
+// It is deliberately empty rather than a generic sentence: any phrase is
+// something that can drift back into a description of the verdict, and it adds
+// nothing the numeric application error code does not already carry. The code
+// IS still distinct per verdict (QUICErrRevoked / QUICErrPromiscuousCert /
+// QUICErrPeerRemoved) — that is the protocol contract, and collapsing it would
+// cost the peer the ability to tell a policy close from a resource limit — so
+// this narrows the disclosure to its coarsest form rather than removing it.
 const closeReasonRedacted = ""
 
 // Stream-level QUIC error codes, sent in STOP_SENDING / RESET_STREAM frames
 // via Stream.CancelRead / Stream.CancelWrite. These are distinct from the
 // connection-level quic.ApplicationErrorCode values above.
 const (
-	// QUICStreamErrReceiverGone is sent via CancelRead when the receiver abandons an inbound stream, so the peer's next Write fails fast.
+	// QUICStreamErrReceiverGone is sent via CancelRead when the receiver
+	// abandons an inbound stream (frame error, budget exhaustion, snapshot
+	// drop, shutdown). The STOP_SENDING it triggers makes the peer's next
+	// Write on the stream fail fast and releases the stream's flow-control
+	// credit, instead of letting the peer silently black-hole data into a
+	// stream nobody drains.
 	QUICStreamErrReceiverGone quic.StreamErrorCode = 0x1
 
-	// QUICStreamErrFrameRejected is sent via CancelRead when a frame was unacceptable; the sender drops the batch and replaces only the stream (see isPeerFrameRejection).
+	// QUICStreamErrFrameRejected is sent via CancelRead when the receiver
+	// abandons an inbound stream because a FRAME on it was unacceptable
+	// (bad magic, wrong wire version, foreign deployment, undecodable or
+	// over-limit batch) rather than because the receiver or the connection
+	// is gone.
+	//
+	// The distinction is what keeps a rejected frame from tearing the
+	// connection down. Both cases surface at the sender as the same
+	// *quic.StreamError from Write, so without a distinct code the sender
+	// must assume the connection is dead: it closes and re-dials, retries the
+	// identical unacceptable frame, and loops — a dial storm that also starves
+	// the peer of the very data it is waiting for. Seeing this code, the
+	// sender drops the batch and replaces only the stream (see
+	// isPeerFrameRejection).
 	QUICStreamErrFrameRejected quic.StreamErrorCode = 0x3
 
-	// QUICStreamErrShutdown is sent via CancelWrite when the transport stops during a snapshot chunk write.
+	// QUICStreamErrShutdown is sent via CancelWrite when the transport is
+	// stopping while a snapshot chunk write is in flight. The RESET_STREAM
+	// unblocks a Write that would otherwise hold Stop() hostage for up to
+	// snapshotChunkWriteDeadline per chunk.
 	QUICStreamErrShutdown quic.StreamErrorCode = 0x2
 )
 
@@ -194,7 +260,12 @@ var (
 	// contains path traversal sequences.
 	ErrChunkFilepathTraversal = errors.New("transport: snapshot chunk filepath contains path traversal")
 
-	// ErrChunkHeaderMismatch is returned when a snapshot chunk's ShardID, Index or Epoch differs from its stream header.
+	// ErrChunkHeaderMismatch is returned when a snapshot chunk's identity
+	// fields (ShardID, Index, or Epoch) do not match the stream header that
+	// was used for epoch pinning and resource accounting. Accepting such a
+	// chunk could persist snapshot data under a barrier epoch that was
+	// never pinned, letting a concurrent epoch purge strand an
+	// undecryptable snapshot.
 	ErrChunkHeaderMismatch = errors.New("transport: snapshot chunk does not match stream header")
 )
 
@@ -278,7 +349,10 @@ func (e *ChunkFilepathTraversalError) Is(target error) bool {
 	return target == ErrChunkFilepathTraversal
 }
 
-// ChunkHeaderMismatchError is returned when a snapshot chunk's ShardID, Index or Epoch differs from the stream header, which is authoritative.
+// ChunkHeaderMismatchError is returned when a deserialized snapshot chunk's
+// ShardID, Index, or Epoch differs from the stream's snapshot header. The
+// header is the authority for epoch pinning, so every chunk must match it
+// before any chunk data is retained.
 type ChunkHeaderMismatchError struct {
 	// Field names the mismatching chunk field ("shard_id", "index", "epoch").
 	Field string
@@ -315,7 +389,10 @@ type DialError struct {
 	Err    error
 }
 
-// DialIdentityError reports a connection refused because the peer's node identity is not bound to the dialed replica; Presented is empty without a verified leaf.
+// DialIdentityError reports a connection refused because the peer's verified
+// node identity is not one membership binds to a replica routed to the dialed
+// address, or not the replica a snapshot send was for (Config.ReplicaIdentity).
+// Presented is empty when the peer offered no verified leaf.
 type DialIdentityError struct {
 	Presented string
 }
@@ -335,7 +412,11 @@ func (e *DialError) Unwrap() error {
 	return e.Err
 }
 
-// CACertificateParseError is returned at startup when MTLSConfig.CACert does not parse and RevocationConfig needs it.
+// CACertificateParseError is returned when the CA certificate PEM provided
+// in MTLSConfig.CACert cannot be decoded or the DER block cannot be parsed
+// as an X.509 certificate. This is a fail-fast error at startup when
+// RevocationConfig is non-nil, because OCSP/CRL checking requires a valid
+// issuer certificate.
 type CACertificateParseError struct {
 	// Reason describes the failure mode (e.g., "PEM decode returned nil block").
 	Reason string
@@ -362,7 +443,15 @@ func (e *CACertificateParseError) Unwrap() error {
 	return e.Err
 }
 
-// SnapshotChunkWriteTimeoutError reports any failed snapshot chunk write (deadline, close or reset); Unwrap gives the stream error.
+// SnapshotChunkWriteTimeoutError is returned when writing a snapshot chunk
+// to a QUIC stream fails. Despite its name it wraps every chunk write
+// failure, not only the per-chunk write deadline expiring: a receiver that
+// closes the connection or resets the stream mid-transfer is reported as
+// this type too. ShardID and ReplicaID name the target, ChunkID is the
+// zero-based position of the failed chunk in the transfer, and Err (returned
+// by Unwrap) is the stream error that says which failure it was. The
+// snapshot send is aborted and the snapshotTracker slot is released so
+// Stop() can proceed.
 type SnapshotChunkWriteTimeoutError struct {
 	ShardID   uint64
 	ReplicaID uint64
@@ -394,7 +483,10 @@ func (e *SnapshotChunkWriteTimeoutError) Unwrap() error {
 // for a real shard.
 var ErrInvalidShardID = errors.New("transport: invalid shard ID (zero)")
 
-// InvalidShardIDError is returned for an inbound message with the reserved ShardID 0; the message is dropped.
+// InvalidShardIDError is returned when an inbound Raft message has a
+// zero ShardID. Zero is reserved and never assigned to real shards, so
+// a message with ShardID == 0 indicates corruption or a malicious peer.
+// The message is logged and dropped rather than closing the connection.
 type InvalidShardIDError struct {
 	From    uint64
 	MsgType uint64
@@ -459,7 +551,10 @@ func (e *WorkerPanicError) Error() string {
 // receive accumulates more chunk data than the configured memory budget.
 var ErrSnapshotMemoryBudgetExceeded = errors.New("transport: snapshot memory budget exceeded")
 
-// ErrMessageRecvMemoryBudgetExceeded is returned when a frame would exceed MaxMessageReceiveMemory; the stream is dropped.
+// ErrMessageRecvMemoryBudgetExceeded is returned when an inbound message frame
+// would push total in-flight message-receive memory past MaxMessageReceiveMemory.
+// The offending stream is dropped; this bounds an OOM DoS where a peer opens many
+// streams that each declare a large frame length and withhold the body.
 var ErrMessageRecvMemoryBudgetExceeded = errors.New("transport: message receive memory budget exceeded")
 
 // MaxMessageReceiveMemoryTooSmallError is returned by Config.Validate when
@@ -482,7 +577,10 @@ func (e *MaxMessageReceiveMemoryTooSmallError) Is(target error) bool {
 	return target == ErrInvalidMaxMessageReceiveMemory
 }
 
-// ErrFrameDrainIncomplete is returned when a dropped frame's body could not be discarded; the stream must be torn down.
+// ErrFrameDrainIncomplete is returned when a dropped frame's body could not be
+// fully discarded. Unlike the budget error it is NOT retryable: the stream is
+// desynchronised mid-frame, so the next "header" would be parsed out of
+// undelivered payload. The caller must tear the stream down.
 var ErrFrameDrainIncomplete = errors.New("transport: frame body drain incomplete; stream desynchronised")
 
 // FrameDrainError carries the declared length and drained byte count of a
@@ -509,7 +607,10 @@ func (e *FrameDrainError) Unwrap() error {
 	return e.Err
 }
 
-// SnapshotMemoryBudgetExceededError is returned when one snapshot receive exceeds its memory budget.
+// SnapshotMemoryBudgetExceededError is returned when the accumulated chunk
+// data for a single snapshot receive exceeds the configured memory budget.
+// This prevents a malicious or misconfigured peer from causing unbounded
+// memory growth on the receiver.
 type SnapshotMemoryBudgetExceededError struct {
 	Accumulated int64 // total bytes accumulated so far
 	Budget      int64 // configured maximum memory budget
@@ -534,7 +635,10 @@ var (
 	// transfer exceeds maxSnapshotTransferDuration.
 	ErrSnapshotTransferTimeout = errors.New("transport: snapshot transfer exceeded maximum duration")
 
-	// ErrSnapshotProgressStalled is returned when an inbound snapshot falls below the minimum sustained throughput.
+	// ErrSnapshotProgressStalled is returned when an inbound snapshot
+	// transfer falls below the minimum sustained throughput. Without it the
+	// per-frame read deadline is reset every iteration, so a peer trickling
+	// bytes can hold a concurrency slot indefinitely.
 	ErrSnapshotProgressStalled = errors.New("transport: snapshot transfer below minimum throughput")
 
 	// ErrSnapshotZeroLengthFrameFlood is returned when an inbound snapshot
@@ -649,11 +753,23 @@ func (e *SnapshotChunkCountError) Is(target error) bool {
 	return target == ErrSnapshotChunkCount
 }
 
-// SharedPeerCertificateError reports at startup that this node's leaf certificate also covers other members' hosts; per-node SANs are required.
+// SharedPeerCertificateError reports that this node's own leaf certificate also
+// covers one or more OTHER member addresses of the cluster.
+//
+// Every in-band authorization decision the transport makes — clearing a spoofed
+// SourceAddress, permitting a peerEpoch mutation and the eviction of a live
+// outbound, and binding a snapshot sender to a shard member — reduces to
+// "is the claimed host present in the sender's verified certificate". A
+// certificate that covers other members' hosts (a wildcard SAN, or one shared
+// certificate carrying every node's SAN) makes that question answer yes for
+// every peer address, so any single compromised replica can speak for every
+// other node. Per-node SANs are a hard deployment precondition, and this error
+// is what enforces it at startup.
 type SharedPeerCertificateError struct {
 	// SelfAddress is this node's own advertised Raft address.
 	SelfAddress string
-	// CoveredPeers are the other members' hosts the certificate covers, sorted.
+	// CoveredPeers are the OTHER members' hosts this node's certificate also
+	// covers, sorted for a deterministic message.
 	CoveredPeers []string
 }
 
@@ -671,7 +787,14 @@ func (e *SharedPeerCertificateError) Is(target error) bool {
 	return target == ErrSharedPeerCertificate
 }
 
-// MTLSReloadError reports that ReloadMTLS refused new material and nothing was swapped; Err is the failed NewQUICTransport check.
+// MTLSReloadError reports that ReloadMTLS refused new mTLS material. Nothing
+// was swapped: every handshake keeps using the material in force before the
+// call. Err is the check that failed — ErrMTLSConfigRequired or
+// ErrIncompleteMTLSConfig (material missing), ErrInvalidCertKeyPair (the
+// leaf does not parse or its key does not match), ErrInvalidCACert (no
+// certificate in the CA bundle), a *CACertificateParseError (revocation is
+// enabled and the bundle holds no issuer), a *NodeIdentityChangedError, or a
+// *SharedPeerCertificateError — the same checks NewQUICTransport runs.
 type MTLSReloadError struct {
 	Err error
 }
@@ -691,7 +814,13 @@ func (e *MTLSReloadError) Unwrap() error {
 	return e.Err
 }
 
-// NodeIdentityChangedError reports a reloaded leaf with a different public key; the identity is the SPKI hash, so a new keypair needs a membership change.
+// NodeIdentityChangedError reports a reloaded leaf whose public key differs
+// from the one in force. The node identity is the SHA-256 of the leaf's
+// SubjectPublicKeyInfo, and peers count this node's quorum-bearing messages
+// only under the identity they committed for it, so a reload that changed it
+// would lock this node out of every shard it serves. Renewing or re-issuing
+// the certificate on the SAME keypair keeps the identity; a new keypair goes
+// through a membership change that commits the new identity.
 type NodeIdentityChangedError struct {
 	// Current is the identity of the leaf in force.
 	Current string
@@ -710,7 +839,16 @@ func (e *NodeIdentityChangedError) Is(target error) bool {
 	return target == ErrNodeIdentityChanged
 }
 
-// PromiscuousPeerCertificateError reports an inbound peer certificate that also covers this node's host; the receive-side half of SharedPeerCertificateError.
+// PromiscuousPeerCertificateError reports that an INBOUND peer's verified leaf
+// certificate also covers THIS node's own host.
+//
+// It is the mirror image of SharedPeerCertificateError and the enforcing half
+// of the same precondition. SharedPeerCertificateError is raised by the local
+// node about its OWN certificate at startup and at config-change time — a
+// misconfiguration detector an attacker simply declines to run. This one is
+// raised on the receive path about a certificate the peer actually presented,
+// which is why it, and not the startup check, is what stops a wildcard-cert
+// holder from asserting another member's replica ID.
 type PromiscuousPeerCertificateError struct {
 	// PeerAddress is the QUIC remote address the connection arrived from.
 	PeerAddress string

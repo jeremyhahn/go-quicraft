@@ -893,7 +893,12 @@ func TestPrometheusMetricsCollector_RegisterShard_MultipleTimes(t *testing.T) {
 	}
 }
 
-// TestPrometheusMetricsCollector_UnregisterShard verifies a sample after UnregisterShard is dropped, not re-creating the series.
+// TestPrometheusMetricsCollector_UnregisterShard is the ML8 regression test:
+// a sample that arrives AFTER UnregisterShard (an OnApplied still in flight
+// on the engine apply goroutine when StopShard runs) must be dropped, not
+// re-create the child series the unregister just deleted. Re-creating it
+// would resurrect the series permanently and reinstate the cardinality leak
+// UnregisterShard exists to close.
 func TestPrometheusMetricsCollector_UnregisterShard(t *testing.T) {
 	c := newPerShardTestCollector()
 	c.RegisterShard(99)
@@ -1010,7 +1015,11 @@ func TestSampledMetricsCollector_ObserveCommitLatency_Sampling(t *testing.T) {
 	}
 }
 
-// TestSampledMetricsCollector_MessageCountersAreUnsampled verifies counters record every increment.
+// TestSampledMetricsCollector_MessageCountersAreUnsampled is a regression
+// test: counters must record EVERY increment. Sampling a
+// prometheus.Counter.Inc() makes *_total under-report by SampleRate, so
+// every rate()/increase() built on it is off by orders of magnitude. Both the
+// send and the receive counter are checked, each at its own rate.
 func TestSampledMetricsCollector_MessageCountersAreUnsampled(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -1040,7 +1049,13 @@ func TestSampledMetricsCollector_MessageCountersAreUnsampled(t *testing.T) {
 	}
 }
 
-// TestSampledMetricsCollector_InterleavedSamplingIndependent verifies each metric samples 1 in SampleRate of its own observations.
+// TestSampledMetricsCollector_InterleavedSamplingIndependent is the
+// regression test for the per-metric sampling counters. With a single
+// counter shared across metrics, a strictly alternating commit/apply call
+// pattern at an even SampleRate lands every even count on one metric —
+// it gets sampled ALWAYS while the other is sampled NEVER. Dedicated
+// counters guarantee each metric records 1 in SampleRate of its own
+// observations regardless of interleaving.
 func TestSampledMetricsCollector_InterleavedSamplingIndependent(t *testing.T) {
 	inner := newPerShardTestCollector()
 	s := NewSampledMetricsCollector(inner, 2) // 1 in 2
@@ -1365,7 +1380,8 @@ var aggregatableFamilies = []string{
 	"quicraft_transport_snapshots_received_bytes",
 }
 
-// alertableFamilies keep a shard_id label in both modes.
+// alertableFamilies keep a shard_id label in BOTH modes: an operator pages on
+// them and the shard is the only thing that makes the page actionable.
 var alertableFamilies = []string{
 	"quicraft_raft_elections_total",
 	"quicraft_raft_proposals_dropped_total",
@@ -1417,7 +1433,10 @@ func hasLabel(mf *dto.MetricFamily, name string) bool {
 	return false
 }
 
-// TestPrometheusMetrics_DefaultIsAggregated verifies the zero-value config aggregates to one host-level series without shard_id.
+// TestPrometheusMetrics_DefaultIsAggregated pins the DEFAULT down: the
+// zero-value config must collapse the volume-and-latency telemetry to one
+// host-level series with no shard_id, and samples from different shards must
+// land in that single series rather than in one series each.
 func TestPrometheusMetrics_DefaultIsAggregated(t *testing.T) {
 	c := NewPrometheusMetricsCollector()
 	c.RegisterShard(1)

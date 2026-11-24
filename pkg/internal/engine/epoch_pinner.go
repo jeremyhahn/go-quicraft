@@ -14,7 +14,26 @@
 
 package engine
 
-// epochPinner seals snapshot frames and pins every distinct epoch used, so a rotation and purge cannot retire a needed DEK; not safe for concurrent use.
+// epochPinner seals snapshot frames while keeping EVERY epoch they are sealed
+// under pinned in-flight on the barrier, so a concurrent key rotation +
+// PurgeEpochsBefore cannot retire the DEK of a frame that is already in the
+// artifact — which would leave that snapshot permanently undecryptable.
+//
+// Two hazards, both closed here:
+//
+//   - Pinning only the MINIMUM epoch leaves an INTERMEDIATE epoch exposed once
+//     two rotations land during one encrypt loop. Every distinct epoch is pinned.
+//   - EncryptWithEpoch releases the barrier lock before returning, so a rotation
+//     plus a purge could complete in the gap before the caller pinned the
+//     returned epoch. Every frame is therefore sealed with
+//     EncryptWithEpochPinnedContext, which seals and pins under one lock, so no
+//     purge can interleave. It is part of the barrier contract, not an optional
+//     capability: the pin-before + pin-after fallback it replaced left exactly
+//     that gap open for any barrier that did not implement it.
+//
+// Each distinct epoch is pinned exactly once, so the caller releases each
+// exactly once via releaseAll — after the snapshot's epoch is durably recorded.
+// Not safe for concurrent use; one pinner belongs to one encrypt loop.
 type epochPinner struct {
 	barrier SnapshotBarrier
 	seen    map[uint64]struct{}
@@ -44,7 +63,13 @@ func (p *epochPinner) track(epoch uint64) {
 	p.order = append(p.order, epoch)
 }
 
-// sealFrame encrypts one frame bound to contextAAD and pins its epoch.
+// sealFrame encrypts one frame and pins the epoch it was sealed under.
+//
+// contextAAD is the frame's positional context (see engine.SnapshotAAD); it is
+// folded into the AEAD AAD alongside the epoch so a frame cannot be replayed at
+// a different ordinal, snapshot index, replica or shard. A nil context is
+// byte-identical to the epoch-only binding and is what a hardware-mode barrier
+// requires.
 func (p *epochPinner) sealFrame(plain, contextAAD []byte) ([]byte, uint64, error) {
 	ct, epoch, err := p.barrier.EncryptWithEpochPinnedContext(nil, plain, contextAAD)
 	if err != nil {

@@ -209,7 +209,7 @@ func parseMemCmd(cmd []byte) (key, value string, conditional, ok bool) {
 	return "", "", false, false
 }
 
-// extractKV takes the key and value from the command bytes.
+// extractKV takes the key and value from the COMMAND bytes.
 func extractKV(cmd []byte) (string, []byte) {
 	key, value, _, ok := parseMemCmd(cmd)
 	if !ok {

@@ -336,7 +336,12 @@ func FuzzCheckDuplicateConsistency(f *testing.F) {
 			if err != nil {
 				t.Fatalf("CheckDuplicate(%d) after eviction: unexpected error: %v", seriesID, err)
 			}
-			// No error and no duplicate means respondedTo passed seriesID and the response was evicted.
+			// If no error and not duplicate, the eviction removed the
+			// cached response. This is acceptable behavior: respondedTo
+			// advanced past seriesID, so the response was legitimately
+			// cleaned up. CheckDuplicate may return (zero, false, nil)
+			// if respondedTo was later lowered (not possible in this
+			// test), or ErrResponseEvicted.
 			if isDup {
 				t.Fatalf("CheckDuplicate(%d): found duplicate after respondedTo=%d >= seriesID",
 					seriesID, respondedTo)

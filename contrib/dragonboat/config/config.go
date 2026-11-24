@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package config provides dragonboat-compatible configuration types that convert to quicraft equivalents.
+// Package config provides dragonboat-compatible configuration types with
+// conversion methods to quicraft equivalents. This enables existing
+// dragonboat users to migrate to quicraft by changing imports without
+// rewriting their configuration code.
 package config
 
 import (
@@ -66,7 +69,10 @@ type Config struct {
 	// snapshots. Set to 0 to disable automatic snapshots.
 	SnapshotEntries uint64
 
-	// CompactionOverhead is the number of entries kept after compaction; 0 with SnapshotEntries set maps to an explicit quicraft value.
+	// CompactionOverhead is the number of entries to retain after log
+	// compaction for follower catch-up. When left 0 with SnapshotEntries
+	// set, the conversion picks an explicit quicraft value (see
+	// ToQuicraft) because quicraft cannot express zero retention.
 	CompactionOverhead uint64
 
 	// OrderedConfigChange serializes configuration changes so that only
@@ -85,7 +91,14 @@ type Config struct {
 	// entry payloads.
 	EntryCompressionType CompressionType
 
-	// DisableAutoCompactions approximates dragonboat by raising a zero CompactionOverhead to SnapshotEntries-1; snapshots continue.
+	// DisableAutoCompactions disables automatic log compaction when true.
+	// In dragonboat this only suppresses the compaction request issued
+	// after each snapshot; snapshotting continues at the SnapshotEntries
+	// cadence and CompactionOverhead still governs retention for a manual
+	// RequestCompaction. Quicraft has no switch to turn compaction off, so
+	// the conversion approximates it by raising CompactionOverhead to
+	// SnapshotEntries-1 ONLY when CompactionOverhead is 0; an explicitly
+	// configured CompactionOverhead is preserved.
 	DisableAutoCompactions bool
 
 	// IsNonVoting marks this replica as a non-voting learner. Maps to
@@ -100,14 +113,25 @@ type Config struct {
 	// in elections and quorum but does not maintain a state machine.
 	IsWitness bool
 
-	// MemberIdentities is passed to quicraft unchanged: initial member identities, or the join anchor when join is true; required with a transport.
+	// MemberIdentities has no dragonboat counterpart. It is quicraft's
+	// config.Config.MemberIdentities passed through unchanged: the node
+	// identity (NodeHost.NodeIdentity) of every initial member for a
+	// founding replica, and the join anchor — the replicas a joining replica
+	// will accept its bootstrap snapshot from — for join=true. A NodeHost
+	// with a transport refuses to start a shard without it, because quicraft
+	// authorizes a member by its identity and by nothing else; a NodeHost
+	// started WithoutTransport does not need it.
 	MemberIdentities map[uint64]string
 
 	// Quiesce enables quiescence for idle shards, reducing CPU usage
 	// when there are no pending proposals.
 	Quiesce bool
 
-	// WaitReady makes Start*Replica block, with a bounded poll, until the replica is initialized.
+	// WaitReady makes Start*Replica block until the replica is initialized,
+	// matching dragonboat's startShard. Quicraft's StartShard returns as
+	// soon as the node is registered, so the adapter polls the shard's
+	// readiness after StartShard returns and gives up after a bounded
+	// timeout (see the readiness wait in the dragonboat NodeHost adapter).
 	WaitReady bool
 
 	// MaxEntrySize is the maximum proposal payload size in bytes.
@@ -151,7 +175,10 @@ func (c Config) Validate() error {
 	if !isKnownCompressionType(c.EntryCompressionType) {
 		return &ValidationError{Field: "EntryCompressionType", Message: "unknown compression type"}
 	}
-	// Pairs dragonboat accepts are accepted here; ToQuicraft clamps them to quicraft's SnapshotEntries > CompactionOverhead >= 1.
+	// SnapshotEntries == 1 and SnapshotEntries <= CompactionOverhead are
+	// accepted by dragonboat, so they are accepted here too. Quicraft
+	// requires SnapshotEntries > CompactionOverhead >= 1, so ToQuicraft
+	// clamps the pair instead of this rejecting the config.
 	return nil
 }
 
@@ -174,16 +201,38 @@ func warnAutoCompactionsNotDisablable() {
 	})
 }
 
-// ToQuicraft converts the dragonboat-compatible Config to a quicraft config.Config, keeping explicit booleans as *bool.
+// ToQuicraft converts the dragonboat-compatible Config to a quicraft
+// config.Config. Boolean fields that dragonboat treats as plain bool
+// are converted to *bool pointers so that user-specified values are
+// respected rather than treated as zero-value defaults.
 func (c Config) ToQuicraft() qcConfig.Config {
 	observer := c.IsNonVoting || c.IsObserver
 
-	// SnapshotEntries passes through; zero or disabled compaction overhead maps to an explicit quicraft value so snapshots stay on.
+	// SnapshotEntries passes through unchanged: dragonboat's
+	// DisableAutoCompactions only disables log compaction, never
+	// snapshotting. Quicraft cannot switch compaction off, and it also
+	// cannot express dragonboat's CompactionOverhead=0 ("retain no extra
+	// entries") because quicraft's SetDefaults replaces a zero
+	// CompactionOverhead with DefaultCompactionOverhead, which its
+	// validation then requires to be < SnapshotEntries. Both cases are
+	// therefore mapped to an explicit CompactionOverhead here so that
+	// every valid dragonboat config starts cleanly and snapshots are
+	// never silently disabled.
 	snapshotEntries := c.SnapshotEntries
 	compactionOverhead := c.CompactionOverhead
 	if snapshotEntries > 0 {
 		if compactionOverhead == 0 {
-			// Overhead 0 uses quicraft's default retention capped below SnapshotEntries; a configured overhead is kept.
+			// Dragonboat with CompactionOverhead 0 retains no extra
+			// entries after compaction. Use quicraft's default retention,
+			// capped below SnapshotEntries so quicraft's
+			// SnapshotEntries > CompactionOverhead check passes. Retaining
+			// more entries than dragonboat's zero only costs disk space;
+			// followers that fall behind further catch up via snapshot.
+			//
+			// DisableAutoCompactions does NOT override a CompactionOverhead
+			// the user configured: dragonboat's flag only suppresses the
+			// automatic compaction request, while CompactionOverhead keeps
+			// governing retention for a manual RequestCompaction.
 			compactionOverhead = qcConfig.DefaultCompactionOverhead
 			if c.DisableAutoCompactions {
 				// With no user retention to preserve, approximate
@@ -205,7 +254,20 @@ func (c Config) ToQuicraft() qcConfig.Config {
 			compactionOverhead = snapshotEntries - 1
 		}
 	} else {
-		// Dragonboat's SnapshotEntries 0 means snapshots off; SnapshotsDisabled keeps that meaning, which quicraft's zero default would not.
+		// Dragonboat reads SnapshotEntries == 0 as "automatic snapshotting is
+		// off; the user will call RequestSnapshot". Quicraft does not: a zero
+		// there means "I did not choose" and SetDefaults substitutes
+		// DefaultSnapshotEntries.
+		// Passing the zero through would therefore silently ENABLE snapshotting
+		// on a config that explicitly asked for it off — and would do it to
+		// every witness, since dragonboat REQUIRES SnapshotEntries == 0 for
+		// witnesses (see Validate).
+		//
+		// SnapshotsDisabled is the sentinel that preserves the caller's
+		// meaning. CompactionOverhead is left as the caller set it: with no
+		// automatic snapshot there is no automatic compaction for it to bound,
+		// and quicraft's SnapshotEntries > CompactionOverhead check does not
+		// apply to the sentinel.
 		snapshotEntries = qcConfig.SnapshotsDisabled
 	}
 
@@ -214,7 +276,11 @@ func (c Config) ToQuicraft() qcConfig.Config {
 		ReplicaID:  c.ReplicaID,
 		IsObserver: observer,
 		IsWitness:  c.IsWitness,
-		// Dragonboat does not restrict witness adds, so RequireFullReplicaMajority is off here.
+		// Dragonboat has no witness-membership policy: witness adds are
+		// unrestricted. Disable quicraft's RequireFullReplicaMajority default
+		// so the adapter preserves dragonboat semantics (its unified quorum
+		// carries the same durability trade-off; see quicraft
+		// config.WitnessConfig).
 		Witness: qcConfig.WitnessConfig{
 			RequireFullReplicaMajority: qcConfig.BoolPtr(false),
 		},

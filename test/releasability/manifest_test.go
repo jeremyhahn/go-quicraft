@@ -99,7 +99,12 @@ func publishedFiles(ctx context.Context, root string) ([]string, error) {
 	return published, nil
 }
 
-// statIndex stats the git index so go test's cache keys on it; a missing index is not an error.
+// statIndex stats the git index from this process, so that go test's result
+// cache keys on it. The manifest is read by git in a subprocess, which the
+// cache cannot see: without this, staging a new file — whose contents the
+// previous run never opened — leaves a plain `go test` reporting a cached pass
+// over a tree that now leaks. A missing index (a repository with nothing
+// staged yet) is not an error; ls-files then reports an empty index anyway.
 func statIndex(ctx context.Context, root string) error {
 	out, err := gitCommand(ctx, root, "rev-parse", "--path-format=absolute", "--git-path", "index").Output()
 	if err != nil {

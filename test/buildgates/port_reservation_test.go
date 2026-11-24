@@ -26,7 +26,71 @@ import (
 	"testing"
 )
 
-// The port-0 reservation rule: a test node's listen port comes from a held reservation, never a released probe.
+// The port-0 reservation rule.
+//
+// A cluster node in these suites has to be told its listen address before the
+// host that binds it exists, so the address has to be chosen by the test. The
+// obvious way to choose one is to ask the kernel:
+//
+//	pc, _ := net.ListenPacket("udp", "127.0.0.1:0")
+//	addr := pc.LocalAddr().String()
+//	pc.Close()
+//
+// and it is wrong every time. The port is free when it is read and nothing
+// holds it afterwards, so the kernel is free to give the same number to the
+// next caller — the next node of the same cluster, or the local end of any
+// outbound connection — before the host binds. It is one instance of a
+// recurring class: a value that is not pinned, treated as if it were.
+//
+// The pattern is easy to copy, which is why the remedy is a gate and not a set
+// of edits. Reservation goes through test/netport, which allocates from a
+// window OUTSIDE ip_local_port_range, and this gate keeps a copy of the
+// close-then-return helper from appearing.
+//
+// # The rule
+//
+// No file in the scanned trees may pass a port-0 address literal to
+// net.Listen, net.ListenPacket, net.ListenUDP or ListenConfig.Listen/
+// ListenPacket. Reserve through test/netport instead.
+//
+// A "port-0 address" is any string literal whose port component is 0 — ":0",
+// "127.0.0.1:0", "[::1]:0", "localhost:0". A literal naming a CONCRETE port is
+// not matched: that is what netport itself does when it probes a candidate,
+// and what a test does when it deliberately rebinds an address it already
+// holds.
+//
+// # What is scanned
+//
+// portZeroRoots: integrationRoots — the parent module's integration suites and
+// contrib/dragonboat's, shared with the leader-resolution gates in
+// leader_resolution_test.go — plus test/performance. The gate parses rather
+// than compiles, so a module boundary is invisible to it and one
+// implementation covers every tree. See the integrationRoots comment for the
+// full reasoning.
+//
+// test/performance is under the gate because benchutil delegates to
+// test/netport rather than carrying a TCP-shaped copy of the reservation
+// window, so the rule can be satisfied there.
+//
+// # What is NOT scanned, and why
+//
+//   - pkg/. A transport unit test binds "127.0.0.1:0" through Config.
+//     ListenAddress and the transport keeps that socket for its lifetime;
+//     nothing is closed and handed on, so the class cannot occur.
+//
+// # The marker
+//
+// In the integration trees no marker would be needed: netport.MustReserveUDP is
+// strictly better at the same call site, so there is nothing to excuse. That
+// does not hold in test/performance, which has a harness that binds port 0 and KEEPS the
+// listener for the transport's lifetime — the pkg/ shape, in a scanned tree.
+// netport is not better there; it is not applicable, because nothing is closed
+// and handed on.
+//
+// So the gate takes //quicraft:direct-port, on the same terms as the
+// leader-resolution markers: it sits on the line that needs it or at the top of
+// the comment block above it, it carries its own reason, and a bare marker is
+// reported rather than honoured.
 
 // listenFuncs are the calls that bind a local socket from an address argument.
 // The value is the index of that argument.
@@ -51,7 +115,14 @@ type portZeroSite struct {
 // TestNoPortZeroReservationsInIntegrationTrees. See "The marker" above.
 const directPortMarker = "//quicraft:direct-port"
 
-// portZeroRoots are the trees this gate walks: the two integration trees and test/performance.
+// portZeroRoots are the trees this gate walks: the two integration trees the
+// leader-resolution gates share, plus test/performance.
+//
+// It is a separate list rather than an addition to integrationRoots because
+// test/performance holds benchmarks, not integration tests: the
+// leader-resolution gates have nothing to say about it, and folding it into
+// their root list would put every benchmark under three rules it was never
+// written against.
 var portZeroRoots = append(append([]integrationRoot{}, integrationRoots...),
 	integrationRoot{dir: filepath.Join("..", "performance"), minFiles: 10},
 )
@@ -77,7 +148,14 @@ func TestNoPortZeroReservationsInIntegrationTrees(t *testing.T) {
 			}
 
 			fset := token.NewFileSet()
-			// Build tags are not evaluated, so every file is scanned.
+			// The integration files sit behind build tags, which
+			// parser.ParseFile does not evaluate, so every file is scanned
+			// regardless of which tags CI is running.
+			//
+			// ParseComments is REQUIRED, not an optimisation to drop: without
+			// it file.Comments is empty, excusedLines finds no markers, and
+			// every //quicraft:direct-port comment is silently ignored while
+			// the gate keeps reporting the site it excuses.
 			file, perr := parser.ParseFile(fset, path, nil, parser.ParseComments)
 			if perr != nil {
 				return perr

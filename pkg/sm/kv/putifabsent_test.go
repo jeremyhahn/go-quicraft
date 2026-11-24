@@ -17,7 +17,16 @@ func mustEncodePutIfAbsent(t *testing.T, key, value []byte) []byte {
 	return cmd
 }
 
-// stores runs a test body against both store implementations. applier is the narrow surface the tests need.
+// stores exercises both state-machine implementations through one test body.
+//
+// ConcurrentStore is not a variant of MemoryStore — it decodes in a separate
+// validation pass and applies under per-bucket locks — so an opcode can be
+// handled correctly by one and rejected by the other. That is exactly what
+// happened while adding this op: the concurrent store's opcode whitelist was
+// missed, and every conditional write there would have been answered
+// ResultInvalidCommand.
+// applier is the narrow surface these tests need. The two stores satisfy
+// different snapshot interfaces, and snapshots are irrelevant here.
 type applier interface {
 	Update(ctx context.Context, entries []sm.Entry, results []sm.Result) error
 	Lookup(ctx context.Context, query interface{}) (interface{}, error)
@@ -31,7 +40,14 @@ func stores(t *testing.T) map[string]applier {
 	}
 }
 
-// TestPutIfAbsent_StoresOnlyWhenKeyIsAbsent checks the first write stores and a second is declined without overwriting.
+// TestPutIfAbsent_StoresOnlyWhenKeyIsAbsent is the operation's defining
+// property.
+//
+// The first write takes effect and reports ResultStored; the second, for a key
+// that now exists, is declined with ResultNotStored and — critically — must not
+// overwrite. A conditional write that clobbered the existing value would be an
+// ordinary Put with extra steps, and every single-use token built on it would
+// be redeemable twice.
 func TestPutIfAbsent_StoresOnlyWhenKeyIsAbsent(t *testing.T) {
 	for name, store := range stores(t) {
 		t.Run(name, func(t *testing.T) {
@@ -71,7 +87,14 @@ func TestPutIfAbsent_StoresOnlyWhenKeyIsAbsent(t *testing.T) {
 	}
 }
 
-// TestPutIfAbsent_OneWinnerInASingleBatch checks exactly one of competing writes in a batch succeeds.
+// TestPutIfAbsent_OneWinnerInASingleBatch is the property Raft actually relies
+// on.
+//
+// Competing proposals for one key arrive as consecutive entries in a committed
+// batch, and the state machine applies them in log order. Exactly one may
+// succeed. If both did, two replicas replaying the same log would still agree
+// with each other — but the cluster would have handed the same single-use
+// credential to two callers, which is the failure this op exists to prevent.
 func TestPutIfAbsent_OneWinnerInASingleBatch(t *testing.T) {
 	for name, store := range stores(t) {
 		t.Run(name, func(t *testing.T) {

@@ -42,7 +42,9 @@ func TestE2E_Failover_ProposalAfterFailover(t *testing.T) {
 	newLeaderIdx := cluster.waitForClusterLeader(1, failoverTimeout)
 	t.Logf("new leader at node[%d]", newLeaderIdx)
 
-	// Propose through whichever replica leads at the point of use.
+	// Propose through the new leader.
+	// The property is that the CLUSTER still accepts writes after the
+	// failure, not that newLeaderIdx specifically does. Resolve at the point of use.
 	proposeToLeader(t, cluster, 1, encodeKVPut("after-failover", "recovered"), defaultTimeout)
 
 	// Verify new data is replicated to all surviving nodes.
@@ -110,7 +112,9 @@ func TestE2E_FiveNode_Failover_ProposalAfterFailover(t *testing.T) {
 	newLeaderIdx := cluster.waitForClusterLeader(1, failoverTimeout)
 	t.Logf("new leader at node[%d]", newLeaderIdx)
 
-	// Propose through whichever replica leads at the point of use.
+	// Propose through the new leader.
+	// The property is that the CLUSTER still accepts writes after the
+	// failure, not that newLeaderIdx specifically does. Resolve at the point of use.
 	proposeToLeader(t, cluster, 1, encodeKVPut("f5-after-failover", "recovered"), defaultTimeout)
 
 	// Verify new data is replicated to all surviving nodes.

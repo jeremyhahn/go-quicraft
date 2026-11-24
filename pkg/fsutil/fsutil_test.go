@@ -24,7 +24,20 @@ import (
 	"time"
 )
 
-// TestSyncDirChainWith_WalksToEveryRoot verifies the chain fsync reaches every ancestor for stopAt "/", "." and "".
+// TestSyncDirChainWith_WalksToEveryRoot is the regression test for
+// SyncDirChainWith silently degrading to a LEAF-ONLY fsync.
+//
+// Deciding containment with a string prefix over leaf+sep and stopAt+sep
+// breaks for exactly the two values DeepestExistingAncestor returns when
+// nothing above the leaf pre-exists: stopAt "/" builds the prefix "//" and
+// stopAt "." builds "./", and neither prefixes a CLEANED leaf. Both fell
+// through to syncing the leaf alone, skipping every ancestor os.MkdirAll had
+// just created — so a crash could roll back the directory entries of the tree
+// a snapshot or WAL segment had just been fsynced into.
+//
+// The `stopAt == ""` test also has to run BEFORE Clean, because
+// filepath.Clean("") is ".", which is a legitimate stop point (the working
+// directory) rather than "no stop point at all".
 func TestSyncDirChainWith_WalksToEveryRoot(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -114,7 +127,13 @@ func statOver(present []string, errs map[string]error) func(string) (fs.FileInfo
 	}
 }
 
-// TestDeepestExistingAncestorWith covers the stopAt walk; an unknown stat error continues upward, syncing more, never fewer.
+// TestDeepestExistingAncestorWith covers the walk that chooses the stopAt for
+// the chain sync following a MkdirAll.
+//
+// A stat error other than fs.ErrNotExist leaves the level's existence unknown
+// and the walk continues upward. That makes the chain sync cover MORE
+// directories, never fewer: fsyncing a directory that did exist costs one
+// fsync, while skipping one that MkdirAll created loses its dirent on a crash.
 func TestDeepestExistingAncestorWith(t *testing.T) {
 	cases := []struct {
 		name    string

@@ -76,7 +76,10 @@ func TestOnlyOpsAcceptsEveryOperationConstant(t *testing.T) {
 	}
 }
 
-// TestTimesBudgetControlsRepeatedInjection checks Times allows a second fault.
+// TestTimesBudgetControlsRepeatedInjection covers the property the
+// retry-exhaustion and rollback-after-failure paths depend on: the SECOND
+// fault. One-shot injection heals the filesystem the instant the first fault
+// lands, so any code that runs because of it runs against a healthy disk.
 func TestTimesBudgetControlsRepeatedInjection(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -113,7 +116,16 @@ func TestTimesBudgetControlsRepeatedInjection(t *testing.T) {
 	}
 }
 
-// TestWrappedFileMirrorsDelegateCapabilities checks wrapped files answer type assertions exactly as the delegate does.
+// TestWrappedFileMirrorsDelegateCapabilities guards against the harness
+// silently degrading the production path it wraps.
+//
+// waldb selects the directory-metadata-sync and pre-allocation paths by type
+// assertion. A wrapper that answers assertions its delegate cannot honour
+// sends production down a path the real filesystem does not have, and one that
+// answers none of them sends every directory flush through fdatasync — which
+// is exactly the call FileMetadataSyncer exists to keep directories away from,
+// and which no assertion downstream can detect because the return value is the
+// same.
 func TestWrappedFileMirrorsDelegateCapabilities(t *testing.T) {
 	t.Run("real filesystem keeps both capabilities", func(t *testing.T) {
 		efs := errfs.New(waldb.DefaultFS(), 0, errHarness)

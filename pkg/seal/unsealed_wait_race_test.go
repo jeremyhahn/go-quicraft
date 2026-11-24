@@ -222,7 +222,15 @@ type unsealedCReaders struct {
 	openAt []atomic.Int64
 }
 
-// startConcurrentUnsealedCReaders starts n goroutines calling b.UnsealedC until stop, checking a channel taken at generation g closes by g+1.
+// startConcurrentUnsealedCReaders starts n goroutines that, from start until
+// stop, call b.UnsealedC in a loop with no handshake against the transitions
+// that run meanwhile. gen is the number of completed transitions to unsealed
+// (Unseal or Initialize), stored by the transition goroutine once each one
+// returns. A channel taken open while gen read g after the call must be
+// closed once gen reaches g+1: the call ended before transition g+1
+// completed, so that transition's wake-up follows the call or the call saw
+// the barrier unsealed. Readers check this as they loop and record every open
+// channel they took.
 func startConcurrentUnsealedCReaders(ctx context.Context, t *testing.T, b *Barrier, n int, start, stop <-chan struct{}, gen *atomic.Int64, transitions int) *unsealedCReaders {
 	t.Helper()
 	r := &unsealedCReaders{openAt: make([]atomic.Int64, transitions+1)}

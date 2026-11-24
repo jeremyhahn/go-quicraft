@@ -65,7 +65,21 @@ func (h *identityCapturingHandler) awaitIdentity(t *testing.T, d time.Duration) 
 	return h.identities[len(h.identities)-1]
 }
 
-// TestInboundPeerAuthCarriesConnectionIdentity checks PeerAuth.Identity comes from the connection, not the frame.
+// TestInboundPeerAuthCarriesConnectionIdentity pins the binding the entire
+// sender gate rests on.
+//
+// PeerAuth.Identity is what IsRemovedIdentity and the committed-sender check
+// consult; it is the fix for the msg.From quorum-forgery defect. Yet no test
+// asserted it was wired: all 41 PeerAuth references in this package's tests
+// are either `_ PeerAuth` in a handler signature or a literal `PeerAuth{}`
+// argument, so changing the construction site to `Identity: ""` left the suite
+// green. On a shard with committed identities that regression fails loudly, but
+// on an address-only shard it fails SILENTLY OPEN — a removed replica's
+// tombstone simply stops being enforced.
+//
+// The batch below carries an in-band From naming a DIFFERENT replica, so the
+// test also pins that the identity is taken from the connection rather than
+// from anything in the frame.
 func TestInboundPeerAuthCarriesConnectionIdentity(t *testing.T) {
 	h := newIdentityCapturingHandler()
 	recv, send, cleanup := transportPairWith(t, 42, h, newTestHandler())
@@ -95,7 +109,20 @@ func TestInboundPeerAuthCarriesConnectionIdentity(t *testing.T) {
 	_ = recv
 }
 
-// TestListenerRefusesUnauthenticatedClients checks a live listener refuses clients without valid certificates, judged on the server side.
+// TestListenerRefusesUnauthenticatedClients pins mandatory mTLS end to end.
+//
+// The existing coverage asserts on the struct FIELDS of the *tls.Config that
+// buildMTLSTLS returns — that ClientAuth is RequireAndVerifyClientCert, that
+// RootCAs is non-nil. That proves the config was built; it says nothing about
+// the config Start actually hands to Listen. Setting
+// serverTLS.ClientAuth = tls.NoClientCert at that call left every test in the
+// package passing, and no test anywhere dialled a live listener with a client
+// that genuinely lacks the property.
+//
+// NOTE on the QUIC subtlety this test is built around: under TLS 1.3 the
+// CLIENT finishes its handshake before the server has verified the client
+// certificate, so a successful dial does NOT mean admission. The verdict is
+// read from the server side — whether a batch reached the handler.
 func TestListenerRefusesUnauthenticatedClients(t *testing.T) {
 	mtls := testMTLSConfig(t)
 	h := newIdentityCapturingHandler()
@@ -123,7 +150,8 @@ func TestListenerRefusesUnauthenticatedClients(t *testing.T) {
 	tls12 := good.client.Clone()
 	tls12.MaxVersion = tls.VersionTLS12
 
-	// Control: a correctly configured peer is admitted.
+	// CONTROL FIRST: a correctly-configured peer IS admitted, so the negative
+	// cases below are verdicts rather than a blanket inability to connect.
 	before := h.countIdentities()
 	sender.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 2, To: 1}})
 	waitForCount(t, h, before+1, 5*time.Second, "the control peer was never admitted: every negative case "+
@@ -150,7 +178,10 @@ func TestListenerRefusesUnauthenticatedClients(t *testing.T) {
 	}
 }
 
-// dialAndWriteBestEffort dials with cfg and, if connected, writes one message frame; failures are expected.
+// dialAndWriteBestEffort attempts a QUIC dial with cfg and, if it connects,
+// writes one well-formed message frame. Every failure is expected for the
+// negative cases and is therefore not an assertion — the assertion is made on
+// the SERVER side by the caller.
 func dialAndWriteBestEffort(t *testing.T, cfg *tls.Config, target string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -200,7 +231,10 @@ func waitForCount(t *testing.T, h *identityCapturingHandler, want int, d time.Du
 	})
 }
 
-// peerVisibleCloseError returns the CONNECTION_CLOSE error the remote end sent.
+// peerVisibleCloseError returns the CONNECTION_CLOSE the REMOTE end sent for a
+// connection, which is the only place the reason phrase a peer actually
+// receives can be read. quic-go cancels the connection context with the close
+// error as its cause.
 func peerVisibleCloseError(t *testing.T, conn *quic.Conn, timeout time.Duration) *quic.ApplicationError {
 	t.Helper()
 	select {
@@ -221,13 +255,25 @@ func peerVisibleCloseError(t *testing.T, conn *quic.Conn, timeout time.Duration)
 	return appErr
 }
 
-// TestAuthorizationCloseReasonIsNotDisclosedToPeer checks the close reason phrase hides the verdict while the error code stays distinct.
+// TestAuthorizationCloseReasonIsNotDisclosedToPeer pins that an authorization
+// verdict is not written out to the peer in the CONNECTION_CLOSE reason phrase.
+//
+// The phrase travels verbatim — quic-go's PackApplicationClose copies
+// ErrorMessage straight onto the wire, and only TLS-alert (crypto) closes have
+// their reason stripped — so "peer certificate revoked" was the readable answer
+// to a question the peer should have to work for. The precise verdict is still
+// logged locally at each close site; only the wire copy is removed.
+//
+// The numeric application error code is deliberately still distinct per verdict
+// and is asserted, so this test also pins that the redaction did not go so far
+// as to make a policy close indistinguishable from a resource limit.
 func TestAuthorizationCloseReasonIsNotDisclosedToPeer(t *testing.T) {
 	t.Run("revoked", func(t *testing.T) {
 		t1, t2, cleanup := transportPairWithRevocation(t)
 		defer cleanup()
 
-		// t1 publishes the revocation, so read the close from t2's inbound connection.
+		// t1 dials t2 and is the side that will publish the revocation, so the
+		// peer-visible close is read from t2's INBOUND connection.
 		outbound, err := t1.getConnection(t2.Addr().String(), "")
 		if err != nil {
 			t.Fatalf("getConnection: %v", err)
@@ -261,7 +307,7 @@ func TestAuthorizationCloseReasonIsNotDisclosedToPeer(t *testing.T) {
 		sender.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 2, To: 1}})
 		awaitInboundConn(t, receiver)
 
-		// The peer-visible side is the sender's outbound connection.
+		// The peer-visible side is the SENDER's outbound connection.
 		outbound, err := sender.getConnection(receiver.Addr().String(), "")
 		if err != nil {
 			t.Fatalf("getConnection: %v", err)

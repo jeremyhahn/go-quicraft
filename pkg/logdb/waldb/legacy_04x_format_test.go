@@ -25,13 +25,26 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// Detection of 0.4.x on-disk data, which 0.5.x cannot read, by retired payload type bytes.
+// This file covers the detection of 0.4.x on-disk data, which 0.5.x cannot
+// read. The break itself was deliberate; going undetected was not. Detection is
+// per-record: the format version marker is pinned, so the payload type byte is
+// what separates a readable record from one written under a layout whose fields
+// have since moved. A retired byte is left unallocated and falls through to
+// ErrUnknownPayloadType rather than being misparsed.
 
 // retiredEntryHeaderSize is the entry record header 0.4.x wrote: the current
 // 84-byte header minus OwnerID, which 0.5.x inserted at +72.
 const retiredEntryHeaderSize = entryRecordHeaderSize - 8 // 76 bytes
 
-// retiredEntryRecord builds a 0.4.x single-entry record (type 0x07, 76-byte header) whose command would misparse cleanly under the current layout.
+// retiredEntryRecord builds a single-entry record exactly as 0.4.x wrote it:
+// payload type 0x07, a 76-byte header, then the command.
+//
+// The command is chosen so the record MISPARSES SILENTLY rather than being
+// caught as corruption. The current decoder takes CmdLen from +80, which lands
+// four bytes into a retired-format record's command; with those bytes naming len(cmd)-8 the
+// misparse consumes the record exactly, so every length check passes and the
+// entry is stored. That is the case the payload-type gate exists for — a
+// record that fails a length check was never the dangerous one.
 func retiredEntryRecord() []byte {
 	cmd := make([]byte, 24)
 	copy(cmd, "ABCD")
@@ -39,7 +52,11 @@ func retiredEntryRecord() []byte {
 	copy(cmd[8:], "PAYLOAD-PAYLOAD!")
 
 	rec := make([]byte, 1+retiredEntryHeaderSize+len(cmd))
-	// The literal retired byte, not a constant, so the test fails if a constant moves back to it.
+	// The LITERAL retired byte, deliberately not a named constant.
+	// A fixture built from the constant follows it wherever it is moved, so it
+	// would keep passing if the current format were pointed back at 0x07 --
+	// which is precisely the collision this file exists to prevent. Pinning the
+	// on-disk value is what makes the test able to fail.
 	rec[0] = 0x07
 	binary.LittleEndian.PutUint64(rec[1:], 1)   // shardID
 	binary.LittleEndian.PutUint64(rec[9:], 2)   // replicaID
@@ -68,9 +85,20 @@ func newReplayShard() *walShard {
 	}
 }
 
-// TestRetiredSnapshotPayloadTypeRejected checks a 0.4.x snapshot record is refused as an unknown payload type.
+// TestRetiredSnapshotPayloadTypeRejected pins the snapshot gate.
+//
+// The snapshot record carried the same unallocated change: 0.5.x grew the
+// membership section's session policy tail from three fields to four without
+// moving payloadTypeSnapshot, so a 0.4.x record's RemovedIdentities map begins
+// eight bytes before the current decoder looks for it. Before the payload type
+// was allocated this fixture reached replaySnapshot and came back
+// ErrTruncatedSnapshotRecord — a corruption diagnosis, sending an operator to
+// look for a damaged disk when the answer is a wiped data directory.
 func TestRetiredSnapshotPayloadTypeRejected(t *testing.T) {
-	// Each retired snapshot layout; 0x0a has a three-field session policy, 0x0c four fields without WireVersion.
+	// Each retired snapshot layout: base header, zero fpLen, membership
+	// section with its version byte, the fixed region, six empty map counts
+	// and the policy tail that layout wrote. 0x0a wrote a THREE-field session
+	// policy; 0x0c wrote the four-field policy without the WireVersion.
 	for _, retired := range []struct {
 		typ      byte
 		tailSize int
@@ -80,7 +108,8 @@ func TestRetiredSnapshotPayloadTypeRejected(t *testing.T) {
 	} {
 		payload := make([]byte,
 			1+snapshotRecordBaseSize+membershipFixedSize+6*4+retired.tailSize)
-		// The literal retired byte; see retiredEntryRecord.
+		// The LITERAL retired byte -- see the note in retiredEntryRecord for why a
+		// fixture built from a constant cannot fail.
 		payload[0] = retired.typ
 		binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
 		binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
@@ -106,11 +135,17 @@ func TestRetiredSnapshotPayloadTypeRejected(t *testing.T) {
 	}
 }
 
-// TestRetiredStatePayloadTypeRejected checks a 40-byte 0x02 hard-state record without VoteWindow is refused as unknown.
+// TestRetiredStatePayloadTypeRejected pins that a hard-state record in the
+// 40-byte layout released builds wrote under 0x02 — Term, Vote and Commit,
+// without the VoteWindow a leader's read lease may be relying on — is refused
+// as an unknown record rather than reported as a truncated one. A current
+// replica recovering from it would come up owing no vote window, which is the
+// safety property the field exists to carry across a restart, so it must not
+// be read at all: the remedy is to wipe the directory and re-sync.
 func TestRetiredStatePayloadTypeRejected(t *testing.T) {
 	const legacyStateRecordSize = stateRecordSize - 8 // 40 bytes
 	payload := make([]byte, 1+legacyStateRecordSize)
-	// The literal retired byte; see retiredEntryRecord.
+	// The LITERAL retired byte -- see the note in retiredEntryRecord.
 	payload[0] = 0x02
 	binary.LittleEndian.PutUint64(payload[1:], 1)   // shardID
 	binary.LittleEndian.PutUint64(payload[9:], 1)   // replicaID
@@ -134,7 +169,24 @@ func TestRetiredStatePayloadTypeRejected(t *testing.T) {
 	})
 }
 
-// TestA04xDirectoryIsRefusedByRecordNotByVersion checks a 0.4.x directory passes the version marker and is refused by the record payload types.
+// TestA04xDirectoryIsRefusedByRecordNotByVersion pins WHERE detection lives.
+//
+// walFormatVersion is deliberately held at 1 for the whole pre-release period,
+// and 0.4.x recorded 1 as well, so the marker gate cannot tell the two apart —
+// a 0.4.x directory passes it. That is intentional, not an oversight, and it
+// makes the record-level payload types the ONLY thing standing between a 0.4.x
+// directory and a silent misparse. This test asserts both halves, because the
+// first half is what makes the second load-bearing: if someone bumps the
+// constant later, the marker gate starts catching this fixture first and the
+// record gate stops being exercised by it.
+//
+// The second half is also the test of the entry gate. While 0x07 still named
+// the current entry format, this fixture replayed with a nil error and stored
+// an entry whose OwnerID was the record's own CmdLen concatenated with the
+// first four bytes of its command, and whose command was the last sixteen
+// bytes of the real one. OwnerID is the session-admission grouping key every
+// replica must agree on, and the command goes to the state machine, so the
+// accepted-and-wrong outcome is worse than any rejection.
 func TestA04xDirectoryIsRefusedByRecordNotByVersion(t *testing.T) {
 	const legacyWALFormatVersion uint32 = 1
 
@@ -180,9 +232,18 @@ func TestA04xDirectoryIsRefusedByRecordNotByVersion(t *testing.T) {
 	}
 }
 
-// TestPayloadTypesAreDistinct checks every live and retired payload type byte is distinct.
+// TestPayloadTypesAreDistinct pins the invariant whose violation caused all of
+// this: 0.5.x changed the entry and snapshot layouts and REUSED the payload
+// types 0.4.x had written, so the two generations were indistinguishable on
+// disk. A byte serves as a format discriminator only while it names one format,
+// and a superseded byte therefore stays reserved forever rather than being
+// recycled. Sweeping every constant is what makes this an invariant rather than
+// an assertion about the pair that happened to collide.
 func TestPayloadTypesAreDistinct(t *testing.T) {
-	// Live constants plus every retired byte as a literal.
+	// Live constants, plus every retired byte as a LITERAL. The retired values
+	// are not named in the source precisely so they cannot be used, so this is
+	// the one place they are written down -- and writing them as literals is
+	// what lets this test catch a live constant being pointed back at one.
 	types := map[string]byte{
 		"payloadTypeState":     payloadTypeState,
 		"payloadTypeBootstrap": payloadTypeBootstrap,
@@ -207,7 +268,9 @@ func TestPayloadTypesAreDistinct(t *testing.T) {
 				"read as a 0.5.x one", name, other, b)
 		}
 		seen[b] = name
-		// 0x00 is what a keyed WAL decodes to without a barrier; it stays unallocated.
+		// 0x00 is what every record decodes to when a KEYED WAL is opened with
+		// no barrier, and replayRecord's default case leans on that. Allocating
+		// it would turn a fail-stop into a plausible record.
 		if b == 0x00 {
 			t.Fatalf("%s is 0x00, which is reserved as the no-barrier misdecode "+
 				"sentinel", name)
@@ -215,7 +278,14 @@ func TestPayloadTypesAreDistinct(t *testing.T) {
 	}
 }
 
-// TestEntryRecordIsWrittenWithCurrentPayloadType checks the entry payload type byte on disk.
+// TestEntryRecordIsWrittenWithCurrentPayloadType pins the WRITE side of the
+// entry rename, against the bytes on disk.
+//
+// Pointing the reader at a new byte while the writer kept stamping the old one
+// would make every newly written WAL unreadable by the build that wrote it, and
+// nothing shows it until a restart — so the assertion is on the segment, not on
+// the constants. The snapshot write site has the same assertion already, in
+// TestSnapshotRecordCarriesMembershipVersionByte.
 func TestEntryRecordIsWrittenWithCurrentPayloadType(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -249,7 +319,12 @@ func TestEntryRecordIsWrittenWithCurrentPayloadType(t *testing.T) {
 	}
 }
 
-// TestEntryAndSnapshotRoundTripAcrossReopen checks current records round-trip across a reopen.
+// TestEntryAndSnapshotRoundTripAcrossReopen is the positive control for the
+// whole file: the new payload bytes are written, read back, and every field
+// survives a close and a replay.
+//
+// Without it the gates above would pass just as well against a build that
+// refused everything, including its own records.
 func TestEntryAndSnapshotRoundTripAcrossReopen(t *testing.T) {
 	dir := t.TempDir()
 	db, err := Open(dir, WithNoSync(true), WithBlockSize(1024), WithMaxFileSize(64*1024))
@@ -325,7 +400,21 @@ func TestEntryAndSnapshotRoundTripAcrossReopen(t *testing.T) {
 	}
 }
 
-// TestPayloadTypesAreThePublishedBytes checks each live payload type equals its published literal byte.
+// TestPayloadTypesAreThePublishedBytes pins each live payload type to the
+// literal byte 0.5.1-alpha wrote, which is the half TestPayloadTypesAreDistinct
+// cannot cover.
+//
+// Distinctness only refuses a constant pointed back at a RETIRED byte. Moving
+// one onto a fresh unallocated byte — 0x0d, say — keeps every constant distinct,
+// keeps writer and reader agreeing with each other, and passes
+// TestEntryRecordIsWrittenWithCurrentPayloadType, because that test looks the
+// record up BY the constant. What it breaks is the thing no in-process test
+// touches: a WAL written by a released build is refused by the next one with
+// ErrUnknownPayloadType, and the shard cannot start.
+//
+// The expected values are written as literals rather than derived from the
+// constants for the reason the retired list is: a fixture built from the
+// constant follows it wherever it moves and can never fail.
 func TestPayloadTypesAreThePublishedBytes(t *testing.T) {
 	published := []struct {
 		name string

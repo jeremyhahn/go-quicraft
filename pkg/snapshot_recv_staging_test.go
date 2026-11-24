@@ -26,7 +26,10 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// seedCanonicalSnapshot writes a complete artifact into snapshot-<index> without recording it in LogDB.
+// seedCanonicalSnapshot writes a complete artifact into the canonical
+// snapshot-<index> directory through the fixture's filesystem, WITHOUT
+// recording it in LogDB — the shape a transfer that wrote its files and then
+// failed leaves behind, and the shape a same-index re-send routinely meets.
 func seedCanonicalSnapshot(t *testing.T, f *recvFixture, index uint64, content []byte) string {
 	t.Helper()
 	dir := f.snapDir(index)
@@ -59,7 +62,20 @@ func recvStageDirs(f *recvFixture, index uint64) []string {
 	return out
 }
 
-// TestSnapshotReceive_FailedTransferDoesNotDestroyTheExistingArtifact: a receive stages in its own directory and never removes one it found.
+// TestSnapshotReceive_FailedTransferDoesNotDestroyTheExistingArtifact is the
+// regression guard for the destructive receive.
+//
+// A receive that opened snapshot.dat in the CANONICAL snapshot-<index>
+// directory with O_CREATE|O_TRUNC, before a single received byte had been
+// authenticated, and whose failure defer called RemoveAll on that same
+// directory would be destructive. Same-index re-sends are routine and supported
+// — msg.Hint carries a transfer sequence precisely to disambiguate them — so a
+// re-send that failed anywhere in the write would truncate and then DELETE a
+// complete artifact the receive had not created.
+//
+// The receive uses the discipline ImportSnapshot uses: stage in a directory
+// this receive created, publish with one rename, and never remove a directory
+// it merely found.
 func TestSnapshotReceive_FailedTransferDoesNotDestroyTheExistingArtifact(t *testing.T) {
 	f := newRecvFixture(t, createTestBarrier(t))
 	const index, term = uint64(1700), uint64(4)
@@ -91,7 +107,13 @@ func TestSnapshotReceive_FailedTransferDoesNotDestroyTheExistingArtifact(t *test
 	}
 }
 
-// TestSnapshotReceive_PublishesAtomicallyOverAnUnrecordedDirectory: a same-index re-send succeeds and never exposes a partial artifact.
+// TestSnapshotReceive_PublishesAtomicallyOverAnUnrecordedDirectory pins the
+// other half: a re-send whose destination already exists must still SUCCEED,
+// and the canonical name must never be visible holding a partial artifact.
+//
+// Refusing the collision (which is what ImportSnapshot does) would be wrong
+// here: a leader re-sending after its ack timeout is normal operation, and a
+// receive that refuses it leaves the follower permanently behind.
 func TestSnapshotReceive_PublishesAtomicallyOverAnUnrecordedDirectory(t *testing.T) {
 	f := newRecvFixture(t, createTestBarrier(t))
 	const index, term = uint64(1701), uint64(4)
@@ -137,14 +159,25 @@ func TestSnapshotReceive_PublishesAtomicallyOverAnUnrecordedDirectory(t *testing
 	}
 }
 
-// TestSnapshotReceive_RefusesToPublishOverTheRecordedSnapshot: the publish never replaces the directory LogDB records.
+// TestSnapshotReceive_RefusesToPublishOverTheRecordedSnapshot pins the
+// fail-closed guard on the publish.
+//
+// The publish clears its destination before renaming. Doing that to the
+// artifact LogDB currently RECORDS would leave the record pointing at nothing:
+// the shard cannot start, and every leader re-send is answered by the dedup
+// branch out of a record that names a deleted directory — a permanent wedge
+// with no self-heal. The dedup branch means this is normally unreachable, so
+// the guard is reached here by recording a snapshot whose Filepath is the
+// destination while the recorded INDEX is below it, which is the disagreement
+// a lost or rolled-back LogDB record produces.
 func TestSnapshotReceive_RefusesToPublishOverTheRecordedSnapshot(t *testing.T) {
 	f := newRecvFixture(t, createTestBarrier(t))
 	const index, term = uint64(1702), uint64(4)
 	preexisting := []byte("the artifact LogDB currently points at")
 	dataPath := seedCanonicalSnapshot(t, f, index, preexisting)
 
-	// LogDB names the destination at a lower index, so the dedup branch does not fire.
+	// LogDB names the destination directory but at a LOWER index, so the dedup
+	// branch (existing.Index >= snapshotIndex) does not fire.
 	if err := f.ldb.SaveSnapshot(f.shardID, f.replicaID, logdb.Snapshot{
 		Index:    index - 1,
 		Term:     term,
@@ -174,7 +207,16 @@ func TestSnapshotReceive_RefusesToPublishOverTheRecordedSnapshot(t *testing.T) {
 // The LogReader snapshot must describe the artifact, not just locate it
 // ---------------------------------------------------------------------------
 
-// TestRecoverLogReader_CarriesTheArtifactDescription: the LogReader's snapshot carries every field of the durable record.
+// TestRecoverLogReader_CarriesTheArtifactDescription pins that the snapshot
+// StartShard hands the raft LogReader carries the DURABLE record's full
+// description of the artifact.
+//
+// The LogReader's copy is what the SEND path reads when this replica becomes
+// leader and ships the snapshot on (forEachSnapshotChunk reads snap.OnDiskIndex
+// and snap.Epoch straight out of it), and it is what the commit pipeline
+// converts back into a LogDB record on the receiving side. A field dropped in
+// this one literal is therefore a field the FOLLOWER records wrong: a snappy
+// artifact announced as uncompressed is fed to its state machine as garbage.
 func TestRecoverLogReader_CarriesTheArtifactDescription(t *testing.T) {
 	const shardID, replicaID = uint64(41), uint64(1)
 

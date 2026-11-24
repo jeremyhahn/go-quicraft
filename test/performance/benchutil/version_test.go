@@ -21,7 +21,9 @@ import (
 	"testing"
 )
 
-// TestProjectVersionIsTheVersionFile checks the build stamp wins, else the root VERSION file.
+// TestProjectVersionIsTheVersionFile pins the two sources and their order:
+// the build-time stamp wins, and without it the VERSION file at the
+// repository root is what a benchmark records -- never a placeholder.
 func TestProjectVersionIsTheVersionFile(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "VERSION"))
 	if err != nil {

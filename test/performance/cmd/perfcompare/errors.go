@@ -150,7 +150,9 @@ func (e *DockerRunError) Unwrap() error { return e.Err }
 // bury the summary it is meant to be.
 const maxDiagnosticLines = 40
 
-// verdictPrefixes are the line prefixes naming the failed benchmark or how the binary died.
+// verdictPrefixes are the line prefixes that carry the VERDICT: which benchmark
+// failed, or how the binary died. These are what an operator reads first and
+// the summary must never be without them.
 var verdictPrefixes = []string{
 	"--- FAIL",
 	"FAIL",
@@ -175,7 +177,16 @@ type diagLine struct {
 	verdict bool
 }
 
-// extractDiagnostic returns the FAIL, error and panic lines from a failed benchmark's output, keeping verdicts first.
+// extractDiagnostic pulls the lines that explain a benchmark container failure
+// out of its output: the FAIL markers, the b.Fatalf / b.Errorf messages that
+// precede them, and any panic. Benchmark result rows are dropped.
+//
+// The budget is spent on verdicts first. `go test` prints every relayed message
+// BEFORE the "--- FAIL:" that names the benchmark, so a summary that simply kept
+// the first maxDiagnosticLines matches would cut off at exactly the line the
+// operator needed: a run that logged 40 tolerated propose errors would report 40
+// propose errors and no verdict at all. Detail lines are dropped to make room
+// for verdicts, never the reverse.
 func extractDiagnostic(output string) []string {
 	var verdicts, details []diagLine
 	truncated := false

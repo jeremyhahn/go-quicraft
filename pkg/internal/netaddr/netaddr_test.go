@@ -67,7 +67,11 @@ func TestCanonicalHost_MatchesVerifyHostnameSemantics(t *testing.T) {
 	}
 }
 
-// TestCanonical_PreservesThePort: Canonical normalises the spelling but keeps the port, so co-located replicas stay distinct.
+// TestCanonical_PreservesThePort is the property that keeps co-located replicas
+// working. Two replicas on one machine at different ports are a supported
+// deployment and genuinely distinct endpoints, so the address canonicaliser must
+// normalise the SPELLING without collapsing the port — which is exactly what
+// distinguishes it from CanonicalHost.
 func TestCanonical_PreservesThePort(t *testing.T) {
 	if Canonical("node-b.example.com:5001") == Canonical("node-b.example.com:5002") {
 		t.Fatal("Canonical collapsed two ports on one host: co-located replicas would " +

@@ -20,7 +20,10 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// reencryptBatchBytes bounds each re-encryption read batch; a var so tests can lower it.
+// reencryptBatchBytes bounds the per-iteration byte size when streaming a
+// node's log entries during re-encryption, keeping peak memory flat regardless
+// of log length. A var (not const) so tests can lower it to exercise the
+// multi-batch streaming path without writing 64 MiB of entries.
 var reencryptBatchBytes uint64 = 64 << 20 // 64 MiB
 
 // ReencryptError wraps a failure during WAL re-encryption, naming the failed
@@ -39,14 +42,85 @@ func (e *ReencryptError) Error() string {
 // Unwrap returns the underlying error.
 func (e *ReencryptError) Unwrap() error { return e.Err }
 
-// SnapshotReencryptFunc re-encrypts a node's host-owned snapshot data file between barriers and returns the destination epoch; it is called once per node with a snapshot.
+// SnapshotReencryptFunc re-encrypts a node's snapshot DATA FILE from the source
+// barrier to the destination barrier and returns the destination at-rest epoch
+// to record in the migrated snapshot metadata. The snapshot data file lives
+// OUTSIDE the WAL — in the host/engine snapshot directory, in a host-defined
+// frame format sealed by the host's seal.Barrier — so only the layer that owns
+// those files can re-encrypt them. waldb owns LogDB records (entries, hard
+// state, bootstrap, and snapshot METADATA) and copies those itself.
+//
+// It is invoked once per node that has a snapshot. Returning an error aborts the
+// migration. It may be nil only when no barrier is involved on either side
+// (plaintext-to-plaintext) or when no node has a snapshot; otherwise Reencrypt
+// fails closed with ErrSnapshotReencryptRequired.
 type SnapshotReencryptFunc func(shardID, replicaID uint64, snap logdb.Snapshot) (dstEpoch uint64, err error)
 
-// ErrSnapshotReencryptRequired is returned when a snapshot must be re-encrypted but no SnapshotReencryptFunc was given.
+// ErrSnapshotReencryptRequired is returned when a node has a snapshot that must
+// be re-encrypted during migration (a barrier is involved on at least one side)
+// but no SnapshotReencryptFunc was provided. Reencrypt fails closed rather than
+// copy snapshot metadata whose data file is still sealed under the source
+// barrier — which the destination, opened under a different barrier, cannot
+// decrypt (silent, unrecoverable snapshot loss).
 var ErrSnapshotReencryptRequired = errors.New(
 	"waldb: reencrypt: snapshot data file re-encryption required but no SnapshotReencryptFunc provided")
 
-// Reencrypt copies the LogDB at srcDir (read via srcBarrier) into an empty dstDir (written via dstBarrier) node by node, hard state last, and returns the node count; opts apply to both sides, and srcDir may be repaired by recovery.
+// Reencrypt re-encrypts an entire WAL/LogDB at srcDir — read through srcBarrier
+// — into a freshly-opened LogDB at dstDir written through dstBarrier, returning
+// the number of Raft nodes (shard/replica pairs) copied.
+//
+// It performs a logical copy through the public LogDB surface: for every node it
+// reproduces the bootstrap record, the most recent snapshot metadata (which
+// carries cluster membership), the compaction floor, the full live log-entry
+// range in bounded batches, and finally the hard state. The source LogDB
+// decrypts each record under srcBarrier and the destination encrypts under
+// dstBarrier, so WAL records are byte-for-byte identical at the Raft level while
+// their at-rest encryption changes.
+//
+// The hard state is written LAST on purpose: each step is independently fsynced
+// and the destination WAL recovers at a record prefix, so a crash mid-migration
+// can only lose the state while keeping the entries, never recover a commit
+// index past the last durable entry. See reencryptNode.
+//
+// Snapshot DATA FILES are NOT WAL records and live outside this layer. When a
+// barrier is involved, snapFn (provided by the host) re-encrypts each node's
+// snapshot file and reports the destination epoch recorded in the migrated
+// metadata. If snapFn is nil but a node has a snapshot, Reencrypt fails closed
+// with ErrSnapshotReencryptRequired — it never copies snapshot metadata pointing
+// at a source-sealed file the destination cannot decrypt.
+//
+// Either barrier may be nil for a plaintext side. dstDir must be empty; the
+// caller verifies the result and performs the atomic directory swap, so a
+// partial run never changes the Raft-visible content of the source.
+//
+// Closing the DESTINATION is part of the migration and its failure is reported
+// (ReencryptError, Op "close-dest"). DB.Close flushes, truncates and closes
+// every shard's active segment, so a swallowed error here would return "the
+// migration succeeded" for a rekey whose newly written WAL was never completed
+// on disk — and the caller's next act is to swap that directory into place.
+//
+// The source is NOT opened read-only: Open runs full crash recovery on
+// srcDir, which may repair a corrupt segment tail, discard orphaned segments
+// above it, create a new active segment and fsync the directory. That is the
+// same recovery any normal Open would perform, and it never removes records
+// that a normal Open would have replayed — but srcDir is modified on disk, so
+// the caller must not treat it as byte-for-byte immutable across a run.
+//
+// opts are the same options Open takes and are applied to BOTH sides, which is
+// what makes a non-default geometry migratable at all: opening the source with
+// the default block size when it was written with another is refused outright
+// by Open's WALFORMAT check (a WAL written with WithBlockSize could not be
+// re-encrypted AT ALL), and opening the destination with the default would
+// produce a migrated directory the caller's own configuration then rejects on
+// the next Open. One option set for both sides makes the destination a
+// geometry-faithful copy by construction, and a block size that disagrees with
+// what srcDir records still fails closed, naming both values — Reencrypt is
+// not the one path in this package where a wrong geometry is silently
+// accepted. Pass the SAME options the node normally opens its WAL with.
+//
+// The srcBarrier and dstBarrier parameters are applied after opts and are
+// authoritative: a WithBarrier in opts cannot override the side-specific
+// barrier the caller named explicitly.
 func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier WALBarrier, snapFn SnapshotReencryptFunc, opts ...Option) (count int, err error) {
 	srcOpts := make([]Option, 0, len(opts)+1)
 	srcOpts = append(srcOpts, opts...)
@@ -57,7 +131,9 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 	if err != nil {
 		return 0, &ReencryptError{Op: "open-source", Err: err}
 	}
-	// The source close error is discarded; nothing in it needs to survive.
+	// The SOURCE is a read path: it was opened only so its records could be
+	// listed and decrypted, and nothing this call did needs to survive in it.
+	// Its close error is genuinely uninteresting and stays discarded.
 	defer closeReencryptSource(src)
 
 	dstOpts := make([]Option, 0, len(opts)+1)
@@ -69,14 +145,22 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 	if err != nil {
 		return 0, &ReencryptError{Op: "open-dest", Err: err}
 	}
-	// Report a destination close failure without masking an earlier error.
+	// The DESTINATION close is NOT: DB.Close flushes, truncates and closes every
+	// shard's active segment and reports the first failure, so discarding it
+	// returns (count, nil) — "the migration succeeded" — for a rekey whose newly
+	// written WAL could not be completed on disk. The operator then swaps that
+	// directory into place. Report it instead, without masking an error the
+	// migration itself already produced.
 	defer func() {
 		if cerr := dst.Close(); cerr != nil && err == nil {
 			err = &ReencryptError{Op: "close-dest", Err: cerr}
 		}
 	}()
 
-	// Copy retirements first, in one registry write, so removed replica IDs stay retired.
+	// Retirements first: the retired-replica registry is what keeps a
+	// removed replica ID from ever being started again
+	// (logdb.LogDB.NodeRemoved), and a migration that dropped it would hand
+	// the ID back. Carried in one registry write however many there are.
 	if err := dst.retireNodes(src.removedNodes()); err != nil {
 		return 0, &ReencryptError{Op: "retire-nodes", Err: err}
 	}
@@ -96,7 +180,14 @@ func Reencrypt(srcDir string, srcBarrier WALBarrier, dstDir string, dstBarrier W
 	return count, nil
 }
 
-// closeReencryptSource closes the source and removes the empty segments Open created in it.
+// closeReencryptSource closes the source DB of a Reencrypt and leaves its
+// directory as it found it. Open's ensureActiveSegment creates a fresh,
+// empty segment in every shard it opens; a plain Close would keep those
+// files, so a migration that must not write to its source would leave one
+// new segment per shard behind. closeAfterFailedOpen closes each shard and
+// unlinks exactly the segment that open created, and only while it holds
+// no records, which a read-only source never gives it. DB.Close then
+// finds every shard already closed and releases the directory lock.
 func closeReencryptSource(src *DB) {
 	for _, s := range src.shards {
 		if s != nil {
@@ -118,14 +209,21 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 		}
 	}
 
-	// Snapshot metadata first, since it carries the membership; ErrNoSnapshot is not a failure.
+	// Snapshot metadata FIRST — it carries the membership that ReadState
+	// reports, so it must exist before the state is read back on recovery. A node
+	// that has never snapshotted (e.g. a young shard whose log fits in the live
+	// range) legitimately has none; ErrNoSnapshot is not a failure.
 	if snap, err := src.GetSnapshot(ni.ShardID, ni.ReplicaID); err != nil {
 		if !errors.Is(err, logdb.ErrNoSnapshot) {
 			return &ReencryptError{Op: "get-snapshot", Err: err}
 		}
 	} else if snap.Index > 0 || snap.Term > 0 {
 		dstSnap := snap
-		// Re-encrypt the snapshot data file through the hook and record the destination epoch.
+		// The snapshot DATA FILE is host-owned and sealed under the source
+		// barrier. When a barrier is involved it must be re-encrypted via the
+		// caller's hook and the resulting destination epoch recorded; copying
+		// the metadata as-is would leave the destination pointing at a
+		// source-sealed file it cannot decrypt.
 		if barrierInvolved {
 			if snapFn == nil {
 				return &ReencryptError{Op: "snapshot-reencrypt", Err: ErrSnapshotReencryptRequired}
@@ -141,7 +239,10 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 		}
 	}
 
-	// Carry the compaction floor so reads below it return ErrCompacted.
+	// Compaction floor. Without carrying the marker, the destination's
+	// compactedTo stays 0 and a post-migration request below the true floor
+	// would fail as a log gap (or, before that guard existed, be served as
+	// a silently shifted range) instead of returning ErrCompacted.
 	if compactedTo, err := src.CompactedTo(ni.ShardID, ni.ReplicaID); err != nil {
 		return &ReencryptError{Op: "compacted-to", Err: err}
 	} else if compactedTo > 0 {
@@ -150,12 +251,23 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 		}
 	}
 
-	// Entries before the hard state, so a crash never recovers a commit past the last entry.
+	// Live log entries, streamed in bounded batches, BEFORE the hard state.
+	// Each SaveState call is independently fsynced, so the destination WAL's
+	// record order is this call order, and the WAL truncates at a prefix. Every
+	// entry record therefore becomes durable before the state record naming the
+	// commit index that covers it. Writing the state first would invert exactly
+	// the invariant writeEntries preserves for a normal Update: a crash midway
+	// through a migration would leave dstDir recovering CLEANLY with
+	// HardState.Commit = N over a log that ends at k < N -- a commit index past
+	// the last entry, which nothing in waldb cross-validates on reopen. The
+	// state is a single small record, so it costs nothing to write it last.
 	if err := streamEntries(src, dst, ni); err != nil {
 		return err
 	}
 
-	// Hard state last, in its own batch.
+	// Hard state LAST, in its own batch so a large entry log does not have to
+	// be buffered alongside it, and so a torn tail can only lose the state
+	// while keeping the entries -- never the reverse.
 	if state, _, stateErr := src.ReadState(ni.ShardID, ni.ReplicaID); stateErr == nil {
 		upd := logdb.Update{ShardID: ni.ShardID, ReplicaID: ni.ReplicaID, State: state}
 		if err := dst.SaveState([]logdb.Update{upd}); err != nil {
@@ -166,7 +278,12 @@ func reencryptNode(src, dst *DB, ni logdb.NodeInfo, barrierInvolved bool, snapFn
 	return nil
 }
 
-// streamEntries copies a node's live entries from src to dst in bounded batches, one SaveState each.
+// streamEntries copies a node's entire live log-entry range from src to dst in
+// bounded batches, writing each batch as its OWN SaveState. Peak memory stays
+// flat regardless of log length, and no single destination WAL record can exceed
+// the segment size limit. The prior implementation accumulated the entire live
+// log into one slice and emitted one SaveState, which on a multi-segment log
+// allocated the whole log and could fail with ErrSegmentFull or OOM.
 func streamEntries(src, dst *DB, ni logdb.NodeInfo) error {
 	first, length, err := src.EntryRange(ni.ShardID, ni.ReplicaID)
 	if err != nil {

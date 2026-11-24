@@ -204,7 +204,10 @@ func waitForDragonboatLeader(nh *dragonboat.NodeHost, shardID uint64, timeout ti
 func BenchDragonboatPropose(b *testing.B, nh *dragonboat.NodeHost, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
-	// The outer context must exceed the longest benchtime.
+	// The outer context must comfortably exceed the longest benchtime: it
+	// parents every per-op context, so an outer deadline shorter than the
+	// measured loop (e.g. 30s at BENCHTIME=30s) expires mid-run and fails
+	// every remaining proposal. Matches the cluster variants.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -357,7 +360,12 @@ func BenchDragonboatCommitLatency(b *testing.B, nh *dragonboat.NodeHost, rec *pe
 	requireFloor(b, "proposals", completed, errored)
 }
 
-// BenchDragonboatElection measures StartReplica plus waitForLeader per iteration on a NodeHost created once, over primed ring shard IDs.
+// BenchDragonboatElection benchmarks the Raft election algorithm time,
+// excluding NodeHost infrastructure setup (TLS cert generation, gRPC
+// transport initialization). The NodeHost is created once outside the
+// timed loop; only StartReplica + waitForLeader is measured per iteration.
+// primeElectionRing bootstraps every ring shard ID before the timer starts, so
+// each timed iteration restarts an existing group (see electionShardRing).
 func BenchDragonboatElection(b *testing.B, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
@@ -465,7 +473,8 @@ func BenchDragonboatConcurrentProposeFixed(b *testing.B, nh *dragonboat.NodeHost
 				elapsed := time.Since(start)
 				if err != nil {
 					if !tolerable(err) {
-						// A goroutine must not touch b; keep the first permanent error.
+						// A goroutine must not touch b. Keep the FIRST
+						// permanent error; the parent fails on it after Wait.
 						permanent.CompareAndSwap(nil, &err)
 						return
 					}
@@ -513,7 +522,16 @@ func (c *BenchCluster) Leader() *dragonboat.NodeHost {
 	return c.Hosts[c.LeaderIdx]
 }
 
-// seed writes key through the current leader with the warmup retry budget, re-resolving each attempt, and updates LeaderIdx.
+// seed writes key through the cluster's CURRENT leader before a read
+// benchmark times reads of it, on the warmup retry budget, re-resolving the
+// leader before every attempt. The cluster was warm a moment ago, but a
+// 3-node shard on a large host can lose its leader between the warmup and
+// the first benchmark, and dragonboat does not forward: a proposal
+// addressed to the deposed leader sits for its whole 10s and reports
+// "timeout", which would take the run down with it. The retry treats that
+// the way the propose loops treat every other transient, and LeaderIdx is
+// updated so the loop that follows reads from the leader the seed actually
+// landed on.
 func (c *BenchCluster) seed(b *testing.B, key []byte) {
 	b.Helper()
 	cmd := makeKVCmd(key)
@@ -534,7 +552,12 @@ func (c *BenchCluster) seed(b *testing.B, key []byte) {
 	}
 }
 
-// freeTCPPort reserves a loopback address outside the ephemeral range via benchutil.ReserveTCPPort.
+// freeTCPPort reserves a loopback address for a Dragonboat transport listener.
+// Dragonboat binds by address rather than by inherited listener, so the port
+// has to be chosen before the NodeHost exists; benchutil.ReserveTCPPort picks
+// one from outside the kernel's ephemeral range so no outbound connection can
+// be assigned it in the gap. See benchutil/port.go for the failure this
+// replaced.
 func freeTCPPort(b testing.TB) string {
 	b.Helper()
 	return benchutil.MustReserveTCPPort(b.Fatalf)
@@ -555,7 +578,16 @@ func nodeHostConfig(dir, addr string, cert tlsCertBundle) dbconfig.NodeHostConfi
 	}
 }
 
-// electionShardRing is how many shard IDs the election benchmarks rotate through, bounding Tan's per-shard disk use.
+// electionShardRing is how many shard IDs the election benchmarks rotate
+// through. Tan gives every shard/replica pair its own database with a 64 MiB
+// preallocated log file that neither StopShard nor RemoveData deletes, so a new
+// shard ID per iteration fills the disk (about 300 MiB per 5-node iteration).
+// Reusing one ID is not possible either: StopShard unloads the node
+// asynchronously and StartReplica refuses the ID until it has. A ring bounds the
+// disk to electionShardRing databases per replica and returns to an ID only
+// after many iterations, long after its unload finished. An iteration that
+// reuses an ID restarts the replicas from their log and runs a fresh election,
+// as the QuicRaft harness does with its single shard ID.
 const electionShardRing = 16
 
 // electionShardID returns the shard ID for election benchmark iteration i.
@@ -563,7 +595,21 @@ func electionShardID(i int) uint64 {
 	return dbShardID + uint64(i%electionShardRing)
 }
 
-// primeElectionRing runs one untimed election cycle per ring shard ID before the timer starts, retrying ErrShardAlreadyExist.
+// primeElectionRing runs one untimed election cycle for every ring shard ID:
+// start the replica on every host, wait for a leader, stop the shard. It runs
+// before the election benchmarks reset their timer, so Tan's per-shard database
+// creation (including its 64 MiB log preallocation) and the first-ever
+// bootstrap of each group stay out of the measurement, and every timed
+// iteration restarts an existing group, as the QuicRaft harness restarts its
+// one shard ID.
+//
+// StopShard returns before the engine has unloaded the node, and StartReplica
+// refuses the ID with ErrShardAlreadyExist until it has. Every ID here is fresh,
+// so that cannot happen while priming; the start is still retried on that error
+// rather than assumed. The timed loop does not retry: the ring order puts
+// electionShardRing-1 other cycles between a stop and the next start of the
+// same ID, and a start that still collides fails the run loudly instead of
+// folding a wait into the measurement.
 func primeElectionRing(b *testing.B, hosts []*dragonboat.NodeHost,
 	members map[uint64]dragonboat.Target, createFn dbsm.CreateStateMachineFunc) {
 	b.Helper()
@@ -661,7 +707,12 @@ func SetupDragonboatCluster(b *testing.B, numNodes int) *BenchCluster {
 		b.Fatalf("leader election failed: %v", err)
 	}
 
-	// Warm up before timing; a warmup that never succeeds is fatal.
+	// Warm up so all TLS connections are fully established before timing
+	// begins. The retry budget is benchutil's, shared with every other engine,
+	// and a warmup that never succeeds is fatal HERE. Swallowing it would hand
+	// an unready cluster to the caller, to surface later as a misleading
+	// downstream error such as "seed propose failed: request dropped as the
+	// shard is not ready" instead of naming the setup that had already failed.
 	if err := warmupShard(hosts[leaderIdx], dbShardID); err != nil {
 		for _, h := range hosts {
 			h.Close()
@@ -703,7 +754,12 @@ func waitForDragonboatClusterLeader(hosts []*dragonboat.NodeHost, shardID uint64
 // Multi-Node Cluster Benchmark Functions
 // ---------------------------------------------------------------------------
 
-// BenchDragonboatElectionCluster measures multi-node election time with MutualTLS, restarting replicas on the next ring shard ID per iteration.
+// BenchDragonboatElectionCluster benchmarks leader election time for a
+// multi-node cluster with MutualTLS. NodeHost infrastructure (TLS, gRPC
+// transport) is created once outside the timed loop, and primeElectionRing
+// bootstraps every ring shard ID before the timer starts. Each iteration
+// restarts replicas on all hosts with the next ring shard ID, waits for leader
+// election, records the elapsed time, and stops the shard on all hosts.
 func BenchDragonboatElectionCluster(b *testing.B, numNodes int, rec *perfresult.LatencyRecorder) {
 	b.Helper()
 
@@ -836,7 +892,9 @@ func BenchDragonboatProposeCluster(b *testing.B, cluster *BenchCluster, rec *per
 		completed++
 		rec.Record(elapsed)
 	}
-	// Check the error count, or a run where every proposal failed passes.
+	// This loop tolerates errors and counts them, and the count must be
+	// checked, or a run in which EVERY proposal failed reports zero samples
+	// and passes clean.
 	requireFloor(b, "proposals", completed, errored)
 }
 
@@ -875,7 +933,8 @@ func BenchDragonboatConcurrentProposeFixedCluster(b *testing.B, cluster *BenchCl
 				elapsed := time.Since(start)
 				if err != nil {
 					if !tolerable(err) {
-						// A goroutine must not touch b; keep the first permanent error.
+						// A goroutine must not touch b. Keep the FIRST
+						// permanent error; the parent fails on it after Wait.
 						permanent.CompareAndSwap(nil, &err)
 						return
 					}
@@ -1020,13 +1079,62 @@ func BenchDragonboatStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *p
 // maxProposeErrorRate is the share of a propose loop's iterations that may fail before its latencies are not published.
 const maxProposeErrorRate = 0.20
 
-// minProposeSample is the attempt count below which only the zero-completions check applies.
+// minProposeSample is the number of attempts below which the floor withholds
+// judgement instead of applying a rate.
+//
+// Go's benchmark runner invokes every benchmark first with b.N=1, and only
+// launches the larger calibrated runs if that invocation returns without
+// failing. At b.N=1 the sequential loops make ONE proposal and the concurrent
+// helper makes eight (one per goroutine), so a single transient refusal is a
+// 100% or 12.5% error rate -- and a rate-based floor would call b.Fatal on the
+// calibration probe and abort the whole benchmark before it measured anything.
+// That is the exact failure this file was changed to remove, arriving by a
+// different door.
+//
+// A rate is not meaningful over a handful of attempts anyway. Below this many,
+// the floor applies only the zero-completions check (a probe that could not
+// propose at all IS a real failure and should stop calibration) and lets the
+// calibrated run, with thousands of attempts, be the one that is judged.
 const minProposeSample = 100
 
-// tolerable reports whether err is transient (dragonboat.IsTempError) so the loop may count and continue.
+// tolerable reports whether err is transient Raft weather a benchmark loop may
+// count and continue past, as opposed to a real result that must stop the run.
+//
+// Counting EVERY error would let a permanent failure -- ErrPayloadTooBig,
+// ErrRejected, ErrInvalidSession, a state-machine failure -- at 5% be
+// published as a clean run with a note. The distinction is the one test/proposer already draws and
+// documents: a retry loop may absorb only the conditions that clear on their
+// own, because those are the only ones re-trying can change the answer to.
+// Everything else is the engine answering, and the benchmark must report it.
+//
+// dragonboat.IsTempError is the library's own classification -- "worth
+// retrying with the exact same input" -- and it covers the two transient
+// failures actually observed: ErrShardNotReady and ErrTimeout.
 func tolerable(err error) bool { return dragonboat.IsTempError(err) }
 
-// requireFloor fails the benchmark unless enough proposals completed for the latencies to mean anything.
+// requireFloor fails the benchmark unless enough of its proposals
+// completed for the recorded latencies to mean anything.
+//
+// # Why this exists at all
+//
+// Calling b.Fatalf on the FIRST error, under a 5-second per-proposal deadline,
+// would let one transient "request dropped as the shard is not ready" destroy
+// a whole run, so the Dragonboat baseline could not be measured at all on a
+// host carrying ordinary CI load. Those are precisely the conditions a
+// benchmark must not treat as failures.
+//
+// # Why a floor and not merely tolerance
+//
+// Tolerance alone replaces a loud failure with a silent one. The concurrent
+// loop already counted its errors and logged them -- and would have reported
+// ZERO successful proposals as a clean pass, because nothing checked. A
+// benchmark that publishes percentiles over no samples is worse than one that
+// crashes, since the number reaches a comparison table.
+//
+// So both halves are here: a transient error does not abort the run, and a
+// run that failed to measure the thing it exists to measure fails loudly and
+// says which of the two it was. This is the shape linearizability's
+// minSuccessfulReads floor already uses in the integration suites.
 func requireFloor(b *testing.B, op string, completed, errored int) {
 	b.Helper()
 	note, fatal := proposeFloorVerdict(op, completed, errored)
@@ -1039,7 +1147,12 @@ func requireFloor(b *testing.B, op string, completed, errored int) {
 	b.Log(note)
 }
 
-// proposeFloorVerdict returns requireFloor's message and whether it is fatal; empty means clean.
+// proposeFloorVerdict is requireFloor's decision, separated from the
+// *testing.B it reports through so the thresholds can be tested at their
+// boundaries rather than only exercised by a 30-minute benchmark run.
+//
+// It returns the message to report and whether it is fatal; an empty message
+// means the loop was clean and there is nothing to say.
 func proposeFloorVerdict(op string, completed, errored int) (string, bool) {
 	attempted := completed + errored
 	if attempted == 0 {

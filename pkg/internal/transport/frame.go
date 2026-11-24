@@ -22,7 +22,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Frame layout: [Magic:2 "QC" | Version:1 | Flags:1 | Length:4 big-endian, max 16MB | Payload].
+// Wire format constants for the transport frame protocol.
+//
+// Frame layout: [Magic:2 | Version:1 | Flags:1 | Length:4 | Payload:Length]
+//
+// Magic:   0x51 0x43 ("QC" for QuicRaft)
+// Version: 0x01
+// Flags:   bitfield for compression, batching hints, etc.
+// Length:  uint32 big-endian, max 16MB
+// Payload: serialized proto.MessageBatch or other data
 const (
 	// MagicByte0 is the first byte of the frame magic ("Q").
 	MagicByte0 byte = 0x51
@@ -30,10 +38,16 @@ const (
 	// MagicByte1 is the second byte of the frame magic ("C").
 	MagicByte1 byte = 0x43
 
-	// WireVersion is the frame header version, pinned at 1 before release; receivers require an exact match.
+	// WireVersion is the frame header's wire format version. Like every other
+	// format in this repository it is PINNED at 1 for the whole pre-release
+	// period: a layout change is made in place and every peer is rebuilt, so
+	// the number does not move for it. Receivers gate on EXACT equality; see
+	// ValidateFrameHeader and docs/compatibility/architecture.md.
 	WireVersion byte = 0x01
 
-	// PreviousWireVersion is the previous minor's frame version, equal to WireVersion until a release moves it.
+	// PreviousWireVersion is the previous MINOR's frame version, the second
+	// member of the accept set. It equals WireVersion until a release moves
+	// WireVersion (see proto.PreviousWireVersion).
 	PreviousWireVersion byte = WireVersion
 
 	// MaxFrameSize is the maximum allowed frame payload size (16MB).
@@ -48,25 +62,65 @@ const (
 	// Buffers larger than this are left for GC to prevent pool pollution.
 	maxPoolBufSize = 256 * 1024
 
-	// batchFramingReserve is frame headroom for the MessageBatch header and per-message framing.
+	// batchFramingReserve is headroom reserved inside a frame for the
+	// MessageBatch header (BinVer, DeploymentID, SourceEpoch, SourceAddress,
+	// request count) and the per-message framing that sits on top of the raw
+	// entry payload bytes a replication batch is sized against.
 	batchFramingReserve = 64 * 1024
 )
 
-// MaxReplicationPayloadBytes is the largest raw entry payload one replication batch may carry in one frame; Config.MaxApplyEntrySize must be clamped to it.
+// MaxReplicationPayloadBytes is the largest raw entry payload a single
+// replication batch may carry and still fit in one transport frame.
+//
+// A message above this bound cannot be framed and is DROPPED by the send path:
+// raft does not advance the follower's next index, so it rebuilds the identical
+// oversized message on every replicate cycle and the follower can never catch
+// up (no backoff, no batch-size reduction, and no snapshot fallback because the
+// entries are still present). Configuration that sizes replication batches —
+// raft's maxReplicationPayload, i.e. Config.MaxApplyEntrySize — MUST be clamped
+// to this bound.
+//
+// This is only the BYTE half of the contract. proto.MaxEntriesPerMessage is the
+// other half: a byte-bounded batch of small entries still exceeds the decoder's
+// entry-count limit, with the same starvation outcome. Both must be enforced
+// where a replication message is built (see raft's limitEntryCount).
 const MaxReplicationPayloadBytes = int(MaxFrameSize) - FrameHeaderSize - batchFramingReserve
 
-// Fail the build if config.MaxReplicationPayloadBytes drifts from this value.
+// config.MaxReplicationPayloadBytes duplicates this value because this package
+// imports pkg/config (so config cannot import back). This assertion fails the
+// build if the two ever drift: config uses it to reject a MaxApplyEntrySize
+// that would make raft build replication batches this transport cannot frame.
 const _ = uint64(MaxReplicationPayloadBytes) - config.MaxReplicationPayloadBytes
 
-// Send-side admission: decide before writing whether a batch fits, sized on the uncompressed payload, splitting or dropping what cannot be framed.
+// Send-side framing admission control.
+//
+// A frame the peer will not accept is worse than no frame at all: the peer's
+// decoder rejects it and resets the stream, the sender reads that reset as a
+// generic write failure, and retrying the identical batch reproduces it
+// forever. The sender must therefore decide BEFORE writing whether a batch can
+// be carried, splitting what can be split and dropping (not retrying, and
+// never at the cost of the connection) what cannot.
+//
+// Sizing is done on the UNCOMPRESSED marshaled payload even though the wire
+// may carry a Snappy-compressed one. The receiver's MaxDecompressedSize is
+// itself capped at MaxFrameSize, so a payload that only fits after compression
+// is rejected on arrival with ErrDecompressedSizeLimitExceeded — checking the
+// compressed length alone (what MarshalFrame does) is not sufficient.
 
-// batchHeaderSize returns the marshaled size of an empty MessageBatch, the per-frame overhead.
+// batchHeaderSize returns the marshaled byte size of a MessageBatch carrying
+// no requests, i.e. the per-frame overhead every group of messages pays.
+// MessageBatch.Size() is the sum of this and each request's Size(), so a group
+// fits a frame exactly when headerSize + sum(Size()) <= MaxFrameSize.
 func batchHeaderSize(sourceAddress string) int {
 	header := proto.MessageBatch{SourceAddress: sourceAddress}
 	return header.Size()
 }
 
-// messageFrameError reports why msg of size n can never be framed, or nil.
+// messageFrameError reports why msg can never be delivered in a frame, given
+// its already-computed marshaled size, or nil if it can. The two conditions
+// are the wire limits the peer's decoder enforces: a message that violates
+// either is rejected by every peer, so emitting it can only destroy the stream
+// it is written to.
 func messageFrameError(msg *proto.Message, headerSize, size int) error {
 	if len(msg.Entries) > proto.MaxEntriesPerMessage {
 		return proto.ErrTooManyMessages
@@ -77,12 +131,24 @@ func messageFrameError(msg *proto.Message, headerSize, size int) error {
 	return nil
 }
 
-// messageFrameable reports whether msg can be framed at all.
+// messageFrameable reports whether msg can be carried by a frame at all. It is
+// the predicate form of messageFrameError, for the group scan, which ends a
+// group at an unframeable message rather than reporting the reason: the caller
+// takes that message as the next head and drops it there, once.
 func messageFrameable(msg *proto.Message, headerSize, size int) bool {
 	return messageFrameError(msg, headerSize, size) == nil
 }
 
-// sendableGroup returns how many leading msgs fit one frame and its payload size; it errors only when msgs[0] can never be framed.
+// sendableGroup returns how many of the leading messages in msgs marshal into
+// a single frame together, and the payload size that frame will have. The
+// group ends at the first message that would overflow the frame, at the first
+// message that can never be framed (the caller drops it as the next head), or
+// at proto.MaxMessagesPerBatch messages.
+//
+// It returns a non-nil error only when msgs[0] itself cannot ever be framed;
+// otherwise the count is >= 1, so a caller looping over the batch always makes
+// progress. Each message's size is computed once here and handed to the
+// marshal path, keeping the send hot path to a single sizing pass.
 func sendableGroup(headerSize int, msgs []proto.Message) (count, payload int, err error) {
 	size := msgs[0].Size()
 	if err := messageFrameError(&msgs[0], headerSize, size); err != nil {
@@ -181,7 +247,13 @@ func ValidateFrameHeaderWindow(buf []byte, w WireWindow) error {
 	if buf[0] != MagicByte0 || buf[1] != MagicByte1 {
 		return ErrInvalidMagic
 	}
-	// Accept exactly the set {FrameCurrent, FramePrevious}, not a range.
+	// A closed SET, not a range: {FrameCurrent, FramePrevious}, the
+	// rolling-upgrade window (docs/compatibility/engineering.md, "Rolling
+	// upgrade"), which has one member until a release moves WireVersion.
+	// Written as `buf[2] >= 1 && buf[2] <= WireVersion` the gate would
+	// silently WIDEN the moment the constant moves, which is the drift the
+	// pinning policy exists to prevent. A peer speaking any other dialect is
+	// refused outright rather than misparsed.
 	if !w.AcceptsFrame(buf[2]) {
 		return ErrUnsupportedVersion
 	}
@@ -192,7 +264,10 @@ func ValidateFrameHeaderWindow(buf []byte, w WireWindow) error {
 	return nil
 }
 
-// MarshalFrame writes a frame into buf and returns its length, or ErrBufferTooSmall or ErrPayloadTooLarge.
+// MarshalFrame marshals a complete frame (header + payload) into buf.
+// Returns the total number of bytes written (FrameHeaderSize + len(payload)).
+// Returns ErrBufferTooSmall if buf is too short, or ErrPayloadTooLarge if
+// the payload exceeds MaxFrameSize.
 func MarshalFrame(buf []byte, payload []byte, flags FrameFlags) (int, error) {
 	return marshalFrameAt(buf, payload, flags, WireVersion)
 }

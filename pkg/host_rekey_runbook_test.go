@@ -181,7 +181,12 @@ func assertReencryptLeftSource(t *testing.T, name string, before, after map[stri
 	}
 }
 
-// TestRekeyRunbook_NewBarrierServesOldBarrierRefuses runs the key-compromise runbook (docs/seal-barrier/user.md) against a real Host.
+// TestRekeyRunbook_NewBarrierServesOldBarrierRefuses runs the documented
+// root-key compromise runbook (docs/seal-barrier/user.md, "Respond to a key
+// compromise") against a real Host: data written under barrier A, copied
+// with waldb.Reencrypt and ReencryptSnapshotFile under barrier B, is served
+// by a Host on B and is unreadable under A, and the original directories are
+// left as they were.
 func TestRekeyRunbook_NewBarrierServesOldBarrierRefuses(t *testing.T) {
 	const (
 		shardID, replicaID uint64 = 1, 1

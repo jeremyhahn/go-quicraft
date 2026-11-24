@@ -40,7 +40,15 @@ const (
 	crossBuildCurve = tls.SecP256r1MLKEM768
 )
 
-// assertHandshakeCurves pins the FIPS list: SecP256r1MLKEM768, then the two NIST groups, and nothing with an X25519 half.
+// assertHandshakeCurves pins the FIPS build's list: the SecP256r1MLKEM768
+// hybrid, then the two approved NIST groups, and no group with an X25519 half.
+//
+// The absence check is the stronger of the two claims and the reason this file
+// exists. A list that merely deprioritised X25519 would still offer it, and
+// what the connection ends up using would depend on the peer — under
+// GODEBUG=fips140=only landing on it fails the handshake outright, so the
+// build must not be able to name it. X25519MLKEM768 is refused here too: the
+// module accepts it, but its classical half is the group this list keeps out.
 func assertHandshakeCurves(t *testing.T, role string, curves []tls.CurveID) {
 	t.Helper()
 
@@ -63,7 +71,11 @@ func assertHandshakeCurves(t *testing.T, role string, curves []tls.CurveID) {
 	}
 }
 
-// TestFIPSOnlyNegotiatesHybrid shows a QUIC handshake offering only SecP256r1MLKEM768 completes under GODEBUG=fips140=only (make verify-fips).
+// TestFIPSOnlyNegotiatesHybrid is the evidence that SecP256r1MLKEM768 may lead
+// the FIPS list: a handshake offering it and nothing else completes, over
+// QUIC, inside the Go Cryptographic Module. make verify-fips runs this
+// package under GODEBUG=fips140=only, where a group the module does not
+// approve fails with `tls: no supported key exchange methods`.
 func TestFIPSOnlyNegotiatesHybrid(t *testing.T) {
 	t.Logf("crypto/fips140: enabled=%v version=%q", fips140.Enabled(), fips140.Version())
 

@@ -38,5 +38,13 @@ func TestInvalidModeError_Error(t *testing.T) {
 	}
 }
 
-// Compile-time check that *InvalidModeError implements error.
+// Compile-time proof that *InvalidModeError satisfies error. This replaces a
+// TestInvalidModeError_ImplementsError that did `var err error =
+// &InvalidModeError{...}` and then asserted `err != nil`: a non-nil pointer in
+// an interface is never nil, so the runtime half could not fail and the
+// assignment was the only real check. That check belongs here, and everything
+// else the test could have proved is already covered — the error message by
+// TestInvalidModeError_Error, and recovery through the error interface at the
+// production call sites that return it by TestFromString_InvalidMode and
+// TestMode_UnknownValueGuaranteesNothing in mode_test.go.
 var _ error = (*InvalidModeError)(nil)

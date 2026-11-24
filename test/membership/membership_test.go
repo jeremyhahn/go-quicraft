@@ -25,7 +25,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/membership"
 )
 
-// Mutation tests for the retry decision.
+// ---------------------------------------------------------------------------
+// Mutation tests for the retry decision
+//
+// These drive membership.Drive with scripted attempts and a scripted
+// membership, so every branch the idempotence gate turns on is pinned WITHOUT
+// a cluster or a loaded box. The two that define the line are
+// TestRetry_AlreadyExistsAtDifferentAddressStillFails (a fix that confirms the
+// replica ID without the address passes every other test and fails that one)
+// and the two *WithoutSubmissionStillFails tests (a fix that swallows the
+// refusal without the submission bit passes every other test and fails those).
+// ---------------------------------------------------------------------------
 
 // scriptedAttempt returns an attempt function that yields errs in order and
 // then repeats the last one, recording how many times it was called.
@@ -45,7 +55,14 @@ func fixedMembership(m *quicraft.Membership) func(context.Context) (*quicraft.Me
 	return func(context.Context) (*quicraft.Membership, error) { return m, nil }
 }
 
-// quicraftAlreadyExists and quicraftNodeNotFound reproduce the two engine refusals the gate handles.
+// quicraftAlreadyExists and quicraftNodeNotFound reproduce the two engine
+// refusals the gate is about.
+//
+// They are constructed by text rather than imported on purpose: the driver
+// deliberately does NOT branch on these identities. It decides from the
+// submission bit and a linearizable membership read, so any non-retryable
+// refusal exercises the same path these do, and a test that used the exported
+// sentinels would be pinning a dependency the driver does not have.
 func quicraftAlreadyExists() error {
 	return errors.New("raft: node already exists in membership")
 }
@@ -54,14 +71,18 @@ func quicraftNodeNotFound() error {
 	return errors.New("raft: target node not found in membership")
 }
 
-// postDeliveryNotLeader is the error for a config change already delivered when leadership moved.
+// postDeliveryNotLeader is the error the engine hands a caller whose config
+// change was ALREADY delivered to raft when leadership moved. Host builds
+// exactly this shape in OnLeaderChanged.
 func postDeliveryNotLeader() error {
 	return &quicraft.MaybeAppliedError{
 		Err: &quicraft.NotLeaderError{ShardID: 1, LeaderID: 2},
 	}
 }
 
-// preflightNotLeader is the refusal before anything is submitted; it is not evidence a change landed.
+// preflightNotLeader is the refusal produced BEFORE anything is submitted. It
+// is textually indistinguishable from postDeliveryNotLeader and must not be
+// treated as evidence that a change may have landed.
 func preflightNotLeader() error {
 	return &quicraft.NotLeaderError{ShardID: 1, LeaderID: 2}
 }
@@ -113,7 +134,12 @@ func scriptedMembership(m *quicraft.Membership, errs ...error) func(context.Cont
 	}
 }
 
-// TestRetry_AlreadyExistsWithAFailedReadKeepsLooking verifies an applied but unacknowledged add keeps the retry looking.
+// TestRetry_AlreadyExistsWithAFailedReadKeepsLooking is the applied-but-
+// unacknowledged add on a loaded cluster: the add is delivered and its wait
+// lost, the retry is refused "already exists" because the first add
+// committed, and the reads that would confirm it time out. A failed read
+// decides nothing, so the refusal must not fail the loop; the next read that
+// succeeds shows the add in effect.
 func TestRetry_AlreadyExistsWithAFailedReadKeepsLooking(t *testing.T) {
 	calls := 0
 	m := &quicraft.Membership{Nodes: map[uint64]string{11: "127.0.0.1:59436"}}
@@ -425,7 +451,9 @@ func TestIsRetryable(t *testing.T) {
 		{"shard not ready", quicraft.ErrShardNotReady, true},
 		{"context deadline", context.DeadlineExceeded, true},
 		{"context canceled", context.Canceled, true},
-		// The real sentinel: IsRetryable matches by sentinel, not text.
+		// The real sentinel, not a look-alike built from the same text.
+		// IsRetryable matches by sentinel, so a fixture that only LOOKS like
+		// a transfer refusal is correctly not retried.
 		{"leadership transfer in progress", quicraft.ErrTransferInProgress, true},
 		{"already exists", quicraftAlreadyExists(), false},
 		{"not found", quicraftNodeNotFound(), false},

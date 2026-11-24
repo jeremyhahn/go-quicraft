@@ -20,7 +20,20 @@ import (
 	"testing"
 )
 
-// Decode memory amplification: MaxDecodeMemoryFactor is what a receiver multiplies its wire-length reservation by to bound decoded memory.
+// ---------------------------------------------------------------------------
+// Decode memory amplification
+//
+// The transport reserves a frame's WIRE LENGTH against its aggregate
+// message-receive budget and then hands the bytes to MessageBatch.UnmarshalFrom,
+// whose result is materially larger than the bytes it came from. Nothing
+// measured that gap, so the budget bounded bytes READ while the heap held bytes
+// DECODED, and the two differed by nearly an order of magnitude for the frames
+// an attacker would choose.
+//
+// This is the measurement. MaxDecodeMemoryFactor is the contract it enforces:
+// what a receiver must multiply its reservation by for the budget to describe
+// memory rather than I/O.
+// ---------------------------------------------------------------------------
 
 // amplifyingFrames returns the densest MessageBatch encodings this format
 // admits, each paired with the shape it exercises. They are chosen for
@@ -112,7 +125,13 @@ func amplifyingFrames(t *testing.T) map[string][]byte {
 	return out
 }
 
-// TestDecodeMemoryAmplification enforces MaxDecodeMemoryFactor across the frames below.
+// TestDecodeMemoryAmplification is the enforcement of MaxDecodeMemoryFactor.
+//
+// It fails in exactly the case that matters: a decoder change that makes the
+// decoded form cost more per wire byte than a receiver was told to expect. A
+// clamped map size hint is the worked example — it measures 9.8x on the
+// membership-dense frame, so this test refuses it, and that frame is one of
+// the cases below.
 func TestDecodeMemoryAmplification(t *testing.T) {
 	for name, buf := range amplifyingFrames(t) {
 		t.Run(name, func(t *testing.T) {
@@ -139,7 +158,15 @@ func TestDecodeMemoryAmplification(t *testing.T) {
 	}
 }
 
-// TestGetMapSizesExactly checks getMap allocates one exactly-sized table rather than growing one.
+// TestGetMapSizesExactly pins the sizing that halves the amplification above:
+// the map is sized from the (already cross-checked) wire count in one
+// allocation, not clamped to a fixed hint and grown by rehashing.
+//
+// It asserts the OBSERVABLE consequence rather than the hint itself, because
+// the hint is not observable: a map built by doubling allocates its
+// intermediate tables too, so the decode's total allocation is roughly twice
+// the final map's. The threshold sits between the two — comfortably above one
+// exactly-sized table and comfortably below a table plus its growth history.
 func TestGetMapSizesExactly(t *testing.T) {
 	// Just past 7*128 slots: the worst point for a map that grows into its
 	// size, and unremarkable for one that is sized up front.

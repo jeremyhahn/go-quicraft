@@ -58,7 +58,16 @@ func corruptWALForRepair(t *testing.T, blockSize int) (string, *SegmentCorruptio
 	return dir, corrupt
 }
 
-// TestRepair_MakesAFailClosedWALOpenableAgain checks Repair makes a mid-segment fail-stop WAL openable.
+// TestRepair_MakesAFailClosedWALOpenableAgain is the availability half of the
+// mid-segment fail-stop.
+//
+// Refusing to open is the right call — truncating past records that reached the
+// medium would destroy acknowledged data — but it cannot be the ONLY outcome.
+// The condition is reachable from an ordinary power loss (a multi-block batch
+// issues one WriteAt per block before a single fdatasync, and writeback can
+// persist any subset of those pages), and "restore from peers" is no answer at
+// all for a single-node deployment. Without an explicit exit the node is simply
+// dead, permanently, with its data sitting right there on disk.
 func TestRepair_MakesAFailClosedWALOpenableAgain(t *testing.T) {
 	const blockSize = 1024
 	dir, corrupt := corruptWALForRepair(t, blockSize)
@@ -106,7 +115,14 @@ func TestRepair_MakesAFailClosedWALOpenableAgain(t *testing.T) {
 	}
 }
 
-// TestRepair_RefusesAnOffsetItDidNotComputeIsTheInterlock checks TruncateAt must confirm the offset the WAL named.
+// TestRepair_RefusesAnOffsetItDidNotComputeIsTheInterlock pins the guard that
+// makes the API safe to hand an operator: TruncateAt is a CONFIRMATION of the
+// offset the WAL named, never a free parameter.
+//
+// A repair that accepted any offset would let a mistyped or stale value cut the
+// segment at an arbitrary byte — leaving a half record at the end, and if the
+// cut landed above the real clean end, silently readmitting the corrupt region
+// on the next open.
 func TestRepair_RefusesAnOffsetItDidNotCompute(t *testing.T) {
 	const blockSize = 1024
 	dir, corrupt := corruptWALForRepair(t, blockSize)
@@ -200,7 +216,8 @@ func TestRepair_DeletesSegmentsAboveTheTruncation(t *testing.T) {
 	}
 }
 
-// walShardDirByIndex returns the directory of the shard at index (walShardDir hashes a Raft shard ID).
+// walShardDirByIndex returns the directory of the shard at the given INDEX
+// (walShardDir takes a Raft shard ID and hashes it).
 func walShardDirByIndex(root string, idx int) string {
 	return filepath.Join(root, shardDirName(idx))
 }
@@ -233,7 +250,19 @@ func TestRepair_RefusesTheWrongBlockSize(t *testing.T) {
 	}
 }
 
-// TestRepair_DirSyncFailureIsReported checks discardSegmentsAbove returns its directory fsync failure.
+// TestRepair_DirSyncFailureIsReported is the regression test for the dropped
+// error in discardSegmentsAbove.
+//
+// The directory fsync that makes the orphan unlinks durable must not be
+// logged and swallowed. Inside recover() a swallowed failure would be masked by
+// a second, fatal directory fsync a few lines later; Repair has no such
+// backstop. It would therefore return a RepairResult naming the segments it
+// had deleted while the deletions might never reach the medium — and a crash
+// would then resurrect segments holding CRC-valid records ABOVE the offset the
+// operator authorized truncating at, whose stale HardState replays and lets
+// the node vote twice in one term. That is precisely what the
+// directory fsync exists to prevent, reached through the one code path an
+// operator drives by hand.
 func TestRepair_DirSyncFailureIsReported(t *testing.T) {
 	const blockSize = 1024
 	dir, corrupt := corruptWALForRepair(t, blockSize)
@@ -278,7 +307,20 @@ func TestRepair_DirSyncFailureIsReported(t *testing.T) {
 	}
 }
 
-// TestRepair_DeletesOrphansBeforeCuttingTheSegment checks higher segments are deleted before the named one is truncated.
+// TestRepair_DeletesOrphansBeforeCuttingTheSegment pins the repair ORDER.
+//
+// Truncating the named segment first leaves it ending cleanly at a record
+// boundary — nothing left for recovery to detect — while the segments above it
+// still hold CRC-valid records. A crash there produces a recovery that replays
+// the truncated segment in full and then every segment above it, readmitting
+// exactly the records the operator authorized destroying, with a hole where the
+// cut was. Deleting high to low means every intermediate crash state is a valid
+// prefix: the named segment is still corrupt, so a re-run finds the same clean
+// end and does the same thing.
+//
+// The order is observed through the ONE point where the two steps can be told
+// apart: a truncation that cannot even open the segment file. The discard must
+// already have happened.
 func TestRepair_DeletesOrphansBeforeCuttingTheSegment(t *testing.T) {
 	const blockSize = 1024
 	dir, corrupt := corruptWALForRepair(t, blockSize)

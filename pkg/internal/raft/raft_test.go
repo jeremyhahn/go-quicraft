@@ -98,7 +98,12 @@ const testLeaseTick = time.Second
 // count the ack toward its lease (ackBacksLease).
 const testLeaseWindow = uint64(10 * testLeaseTick)
 
-// setTestLeaseClock gives r a real-time lease and a frozen clock moved only by advanceLeaseClock; the vote hold-down is anchored on it.
+// setTestLeaseClock gives r a real-time lease (testLeaseTick per tick) and
+// freezes its clock, so a test moves time only through advanceLeaseClock
+// and no lease expires because the test machine was slow. The vote
+// hold-down is re-anchored on the frozen clock, as if r had been
+// constructed at t0; passVoteHoldDown ends it. The anchor is set on every
+// shard, LeaseRead or not, so a hold-down that ignored the flag would show.
 func setTestLeaseClock(r *raft) {
 	r.setTickInterval(testLeaseTick)
 	t0 := time.Unix(1_700_000_000, 0)
@@ -128,7 +133,12 @@ func sendLeaseRound(r *raft) uint64 {
 	return r.leaseRound
 }
 
-// persistLog simulates the commit worker persisting every appended entry and re-evaluating commit, advancing savedTo.
+// persistLog simulates the engine's commit worker persisting every
+// appended entry and firing the persistence-edge commit re-evaluation
+// (the Peer.Commit contract). tryCommit counts the leader's own match
+// at its durable index (inmem.savedTo), so tests that drive the raft
+// struct directly must advance savedTo before commit can be observed —
+// exactly as the production pipeline does after SaveState+fsync.
 func persistLog(r *raft) {
 	last := r.log.lastIndex()
 	if last == 0 || last <= r.log.inmem.savedTo {
@@ -325,7 +335,15 @@ func electLeader(r *raft) {
 	r.drainMessages()
 }
 
-// TestRaft_CheckQuorum_NewWitnessGetsOneWindowOfGrace verifies a new witness defers CheckQuorum by one window without disabling it.
+// TestRaft_CheckQuorum_NewWitnessGetsOneWindowOfGrace reproduces #1103: a
+// one-replica leader that commits an AddWitness must not step down at the
+// very next CheckQuorum boundary merely because the witness has not had a
+// chance to answer yet. The new remote starts inactive, so without a grace
+// window the boundary right after the membership change sees 1 of 2 voters
+// active and the leader abdicates, failing the still-pending AddWitness with
+// ErrNotLeader. Worst case: the change lands one tick before the boundary.
+// The leader must still step down one full window later if the witness
+// never answers: the grace only defers CheckQuorum, it never disables it.
 func TestRaft_CheckQuorum_NewWitnessGetsOneWindowOfGrace(t *testing.T) {
 	r := newTestRaftWithMembers(1, map[uint64]string{1: "a"})
 	r.checkQuorum = true
@@ -595,7 +613,13 @@ func TestRaft_Election_PreVoteRejected(t *testing.T) {
 	}
 }
 
-// TestRaft_PreVoteReject_UsesResponderTerm verifies a PreVote rejection carries the responder's own term.
+// TestRaft_PreVoteReject_UsesResponderTerm is the regression test for the
+// PreVote term-inflation bug. It drives a real RequestPreVote through
+// handleVoteRequest on a follower that currently has an active leader, then
+// asserts the emitted rejection carries the responder's OWN term, not the
+// prospective (T+1) term. Echoing the prospective term on a rejection let the
+// pre-candidate advance its term and ultimately forced the legitimate leader
+// to step down.
 func TestRaft_PreVoteReject_UsesResponderTerm(t *testing.T) {
 	r := newTestRaft(1)
 	// Establish an active leader so the follower rejects pre-votes.
@@ -1467,7 +1491,14 @@ func TestRaft_HeartbeatResp_ClearsProbeSentAndRetriesAppend(t *testing.T) {
 	}
 }
 
-// TestRaft_HeartbeatResp_StalledReplicateFallsBackToProbe verifies a stalled replicate remote with unacked inflights falls back to probe on a heartbeat response.
+// TestRaft_HeartbeatResp_StalledReplicateFallsBackToProbe verifies that
+// when the leader is in replicate mode, has advanced next past lastIndex
+// (nothing more to send), but still has unacknowledged inflights, a
+// heartbeat response triggers a fallback to probe mode. This recovers
+// from the stall caused by the transport silently dropping Replicate
+// messages: the leader's next was optimistically advanced past what the
+// follower received, and entries(next, last+1) returns empty, preventing
+// resend. Probe mode resets next=match+1, clearing the stall.
 func TestRaft_HeartbeatResp_StalledReplicateFallsBackToProbe(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -1713,7 +1744,8 @@ func TestRaft_HeartbeatResp_ReadIndexRetryStateSendsAppend(t *testing.T) {
 	rm.becomeProbe()
 	rm.probeSent = false
 
-	// The leader must have issued the echoed context.
+	// The leader must have ISSUED the context the response echoes; see the
+	// sibling test above.
 	r.readIndexCtx = 99
 
 	// Send a HeartbeatResp with Hint > 0 (ReadIndex context) but remote
@@ -2511,7 +2543,14 @@ func TestRaft_HardState_ReflectsCommit(t *testing.T) {
 // Test: SnapshotStatus and Unreachable
 // ---------------------------------------------------------------------------
 
-// TestRaft_SnapshotStatus_AckTimeoutFallsBackToProbe verifies an unacknowledged transfer falls back to probe when the ack countdown expires, even while quiesced.
+// TestRaft_SnapshotStatus_AckTimeoutFallsBackToProbe verifies the liveness
+// fallback: a successful transfer report keeps the remote paused with the
+// ack countdown armed (snapshotAckWaitMultiplier x electionTimeout); if the
+// follower never acknowledges (crashed, or the ack was lost), the per-tick
+// countdown expires and the remote falls back to probe so the retry path
+// resumes. The countdown ticks even while the shard is quiesced — the whole
+// snapshot cycle can run under quiesce because none of its messages reset
+// the quiesce idle counter.
 func TestRaft_SnapshotStatus_AckTimeoutFallsBackToProbe(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -2536,7 +2575,9 @@ func TestRaft_SnapshotStatus_AckTimeoutFallsBackToProbe(t *testing.T) {
 		t.Fatalf("expected wait countdown %d, got %d", wait, rm.snapshotWaitTicks)
 	}
 
-	// Tick with quiesce active, one tick short of the timeout: still paused.
+	// Drive the countdown through tickLeader with quiesce ACTIVE to pin
+	// that the quiesce early-return cannot freeze it. One tick short of
+	// the timeout: still paused in snapshot state.
 	r.quiesce.active = true
 	for i := 0; i < wait-1; i++ {
 		tickLeader(r)
@@ -2577,7 +2618,12 @@ func TestRaft_SnapshotStatus_StaleTransferIgnored(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		// A stale status leaves the transfer backstop countdown unchanged.
+		// becomeSnapshot arms a transfer BACKSTOP (snapshotTransferTicks) so a
+		// lost SnapshotStatus cannot pause the peer forever. A stale status
+		// must therefore leave the countdown exactly at that backstop —
+		// unchanged — rather than at the ack-wait or retry value a fresh
+		// status would install. Asserting "unchanged" is sharper than the old
+		// "still zero": it distinguishes "ignored" from "armed by a status".
 		if rm.state != remoteSnapshot || rm.snapshotWaitTicks != snapshotTransferTicks {
 			t.Fatalf("stale status (reject=%v) must be ignored: state=%s waitTicks=%d (want %d)",
 				reject, rm.state, rm.snapshotWaitTicks, snapshotTransferTicks)
@@ -2585,7 +2631,11 @@ func TestRaft_SnapshotStatus_StaleTransferIgnored(t *testing.T) {
 	}
 }
 
-// TestRaft_SnapshotStatus_SameIndexResendDisambiguated verifies a late status from the first attempt at an index is ignored and the retry's honored.
+// TestRaft_SnapshotStatus_SameIndexResendDisambiguated pins the transfer
+// sequence: after an ack-timeout retry re-sends the SAME snapshot index,
+// the late status from the first attempt must be ignored, while the second
+// attempt's status is honored. The snapshot index alone cannot tell the
+// two attempts apart.
 func TestRaft_SnapshotStatus_SameIndexResendDisambiguated(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -2599,7 +2649,7 @@ func TestRaft_SnapshotStatus_SameIndexResendDisambiguated(t *testing.T) {
 	if rm.state != remoteProbe {
 		t.Fatalf("expected probe after attempt #1 expiry, got %s", rm.state)
 	}
-	// The retry re-sends the same index as attempt 2.
+	// ...and the retry re-sends the SAME index as attempt #2.
 	rm.becomeSnapshot(40, 2)
 
 	// The late status for attempt #1 arrives: same index, stale seq.
@@ -2785,7 +2835,12 @@ func TestRaft_LeaderProposeEnforcesWitnessPolicy(t *testing.T) {
 	})
 }
 
-// TestRaft_SnapshotStatus_NoResendWhileAwaitingAck verifies heartbeat responses do not un-pause a remote awaiting a snapshot ack.
+// TestRaft_SnapshotStatus_NoResendWhileAwaitingAck is the regression guard
+// for the duplicate-snapshot-send loop: after a successful transfer report,
+// heartbeat responses must NOT un-pause the remote into probing a follower
+// that is still restoring — the old behavior probed immediately, drew a
+// rejection whose hint backtracked next into compacted territory, and
+// re-streamed the full snapshot 3-4x per restore.
 func TestRaft_SnapshotStatus_NoResendWhileAwaitingAck(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -3437,7 +3492,23 @@ func TestRaft_TickFollower_QuiesceActiveTriggersElectionOnTimeout(t *testing.T) 
 	}
 }
 
-// TestRaft_TickFollower_CampaignsRatherThanQuiescing verifies a follower whose election timer expires campaigns; quiesce is leader-driven only.
+// TestRaft_TickFollower_CampaignsRatherThanQuiescing asserts that a follower
+// whose election timer expires CAMPAIGNS, and never suppresses that election
+// to enter quiesce on its own.
+//
+// This replaces TestRaft_TickFollower_EntersQuiesceAfterThreshold, which
+// exercised a self-quiesce path that has been removed. That path gated
+// startElection on quiesce.tryEnter() and returned when it fired, so a
+// follower that had heard nothing from a leader for a full election timeout
+// would skip the election and then run at 30x the timeout. The old test's own
+// comment documented that the counter was miscounted into near-irrelevance
+// ("we need to go through 100 election timeout cycles"), so it was asserting
+// the shape of dead code. Correcting the arithmetic would have activated the
+// hazard rather than removed it.
+//
+// Quiesce remains leader-driven: the leader enters it and broadcasts, and
+// followers enter through handleQuiesceMessage, gated on the local enabled
+// flag so a peer cannot impose it.
 func TestRaft_TickFollower_CampaignsRatherThanQuiescing(t *testing.T) {
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgQuiesce(1, 1)
@@ -3448,7 +3519,12 @@ func TestRaft_TickFollower_CampaignsRatherThanQuiescing(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Put the quiesce counter one short of its threshold directly.
+	// Put the quiesce counter one call short of its threshold, so the removed
+	// tryEnter call would fire on the very next election timeout. Driving the
+	// counter there with plain ticks is not possible in a reasonable loop --
+	// the old follower call site ran once per election timeout against a
+	// threshold measured in ticks, which is exactly the miscounting that made
+	// the path dead. Setting it directly is what gives this test power.
 	r.quiesce.tick = r.quiesce.threshold - 1
 
 	// Expire the election timer.
@@ -3770,7 +3846,7 @@ func TestRaft_Step_RejectedPreVoteRespFromHigherTermCausesStepDown(t *testing.T)
 	originalTerm := r.term
 	r.drainMessages()
 
-	// A rejected PreVoteResp from a higher term causes step-down.
+	// A REJECTED PreVoteResp from a higher term DOES cause step down.
 	err := r.step(proto.Message{
 		Type:   proto.RequestPreVoteResp,
 		From:   2,
@@ -3990,7 +4066,12 @@ func TestRaft_Witness_ReadIndexUsesElectionQuorum(t *testing.T) {
 }
 
 func TestRaft_Witness_ReadIndexRequiresElectionQuorum(t *testing.T) {
-	// Leader 1, remotes 2 and 3, witness 4: quorum 3, so ReadIndex needs one more ack than self and one remote.
+	// 4-node cluster: node 1 (leader), node 2 (remote), node 3 (remote),
+	// node 4 (witness). quorum = 3 (4 voting / 2 + 1).
+	// ReadIndex uses quorum because witnesses vote in elections
+	// and the leadership confirmation quorum must overlap with every
+	// possible election-winning coalition. One remote ack (self + remote2
+	// = 2) is insufficient; need one more ack from remote3 or witness4.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgPreVote(1, 1, false)
 	cfg.CheckQuorum = config.BoolPtr(false)
@@ -4934,7 +5015,16 @@ func TestRaftLog_Entries_LogDBReturnsError(t *testing.T) {
 // Test: log.lastTerm error path
 // ---------------------------------------------------------------------------
 
-// TestRaftLog_LastTerm_ReportsUnreadable verifies an unreadable last term reports not OK and isUpToDate refuses the vote.
+// TestRaftLog_LastTerm_ReportsUnreadable asserts that an unreadable last term
+// is reported as NOT OK rather than fabricated as 0, and that isUpToDate then
+// refuses the vote.
+//
+// Returning 0 on error would be a Leader Completeness hazard. Term 0 is
+// Raft's "no term" sentinel: fed to isUpToDate as our OWN last term it makes
+// every candidate compare as up to date, so a replica holding a committed
+// entry no other node has would vote for a candidate missing it. The
+// LogReader deliberately refuses to fabricate a zero term for exactly this
+// reason; this layer must not undo it.
 func TestRaftLog_LastTerm_ReportsUnreadable(t *testing.T) {
 	// A log whose last index resolves from neither inmem nor LogDB.
 	logdb := newTestLogReader(nil, proto.State{})
@@ -6339,7 +6429,10 @@ func TestReadIndex_UnknownReplicaAckIgnored(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestReadIndexBatching_SingleBroadcast(t *testing.T) {
-	// Four ReadIndex requests send one heartbeat per follower, and one response per follower with the latest ctx resolves all four.
+	// Setup: 3-node cluster with leader. Submit 4 ReadIndex requests, then
+	// flush. Verify only ONE heartbeat per follower (2 total, not 8).
+	// Send one HeartbeatResp from each follower with the LATEST ctx.
+	// Verify ALL 4 ReadIndex entries are resolved.
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
 	r.drainMessages()
@@ -6356,7 +6449,7 @@ func TestReadIndexBatching_SingleBroadcast(t *testing.T) {
 	r.drainMessages()
 	r.readStates = nil
 
-	// Submit four ReadIndex requests without flushing.
+	// Submit 4 ReadIndex requests WITHOUT flushing between them.
 	for i := 0; i < 4; i++ {
 		if err := r.step(proto.Message{
 			Type: proto.ReadIndex, Origin: proto.OriginLocal,
@@ -6389,7 +6482,7 @@ func TestReadIndexBatching_SingleBroadcast(t *testing.T) {
 	hbCtx := hbs[0].Hint
 	r.drainMessages()
 
-	// All heartbeats carry the latest ctx.
+	// All heartbeats should carry the LATEST ctx (the one from the 4th ReadIndex).
 	for i, hb := range hbs {
 		if hb.Hint != hbCtx {
 			t.Fatalf("heartbeat[%d] ctx mismatch: got %d, want %d", i, hb.Hint, hbCtx)
@@ -6484,7 +6577,8 @@ func TestReadIndexHeartbeatResp_ConfirmsEarlierCtx(t *testing.T) {
 		t.Fatalf("expected 3 pending reads, got %d", len(r.pendingReadIndex))
 	}
 
-	// One HeartbeatResp with the latest ctx confirms all three entries.
+	// Send ONE HeartbeatResp with the LATEST ctx (ctx[2]).
+	// The <= comparison should confirm all 3 entries at once.
 	if err := r.step(proto.Message{
 		Type: proto.HeartbeatResp,
 		From: 2,
@@ -6746,7 +6840,14 @@ func TestCampaign_PreVote_UsesTermPlusOne(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSendAppend_UsesMaxReplicationPayload(t *testing.T) {
-	// A 200-byte payload limit with 168-byte entries fits one entry per Replicate message.
+	// Create a raft as leader with a small maxReplicationPayload so that
+	// sendAppend cannot fit all entries into one Replicate message. Each
+	// Entry has a fixed 68-byte header plus Cmd bytes. We set the payload
+	// limit to 200 bytes and append entries with 100-byte commands, so
+	// each entry is 168 bytes. Two entries = 336 bytes > 200, meaning
+	// the second entry should be excluded from the first batch (but the
+	// first entry always fits because limitEntrySize includes at least
+	// one entry).
 	members := map[uint64]string{
 		1: "addr1",
 		2: "addr2",
@@ -7146,7 +7247,9 @@ func TestLeaseRead_InvalidatedOnLeadershipLoss(t *testing.T) {
 }
 
 func TestLeaseRead_RenewalOnHeartbeatAck(t *testing.T) {
-	// Heartbeat acks update remoteLastAck, dated by when the round was sent.
+	// Verify that heartbeat ack responses update remoteLastAck, which
+	// keeps the lease valid, and that the ack is dated by when its round
+	// was SENT rather than when it arrived.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
@@ -7290,7 +7393,13 @@ func TestLeaseRead_LeaseExpiresAfterTimeout(t *testing.T) {
 }
 
 func TestLeaseRead_PausedLeaderRefusesLease(t *testing.T) {
-	// A leader descheduled past the election timeout must not serve a lease read on resuming; the lease is dated by real time.
+	// Regression: a leader descheduled for longer than the followers'
+	// election timeout must not serve a lease read on resuming. Its ticker
+	// coalesced the missed ticks, so it resumes with at most one tick and
+	// acks that are fresh by any tick count; meanwhile the followers may
+	// have elected a new leader and committed past it. The lease is dated
+	// by real time since the acked round was sent, so the pause expires it
+	// and the read goes through the heartbeat quorum round.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
@@ -7391,7 +7500,9 @@ func TestLeaseRead_FreshLeaseWithinDurationIsHonoured(t *testing.T) {
 }
 
 func TestLeaseRead_RoundReusedWithinGranularity(t *testing.T) {
-	// Broadcasts within one granule share a round and its first send time.
+	// Broadcasts inside one granule share a round and keep its FIRST send
+	// time; a broadcast after the granule opens a new round. Reuse is what
+	// keeps the window from being flooded by per-step ReadIndex broadcasts.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
@@ -7546,7 +7657,11 @@ func TestLeaseRead_SingleNodeBypassesLeaseCheck(t *testing.T) {
 }
 
 func TestLeaseRead_RestoredAfterFailedLeaderTransfer(t *testing.T) {
-	// A transfer that times out before TimeoutNow restores remoteLastAck so lease reads resume.
+	// After a leader transfer times out WITHOUT having sent TimeoutNow —
+	// its target never caught up — the leader must restore remoteLastAck so
+	// lease reads can resume: nothing that could release a vote promise is
+	// in flight. (Once TimeoutNow has been sent, the lease is forfeit for
+	// the term; see TestLeaseRead_ForfeitForTheTermOnceTimeoutNowIsSent.)
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)
@@ -8033,7 +8148,22 @@ func TestLeaseRead_ElectionTickWrapResetsLeaseAcks(t *testing.T) {
 // replicaToBit 64-member guard
 // ---------------------------------------------------------------------------
 
-// TestBecomeLeader_RefusesTooManyVotingMembers verifies newRaft refuses a voting set beyond the 64-bit ackBits, failing the shard instead of panicking.
+// TestBecomeLeader_RefusesTooManyVotingMembers pins how an over-cap voting
+// set is refused.
+//
+// The ackBits bitfield is a uint64, so positions 0..63 are all there are, and a
+// 65th voting member cannot be tracked. Enforcing that with an assertion would
+// panic the raft STEP WORKER — a goroutine shared by every shard it owns, and
+// joined by Host.Close — over a fault confined to one shard. Because the
+// offending membership is durable, it would panic again on every restart, so
+// the node could not be brought up to repair it.
+//
+// The refusal happens at the constructor: newRaft will not build a replica
+// whose recovered configuration does not fit, so NewPeer returns the error and
+// StartShard fails this shard while the host stays up. becomeLeader keeps an
+// independent guard as a backstop (see
+// TestBecomeLeaderDeclinesOverCapVotingSet), but it is not reachable through
+// this path — there is no replica to campaign with.
 func TestBecomeLeader_RefusesTooManyVotingMembers(t *testing.T) {
 	// Create a membership with 65 voting members (self + 64 remotes).
 	members := make(map[uint64]string, 65)
@@ -8128,7 +8258,13 @@ func TestHasConfigChangeToApplyNoChanges(t *testing.T) {
 	}
 }
 
-// TestHasConfigChangeToApplyAllApplied verifies hasConfigChangeToApply returns false once processed reaches lastIndex.
+// TestHasConfigChangeToApplyAllApplied verifies that hasConfigChangeToApply
+// returns false via the early-return branch when processed >= lastIndex (every
+// entry has already been handed to the apply pipeline, so no config change can
+// still be waiting to take effect).
+//
+// The frontier is processed, not committed: membership takes effect in
+// Peer.Commit -> processConfigChanges, which lags r.log.committed.
 func TestHasConfigChangeToApplyAllApplied(t *testing.T) {
 	r := newTestRaft(1)
 	electLeader(r)
@@ -8147,7 +8283,9 @@ func TestHasConfigChangeToApplyAllApplied(t *testing.T) {
 	}
 }
 
-// TestHasConfigChangeToApplyCommittedNotApplied verifies a committed but unapplied config change still arms the gate.
+// TestHasConfigChangeToApplyCommittedNotApplied verifies the complement: a
+// config change that is COMMITTED but whose membership effect has not landed
+// yet must still arm the gate.
 func TestHasConfigChangeToApplyCommittedNotApplied(t *testing.T) {
 	r := newTestRaft(1)
 	electLeader(r)
@@ -8166,7 +8304,12 @@ func TestHasConfigChangeToApplyCommittedNotApplied(t *testing.T) {
 	}
 }
 
-// TestStartElectionWithUncommittedConfigChange verifies a follower with an uncommitted config change can start an election (Raft 5.2, 6).
+// TestStartElectionWithUncommittedConfigChange verifies that a follower
+// with an uncommitted config change entry CAN start an election. This is
+// the liveness fix: the Raft spec (Section 5.2, Section 6) does not block
+// elections based on uncommitted log content. Blocking elections here would
+// cause a permanent cluster stall if the leader crashes after replicating
+// an uncommitted config change to a majority.
 func TestStartElectionWithUncommittedConfigChange(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 
@@ -8294,7 +8437,12 @@ func TestHasConfigChangeToApplyCompressedEntry(t *testing.T) {
 // AppendEntries Pipelining
 // ---------------------------------------------------------------------------
 
-// TestSendAppendPipelining verifies sendAppend fills the inflight window with one Replicate per 168-byte entry under a 200-byte limit.
+// TestSendAppendPipelining verifies that sendAppend sends multiple Replicate
+// messages in a single call when the follower is far behind and the inflight
+// window has capacity. With a small maxReplicationPayload (200 bytes) and
+// entries of 168 bytes each (68-byte header + 100-byte Cmd), each batch fits
+// only one entry. With 5 entries to send, sendAppend should produce 5
+// Replicate messages filling the pipeline without waiting for acks.
 func TestSendAppendPipelining(t *testing.T) {
 	members := map[uint64]string{
 		1: "addr1",
@@ -9182,7 +9330,12 @@ func TestRaft_Witness_HeartbeatAckCountsForReadIndexQuorum(t *testing.T) {
 }
 
 func TestRaft_Witness_ReadIndexQuorum_WitnessAckSufficientSmallCluster(t *testing.T) {
-	// Leader 1, remote 2, witness 3: quorum 2, so a witness ack satisfies ReadIndex.
+	// Minimal cluster: node 1 (leader), node 2 (remote), node 3 (witness).
+	// quorum = 2 (3 voting / 2 + 1). Since witnesses vote in
+	// elections, witness ack correctly satisfies ReadIndex quorum:
+	// self(1) + witness(1) = 2 = quorum. This is safe because
+	// the leadership confirmation quorum overlaps with every possible
+	// election-winning coalition.
 	members := map[uint64]string{1: "addr1", 2: "addr2"}
 	cfg := raftTestCfgPreVote(1, 1, false)
 	cfg.CheckQuorum = config.BoolPtr(false)
@@ -9449,7 +9602,9 @@ func TestRaft_Witness_HeartbeatRespReplicateStateSkipsCorrectly(t *testing.T) {
 	// Advance witness to Replicate state.
 	r.witnesses[20].becomeReplicate()
 
-	// The leader must have issued the echoed context, or handleHeartbeatResp refuses it.
+	// The leader must have ISSUED the context the response echoes, or
+	// handleHeartbeatResp refuses it as a context no heartbeat of this
+	// leader's ever carried.
 	r.readIndexCtx = 42
 
 	// Send ReadIndex heartbeat response from witness (Hint > 0).
@@ -10966,7 +11121,32 @@ func TestRaft_FastBacktrack_ReplicateStateFallsBackToMatch(t *testing.T) {
 // Witnesses count toward the unified commit quorum
 // ---------------------------------------------------------------------------
 
-// newWitnessClusterRaft builds replica 1 of full replicas {1,2,3} plus the given witnesses, with PreVote and CheckQuorum disabled.
+// TestRaft_WitnessCountsTowardCommitQuorum_Unified is the regression guard for
+// the unified quorum: witnesses vote in elections, so they MUST also be counted toward
+// the commit quorum. Using a single unified quorum for both election and commit
+// is required for Leader Completeness — if the commit quorum excluded witnesses
+// (the old behavior), a commit set (a data-node minority) and an election-
+// winning set (data minority + witnesses) could be disjoint, letting a
+// candidate that never saw a committed entry win on witness votes and truncate
+// it.
+//
+// Cluster: 3 full replicas (1,2,3) + 2 witnesses (4,5) = 5 voting members.
+//   - quorum = 5/2+1 = 3
+//   - commit quorum  = 5/2+1 = 3 (UNIFIED — witnesses included)
+//
+// The old (buggy) model computed commit quorum as (3 data)/2+1 = 2, which let a
+// commit land on a data-node minority {leader, 1 data}. This test asserts the
+// corrected behavior:
+//
+//	(a) the unified quorum is 3 (not 2);
+//	(b) commit does NOT advance with only a data-node minority matching;
+//	(c) a witness metadata-ack legitimately contributes to a 3-node quorum
+//	    (alongside the leader's own data and one full replica's data), so the
+//	    committed entry's data is always present on a full-replica subset.
+//
+// newWitnessClusterRaft builds the canonical witness test fixture: a raft
+// node for replica 1 in a shard of 3 full replicas {1,2,3} plus witnesses
+// {4..3+witnesses}, with PreVote and CheckQuorum disabled.
 func newWitnessClusterRaft(tb testing.TB, witnesses int) *raft {
 	tb.Helper()
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
@@ -11018,7 +11198,8 @@ func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
 	// 3 full replicas + 2 witnesses.
 	r := newWitnessClusterRaft(t, 2)
 
-	// (a) Election and commit share one quorum over the full voting set.
+	// (a) Election and commit quorums are now the SAME unified value over the
+	// full voting set (remotes + witnesses + self).
 	eq := quorum(r.remotes, r.witnesses)
 	if eq != 3 {
 		t.Fatalf("expected quorum 3, got %d", eq)
@@ -11053,7 +11234,9 @@ func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
 	// already covers proposalIdx when the acks arrive.
 	persistLog(r)
 
-	// (b) Leader plus one full replica is below quorum 3 and must not commit.
+	// (b) A single full-replica ack (leader + remote 2 = 2 matches) is a
+	// MINORITY (< unified quorum of 3) and must NOT advance commit. Under a
+	// split quorum this would commit.
 	if err := r.step(proto.Message{
 		Type:     proto.ReplicateResp,
 		From:     2,
@@ -11068,7 +11251,10 @@ func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
 			r.log.committed, proposalIdx)
 	}
 
-	// (c) A witness ack makes quorum 3, with the data on two full replicas.
+	// (c) A witness metadata-ack brings the match count to 3 = unified quorum
+	// (leader's data + remote 2's data + witness 4's metadata). Commit advances,
+	// and the entry's DATA is present on two full replicas (leader and remote 2),
+	// so it can never be lost.
 	if err := r.step(proto.Message{
 		Type:     proto.ReplicateResp,
 		From:     4, // witness
@@ -11084,7 +11270,12 @@ func TestRaft_WitnessCountsTowardCommitQuorum_Unified(t *testing.T) {
 	}
 }
 
-// TestRaft_WitnessOnlyCommitQuorum verifies a commit can advance on leader plus witness acks; see docs/raft-consensus/engineering.md section 6.
+// TestRaft_WitnessOnlyCommitQuorum pins the documented durability trade-off
+// of the unified quorum: a commit CAN advance on {leader + witnesses} acks
+// alone, with the entry's payload held by the leader only. Deliberate,
+// matching dragonboat; see docs/raft-consensus/engineering.md Section 6. If this behavior
+// is ever changed (e.g. commits additionally gated on a full-replica
+// majority), update this test alongside the docs.
 func TestRaft_WitnessOnlyCommitQuorum(t *testing.T) {
 	// 3 full replicas + 2 witnesses; a membership the default
 	// RequireFullReplicaMajority policy allows (full 3 >= quorum 3).
@@ -11128,7 +11319,25 @@ func TestRaft_WitnessOnlyCommitQuorum(t *testing.T) {
 // Test: Figure 8 - previous-term entry must not be committed directly
 // ---------------------------------------------------------------------------
 
-// TestRaft_Figure8_PreviousTermEntryNotCommittedDirectly verifies a leader never commits a previous-term entry by counting replicas (Raft 5.4.2, figure 8).
+// TestRaft_Figure8_PreviousTermEntryNotCommittedDirectly recreates the
+// scenario from Section 5.4.2 (Figure 8) of the Raft paper. It verifies
+// that a leader does NOT commit entries from a previous term by counting
+// replicas alone. Only entries from the leader's current term can be
+// committed; once a current-term entry commits, all prior entries are
+// implicitly committed.
+//
+// The scenario:
+//  1. Leader S1 at term 2 has entry (index 2, term 2). S2 also has it.
+//  2. S1 crashes; S5 becomes leader at term 3, appends (index 2, term 3),
+//     but crashes before replicating.
+//  3. S1 restarts, becomes leader at term 4. S1 replicates (index 2, term 2)
+//     to S3, achieving majority {S1, S2, S3} for index 2. But the entry at
+//     index 2 is term 2, not the current term 4, so it must NOT be committed.
+//  4. If it were committed and S1 crashed, S5 could win at term 5 and
+//     overwrite index 2 with term 3, violating the safety property.
+//  5. Instead, S1 appends an entry at its own term (term 4) at index 3.
+//     Once that entry achieves majority and commits, index 2 is implicitly
+//     committed (all entries before a committed entry are committed).
 func TestRaft_Figure8_PreviousTermEntryNotCommittedDirectly(t *testing.T) {
 	// 5-node cluster: S1..S5. We operate from S1's perspective (replicaID=1).
 	members := map[uint64]string{
@@ -11294,7 +11503,12 @@ func TestRaft_Figure8_PreviousTermEntryNotCommittedDirectly(t *testing.T) {
 	}
 }
 
-// TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask verifies a config change is detected with extra type flags set, via EntryTypeMask.
+// TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask verifies that
+// handleLeaderPropose correctly detects a config change entry even when
+// additional type flags (e.g., EntryCompressFlag) are set in the upper
+// bits. Without masking via EntryTypeMask the comparison would fail,
+// allowing a second config change to be proposed while the first is
+// still pending.
 func TestRaft_HandleLeaderPropose_ConfigChangeWithTypeMask(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -11955,7 +12169,15 @@ func TestWitnessInReplicaToBitAndRemoteLastAck(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestQuiesceBlockedDuringLeaderTransfer(t *testing.T) {
-	// Quiesce is blocked while a leader transfer is active, so the transfer timer keeps running.
+	// When a leader transfer is active, quiesce entry must be blocked.
+	// Otherwise transferElapsed would never increment in the quiesce
+	// branch, causing the transfer timer to stall indefinitely.
+	//
+	// The quiesce threshold is electionTimeout * quiesceThresholdMultiplier
+	// = 10 * 10 = 100 ticks. The transfer timeout is electionTimeout = 10.
+	// During the first 10 ticks, the transfer is active and quiesce must
+	// be blocked. The quiesce inactivity counter must NOT advance while
+	// the transfer is active.
 	members := map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 	cfg := raftTestCfgQuiesce(1, 1)
 	cfg.PreVote = config.BoolPtr(false)

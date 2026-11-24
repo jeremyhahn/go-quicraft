@@ -19,7 +19,15 @@ import (
 	"crypto/cipher"
 )
 
-// StorageBackend is a context-aware string-keyed store an embedder can adapt to a StatePersister; the barrier never calls it, and its contract is pinned by a conformance test.
+// StorageBackend is a minimal context-aware interface for key-value storage
+// using string keys. go-qrdb's storage.Storage satisfies this via Go duck
+// typing (no circular deps).
+//
+// The barrier never calls this: it is a SHAPE, declared here so an embedder
+// that already has such a store can adapt it to a StatePersister in a few
+// lines. There is no field or option that installs one on a Barrier, and
+// nothing in this module implements it — which is also why the contract is
+// pinned by an executable conformance test rather than by prose alone.
 type StorageBackend interface {
 	// Get returns the data stored under key.
 	Get(ctx context.Context, key string) ([]byte, error)
@@ -35,17 +43,86 @@ type StorageBackend interface {
 	// stopping at the first error fn returns.
 	Scan(ctx context.Context, prefix string, fn func(key string, value []byte) error) error
 
-	// PutIfAbsent stores data under key only if absent, reporting whether it did; an error means the outcome is unknown. Atomic within the backend's consistency domain.
+	// PutIfAbsent atomically stores data under key only if key does not
+	// already exist. It returns stored=true when this call created the key,
+	// and stored=false (with a nil error) when the key already existed — in
+	// that case the store is unchanged. A non-nil error means the outcome is
+	// unknown and the caller must not assume either way.
+	//
+	// Atomicity is provided per consistency domain: single-process backends
+	// serialize the check-then-write internally (e.g., with a mutex), while
+	// distributed backends must use their native compare-and-set primitive
+	// (e.g., a Raft transaction) so the guarantee holds across nodes.
 	PutIfAbsent(ctx context.Context, key string, data []byte) (bool, error)
 
-	// CompareAndDelete removes key only while its value equals expected (nil matches only an empty value), reporting whether it did; a mismatch is not an error. Encrypting backends guard on the stored ciphertext.
+	// CompareAndDelete atomically removes key only when its stored value still
+	// equals expected. It returns deleted=true when this call removed the key,
+	// and deleted=false (with a nil error) when the key was absent or held a
+	// different value — in that case the store is unchanged. A non-nil error
+	// means the outcome is unknown and the caller must not assume either way.
+	//
+	// This is the release half of the pair PutIfAbsent opens, and the halves
+	// are not independent: a guarded create is only as strong as its release.
+	// With PutIfAbsent to acquire and a plain Delete to release, two releasers
+	// can both read holder A, the first deletes, B legitimately claims the
+	// now-absent key, and the second executes its unguarded delete and removes
+	// B's value — B having acquired the key under the guarantee PutIfAbsent
+	// advertises, and lost it to a releaser that never observed it. Re-reading
+	// before the delete does not close this, because the window is BETWEEN the
+	// read and the delete. Only a delete conditioned on the value the caller
+	// last observed, evaluated where the store serializes writes, closes it.
+	//
+	// Atomicity is provided per consistency domain, exactly as for
+	// PutIfAbsent: single-process backends serialize the compare-then-delete
+	// internally, while distributed backends must evaluate the comparison in
+	// their native compare-and-set primitive — for a replicated state machine,
+	// at the entry's log position, so replicas cannot diverge.
+	//
+	// Two obligations that are easy to get wrong:
+	//
+	//   - An ENCRYPTING backend must guard on the ciphertext it read, never on
+	//     a fresh encryption of expected. This package encrypts with
+	//     cipher.NewGCMWithRandomNonce, so encrypting the same plaintext twice
+	//     produces different bytes, so a re-encrypted guard refuses EVERY
+	//     release — every release silently a no-op, which is worse than the
+	//     race it was meant to fix. Read the stored ciphertext, decrypt to
+	//     compare in plaintext, and guard the delete on those exact bytes: any
+	//     interleaved write replaces them, which is precisely the signal.
+	//
+	//   - A refused delete is a NORMAL OUTCOME, not an error, and must be
+	//     reported through deleted=false. In a replicated state machine an
+	//     error for a lost guard stalls consensus over a deterministic
+	//     consequence of valid input. A failed guard READ is the opposite and
+	//     must refuse rather than decide: treating a local read fault as
+	//     "value differs" leaves the key on one replica while peers that read
+	//     successfully removed it.
+	//
+	// A NIL expected IS A VALUE, NOT A WILDCARD, and this is stated explicitly
+	// because other guarded compare-and-set APIs read it the
+	// other way. nil compares equal to a stored EMPTY value and to nothing else;
+	// an ABSENT key is refused whatever expected holds, because the compare has
+	// nothing to compare against. So nil never means "require the key absent",
+	// and there is no way to spell that request through this method — PutIfAbsent
+	// is the verb for an absence-guarded write.
+	//
+	// The conformance test in this package is the normative statement of that
+	// contract; the reference store compares with bytes.Equal after an existence
+	// check, which is exactly the behaviour described above. go-qrdb's engine
+	// (handleCompareAndDelete) matches it. go-xkms's CompareAndSwapper does NOT
+	// — it reads nil as "require the key ABSENT" — and an implementer coming
+	// from that interface must not carry the assumption across.
 	CompareAndDelete(ctx context.Context, key string, expected []byte) (bool, error)
 
 	// Close releases the resources held by the backend.
 	Close() error
 }
 
-// InvocationCounter counts AEAD encryptions per key and enforces the NIST SP 800-38D limit of 2^32 for random 96-bit nonces; safe for concurrent use.
+// InvocationCounter tracks the number of AEAD encrypt operations performed
+// with a single key and enforces the NIST SP 800-38D invocation limit.
+// For AES-GCM with random 96-bit nonces, the limit is 2^32 invocations
+// to keep nonce collision probability below 2^-32.
+//
+// Implementations must be safe for concurrent use.
 type InvocationCounter interface {
 	// Increment atomically increments the counter. Returns
 	// ErrInvocationLimitExceeded if the limit would be breached.
@@ -81,18 +158,47 @@ type InvocationCounter interface {
 	Close() error
 }
 
-// AEADProvider creates cipher.AEAD instances (BarrierConfig.AEADProvider); NonceSize() > 0 means the barrier supplies nonces, 0 means the AEAD prepends exactly alg.NonceSize() bytes itself.
+// AEADProvider creates cipher.AEAD instances for a given algorithm and key.
+// The default SoftwareAEADProvider dispatches to the standard Go crypto
+// library. Consumers may inject hardware-backed implementations (e.g.,
+// go-xkms) via BarrierConfig.AEADProvider.
+//
+// TWO NONCE CONVENTIONS ARE SUPPORTED, and the returned AEAD declares which one
+// it follows through NonceSize():
+//
+//   - NonceSize() > 0 — a caller-nonce AEAD. The barrier draws a nonce of that
+//     width from its own random source, writes it into the frame ahead of the
+//     payload, and passes it to Seal/Open.
+//   - NonceSize() == 0 — a module-nonce AEAD, as returned by
+//     cipher.NewGCMWithRandomNonce. It generates its own nonce, prepends it to
+//     the Seal output, consumes it from the head of the payload on Open, and
+//     counts it in Overhead(). The barrier passes a nil nonce. An implementation
+//     that chooses this MUST prepend exactly alg.NonceSize() bytes, because that
+//     is the width the barrier reports to a reader and the slice it hands the
+//     nonce-reuse tracker.
+//
+// The two produce identical frames for AES-GCM, which is why the wire format is
+// unversioned across the migration; see newAESGCM.
 type AEADProvider interface {
 	// NewAEAD returns an AEAD cipher for the algorithm keyed with key.
 	NewAEAD(alg SymmetricAlgorithm, key []byte) (cipher.AEAD, error)
 }
 
-// NonceTrackerProvider detects AEAD nonce reuse; safe for concurrent use. Inject one via BarrierConfig.NonceTrackerProvider.
+// NonceTrackerProvider provides detection of nonce reuse for AEAD ciphers.
+// Implementations must be safe for concurrent use.
+//
+// The default in-memory implementation (InMemoryNonceTracker) uses sync.Map
+// keyed by the full nonce, whatever its length, for lock-free reads. Consumers may inject
+// persistent or hardware-backed implementations via
+// BarrierConfig.NonceTrackerProvider.
 type NonceTrackerProvider interface {
-	// CheckAndRecordNonce records nonce, returning ErrNonceReuse if it was seen before.
+	// CheckAndRecordNonce checks whether nonce has been seen before and, if
+	// unique, records it. Returns ErrNonceReuse if the nonce was previously
+	// recorded.
 	CheckAndRecordNonce(nonce []byte) error
 
-	// Contains reports whether nonce was recorded, without recording it.
+	// Contains reports whether nonce has been previously recorded without
+	// modifying the tracker state.
 	Contains(nonce []byte) bool
 
 	// Count returns the number of unique nonces currently tracked.
@@ -112,7 +218,15 @@ type NonceTrackerProvider interface {
 	Close() error
 }
 
-// SymmetricEncrypter is a delegated encryptor returned by hardware strategies from BarrierEncryptor(); it carries no AAD (see AADSymmetricEncrypter).
+// SymmetricEncrypter provides symmetric encryption/decryption operations.
+// Hardware-backed strategies return this from BarrierEncryptor() to delegate
+// encryption to hardware (keys never leave the hardware boundary).
+// Software strategies return nil from BarrierEncryptor(), causing the barrier
+// to use its own epoch-based HKDF DEK encryption.
+//
+// The signature carries no AAD, so a delegated encryptor that implements only
+// this interface cannot authenticate the caller's positional context. Implement
+// AADSymmetricEncrypter as well to declare that capability.
 type SymmetricEncrypter interface {
 	// Encrypt returns the ciphertext of plaintext.
 	Encrypt(plaintext []byte) ([]byte, error)
@@ -121,7 +235,24 @@ type SymmetricEncrypter interface {
 	Decrypt(ciphertext []byte) ([]byte, error)
 }
 
-// AADSymmetricEncrypter declares that a delegated encryptor authenticates aad end to end; implement it only if DecryptWithAAD fails on a different aad.
+// AADSymmetricEncrypter is the OPTIONAL capability a delegated (hardware,
+// KMS, enclave) encryptor implements to DECLARE that it authenticates
+// caller-supplied additional authenticated data end to end.
+//
+// A barrier in delegated mode bypasses its own AEAD entirely, so the positional
+// binding the software path folds into the AAD (a snapshot frame's
+// shard/replica/index/ordinal, a WAL record's shard/segment/ordinal) exists only
+// if the delegated encryptor carries it. Implementing this interface is that
+// promise: the aad bytes passed to EncryptWithAAD MUST be authenticated such
+// that DecryptWithAAD fails when a different aad is supplied at decrypt time.
+//
+// DO NOT implement this interface on an encryptor that merely ACCEPTS an aad
+// argument and drops it. Advertising a binding that does not exist is strictly
+// worse than not advertising one: the barrier reports SupportsContextAAD, every
+// caller stops suppressing its context, RequireContextAAD passes at startup, and
+// the deployment believes it has splice/reorder protection it does not have. An
+// encryptor that cannot bind AAD must implement only SymmetricEncrypter, which
+// makes the barrier refuse non-empty contexts with ErrHardwareMode.
 type AADSymmetricEncrypter interface {
 	SymmetricEncrypter
 

@@ -428,7 +428,12 @@ func TestLogReaderSetRangeOldEntriesIgnored(t *testing.T) {
 	lastAfter := lr.lastIndex()
 	lr.mu.RUnlock()
 
-	// SetRange with overlap replaces the tail, so lastAfter is 3.
+	// The range should not shrink -- but SetRange with overlap could truncate.
+	// Looking at the logic: offset = 1-0 = 1, lr.length (11) > offset (1),
+	// so lr.length = 1 + 3 = 4. This would actually shrink the range.
+	// This matches dragonboat behavior where SetRange can truncate.
+	// The design says "extends or replaces the tail of the existing range."
+	// So lastAfter should be 3.
 	if lastAfter != 3 {
 		t.Errorf("lastIndex = %d, want 3 (SetRange replaces tail), was %d before",
 			lastAfter, lastBefore)
@@ -2584,7 +2589,12 @@ func TestLogReaderSnapshotAfterCreateSnapshot(t *testing.T) {
 	}
 }
 
-// TestLogReaderTermCacheInvalidatedOnTruncatingAppend checks a conflict truncation drops superseded terms from termBuf.
+// TestLogReaderTermCacheInvalidatedOnTruncatingAppend covers the follower
+// conflict-truncation path: entries 1..10 at term 5 are replaced from index 6
+// onward by entries 6..8 at term 6. Before the termBuf trimFrom fix, the ring
+// still held the superseded (7,5)/(8,5)/(9,5)/(10,5) pairs and termLocked —
+// which consults termBuf ahead of the range check — served them, corrupting
+// matchTerm, the conflict hint, and (via Compact) markerTerm.
 func TestLogReaderTermCacheInvalidatedOnTruncatingAppend(t *testing.T) {
 	lr := NewLogReader(1, 1, nil)
 
@@ -2787,7 +2797,19 @@ func TestTermRingBufferAppendRepairAfterWraparound(t *testing.T) {
 	}
 }
 
-// TestCreateSnapshot_RejectsRegressionAboveTheMarker checks a stale snapshot between markerIndex and the recorded snapshot index is rejected.
+// TestCreateSnapshot_RejectsRegressionAboveTheMarker pins the guard that the
+// marker check cannot cover.
+//
+// Compaction deliberately retains CompactionOverhead entries BELOW the
+// snapshot, so markerIndex normally trails the recorded snapshot index. That
+// leaves a live band, markerIndex < ss.Index < snapshot.Index, in which a stale
+// snapshot passes the marker check. Accepting it does not merely record the
+// wrong index: setSnapshot also overwrites lr.membership from the snapshot, so
+// the reader's quorum set rolls back to an older configuration — a removed
+// replica reappears as a voter, and quorum is computed over a set the cluster
+// has moved past.
+//
+// Deleting the guard left the whole pkg/logdb suite green.
 func TestCreateSnapshot_RejectsRegressionAboveTheMarker(t *testing.T) {
 	lr := NewLogReader(1, 1, nil)
 
@@ -2828,7 +2850,15 @@ func TestCreateSnapshot_RejectsRegressionAboveTheMarker(t *testing.T) {
 	}
 }
 
-// TestSetSnapshot_GuardsDoNotDependOnUnrelatedState checks the staleness guards apply even when ConfigChangeID and Commit are zero.
+// TestSetSnapshot_GuardsDoNotDependOnUnrelatedState pins that neither
+// staleness guard is gated on a zero-value proxy for "this reader has been
+// used".
+//
+// A proxy such as `membership.ConfigChangeID != 0 || state.Commit != 0` reads
+// zero for a replica that recovered from a snapshot and has committed nothing
+// of its own since — both values are legal there — and would switch BOTH guards
+// off for exactly that replica, so the one state in which a stale snapshot is
+// most likely to arrive would be the one state in which nothing rejected it.
 func TestSetSnapshot_GuardsDoNotDependOnUnrelatedState(t *testing.T) {
 	lr := NewLogReader(1, 1, nil)
 
@@ -2900,7 +2930,17 @@ func (r *rangeRecordingLogDB) IterateEntries(entries []Entry, size uint64,
 	return entries, size, ErrUnavailable
 }
 
-// TestLogReaderRangeBoundariesAreExact checks the exact range getRangeLockedInto requests at both boundaries.
+// TestLogReaderRangeBoundariesAreExact pins the two range comparisons in
+// getRangeLockedInto that no test could fail on: widening either by one index
+// left the pkg/logdb and pkg/internal/raft suites green.
+//
+// Neither can be pinned on the returned error, and that is the whole difficulty.
+// Both guards are backstopped by something further down that happens to return
+// the same error for the same input, so a widened guard still LOOKS right:
+// an inverted range underflows `high-low`, is silently rewritten to a huge
+// range, and then fails on a cache miss; an over-long range fails when the
+// backend has nothing at the missing index. What actually changes is the range
+// the reader ASKS FOR, so that is what is asserted here.
 func TestLogReaderRangeBoundariesAreExact(t *testing.T) {
 	const marker, count = uint64(10), uint64(5) // available: [11,15]
 
@@ -2964,7 +3004,18 @@ func TestLogReaderRangeBoundariesAreExact(t *testing.T) {
 	})
 }
 
-// TestLogReaderCompactRefusesOutOfRangeIndexes checks Compact refuses indexes outside its range and leaves the range untouched.
+// TestLogReaderCompactRefusesOutOfRangeIndexes pins Compact's outcome at both
+// ends of its range.
+//
+// Its two explicit guards (`index < markerIndex` and `index > lastIndex()`) are
+// REDUNDANT and cannot be pinned individually: widening either one leaves the
+// behaviour unchanged, because the termLocked call immediately below repeats the
+// same bounds through getRangeLockedInto and returns the same error for the same
+// input. That is a genuine defence-in-depth, not a coverage gap, and this test
+// therefore asserts the OUTCOME both paths must produce rather than which line
+// produced it — including that a refused Compact leaves the range untouched,
+// which matters because the update it guards (`lr.length -= index - markerIndex`)
+// underflows on unsigned arithmetic.
 func TestLogReaderCompactRefusesOutOfRangeIndexes(t *testing.T) {
 	const marker, count = uint64(10), uint64(5) // available: [11,15]
 
@@ -3037,7 +3088,21 @@ func (f *failingSaveStateLogDB) IterateEntries(entries []Entry, size uint64,
 	return entries, size, ErrUnavailable
 }
 
-// TestPersistBootstrap_RegistersNothingWhenTheDurableWriteFails checks a failed durable write registers nothing; the reader's caches may lag storage, never lead it.
+// TestPersistBootstrap_RegistersNothingWhenTheDurableWriteFails pins the
+// ordering PersistBootstrap's contract rests on: the durable write happens
+// FIRST, and the in-memory registration only if it succeeded.
+//
+// Reversing the two — registering the entries and caching their terms before
+// calling SaveState — left pkg/logdb, pkg/internal/raft and pkg/internal/engine
+// all green, so the ordering was free to flip. It must not, and the reason is
+// what the reader becomes if it does: a failed bootstrap write leaves the reader
+// reporting a range the LogDB does not hold and answering Term() for an index
+// that was never persisted, while GetRange for the same index goes to storage
+// and fails. The two views of the log disagree, and the disagreement is exactly
+// the window in which raft would use a term for an entry that does not exist.
+//
+// This is the general invariant in its one testable instance: the reader's
+// caches may LAG storage, never lead it.
 func TestPersistBootstrap_RegistersNothingWhenTheDurableWriteFails(t *testing.T) {
 	injected := errors.New("reader_test: bootstrap write refused")
 	db := &failingSaveStateLogDB{err: injected}

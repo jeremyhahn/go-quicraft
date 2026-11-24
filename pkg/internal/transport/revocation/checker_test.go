@@ -232,7 +232,8 @@ func TestCRLReloadMissingFile(t *testing.T) {
 		CRLPaths: []string{"/nonexistent/crl.pem"},
 	}, nil)
 
-	// An unreadable CRL must fail the reload.
+	// An unreadable CRL must FAIL the reload: silently continuing with a
+	// partial set would un-revoke every certificate in the missing file.
 	err := checker.ReloadCRLs()
 	if err == nil {
 		t.Fatal("ReloadCRLs must fail for an unreadable CRL file")
@@ -300,7 +301,8 @@ func TestCRLReloadReadFailureKeepsPreviousSet(t *testing.T) {
 // CRLParseError.
 func TestCRLReloadInvalidPEM(t *testing.T) {
 	dir := t.TempDir()
-	// "AAAA" decodes to 3 zero bytes, which is not valid CRL DER.
+	// Use valid base64 that decodes to garbage DER.
+	// "AAAA" decodes to 3 zero bytes, which is not valid DER for a CRL.
 	path := writeCRLFile(t, dir, "bad.crl.pem",
 		[]byte("-----BEGIN X509 CRL-----\nAAAA\n-----END X509 CRL-----\n"))
 
@@ -463,7 +465,12 @@ func TestCRLNonCRLPEMBlocksIgnored(t *testing.T) {
 // Programmatic serial management tests
 // ---------------------------------------------------------------------------
 
-// TestAddRevokedSerial verifies added serials are revoked; soft-fail because there is no CRL file.
+// TestAddRevokedSerial verifies that programmatically added serials
+// are detected by IsRevoked.
+//
+// The checker has no CRL file, so soft-fail is what makes "not revoked yet"
+// an admission rather than a missing-source rejection; the admin path is the
+// only source of truth here and it is asked for explicitly.
 func TestAddRevokedSerial(t *testing.T) {
 	ca := newTestCA(t)
 	checker := NewChecker(Config{Mode: ModeCRL, AllowSoftFail: true}, ca.cert)
@@ -885,7 +892,18 @@ func TestOCSPNegativeCacheStillFailsClosedUnderEnforcement(t *testing.T) {
 	}
 }
 
-// TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable verifies a query failure never replaces an unexpired revoked verdict.
+// TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable verifies verdict
+// precedence: a query failure must NOT overwrite an unexpired definitive
+// "revoked" verdict already in the cache with a short-TTL unavailable entry. In
+// soft-fail mode this guarantees a peer the checker already knows to be revoked
+// stays rejected even while the responder is down, rather than being silently
+// accepted as "status unknown".
+//
+// The cache-hit fast path in checkOCSPRaw normally returns the definitive entry
+// before any query, so the dangerous overwrite can only occur under a race
+// where the query was already in flight when a definitive verdict was cached.
+// We exercise the write guard deterministically by invoking the failing query
+// path while a definitive entry is present, asserting the guard preserves it.
 func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 5151)
@@ -1571,7 +1589,12 @@ func TestCheckerStartIdempotent(t *testing.T) {
 	dir := t.TempDir()
 	path := writeCRLFile(t, dir, "idem.crl.pem", ca.createCRL(t, 91))
 
-	// Count "created by" lines: a goroutine is listed from its go statement, even before it enters reloadLoop.
+	// A goroutine is listed in the dump from the moment its go statement
+	// runs, with a "created by" line naming the function that ran it, even
+	// while it is still in the generated wrapper and has not entered
+	// reloadLoop. Counting those lines counts every goroutine the three
+	// Start calls spawned, so a duplicate loop cannot be missed because it
+	// was not yet scheduled.
 	spawned := func() int {
 		buf := make([]byte, 1<<20)
 		n := runtime.Stack(buf, true)
@@ -1671,7 +1694,12 @@ func newTestIntermediate(t *testing.T, root *testCA) *testCA {
 	}
 }
 
-// TestIssuerSelectedPerLeafInTwoTierPKI: with a root-first bundle the checker selects the intermediate that signed the leaf as issuer.
+// TestIssuerSelectedPerLeafInTwoTierPKI is the regression test: with a
+// root-first CA bundle and leaves signed by the issuing intermediate, the
+// checker must select the INTERMEDIATE as the issuer. Wiring revocation to the
+// bundle's first block (the root) builds OCSP requests whose
+// issuerNameHash/issuerKeyHash no responder can match and rejects every
+// intermediate-signed CRL.
 func TestIssuerSelectedPerLeafInTwoTierPKI(t *testing.T) {
 	root := newTestCA(t)
 	intermediate := newTestIntermediate(t, root)
@@ -1780,7 +1808,14 @@ func newUnknownOCSPServer(t *testing.T, ca *testCA, queries *atomic.Int64) *http
 	}))
 }
 
-// TestOCSPUnknownStatusNotCachedAsGood: RFC 6960 unknown is rejected under enforcement and only negatively cached.
+// TestOCSPUnknownStatusNotCachedAsGood is the regression test:
+// RFC 6960 "unknown" is NOT "not revoked". Under enforcement a leaf the
+// responder has no record of must be rejected, not admitted.
+// It also verifies the second half: an
+// unknown verdict must never populate the definitive cache. If it did, the
+// "good" verdict would be served for the full OCSPCacheSeconds to every
+// subsequent handshake. Only the short-TTL negative cache may hold it, which
+// still fails closed under enforcement.
 func TestOCSPUnknownStatusNotCachedAsGood(t *testing.T) {
 	ca := newTestCA(t)
 	leaf := ca.issueLeaf(t, 701)
@@ -2128,7 +2163,12 @@ func issueLeafWithAKI(t *testing.T, signer *testCA, serial int64, aki []byte) *x
 	return leaf
 }
 
-// TestIssuerForAuthorityKeyIdFallback covers matching the leaf's AuthorityKeyId to candidate SubjectKeyIds when no signature verifies.
+// TestIssuerForAuthorityKeyIdFallback covers the second selection stage: when
+// no candidate's key verifies the leaf signature, the leaf's AuthorityKeyId is
+// matched against candidate SubjectKeyIds. This keeps issuer selection working
+// for signature algorithms this build cannot verify; a wrongly selected issuer
+// still fails closed downstream because ocsp.ParseResponseForCert verifies the
+// response against it.
 func TestIssuerForAuthorityKeyIdFallback(t *testing.T) {
 	trusted := newTestCA(t)
 	rogue := newTestCA(t)

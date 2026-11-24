@@ -22,7 +22,24 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// Benchmarks for the durability sequence's cost on the WAL write path, framing alone and end to end; the end-to-end ones also report wbytes/op.
+// Benchmarks for the cost of the durability sequence on the WAL write path.
+//
+// The sequence adds four bytes to every chunk header and four bytes to every
+// chunk's CRC input, both on the hot path, so the cost is measured rather than
+// argued about. They are written to be run against two builds — one with the
+// field and one without — and compared, which is why they cover the framing in
+// isolation as well as end to end:
+//
+//   - BenchmarkEncodeRecord*: the framing alone, with no I/O to hide it in.
+//   - BenchmarkSegmentWriteHardState: one 48-byte record into the block buffer,
+//     the shape a HardState-only SaveNodeState produces.
+//   - BenchmarkSaveNodeState / BenchmarkSaveStateBatch: end to end through the
+//     shard, including the fdatasync the writer actually pays.
+//
+// The last two also report wbytes/op — the bytes handed to WriteAt per
+// operation — because write amplification, not CPU, is what the flush-watermark
+// work in this area was about, and a framing change is exactly the sort of thing
+// that could quietly give it back.
 
 // countingFS wraps an FS and totals the bytes every WriteAt puts on the medium.
 type countingFS struct {

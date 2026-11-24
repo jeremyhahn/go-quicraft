@@ -47,7 +47,16 @@ const (
 	// readTimeout bounds a single linearizable read.
 	readTimeout = 5 * time.Second
 
-	// checkTimeout bounds the porcupine search; an undecided history fails.
+	// checkTimeout bounds the porcupine search. A history the checker cannot
+	// decide within this budget fails the test: "Unknown" is not "Ok".
+	//
+	// The budget is generous because the search cost is exponential in the
+	// number of INDETERMINATE operations that land on one key without an
+	// intervening successful read, and a fault-injection run can produce an
+	// unlucky pile-up even with maxAttemptsPerOp bounding each client's chain.
+	// A decided history takes milliseconds here; the budget only matters for
+	// the tail, and spending it is preferable to reporting Unknown as though a
+	// violation had been found.
 	checkTimeout = 300 * time.Second
 )
 
@@ -62,7 +71,14 @@ type kvInput struct {
 	Value string // written value (put) or appended token (append)
 }
 
-// kvOutput is a KV operation result; Unknown marks an indeterminate outcome.
+// kvOutput describes the result of a KV store operation.
+//
+// Unknown marks an INDETERMINATE outcome: the client never learned whether
+// the operation took effect. A Raft proposal that times out, is dropped, or
+// is aborted may still commit and apply afterwards, so the checker must be
+// free to place its effect anywhere at or after the call. This is the Jepsen
+// :info case, and it is the only way a timed-out-but-actually-applied write
+// becomes visible to the checker at all.
 type kvOutput struct {
 	Value   string // resulting value: the read value (get) or the accumulated value (append)
 	Ok      bool   // the write definitely took effect
@@ -113,14 +129,24 @@ func partitionByKey(history []porcupine.Event) [][]porcupine.Event {
 	return result
 }
 
-// kvModel returns a nondeterministic porcupine.Model for a linearizable KV store, partitioned by key.
+// kvModel returns a porcupine.Model for a linearizable KV store. Per-partition
+// state is the current value of one key (empty string = missing).
+//
+// The specification is deliberately NONDETERMINISTIC: an indeterminate write
+// has two legal successor states — applied and not applied — and porcupine's
+// power set construction explores both. A deterministic model would have to
+// pick one, and either choice turns a real lost write into a pass.
 func kvModel() porcupine.Model {
 	nm := kvSpec()
 	nm.PartitionEvent = partitionByKey
 	return nm.ToModel()
 }
 
-// kvSingleKeyModel returns the same model for a history already reduced to one key.
+// kvSingleKeyModel returns the same specification over a history that has
+// ALREADY been reduced to one key. It exists so a failed whole-history check
+// can be re-run per partition: porcupine reports one verdict for the entire
+// history, which names no key, and the key is the only thing that makes an
+// undecidable or violating result actionable.
 func kvSingleKeyModel() porcupine.Model {
 	nm := kvSpec()
 	nm.PartitionEvent = func(events []porcupine.Event) [][]porcupine.Event {
@@ -159,7 +185,11 @@ func kvSpec() porcupine.NondeterministicModel {
 				case out.Unknown:
 					return []interface{}{val, applied}
 				case out.Ok:
-					// A successful append returns the exact accumulated value; a double apply cannot.
+					// A successful append must return the exact accumulated
+					// value. A DOUBLE apply yields a value carrying the token
+					// twice, which no state reachable in this model produces —
+					// which is the whole point of using a non-idempotent
+					// operation for the session workload.
 					if out.Value != applied {
 						return nil
 					}
@@ -224,7 +254,15 @@ type opRecord struct {
 	err         error
 }
 
-// opRecorder records every operation a client issues, including failed and indeterminate ones.
+// opRecorder collects EVERY operation a client issues: the ones that
+// succeeded, the ones that definitely failed, and the ones whose outcome the
+// client never learned. Nothing is dropped.
+//
+// An operation that never reaches the history cannot be checked, and a
+// per-key history containing no operations is trivially linearizable. A
+// recorder that skips failed operations therefore reports "Ok" for a cluster
+// that is losing writes, which would let this harness pass while half of the
+// committed entries were being discarded.
 type opRecorder struct {
 	mu         sync.Mutex
 	seq        int64
@@ -354,7 +392,21 @@ func (r *opRecorder) stats() (total, determinate, writes, reads int) {
 	return total, determinate, writes, reads
 }
 
-// events converts the history to porcupine events in real-time order, with indeterminate returns as Unknown at the end.
+// events converts the recorded history into porcupine's Event representation.
+//
+// The Event form is required because an indeterminate operation has no
+// meaningful return timestamp: its effect may land at any later point. Calls
+// and determinate returns are emitted in the real-time order in which they
+// happened; the return of an indeterminate operation is emitted at the very
+// END of the history, carrying Unknown, which leaves the checker free to
+// linearize its effect anywhere at or after the call.
+//
+// The unknown return is emitted rather than left out because porcupine
+// (v1.1.0) requires every call to have a matching return: makeLinkedEntries
+// resolves a call's match from a map keyed by Id and checkSingle assumes
+// len(history)/2 pairs, so a genuinely unmatched CallEvent panics the checker.
+// A trailing Unknown return is the same thing semantically and is exactly the
+// encoding porcupine's own Jepsen :info fixtures use.
 func (r *opRecorder) events() []porcupine.Event {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -433,7 +485,19 @@ type LinearizabilityViolationError struct {
 	Duration      time.Duration
 }
 
-// Error describes the failed check, distinguishing Illegal from Unknown.
+// Error returns a description of the failed check.
+//
+// porcupine.Unknown and porcupine.Illegal are reported differently because they
+// mean different things and calling both "a linearizability violation" sends
+// the reader looking for a bug the checker never found. Illegal is a proof that
+// no linearization exists. Unknown is the search budget running out, which on
+// this harness is driven by BACKTRACKING, not by history size: a legal history
+// is linearized greedily and decides in milliseconds even with hundreds of
+// indeterminate operations spread over its keys, so a search that exhausts its
+// budget is one that kept failing to place an operation. Both still fail the
+// test — an undecidable history is not a passing one — and neither may be
+// dismissed without the per-partition diagnosis, because "expensive" and
+// "illegal" look identical from the aggregate result.
 func (e *LinearizabilityViolationError) Error() string {
 	if e.Result == porcupine.Unknown {
 		return fmt.Sprintf(
@@ -459,7 +523,28 @@ func (e *LinearizabilityViolationError) Error() string {
 // Throughput Floors
 // ---------------------------------------------------------------------------
 
-// baselineWritesPerClientSecond is the slowest measured per-client write rate on this harness.
+// baselineWritesPerClientSecond is the MEASURED completed-write rate of a
+// single client worker on this harness. It comes from a full baseline run of
+// this file (go test -race -tags=integration, 96-core dev machine), taking
+// completed writes over the run's serving window:
+//
+//	3Node_Normal              8 clients /  5s -> 1030 writes  25.8 /client-s
+//	3Node_SnapshotDuringLoad  8 clients / 10s -> 1832 writes  22.9 /client-s
+//	3Node_FollowerRestart     4 clients / 10s ->  905 writes  22.6 /client-s
+//	5Node_RollingRestart      4 clients / 16s -> 1146 writes  17.9 /client-s
+//	4Node_ElectionSafety      4 clients /  8s ->  605 writes  18.9 /client-s
+//	3Node_LeaderRestart       4 clients /  8s ->  525 writes  16.4 /client-s
+//	3Node_SingleKeyContention 8 clients /  5s ->  595 writes  14.9 /client-s
+//	5Node_MultipleFailovers   4 clients / 11s ->  627 writes  14.3 /client-s
+//	5Node_MinorityDown        8 clients /  7s ->  740 writes  13.2 /client-s
+//	3Node_LeaderFailover      4 clients /  3s ->  144 writes  12.0 /client-s
+//	5Node_MembershipAddRemove 4 clients / 13s ->  590 writes  11.3 /client-s
+//	3Node_SessionProposal     4 clients /  4s ->  129 writes   8.1 /client-s
+//	3Node_LeaseRead           8 clients /  5s ->  265 writes   6.6 /client-s
+//	5Node_HighThroughput     16 clients / 30s -> 2632 writes   5.5 /client-s
+//
+// The floor is anchored at the SLOWEST observation (5.5), not the average, so
+// that the same formula is safe for every test in the file.
 const baselineWritesPerClientSecond = 5.4
 
 // floorFraction is the share of that baseline a run must reach. At 0.30 a run
@@ -546,7 +631,14 @@ func logPartitionCensus(t *testing.T, events []porcupine.Event) {
 // turns an unactionable timeout into a report.
 const perPartitionCheckTimeout = 60 * time.Second
 
-// diagnosePartitions re-checks each key and reports those not Ok with the operations porcupine could not place.
+// diagnosePartitions re-checks every key independently and reports the ones
+// that did not come back Ok, with the operations porcupine could not place.
+//
+// A whole-history Unknown says only that the search ran out of budget; it does
+// not say on which key, and it does not distinguish "expensive but legal" from
+// "illegal and expensive to prove". Per-key verdicts separate those, and an
+// Illegal here is a genuine consensus defect that the aggregate result would
+// have reported as a mere timeout.
 func diagnosePartitions(events []porcupine.Event) (verdicts []partitionVerdict, decided, total int) {
 	model := kvSingleKeyModel()
 	parts := partitionByKey(events)
@@ -625,7 +717,27 @@ func formatPartition(part []porcupine.Event) string {
 	return sb.String()
 }
 
-// pruneNeverReadIndeterminatePuts drops indeterminate PUTs whose value no determinate GET returned; the reduction is exact.
+// pruneNeverReadIndeterminatePuts drops every indeterminate PUT whose value no
+// determinate GET in the same partition ever returned. It is an EXACT
+// reduction: the pruned history is linearizable iff the original is.
+//
+//   - If the original has a linearization, each such put is either not applied
+//     or applied and overwritten before any get (otherwise some get would have
+//     returned it). Removing it preserves that linearization either way.
+//   - If the pruned history has a linearization, mark every removed put "not
+//     applied": the nondeterministic model allows that branch for an Unknown
+//     write, so the original linearizes too.
+//
+// Porcupine cannot know a branch is irrelevant; its power-set construction
+// explores both for every indeterminate write. A leader kill under load fails a
+// burst of writes that nobody reads, and 2^23 such branches is where a
+// 30-minute budget can go on a history that decides in 1ms once they are gone.
+// This removes the one shape of Unknown that is provably noise; a
+// history still Unknown AFTER pruning is backtracking on constraints that
+// matter, and the check must still fail on it.
+//
+// Only PUT is prunable. An indeterminate APPEND changes the accumulated value
+// later reads return even when its own token is never read alone, so it stays.
 func pruneNeverReadIndeterminatePuts(events []porcupine.Event) ([]porcupine.Event, int) {
 	type putRec struct {
 		key   string
@@ -669,7 +781,27 @@ func pruneNeverReadIndeterminatePuts(events []porcupine.Event) ([]porcupine.Even
 	return kept, len(drop)
 }
 
-// pruneIndeterminateGets drops every indeterminate GET; the reduction is exact.
+// pruneIndeterminateGets drops every indeterminate GET: a read whose result
+// the client never saw. It is an EXACT reduction: the pruned history is
+// linearizable iff the original is.
+//
+//   - The model steps an Unknown get to the state it was in (kvSpec), so it
+//     constrains no state and no other operation's result.
+//   - Real-time order is pairwise -- a precedes b iff a returned before b was
+//     called -- so removing an operation removes only the edges that touch
+//     it; no edge between two remaining operations is lost. Its return sits
+//     at the end of the history, so it has no successor to lose anyway.
+//   - If the original has a linearization, deleting the get from it is a
+//     linearization of the pruned history. If the pruned history has one,
+//     placing the get last satisfies its only edges (operations that returned
+//     before its call) and leaves every state unchanged.
+//
+// Porcupine does not know the operation is inert: every never-returned get
+// stays pending to the end, overlaps everything after its call, and
+// multiplies the states the search must try. A burst of reads stranded by a
+// restart is enough to exhaust the checker's budget on a legal history. Every
+// COMPLETED get stays, so a read that returned an illegal value is rejected
+// exactly as before.
 func pruneIndeterminateGets(events []porcupine.Event) ([]porcupine.Event, int) {
 	calls := make(map[int]kvInput, len(events)/2)
 	drop := make(map[int]bool)
@@ -939,7 +1071,12 @@ func clientWorker(
 		}
 		nextOp = time.Now().Add(minOpInterval + rand.N(minOpInterval))
 
-		// Advance the key every other operation so the put and get at opIdx and opIdx+1 share a key.
+		// The key advances every OTHER operation so that the put at opIdx and
+		// the get at opIdx+1 target the SAME key. Deriving the key from opIdx
+		// directly makes the put and get key sets DISJOINT whenever numKeys is
+		// even, leaving every partition either write-only or read-only — and a
+		// write-only history is linearizable no matter what the cluster does
+		// with the writes.
 		key := fmt.Sprintf("key-%d", (opIdx/2)%numKeys)
 		host := findAnyLiveHost(cluster, shardID)
 		if host == nil {
@@ -948,7 +1085,9 @@ func clientWorker(
 		}
 
 		if opIdx%2 == 0 {
-			// Each retry writes a distinct value.
+			// Every retry writes a DISTINCT value. Re-proposing the identical
+			// byte string would make a lost write indistinguishable from an
+			// idempotent rewrite, masking the very loss being retried.
 			value := fmt.Sprintf("v-%d-%d-%d", clientID, opIdx, attempt)
 			rec := recorder.begin(clientID, kvInput{Op: "put", Key: key, Value: value})
 
@@ -973,7 +1112,10 @@ func clientWorker(
 				continue
 			}
 
-			// kvStateMachine returns the stored value's length; anything else means the entry was not applied.
+			// Assert on the REAL state machine result. kvStateMachine returns
+			// the length of the stored value; anything else means the entry
+			// never reached the state machine even though the proposal
+			// reported success.
 			if want := uint64(len(value)); result.Value != want {
 				recorder.violation(
 					"put(%s,%q) reported success but the state machine returned Value=%d, want %d",
@@ -1036,10 +1178,20 @@ func clientWorker(
 // Session Client Worker
 // ---------------------------------------------------------------------------
 
-// sessionDupEvery is how often the session worker re-proposes the same (clientID, seriesID).
+// sessionDupEvery is how often the session worker deliberately re-proposes the
+// SAME (clientID, seriesID) pair without advancing the session, exercising the
+// at-most-once dedup path directly.
 const sessionDupEvery = 8
 
-// sessionClientWorker drives sessions with a non-idempotent append workload, so a duplicate apply is visible.
+// sessionClientWorker drives the session (at-most-once) path with a
+// NON-IDEMPOTENT workload: it appends a unique token to a key rather than
+// overwriting it. The model state is therefore the sequence of applied
+// appends, so applying one entry twice produces a value the model forbids.
+//
+// This matters because a last-write-wins register cannot expose a duplicate
+// apply at all: writing "v-3-12" twice leaves exactly the same state as
+// writing it once, so a dedup layer that never dedups is invisible by
+// construction.
 func sessionClientWorker(
 	t *testing.T,
 	cluster *testCluster,
@@ -1060,7 +1212,13 @@ func sessionClientWorker(
 
 	opIdx := 0
 	var pacer retryPacer
-	// open is the append still being retried under its series, recorded as one operation.
+	// open is the append whose series is still being retried. A retry under
+	// the same series ID is the SAME logical operation, so it stays ONE record
+	// spanning the first attempt's call to the final result, rather than one
+	// indeterminate record per failed attempt. Split records would let a
+	// double apply hide behind an indeterminate copy of the token, and each
+	// copy doubles the checker's search: 32 of them from one leaderless
+	// stretch exhausted the per-partition budget in #309.
 	var open *opRecord
 
 	for time.Now().Before(deadline) {
@@ -1078,14 +1236,20 @@ func sessionClientWorker(
 		}
 
 		if opIdx%2 == 0 {
-			// The token is fixed across retries of one series.
+			// The token is FIXED across retries, unlike the plain put path.
+			// A session retry keeps the same series ID, so it is the same
+			// logical operation: the engine is entitled to answer it from the
+			// dedup cache with the ORIGINAL result. Varying the payload while
+			// reusing the series ID would be a client protocol error and would
+			// make the cached response look like a mismatch.
 			token := fmt.Sprintf("t%d-%d", clientID, opIdx)
 			rec := open
 			if rec == nil {
 				rec = recorder.begin(clientID, kvInput{Op: "append", Key: key, Value: token})
 			}
 
-			// Every sessionDupEvery-th append is issued twice under one seriesID.
+			// Every sessionDupEvery-th append is issued TWICE under the same
+			// seriesID to prove the dedup cache actually dedups.
 			retrySameSeries := opIdx%(2*sessionDupEvery) == 0
 			value, err := proposeAppend(host, session, key, token, retrySameSeries, recorder)
 			if err != nil {
@@ -1171,7 +1335,16 @@ func acquireSession(cluster *testCluster, shardID uint64, deadline time.Time, do
 	return nil
 }
 
-// proposeAppend issues one session append and returns the accumulated value; with retrySameSeries it re-proposes the same series and requires the cached response.
+// proposeAppend issues one session-managed append and returns the accumulated
+// value the state machine reported.
+//
+// When retrySameSeries is set, the SAME (clientID, seriesID) pair is proposed
+// a second time after the first has completed, without advancing the session.
+// The engine must recognise the retry as a duplicate and return the cached
+// response byte-for-byte; applying the append a second time would both change
+// the returned value and corrupt the key. ProposeWithSession is used instead
+// of SyncProposeWithSession precisely because the latter advances the session
+// on success, which would make the second proposal a new series.
 func proposeAppend(
 	host *quicraft.Host,
 	session *quicraft.Session,
@@ -1205,7 +1378,8 @@ func proposeAppend(
 	return string(first.Data), nil
 }
 
-// proposeOnce submits one session proposal and waits for its result without advancing the series.
+// proposeOnce submits one session proposal and waits for its apply result
+// WITHOUT advancing the session's series ID.
 func proposeOnce(host *quicraft.Host, session *quicraft.Session, cmd []byte) (sm.Result, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), proposeTimeout)
 	defer cancel()
@@ -1253,7 +1427,16 @@ func warmupCluster(t *testing.T, cluster *testCluster, shardID uint64) {
 		}
 	}
 
-	// Check a linearizable read through proposer.Read, which re-resolves the leader.
+	// Verify linearizable read works after warmup. The leader is resolved once
+	// more here rather than reused from above: the writes may themselves have
+	// spanned an election, and a ReadIndex on a deposed replica proves nothing
+	// about the read path.
+	//
+	// Resolving it ON THIS LINE was still not enough, which is why the read
+	// goes through proposer.Read now. One resolution and one attempt leaves
+	// the same gap the proposals above closed, only narrower: this helper runs
+	// at the start of nearly every test in this package, immediately after an
+	// election, which is exactly when leadership is most likely to move.
 	result := proposer.Read(t, cluster.leaderHost, shardID, encodeKVGet("warmup-0"), defaultTimeout)
 	val, ok := result.(string)
 	if !ok || val != "ok" {
@@ -1371,7 +1554,34 @@ func TestLinearizability_3Node_LeaderFailover(t *testing.T) {
 	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*electionRound))
 }
 
-// TestLinearizability_4Node_ElectionSafety checks election safety on an even-sized shard; one-vote-per-term is covered by TestElectionSafety_SpentTermCannotBeWonTwice.
+// TestLinearizability_4Node_ElectionSafety exercises the election-safety
+// invariant on an EVEN-sized shard. Even N is where an off-by-one in the
+// quorum computation shows up: quorumOf(4) must be 3, and a quorum of 2 would
+// let two candidates each collect a "majority" and lead the same term. The
+// leader/term guard samples every host on every poll and fails immediately if
+// that ever happens, including while the killed leader is rejoining.
+//
+// # What this test does NOT cover, and where that lives
+//
+// It cannot detect the loss of the one-vote-per-term rule itself. That was
+// measured, not assumed: with the r.vote test deleted from canVote in
+// handleVoteRequest — so a replica grants every candidate that asks, in any
+// term — this test passed three runs out of three with a clean porcupine
+// verdict on roughly 7000 operations each.
+//
+// The reason is structural rather than a matter of tuning. This test kills the
+// leader and lets ONE clean election run, and a single election never asks a
+// voter for a second vote in a term it has already voted in. Reaching that code
+// path at all requires two candidates alive in the same term, which stopNode
+// cannot produce (a killed replica campaigns for nothing) and which PreVote,
+// the CheckQuorum vote drop, and the new leader's no-op entry each independently
+// prevent from arising by accident.
+//
+// Constructing it needs the network-fault injector, so the assertion lives in
+// TestElectionSafety_SpentTermCannotBeWonTwice in test/integration/e2e, built
+// under the quicraft_netfault tag. It spends a term's votes on a candidate that
+// is structurally unable to win with them and asserts that nothing else can win
+// that term. Do not read the presence of this test as covering that invariant.
 func TestLinearizability_4Node_ElectionSafety(t *testing.T) {
 	const (
 		numNodes   = 4
@@ -1640,7 +1850,12 @@ func TestLinearizability_3Node_FollowerRestart(t *testing.T) {
 	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*time.Second))
 }
 
-// TestLinearizability_5Node_RollingRestart restarts followers one at a time under load and checks the history is linearizable.
+// TestLinearizability_5Node_RollingRestart simulates a rolling deployment by
+// stopping and restarting follower nodes one at a time. At no point is more
+// than one node down, so the 5-node cluster always maintains a 4-node
+// majority quorum. Each restarted node recovers from its WAL and catches
+// up while clients continue issuing operations. The full operation history
+// must be linearizable.
 func TestLinearizability_5Node_RollingRestart(t *testing.T) {
 	const (
 		numNodes   = 5
@@ -1861,11 +2076,24 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 	<-removeNodeTimer.C
 	removeNodeTimer.Stop()
 
-	// Re-read the leader now and pick a node that is neither leader nor newly added.
+	// Re-read the leader HERE rather than reusing the one from setup.
+	//
+	// Picking the first index that was not the leader as observed at the TOP
+	// of the test — more than eight seconds, a node addition and a catch-up
+	// wait earlier — would not hold: leadership does not hold still across
+	// that window. Under a loaded runner the campaign lands differently and
+	// elections recur, and if leadership had moved to the index this loop
+	// chose, removeNode would correctly refuse with "cannot remove the leader"
+	// and the test would fail having proven nothing — checkLinearizability,
+	// the entire point, is the last line and would never be reached.
+	//
+	// So "not the leader, not the newly added node" is evaluated now.
 	currentLeader := cluster.waitForClusterLeader(shardID, failoverTimeout)
 	removeIdx := -1
 	for i := range numNodes {
-		// Exclude newIdx explicitly.
+		// newIdx is excluded EXPLICITLY. numNodes is 5 and the added node is
+		// index 5, so the loop bound already skips it — by arithmetic accident,
+		// which stops being true the moment numNodes or this bound changes.
 		if i != currentLeader && i != newIdx {
 			removeIdx = i
 			break
@@ -1885,7 +2113,13 @@ func TestLinearizability_5Node_MembershipAddRemove(t *testing.T) {
 	checkLinearizability(t, recorder, floorFor(numClients, testDur-2*time.Second))
 }
 
-// TestLinearizability_3Node_SessionProposal checks session proposals stay linearizable under a non-idempotent workload with deliberate duplicates.
+// TestLinearizability_3Node_SessionProposal verifies that session-managed
+// proposals produce a linearizable history under a NON-IDEMPOTENT workload.
+// Sessions provide at-most-once delivery, so a duplicate apply must be
+// impossible; the append workload makes such a duplicate observable, and
+// every eighth operation is deliberately re-proposed under the same series ID
+// to check that the engine hands back the cached response instead of applying
+// the entry a second time.
 func TestLinearizability_3Node_SessionProposal(t *testing.T) {
 	const (
 		numNodes   = 3

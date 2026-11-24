@@ -29,8 +29,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// TestHost_Drain_InFlightSyncProposeThenClose drives Drain under concurrent SyncPropose; later calls get ErrDraining and Close leaves no goroutine.
-// boundedCloser runs Host.Close at most once in its own goroutine and never blocks a caller past its deadline.
+// TestHost_Drain_InFlightSyncProposeThenClose drives Drain while 16
+// goroutines issue SyncPropose on an in-process single-replica shard. A call
+// that starts before Drain returns ends in success or ErrDraining (the drain
+// flag went up while it was being admitted); every call that starts after
+// Drain returns is refused with ErrDraining. A second Drain is safe, and
+// Close then returns within 5s and leaves no goroutine behind.
+// boundedCloser runs Host.Close at most once, in its own goroutine, and never
+// blocks a caller past its deadline. A second synchronous Close after a hung
+// one would join the stuck stopOnce and hang the test binary, so the test and
+// its cleanup share the single attempt, and the cleanup skips waiting once an
+// earlier wait has timed out.
 type boundedCloser struct {
 	h        *Host
 	mu       sync.Mutex

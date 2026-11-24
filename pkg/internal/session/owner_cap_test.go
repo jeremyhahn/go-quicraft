@@ -20,7 +20,21 @@ import (
 	"testing"
 )
 
-// TestOwnerCapStopsOneOwnerExhaustingTheTable verifies one owner is refused at its cap while another owner is still admitted.
+// TestOwnerCapStopsOneOwnerExhaustingTheTable is the regression gate for the
+// defect the per-owner cap exists to close.
+//
+// MaxTotalSessions is a SHARD-WIDE bound, and a shard-wide bound cannot defend
+// itself: a clientID is eight bytes the caller chooses, so a single principal
+// registers under as many of them as it likes until the table is full. From
+// that moment every other tenant on the shard is refused at-most-once delivery
+// — not by a bug in Raft, but by a limit working exactly as written.
+//
+// The assertion is deliberately in two halves, and the SECOND half is the one
+// that matters. "Owner A is eventually refused" passes against a manager with
+// no per-owner cap at all, because A hits the shard-wide limit sooner or later;
+// what distinguishes a fixed manager from a broken one is that owner B is still
+// admitted afterwards. Without the cap, A has consumed the table and B's
+// registration fails too.
 func TestOwnerCapStopsOneOwnerExhaustingTheTable(t *testing.T) {
 	const (
 		ownerA      = 0xA
@@ -55,7 +69,8 @@ func TestOwnerCapStopsOneOwnerExhaustingTheTable(t *testing.T) {
 			"delivery.", maxPerOwner+1, err, m.Count(), maxPerOwner, maxTotal)
 	}
 
-	// A different owner is unaffected.
+	// The half that actually distinguishes the fix: a DIFFERENT owner is
+	// unaffected. A's refusal must be A's alone.
 	if err := m.Register(3000, ownerB, 101); err != nil {
 		t.Fatalf("Register for owner B = %v, want nil. Owner A hitting its cap "+
 			"must not consume anything B needs — that is the whole point of a "+
@@ -115,7 +130,14 @@ func TestOwnerCapReleasesOnUnregisterAndExpiry(t *testing.T) {
 	})
 }
 
-// TestOwnerCapIgnoresUnsetOwner verifies owner zero is exempt from the cap.
+// TestOwnerCapIgnoresUnsetOwner pins the compatibility guarantee.
+//
+// Every session registered before Entry.OwnerID existed decodes to owner zero,
+// as does every session from an embedder that does not declare owners. Those
+// must be exempt. Treating zero as an owner in its own right would pool every
+// ownerless session on the shard under one key and refuse them all at the cap —
+// which is not a stricter version of the old behaviour, it is a shard that
+// stops accepting sessions.
 func TestOwnerCapIgnoresUnsetOwner(t *testing.T) {
 	m := NewManager(1000, 16, 2)
 
@@ -135,7 +157,12 @@ func TestOwnerCapIgnoresUnsetOwner(t *testing.T) {
 	}
 }
 
-// TestOwnerCapDisabledWhenPolicyIsZero verifies a zero per-owner cap disables it.
+// TestOwnerCapDisabledWhenPolicyIsZero pins that a shard which committed no
+// per-owner cap behaves exactly as it did before the field existed.
+//
+// Zero is the value a membership with no committed session policy decodes to,
+// so this is not a hypothetical configuration — it is the state of every shard
+// bootstrapped before the policy grew this field.
 func TestOwnerCapDisabledWhenPolicyIsZero(t *testing.T) {
 	m := NewManager(1000, 16, 0)
 	for i := 0; i < 50; i++ {

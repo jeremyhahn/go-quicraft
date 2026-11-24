@@ -27,7 +27,23 @@ import (
 // processes on this platform.
 const crossProcessClaims = true
 
-// lockPort takes an exclusive non-blocking flock on path, returning the unlock function; busy is true only when another process holds it. The file is never removed.
+// lockPort takes an exclusive, non-blocking flock on the file at path.
+//
+// On success it returns the function that drops the lock. busy is true only
+// when another process holds the lock. Any other failure — the file cannot be
+// opened, flock is unsupported on the file system — returns neither: the port
+// is then guarded by the probe alone, which is the behaviour before the lock
+// existed, rather than skipped forever.
+//
+// The lock belongs to the open file description, so the kernel drops it when
+// the process exits, however it exits. The file itself is never removed:
+// unlinking a lock file another process may be about to open would let two
+// processes lock two different inodes under one name.
+//
+// The file is created 0o600. A wider mode would not extend the claim to other
+// users: under the usual umask the shared directory and its files are not
+// writable by them, so their open fails and they fall back to the probe
+// whatever mode is asked for here.
 func lockPort(path string) (unlock func(), busy bool) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {

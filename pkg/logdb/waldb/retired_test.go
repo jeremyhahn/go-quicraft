@@ -185,7 +185,12 @@ func TestRemoveNodeData_RegistryDirSyncFailurePoisons(t *testing.T) {
 	}
 }
 
-// TestOpen_FinishesARemovalThatStoppedAfterItsRetirement checks Open purges a retired node's records and reclaims its segment.
+// TestOpen_FinishesARemovalThatStoppedAfterItsRetirement verifies the open
+// that follows an interrupted removal finishes it: the retirement was
+// published, but the process stopped before the node's records were dropped
+// and its segments collected (or that collection failed). Replay finds the
+// records, purgeRetired drops them, and the segment holding nothing else is
+// reclaimed there — not left until some later compaction happens to run.
 func TestOpen_FinishesARemovalThatStoppedAfterItsRetirement(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {

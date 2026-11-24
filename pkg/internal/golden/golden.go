@@ -12,7 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package golden checks encoders and decoders against byte fixtures under testdata/golden; -update-golden rewrites them for a deliberate layout change.
+// Package golden checks encoded bytes against the golden format fixtures
+// checked in under a package's testdata/golden directory.
+//
+// A fixture is the exact byte string a pinned layout encodes from a fixed
+// input. Every package that owns a pinned layout tests both directions against
+// its fixtures: decoding a fixture yields the input field for field, and
+// encoding the input reproduces the fixture byte for byte. Because every
+// format version is pinned until v1.0.0, these fixtures are what makes a
+// layout change visible: it cannot land without a fixture diff in the same
+// commit.
+//
+// Running a package's tests with -update-golden rewrites its fixtures from the
+// current encoders. CI never passes the flag; a fixture is regenerated only
+// for a deliberate layout change, and the diff is reviewed with it.
 package golden
 
 import (

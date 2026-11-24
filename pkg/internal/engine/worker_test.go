@@ -500,7 +500,9 @@ func TestApplyWorker_SequentialPerShard(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_FailFast checks the first SM.Apply error fails the shard, reports it and leaves lastApplied.
+// TestApplyWorker_FailFast verifies that an SM.Apply error marks the shard
+// failed on the FIRST error (fail-fast), reports a failure through the
+// listener, and does NOT advance lastApplied.
 func TestApplyWorker_FailFast(t *testing.T) {
 	applyC := make(chan *applyItem, 64)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -773,8 +775,13 @@ func TestApplyWorker_SemaphoreLimitsConcurrency(t *testing.T) {
 	}
 }
 
-// Successful applies advance lastApplied without failing the shard.
-// After a fail-fast apply error the shard stays failed while later items are still drained.
+// TestApplyWorker_SuccessfulAppliesAdvance verifies the happy path: a
+// sequence of successful applies advances lastApplied and never marks the
+// shard failed.
+// TestApplyWorker_FailFastHaltsShard verifies that after a fail-fast apply
+// error, the shard is marked failed. A subsequent item delivered to the
+// per-shard goroutine is still drained from the channel (the goroutine
+// must not leak), but the shard remains failed.
 func TestCommitWorker_RunDrainsAndStops(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -1262,7 +1269,12 @@ func TestCommitWorker_ProcessBatch_SuccessPath(t *testing.T) {
 
 	tickPeerToLeader(peer)
 
-	// Persist the no-op through GetUpdate/Commit so the next update carries it as committed.
+	// Persist the term-opening no-op through a real GetUpdate/Commit
+	// cycle. tryCommit counts the leader's own match at its durable
+	// index, so the single-node commit index only advances at the
+	// persistence edge inside Peer.Commit. The next GetUpdate then
+	// carries the no-op as a committed entry, keeping processBatch on
+	// the normal apply-forward path (single batch SaveState).
 	initial, err := peer.GetUpdate(true, 0)
 	if err != nil {
 		t.Fatalf("GetUpdate (initial) failed: %v", err)
@@ -1565,7 +1577,12 @@ func TestApplyWorker_AutoSnapshot_ClearsSnapshottingOnPoolFull(t *testing.T) {
 		close(runDone)
 	}()
 
-	// Poll until the worker is done; the commitPending clear follows the auto-snapshot trigger.
+	// Poll until the worker has finished with the item. The auto-snapshot
+	// trigger runs AFTER lastApplied is stored: it sets snapshotting, has
+	// the request rejected, and clears the flag again. Waiting on
+	// lastApplied alone can land between the set and the clear and read
+	// the flag as true. The deferred commitPending clear follows the whole
+	// trigger, so it pins the read below.
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"timed out waiting for the 5-entry batch to be processed",
 		func() bool { return !node.commitPending.Load() })
@@ -1948,7 +1965,11 @@ func TestApplyWorker_Metrics_ApplyLatency(t *testing.T) {
 
 // --- GAP-1: Ordered Message Sending After WAL Persist Tests ---
 
-// TestCommitWorker_SendsOrderedMessagesAfterSaveState checks ordered messages are sent only after SaveState succeeds.
+// TestCommitWorker_SendsOrderedMessagesAfterSaveState verifies that
+// ordered messages (VoteResp, HeartbeatResp, etc.) attached to
+// commitItems are sent by the commit worker AFTER successful SaveState.
+// This is the core correctness guarantee of GAP-1: persistent state
+// must be durable before responding to RPCs.
 func TestCommitWorker_SendsOrderedMessagesAfterSaveState(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()
@@ -2541,7 +2562,13 @@ func TestCommitWorker_SaveStateError_NilCallback(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_ProcessBatch_StaleIncarnation checks two incarnations of one shard in a batch each commit to their own node.
+// TestCommitWorker_ProcessBatch_StaleIncarnation verifies that when two
+// commitItems for the same shardID from different node incarnations land
+// in the same batch (rapid stop/restart), each update is committed to
+// its own node rather than the last node for that shardID. This is a
+// regression test for a panic where the old update's applied index
+// exceeds the new incarnation's committed index because a shardID-keyed
+// nodesBuf clobbers the old node pointer with the new one.
 func TestCommitWorker_ProcessBatch_StaleIncarnation(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -2654,7 +2681,27 @@ done:
 // Piggyback commit optimization tests
 // ---------------------------------------------------------------------------
 
-// setupPiggybackPeer returns a single-node leader with one proposed entry and an update whose CommittedEntries are cleared, plus the expected piggyback index.
+// setupPiggybackPeer creates a single-node leader peer with one proposed
+// entry whose committed index exceeds the processed index. This simulates
+// the multi-node scenario where entries become committable during the
+// commitPending window. Returns the peer, LogReader, the initial update
+// (with CommittedEntries cleared to trigger the piggyback path), and the
+// expected piggyback entry index.
+//
+// The flow:
+//  1. Create single-node peer, tick to leader (immediate self-election).
+//  2. Drain initial state (leader no-op entry). Persisting the no-op
+//     inside Peer.Commit fires the persistence-edge commit
+//     re-evaluation, committing it — but processed stays behind because
+//     only Commit of an update carrying committed entries advances it.
+//  3. Propose a new entry.
+//  4. Call GetUpdate to extract the update. Clear CommittedEntries from
+//     the returned update so processBatch enters the piggyback branch.
+//  5. When processBatch persists the update, the persistence edge
+//     inside Peer.Commit commits the proposed entry as well, so
+//     GetPiggybackUpdate reports committed entries through the
+//     proposal's index — the last EntriesToSave index is the expected
+//     piggyback tip.
 func setupPiggybackPeer(t *testing.T, shardID, replicaID uint64) (
 	*raft.Peer, *logdb.LogReader, proto.Update, uint64,
 ) {
@@ -2842,7 +2889,11 @@ func TestCommitWorker_PiggybackNoEntries(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_PiggybackPersistFailureReoffers checks a failed piggyback persist forwards nothing, clears commitPending and re-offers later.
+// TestCommitWorker_PiggybackPersistFailureReoffers verifies that when the
+// piggyback commit-index persist fails after all retries, the path is
+// SELF-HEALING (not a shard failure): it does NOT forward to apply, releases the
+// entries, clears commitPending, and leaves the shard to re-offer the entries on
+// a later cycle. The persist is retried on the full backoff schedule first.
 func TestCommitWorker_PiggybackPersistFailureReoffers(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()
@@ -2869,7 +2920,10 @@ func TestCommitWorker_PiggybackPersistFailureReoffers(t *testing.T) {
 	node := NewNode(peer, rsmSM, lr, cfg, nil, "", listener)
 	node.commitPending.Store(true)
 
-	// Fail the second SaveState, the piggyback persist; nothing may be applied before the commit index is durable.
+	// Fail the SECOND SaveState. The first persists the batch; the second is
+	// the piggyback commit-index persist. Its failure must abort the
+	// piggyback (no apply forwarded), since applying before the commit index
+	// is durable is exactly the crash-safety hole this fix closes.
 	ldb.setFailAfterN(1, errors.New("disk full on piggyback"))
 
 	cw.batch = append(cw.batch[:0], update)
@@ -2922,7 +2976,11 @@ var _ MessageSender = (*sequencingSender)(nil)
 // clearStepCommitPending tests
 // ---------------------------------------------------------------------------
 
-// TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode checks only the node mid hand-off has commitPending cleared.
+// TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode verifies that
+// clearStepCommitPending resets commitPending ONLY for the node that was mid
+// hand-off (enqueuingNode) when the step worker panicked. Nodes whose item is
+// owned by the commit worker's in-flight batch must be left untouched: a blanket
+// clear would race that batch and cause a double GetUpdate extraction.
 func TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -2965,7 +3023,21 @@ func TestStepWorker_ClearStepCommitPending_ClearsOnlyEnqueuingNode(t *testing.T)
 // drainUnloadReload tests
 // ---------------------------------------------------------------------------
 
-// TestCommitWorker_DrainUnloadReload_OrderIsDeterministic checks queued unload and reload requests apply in request order; it repeats the race.
+// TestCommitWorker_DrainUnloadReload_OrderIsDeterministic verifies that
+// unload and reload requests are applied in the order they were made, even
+// when both are already queued when the worker drains.
+//
+// select picks uniformly at random among ready cases, so while unloads and
+// reloads travelled on two separate channels the drain applied them in an
+// arbitrary order. StopShard(S) followed by StartShard(S) could therefore
+// leave S permanently in the unloaded set: processBatch would skip
+// Peer.Commit for S forever, so the restarted replica would persist to the
+// WAL, vote, and even win elections while never applying anything and timing
+// out every proposal. The reverse inversion is just as bad in the other
+// direction: a shard that was unloaded would come back "loaded".
+//
+// The loop runs the race many times because a two-channel drain picks the
+// wrong order roughly half the time.
 func TestCommitWorker_DrainUnloadReload_OrderIsDeterministic(t *testing.T) {
 	const iterations = 1000
 	ldb := newTestLogDB()
@@ -2979,7 +3051,7 @@ func TestCommitWorker_DrainUnloadReload_OrderIsDeterministic(t *testing.T) {
 	for i := range iterations {
 		stopC := make(chan struct{})
 
-		// StopShard(9) then StartShard(9): the shard must end up loaded.
+		// StopShard(9) then StartShard(9): the shard must end up LOADED.
 		cw := newWorker(stopC)
 		cw.requestUnload(9)
 		cw.requestReload(9)
@@ -2989,7 +3061,7 @@ func TestCommitWorker_DrainUnloadReload_OrderIsDeterministic(t *testing.T) {
 				"the reload was applied before the unload it followed", i)
 		}
 
-		// StartShard(9) then StopShard(9): the shard must end up unloaded.
+		// StartShard(9) then StopShard(9): the shard must end up UNLOADED.
 		cw = newWorker(stopC)
 		cw.requestReload(9)
 		cw.requestUnload(9)
@@ -3050,7 +3122,13 @@ func TestApplyWorker_Dispatch_SkipsUnloadedShard(t *testing.T) {
 // CommitWorker run loop: unload/reload select cases in main loop
 // ---------------------------------------------------------------------------
 
-// TestCommitWorker_Run_HandlesUnloadInMainLoop checks the main loop applies unload/reload in order: 55 loaded, 66 unloaded.
+// TestCommitWorker_Run_HandlesUnloadInMainLoop verifies that the commit
+// worker's main run loop correctly handles unload/reload requests received
+// via the membership select case (not just via drainUnloadReload), and that
+// the resulting unloaded set reflects the ORDER the requests were made in:
+// unload(55), reload(55), unload(66) must leave 55 loaded and 66 unloaded.
+// Draining the channel is not enough — a worker that applied the requests in
+// an arbitrary order would drain it just the same while wedging shard 55.
 func TestCommitWorker_Run_HandlesUnloadInMainLoop(t *testing.T) {
 	ldb := newTestLogDB()
 	commitC := make(chan *commitItem, 16)
@@ -3802,7 +3880,13 @@ func (db *errorGetSnapshotLogDB) GetSnapshot(_, _ uint64) (logdb.Snapshot, error
 	return logdb.Snapshot{}, db.err
 }
 
-// TestRecoverSnapshot_FileNotExist checks a recorded snapshot whose data file is gone fails with ErrSnapshotArtifactMissing.
+// TestRecoverSnapshot_FileNotExist verifies that recoverSnapshot FAILS with a
+// typed ErrSnapshotArtifactMissing when a LogDB-recorded snapshot's data file
+// is gone. A recorded snapshot (Index != 0) whose snapshot.dat is missing
+// is NOT "cleaned up" — the record still points at it — so reporting recovery
+// success would clear the recovering gate without seeding lastApplied and later
+// fail the shard with ErrApplyGap or serve stale reads. The failure is what
+// engages the leader's re-send path, matching the encrypted branch.
 func TestRecoverSnapshot_FileNotExist(t *testing.T) {
 	stopC := make(chan struct{})
 	ws := NewWorkSignal(1)
@@ -4376,7 +4460,13 @@ func TestCommitWorker_ProcessBatch_ApplyCStopC(t *testing.T) {
 	}
 }
 
-// TestStepWorker_ProcessReady_RecoveringDefersSnapshot checks a recovering node defers InstallSnapshot and re-injects it once recovery clears.
+// TestStepWorker_ProcessReady_RecoveringDefersSnapshot verifies that a
+// recovering node steps ordinary Raft traffic but DEFERS InstallSnapshot.
+// Handling one would restore the raft log onto a newer snapshot index while
+// the snapshot pool is still installing an older one into the state machine,
+// leaving lastApplied permanently below the log's snapshot floor (an apply
+// gap that fails the shard). The deferred message is re-injected once the
+// recovering gate clears.
 func TestStepWorker_ProcessReady_RecoveringDefersSnapshot(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -4444,7 +4534,12 @@ func TestStepWorker_ProcessReady_RecoveringDefersSnapshot(t *testing.T) {
 // Peer.Commit failure handling (state-machine safety)
 // ---------------------------------------------------------------------------
 
-// newCommitFailurePeer returns a single-node leader and an update whose EntriesToSave make Peer.Commit fail after advancing the processed marker.
+// newCommitFailurePeer returns a single-node leader peer that has completed
+// one election cycle, plus an Update carrying real committed entries whose
+// EntriesToSave start far past the LogReader's tracked range. Peer.Commit
+// advances the processed marker past the committed entries FIRST and only then
+// fails in logReader.Append, so those committed entries can never be re-offered
+// by entriesToApply — the shard must be failed rather than allowed to continue.
 func newCommitFailurePeer(t *testing.T, shardID, replicaID uint64) (*raft.Peer, *logdb.LogReader, proto.Update) {
 	t.Helper()
 	peer, lr := newTestPeer(t, shardID, replicaID)
@@ -4474,7 +4569,11 @@ func newCommitFailurePeer(t *testing.T, shardID, replicaID uint64) (*raft.Peer, 
 	return peer, lr, u
 }
 
-// TestCommitWorker_PeerCommitError_FailsShard checks a Peer.Commit error takes the shard offline.
+// TestCommitWorker_PeerCommitError_FailsShard verifies that a Peer.Commit
+// error takes the shard OFFLINE instead of letting it keep running. Commit
+// has already advanced the processed marker, so the batch is gone: a shard
+// that continued would ack the leader and serve reads from a state machine
+// permanently missing those committed entries.
 func TestCommitWorker_PeerCommitError_FailsShard(t *testing.T) {
 	commitC := make(chan *commitItem, 4)
 	applyC := make(chan *applyItem, 4)
@@ -4550,7 +4649,12 @@ func TestExecutePiggyback_CommitError_FailsShard(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_ProcessBatch_ShutdownAbandonsBatchTail checks a shutdown return releases the whole batch remainder.
+// TestCommitWorker_ProcessBatch_ShutdownAbandonsBatchTail verifies that a
+// shutdown early-return inside processBatch releases the WHOLE remainder of
+// the batch, not just the item it was working on. Every item in the batch
+// arrived with commitPending set by the step worker; an item that is never
+// reached keeps it set forever, so Engine.Stop returns with the shard
+// wedged and a restarted pipeline never produces another update for it.
 func TestCommitWorker_ProcessBatch_ShutdownAbandonsBatchTail(t *testing.T) {
 	_, restore := captureLogOutput(t)
 	defer restore()

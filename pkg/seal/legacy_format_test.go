@@ -186,7 +186,14 @@ func TestLegacyFormat_BarrierDecryptsFrame(t *testing.T) {
 	})
 }
 
-// TestFrameLayoutUnchangedByMigration verifies a new frame has the legacy frame's length and layout.
+// TestFrameLayoutUnchangedByMigration asserts the other direction of
+// compatibility: a frame written NOW occupies exactly the bytes the legacy
+// framing did, so a reader that has not taken this change — an older node in a
+// mixed-version cluster, or a forensic tool — parses it correctly.
+//
+// It is a length-and-position assertion rather than a byte comparison because
+// the nonce is random by construction; the golden vectors above cover the
+// value-level claim in the other direction.
 func TestFrameLayoutUnchangedByMigration(t *testing.T) {
 	b, strategy := testInitializedBarrier(t)
 	defer func() { _ = strategy.Close() }()

@@ -293,7 +293,9 @@ func TestDialConnectionServerNameExtraction(t *testing.T) {
 		t1, t2, _, _, cleanup := transportPair(t, 42)
 		defer cleanup()
 
-		// Test the empty-host fallback through an address that resolves to the peer.
+		// The actual transport pair uses resolved addresses (127.0.0.1:PORT),
+		// so we test the empty host fallback indirectly: verify getConnection
+		// works with an address that resolves to the peer.
 		target := t2.Addr().String()
 		conn, err := t1.getConnection(target, "")
 		if err != nil {
@@ -866,7 +868,21 @@ func TestEvictStaleOutboundAliveConnection(t *testing.T) {
 		t.Fatalf("getStream failed: %v", err)
 	}
 
-	// Let the stream pool reach steady state before snapshotting it.
+	// Let the stream pool reach steady state BEFORE snapshotting it.
+	//
+	// dialConnection pre-opens the heartbeat stream in a goroutine
+	// (`go t.preOpenHeartbeatStream(...)`) and nothing here joins it, so the
+	// count reaches its final value asynchronously. Snapshotting first and
+	// asserting equality afterwards made the assertion a race against that
+	// goroutine: if it registered its stream in between, StreamCount went from
+	// 1 to 2 and the test failed with "expected 1 streams after alive check,
+	// got 2" — attributing to evictStaleOutboundOnRecv a stream it never
+	// created. It survives an unloaded machine and fails on a busy CI runner.
+	//
+	// Waiting for both streams (pre-opened heartbeat + the data stream above)
+	// also makes the assertion STRONGER: the eviction path is now checked
+	// against a fully-populated pool rather than whatever subset happened to
+	// exist at snapshot time.
 	const wantStreams = 2
 	pollUntil(t, 5*time.Second, 5*time.Millisecond, "stream pool did not reach the pre-opened heartbeat plus the data stream", func() bool {
 		return t1.StreamCount() >= wantStreams
@@ -1315,7 +1331,13 @@ func exhaustStreamCredit(t *testing.T, conn *quic.Conn) {
 	t.Fatal("stream limit never reached")
 }
 
-// takeHeartbeatStream waits for the pre-opened heartbeat stream to be pooled, then takes it out without closing it.
+// takeHeartbeatStream waits until the heartbeat stream that getConnection
+// pre-opens in the background is in tr's stream pool, then takes it out
+// without closing it. The pre-open is then over and holds no stream credit,
+// and Stop has no pooled stream to close. A close (as evictStreamsForTarget
+// does) would send the stream's first frame; the live peer, done with it,
+// would grant new stream credit and could release a blocked open without the
+// shutdown. Never written to, the stream stays unknown to the peer.
 func takeHeartbeatStream(t *testing.T, tr *QUICTransport, target string) {
 	t.Helper()
 	key := streamKey{target: target, idx: 0}
@@ -1492,7 +1514,10 @@ func TestDialConnectionReturnsPromptlyOnShutdown(t *testing.T) {
 		t.Fatalf("Start failed: %v", err)
 	}
 
-	// Dial a local UDP socket that never answers, so the handshake waits the full timeout.
+	// Dial a local UDP socket that is open but never answers: the QUIC
+	// handshake then waits on it for the full timeout on any host. A
+	// TEST-NET address depends on the host's routing and can fail at once
+	// with a send error, so the dial would never block.
 	silent, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("ListenUDP failed: %v", err)
@@ -1625,7 +1650,12 @@ func TestConnectionCleanupOnce_PanicReturnsTrueAndRecovers(t *testing.T) {
 		t.Fatalf("NewQUICTransport failed: %v", err)
 	}
 
-	// Drive the sweep directly instead of waiting for a tick.
+	// Drive the sweep immediately instead of waiting a real tick.
+	//
+	// connectionCleanupOnce tickers on cleanupInterval, and the panic can only
+	// fire once the ticker fires. On the 30s production interval this test
+	// would pay the full interval; with the interval as a field it exercises
+	// the panic path at once.
 	tr.cleanupInterval = time.Millisecond
 
 	tr.stopC = make(chan struct{})
@@ -1793,7 +1823,7 @@ func TestDialConnection_WithEventListener(t *testing.T) {
 	}
 	defer tr.Stop()
 
-	// Create a second transport with the same mTLS config.
+	// Create a second transport with the SAME mTLS config.
 	t2, err := NewQUICTransport(Config{
 		ListenAddress: ":0",
 		DeploymentID:  42,
@@ -2269,7 +2299,9 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	// outbound cached so the second call compares against it.
 	t1.evictStaleOutboundOnRecv(t2Addr, 1, outbound)
 
-	// Drop the cache entry, keeping the peer epoch, so the next dial makes a distinct connection.
+	// Drop the cache entry (without forgetting the peer epoch) so
+	// dialConnection produces a DISTINCT second connection: its dial-race
+	// re-check would otherwise reuse the cached live outbound.
 	t1.connMu.Lock()
 	delete(t1.conns, t2Addr)
 	t1.connMu.Unlock()
@@ -2284,7 +2316,8 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 	t1.conns[t2Addr] = outbound
 	t1.connMu.Unlock()
 
-	// A different epoch means the peer restarted; the stale outbound must be evicted.
+	// Second recv carries a DIFFERENT epoch (2) → the peer restarted → the
+	// alive-but-stale outbound must be evicted promptly.
 	t1.evictStaleOutboundOnRecv(t2Addr, 2, conn2)
 
 	// The eviction leaves the pool synchronously; there is nothing to wait on.
@@ -2303,7 +2336,18 @@ func TestEvictStaleOutboundOnRecv_InboundChanged(t *testing.T) {
 // TestSendBatch_DirectCallSnappyPoolPaths verifies the snappy encode pool
 // get/put paths by directly calling sendBatch with compression enabled.
 
-// TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound verifies a changed inbound connection alone does not evict a live outbound.
+// TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound documents the
+// corrected behaviour after fixing a regression where an inbound identity
+// change was treated as a peer-restart signal. In small clusters that
+// heuristic produced a self-sustaining eviction cascade (node A evicts its
+// outbound -> redials -> B observes new inbound -> B evicts its outbound ->
+// B redials -> A observes new inbound -> ... ) that starved leader election.
+//
+// The contract is now: while the outbound's own context is still alive,
+// evictStaleOutboundOnRecv must leave it alone even if the inbound identity
+// changes. Peer restarts naturally kill the outbound (MaxIdleTimeout /
+// keepalive / explicit close) which flips the context to Done and is
+// handled by the dead-connection branch.
 func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T) {
 	mtls := testMTLSConfig(t)
 	handler1 := newTestHandler()
@@ -2357,7 +2401,9 @@ func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T)
 	// Seed the peer epoch (7) with a prior recv.
 	t1.evictStaleOutboundOnRecv(t2Addr, 7, outbound)
 
-	// A recv on a new connection with the same epoch is a re-dial, not a restart.
+	// Open a second connection and simulate a recv on that new *quic.Conn —
+	// i.e. "the peer dialled us from a fresh connection" — but with the SAME
+	// boot epoch (7): a benign re-dial, NOT a restart.
 	conn2, dialErr := t1.dialForTest(t2Addr)
 	if dialErr != nil {
 		t.Fatalf("dialConnection for second conn failed: %v", dialErr)
@@ -2381,7 +2427,14 @@ func TestEvictStaleOutboundOnRecv_InboundChangedKeepsAliveOutbound(t *testing.T)
 	}
 }
 
-// TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored verifies a restart hint for an address the inbound certificate does not cover is ignored.
+// TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored verifies the
+// authentication gate on restart-eviction: a restart hint (epoch change) whose
+// target is NOT covered by the inbound connection's verified certificate must
+// be ignored. Without it, an authenticated-but-malicious cluster member could
+// stamp another node's SourceAddress with a mutating SourceEpoch and force
+// eviction of our live outbound to that victim (a liveness/DoS vector). The
+// shared test certificate covers loopback/:: only, so a TEST-NET-1 host
+// (RFC 5737, 192.0.2.0/24) is guaranteed absent from its SANs.
 func TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored(t *testing.T) {
 	mtls := testMTLSConfig(t)
 	handler1 := newTestHandler()
@@ -2426,7 +2479,9 @@ func TestEvictStaleOutboundOnRecv_UnauthorizedAddressIgnored(t *testing.T) {
 		t.Fatalf("dialConnection(inbound) failed: %v", dialErr)
 	}
 
-	// Cache a live outbound under a target no certificate covers, on a connection other than the inbound.
+	// Cache an ALIVE outbound under a spoofed target whose host is not in any
+	// node's certificate. inboundConn differs from cachedConn so the same-conn
+	// fast path does not short-circuit the eviction logic.
 	const spoofed = "192.0.2.50:4001"
 	t1.connMu.Lock()
 	t1.conns[spoofed] = cachedConn
@@ -2556,7 +2611,13 @@ func TestGetStream_StaleStreamInShardDedupRetry(t *testing.T) {
 	}
 	defer t2b.Stop()
 
-	// getStream misses the fast path, dials t2b fresh and returns a stream on it.
+	// Step 7: Call getStream. It should:
+	// 1. Miss fast path (no connection in conns)
+	// 2. Dial fresh connection to t2b
+	// 3. Open new stream
+	// 4. Find injected stale stream in shard dedup check
+	// 5. Detect stale (!connOK since we removed the original conn)
+	// 6. Retry with fresh connection
 	stream, err := t1.getStream(t2Addr, shardID, false, "")
 	if err != nil {
 		t.Fatalf("getStream stale dedup retry failed: %v", err)
@@ -3160,7 +3221,12 @@ func TestDialConnection_ShutdownContextCanceled(t *testing.T) {
 // dialConnection dial-race re-check (conn.go)
 // ---------------------------------------------------------------------------
 
-// TestDialConnection_ReusesCachedWinner verifies a late dial closes its connection and reuses the cached one.
+// TestDialConnection_ReusesCachedWinner verifies the dial-race fix: a dial
+// that completes after another dial already populated the connection cache
+// (singleflight only coalesces OVERLAPPING dials) must close its own
+// connection and return the cached winner instead of overwriting it — the
+// overwritten connection would otherwise stay alive on keep-alives forever,
+// with its pre-opened streams diverging from the pool's bookkeeping.
 func TestDialConnection_ReusesCachedWinner(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -3235,7 +3301,8 @@ func TestCloseTargetUnknownAddressIsNoOp(t *testing.T) {
 	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
 
-	// A live connection to another target shows the no-op leaves unrelated state alone.
+	// Establish a live connection to a DIFFERENT target so the no-op case can
+	// be shown not to disturb unrelated state.
 	target := t2.Addr().String()
 	t1.Send([]proto.Message{{Type: proto.Replicate, ShardID: 1, From: 1, To: 2, Term: 1}})
 	handler2.waitBatch(t, 10*time.Second)
@@ -3273,7 +3340,10 @@ func TestCloseTargetClosesConnectionAndEvictsState(t *testing.T) {
 
 	target := t2.Addr().String()
 
-	// Receive t2's batch first so the dial is stamped with the known epoch.
+	// Take the inbound batch from t2 FIRST: that is what creates t1's
+	// incarnation record for the target, and dialing afterwards stamps the
+	// outbound with the epoch already known, so the receive path's
+	// restart-eviction never fires on the connection under test.
 	t2.Send([]proto.Message{{Type: proto.ReplicateResp, ShardID: 1, From: 2, To: 1, Term: 1}})
 	handler1.waitBatch(t, 10*time.Second)
 	pollUntil(t, 5*time.Second, 10*time.Millisecond,
@@ -3460,7 +3530,21 @@ func awaitInboundConn(t *testing.T, tr *QUICTransport) (*quic.Conn, *inboundConn
 	return found, state
 }
 
-// TestIdleInboundConnectionIsReclaimed verifies the idle sweep closes an inbound connection past the idle bound.
+// TestIdleInboundConnectionIsReclaimed is the regression test for an inbound
+// connection that nothing could ever close.
+//
+// Tracking inbound connections was only half the control. This node's own
+// quic.Config sets KeepAlivePeriod (10s) below MaxIdleTimeout (30s) for BOTH
+// roles, so the listener PINGs every accepted connection forever and QUIC's
+// idle timeout can never fire on it; cleanStaleConnections reaps only
+// connections that are ALREADY dead. A peer that completes a handshake and then
+// says nothing held one of MaxIncomingConnections and one of
+// MaxConnectionsPerIP for the process lifetime, for the cost of answering a
+// PING.
+//
+// The test drives the sweep with an explicit clock rather than waiting out the
+// real 5-minute bound, and asserts BOTH directions: a connection inside the
+// bound survives, one past it does not.
 func TestIdleInboundConnectionIsReclaimed(t *testing.T) {
 	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -3469,7 +3553,9 @@ func TestIdleInboundConnectionIsReclaimed(t *testing.T) {
 	handler2.waitBatch(t, 10*time.Second)
 	inbound, _ := awaitInboundConn(t, t2)
 
-	// Control: a sweep now must not touch a connection that just carried a frame.
+	// CONTROL: a sweep at the current time must not touch a connection that
+	// has just carried a frame. Without this the assertion below would pass
+	// against a sweep that closes everything it sees.
 	t2.reapIdleInboundConns(time.Now())
 	select {
 	case <-inbound.Context().Done():
@@ -3479,7 +3565,7 @@ func TestIdleInboundConnectionIsReclaimed(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	// Past the idle bound the connection is closed.
+	// SUBJECT: past the idle bound the connection must actually be closed.
 	t2.reapIdleInboundConns(time.Now().Add(inboundIdleRetention + time.Second))
 	select {
 	case <-inbound.Context().Done():
@@ -3510,13 +3596,14 @@ func TestInboundActivityStampKeepsBusyConnectionAlive(t *testing.T) {
 	stale := time.Now().Add(-2 * inboundIdleRetention)
 	state.lastActive.Store(stale.UnixNano())
 
-	// Control: the backdated connection is reapable.
+	// CONTROL: the backdated connection really is reapable, so the assertion
+	// below is about the stamp rather than about a sweep that never fires.
 	if state.lastActive.Load() > time.Now().Add(-inboundIdleRetention).UnixNano() {
 		t.Fatal("the connection was not aged past the idle bound; the " +
 			"assertion below would pass without any per-frame stamp")
 	}
 
-	// Traffic over the same cached stream refreshes it.
+	// Traffic over the SAME cached stream must refresh it.
 	t1.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2}})
 	handler2.waitBatch(t, 10*time.Second)
 
@@ -3530,7 +3617,18 @@ func TestInboundActivityStampKeepsBusyConnectionAlive(t *testing.T) {
 	}
 }
 
-// TestCloseTargetClosesInboundFromRemovedPeer verifies CloseTarget closes a removed peer's inbound connection.
+// TestCloseTargetClosesInboundFromRemovedPeer is the regression test for the
+// half of a removed member's connectivity that the member controls.
+//
+// CloseTarget reached only t.conns, the connection this node DIALED. A removed
+// member that dialed US kept a fully live inbound connection — keep-alived from
+// both ends, holding a global and a per-IP slot, free to open streams — and
+// when this node had never dialed the peer at all, CloseTarget reclaimed
+// literally nothing and returned false.
+//
+// The receiving transport advertises a host its peers' certificate does NOT
+// cover, so the co-location exemption (which every loopback deployment lands
+// in) does not apply and the certificate match is actually exercised.
 func TestCloseTargetClosesInboundFromRemovedPeer(t *testing.T) {
 	receiver, sender, cleanup := inboundCertMatchPair(t)
 	defer cleanup()
@@ -3538,7 +3636,8 @@ func TestCloseTargetClosesInboundFromRemovedPeer(t *testing.T) {
 	sender.Send([]proto.Message{{Type: proto.Heartbeat, ShardID: 1, From: 2, To: 1}})
 	inbound, _ := awaitInboundConn(t, receiver)
 
-	// Control: an address the peer's certificate does not cover closes nothing.
+	// CONTROL: an address the peer's certificate does not cover must not close
+	// anything, or the "match" is really a sweep over every inbound connection.
 	if n := receiver.closeInboundFromPeer("not-in-any-san.example:9999"); n != 0 {
 		t.Fatalf("closeInboundFromPeer closed %d connections for an address no "+
 			"peer certificate covers: the teardown is not certificate-matched "+
@@ -3550,7 +3649,9 @@ func TestCloseTargetClosesInboundFromRemovedPeer(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	// The removed peer's address, covered by the leaf, closes its inbound connection.
+	// SUBJECT: the removed peer's own address closes its inbound connection.
+	// "localhost" is in the test leaf's SANs; the receiver advertises
+	// node-under-test.example, so the co-location exemption does not fire.
 	if !receiver.CloseTarget("localhost:9999") {
 		t.Fatal("CloseTarget reported nothing reclaimed for a removed peer " +
 			"holding a live inbound connection: the inbound half is invisible " +
@@ -3564,7 +3665,14 @@ func TestCloseTargetClosesInboundFromRemovedPeer(t *testing.T) {
 	}
 }
 
-// TestCloseTargetSparesCoLocatedInbound verifies inbound teardown spares co-located peers.
+// TestCloseTargetSparesCoLocatedInbound pins the exemption that keeps the
+// inbound teardown from destroying single-machine deployments.
+//
+// A certificate is matched on HOST alone, so on one machine every replica's
+// leaf covers every other replica's address. Without the exemption, removing
+// one loopback replica would close the healthy inbound connections of all its
+// neighbours — the same reason every other certificate control here exempts
+// co-located hosts.
 func TestCloseTargetSparesCoLocatedInbound(t *testing.T) {
 	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -3585,7 +3693,12 @@ func TestCloseTargetSparesCoLocatedInbound(t *testing.T) {
 	}
 }
 
-// inboundCertMatchPair builds a receiver whose advertised host the test certificate does not cover.
+// inboundCertMatchPair builds a receiver whose ADVERTISED host is absent from
+// the shared test certificate, so certificate-matched inbound teardown can be
+// exercised: the co-located exemption would otherwise make it a no-op on
+// loopback, which is every test in this package.
+//
+// Returns (receiver, sender, cleanup).
 func inboundCertMatchPair(t *testing.T) (*QUICTransport, *QUICTransport, func()) {
 	t.Helper()
 	mtls := testMTLSConfig(t)

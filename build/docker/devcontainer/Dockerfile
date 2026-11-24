@@ -1,7 +1,32 @@
-# go-quicraft devcontainer stages: tools, modules, base, toolchain (make build/test/security/deps-check) and integration; build with make docker-build (pins from scripts/tool-pins.sh).
+# go-quicraft devcontainer: one Dockerfile, the shipped stages built FROM base
+# (handbook devcontainer.md §1).
+#
+#   tools        build-only: the pinned tools, built or downloaded into /out
+#   modules      build-only: the module cache, fetched with the forge credentials
+#   base         the Go toolchain by digest, the C compiler -race needs, a
+#                non-root user and the verified module cache; GOPROXY=off
+#   toolchain    base + every tool the Makefile calls. `make build`, `make test`,
+#                `make security` and `make deps-check` run here, in CI too.
+#   integration  base + the source only. `make integration-test` runs it under
+#                the hardened compose service (compose.yaml beside this file).
+#
+# Build with `make docker-build`: it passes GO_IMAGE and every tool version from
+# scripts/tool-pins.sh, the one pin file the Makefile also reads, and the forge
+# credentials as the gomodauth BuildKit secret. GO_IMAGE has no default here, so
+# a build that bypasses the pin file fails instead of drifting. Requires
+# BuildKit.
+#
+# The build context is the repository root, filtered by the root .dockerignore.
+# A CI runner reaches its Docker daemon through a socket, so a bind mount would
+# resolve on the daemon's host, where the checkout does not exist: integration
+# bakes the source in, and CI copies the checkout into a toolchain container
+# (scripts/in-toolchain-image.sh) instead of mounting it.
 
 ARG GO_IMAGE
-# Build-time downloads go through this proxy only; a module it cannot serve fails the build.
+# Build-time module and tool downloads go through this proxy (devcontainer.md
+# §4). The caller's environment supplies another; no tracked file does. No
+# direct entry (ci-template v1.34.1): a module the proxy cannot serve fails
+# the build instead of being fetched from its origin.
 ARG GO_BUILD_PROXY=https://proxy.golang.org
 
 # ---------------------------------------------------------------------------
@@ -11,7 +36,10 @@ ARG TARGETARCH
 ENV GOTOOLCHAIN=local CGO_ENABLED=0 GOPROXY=${GO_BUILD_PROXY} GOBIN=/out
 RUN apk add --no-cache curl tar
 COPY scripts/tool-pins.sh /tmp/tool-pins.sh
-# gosec builds in a throwaway module so x/tools can be raised to XTOOLS_VERSION; retry runs a fetch up to three times.
+# gosec builds in a throwaway module so x/tools can be raised to XTOOLS_VERSION
+# (see tool-pins.sh); the others build with the x/tools their go.mod names.
+# retry runs a module fetch up to three times, so one transient proxy error
+# does not fail the image build.
 RUN set -eu; \
     retry() { \
       n=1; \
@@ -58,7 +86,13 @@ ENV GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOMODCACHE=/gomodcache GOPROXY=${GO_
 RUN apk add --no-cache git
 WORKDIR /src
 
-# Module cache layer; forge credentials come from the optional gomodauth BuildKit secret and are never written to a layer. Kept byte-identical across images (test/buildgates).
+# Download the module cache in its own layer. Credentials for the project
+# forge arrive as the optional gomodauth BuildKit secret (the K=V lines of
+# .devcontainer/.env), mounted for this RUN only: sourced, never written to a
+# layer or a command line. With no secret, modules resolve from the public
+# proxy, so a module only the forge serves (go-enclave) fails the build here,
+# loudly. This RUN is byte-identical in every image that downloads such a
+# module (test/buildgates/module_download_test.go). Requires BuildKit.
 COPY go.mod go.sum* ./
 RUN --mount=type=secret,id=gomodauth \
     set -eu; \
@@ -108,7 +142,10 @@ USER dev:dev
 
 # ---------------------------------------------------------------------------
 FROM base AS integration
-# Alpine package index checksum from scripts/apk-index-sum.sh; a new sum busts the cache so the upgrade below re-runs.
+# ci-template v1.29 (devcontainer.md §6): the Alpine package index checksum CI
+# reads (scripts/apk-index-sum.sh). A new sum misses the cache from here on, so
+# the upgrade below re-runs and takes the fixed package. Declared in this stage
+# only; base and toolchain do not take it.
 ARG APK_INDEX_SUM
 RUN apk upgrade --no-cache
 WORKDIR /src

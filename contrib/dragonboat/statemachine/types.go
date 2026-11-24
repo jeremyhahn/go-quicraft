@@ -12,7 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package statemachine adapts dragonboat's state machine interfaces to quicraft's batch interfaces via the Wrap*CreateFunc helpers.
+// Package statemachine provides a dragonboat-compatible state machine API
+// layer that adapts dragonboat's single-entry Update convention to
+// QuicRaft's batch-oriented state machine interfaces. Users migrating from
+// dragonboat implement the familiar IStateMachine, IConcurrentStateMachine,
+// or IOnDiskStateMachine interfaces and use the Wrap*CreateFunc helpers to
+// produce a quicraft sm.CreateFunc.
+//
+// MIGRATION NOTE: quicraft passes an initial snapshot directory to an
+// on-disk state machine's Open. Dragonboat's IOnDiskStateMachine.Open
+// takes only a stop channel, so the adapter discards that directory: an
+// on-disk state machine keeps managing its own storage paths exactly as
+// it did on dragonboat, and does not receive quicraft's managed
+// directory.
 package statemachine
 
 import "log/slog"
@@ -60,12 +72,21 @@ type ISnapshotFileCollection interface {
 	AddFile(fileID uint64, path string, metadata []byte)
 }
 
-// snapshotFileCollection records external files; SaveSnapshot fails with ErrSnapshotFilesNotSupported if any was added.
+// snapshotFileCollection records external files added through the
+// dragonboat ISnapshotFileCollection API. QuicRaft does not support
+// external snapshot files: the SaveSnapshot adapters inspect the
+// collection after the user state machine returns and FAIL the snapshot
+// with ErrSnapshotFilesNotSupported when any file was added. Discarding
+// the files instead would produce a snapshot that recovers without its
+// external data — permanent, silent data loss.
 type snapshotFileCollection struct {
 	files []SnapshotFile
 }
 
-// AddFile records the file so the SaveSnapshot adapter can fail the snapshot.
+// AddFile records the external file so the surrounding SaveSnapshot
+// adapter can fail the snapshot. QuicRaft does not support external
+// snapshot files; the warning makes the subsequent snapshot failure
+// attributable.
 func (s *snapshotFileCollection) AddFile(fileID uint64, path string, metadata []byte) {
 	s.files = append(s.files, SnapshotFile{
 		FileID:   fileID,

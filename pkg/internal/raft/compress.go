@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package raft implements Raft as a pure state machine: election, replication, membership, snapshots, read index and quiesce, with no I/O.
+// Package raft implements the core Raft consensus protocol as a pure state
+// machine. It handles leader election, log replication, membership changes,
+// snapshotting, read index, and quiesce. The package performs no I/O; the
+// engine layer is responsible for persistence and network transport.
 package raft
 
 import (
@@ -35,7 +38,10 @@ func CompressEntry(e *proto.Entry) {
 	}
 }
 
-// DecompressEntry decompresses a flagged entry's Cmd and clears the flag; it returns DecompressError or ErrDecompressionBomb past maxSize.
+// DecompressEntry decompresses an entry's Cmd payload if the EntryCompressFlag
+// is set. Returns a DecompressError if Snappy decoding fails, or
+// ErrDecompressionBomb if decompressed size exceeds maxSize (when maxSize > 0).
+// The flag is cleared after successful decompression.
 func DecompressEntry(e *proto.Entry, maxSize int) error {
 	if e.Type&proto.EntryCompressFlag == 0 {
 		return nil

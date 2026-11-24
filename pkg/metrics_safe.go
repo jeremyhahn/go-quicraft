@@ -24,7 +24,27 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 )
 
-// safeMetricsCollector wraps a caller's MetricsCollector so a panic in it is contained instead of unwinding an engine worker.
+// safeMetricsCollector wraps a caller-supplied MetricsCollector so a panic in
+// it can never reach engine code.
+//
+// This is not defensive programming for its own sake. The engine calls the
+// collector from inside critical sections in the step and commit workers. Every
+// node.raftMu acquisition there releases the lock with defer, so an escaping
+// panic does not leak the lock, but it would still unwind the engine worker:
+// the worker's recover-and-restart loop then drops the in-flight update, and
+// with it the readStates that GetUpdate already drained out of the peer, every
+// time a metrics backend hiccups. Containing the panic where it happens is
+// strictly better than recovering from it three frames up.
+//
+// The state machine and the snapshot sender have recover barriers of their
+// own; this is the one for MetricsCollector. The interface is deliberately not
+// documented as "must not panic" — a library cannot enforce that, and a
+// metrics backend that panics on a full buffer or a closed registry is an
+// ordinary bug, not a contract violation.
+//
+// Cost is one deferred call per metric observation on paths that already do a
+// map lookup and an atomic; measurable only in a microbenchmark of the wrapper
+// itself. Correctness of the host outranks it.
 type safeMetricsCollector struct {
 	inner MetricsCollector
 

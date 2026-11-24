@@ -280,7 +280,12 @@ func TestHandleSnapshot_UnloadedShardIsNotAMetricLabel(t *testing.T) {
 	}
 }
 
-// TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone verifies the sender is authorized from the stream header with HandleSnapshot's gates.
+// TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone: the transport asks the host
+// to authorize a snapshot's sender from the stream header, before it takes a
+// receive slot or any memory. The host applies HandleSnapshot's own gates
+// there, so a sender the shard admits proceeds and one it does not — a
+// certificate holder with the wrong identity, a misaddressed transfer, a shard
+// not loaded — is refused before the transfer costs the receiver anything.
 func TestAuthorizeSnapshot_AdmitsFromTheHeaderAlone(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
@@ -333,7 +338,12 @@ func (d *stopThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) bo
 	return d.engineDeliverer.DeliverLocalTo(node, msg)
 }
 
-// TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory verifies a failed receive does not discard a directory that may be recorded.
+// TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory: a receive that
+// published and then failed must not discard the canonical directory
+// unconditionally. On a node stopped in between, that directory may be named
+// by a record the stopped incarnation's commit pipeline is still writing — its
+// own adopted install at this index, which this receive's publish replaced —
+// so the discard takes the write lease, and a stopped node keeps it.
 func TestHandleSnapshot_StoppedShardKeepsThePublishedDirectory(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)
@@ -369,7 +379,12 @@ func (d *recordThenRefuse) DeliverLocalTo(node *engine.Node, msg proto.Message) 
 	return d.engineDeliverer.DeliverLocalTo(node, msg)
 }
 
-// TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords verifies a failed receive keeps a directory LogDB records.
+// TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords: the write lease
+// is shared, so a local save can publish and record the very index a receive
+// published while the receive awaited its verdict. The failed receive's
+// discard then deleted the artifact LogDB named, with the log below it already
+// compacted. The discard now runs under the snapshot-directory lock and keeps
+// a directory the record names.
 func TestHandleSnapshot_FailedReceiveKeepsADirectoryLogDBRecords(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)

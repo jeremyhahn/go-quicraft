@@ -285,7 +285,12 @@ func TestObserverReplica_ReceivesEveryEntryAndNeverCountsTowardQuorum(t *testing
 	}
 	c.assertObserverNeverLeads(200 * time.Millisecond)
 
-	// Stop two voters: with no quorum nothing commits and the observer never leads.
+	// Stop two voters. One voter and one observer are no quorum: no proposal
+	// commits, through the surviving voter or the observer, and the observer
+	// never takes leadership.
+	// The survivor is the current leader, so the lone voter keeps its role and
+	// only the commit rule can stop a proposal: if the observer's
+	// acknowledgements counted, leader plus observer would commit.
 	var survivor uint64
 	if !waitUntil(20*time.Second, func() bool {
 		survivor = c.leader()

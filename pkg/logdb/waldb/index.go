@@ -35,7 +35,11 @@ type indexEntry struct {
 	Size int64
 }
 
-// index is a sorted in-memory index of one node's log entries with binary-search lookup, guarded by an embedded sync.RWMutex.
+// index provides an in-memory sorted index of Raft log entries for a single
+// (shardID, replicaID) pair. Entries are kept in ascending Index order,
+// enabling O(log n) lookup and O(log n) range queries via binary search.
+//
+// Thread safety is provided by an embedded sync.RWMutex.
 type index struct {
 	mu      sync.RWMutex
 	entries []indexEntry
@@ -48,7 +52,10 @@ func newIndex() *index {
 	}
 }
 
-// Append adds entries in increasing Index order; an Index at or below the tail truncates from there first.
+// Append adds one or more entries to the index. Entries must have
+// monotonically increasing Index values. If an entry's Index is less than
+// or equal to the last entry in the index, it is treated as an overwrite:
+// all entries from that Index onward are truncated before appending.
 func (idx *index) Append(entries ...indexEntry) {
 	if len(entries) == 0 {
 		return
@@ -61,7 +68,10 @@ func (idx *index) Append(entries ...indexEntry) {
 	}
 }
 
-// appendLocked adds one entry, truncating from its Index first if it overwrites. Caller holds the write lock.
+// appendLocked adds a single entry while holding the write lock.
+// If the new entry's Index already exists or is earlier than the tail,
+// all entries from that position onward are truncated first. This handles
+// Raft leader changes where a new leader overwrites uncommitted entries.
 func (idx *index) appendLocked(e indexEntry) {
 	n := len(idx.entries)
 	if n == 0 || e.Index > idx.entries[n-1].Index {
@@ -102,7 +112,11 @@ func (idx *index) Lookup(raftIndex uint64) (indexEntry, bool) {
 	return indexEntry{}, false
 }
 
-// Range returns a copy of the entries with index in [low, high), or nil if none.
+// Range returns all indexEntry values whose Raft log index is in [low, high).
+// Returns nil if no entries fall within the range.
+//
+// The returned slice is a copy of the internal entries, safe to retain and
+// use after the read lock is released.
 func (idx *index) Range(low, high uint64) []indexEntry {
 	if low >= high {
 		return nil
@@ -134,7 +148,8 @@ func (idx *index) Range(low, high uint64) []indexEntry {
 	return result
 }
 
-// Compact removes all entries with Index <= upTo.
+// Compact removes all entries with Index <= upTo. This supports Raft log
+// compaction where entries below the snapshot index are no longer needed.
 func (idx *index) Compact(upTo uint64) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
@@ -185,7 +200,11 @@ func (idx *index) Last() (indexEntry, bool) {
 	return idx.entries[len(idx.entries)-1], true
 }
 
-// Bounds returns the first entry, last entry and count under one lock; count 0 means empty.
+// Bounds returns the first entry, last entry, and entry count under a single
+// lock acquisition, so callers deriving a range from all three see one
+// consistent snapshot instead of racing First/Last/Len against a concurrent
+// append or compaction. count == 0 means the index is empty and both entries
+// are zero-valued.
 func (idx *index) Bounds() (first, last indexEntry, count int) {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()

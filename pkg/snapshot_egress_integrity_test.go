@@ -29,7 +29,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Egress integrity: a snapshot leaves the node, by send or export, only as the bytes its snapshot.meta recorded.
+// ---------------------------------------------------------------------------
+// Egress integrity: a snapshot leaves the node only as the bytes its
+// snapshot.meta recorded. Recovery checked that record; the transport send and
+// ExportSnapshot did not, so a same-size bit flip in a retained plaintext
+// artifact was streamed to a lagging follower, which stamped the damaged bytes
+// with a fresh hash of its own and discarded the log the snapshot covers.
+// ---------------------------------------------------------------------------
 
 // writeRecordedSnapshot writes data as dir/snapshot.dat and a snapshot.meta
 // beside it recording the length and hash of those bytes, as the save path

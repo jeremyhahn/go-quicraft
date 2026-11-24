@@ -26,7 +26,12 @@ import (
 // with.
 const errAddrInUse = unix.EADDRINUSE
 
-// TestStart_AppliesListenerSockopts checks the listener has at least the configured buffers and no SO_REUSEADDR.
+// TestStart_AppliesListenerSockopts verifies that the socket Start binds
+// carries at least the configured SO_RCVBUF and SO_SNDBUF and does NOT carry
+// SO_REUSEADDR, which on Linux would let another socket that sets it share the
+// listener's address (see sockopt_unix.go). The kernel may round a buffer size
+// up (Linux doubles it) and quic-go may raise the receive buffer further, so
+// the buffers are checked as floors.
 func TestStart_AppliesListenerSockopts(t *testing.T) {
 	const bufSize = 64 * 1024
 	got := listenerSockopts(t, bufSize, map[string]int{

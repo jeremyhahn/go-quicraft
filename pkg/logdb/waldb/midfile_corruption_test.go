@@ -50,7 +50,19 @@ func flipByteAt(t *testing.T, path string, off int64) {
 	}
 }
 
-// writeSegmentRecords fills a fresh segment with n records of size bytes and returns its path.
+// writeSegmentRecords fills a fresh segment with n records of the given size
+// and returns the segment path. The records are large enough that the segment
+// spans many blocks, so corruption can be placed in the middle with valid data
+// on both sides.
+//
+// Every record is FSYNCED before the next one is written, which is what
+// walShard.writeRecord does outside batch mode. That is not incidental setup: it
+// is what makes these records ACKNOWLEDGED, and acknowledged is the whole
+// property the mid-file tests below assert must not be destroyed. Records
+// written into a segment that was never synced carry one durability generation
+// and are, correctly, discardable — a fixture that skipped the syncs would be
+// asserting against data the WAL never promised anyone, and recovery would be
+// right to truncate it.
 func writeSegmentRecords(t *testing.T, dir string, id uint64, blockSize, n, recSize int) string {
 	t.Helper()
 	seg, _, err := createSegment(defaultFS(), dir, id, blockSize, 1024*1024)
@@ -71,7 +83,12 @@ func writeSegmentRecords(t *testing.T, dir string, id uint64, blockSize, n, recS
 	return filepath.Join(dir, segmentFilename(id))
 }
 
-// TestReadAll_TornTailIsStillATornTail verifies corruption with nothing decodable after it is a torn tail.
+// TestReadAll_TornTailIsStillATornTail is the counterweight to
+// TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating, which fails
+// stop on a flipped bit that valid records follow: corruption with NOTHING
+// decodable after it is a genuinely interrupted write, and recovery must still
+// be allowed to repair it by truncation. Without this, the mid-file fix would
+// turn every ordinary crash into an unbootable node.
 func TestReadAll_TornTailIsStillATornTail(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -114,7 +131,12 @@ func TestReadAll_TornTailIsStillATornTail(t *testing.T) {
 	}
 }
 
-// TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating verifies corruption followed by valid records fails stop and leaves the file intact.
+// TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating is the DB-level
+// half of mid-file corruption detection. Corruption in the highest-numbered (final) segment is a
+// legal torn tail ONLY when nothing decodable follows it. When records do
+// follow, Open must fail-stop with ErrMidSegmentCorruption and leave the file
+// byte-for-byte intact, so the operator can restore from snapshot/peers with
+// the evidence still on disk — instead of the WAL silently amputating itself.
 func TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
@@ -138,7 +160,9 @@ func TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating(t *testing.T) {
 		t.Fatalf("fixture: segment is %d bytes, need several blocks", sizeBefore)
 	}
 	flipByteAt(t, seg0Path, int64(blockSize)+100)
-	// Snapshot the content, not just the length.
+	// Snapshot the CONTENT, not just the length. A fail-stop that truncated and
+	// re-extended, or that rewrote a block in place, leaves the size unchanged
+	// while destroying the evidence the operator is being told to preserve.
 	bytesBefore, err := os.ReadFile(seg0Path)
 	if err != nil {
 		t.Fatalf("read segment before recovery: %v", err)
@@ -189,7 +213,8 @@ func TestRecovery_MidSegmentCorruptionFailsStopWithoutTruncating(t *testing.T) {
 	}
 }
 
-// shortReadErrFile returns a partial read with a non-EOF error at or past an offset.
+// shortReadErrFile returns a PARTIAL read together with a non-EOF error on the
+// first ReadAt at or past a given offset, the shape a failing sector produces.
 type shortReadErrFile struct {
 	File
 	failAt  int64
@@ -208,7 +233,13 @@ func (f *shortReadErrFile) ReadAt(p []byte, off int64) (int, error) {
 	return f.File.ReadAt(p, off)
 }
 
-// TestReadAll_ShortReadWithErrorIsAnError verifies a partial read with an error is reported.
+// TestReadAll_ShortReadWithErrorIsAnError pins the read guard in ReadAll.
+//
+// A guard of `err != nil && n == 0` would drop the error of a partial read
+// that ALSO reported one: the truncated block would be parsed as if it simply
+// ended there, the loop would still stride a full block forward, and every
+// following block would be replayed with neither a hole nor a corruption
+// recorded — a silently shortened WAL presented as a clean one.
 func TestReadAll_ShortReadWithErrorIsAnError(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -259,7 +290,9 @@ func TestReadAll_ShortReadWithErrorIsAnError(t *testing.T) {
 	}
 }
 
-// lastBlockRecordOffsets returns the offsets of the chunks decoding in the segment's final block.
+// lastBlockRecordOffsets returns the in-block offsets of every chunk that
+// decodes in the segment's final data block, so a test can place corruption
+// with known-good records after it INSIDE that block.
 func lastBlockRecordOffsets(t *testing.T, path string, blockSize int) (blockStart int64, offsets []int) {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -279,7 +312,20 @@ func lastBlockRecordOffsets(t *testing.T, path string, blockSize int) (blockStar
 	return blockStart, offsets
 }
 
-// TestReadAll_CorruptionInTheFinalBlockIsNotATornTail verifies corruption followed by valid records in the final block is not a torn tail.
+// TestReadAll_CorruptionInTheFinalBlockIsNotATornTail closes the blind spot in
+// the torn-tail test.
+//
+// The post-corruption sweep probed the first record of each SUBSEQUENT block,
+// which answers the question everywhere except where it is most likely to be
+// asked: if the damage is in the LAST block holding data there are no later
+// blocks to probe, so no evidence was gathered and recovery
+// truncated. The records sitting after the damaged bytes inside that same block
+// — up to a blockful of already-acknowledged records — were destroyed, and the
+// segment was cut at a fixed prefix boundary that had nothing to do with where
+// the writer actually stopped.
+//
+// The block is already in memory, and every candidate is validated by its own
+// CRC, so finding one is evidence and not a guess.
 func TestReadAll_CorruptionInTheFinalBlockIsNotATornTail(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -295,7 +341,8 @@ func TestReadAll_CorruptionInTheFinalBlockIsNotATornTail(t *testing.T) {
 			"so that one can survive after the corruption", len(offsets))
 	}
 
-	// Corrupt the first record in the final block; later records still pass their CRC.
+	// Corrupt the payload of the FIRST record in the final block. Every later
+	// record in that block is untouched and still passes its own CRC.
 	flipByteAt(t, path, blockStart+int64(offsets[0])+recordHeaderSize)
 
 	seg := openSegmentForTest(t, dir, 5, blockSize)
@@ -318,7 +365,12 @@ func TestReadAll_CorruptionInTheFinalBlockIsNotATornTail(t *testing.T) {
 	}
 }
 
-// TestReadAll_ZeroPaddingAfterCorruptionIsStillATornTail verifies zero padding after corruption is not mistaken for data.
+// TestReadAll_ZeroPaddingAfterCorruptionIsStillATornTail guards the other
+// direction of the intra-block probe: the pre-allocated zero tail that follows
+// the last record in a block must not be mistaken for surviving data. A zeroed
+// header decodes to record type 0, which is not a valid type, so it can never
+// pass — but the whole value of the fail-closed path depends on that staying
+// true, so it is pinned rather than assumed.
 func TestReadAll_ZeroPaddingAfterCorruptionIsStillATornTail(t *testing.T) {
 	dir := t.TempDir()
 	const (
@@ -382,7 +434,21 @@ func zeroBlockAt(t *testing.T, path string, off int64, blockSize int) {
 	}
 }
 
-// TestRecovery_ZeroHoleUnderAcknowledgedDataFailsStop verifies a zeroed range under acknowledged data fails stop.
+// TestRecovery_ZeroHoleUnderAcknowledgedDataFailsStop is the end-to-end
+// reproduction of the WAL's most damaging failure mode, and the DB-level half of
+// TestSegment_ZeroHoleUnderAcknowledgedDataIsNotTruncatable.
+//
+// Sixty single-entry SaveState calls, each its own fsynced batch and therefore
+// its own durability generation, then one zeroed block in the middle of the
+// segment. A zero-hole classifier that ignored the generations would reopen
+// SUCCESSFULLY, returning nine of the sixty entries with HardState.Commit
+// rolled back from 60 to 9 — fifty-one acknowledged, committed Raft log
+// entries destroyed and the commit index moved BACKWARDS, with Open returning
+// nil — while flipping four bytes at the same offset instead of zeroing them
+// refuses to open: identical damage, opposite verdicts.
+//
+// The whole file must also survive untouched, because the operator is being told
+// to restore from snapshot/peers and the evidence has to still be there.
 func TestRecovery_ZeroHoleUnderAcknowledgedDataFailsStop(t *testing.T) {
 	const (
 		blockSize = 1024
@@ -411,7 +477,11 @@ func TestRecovery_ZeroHoleUnderAcknowledgedDataFailsStop(t *testing.T) {
 	}
 	seg0Path := segmentPath(db, shardID, 0)
 
-	// Take the baseline before closing; reopening would create segment 1.
+	// Baseline, taken BEFORE the DB is closed. Reopening to check it would
+	// create segment 1, and segment 0 would then be non-final — which the prefix
+	// rule rejects on its own, hiding the defect behind a different fail-stop.
+	// The damage has to land in the HIGHEST-numbered segment, which is the only
+	// place recovery is ever willing to truncate.
 	first, length, err := db.EntryRange(shardID, 1)
 	if err != nil {
 		t.Fatalf("EntryRange (baseline): %v", err)
@@ -472,7 +542,15 @@ func TestRecovery_ZeroHoleUnderAcknowledgedDataFailsStop(t *testing.T) {
 	}
 }
 
-// TestRecovery_ZeroHoleInsideOneGenerationStillBoots verifies a WAL from an ordinary power loss still opens.
+// TestRecovery_ZeroHoleInsideOneGenerationStillBoots guards the other direction:
+// making the hole path consult the durability generations must not refuse a WAL
+// that an ordinary power loss produces.
+//
+// One SaveState carrying many per-replica updates is written record by record
+// and fsynced once. Tearing an interior block of that single in-flight batch
+// leaves decodable records above the hole, all of them in the generation that
+// never completed a sync — so nothing above the damage was acknowledged,
+// recovery truncates to the clean prefix, and the node boots on it.
 func TestRecovery_ZeroHoleInsideOneGenerationStillBoots(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()

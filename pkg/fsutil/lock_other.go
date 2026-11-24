@@ -22,7 +22,10 @@ import (
 	"runtime"
 )
 
-// lockFile fails on platforms without a per-open-file exclusive lock rather than proceed unprotected.
+// lockFile refuses on a platform with no per-open-file exclusive lock. An
+// open that cannot exclude a second writer fails rather than proceeding
+// unprotected: a lock that silently does nothing is the defect it exists to
+// prevent.
 func lockFile(*os.File) error {
 	return fmt.Errorf("exclusive directory lock is not supported on %s", runtime.GOOS)
 }

@@ -28,7 +28,26 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestImportSnapshot_ReachesDEKPurgeFloorAndGC checks an imported snapshot lands in the canonical tree, so it sets the DEK purge floor and is seen by GC.
+// TestImportSnapshot_ReachesDEKPurgeFloorAndGC guards against import-path key
+// destruction.
+//
+// The shard's canonical BASE directory already ends in shard-N and the engine
+// appends shard-N/replica-M/snapshot-... to it, so an import that hand-rolled
+// its on-disk path as <NodeHostDir>/snapshots/shard-N/replica-M/snapshot-...
+// would land one level ABOVE the canonical tree, invisible to
+// listSnapshotDirs. Two consequences, both serious:
+//
+//  1. The DEK purge floor is computed by SCANNING snapshot directories, not
+//     from LogDB records. An invisible snapshot contributes no floor, so
+//     PurgeEpochsBefore legitimately drops the DEK the imported snapshot was
+//     re-encrypted under and StartShard then fails closed on an undecryptable
+//     artifact — for a disaster-recovery restore, total loss.
+//  2. Snapshot GC never enumerates the directory, so every import leaks.
+//
+// The assertion is on the FLOOR, not on the path string: the floor is produced
+// by the very scan (listSnapshotDirs + readSnapshotEpoch) that GC and epoch
+// purging use, so it proves the artifact is genuinely reachable rather than
+// merely well-named.
 func TestImportSnapshot_ReachesDEKPurgeFloorAndGC(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -83,7 +102,9 @@ func TestImportSnapshot_ReachesDEKPurgeFloorAndGC(t *testing.T) {
 					"so this test cannot observe the purge floor it is guarding")
 			}
 
-			// The path must match every other snapshot writer's, honouring DataDir, named by the snapshot index.
+			// The path must be the SAME construction every other snapshot
+			// writer uses, honouring the shard's DataDir — including the
+			// directory name, which is the snapshot's own index (900 here).
 			base := shardSnapshotBaseDir(cfg.NodeHostDir, shardCfg.DataDir, shardID)
 			wantDir := engine.SnapshotSaveDir(base, shardID, replicaID, 900)
 			if imported.Filepath != wantDir {
@@ -129,7 +150,11 @@ func TestImportSnapshot_ReachesDEKPurgeFloorAndGC(t *testing.T) {
 	}
 }
 
-// TestImportSnapshot_WritesEpochMetadata pins that an import writes snapshot.meta, which the purge-floor scan reads.
+// TestImportSnapshot_WritesEpochMetadata pins the other half of the same
+// failure: the purge-floor scan reads the epoch from snapshot.meta, and a
+// MISSING metadata file is read as "no snapshot here, imposes no floor". An
+// import that writes no metadata is therefore just as invisible to the purge
+// floor as one written to the wrong directory, even when the path is correct.
 func TestImportSnapshot_WritesEpochMetadata(t *testing.T) {
 	const shardID, replicaID uint64 = 8, 1
 
@@ -193,7 +218,19 @@ func readSnapshotMetaFields(t *testing.T, dir string) (epoch, index, term uint64
 	return meta.Epoch, meta.Index, meta.Term
 }
 
-// The DataDir layout is discovered from the shard's LogDB bootstrap record, not declared by the caller.
+// The DataDir layout must be DISCOVERED, not declared.
+//
+// WithImportDataDir was documented as required whenever Config.DataDir is
+// non-empty, but nothing validated it and ImportSnapshot could not detect the
+// omission. Omitting it wrote the artifact under NodeHostDir while StartShard
+// pointed the shard's SnapshotDir at DataDir/shard-N, so listSnapshotDirs
+// never enumerated it: the artifact contributed no floor to the DEK purge and
+// the next PurgeEpochsBefore destroyed the key it needed. That is exactly the
+// bug TestImportSnapshot_ReachesDEKPurgeFloorAndGC covers, still live, behind
+// a silent caller opt-in.
+//
+// StartShard now records Config.DataDir in the shard's LogDB bootstrap record,
+// so an import of a shard this host has started resolves the layout itself.
 func TestImportSnapshot_DiscoversDataDirFromBootstrapRecord(t *testing.T) {
 	const shardID, replicaID uint64 = 41, 1
 	dataDir := t.TempDir()

@@ -22,7 +22,12 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 )
 
-// TestSharedPeerCertificateAliasIsTheTransportValue pins that the re-exported error is the transport's own value.
+// TestSharedPeerCertificateAliasIsTheTransportValue pins the re-export of the
+// certificate-exclusivity rejection StartShard and the membership-add API
+// return. pkg/internal/transport is unimportable from outside this module, so
+// the alias is a caller's only way to match it; it is worth something only
+// while it is the SAME value, which a look-alike with identical text must not
+// satisfy.
 func TestSharedPeerCertificateAliasIsTheTransportValue(t *testing.T) {
 	if ErrSharedPeerCertificate != transport.ErrSharedPeerCertificate {
 		t.Fatal("quicraft.ErrSharedPeerCertificate is not the same error VALUE as " +

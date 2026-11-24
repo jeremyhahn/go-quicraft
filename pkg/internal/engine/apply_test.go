@@ -76,7 +76,11 @@ func TestApplyWorker_RecoverFromSMPanic(t *testing.T) {
 	item.node = node
 	applyC <- item
 
-	// Poll errorReported, which handleError sets after node.failed.
+	// Wait for the apply worker to process the item. Poll for
+	// errorReported (set by handleError) rather than node.failed,
+	// because failed is stored BEFORE handleError runs. Polling
+	// on the later signal avoids the race where the test reads
+	// errorReported before the apply goroutine has called handleError.
 	waitFor(t, 5*time.Second, time.Millisecond, "timed out waiting for panic recovery", func() bool {
 		return errorReported.Load() != nil
 	})
@@ -322,7 +326,12 @@ func TestApplyWorker_UnloadThenReload(t *testing.T) {
 		t.Fatalf("expected 1 apply callback for shard 5 before reload, got %d", count)
 	}
 
-	// Re-load shard 5 with a fresh Node, as LoadNode does; the reload is applied before the queued item.
+	// Step 4: Re-load shard 5 (clears unloaded entry). In production,
+	// LoadNode creates a fresh Node, so we do the same to avoid sharing
+	// the old node's non-atomic fields with the old goroutine (which
+	// may still be draining).
+	// The reload rendezvouses with the dispatcher, which applies it before
+	// it can pick up the item queued below.
 	aw.requestReload(5)
 
 	goodSM2 := newTestSM()
@@ -438,7 +447,13 @@ func TestSMPanicError_ErrorMessage(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_ReloadServicedBeforeQueuedItem checks a re-loaded shard's first committed batch is applied, not dropped.
+// TestApplyWorker_ReloadServicedBeforeQueuedItem verifies that a re-loaded
+// shard's first committed batch is applied rather than dropped. LoadNode
+// requests the reload before publishing the node; the request rendezvouses
+// with the dispatcher, which therefore clears the unloaded mark before it can
+// pick up the shard's next committed batch. A dropped batch is permanent:
+// Peer.Commit has already advanced the processed marker, so it is never
+// re-offered.
 func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	applyC := make(chan *applyItem, 4)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -470,7 +485,13 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	item.node = node
 	applyC <- item
 
-	// Wait on commitPending, cleared after Apply returns and lastApplied is stored.
+	// commitPending is the worker's per-item completion mark: the per-shard
+	// goroutine clears it in a defer that runs AFTER SM.Apply has returned
+	// and lastApplied has been stored, and the unloaded-discard path clears
+	// it too, so the wait ends promptly whichever way the item went and
+	// every read below is pinned. testSM.Update bumps applyCount on ENTRY,
+	// so waiting on that alone observes the batch mid-apply, before the
+	// worker has advanced lastApplied.
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"committed batch of the re-loaded shard was never processed",
 		func() bool { return !node.commitPending.Load() })
@@ -490,7 +511,20 @@ func TestApplyWorker_ReloadServicedBeforeQueuedItem(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_MembershipOrderIsDeterministic checks unload and reload requests apply in the order made, over many iterations.
+// TestApplyWorker_MembershipOrderIsDeterministic verifies that the dispatcher
+// applies unload and reload requests in the order they were made.
+//
+// While the two travelled on separate channels (an unbuffered unloadC and a
+// buffered reloadC) the dispatcher's select picked between them uniformly at
+// random whenever both were ready. A LoadNode(S) immediately followed by a
+// StopShard(S) could therefore be applied in reverse, leaving S OUT of the
+// unloaded set after it had been unloaded: a stale applyItem would then spawn
+// a per-shard goroutine that nothing ever closes and apply committed entries
+// into a state machine StopShard has already closed. The reverse inversion
+// leaves a re-loaded shard marked unloaded, so its batches are dropped.
+//
+// The loop runs the race many times because a two-channel dispatcher picks
+// the wrong order roughly half the time.
 func TestApplyWorker_MembershipOrderIsDeterministic(t *testing.T) {
 	const iterations = 500
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}
@@ -570,7 +604,11 @@ func TestApplyWorker_GapDetection_FailsShard(t *testing.T) {
 	item.node = node
 	applyC <- item
 
-	// Wait on commitPending: OnProposalFailed fires before the node is marked failed.
+	// failApply reports the batch through OnProposalFailed BEFORE it marks
+	// the node failed, so waiting on the callback count alone reads
+	// IsFailed before the worker has set it. commitPending is cleared by
+	// the per-shard goroutine's defer after failApply has returned, which
+	// pins every read below.
 	waitFor(t, 5*time.Second, time.Millisecond,
 		"timed out waiting for the gapped batch to be processed",
 		func() bool { return !node.commitPending.Load() })
@@ -593,7 +631,19 @@ func TestApplyWorker_GapDetection_FailsShard(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_GapDetection_FailsShardWhenNothingApplied checks a first batch above index 1 fails a fresh shard.
+// TestApplyWorker_GapDetection_FailsShardWhenNothingApplied verifies that the
+// gap check also covers a shard whose applied marker is still zero.
+//
+// A fresh shard is seeded with SeedLastApplied(0, 0) and raft's processed
+// marker is 0 with it, so raft offers its first batch at index 1. A first
+// batch that starts anywhere above 1 therefore means an earlier batch was
+// dropped by one of the three drop paths (the commit worker's unloaded skip,
+// the apply dispatcher's unloaded/shutdown drop, a failed Peer.Commit), each
+// of which relies on this check as its safety net. Peer.Commit has already
+// advanced the processed marker past the missing range, so it can never be
+// re-offered: applying over the hole would leave the replica acking the leader
+// and serving reads from a state machine missing committed entries — a state
+// machine safety violation with no error and no failed shard.
 func TestApplyWorker_GapDetection_FailsShardWhenNothingApplied(t *testing.T) {
 	applyC := make(chan *applyItem, 4)
 	applyPool := &sync.Pool{New: func() interface{} { return &applyItem{} }}

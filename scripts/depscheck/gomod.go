@@ -28,7 +28,10 @@ type directive struct {
 	Comment string
 }
 
-// parseGoMod reads a go.mod's require and replace directives in line and block form; a comment belongs to the line it trails or sits directly above.
+// parseGoMod reads the require and replace directives of a go.mod file, in
+// both the single-line and the block form. A comment belongs to a line when
+// it trails the line or sits directly above it with no blank line between;
+// a comment above a "require (" block belongs to no line in it.
 func parseGoMod(file string, data []byte) ([]directive, error) {
 	var (
 		directives []directive
@@ -168,7 +171,10 @@ type dependency struct {
 	Reason  string
 }
 
-// dependencies returns what deps-check compares: direct requires no replace overrides, and replaces onto a module version.
+// dependencies selects what deps-check compares: every direct require that
+// no replace overrides, and every replace onto a module version. Indirect
+// requires follow from the direct ones, and a local-directory replace (the
+// intra-repo sdk/go reference) has no published version to be behind.
 func dependencies(file string, directives []directive) []dependency {
 	replaced := make(map[string]bool)
 	var deps []dependency

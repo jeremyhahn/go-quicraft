@@ -241,9 +241,19 @@ func TestStep_AllowsZeroTermLocalControlMessages(t *testing.T) {
 	}
 }
 
-// The Term==0 bypass applies to local delivery only, not to the message type.
+// ---------------------------------------------------------------------------
+// The Term==0 bypass belongs to the LOCAL delivery path, not to the
+// message TYPE. Every type in localControlMessages is decodable from the wire
+// (proto.Message.UnmarshalFrom accepts any known type), the transport hands
+// whole batches to the message handler with no type filter, and the handler
+// delivers into the SAME inbox the in-process injectors use. Keying the
+// exemption on the type alone therefore exposed all six to the network.
+// ---------------------------------------------------------------------------
 
-// A wire message of a local-control type with Term 0 is dropped; real forwards carry the sender's term.
+// A wire message of a local-control type carrying Term 0 must be dropped, not
+// stepped. Propose and ReadIndex are legitimately FORWARDED by followers, but
+// a forward is produced by send() and always carries the sender's term; a
+// term-less one can only be a forgery.
 func TestStep_RejectsZeroTermLocalControlFromWire(t *testing.T) {
 	for msgType := range localControlMessages {
 		name := proto.MessageTypeName(msgType)
@@ -264,7 +274,10 @@ func TestStep_RejectsZeroTermLocalControlFromWire(t *testing.T) {
 	}
 }
 
-// The four types never exchanged between replicas are refused from the wire at any term.
+// The four types that are NEVER exchanged between replicas must be refused
+// from the wire at ANY term, including the receiver's own current term.
+// Supplying a matching term is free for an attacker (terms are observable in
+// every heartbeat), so a term-value heuristic is not a boundary.
 func TestStep_RejectsProcessLocalTypesFromWireAtAnyTerm(t *testing.T) {
 	for msgType := range processLocalMessages {
 		name := proto.MessageTypeName(msgType)
@@ -380,7 +393,8 @@ func TestJoiningNode_AdoptsSnapshotWithEqualConfigChangeID(t *testing.T) {
 	}
 	p.publishMembership()
 
-	// The leader's snapshot carries the full configuration at the same ConfigChangeID.
+	// The leader's snapshot carries the full configuration at the SAME
+	// ConfigChangeID.
 	full := proto.Membership{
 		Addresses: map[uint64]string{
 			1: "a1", 2: "a2", 3: "a3", 4: "a4",
@@ -689,7 +703,18 @@ func TestHasConfigChangeToApply_CoversArbitrarilyWideRanges(t *testing.T) {
 	}
 }
 
-// becomeLeader must not read the unapplied log: a counting LogReader proves the gate reads nothing.
+// becomeLeader must not do work proportional to the unapplied log.
+//
+// A gate that re-read (processed, lastIndex] with no byte bound, synchronously
+// on the step worker, would not scale. On a restart processed starts at the
+// snapshot index, and Config.SnapshotEntries has no default, so a default
+// deployment never compacts: the range is the whole log. 200k unapplied 1KB
+// entries is ~200MB copied before the new leader can send its first heartbeat,
+// so the election it had just won would time out and the shard would
+// election-loop.
+//
+// A counting LogReader proves the property directly: answering the gate over
+// a large unapplied range must not read the log at all.
 func TestHasConfigChangeToApply_DoesNotReadTheLog(t *testing.T) {
 	entries := make([]proto.Entry, 0, 20000)
 	for i := uint64(1); i <= 20000; i++ {
@@ -717,7 +742,7 @@ func TestHasConfigChangeToApply_DoesNotReadTheLog(t *testing.T) {
 			"unapplied tail; the config-change gate must be O(1) or the "+
 			"first heartbeat is delayed behind the whole log", got)
 	}
-	// It must still fail closed over an unclassified recovered tail.
+	// It must still FAIL CLOSED over an unclassified recovered tail.
 	if !r.pendingConfigChange {
 		t.Fatal("a restarted leader with an unapplied tail did not arm the " +
 			"config-change gate: the tail may hold a config change this " +
@@ -725,7 +750,11 @@ func TestHasConfigChangeToApply_DoesNotReadTheLog(t *testing.T) {
 	}
 }
 
-// The conservative arming releases as the recovered tail is applied, without reading the log.
+// The conservative arming must RELEASE as the recovered tail is applied, or a
+// leader elected after a restart would reject membership changes for its whole
+// term. This is what the old scan's configChangeScanUnproven re-check existed
+// to guarantee; the bound now releases without reading anything, so a LogDB
+// read error cannot latch the gate at all.
 func TestConfigChangeGate_ConservativeArmingReleasesOnApply(t *testing.T) {
 	entries := []proto.Entry{
 		{Index: 1, Term: 1},
@@ -806,7 +835,9 @@ func TestConfigChangeGate_ArmedUntilConfigChangeIsApplied(t *testing.T) {
 // until its log grew past a stale index.
 func TestConfigChangeGate_ClearedBySnapshotRestore(t *testing.T) {
 	r := newTestRaft(1)
-	// The config change is above the snapshot index, so the restore discards it and must drop its bound.
+	// The config change sits ABOVE the snapshot index, so it is one of the
+	// entries the restore DISCARDS. A bound left behind here outlives every
+	// entry it described.
 	r.log.append([]proto.Entry{{Index: 20, Term: 1, Type: proto.EntryConfigChange}})
 	if !r.hasConfigChangeToApply() {
 		t.Fatal("fixture: the appended config change did not arm the gate")
@@ -824,9 +855,14 @@ func TestConfigChangeGate_ClearedBySnapshotRestore(t *testing.T) {
 	}
 }
 
-// The config change gate is anchored at the applied frontier.
+// ---------------------------------------------------------------------------
+// The config change gate must be anchored at the APPLIED frontier
+// ---------------------------------------------------------------------------
 
-// newConfigChangeGateRaft builds a leader-elect whose last entry is a committed but unapplied config change.
+// newConfigChangeGateRaft builds a leader-elect over a log whose last entry is
+// a config change that has COMMITTED but has NOT been applied to membership
+// yet — the window between r.log.committed advancing in the step worker and
+// Peer.Commit -> processConfigChanges running.
 func newConfigChangeGateRaft(t *testing.T, applied uint64) *raft {
 	t.Helper()
 	cc := proto.ConfigChange{Type: proto.AddNode, ReplicaID: 4, Address: "a4"}
@@ -852,7 +888,23 @@ func newConfigChangeGateRaft(t *testing.T, applied uint64) *raft {
 	return r
 }
 
-// TestConfigChangeGate_ArmedByCommittedButUnappliedChange checks a new leader refuses a config change while a committed one is unapplied.
+// TestConfigChangeGate_ArmedByCommittedButUnappliedChange is the
+// regression.
+//
+// Membership does not take effect at commit; it takes effect in Peer.Commit
+// -> processConfigChanges, a stage BEHIND r.log.committed. becomeLeader armed
+// pendingConfigChange from a scan of (committed, lastIndex] only, so a config
+// change that had committed but not yet been folded into the membership was
+// invisible to it.
+//
+// {A,B,C}: A commits AddNode(D) at index 2 and crashes. B has committed=2 but
+// has not run Peer.Commit for it, so B.membership is still {A,B,C}. B wins the
+// election; the old scan starts at committed+1 = 3 over a log whose last index
+// is 2, returns immediately, and leaves pendingConfigChange=false. A client
+// then proposes AddNode(E) and it is ACCEPTED. B now computes its commit
+// quorum over {A,B,C} (q=2) while the newest configuration in the log is
+// {A,B,C,D,E} (q=3): commit quorum {A,B} and election quorum {C,D,E} do not
+// intersect, and Leader Completeness fails.
 func TestConfigChangeGate_ArmedByCommittedButUnappliedChange(t *testing.T) {
 	r := newConfigChangeGateRaft(t, 1)
 
@@ -891,7 +943,8 @@ func TestConfigChangeGate_ArmedByCommittedButUnappliedChange(t *testing.T) {
 	}
 }
 
-// The gate releases once the change is applied.
+// The gate must RELEASE once the change has actually been applied, or a
+// leader could never make a second membership change.
 func TestConfigChangeGate_ReleasedOnceChangeIsApplied(t *testing.T) {
 	r := newConfigChangeGateRaft(t, 2)
 
@@ -925,7 +978,9 @@ func TestConfigChangeGate_ReleasedOnceChangeIsApplied(t *testing.T) {
 // membership
 // ---------------------------------------------------------------------------
 
-// witnessMismatchMembership lists replica 1 as a witness beside two full replicas.
+// witnessMismatchMembership lists replica 1 as a WITNESS alongside two full
+// replicas. A node started with IsWitness=false over this configuration is on
+// the wrong side of the witness/full-replica split.
 func witnessMismatchMembership() proto.Membership {
 	return proto.Membership{
 		ConfigChangeID: 4,
@@ -934,7 +989,18 @@ func witnessMismatchMembership() proto.Membership {
 	}
 }
 
-// TestWitnessRoleMismatch_CannotCampaign checks a replica listed as a witness but started with IsWitness=false cannot campaign.
+// TestWitnessRoleMismatch_CannotCampaign is the regression.
+//
+// r.isWitness comes only from local config; nothing validated it against the
+// replicated membership. A node the configuration lists as a witness but that
+// was started with IsWitness=false passed every witness gate — they all key
+// on the local config — and could win an election. Its leader has been
+// sending it metadata-only entries (sendAppend strips the payload for
+// witnesses), so the state machine it would then answer reads from never saw
+// the entry data: linearizability is violated for the whole shard.
+//
+// dragonboat fails closed on this disagreement by panicking
+// (internal/raft/raft.go addNode/addWitness).
 func TestWitnessRoleMismatch_CannotCampaign(t *testing.T) {
 	cfg := raftTestCfgPreVote(1, 1, false)
 	cfg.IsWitness = false // contradicts the replicated membership below
@@ -998,7 +1064,8 @@ func TestWitnessRoleMismatch_RefusesReadIndex(t *testing.T) {
 	}
 }
 
-// An agreeing configuration latches nothing.
+// An AGREEING configuration must not latch anything, or every witness and
+// every full replica in the cluster would stop campaigning and stop reading.
 func TestWitnessRole_AgreeingConfigurationIsNotLatched(t *testing.T) {
 	t.Run("full replica", func(t *testing.T) {
 		cfg := raftTestCfgPreVote(1, 1, false)
@@ -1032,7 +1099,27 @@ func TestWitnessRole_AgreeingConfigurationIsNotLatched(t *testing.T) {
 	})
 }
 
-// checkSelfRole returns early for a replica the configuration does not list, so a joining witness latches no mismatch.
+// TG-16. checkSelfRole's `if !inConfig { return }` early return.
+//
+// The check compares the LOCAL witness flag against the membership's witness
+// list. For a replica the membership does not mention, "not listed as a
+// witness" is not a statement that the replica is a full voter — the
+// configuration says nothing about it at all. Without the early return, that
+// silence reads as "listed as a full replica" and a replica started as a
+// WITNESS latches a role mismatch against a configuration that never disagreed
+// with it.
+//
+// That is the normal state of a JOINING witness: it is started with
+// IsWitness=true and knows only the existing members until the AddWitness
+// naming it commits. Latching there logs an ERROR declaring the replica
+// unsafe, and turns its TimeoutNow and read paths into
+// ErrWitnessRoleMismatch — a diagnosis of a corrupted replica, produced by the
+// one check whose entire job is to distinguish a corrupted replica from a
+// healthy one.
+//
+// The existing "not in configuration" coverage cannot see this: it uses
+// IsWitness=false, where listedWitness==false agrees with the local flag and
+// the early return changes nothing.
 func TestCheckSelfRole_AbsentFromConfigurationMakesNoStatement(t *testing.T) {
 	// The configuration lists the two existing members; this replica (1) is
 	// joining and is not mentioned anywhere.
@@ -1066,7 +1153,9 @@ func TestCheckSelfRole_AbsentFromConfigurationMakesNoStatement(t *testing.T) {
 		}
 	})
 
-	// Control: once the configuration lists this replica, the disagreement is caught.
+	// Control: once the configuration DOES make a statement about this
+	// replica, the disagreement must still be caught. Without this the test
+	// above would also pass against a checkSelfRole that never latches.
 	t.Run("witness listed as a voter is latched", func(t *testing.T) {
 		cfg := raftTestCfgPreVote(1, 1, false)
 		cfg.IsWitness = true
@@ -1123,7 +1212,15 @@ func TestWitnessRoleMismatch_LeaderStepsDownWhenLearned(t *testing.T) {
 // TG-10 / TG-15: the witness role latch on the paths that were untested
 // ---------------------------------------------------------------------------
 
-// syncRaftRemotes detects a role mismatch that arrives when a committed AddWitness names a replica started as full.
+// TG-15. syncRaftRemotes is the only DYNAMIC detection path for a role
+// disagreement: construction (newRaft -> initRemotes) catches a mismatch that
+// exists at startup, and snapshot restore catches one that arrives whole, but
+// a replica that JOINS as a witness while it was started with IsWitness=false
+// only learns about it when the committed AddWitness naming it is applied to
+// membership. Nothing else cross-checks the two — every witness gate in the
+// host and in raft keys on the LOCAL config — so if this call is missing the
+// replica runs a payload-stripped state machine while believing itself a full
+// replica, indefinitely.
 func TestSyncRaftRemotes_LatchesWitnessRoleMismatchOnCommittedAddWitness(t *testing.T) {
 	cfg := testConfigWithID(1, 4)
 	cfg.IsWitness = false // contradicts the AddWitness applied below
@@ -1139,7 +1236,7 @@ func TestSyncRaftRemotes_LatchesWitnessRoleMismatchOnCommittedAddWitness(t *test
 			"be flagged; it makes no statement about its role")
 	}
 
-	// The cluster adds it as a witness and the change commits.
+	// The cluster adds it as a WITNESS and the change commits.
 	if err := p.membership.apply(proto.ConfigChange{
 		Type:      proto.AddWitness,
 		ReplicaID: 4,
@@ -1168,7 +1265,11 @@ func TestSyncRaftRemotes_LatchesWitnessRoleMismatchOnCommittedAddWitness(t *test
 	}
 }
 
-// The latch clears when configuration and membership agree again, through syncRaftRemotes.
+// The latch must CLEAR when the disagreement is resolved, or a replica whose
+// configuration and membership are brought back into agreement stays
+// permanently unelectable and unable to serve reads. syncRaftRemotes is the
+// clearing path too: Peer.Handle replaces the membership wholesale from a
+// snapshot and then calls it.
 func TestSyncRaftRemotes_ClearsWitnessRoleMismatchWhenRolesAgree(t *testing.T) {
 	cfg := testConfigWithID(1, 4)
 	cfg.IsWitness = false
@@ -1197,7 +1298,16 @@ func TestSyncRaftRemotes_ClearsWitnessRoleMismatchWhenRolesAgree(t *testing.T) {
 	}
 }
 
-// The leader-side read gate refuses a ReadIndex once the role-mismatch latch is set.
+// TG-10. The LEADER-side read gate.
+//
+// The follower gate (handleFollowerReadIndex) is covered; the leader gate is
+// the one that matters. A follower refusing a read merely fails the request —
+// the client retries against the leader. A LEADER that answers one from a
+// payload-stripped state machine returns data the shard never agreed on,
+// under the linearizability guarantee, to a client that has no way to tell.
+// checkSelfRole steps a mismatched leader down, but a ReadIndex already
+// dispatched in the same inbox batch reaches this handler with the latch set
+// and the role still leader, which is exactly the window this gate covers.
 func TestHandleLeaderReadIndex_RefusesOnWitnessRoleMismatch(t *testing.T) {
 	r := newRegressionRaft(t, 1, map[uint64]string{1: "a1", 2: "a2", 3: "a3"})
 	r.becomeCandidate()
@@ -1205,7 +1315,8 @@ func TestHandleLeaderReadIndex_RefusesOnWitnessRoleMismatch(t *testing.T) {
 	r.log.commitTo(r.log.lastIndex())
 	r.log.appliedTo(r.log.lastIndex())
 
-	// Precondition: without the latch this read would be answered.
+	// Preconditions: without the latch this read WOULD be answered, so the
+	// assertion below cannot pass for an unrelated reason.
 	if err := r.handleLeaderReadIndex(proto.Message{Type: proto.ReadIndex, Hint: 7}); err != nil {
 		t.Fatalf("fixture: the leader must be able to serve this read: %v", err)
 	}
@@ -1232,7 +1343,13 @@ func TestHandleLeaderReadIndex_RefusesOnWitnessRoleMismatch(t *testing.T) {
 	}
 }
 
-// observerMismatchMembership lists replica 1 as an observer among four voters, where miscounting self changes the needed grants.
+// observerMismatchMembership lists replica 1 as a NON-VOTING observer among
+// four real voters. Four is deliberate: with an even voting set the two quorum
+// formulas actually differ. The configuration's quorum is quorumOf(4) = 3,
+// while a replica that wrongly counts itself computes quorumOf(4+1) = 3 and
+// supplies one of those itself — so it needs only 2 real grants where the
+// configuration requires 3. That gap is what lets two observers be elected in
+// the same term.
 func observerMismatchMembership() proto.Membership {
 	return proto.Membership{
 		ConfigChangeID: 4,
@@ -1243,7 +1360,25 @@ func observerMismatchMembership() proto.Membership {
 	}
 }
 
-// TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig checks a listed observer adopts the role, cannot campaign and latches nothing.
+// TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig is the
+// observer counterpart to TestWitnessRoleMismatch_CannotCampaign.
+//
+// A replica the configuration lists as a non-voting observer, but which was
+// started with IsObserver=false, must not campaign. If startElection gated on
+// the LOCAL flag, voters would grant it a vote because handleVoteRequest's
+// configuration test is isKnownMember, and an unconditional +1 for self in
+// numVotingMembers would size quorum over V+1 while the real voting set was V
+// and count its own vote toward it. Two such replicas could each collect a
+// "majority" from disjoint halves of the real voting set and both be elected
+// in the SAME term.
+//
+// Rather than latching the disagreement (roleMismatch), the observer role
+// FOLLOWS the replicated membership:
+// config.IsObserver is only the initial hint, so the replica simply IS an
+// observer here — it cannot campaign, by either entry point — and nothing is
+// latched, because nothing is wrong with it: observers and voters are
+// replicated identically, so the replica serves the same reads any observer
+// does. This test pins both: no candidacy, and no latch (role adopted).
 func TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig(t *testing.T) {
 	cfg := raftTestCfgPreVote(1, 1, false)
 	cfg.IsObserver = false // the replicated membership below says otherwise
@@ -1284,7 +1419,13 @@ func TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig(t *testing.T
 	}
 }
 
-// TestObserverCandidate_IsDeniedAVote checks voters deny a vote to an observer candidate.
+// TestObserverCandidate_IsDeniedAVote is the independent second half of the
+// fix, enforced by every VOTER rather than by the miscounting candidate.
+//
+// handleVoteRequest's configuration test is isKnownMember, which is true for
+// observers because getRemote searches r.observers. That is correct for
+// witnesses — they vote — and wrong for observers, which by definition do not.
+// This holds even when the candidate's own role latch is bypassed.
 func TestObserverCandidate_IsDeniedAVote(t *testing.T) {
 	// This replica (2) is a real voter; replica 1 is a non-voting observer.
 	cfg := raftTestCfgPreVote(1, 2, false)

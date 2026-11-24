@@ -23,7 +23,16 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// A restarted replica of a LeaseRead shard withholds votes and pre-votes for one election timeout, so no leader is elected inside an old lease.
+// Regression: a restarted replica of a LeaseRead shard must withhold its
+// vote and pre-vote for one election timeout of real time.
+//
+// The lease rests on every follower that acked a heartbeat round granting no
+// vote until its election timeout has passed since. A restart discards that
+// timer: the replica comes back with no known leader, so without a hold-down it
+// would grant the first up-to-date candidate at once, while the old leader kept
+// counting its pre-restart ack toward a lease — a new leader elected inside the
+// old one's lease, and a stale read. voteHeldDown restores the promise from the
+// replica's own monotonic clock, anchored at construction.
 
 // holdDownTestTerm is the persisted term a restarted replica recovers with.
 const holdDownTestTerm = 5
@@ -355,7 +364,13 @@ func (s *holdDownShard) leaders() []uint64 {
 	return ids
 }
 
-// TestLeaseVoteHoldDown_RestartedFollowerCannotElectInsideOldLease checks no other replica leads while L's lease holds after F1 restarts.
+// TestLeaseVoteHoldDown_RestartedFollowerCannotElectInsideOldLease drives the
+// reported scenario end to end. L (1) leads; F2 (2) has lost it and its
+// election timer is about to fire; L holds a lease on its own ack and F1's
+// (3). F1 restarts, and F2 campaigns for a higher term. Without the hold-down
+// F1 grants at once, F1 and F2 elect F2, and L keeps serving lease reads on
+// F1's pre-restart ack. With the hold-down no replica other than L may lead
+// while L's lease holds, and a new leader is elected once F1's window ends.
 func TestLeaseVoteHoldDown_RestartedFollowerCannotElectInsideOldLease(t *testing.T) {
 	clock := &holdDownClock{t: time.Unix(1_700_000_000, 0)}
 	s := &holdDownShard{t: t, clock: clock, nodes: map[uint64]*raft{}, cut: map[[2]uint64]bool{}}

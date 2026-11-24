@@ -54,7 +54,10 @@ func (n *Node) resume() bool {
 	return true
 }
 
-// awaitResume parks the apply goroutine until the node resumes, reporting false if it stopped first.
+// awaitResume parks the calling apply goroutine until the node is resumed.
+// It reports false if the node stopped first. The caller has released its
+// applyInFlight registration, so a pause or a recovery waiting on the drain
+// is not held by the parked batch.
 func (n *Node) awaitResume() bool {
 	n.pauseMu.Lock()
 	ch := n.resumeC
@@ -72,7 +75,11 @@ func (n *Node) awaitResume() bool {
 	}
 }
 
-// BeginSnapshotTransfer registers a snapshot transfer, reporting false and registering nothing if the replica is paused.
+// BeginSnapshotTransfer registers a snapshot send or receive of this shard
+// that the host is about to run. It reports false — and registers nothing —
+// if the replica is paused: a paused replica neither sends nor receives a
+// snapshot. The registration comes before the check, so a PauseNode that
+// set the flag first sees the transfer and waits for EndSnapshotTransfer.
 func (n *Node) BeginSnapshotTransfer() bool {
 	n.snapshotTransfers.Add(1)
 	if n.paused.Load() {
@@ -87,7 +94,11 @@ func (n *Node) EndSnapshotTransfer() {
 	n.snapshotTransfers.Add(-1)
 }
 
-// pauseSettled reports whether no log, apply or snapshot work of the paused node is in flight or queued.
+// pauseSettled reports whether no log, apply or snapshot work of the paused
+// node is in flight: no pipeline item is being persisted (one that reached
+// the apply gate is parked, one refused by a sealed barrier is held), no
+// apply is running, and no snapshot save, recovery or transfer is running or
+// queued.
 func (n *Node) pauseSettled(pool *snapshotPool) bool {
 	if n.commitPending.Load() && !n.applyParked.Load() && !n.sealHeld.Load() {
 		return false
@@ -111,7 +122,12 @@ func (p *snapshotPool) holdsSlot(node *Node) bool {
 	return owner == node
 }
 
-// refusePaused settles a snapshot request for a paused shard without running it; recoveries re-arm without counting an attempt.
+// refusePaused settles a snapshot request taken off the queue for a paused
+// shard without running it. A recovery is re-armed on the redrive without
+// counting an attempt, so a pause never exhausts recovery into a shard
+// failure and the recovery runs after the resume. An automatic save is
+// dropped and re-requested by ResumeNode; a requested one is answered
+// ErrShardPaused.
 func (p *snapshotPool) refusePaused(req snapshotRequest) {
 	switch {
 	case !req.save:
@@ -131,18 +147,38 @@ func (e *Engine) stepWorkerFor(shardID uint64) *stepWorker {
 	return e.stepWorkers[int(shardID%uint64(len(e.stepWorkers)))]
 }
 
-// PauseNode stops node without unloading it and waits until none of its work is in flight; on ctx expiry it stays paused. It is BeginPause then AwaitPause.
+// PauseNode stops node without unloading it. Once paused the replica
+// neither ticks nor steps a message — it does not campaign, vote, replicate
+// or acknowledge, and inbound messages are discarded — no committed entry
+// reaches the state machine (a batch already handed to the apply goroutine
+// parks before it), and no snapshot is taken, recovered, sent or received.
+// Its log, state machine, membership and persisted raft state are untouched.
+//
+// PauseNode returns nil once none of that work is in flight, so nothing of
+// the shard writes to the log or the snapshot store until ResumeNode. If
+// ctx ends first it returns ctx's error and the node STAYS paused: the
+// in-flight work settles on its own, and a later PauseNode waits for it
+// again. Pausing a paused node waits the same way and is otherwise a no-op.
+// A failed node is marked paused and returns at once.
+//
+// PauseNode is BeginPause followed by AwaitPause.
 func (e *Engine) PauseNode(ctx context.Context, node *Node) error {
 	e.BeginPause(node)
 	return e.AwaitPause(ctx, node)
 }
 
-// BeginPause marks node paused without waiting; no new log, apply or snapshot work starts.
+// BeginPause marks node paused and returns without waiting: from here on
+// the step worker skips it and no new log, apply or snapshot work of the
+// shard starts. A caller that serializes pause against ResumeNode holds its
+// lock across this call only, not across AwaitPause.
 func (e *Engine) BeginPause(node *Node) {
 	node.pause()
 }
 
-// AwaitPause waits until none of the paused node's work is in flight; it returns nil at once if the node was resumed.
+// AwaitPause waits until none of the paused node's work is in flight, as
+// PauseNode does. It returns nil at once if the node is no longer paused,
+// resumed by ResumeNode while it waited. A ctx already done on entry
+// returns ctx.Err(), however settled the pause is.
 func (e *Engine) AwaitPause(ctx context.Context, node *Node) error {
 	if node.IsFailed() {
 		return nil
@@ -172,7 +208,12 @@ func (e *Engine) AwaitPause(ctx context.Context, node *Node) error {
 	}
 }
 
-// ResumeNode undoes PauseNode: the replica rejoins as a follower and held applies and refused snapshots resume; a no-op if not paused.
+// ResumeNode undoes PauseNode. The replica rejoins as a follower at its
+// current term with a fresh election timeout (raft.Peer.RejoinAfterPause),
+// the parked apply continues with the batches held, in log order, and an
+// automatic snapshot the pause refused is requested again. A recovery the
+// pause refused is re-driven by the step worker. Resuming a node that is not
+// paused is a no-op.
 func (e *Engine) ResumeNode(node *Node) {
 	if !node.IsPaused() {
 		return
@@ -223,7 +264,11 @@ func (e *Engine) requestDueSave(node *Node, appliedToTerm uint64) {
 	}
 }
 
-// awaitIteration waits, bounded by ctx, until any step-worker iteration in progress has ended, by taking nodesMu's write lock once.
+// awaitIteration waits until any step-worker iteration in progress has
+// ended, bounded by ctx. Every iteration runs under nodesMu's read lock, so
+// acquiring the write lock once is the barrier. On ctx expiry the acquiring
+// goroutine finishes on its own when the iteration does. An idle worker is
+// the barrier at once, with no goroutine.
 func (w *stepWorker) awaitIteration(ctx context.Context) error {
 	if w.nodesMu.TryLock() {
 		w.nodesMu.Unlock() // an empty critical section is the barrier

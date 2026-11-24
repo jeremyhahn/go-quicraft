@@ -80,7 +80,12 @@ func TestE2E_Replication_ConcurrentProposals(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, numWorkers*entriesPerWorker)
 
-	// Every entry must commit; a leadership change is retried against the new leader.
+	// Every entry must still commit -- the verification below requires all of
+	// them on every node. A leadership change during the run is retried
+	// against the NEW leader instead of being reported as a failed proposal:
+	// workers that pinned the leader index sampled before they started and
+	// failed on ErrNotLeader would let an ordinary re-election fail the test
+	// with a message that reads like a lost write.
 	for w := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
@@ -180,7 +185,18 @@ func TestE2E_FiveNode_Replication_MultipleEntries(t *testing.T) {
 
 	const numEntries = 50
 
-	// Each proposal gets its own deadline; tryProposeToLeader re-resolves the leader per attempt.
+	// Each proposal gets its own deadline so one context timeout does not cover
+	// all 50 sequential proposals under resource contention. tryProposeToLeader
+	// re-resolves the leader per attempt and absorbs the not-leader rejection;
+	// the rate-limit backoff below stays this test's own, because a busy
+	// pipeline is not a leadership problem.
+	//
+	// The predicate is the typed error rather than a substring of its message,
+	// and it covers the commit half of the round trip as well as the
+	// submission — the helper reports one error for both, and a rate limiter
+	// that rejected at admission cannot be told apart here from one that did
+	// not. That is marginally more permissive than failing outright on a busy
+	// error raised after submission.
 	for i := range numEntries {
 		key := fmt.Sprintf("f5-key-%03d", i)
 		value := fmt.Sprintf("f5-value-%03d", i)

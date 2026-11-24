@@ -22,7 +22,28 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 )
 
-// User code (slog handlers, listeners, metrics) runs only after the state it observes is settled; callbacks run isolated through deliverEvent.
+// User code on the transport's own goroutines
+//
+// The transport runs user code at three kinds of point: a slog handler (any
+// log call), an EventListener callback or revocation notification, and a
+// MetricsCollector. None of it may stand between a state advance — a
+// connection accepted, a slot or budget taken, a connection found dead or
+// revoked, a stream released — and the cleanup or hand-off that settles it,
+// because a panic or runtime.Goexit there skips the settlement. The rule is
+// the engine's:
+//
+//   - settle first: everything structural is done, or owned by a defer that
+//     user code cannot skip, before any user code runs;
+//   - log last and contained: a diagnostic on a path that still has work to do
+//     goes through supervise.LogContained, off the calling goroutine;
+//   - isolate callbacks: an EventListener callback or revocation notification
+//     runs through deliverEvent (supervise.RunEach), synchronously but on a
+//     helper goroutine, so its abnormal exit can end neither the transport
+//     goroutine that produced it nor the callbacks after it.
+//
+// Metrics on the per-message paths are observed after the hand-off they
+// describe, never inside a window, and are not isolated: a helper goroutine
+// per observation would cost more than the observation.
 
 // deliverEvent runs each of calls, in order and synchronously, isolated from
 // one another and from the calling goroutine (supervise.RunEach). A nil call
@@ -50,7 +71,10 @@ func (t *QUICTransport) snapshotEvent(pick func(*config.EventListener) func(conf
 	return func() { cb(info) }
 }
 
-// reportSnapshotSent reports a fully sent snapshot: contained diagnostic, then OnSnapshotSent and IncSnapshotsSent, each isolated.
+// reportSnapshotSent reports an outbound snapshot that is entirely on the
+// wire: its diagnostic, contained, then OnSnapshotSent and the
+// IncSnapshotsSent metric, each isolated. Nothing it runs can change the
+// send's result, which its caller has already recorded as a success.
 func (t *QUICTransport) reportSnapshotSent(info config.SnapshotInfo, chunks uint64, bytes int64, elapsed time.Duration) {
 	supervise.LogContained(func() {
 		slog.Info("snapshot sent",

@@ -22,7 +22,14 @@ import (
 	"testing"
 )
 
-// newTestStrategy returns a SoftwareStrategy with this build's cheapest KDF (PBKDF2-SHA256 here), relying on the TestMain bypass.
+// newTestStrategy returns a SoftwareStrategy wrapped with the cheapest KDF this
+// build supports, so tests that need *a* working strategy do not each hard-code
+// one. PBKDF2-SHA256 here; Argon2id in a build without -tags fips. This build has no
+// Argon2id compiled in at all (see kdf_argon2.go).
+//
+// The work factors are far below the production floor and rely on the bypass
+// TestMain installs. Tests that are ABOUT a specific KDF must name it directly
+// rather than go through this helper.
 func newTestStrategy(passphrase []byte) (*SoftwareStrategy, error) {
 	return NewSoftwareStrategyFIPS(context.Background(), passphrase, 1000)
 }
@@ -47,7 +54,11 @@ func assertDefaultKDFVersionOutsideFIPS(t *testing.T) {
 	}
 }
 
-// assertArgon2idBaseline checks a -tags fips build has no Argon2id deriver registered.
+// assertArgon2idBaseline pins what this build does with Argon2id when FIPS is
+// not requested, which in a -tags fips build is the same as when it is: there
+// is no Argon2id deriver in the binary, so DeriveKey cannot reach one. The
+// registry assertion is the stronger of the two claims — it says the algorithm
+// is ABSENT, not merely declined.
 func assertArgon2idBaseline(t *testing.T, pass, salt []byte) {
 	t.Helper()
 	if _, ok := kdfDispatchers[KDFArgon2id]; ok {
@@ -79,7 +90,11 @@ func assertV2SeparatesSameKeySizeAlgorithms(t *testing.T, rootKey, salt, _ []byt
 	}
 }
 
-// assertChaChaRefusedUnderFIPS checks a -tags fips build refuses ChaCha20 as an unsupported identifier.
+// assertChaChaRefusedUnderFIPS pins how a -tags fips build refuses the ChaCha20
+// family: not as unapproved policy but as an UNSUPPORTED identifier, because
+// algorithm_chacha.go is not compiled and the registry has no entry. That
+// difference is the point of the build tag — the refusal does not depend on a
+// runtime check that could be misconfigured, because there is nothing to run.
 func assertChaChaRefusedUnderFIPS(t *testing.T) {
 	t.Helper()
 	for _, alg := range []SymmetricAlgorithm{AlgChaCha20Poly1305, AlgXChaCha20Poly1305} {

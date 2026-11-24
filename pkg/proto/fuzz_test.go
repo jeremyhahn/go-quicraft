@@ -22,7 +22,11 @@ import (
 	"testing"
 )
 
-// identityPrefix is the identity scheme prefix; clamped addresses must leave room for it.
+// identityPrefix is the scheme prefix the identity shapes below build their
+// values from. It is a named constant because its LENGTH matters: Identities
+// and RemovedIdentities are bounded by MaxAddressLength on both the read and
+// write sides, so anything derived from a clamped address must leave room for
+// it.
 const identityPrefix = "spki:"
 
 // FuzzEntryRoundTrip verifies that Entry marshal/unmarshal round-trips
@@ -608,7 +612,16 @@ func FuzzMembershipRoundTrip(f *testing.F) {
 		removedKey uint64,
 		maxWitnesses uint64, requireFullMajority bool) {
 
-		// Clamp addresses, leaving room for the spki: prefix within MaxAddressLength.
+		// Clamp address values to valid length.
+		//
+		// addrVal is clamped to leave room for the "spki:" prefix the identity
+		// shapes below build from it. Clamping it to exactly MaxAddressLength
+		// made "spki:"+addrVal five bytes too long, and Identities is bounded by
+		// MaxAddressLength on BOTH sides — so the harness was constructing a
+		// membership the decoder would refuse, and asserting the encoder emit
+		// it. That went unnoticed until MarshalTo grew the matching write-side
+		// bound; before that the encoder produced a frame its own decoder could
+		// not read, which is the durability bug the bound exists to prevent.
 		if len(addrVal) > MaxAddressLength-len(identityPrefix) {
 			addrVal = addrVal[:MaxAddressLength-len(identityPrefix)]
 		}
@@ -729,7 +742,12 @@ func checkMembershipRoundTrip(t *testing.T, m *Membership) {
 			}
 		}
 
-		// Compare the authorization maps and the session policy too.
+		// The AUTHORIZATION maps and the replicated session policy were
+		// neither populated by any shape nor compared here — 5 of 12 fields.
+		// A regression dropping Identities or RemovedIdentities "revokes a
+		// revocation" (an ejected keypair is readmitted); one dropping the
+		// session policy makes a recovering replica expire sessions at log
+		// indexes its peers do not. Both are silent.
 		for _, p := range []struct {
 			name      string
 			want, got map[uint64]string

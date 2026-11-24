@@ -22,7 +22,15 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// newBoundStrategies returns one strategy per bound constructor, each bound to passphrase.
+// newBoundStrategies returns one strategy per BOUND constructor, each already
+// bound to passphrase.
+//
+// newTestStrategy is NewSoftwareStrategyWithParams outside FIPS and
+// NewSoftwareStrategyFIPS in a -tags fips build, so between the two CI legs
+// every bound constructor is covered. NewSoftwareStrategyWithParams cannot be
+// named directly here: it selects Argon2id explicitly and therefore fails in a
+// FIPS build by design (strategy_software.go), which is pinned separately by
+// strategy_params_api_fips_test.go.
 func newBoundStrategies(t *testing.T, passphrase []byte) map[string]*SoftwareStrategy {
 	t.Helper()
 	out := make(map[string]*SoftwareStrategy, 3)
@@ -43,7 +51,17 @@ func newBoundStrategies(t *testing.T, passphrase []byte) map[string]*SoftwareStr
 	return out
 }
 
-// TestSoftwareStrategy_DeferredPassphrase_PredictsCredentialSemantics verifies the accessor predicts each mode's credential handling.
+// TestSoftwareStrategy_DeferredPassphrase_PredictsCredentialSemantics is the
+// test that makes the accessor worth having. The two modes have OPPOSITE
+// credential semantics — a bound strategy ignores the credentials handed to
+// UnsealRootKey, a deferred one validates against them — and a consumer reads
+// the accessor precisely to preserve that behaviour when it replaces a
+// strategy.
+//
+// So the assertion is not "the getter echoes the field" but "the getter
+// predicts what unsealing with the WRONG passphrase does". A getter wired to
+// the wrong field, or inverted, disagrees with the observed behaviour here even
+// while the constructor test above could still be made to pass.
 func TestSoftwareStrategy_DeferredPassphrase_PredictsCredentialSemantics(t *testing.T) {
 	const correct = "correct-horse-battery-staple"
 	const wrong = "wrong-horse-battery-staple"

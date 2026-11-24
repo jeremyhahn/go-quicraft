@@ -35,7 +35,16 @@ import (
 // Enabled + enforcing + no source (fail-closed default with nothing wired)
 // ---------------------------------------------------------------------------
 
-// TestValidateRejectsEnforcedRevocationWithoutSource: Config{} (ModeAny, enforcing) with no source fails Validate instead of reporting nothing revoked.
+// TestValidateRejectsEnforcedRevocationWithoutSource pins the fail-closed
+// default. Config{} selects ModeAny, and the zero value of AllowSoftFail
+// ENFORCES; ModeAny names no specific source, so the per-mode source checks
+// never fire and, without this rejection, the checker would consult nothing
+// and report EVERY certificate as not revoked for the process lifetime, with
+// no error, log or metric.
+//
+// Neither case mentions AllowSoftFail. Enforcement is what the zero value
+// means, and spelling it out here would hide a regression that quietly
+// restored the old soft-fail default.
 func TestValidateRejectsEnforcedRevocationWithoutSource(t *testing.T) {
 	for _, mode := range []Mode{"", ModeAny} {
 		cfg := Config{Mode: mode}
@@ -81,7 +90,13 @@ func TestIsRevokedWithoutSourceStillHonoursProgrammaticRevocation(t *testing.T) 
 	}
 }
 
-// sourcelessModes lists every mode with the typed error an enforcing checker returns when the mode has nothing to consult.
+// sourcelessModes lists every mode together with the typed error an enforcing
+// checker owes when that mode has nothing to consult. It is one table rather
+// than one test per mode because the property under test is the CONSISTENCY:
+// a mode that quietly stops failing closed is a hole exactly the size of the
+// mode, and ModeCRL was such a hole — checkCRLStatus reports staleness only
+// when CRLPaths is non-empty, so ModeCRL with no path consulted nothing and
+// answered "not revoked" for every certificate.
 var sourcelessModes = []struct {
 	mode Mode
 	want error
@@ -139,7 +154,10 @@ func TestIsRevokedSoftFailAdmitsInEveryModeWithoutSource(t *testing.T) {
 // Multi-issuer serial collision (revokedSet and ocspCache scoping)
 // ---------------------------------------------------------------------------
 
-// TestCRLRevocationScopedToIssuingCA: a CRL revokes only its own issuer's serials, not the same serial from another intermediate.
+// TestCRLRevocationScopedToIssuingCA is the multi-issuer collision regression
+// for the CRL path. X.509 serials are unique only per ISSUER, so two
+// intermediates in the same bundle can both issue serial 0x2a. A CRL published
+// by one of them must not revoke the other's certificate.
 func TestCRLRevocationScopedToIssuingCA(t *testing.T) {
 	root := newTestCA(t)
 	interA := newTestIntermediate(t, root)
@@ -200,7 +218,9 @@ type ocspIssuerRoute struct {
 	status  int
 }
 
-// newRoutingOCSPServer answers per issuer, as a real responder does.
+// newRoutingOCSPServer answers per ISSUER rather than per serial, which is
+// what a real responder does: the same serial issued by two intermediates has
+// two independent statuses.
 func newRoutingOCSPServer(t *testing.T, routes []ocspIssuerRoute) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +262,11 @@ func newRoutingOCSPServer(t *testing.T, routes []ocspIssuerRoute) *httptest.Serv
 	}))
 }
 
-// TestOCSPCacheScopedToIssuingCA: a cached verdict for one issuer's serial does not answer the same serial from another issuer.
+// TestOCSPCacheScopedToIssuingCA is the multi-issuer collision regression for
+// the OCSP cache. A "good" verdict cached for interA's serial 0x2a must not
+// satisfy a lookup for interB's serial 0x2a, whose responder reports it
+// REVOKED — the cache would otherwise admit a compromised certificate for the
+// full cache TTL.
 func TestOCSPCacheScopedToIssuingCA(t *testing.T) {
 	root := newTestCA(t)
 	interA := newTestIntermediate(t, root)
@@ -284,7 +308,12 @@ func TestOCSPCacheScopedToIssuingCA(t *testing.T) {
 	}
 }
 
-// TestOCSPDelegatedResponderMustBeAuthorized: a delegated responder needs id-kp-OCSPSigning and a valid period (RFC 6960 4.2.2.2).
+// TestOCSPDelegatedResponderMustBeAuthorized: ParseResponseForCert accepts a
+// response signed by ANY certificate the issuer signed, embedded as the
+// responder. A revoked node holds exactly such a certificate — its own — so on
+// the path to the responder it could answer its own OCSP query "good" and pass
+// revocation. A delegated responder must carry id-kp-OCSPSigning and be within
+// its validity period (RFC 6960 §4.2.2.2); a responder that does still works.
 func TestOCSPDelegatedResponderMustBeAuthorized(t *testing.T) {
 	ca := newTestCA(t)
 	issue := func(serial int64, eku []x509.ExtKeyUsage, notAfter time.Time) (*x509.Certificate, *ecdsa.PrivateKey) {

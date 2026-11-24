@@ -22,9 +22,30 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// These tests assert that NewCredentials consumes the caller's passphrase buffer rather than copying it.
+// This file proves the one thing a type change alone does not give you: that
+// the passphrase's caller-side buffer is wiped or never existed, with a
+// mutation of that wipe turning the test red.
+//
+// Typing Credentials.Secret as enclave.Sealed makes the WRONG shape
+// uncompilable, which the compiler proves. What it does not
+// prove is that NewCredentials — the only supported way to get from a caller's
+// bytes to that type — actually consumes those bytes rather than copying them.
+// A constructor that read `enclave.NewSealed(ctx, append([]byte(nil), secret...))`
+// would type-check, satisfy every other test in this package, and leave the
+// passphrase in the caller's slice for the collector to move around.
+//
+// So the wipe is asserted directly, on the caller's own slice, and it is the
+// mutation target.
 
-// TestNewCredentials_ConsumesTheCallersPassphrase fails if NewCredentials seals a copy of the passphrase.
+// TestNewCredentials_ConsumesTheCallersPassphrase is the mutation target.
+//
+// Verified by mutation: changing NewCredentials to seal a COPY —
+// `enclave.NewSealed(ctx, append([]byte(nil), secret...))` — fails here with
+//
+//	credentials_test.go:64: the caller's passphrase must be wiped by
+//	NewCredentials; byte 0 is 0x61 ("a-passphrase-worth-protecting" survived)
+//
+// and passes again when the copy is removed.
 func TestNewCredentials_ConsumesTheCallersPassphrase(t *testing.T) {
 	const passphrase = "a-passphrase-worth-protecting"
 	secret := []byte(passphrase)
@@ -42,7 +63,9 @@ func TestNewCredentials_ConsumesTheCallersPassphrase(t *testing.T) {
 		}
 	}
 
-	// The material is in the credential, so the wipe was a move, not a loss.
+	// And the other half of "consumed": the material is really in the credential,
+	// so the wipe above is a MOVE rather than a loss. A constructor that wiped and
+	// stored nothing would pass the loop and fail here.
 	opened, err := creds.Secret.Open(context.Background())
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -100,7 +123,14 @@ func TestCredentials_ZeroValueMeansNoneSupplied(t *testing.T) {
 	}
 }
 
-// TestCredentials_DeferredRoundTripThroughTheByteAPI: a protected passphrase round-trips through the []byte root-key API, and one credential serves both calls.
+// TestCredentials_DeferredRoundTripThroughTheByteAPI is the end-to-end half:
+// the []byte root-key pair, the surface every strategy
+// implements, carries a protected passphrase and still round-trips.
+//
+// The credential is reused across both calls on purpose. The seal layer opens
+// it, derives from it and destroys the opened copy; it never destroys the
+// credential, so one credential serves many calls and is released by the
+// caller's own Destroy. A strategy that consumed it would fail the unseal here.
 func TestCredentials_DeferredRoundTripThroughTheByteAPI(t *testing.T) {
 	ctx := context.Background()
 	s := NewDeferredSoftwareStrategy()

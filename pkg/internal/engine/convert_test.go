@@ -263,7 +263,22 @@ func BenchmarkProtoUpdatesToLogDBReuse_LargeBatch(b *testing.B) {
 	}
 }
 
-// TestProtoMembershipToLogDB_CarriesEveryField checks every membership field survives the conversion, each with a distinct non-zero value.
+// TestProtoMembershipToLogDB_CarriesEveryField checks every membership field
+// survives the conversion.
+//
+// That test left MaxWitnesses, RequireFullReplicaMajority, Identities,
+// RemovedIdentities and all three session-policy fields at ZERO on both
+// sides, so deleting any of them from the converter changed nothing it
+// observed — every relevant package stayed green. The one round-trip test in
+// the repo that DOES assert them
+// (TestMembershipConvertersRoundTripIdentities) exercises the identically
+// named function in package quicraft, not this one. This is the converter
+// snapshotPool.save actually uses, so a dropped field here means a restarted
+// replica computes a different witness quorum than its peers, or expires
+// sessions at log indexes they do not.
+//
+// Every field is given a DISTINCT non-zero value so no two can be confused
+// and no omission can be masked by a zero default.
 func TestProtoMembershipToLogDB_CarriesEveryField(t *testing.T) {
 	pm := proto.Membership{
 		ConfigChangeID:             11,
@@ -356,7 +371,17 @@ func TestLogDBMembershipFieldCount(t *testing.T) {
 	}
 }
 
-// TestEntryFieldCount pins the field counts of proto.Entry and logdb.Entry, which five hand-written converters copy.
+// TestEntryFieldCount is the same guard for the entry types, which have the
+// same hazard and more copy sites.
+//
+// proto.Entry and logdb.Entry are converted field by field in five hand-written
+// places, none of which fails to compile when a field is added: engine's
+// protoEntryToLogDB, both directions in logdb/reader.go, and the WAL record
+// encoder and replayer in logdb/waldb/db.go. A field that reaches only some of
+// them does not error — it round-trips as zero, which for a session field means
+// at-most-once delivery or a replicated apply-path limit silently changing
+// behaviour after a restart. Both types are pinned because the converters
+// require them to stay in step.
 func TestEntryFieldCount(t *testing.T) {
 	const mapped = 9
 	if got := reflect.TypeOf(proto.Entry{}).NumField(); got != mapped {
@@ -373,7 +398,28 @@ func TestEntryFieldCount(t *testing.T) {
 	}
 }
 
-// TestSnapshotFieldCount pins the field counts of proto.Snapshot and logdb.Snapshot separately, since hand-written converters copy them.
+// TestSnapshotFieldCount is the same guard for the snapshot types, and it is
+// the one that was missing when proto.Snapshot turned out to have no
+// Compression field at all.
+//
+// The two types are converted field by field in six hand-written places — this
+// package's protoSnapshotToLogDB, host.go's recoverLogReader and its export
+// header, messagehandler.go's dedup re-delivery and its post-receive install,
+// and snapshot_pool.go's CreateSnapshot — and not one of them fails to compile
+// when a field is added on either side. A field that reaches only some of them
+// round-trips as ZERO, and for this type zero is a meaningful value in every
+// case: Compression zero means "uncompressed", so a snappy artifact is handed
+// to the state machine as garbage; Epoch zero means "plaintext", so ciphertext
+// is handed to it raw; FileSize zero makes this replica ship a metadata-only
+// snapshot that erases the receiving follower's state.
+//
+// The counts differ on purpose. proto.Snapshot carries the identity pair
+// ShardID/ReplicaID, which has no logdb counterpart (LogDB keys records by
+// shard and replica instead of storing them), while logdb.Snapshot carries a
+// Type this side does not (proto.Snapshot.Type was removed: it had no writer
+// anywhere, so it round-tripped as zero on every snapshot the engine ever
+// produced). So the guard pins each side separately rather than requiring
+// them to match.
 func TestSnapshotFieldCount(t *testing.T) {
 	const protoMapped = 10
 	if got := reflect.TypeOf(proto.Snapshot{}).NumField(); got != protoMapped {
@@ -396,7 +442,13 @@ func TestSnapshotFieldCount(t *testing.T) {
 	}
 }
 
-// TestProtoSnapshotToLogDB_CarriesEveryConvertibleField checks each field is carried, with a distinct non-zero value per field.
+// TestProtoSnapshotToLogDB_CarriesEveryConvertibleField pins the conversion
+// itself, field by field, with a DISTINCT non-zero value per field so a
+// mis-wired assignment (two fields reading the same source) is visible.
+//
+// The field-count guard above catches an addition; this catches a field that
+// exists on both sides and is simply not carried, which is the shape
+// Compression had.
 func TestProtoSnapshotToLogDB_CarriesEveryConvertibleField(t *testing.T) {
 	ps := proto.Snapshot{
 		ShardID:   9,
@@ -449,7 +501,11 @@ func TestProtoSnapshotToLogDB_CarriesEveryConvertibleField(t *testing.T) {
 	}
 }
 
-// TestProtoSnapshotToLogDB_RecordsTheDirectory checks the LogDB record names the artifact directory, not its data file.
+// TestProtoSnapshotToLogDB_RecordsTheDirectory pins the convention a LogDB
+// snapshot record follows: Filepath names the artifact's DIRECTORY, while a
+// proto snapshot's names its data file. The two-phase snapshot receive lets
+// the record converted from raft's Update be the first one written, so a
+// verbatim copy made every reader open <dir>/snapshot.dat/snapshot.dat.
 func TestProtoSnapshotToLogDB_RecordsTheDirectory(t *testing.T) {
 	dir := filepath.Join("/data", "snapshots", "shard-1", "replica-2", "snapshot-00000000000000000500")
 	for _, tc := range []struct {

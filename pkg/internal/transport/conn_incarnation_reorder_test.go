@@ -66,7 +66,8 @@ func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *te
 		t.Fatalf("getStream failed: %v", err)
 	}
 
-	// A frame from the dead incarnation arrives after the re-dial.
+	// A frame written by the DEAD incarnation now drains out of the old
+	// inbound and arrives after the re-dial.
 	t1.evictStaleOutboundOnRecv(target, oldEpoch, inbound)
 
 	if t1.ConnectionCount() != 1 {
@@ -100,7 +101,19 @@ func TestEvictStaleOutboundOnRecv_LateFrameFromDeadIncarnationDoesNotEvict(t *te
 	}
 }
 
-// TestReapPeerIncarnations_ForgetsDepartedPeersOnly: records survive a teardown but are reaped once an address is neither connected nor heard from.
+// TestReapPeerIncarnations_ForgetsDepartedPeersOnly covers the lifetime of the
+// incarnation map.
+//
+// The record must survive a teardown, because the re-dial that follows is
+// stamped from it: dropping it there stamps the fresh outbound "unknown" and
+// the next batch evicts it again. That constraint removed the map's only two
+// reapers, leaving a per-process leak — a replica removed from membership kept
+// its entry for the lifetime of the host, and repeated membership churn grew
+// the map without bound.
+//
+// Reaping on an idle window satisfies both: an address that is neither
+// connected nor talking is genuinely gone, while anything connected or recently
+// heard from keeps the epoch its next dial needs.
 func TestReapPeerIncarnations_ForgetsDepartedPeersOnly(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()

@@ -48,7 +48,12 @@ func getEntrySliceInMemSize(entries []proto.Entry) uint64 {
 	return sz
 }
 
-// inMemory caches contiguous log entries in RAM, including entries not yet persisted: entries[i].Index == markerIndex + i.
+// inMemory holds log entries in memory. It represents the portion of the
+// log that is cached in RAM, including entries not yet persisted to LogDB.
+// Entries in the slice are contiguous: entries[i].Index == markerIndex + i.
+//
+// The inMemory struct is owned by a single goroutine (the step worker) and
+// requires no synchronization.
 type inMemory struct {
 	// entries is the contiguous slice of in-memory log entries.
 	entries []proto.Entry
@@ -61,9 +66,16 @@ type inMemory struct {
 	savedTo uint64
 	// appliedTo tracks the highest index that has been applied.
 	appliedTo uint64
-	// appliedToTerm is the term of the entry at appliedTo; atomic because restore writes it without raftMu.
+	// appliedToTerm tracks the term of the entry at appliedTo. It is atomic
+	// because restore() (driven by the step worker handling InstallSnapshot)
+	// writes it WITHOUT raftMu, while readers such as Peer.AppliedToTerm() may
+	// run on another goroutine (e.g. a Host-initiated RequestSnapshot holding
+	// only raftMu). A plain field would be a data race.
 	appliedToTerm atomic.Uint64
-	// wastedPrefix counts entries truncated from the front of the backing array without compaction.
+	// wastedPrefix tracks the number of entries truncated from the front
+	// of the backing array without compaction. This avoids pathological
+	// reallocation on every single appliedLogTo call by deferring
+	// compaction until the wasted prefix space exceeds live entries.
 	wastedPrefix uint64
 	// shrunk is set when entries have been truncated from the front,
 	// indicating the slice may benefit from reallocation on the next
@@ -75,7 +87,13 @@ type inMemory struct {
 	// globalRL is the global (cross-shard) rate limiter. Nil when global
 	// rate limiting is disabled (MaxTotalInMemLogSize == 0).
 	globalRL *server.RateLimiter
-	// globalContribution is this shard's size counted in the shared globalRL.
+	// globalContribution is the in-memory size this shard currently has
+	// counted in globalRL. The global limiter is SHARED by every shard on the
+	// host, so unlike the per-shard rl it can only ever be updated with
+	// DELTAS — an absolute Set would overwrite every other shard's
+	// contribution. This field is what turns the absolute sizes the log
+	// computes into those deltas. It is owned by the raft step goroutine, the
+	// only mutator of inMemory.
 	globalContribution uint64
 }
 
@@ -104,7 +122,11 @@ func (im *inMemory) addGlobalSize(sz uint64) {
 	im.globalContribution += sz
 }
 
-// subGlobalSize removes sz from this shard's global contribution, clamped to what it contributed.
+// subGlobalSize removes sz from this shard's contribution to the global
+// limiter. The amount is clamped to what this shard actually contributed:
+// decreasing the shared counter by more than that would silently consume
+// another shard's share and drive the global total below the true in-memory
+// footprint, disabling backpressure exactly when it is needed.
 func (im *inMemory) subGlobalSize(sz uint64) {
 	if im.globalRL == nil {
 		return
@@ -136,7 +158,10 @@ func (im *inMemory) checkMarkerIndex() {
 	}
 }
 
-// getEntries returns entries in [low, high), or logdb.ErrCompacted or logdb.ErrUnavailable outside the cached range.
+// getEntries returns entries in the range [low, high). Both low and high
+// must fall within the valid range [markerIndex, markerIndex+len(entries)).
+// Returns logdb.ErrCompacted if low < markerIndex, logdb.ErrUnavailable if
+// high exceeds the upper bound.
 func (im *inMemory) getEntries(low, high uint64) ([]proto.Entry, error) {
 	upperBound := im.markerIndex + uint64(len(im.entries))
 	if low < im.markerIndex {
@@ -292,7 +317,12 @@ func (im *inMemory) appliedLogTo(index uint64) {
 	im.appliedTo = entry.Index
 	im.appliedToTerm.Store(entry.Term)
 
-	// Decrease the per-shard and global limiters independently.
+	// Decrease rate limiter sizes for applied entries. The per-shard and the
+	// global limiter are INDEPENDENT knobs (MaxInMemLogSize and
+	// MaxTotalInMemLogSize), so the global update must not be nested under the
+	// per-shard one: configuring only the host-wide cap — the documented way to
+	// enable it — would otherwise allocate a limiter that is consulted on every
+	// propose and permanently reads zero.
 	if im.rl != nil || im.globalRL != nil {
 		appliedEntries := im.entries[:index+1-im.markerIndex]
 		sz := getEntrySliceInMemSize(appliedEntries)
@@ -329,7 +359,10 @@ func (im *inMemory) restore(ss proto.Snapshot) {
 	im.setGlobalSize(0)
 }
 
-// merge incorporates entries by appending, replacing everything, or truncating a conflicting suffix and appending.
+// merge incorporates entries, handling three cases:
+//   - Entries are contiguous with existing: append directly.
+//   - Entries replace everything: reset marker and replace.
+//   - Entries overlap: keep existing prefix, append new suffix.
 func (im *inMemory) merge(entries []proto.Entry) {
 	if len(entries) == 0 {
 		return
@@ -376,7 +409,13 @@ func (im *inMemory) merge(entries []proto.Entry) {
 			// silently create a hole in the log.
 			invariant.Assert(len(im.entries) == 0,
 				"gapped merge past in-memory tail")
-			// After a snapshot restore there is no prefix to keep; adopt the new entries.
+			// After snapshot restore, entries may be nil while
+			// markerIndex has advanced. No prefix to preserve;
+			// adopt the new entries and advance markerIndex.
+			// Reset savedTo so entriesToSave() includes these
+			// entries. Without this, savedTo from the prior
+			// snapshot stays below markerIndex, causing a uint64
+			// underflow in the offset calculation.
 			im.markerIndex = firstNewIndex
 			im.savedTo = firstNewIndex - 1
 			im.entries = im.newEntrySlice(entries)
@@ -399,7 +438,13 @@ func (im *inMemory) merge(entries []proto.Entry) {
 	im.checkMarkerIndex()
 }
 
-// resize reallocates the entries slice, right-sized to the live entry count, to release capacity.
+// resize forces a reallocation of the entries slice to release excess
+// capacity from previous truncations. The new capacity is right-sized
+// based on the live entry count: enough room for the current entries
+// plus growth headroom, but never the full entrySliceSize (512) when
+// only a handful of entries are live. This avoids the 50KB allocation
+// (512 * ~100 bytes) and associated memclr/GC overhead that dominated
+// the sequential propose hot path.
 func (im *inMemory) resize() {
 	im.shrunk = false
 	im.wastedPrefix = 0
@@ -413,7 +458,16 @@ func (im *inMemory) resize() {
 	im.entries = result
 }
 
-// resizeIfNeeded compacts the entries slice when the wasted prefix justifies it.
+// resizeIfNeeded checks if the entries slice has been shrunk and the
+// wasted prefix space justifies a compaction. The strategy minimizes GC
+// pressure by:
+//  1. Releasing the backing array immediately when no live entries remain
+//     (zero-allocation fast path).
+//  2. Requiring the wasted prefix to reach the absolute minimum threshold
+//     (entrySliceSize = 512) before any compaction is considered.
+//  3. Requiring the wasted prefix to be at least 2x the live entry count,
+//     so compaction is deferred when the waste is modest relative to live
+//     data (avoids allocating a new slice just to save a small prefix).
 func (im *inMemory) resizeIfNeeded() {
 	if !im.shrunk {
 		return

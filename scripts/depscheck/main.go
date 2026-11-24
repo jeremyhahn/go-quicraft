@@ -1,4 +1,28 @@
-// Command depscheck checks (make deps-check) or bumps (make deps-bump, -bump) a module's dependencies against their latest versions and, with -vuln, govulncheck.
+// Command depscheck is `make deps-check`, the CI standard's latest-version
+// stage (handbook ci-standard.md §1, devops.md §9), and `make deps-bump`,
+// the bump the daily deps-bump workflow lands.
+//
+// Usage:
+//
+//	depscheck [-go <go command>] [-first-party <prefix>] [-base <commit>]
+//	          [-vuln [-govulncheck <command>] [-vuln-tags <tags>]] [-bump] <module dir>...
+//
+// Without -base the full gate applies: a direct dependency behind its
+// latest version, with no go.mod reason comment and a latest release older
+// than 7 days, fails. With -base <commit> (CI passes the merge base on a
+// pull request and the previous tip on a push) that lag fails only for a
+// line the change adds or whose version it changes; a lag the change did
+// not touch is reported, not failed. -vuln also runs govulncheck at module
+// level and fails any version it reports vulnerable of a module go.mod
+// requires, touched or not; a finding on the standard library, the
+// toolchain or a module with no require line is reported, not failed. -bump moves every failing lag to latest with `go get`, runs
+// `go mod tidy`, prints what moved and exits 0; the caller then re-runs
+// the check.
+//
+// Exit status: 0 pass, 1 an undocumented lag, 2 a lookup, git or
+// govulncheck failure (GOPROXY=off among them: an offline check never
+// passes silently), 3 the report could not be written, 4 a vulnerable
+// version of a required module.
 package main
 
 import (

@@ -19,7 +19,16 @@ import (
 	"strconv"
 )
 
-// UnsupportedLookupResultError is returned by CachedDiskStateMachine.BytesLookup when Lookup answers with a type the byte path cannot represent.
+// UnsupportedLookupResultError is returned by CachedDiskStateMachine.BytesLookup
+// when the wrapped state machine's Lookup answers with a type the byte-oriented
+// path cannot represent.
+//
+// It exists because the alternative was returning (nil, nil), which reports the
+// answer as "supported, and the value is empty" — indistinguishable from a
+// genuine empty value and from a missing key. A caller reading through the
+// no-allocation path then silently saw nothing where the ordinary Lookup would
+// have returned a real result. Naming the type that came back is the difference
+// between a one-line fix in the state machine and an unexplained empty read.
 type UnsupportedLookupResultError struct {
 	// Got is the concrete type the inner Lookup returned.
 	Got string

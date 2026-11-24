@@ -72,7 +72,11 @@ func listenerSockopts(t *testing.T, bufSize int, opts map[string]int, getsockopt
 	return got
 }
 
-// TestStart_DuplicateBindFailsWithAddrInUse checks a second bind to a started transport's address fails with EADDRINUSE.
+// TestStart_DuplicateBindFailsWithAddrInUse verifies that the listener holds
+// its address exclusively: a second transport, or any plain UDP socket, that
+// binds the address of a started transport fails with EADDRINUSE rather than
+// sharing the port. Two sockets sharing a UDP address silently split its
+// datagrams between them, so a duplicate bind must fail loudly.
 func TestStart_DuplicateBindFailsWithAddrInUse(t *testing.T) {
 	first, err := NewQUICTransport(Config{
 		ListenAddress: "127.0.0.1:0",

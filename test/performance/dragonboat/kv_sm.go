@@ -22,7 +22,14 @@ import (
 	dsm "github.com/jeremyhahn/dragonboat/v4/statemachine"
 )
 
-// KV wire format: [op:1][keyLen:2 BE][key][value]; op 0x01 Put, 0x02 Get.
+// Wire format for KV operations:
+//
+//	[op:1][keyLen:2 BE][key:keyLen][value:remaining]
+//
+// Operations:
+//
+//	0x01 = Put
+//	0x02 = Get (value field ignored)
 const (
 	opPut byte = 0x01
 	opGet byte = 0x02

@@ -233,7 +233,18 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	// publishing its cached IsLeader flag after Peer.Commit steps it down.
 	const electionSchedulingSlack = 200 * time.Millisecond
 
-	// The watcher records when the old leader steps down and when a survivor leads in a higher term, closes handover once both are seen, and latches any later IsLeader on the removed host in sawLeader.
+	// The watcher starts before the removal is submitted and runs
+	// concurrently with it, so neither SyncRequestRemoveNode nor any later
+	// wait can hide a slow election. It records (a) the first time the old
+	// leader's own host stops reporting itself leader, which happens when
+	// the removal commits on it, and (b) the first time a survivor reports
+	// itself leader in a term above the removed leader's. Survivor
+	// membership discovery is not used: a survivor may learn the commit
+	// only from the new leader, after the election. Once both are seen it
+	// closes handover, and it keeps watching the old host until the end of
+	// the test: (d) any IsLeader observation on the removed host after its
+	// first step-down, including one during the handover itself, is
+	// latched in sawLeader.
 	var (
 		stepDownAt, electedAt time.Time
 		electedID             uint64
@@ -328,7 +339,14 @@ func TestRemoveLeader_HandsOverAndLosesNoAcknowledgedWrite(t *testing.T) {
 	t.Logf("replica %d removed itself; replica %d leads term >%d, %v after the step-down, %v after submission (election timeout %v)",
 		oldID, electedID, oldTerm, d, electedAt.Sub(submitAt), c.electionTimeout())
 
-	// Leadership may move: within bound, retry the reads on the current leader on not-leader or read-index-not-ready errors only.
+	// The election was asserted above; leadership may have moved between
+	// survivors since, and may move again during the reads below (a
+	// survivor can time out and campaign at any point), so the rest of the
+	// test uses the current leader. Within bound, leader selection, the
+	// read-readiness wait, the membership read and the reads of the
+	// acknowledged writes are repeated until one attempt runs on a leader
+	// throughout. Only a not-leader or read-index-not-ready error is
+	// retried; any other error fails the test.
 	retryable := func(err error) bool {
 		return errors.Is(err, ErrNotLeader) || errors.Is(err, ErrReadIndexNotReady)
 	}

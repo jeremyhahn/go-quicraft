@@ -54,7 +54,13 @@ func minimalChunk(id, count uint64, hdr *SnapshotHeader) proto.SnapshotChunk {
 	}
 }
 
-// TestSnapshotBudgetChargesRetainedChunkHeaders verifies the snapshot budget charges retained chunk headers.
+// TestSnapshotBudgetChargesRetainedChunkHeaders pins that the inbound snapshot
+// memory budget accounts for what the receiver actually HOLDS. receiveChunks
+// accumulates every accepted chunk in a slice for the whole transfer, so a
+// peer sending many minimum-size chunks retains a proto.SnapshotChunk header
+// (280 bytes here) per 177-byte frame. Charging the frame length alone
+// under-counts residency ~2.6x and lets concurrent transfers hold multiples of
+// the configured budget.
 func TestSnapshotBudgetChargesRetainedChunkHeaders(t *testing.T) {
 	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 10}
 
@@ -65,7 +71,10 @@ func TestSnapshotBudgetChargesRetainedChunkHeaders(t *testing.T) {
 	frameLen := int64(chunks[0].Size())
 	structBytes := int64(unsafe.Sizeof(proto.SnapshotChunk{}))
 
-	// The budget fits the wire bytes but not the retained headers, so the transfer must be refused.
+	// A budget that comfortably fits every chunk's WIRE bytes but not the
+	// headers retained alongside them. Correct accounting must refuse the
+	// transfer; frame-length-only accounting completes it while holding
+	// ChunkCount*structBytes of unaccounted memory.
 	budget := int64(hdr.ChunkCount)*frameLen + structBytes
 	if budget >= int64(hdr.ChunkCount)*(frameLen+structBytes) {
 		t.Fatalf("test budget %d does not distinguish the two accountings", budget)
@@ -205,7 +214,10 @@ func newRevocationTLS(t *testing.T, cfg revocation.Config) (*tlsPair, *revocatio
 	return pair, checker, leafFromPEM(t, mtls.Cert)
 }
 
-// TestVerifyConnectionRejectsRevokedPeer verifies a revoked verdict fails the handshake on both roles and fires OnCertRevoked.
+// TestVerifyConnectionRejectsRevokedPeer pins the wiring the whole revocation
+// subsystem exists for: a checker verdict of "revoked" must fail the TLS
+// handshake on BOTH roles, and fire the OnCertRevoked callback. Without this
+// the checker can be perfectly correct while the connection is still admitted.
 func TestVerifyConnectionRejectsRevokedPeer(t *testing.T) {
 	var notified []string
 	pair, checker, leaf := newRevocationTLS(t, revocation.Config{
@@ -249,7 +261,17 @@ func TestVerifyConnectionPropagatesCheckerError(t *testing.T) {
 // Receive-buffer detach of snapshot metadata (recv.go handleMessageFrame)
 // ---------------------------------------------------------------------------
 
-// TestSnapshotMetadataDetachedFromReceiveBuffer verifies a decoded Snapshot holds no alias into the pooled receive buffer.
+// TestSnapshotMetadataDetachedFromReceiveBuffer pins that nothing on a decoded
+// Snapshot still points into the POOLED receive buffer once the frame has been
+// dispatched. The buffer is recycled immediately, so a surviving alias is read
+// by the step worker after the buffer has been handed to another frame — and a
+// Snapshot is the worst possible place for that, because raft adopts its
+// Membership wholesale.
+//
+// Filepath and every membership map are copied by their own decoders
+// (getString, getMap) and must stay that way. A future "zero-copy Filepath" or
+// a membership map aliased into the buffer would reintroduce exactly this class
+// of bug, and this is what catches it.
 func TestSnapshotMetadataDetachedFromReceiveBuffer(t *testing.T) {
 	handler := newTestHandler()
 	tr, err := NewQUICTransport(Config{
@@ -418,7 +440,10 @@ func TestDropFrameIncompleteDrainIsNotRetryable(t *testing.T) {
 	}
 }
 
-// TestIsProtocolViolationCoversDecoderSentinels verifies decoder errors classify as protocol violations.
+// TestIsProtocolViolationCoversDecoderSentinels pins that the errors a
+// malformed batch ACTUALLY returns are classified as protocol violations.
+// Without them such frames tear streams down with no counter and no warning,
+// indistinguishable from ordinary connection churn.
 func TestIsProtocolViolationCoversDecoderSentinels(t *testing.T) {
 	for _, err := range []error{
 		proto.ErrBufferTooSmall,
@@ -437,7 +462,10 @@ func TestIsProtocolViolationCoversDecoderSentinels(t *testing.T) {
 	}
 }
 
-// TestProtocolViolationRateLimitIsPerTransport verifies the violation log limiter is per transport.
+// TestProtocolViolationRateLimitIsPerTransport pins that the log rate limiter
+// is instance state. A package global lets one transport's violation flood
+// suppress the FIRST diagnostic every other transport would emit, and
+// in-process multi-node deployments run many transports at once.
 func TestProtocolViolationRateLimitIsPerTransport(t *testing.T) {
 	rec1, rec2 := &dropRecorder{}, &dropRecorder{}
 	t1 := &QUICTransport{metrics: rec1}
@@ -460,7 +488,10 @@ func TestProtocolViolationRateLimitIsPerTransport(t *testing.T) {
 // Send-path fixes
 // ---------------------------------------------------------------------------
 
-// TestIsHeartbeatBatchRejectsSnapshotCarrier verifies a heartbeat carrying a snapshot takes the general send path.
+// TestIsHeartbeatBatchRejectsSnapshotCarrier pins that a heartbeat carrying a
+// snapshot falls through to the general send path. The fast path marshals into
+// fixed HeartbeatMessageSize slots, so routing it there overflows the buffer
+// and drops the WHOLE batch — a liveness event, not a dropped byte.
 func TestIsHeartbeatBatchRejectsSnapshotCarrier(t *testing.T) {
 	withSnapshot := []proto.Message{{
 		Type:     proto.Heartbeat,
@@ -496,7 +527,10 @@ func TestGetBufReturnsUndersizedBufferToPool(t *testing.T) {
 
 	marker := make([]byte, 0, 16)
 
-	// Retried because the race detector makes sync.Pool drop some Puts.
+	// Each attempt seeds the pool with the 16-byte buffer, forces the grow
+	// path, and checks the undersized buffer came back. Retried because the
+	// race detector makes sync.Pool discard a random fraction of Puts; a
+	// getBuf that DROPS the buffer instead of returning it fails every attempt.
 	recovered := poolRoundTrips(func() { tr.putBuf(&marker) }, func() bool {
 		grown := tr.getBuf(1024)
 		if cap(*grown) < 1024 {
@@ -590,7 +624,10 @@ func TestSnapshotOver0RTTRejected(t *testing.T) {
 		Allow0RTT:            true,
 	}
 
-	// The first connection stays open until the client has cached the session ticket.
+	// First connection: completes a full handshake so the server issues a
+	// session ticket the client caches. The ticket arrives shortly AFTER the
+	// handshake, so the connection is held open until the client cache holds
+	// it (keyed by the SNI DialAddrEarly derives from the address).
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	warm, err := quic.DialAddrEarly(ctx, addr, pair.client, qcfg)
@@ -605,7 +642,8 @@ func TestSnapshotOver0RTTRejected(t *testing.T) {
 		})
 	_ = warm.CloseWithError(0, "warm-up done")
 
-	// On the resumed connection the snapshot header travels as early data.
+	// Resumed connection: the snapshot header is written BEFORE the handshake
+	// completes, so it travels as replayable early data.
 	early, err := quic.DialAddrEarly(ctx, addr, pair.client, qcfg)
 	if err != nil {
 		t.Fatalf("early dial: %v", err)

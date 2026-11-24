@@ -31,7 +31,13 @@ import (
 // Entry Validation Tests
 // ===========================================================================
 
-// TestDragonboat_AppendRejectsIndexHole checks tryAppend rejects a non-contiguous batch with ErrGappedEntryBatch before any mutation.
+// TestDragonboat_AppendRejectsIndexHole verifies that tryAppend rejects a
+// batch whose entries are not contiguous with the declared prevLogIndex.
+// When the log has entries 1-3 and receives entries starting at index 5
+// (skipping 4), accepting the batch would store entries under wrong
+// positions and corrupt the in-memory log; tryAppend must reject it
+// before any mutation (dragonboat panics via checkEntriesToAppend; we
+// return ErrGappedEntryBatch and drop the message so the leader retries).
 func TestDragonboat_AppendRejectsIndexHole(t *testing.T) {
 	entries := makeEntries(1, 4, 1) // indices 1,2,3 at term 1
 	l := newTestRaftLog(entries)
@@ -206,7 +212,14 @@ func TestDragonboat_LeaderTransferReceiveHigherTermVote(t *testing.T) {
 	}
 	r.drainMessages()
 
-	// A transfer RequestVote (Hint == From) at r.term+1 bypasses the CheckQuorum guard; larger jumps are dropped.
+	// Receive a transfer-initiated RequestVote with a higher term from
+	// node 3 (Hint == From marks a leadership-transfer election, which
+	// bypasses the CheckQuorum higher-term-vote guard).
+	//
+	// r.term+1 is the only term a real transferee can campaign at: it takes
+	// its term from the leader's own TimeoutNow and becomeCandidate adds one.
+	// The exemption is capped there, so a larger jump is dropped — see
+	// dropHighTermVote and TestRaft_DropHighTermVote_TransferHintCappedAtNextTerm.
 	err = r.step(proto.Message{
 		Type:     proto.RequestVote,
 		From:     3,
@@ -852,7 +865,17 @@ func TestDragonboat_CommitAfterRemoveNode(t *testing.T) {
 // Section 5.4.2 - Cannot commit without new term entry
 // ===========================================================================
 
-// TestDragonboat_CannotCommitWithoutNewTermEntry checks a leader cannot commit previous-term entries before its own (Raft 5.4.2).
+// TestDragonboat_CannotCommitWithoutNewTermEntry verifies the Raft safety
+// property from Section 5.4.2 of the Raft paper: a leader CANNOT commit
+// entries from a previous term by just counting replicas. It must first
+// commit an entry from its own term (the no-op). This prevents the
+// "Figure 8" safety violation.
+//
+// Scenario:
+//   - Create a 5-node cluster. Leader in term 1 appends entries.
+//   - Simulate a new leader in term 2 that has previous-term entries
+//     replicated to a majority but has NOT yet committed its own no-op.
+//   - Verify commit index does NOT advance for previous-term entries.
 func TestDragonboat_CannotCommitWithoutNewTermEntry(t *testing.T) {
 	members := map[uint64]string{
 		1: "addr1", 2: "addr2", 3: "addr3", 4: "addr4", 5: "addr5",
@@ -947,7 +970,14 @@ func TestDragonboat_CannotCommitWithoutNewTermEntry(t *testing.T) {
 		}
 	}
 
-	// Commit must not advance past term-1 entries: tryCommit needs the current term at the median match (Raft 5.4.2).
+	// The commit index should NOT advance past the term-1 entries because
+	// tryCommit requires the entry at the median match index to have the
+	// current term (term 4). The entry at previousTermEnd has term 1.
+	// Section 5.4.2: "a leader cannot determine that an entry from a
+	// previous term is committed."
+	//
+	// Note: committed may still be at the old level from when we were
+	// leader in term 1. The point is it should not advance FURTHER.
 	if r.log.committed > previousTermEnd {
 		t.Fatalf("commit should not advance past previous-term entries without a current-term entry: "+
 			"committed=%d, previousTermEnd=%d", r.log.committed, previousTermEnd)
@@ -1252,7 +1282,9 @@ func TestDragonboat_CheckQuorumWithPreVote(t *testing.T) {
 		t.Fatalf("leader should survive first checkQuorum cycle: state=%s", r.state)
 	}
 
-	// Tick another election timeout without acks; the leader must step down.
+	// After the first cycle, resetRemoteActivity was called. Now tick
+	// through another full election timeout WITHOUT any heartbeat acks.
+	// The leader should step down because no remotes are active.
 	for i := 0; i < r.electionTimeout; i++ {
 		r.tickFunc(r)
 	}
@@ -1297,7 +1329,9 @@ func TestDragonboat_LeaderSupersedingWithCheckQuorum(t *testing.T) {
 
 	leaderTerm := r.term
 
-	// Phase 1: with a fresh quorum lease a higher-term RequestVote is dropped (Raft 6).
+	// Phase 1: with a fresh quorum lease, a higher-term RequestVote is
+	// DROPPED (Raft paper §6 last paragraph): a partitioned node that
+	// inflated its term must not disrupt a stable leader.
 	err = r.step(proto.Message{
 		Type:     proto.RequestVote,
 		From:     2,

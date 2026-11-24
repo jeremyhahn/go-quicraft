@@ -46,7 +46,14 @@ func TestHostProposer_PropagatesError(t *testing.T) {
 	}
 }
 
-// TestHostProposer_DrivesAnAggregator checks the adapter constructs and flushes a real Aggregator.
+// TestHostProposer_DrivesAnAggregator is the integration test: the adapter
+// constructs and flushes a real Aggregator, rather than a mock shaped like
+// whatever the test needed.
+//
+// README showed batch.NewAggregator(host, ...), but *Host.SyncPropose returns
+// (sm.Result, error) while Proposer requires error alone — so *Host never
+// satisfied Proposer, no adapter existed anywhere, and the package had zero
+// importers. Every behaviour it claims was verified against mocks only.
 func TestHostProposer_DrivesAnAggregator(t *testing.T) {
 	fake := &fakeSyncProposer{result: sm.Result{Value: 7}}
 	cfg := DefaultConfig()

@@ -26,7 +26,26 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestStop_AnnouncesShutdownOnAcceptedConnections requires the peer to promptly see a remote QUICErrShutdown close on accepted connections.
+// TestStop_AnnouncesShutdownOnAcceptedConnections pins the half of Stop that
+// was missing: the connections the transport ACCEPTED.
+//
+// stop() closed t.conns — the connections this node DIALED — and then
+// t.quicTr.Close(), which destroys quic-go's remaining connections LOCALLY
+// (Transport.close calls handler.destroy) without putting a CONNECTION_CLOSE on
+// the wire. A peer that had dialed this node therefore learnt nothing at all: a
+// poll on the sender's cached conn.Context() ran its full 10s bound and failed,
+// so a leader went on enqueuing to a follower that had shut down cleanly until
+// MaxIdleTimeout expired or its own next write happened to fail. Both of those
+// can be much later than the shutdown, and cleanStaleConnections cannot evict a
+// connection it never sees as stale.
+//
+// The assertion is deliberately in three parts, because "the context is done"
+// alone is too weak: a LOCAL teardown of the sender satisfies it, and so does
+// the idle timeout given enough patience. The test therefore also requires the
+// cause to be a REMOTE quic.ApplicationError carrying QUICErrShutdown, which is
+// only producible by a CONNECTION_CLOSE frame the peer deliberately sent, and it
+// requires it PROMPTLY — the bound below exists to fail the test, not to be
+// waited out. One frame over loopback takes milliseconds.
 func TestStop_AnnouncesShutdownOnAcceptedConnections(t *testing.T) {
 	tests := []struct {
 		name string
@@ -62,7 +81,10 @@ func TestStop_AnnouncesShutdownOnAcceptedConnections(t *testing.T) {
 			t1, t2, _, handler2, cleanup := transportPair(t, 42)
 			defer cleanup()
 
-			// t1 dials t2, so the connection is inbound on t2 only.
+			// t1 dials t2, so the connection under test is INBOUND on t2 and is
+			// reachable from t2.inboundConns and nowhere else. t2 never sends,
+			// so t2.conns is empty and the outbound half of its stop() cannot
+			// be what closes this connection.
 			target := t2.Addr().String()
 			t1.Send([]proto.Message{
 				{Type: proto.Heartbeat, ShardID: 1, From: 1, To: 2, Term: 1},
@@ -107,7 +129,17 @@ func TestStop_AnnouncesShutdownOnAcceptedConnections(t *testing.T) {
 	}
 }
 
-// TestStop_InboundCloseRunsBeforeTransportClose runs stop()'s steps in the wrong order and requires the peer to see nothing.
+// TestStop_InboundCloseRunsBeforeTransportClose pins the ORDERING that makes
+// the announcement reach the wire at all.
+//
+// t.quicTr.Close() destroys every remaining connection locally and tears down
+// the shared UDP socket. quic-go's close is once-only, so a CloseWithError
+// issued afterwards is a silent no-op: an inbound close sequenced BELOW the
+// transport close would leave the defect exactly as it was while looking fixed
+// in the diff. The test drives stop()'s two steps by hand in the WRONG order and
+// requires the peer to observe nothing, which is what makes the assertion in
+// TestStop_AnnouncesShutdownOnAcceptedConnections attributable to the ordering
+// rather than to luck.
 func TestStop_InboundCloseRunsBeforeTransportClose(t *testing.T) {
 	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -133,7 +165,9 @@ func TestStop_InboundCloseRunsBeforeTransportClose(t *testing.T) {
 		t.Fatal("test setup: no inbound connection was tracked on the peer")
 	}
 
-	// Socket first, announcement second: stop()'s steps inverted.
+	// Socket first, announcement second: stop()'s steps inverted. Everything
+	// after this is the REAL stop(), whose closeInboundOnShutdown now runs on
+	// connections quic-go has already destroyed.
 	if err := t2.quicTr.Close(); err != nil {
 		t.Fatalf("test setup: quicTr.Close: %v", err)
 	}
@@ -155,7 +189,26 @@ func TestStop_InboundCloseRunsBeforeTransportClose(t *testing.T) {
 		})
 }
 
-// TestStop_WaitsForTheAcceptLoopBeforeClosingTheTransport verifies Stop joins the accept loop before sweeping inbound connections.
+// TestStop_WaitsForTheAcceptLoopBeforeClosingTheTransport pins the barrier that
+// makes the shutdown announcement complete instead of best-effort.
+//
+// Publishing an admitted connection into inboundConns is not by itself enough.
+// Listener.Close does not discard the connections already queued inside quic-go
+// — baseServer.accept drains connQueue after stopAccepting is closed — so the
+// accept loop can still admit one after the shutdown has begun. If stop() swept
+// the map and called quicTr.Close() while that was possible, the late-admitted
+// connection would be destroyed LOCALLY and its peer left holding it: the exact
+// defect this file exists to prevent, merely moved into a narrower window.
+//
+// stop() therefore joins the accept loop first. Because acceptLoopIteration
+// publishes synchronously, on that goroutine, "the accept loop has returned"
+// means "every connection it admitted is in the map", so the sweep after the
+// join cannot miss one.
+//
+// The test drives that with the real Stop, no sleeps and no test hook: it holds
+// acceptWG to stand for a loop that has not returned yet, requires Stop to make
+// no progress past the join, publishes the late admission the way the loop
+// would, releases the barrier, and requires the peer to have been told.
 func TestStop_WaitsForTheAcceptLoopBeforeClosingTheTransport(t *testing.T) {
 	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -215,7 +268,9 @@ func TestStop_WaitsForTheAcceptLoopBeforeClosingTheTransport(t *testing.T) {
 
 	waitForChan(t, done, 10*time.Second, "Stop never returned after the accept loop was released")
 
-	// Stop returning means the frame was sent; poll until the sender receives it.
+	// Stop returning means the frame was SENT; the sender still has to receive
+	// it. Poll rather than read the cause straight away — the bound is there to
+	// fail the test, not to be waited out.
 	pollUntil(t, 5*time.Second, 2*time.Millisecond,
 		"the late-admitted connection was never announced: the sender's connection stayed live for the whole bound",
 		func() bool { return senderConn.Context().Err() != nil })

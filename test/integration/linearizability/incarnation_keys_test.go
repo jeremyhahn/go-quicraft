@@ -29,7 +29,33 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
-// TestRestart_ProposalKeysDoNotCollideAcrossIncarnations: a restarted follower's new proposals are never completed by replayed entries from its previous incarnation.
+// TestRestart_ProposalKeysDoNotCollideAcrossIncarnations isolates the
+// cross-incarnation key collision.
+//
+// A proposal is matched back to its caller by entry.Key. Were the key
+// (replicaID, per-host sequence) with the sequence living in the Host, a
+// restarted replica -- a NEW Host for the SAME replica ID -- would mint the
+// same keys its previous incarnation minted, while the raft log still carried the
+// previous incarnation's entries under those keys. A restart with no
+// snapshot replays the whole log through OnApplied, and the moment a
+// replayed old entry with key (R, k) meets a fresh proposal registered under
+// (R, k), the fresh proposal is completed with the OLD entry's result: the
+// caller is told its write landed while its entry is still in flight, and
+// a linearizable read issued on the strength of that acknowledgement
+// returns the value from before it. That is the soak's Illegal history.
+//
+// Keys are random 64-bit draws and every pending proposal carries a floor
+// (see pendingProposal), so this test is the regression net: it builds the
+// conditions for that collision, and it must stay quiet however keys are
+// minted.
+//
+// The shape here made the collision certain rather than lucky. Padding
+// entries go first so the replay takes long enough for the new proposals to
+// register; then the follower proposes `keyed` entries, so the old (R, 1..N)
+// keys sit late in the log; then the follower is restarted and the same
+// number of proposals are issued through it immediately. Old and new values
+// have DIFFERENT lengths, so a result carrying the old length is proof of
+// which entry completed the caller, independent of any read.
 func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	const (
 		numNodes = 3
@@ -49,16 +75,50 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 	follower := cluster.hosts[followerIdx]
 	cluster.hostsMu.RUnlock()
 
-	// Pad through whichever replica leads at each proposal, budgeted failoverTimeout; a retried put may apply twice.
+	// Padding through whichever replica leads AT EACH PROPOSAL, never the
+	// leader observed above: 20,000 sequential writes span many election
+	// timeouts, and on a loaded runner leadership moves inside that stretch.
+	// A pinned leader then answers "not leader, leader unknown" and the test
+	// failed on an election the cluster handled correctly (CI run 18403).
+	// Who leads does not matter to the shape; that the entries are NOT
+	// follower-minted does, and a leader proposing on its own replica mints
+	// its own keys. If the new leader is the follower, its padding keys are
+	// minted under a different incarnation's draws and collide with nothing
+	// the assertion reads. A retried padding put may apply twice
+	// (quicraft.MaybeApplied); it is a last-write-wins put and only lengthens
+	// the replay.
+	//
+	// Each proposal before the restart is budgeted failoverTimeout, not
+	// proposeTimeout: these phases only build the log's shape, and over
+	// 20,000 writes a loaded runner can lose its leader to a run of split
+	// votes that outlasts 5s (batch soak on a loaded host, #309: terms 7-13 in 4s
+	// with all three replicas up, then "leader unknown"). An election is
+	// granted failoverTimeout everywhere else in this harness; the keyed
+	// collision after the restart is what this test asserts, and it keeps
+	// its own budgets.
 	for i := range padding {
 		proposeToLeader(t, cluster, shardID, encodeKVPut(fmt.Sprintf("pad-%d", i%256), "p"), failoverTimeout)
 	}
 
-	// A gate entry before the keyed ones parks the follower's replay until the new proposals are registered.
+	// A gate entry goes in just before the keyed ones. When the follower
+	// restarts, its replay parks at this entry -- with the old (R, 1..keyed)
+	// entries still ahead of it -- until the new proposals are registered.
+	// That is what makes the collision a certainty rather than a race
+	// against the machine's speed (on a CI runner the replay of 20,000
+	// entries can finish before the first proposal is accepted).
+	// Re-resolved for the same reason as the padding. A retry that applies
+	// the gate put twice is harmless: the replay parks at the FIRST one, which
+	// still lies ahead of every keyed entry, and release disarms the gate
+	// before the second is applied.
 	const gateKey = "gate"
 	proposeToLeader(t, cluster, shardID, encodeKVPut(gateKey, "closed"), failoverTimeout)
 
-	// Keyed proposals are pinned to the follower, retrying it with quicraft.Temporary.
+	// The follower's first incarnation mints (R, 1..keyed) for these, so they
+	// are PINNED to it: the follower is the subject, and re-resolving would put
+	// some other replica's keys in the log. Pinned with quicraft.Temporary is
+	// the package's policy for that caller -- wait and ask the SAME replica
+	// again, which clears the not-leader window an election opens while the
+	// follower learns the successor it forwards to.
 	for i := range keyed {
 		if _, err := proposer.TryWith(proposer.Pinned(follower), shardID,
 			encodeKVPut(fmt.Sprintf("k-%d", i), "old"), failoverTimeout, quicraft.Temporary); err != nil {
@@ -66,7 +126,11 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		}
 	}
 
-	// The follower's LastApplied bounds every pre-restart entry.
+	// Where the log ends before the restart: every pre-restart entry, the
+	// (R, 1..keyed) ones included, lies at or below this index.
+	// Read from the follower itself: TryWith returned only after each
+	// keyed entry was APPLIED there, so its LastApplied covers them all, and
+	// it needs no leader to answer.
 	logEnd := uint64(0)
 	if info, err := follower.ShardInfo(shardID); err == nil {
 		logEnd = info.LastApplied
@@ -77,7 +141,9 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 
 	// Restart the follower with the gate armed for its replica alone.
 	parked, release := gateApply(t, gateKey, shardID, uint64(followerIdx+1))
-	// Deferred after cluster.close so it runs first; Close waits for the parked Update.
+	// Deferred AFTER cluster.close was, so it runs BEFORE it: Host.Close
+	// waits for the parked Update, and a failure while parked would
+	// otherwise wedge the shutdown ahead of the t.Cleanup that also releases.
 	defer release()
 	cluster.stopNode(followerIdx)
 	cluster.restartNode(followerIdx, shardID)
@@ -100,13 +166,25 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 		wg        sync.WaitGroup
 		stop      = make(chan struct{}) // closed to stop the proposers early
 	)
-	// Once every proposal is in flight, all were registered during the replay; release the gate.
+	// A restarted follower refuses proposals until it knows the leader; it
+	// learns that from the leader's first AppendEntries, which the parked
+	// apply does not delay. Every proposer retries the honest refusals; an
+	// accepted proposal then sits pending -- the follower cannot apply it
+	// while parked -- so once all of them are in flight at once, all of
+	// them were registered during the replay. The gate is released then.
 	for i := range keyed {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			key := fmt.Sprintf("k-%d", i)
-			// Retry refusals for failoverTimeout plus one proposeTimeout; a closed stop ends the retries.
+			// Retry refusals for as long as the in-flight wait below can
+			// still succeed (failoverTimeout), plus one proposeTimeout for a
+			// proposal still pending when the gate is released -- not for
+			// proposeTimeout alone: a restarted follower that learns the
+			// leader more than 5s after the proposers start would otherwise
+			// see every proposer gone, and the wait fail with "only 0 of 64".
+			// Each SyncPropose keeps its own proposeTimeout context, and a
+			// closed stop ends the retries at once.
 			deadline := time.Now().Add(failoverTimeout + proposeTimeout)
 			for time.Now().Before(deadline) {
 				select {
@@ -140,7 +218,14 @@ func TestRestart_ProposalKeysDoNotCollideAcrossIncarnations(t *testing.T) {
 					mu.Unlock()
 					return
 				}
-				// Check the acknowledgement with a linearizable read through the current leader.
+				// A linearizable read through whichever replica leads NOW, to
+				// check the acknowledgement independently of the follower that
+				// gave it. Not the leader observed before the restart: a
+				// 20,000-entry replay lies between the two, and a deposed
+				// leader that has not learned its successor refuses the read.
+				// An ack arrives only after the gate is released (the parked
+				// follower cannot apply), so even a follower that has since
+				// won the shard is a correct reader here.
 				got, readErr := proposer.TryRead(cluster.leaderHost, shardID, encodeKVGet(key), readTimeout)
 				if readErr != nil {
 					t.Errorf("read after ack of %s: %v", key, readErr)

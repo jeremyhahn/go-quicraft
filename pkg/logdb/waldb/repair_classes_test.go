@@ -28,7 +28,17 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// Repair recovers from every corruption class recovery refuses to open over.
+// Repair is documented as the exit from every class of corruption recovery
+// refuses to open over, not only ErrMidSegmentCorruption (repair_test.go).
+// Each test here builds the fixture an existing recovery test uses for one of
+// the other three classes and walks it through the same three steps:
+//
+//   - the failed Open names the class and carries a *SegmentCorruptionError
+//     locating the damage;
+//   - a Repair at any offset other than the clean end the error reported is
+//     refused, and touches nothing on disk;
+//   - a Repair at that clean end succeeds, the next Open succeeds, and the
+//     entries written below the cut read back intact.
 
 // repairClassCase is one refusal class staged on disk and ready to repair.
 type repairClassCase struct {
@@ -208,7 +218,12 @@ func readEntryPrefix(ctx context.Context, t *testing.T, db *DB, shardID, replica
 	return kept
 }
 
-// entriesBelow counts the entries in records ending at or below cleanEnd in an undamaged segment image.
+// entriesBelow walks image, an undamaged segment image written with
+// blockSize-byte blocks, reassembles its logical records, and counts the
+// entries carried by the entry records that end at or below cleanEnd: the
+// entries a repair cutting at cleanEnd must keep, no more and no fewer. One
+// logical entry record may carry several entries (one SaveState batch per
+// node), so the count is taken from each record's payload.
 func entriesBelow(ctx context.Context, t *testing.T, image []byte, blockSize int, cleanEnd int64) uint64 {
 	t.Helper()
 	if err := ctx.Err(); err != nil {

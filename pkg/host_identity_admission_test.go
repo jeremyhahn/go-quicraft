@@ -25,7 +25,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Mandatory identities: every admission path on a host with a transport requires the member's identity.
+// ---------------------------------------------------------------------------
+// Mandatory identities at admission
+//
+// A member is authorized on the receive path by its committed node identity
+// and by nothing else, so every path that ADMITS a member on a host with a
+// transport must require the identity: the founding map, the join anchor,
+// every later add, and a snapshot import. A host with no transport has no
+// wire boundary and does not require one.
+// ---------------------------------------------------------------------------
 
 // TestStartShard_TransportHostRequiresFounderIdentities pins the founding
 // map: every member must be named in Config.MemberIdentities, and the refusal
@@ -78,7 +86,14 @@ func TestStartShard_TransportHostRequiresFounderIdentities(t *testing.T) {
 	}
 }
 
-// TestStartShard_RefusesDuplicateIdentitiesAndKeepsAnchorEntriesOutOfBootstrap checks duplicate identities are refused and anchor identities stay out of the bootstrap entry.
+// TestStartShard_RefusesDuplicateIdentitiesAndKeepsAnchorEntriesOutOfBootstrap
+// pins the two shapes the founding map could otherwise
+// commit: one identity bound to two members (one keypair, two votes —
+// the forgery identities exist to defeat, and the shape a later add refuses),
+// and an identity for a replica the members map does not hold. The second is
+// not refused — it is the operator anchor, and a restarted replica that missed
+// an AddNode is vouched for exactly this way — but it must not be written into
+// the bootstrap entry for a replica no role holds.
 func TestStartShard_RefusesDuplicateIdentitiesAndKeepsAnchorEntriesOutOfBootstrap(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())
@@ -185,7 +200,11 @@ func TestStartShard_TransportHostRequiresJoinAnchor(t *testing.T) {
 	}
 }
 
-// TestStartShard_EstablishedReplicaRestartsWithJoinAndNoAnchor checks the anchor is required on first start only.
+// TestStartShard_EstablishedReplicaRestartsWithJoinAndNoAnchor pins that the
+// anchor is a FIRST-start requirement: a replica that already holds a durable
+// configuration may be restarted with join=true and no MemberIdentities — a
+// supported convention (Peer.MarkJoining) — because it recovers what a joiner
+// would have needed the anchor for.
 func TestStartShard_EstablishedReplicaRestartsWithJoinAndNoAnchor(t *testing.T) {
 	cfg := sanHostConfig(t, "node-a.raft.test:5000", "node-a.raft.test")
 	cfg.WALDir, cfg.NodeHostDir = t.TempDir(), t.TempDir()
@@ -283,7 +302,9 @@ func TestImportMembershipFor_RequiresIdentitiesBehindATransport(t *testing.T) {
 		t.Fatalf("an identity-less artifact was refused on a transportless host: %v", err)
 	}
 
-	// Identities without a rewrite complete the artifact's own membership.
+	// Identities supplied WITHOUT a rewrite complete the artifact's own
+	// membership, which is how an artifact exported by a build that did not
+	// require identities is imported behind a transport.
 	all := map[uint64]string{}
 	for id := range artifact.Addresses {
 		all[id] = testIdentity(id)
@@ -485,7 +506,12 @@ func TestStartShard_RestartHeldToRecoveredIdentities(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_RefusesABindingThisHostDoesNotPresent checks a snapshot binding this replica to another identity is refused before persisting.
+// TestHandleSnapshot_RefusesABindingThisHostDoesNotPresent pins the snapshot
+// path's own identity check: the snapshot REPLACES a joiner's committed
+// membership, so a binding in it for this replica that is not the identity
+// this host presents (the AddNode that admitted it carried a mistyped one) is
+// refused before anything is persisted, instead of being adopted and having
+// every peer refuse the joiner's acks for the life of the shard.
 func TestHandleSnapshot_RefusesABindingThisHostDoesNotPresent(t *testing.T) {
 	cfg := sanHostConfig(t, "node-b.raft.test:5000", "node-b.raft.test")
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())

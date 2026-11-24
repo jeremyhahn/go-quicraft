@@ -35,7 +35,23 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// Snapshot artifact matrix: recovery must decrypt then decompress, so recovery tests run over every epoch and compression combination.
+// ---------------------------------------------------------------------------
+// Snapshot artifact matrix
+//
+// snapshotPool.saveSnapshot builds its writer chain as
+//
+//	state machine -> [snappy.NewBufferedWriter] -> file -> [encrypt in place]
+//
+// so every reader chain that consumes a saved snapshot must mirror it in
+// reverse: decrypt the file, then wrap the plaintext in snappy.NewReader.
+// A recovery path that skips either step feeds the state machine ciphertext or
+// compressed bytes — silent state corruption on restart.
+//
+// The epoch-0 + uncompressed cell is the ONE configuration in which BOTH
+// omissions are invisible, so testing recovery in that cell alone is a blind
+// spot. Recovery tests therefore run as subtests over the whole matrix so a
+// regression names the exact configuration that broke.
+// ---------------------------------------------------------------------------
 
 // snapshotVariant is one cell of the {plaintext, encrypted} × {uncompressed,
 // snappy} matrix an at-rest snapshot artifact can be written in.
@@ -69,7 +85,9 @@ func encryptedSnapshotVariants() []snapshotVariant {
 	return out
 }
 
-// compression is the algorithm the artifact is written with; recovery reads it from the snapshot record.
+// compression is the algorithm the variant's artifact is written through. It
+// is what the SNAPSHOT RECORD must carry: recovery builds its reader chain
+// from the artifact's recorded compression, never from the shard config.
 func (v snapshotVariant) compression() config.CompressionType {
 	if v.snappy {
 		return config.Snappy
@@ -77,14 +95,18 @@ func (v snapshotVariant) compression() config.CompressionType {
 	return config.NoCompression
 }
 
-// shardConfig returns a shard config whose compression matches the variant; it governs saving only.
+// shardConfig returns a shard config whose compression setting matches the
+// variant. It governs the SAVE side only; recovery reads the artifact's own
+// recorded compression.
 func (v snapshotVariant) shardConfig(shardID, replicaID uint64) config.Config {
 	c := testShardConfig(shardID, replicaID)
 	c.SnapshotCompressionType = v.compression()
 	return c
 }
 
-// fileBytes returns snapshot.dat before at-rest encryption, which is also what a decrypting reader must emit.
+// fileBytes returns the bytes snapshot.dat holds BEFORE at-rest encryption:
+// the rsm envelope around payload, Snappy-framed when the variant compresses.
+// It is also exactly what a decrypting reader (ExportSnapshot) must emit.
 func (v snapshotVariant) fileBytes(t *testing.T, payload []byte) []byte {
 	t.Helper()
 	envelope := snapshotEnvelope(payload)
@@ -146,7 +168,38 @@ func seedLocalSnapshot(t *testing.T, db *mockLogDB, v snapshotVariant, barrier B
 	return dir
 }
 
-// quiescentMembers returns the replica plus one never-started peer, so the replica cannot elect itself and ns.lastApplied stays at the recovered index.
+// quiescentMembers is the initial membership a recovery test starts its replica
+// with when it goes on to assert an EXACT ns.lastApplied: the replica under
+// test plus one peer that is never started.
+//
+// A SINGLE-member shard makes that assertion unwinnable. One voter is its own
+// quorum, so the replica campaigns on the step worker's first election tick,
+// wins uncontested, and appends the leader's empty no-op at snapshotIndex+1,
+// which the apply loop then applies and which advances ns.lastApplied off the
+// index recovery seeded it with. Measured on this fixture with a poll straight
+// after StartShard: the counter went 40 -> 41 within milliseconds on all four
+// artifact variants, so whether the assertion samples 40 or 41 is a race
+// against that tick, which can fail with "ns.lastApplied = 41, want 40" while
+// recoverCalled and the payload comparison — the assertions the test exists
+// for — pass in the same run.
+//
+// Two voters and no transport make the counter quiescent instead of merely
+// slow: the replica can never collect a second vote, so it never becomes
+// leader, never appends, and nothing can advance ns.lastApplied past the
+// recovered index. Measured: 40 held for a full 3s on every variant. This is
+// also the ordinary shape of the event under test — a replica restarting from
+// its local snapshot before its peers are back — and recovery itself is
+// membership-independent, running inside StartShard before raft does anything,
+// so what the test proves is unchanged.
+//
+// Widening the assertion to tolerate the no-op instead would have been weaker,
+// not just uglier. A replica whose applied marker was never seeded from the
+// snapshot sits at 0 and is then carried to snapshotIndex+1 by that same
+// no-op, so any bound that admits snapshotIndex+1 also admits the defect the
+// assertion exists to catch. Keeping the shard quiescent keeps the equality.
+//
+// A function rather than a package-level var so each subtest gets its own map
+// and no two of them can ever share mutable fixture state.
 func quiescentMembers() map[uint64]string {
 	return map[uint64]string{1: "127.0.0.1:5000", 2: "127.0.0.1:5001"}
 }
@@ -200,7 +253,16 @@ func assertNoDecryptScratch(t *testing.T, dir string) {
 	}
 }
 
-// TestStartShard_LocalSnapshotRecovery_InMemorySM checks restart recovery decrypts and decompresses per the recorded epoch and compression, over the full matrix.
+// TestStartShard_LocalSnapshotRecovery_InMemorySM is the regression test for
+// the restart-recovery reader chain. It runs the full artifact matrix:
+//
+//   - encrypted cells pin the decryption gap (snapshots are encrypted at rest
+//     and StartShard fed the raw snapshot.dat to the state machine);
+//   - snappy cells pin the decompression gap (the save path wraps the writer in
+//     snappy.NewBufferedWriter, so the reader must be wrapped symmetrically);
+//   - plaintext cells pin the negative: a barrier is always configured here, so
+//     the RECORDED EPOCH — not the barrier's presence — decides whether
+//     decryption runs, and an epoch-0 artifact is recovered verbatim.
 func TestStartShard_LocalSnapshotRecovery_InMemorySM(t *testing.T) {
 	for _, v := range snapshotVariants {
 		t.Run(v.name, func(t *testing.T) {
@@ -229,7 +291,10 @@ func TestStartShard_LocalSnapshotRecovery_InMemorySM(t *testing.T) {
 				t.Fatalf("state machine recovered %q, want %q (reader chain does not mirror the writer chain)",
 					memSM.recovered, payload)
 			}
-			// Exact: the applied marker is seeded before the nodeState is published, and the shard cannot elect itself.
+			// Exact, and safe to read the instant StartShard returns: the
+			// applied marker is seeded to the recovered index BEFORE the
+			// nodeState is published, and quiescentMembers keeps the shard
+			// from electing itself and moving it afterwards.
 			if got := testLoadNode(h, 1).lastApplied.Load(); got != 40 {
 				t.Errorf("ns.lastApplied = %d, want 40 (the recovered snapshot index)", got)
 			}
@@ -252,7 +317,12 @@ func (fs createTempSpyFS) CreateTemp(dir, pattern string) (snapshotFile, error) 
 	return fs.osSnapshotFS.CreateTemp(dir, pattern)
 }
 
-// TestStartShard_LocalSnapshotRecovery_ScratchStaysInTheReplicaTree checks the recovery scratch is created in the replica's own snapshot directory.
+// TestStartShard_LocalSnapshotRecovery_ScratchStaysInTheReplicaTree: a record
+// may name a snapshot directory outside the replica's tree (the fixture's
+// is a bare temp directory). The recovery's plaintext scratch must still be
+// created in the replica's own snapshot directory, which the stale-scratch
+// sweep covers: beside an external artifact, a copy a crash orphans is
+// reclaimed by nothing once the record moves on.
 func TestStartShard_LocalSnapshotRecovery_ScratchStaysInTheReplicaTree(t *testing.T) {
 	v := snapshotVariant{name: "encrypted_uncompressed", encrypted: true}
 	barrier := createTestBarrier(t)
@@ -329,7 +399,15 @@ func TestStartShard_LocalSnapshotRecovery_OnDiskBootstrap(t *testing.T) {
 	}
 }
 
-// TestStartShard_LocalSnapshotRecovery_OnDiskBehindSnapshot checks an on-disk SM behind the local snapshot is recovered from the snapshot.
+// TestStartShard_LocalSnapshotRecovery_OnDiskBehindSnapshot covers #280: an
+// on-disk SM whose Open() reports a durable lastApplied (40) BELOW the local
+// snapshot record (80) — the replica installed a snapshot from the leader, or
+// its database lost writes it had already snapshotted, and restarted before
+// the database caught up. The log is compacted through the snapshot, so
+// entries 41..80 exist only inside snapshot.dat. Seeding the markers from
+// Open() leaves a hole beneath the first entry the log can offer (81): the
+// apply worker refuses it as ErrApplyGap, and StartShard cannot even resolve a
+// term for index 40. The database must be recovered from the snapshot instead.
 func TestStartShard_LocalSnapshotRecovery_OnDiskBehindSnapshot(t *testing.T) {
 	for _, v := range snapshotVariants {
 		t.Run(v.name, func(t *testing.T) {
@@ -428,7 +506,12 @@ func TestStartShard_LocalSnapshotRecovery_PerShardBarrier(t *testing.T) {
 	}
 }
 
-// TestStartShard_LocalSnapshotRecovery_FailsClosedWithoutBarrier checks an encrypted snapshot without a barrier aborts StartShard with ErrSnapshotEncryptedBarrierUnavailable.
+// TestStartShard_LocalSnapshotRecovery_FailsClosedWithoutBarrier verifies the
+// fail-closed contract: a snapshot recorded with Epoch > 0 that cannot be
+// decrypted must abort StartShard with
+// ErrSnapshotEncryptedBarrierUnavailable rather than recover the state machine
+// from ciphertext. Compression must not change the verdict — the barrier gate
+// runs before any reader is built.
 func TestStartShard_LocalSnapshotRecovery_FailsClosedWithoutBarrier(t *testing.T) {
 	encryptBarrier := createTestBarrier(t)
 	payload := []byte("undecryptable snapshot payload")
@@ -600,7 +683,13 @@ func TestStartShard_LocalSnapshotRecovery_CorruptCiphertextFailsStart(t *testing
 	}
 }
 
-// TestExportImportSnapshot_RoundTripRecoversPlaintext checks export, import and StartShard together restore the original payload across the matrix.
+// TestExportImportSnapshot_RoundTripRecoversPlaintext closes the loop across
+// hosts: export decrypts the at-rest artifact, import persists it with Epoch 0,
+// and the destination's StartShard must still hand the state machine the
+// original payload. Running the matrix pins both halves of the reader chain —
+// export owns the decrypt step, StartShard owns the decompress step, and only
+// the combination proves an operator's disaster-recovery restore of an
+// encrypted, compressed shard actually reconstructs state.
 func TestExportImportSnapshot_RoundTripRecoversPlaintext(t *testing.T) {
 	for _, v := range snapshotVariants {
 		t.Run(v.name, func(t *testing.T) {

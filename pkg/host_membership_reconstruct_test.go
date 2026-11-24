@@ -24,7 +24,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Config-in-log reconstruction: each field the index-1 entry carries is asserted individually.
+// Host-side config-in-log reconstruction: what the index-1 entry has to carry
+// back, and what happens when it cannot be read.
+//
+// reconstructShardMembership is the ONLY thing standing between a restart and
+// StartShard's fall-back seed at host.go's `nothingRecovered` branch. That seed
+// builds a Membership from the caller's members map, which carries VOTER
+// ADDRESSES AND NOTHING ELSE — no witnesses, no observers, no Removed
+// tombstones, no committed identities, and neither the replicated witness
+// policy nor the replicated session policy. Every one of those is state the
+// shard agreed on and this replica must not unilaterally revise, so each field
+// is asserted individually below rather than through a whole-struct compare
+// that would silently accept a new field it does not know about.
 
 // fixedEntryLogDB serves one caller-supplied entry from the log-read path, so a
 // test can hand reconstruction an exact index-1 payload — including one that
@@ -131,7 +142,11 @@ func TestReconstructShardMembership_PreservesNonVoterRolesAndPolicy(t *testing.T
 	}
 }
 
-// TestReconstructShardMembership_CorruptBootstrapCmdFailsClosed checks an undecodable index-1 entry aborts StartShard.
+// TestReconstructShardMembership_CorruptBootstrapCmdFailsClosed pins the
+// corrupt-payload path. An index-1 entry of the right TYPE whose Cmd cannot be
+// decoded must abort StartShard, not decode to the zero Membership: an empty
+// reconstruction is indistinguishable from "no bootstrap entry here" and sends
+// the caller straight to the re-seed.
 func TestReconstructShardMembership_CorruptBootstrapCmdFailsClosed(t *testing.T) {
 	valid, err := raft.BuildInitialMembershipEntry(proto.Membership{
 		Addresses: map[uint64]string{1: "a1", 2: "a2"},
@@ -167,7 +182,18 @@ func TestReconstructShardMembership_CorruptBootstrapCmdFailsClosed(t *testing.T)
 	}
 }
 
-// TestReconstructShardMembership_NonBootstrapEntryAtIndexOne checks a non-bootstrap entry at index 1 fails closed rather than re-seeding membership.
+// TestReconstructShardMembership_NonBootstrapEntryAtIndexOne pins the
+// fail-closed behaviour when index 1 holds something OTHER than the founding
+// configuration.
+//
+// The condition is not benign: config-in-log is the only bootstrap this code
+// base performs, so on a shard it created an ordinary entry at index 1 means the
+// log is DAMAGED. Reporting ok=false with no error would make StartShard re-seed
+// membership from the caller's members map, dropping witnesses, observers,
+// Removed tombstones, identities and the replicated witness/session policies.
+//
+// The original assertion survives inside the new one: reconstruction must never
+// FABRICATE a membership, and now it must not report a benign not-found either.
 func TestReconstructShardMembership_NonBootstrapEntryAtIndexOne(t *testing.T) {
 	ldb := &fixedEntryLogDB{entry: logdb.Entry{
 		Index: raft.BootstrapMembershipIndex,
@@ -197,12 +223,23 @@ func TestReconstructShardMembership_NonBootstrapEntryAtIndexOne(t *testing.T) {
 	}
 }
 
-// TestStartShard_MissingBootstrapEntryFailsClosed checks a restart with no bootstrap entry fails and leaves the shard unloaded.
+// TestStartShard_MissingBootstrapEntryFailsClosed is the end-to-end counterpart.
+//
+// A replica restarts on a durable log that has persisted state and entries but
+// NO EntryInitialMembership at index 1. It hands StartShard a members map the
+// log never agreed to, so a re-seed from that map would be observable.
+//
+// StartShard must FAIL, and the shard must not be left loaded: a silent
+// re-seed produces a replica whose voter set, non-voter roles and replicated
+// policies differ from every peer's, which is the divergence the fail-closed
+// path exists to prevent. Damaged durable state is an operator problem.
 func TestStartShard_MissingBootstrapEntryFailsClosed(t *testing.T) {
 	const shardID, replicaID uint64 = 74, 1
 	db := memdb.New()
 
-	// One ordinary entry at index 1 plus a hard state makes this a restart.
+	// A durable log with no bootstrap entry: one ordinary committed entry at
+	// index 1 plus a hard state, which is what makes StartShard treat this as a
+	// RESTART rather than a first start.
 	if err := db.SaveState([]logdb.Update{{
 		ShardID:   shardID,
 		ReplicaID: replicaID,

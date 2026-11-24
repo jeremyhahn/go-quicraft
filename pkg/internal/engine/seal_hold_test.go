@@ -401,7 +401,9 @@ func TestSealHold_PiggybackSealedRefusal(t *testing.T) {
 	cfg.SetDefaults()
 	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 
-	// Entries 1-3 durable and committed, a vote granted at term 2: the piggyback carries them, hard state term 2 vote 3, and an ordered RequestVoteResp.
+	// Entries 1-3 durable, then committed with nothing unsaved, and a vote
+	// granted at term 2: the piggyback carries committed entries, the hard
+	// state term 2 vote 3, and an ORDERED RequestVoteResp.
 	replicateTo(t, peer, 0, 0, 0, []proto.Entry{
 		{Index: 1, Term: 1, Cmd: []byte("a")},
 		{Index: 2, Term: 1, Cmd: []byte("b")},

@@ -33,11 +33,19 @@ var (
 	// ErrNotImplemented is returned when a requested feature is not implemented.
 	ErrNotImplemented = errors.New("requested feature not implemented")
 
-	// ErrSnapshotFilesNotSupported is returned when SaveSnapshot adds external snapshot files, which QuicRaft does not support.
+	// ErrSnapshotFilesNotSupported is returned when a state machine adds
+	// external files to the snapshot file collection during SaveSnapshot.
+	// QuicRaft does not support external snapshot files; the snapshot is
+	// failed rather than silently produced without the files, which would
+	// be unrecoverable data loss for state machines that keep bulk data
+	// outside the snapshot stream.
 	ErrSnapshotFilesNotSupported = errors.New("external snapshot files are not supported by quicraft")
 )
 
-// AdapterResultLengthError is returned when Update returns a result slice whose length differs from the entry batch.
+// AdapterResultLengthError is returned when a concurrent or on-disk state
+// machine's Update returns a slice whose length differs from the applied
+// entry batch. Indexing results by the user-returned length would either
+// panic (longer) or silently zero-fill trailing proposals (shorter).
 type AdapterResultLengthError struct {
 	// Expected is the number of entries in the applied batch.
 	Expected int

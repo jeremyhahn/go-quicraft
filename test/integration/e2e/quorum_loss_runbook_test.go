@@ -27,7 +27,20 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/proposer"
 )
 
-// TestE2E_QuorumLossRunbook walks the quorum-loss runbook in docs/multi-group-host/engineering.md and verifies linearizable service afterwards.
+// TestE2E_QuorumLossRunbook walks the quorum-loss runbook in
+// docs/multi-group-host/engineering.md step by step through the public API,
+// and proves the shard serves linearizable reads and writes afterwards.
+//
+// Seven replicas lose four, so the three survivors cannot elect. The runbook
+// then: picks the most advanced survivor by ShardInfo.LastApplied, exports a
+// snapshot from it while its shard is loaded, stops every survivor, imports
+// the artifact with the survivors as the complete new membership, restarts
+// the survivors and adds a replacement.
+//
+// The exporter's own import is refused with *ImportSnapshotOutOfDateError, as
+// the runbook documents: it already records the artifact's index. The other
+// two survivors hold the rewritten membership and form its quorum on their
+// own, so the shard recovers without depending on how the exporter resumes.
 func TestE2E_QuorumLossRunbook(t *testing.T) {
 	const (
 		shardID  = uint64(1)

@@ -209,7 +209,15 @@ func TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover(t *testing.T) {
 	}
 }
 
-// TestHostAPI_LeaseRead_ConcurrentWritersAndReaders checks lease reads stay monotonic per key under concurrent writers and readers.
+// TestHostAPI_LeaseRead_ConcurrentWritersAndReaders verifies that
+// lease-based reads return monotonically non-decreasing values per key
+// under sustained concurrent write and read pressure. N writer goroutines
+// propose sequentially numbered values for distinct keys while M reader
+// goroutines continuously perform SyncRead (which uses LeaseRead when
+// configured). The test runs for 5 seconds and then verifies:
+//   - All reads returned monotonically non-decreasing values per key.
+//   - No stale reads were observed across any reader goroutine.
+//   - After all writers complete, final reads match the last written values.
 func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -245,7 +253,9 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 	// maxWritten tracks the highest sequence number written per key.
 	maxWritten := make([]atomic.Int64, totalKeys)
 
-	// keyWritten records that a key has a committed value, so an empty read is stale.
+	// keyWritten records that a key has at least one COMMITTED value. It is
+	// what turns an empty read into a provable stale read: before the first
+	// write a missing key legitimately reads back as "".
 	keyWritten := make([]atomic.Bool, totalKeys)
 
 	// totalWrites counts committed proposals across all writers.
@@ -312,7 +322,10 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 			for !writesDone.Load() {
 				for keyIdx := range totalKeys {
 					key := fmt.Sprintf("conc-key-%d", keyIdx)
-					// Sampled before the read: a key committed by then must be visible.
+					// Sampled BEFORE the read: a key already committed when
+					// this read STARTS must be visible to a linearizable
+					// read, so an empty result is a stale read rather than a
+					// race with the writer.
 					committedBeforeRead := keyWritten[keyIdx].Load()
 
 					result, rErr := tryReadFromLeader(cluster, shardID, key, 3*time.Second)
@@ -328,7 +341,10 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 						return
 					}
 					if val == "" {
-						// An empty value is what a missing key returns, so it is a stale read.
+						// An empty value is exactly what a MISSING key
+						// returns. Discarding it as noise — the previous
+						// behaviour — threw away the stale read this test
+						// exists to detect.
 						if committedBeforeRead {
 							errCh <- &StaleReadError{
 								ReaderID: readerID,
@@ -450,7 +466,13 @@ func parseConcValue(val string) (writerID, keyIdx, seq uint64, err error) {
 	return fields[0], fields[1], fields[2], nil
 }
 
-// TestHostAPI_LeaseRead_ReadAfterLeaderTransfer checks the new leader serves no stale reads after a transfer (PhD 6.4.1).
+// TestHostAPI_LeaseRead_ReadAfterLeaderTransfer verifies that the new
+// leader does not serve stale reads after a leadership transfer. Per PhD Section 6.4.1, a leader must
+// expire its lease before transferring leadership. This test:
+//  1. Writes data on the original leader.
+//  2. Transfers leadership to a specific follower.
+//  3. Immediately reads from the new leader.
+//  4. Verifies the read returns the latest committed value (not stale data).
 func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -496,7 +518,8 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 	targetReplicaID := uint64(targetIdx + 1)
 	t.Logf("requesting leadership transfer to node[%d] (replicaID=%d)", targetIdx, targetReplicaID)
 
-	// Require the transfer to land on the requested target.
+	// Request leadership transfer and require that it lands on the REQUESTED
+	// target rather than on whoever happens to lead next.
 	transferLeadershipTo(t, cluster, shardID, targetIdx, failoverTimeout)
 
 	targetInfo, targetErr := cluster.hosts[targetIdx].ShardInfo(shardID)

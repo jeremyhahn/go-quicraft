@@ -26,7 +26,12 @@ import (
 	"testing"
 )
 
-// directProposeMarker opts one call site out of TestIntegrationProposalsResolveTheLeader; it sits on the line it excuses and carries its reason.
+// directProposeMarker opts one call site out of TestIntegrationProposalsResolveTheLeader.
+//
+// It is a marker rather than an allowlist in this file on purpose. A list of
+// file:line pairs rots on the first edit above it, and a list of test names
+// puts the justification in a different file from the code it excuses. The
+// marker sits on the line that needs it and carries its own reason.
 const directProposeMarker = "//quicraft:direct-propose"
 
 // directConfigChangeMarker opts one call site out of
@@ -48,7 +53,40 @@ type integrationRoot struct {
 	minFiles int
 }
 
-// integrationRoots are the multi-replica integration trees every gate here scans, contrib/dragonboat included, since go/parser reads files across module boundaries; single-voter unit tests are excluded.
+// integrationRoots are the trees scanned by every gate in this file.
+//
+// # Why contrib/dragonboat is scanned from here, and not by its own gate
+//
+// contrib/dragonboat is a separate Go module with its own CI job, so the
+// obvious move is a second copy of this gate inside it. That would be ~180
+// lines of AST walking duplicated into a second module, and the duplication is
+// not incidental: the marker convention, the bare-marker rule, the
+// comment-block resolution and the empty-set floor all have to agree exactly
+// between the copies or the rule quietly differs between the two trees, which
+// is how a class like this survives a fix.
+//
+// It does not need to be duplicated, because the gate PARSES rather than
+// compiles. go/parser reads files by path; it never resolves an import, loads a
+// package or evaluates a build tag, so a module boundary is invisible to it —
+// contrib/dragonboat's files are ordinary files in the same repository at a
+// known relative path. Both trees are therefore checked by the one
+// implementation, and a change to the rule lands in both at once.
+//
+// The cost is that a violation in contrib/dragonboat fails the PARENT module's
+// job rather than the contrib job. That is the right way round: a violation
+// fails CI either way, and one gate means there is exactly one place to fix the
+// rule and no way for the two trees to drift apart.
+//
+// # What is NOT scanned, and why
+//
+// Only the multi-replica integration trees. Neither module's root-package unit
+// tests are here, and neither should be: every shard in
+// contrib/dragonboat/nodehost_test.go and nodehost_defects_test.go is a
+// single-voter configuration (map[uint64]Target{replicaID: nh.RaftAddress()}),
+// where the addressed host is the only replica that can lead and there is no
+// successor for a proposal to be redirected to. The class this gate exists to
+// catch cannot occur there, and marking 41 such calls would be noise that
+// devalues the marker everywhere it does matter.
 var integrationRoots = []integrationRoot{
 	// The parent module's integration suites (e2e, host, linearizability, raft).
 	{dir: filepath.Join("..", "integration"), minFiles: 20},
@@ -59,13 +97,24 @@ var integrationRoots = []integrationRoot{
 	{dir: filepath.Join("..", "..", "contrib", "dragonboat", "test", "integration"), minFiles: 20},
 }
 
-// proposalCalls are the methods that submit an entry to Raft and must reach the current leader.
+// proposalCalls are the methods that submit an entry to Raft. Both must reach
+// the shard's CURRENT leader, and neither forwards when the addressed replica
+// has lost leadership without yet learning its successor.
 var proposalCalls = map[string]bool{
 	"Propose":     true,
 	"SyncPropose": true,
 }
 
-// configChangeCalls are the sync and async membership-change methods in both modules; a lost response leaves commit unknown, so they have their own gate.
+// configChangeCalls are the methods that submit a membership change to Raft,
+// in both modules' spellings. A config change reaches the leader and is
+// refused by a non-leader on exactly the same terms as a proposal, and it
+// carries a second unpinned value a proposal does not — whether it COMMITTED —
+// which is why it has its own gate rather than a place in proposalCalls.
+//
+// The async forms are listed alongside the Sync ones because the class is
+// about the CALL: an async RequestState whose ResultC is read after a
+// leadership move has exactly the same ambiguity, and a private retry loop
+// wrapped around either form hides nothing from this gate.
 var configChangeCalls = map[string]bool{
 	// quicraft.Host (pkg/host.go).
 	"RequestAddNode":                     true,
@@ -96,7 +145,31 @@ var configChangeCalls = map[string]bool{
 	"SyncRequestDeleteReplica":            true,
 }
 
-// linearizableReadCalls are the leader-bound read methods in both modules; StaleRead, StaleReadBuf and FollowerRead are served locally and excluded. Add SyncReadBuf when an integration test first calls it.
+// linearizableReadCalls are the methods that serve a read THROUGH the leader,
+// in both modules' spellings — quicraft.Host and dragonboat.NodeHost spell
+// both of them the same.
+//
+// A linearizable read is bound to the leader exactly as a proposal is.
+// SyncRead is a ReadIndex plus a local lookup at the confirmed index;
+// handleFollowerReadIndex forwards when the addressed follower knows the
+// leader and refuses with a not-leader carrying LeaderID 0 when it does not;
+// and a read pending on a replica that loses the shard is failed with the same
+// MaybeApplied-wrapped not-leader a pending proposal is. Same class, same
+// remedy, so it gets a gate on the same terms.
+//
+// # What is deliberately NOT in this set
+//
+// StaleRead, StaleReadBuf and FollowerRead are served from the addressed
+// replica's own applied state and need no leader at all. A test that calls one
+// has already chosen a specific replica — that IS the subject — so requiring a
+// marker on every such site would be noise that devalues the marker where it
+// matters. There are nine of them across the two trees and not one is the
+// class.
+//
+// SyncReadBuf is leader-bound and belongs here by the same reasoning as
+// SyncRead. There is currently no SyncReadBuf call in either integration tree
+// (verified by the same AST walk), so the set is complete against the trees as
+// they stand; add it here when the first such call appears.
 var linearizableReadCalls = map[string]bool{
 	"SyncRead":  true,
 	"ReadIndex": true,
@@ -124,7 +197,13 @@ type directCallScan struct {
 	bare []string
 }
 
-// scanDirectCalls parses every _test.go under integrationRoots and reports each call in calls not excused by marker, plus every bare marker; a marker excuses its own line or the first code line below its comment block.
+// scanDirectCalls parses every _test.go under integrationRoots and reports each
+// call to one of calls that is not excused by marker, plus every bare marker.
+//
+// It is the one implementation behind both gates in this file. The marker
+// resolution — a marker excuses its own line (a trailing comment) and the first
+// non-comment line below its comment block (the statement the block documents)
+// — and the per-root file floor live here so the two rules cannot drift.
 func scanDirectCalls(t *testing.T, marker string, calls map[string]bool) directCallScan {
 	t.Helper()
 
@@ -172,7 +251,22 @@ func scanDirectCalls(t *testing.T, marker string, calls map[string]bool) directC
 					if !ok || !calls[sel.Sel.Name] {
 						return true
 					}
-					// Calls on the suite's own helpers and package-qualified calls (by imported package name) are not the class.
+					// A method on the suite's own cluster helper is the fixed
+					// version, not a violation: cluster.proposeToLeader style
+					// wrappers never appear as a bare Propose selector.
+					//
+					// A PACKAGE-qualified call is not a method call at all, so
+					// it is not the class either. proposalCalls and
+					// configChangeCalls never needed this — test/proposer and
+					// test/membership spell their entry points ToLeader, Try,
+					// AddNode and so on, none of which collide. The read set
+					// does: the fixed form of a gated ReadIndex is
+					// proposer.ReadIndex, whose selector is the identical
+					// bare ReadIndex. Skipping the receiver on the strength of
+					// its NAME would be a hole; skipping it because the file
+					// imports a package by that name is a fact about the file,
+					// and it is what makes the read gate share this scanner
+					// instead of forking it.
 					if ident, ok := sel.X.(*ast.Ident); ok && pkgs[ident.Name] {
 						return true
 					}
@@ -234,7 +328,22 @@ func repoRelative(path string) (string, error) {
 	return filepath.ToSlash(rel), nil
 }
 
-// importedPackageNames returns the names file uses for its imports: the alias, else the path's last element, erring toward false positives.
+// importedPackageNames returns the identifiers by which file refers to the
+// packages it imports: the explicit alias where there is one, otherwise the
+// last element of the import path.
+//
+// Using the path's last element is an approximation — a package whose name
+// differs from its directory would be missed — and it is deliberately the
+// conservative direction. A miss leaves a package-qualified call in the
+// findings, which is a false POSITIVE that a human reads and fixes; the
+// opposite error would silently excuse a real one.
+//
+// The residual hole is a local variable that shadows an imported package name
+// AND is a Host: `proposer := cluster.hosts[i]; proposer.SyncRead(...)` would
+// slip through. Nothing in either tree does that, go vet's shadow analysis
+// would not love it, and the alternative — full type resolution — means
+// loading both modules' packages, which is what this gate exists to avoid (see
+// integrationRoots on why it parses rather than compiles).
 func importedPackageNames(file *ast.File) map[string]bool {
 	names := make(map[string]bool, len(file.Imports))
 	for _, imp := range file.Imports {
@@ -317,7 +426,46 @@ func formatDirectCalls(calls []directCall) string {
 	return b.String()
 }
 
-// TestIntegrationProposalsResolveTheLeader fails when an integration test proposes through a directly addressed Host; use proposeToLeader or tryProposeToLeader, or put directProposeMarker with a reason above a deliberate call.
+// TestIntegrationProposalsResolveTheLeader fails when an integration test
+// proposes through a Host it addressed directly, instead of through the
+// suite's proposeToLeader / tryProposeToLeader helpers.
+//
+// # Why this gate exists
+//
+// A test that reads the leader on one line and uses it several lines later
+// treats the observation as though it pinned the leader. It does not. Raft is
+// free to hold an election in the gap, and the proposal is then refused
+// CORRECTLY while the test reports a failure the cluster never had. Hand-edits
+// do not end the class, because the next test to be written reintroduces the
+// pattern.
+//
+// The class is easy to miss because it has two shapes. The direct one
+//
+//	cluster.hosts[leaderIdx].Propose(ctx, shardID, cmd)
+//
+// is greppable. The indirect one is not:
+//
+//	leaderHost := cluster.hosts[leaderIdx]   // the binding hides it
+//	...
+//	leaderHost.SyncPropose(ctx, shardID, cmd)
+//
+// A fix aimed at the first shape misses every site of the second. So this gate
+// does not try to
+// recognise the caching at all — it is a rule about the CALL, not about how the
+// receiver was obtained, and no binding can hide from it.
+//
+// # What a failure means
+//
+// Route the proposal through proposeToLeader (or tryProposeToLeader off the
+// test goroutine), which resolves the leader at the point of use and retries
+// the not-leader rejection.
+//
+// If the call is deliberate — the test is ABOUT the replica it addresses, such
+// as a deposed incumbent that must NOT commit, or a follower whose forwarding
+// is the assertion — put directProposeMarker and a reason on the line above.
+// That is a real category and roughly a sixth of the propose sites in this
+// suite are in it; the marker is how the judgement gets recorded next to the
+// code instead of in a commit message nobody will find.
 func TestIntegrationProposalsResolveTheLeader(t *testing.T) {
 	scan := scanDirectCalls(t, directProposeMarker, proposalCalls)
 	reportBareMarkers(t, directProposeMarker, scan.bare)
@@ -339,7 +487,32 @@ func TestIntegrationProposalsResolveTheLeader(t *testing.T) {
 		len(scan.direct), formatDirectCalls(scan.direct), directProposeMarker)
 }
 
-// pendingSite is a direct call deferred to a tracking issue, keyed by file, function, method and exact count; an entry that stops matching fails the gate.
+// pendingSite is one direct call that a gate knows about and has deferred to a
+// tracking issue, because the file it sits in was owned by an in-flight pull
+// request when the gate was installed and could not be edited.
+//
+// # Why this is a ratchet and not an allowlist
+//
+// The marker convention above rejects lists for two reasons: a file:line list
+// rots on the first edit above it, and a list of names puts the justification
+// away from the code. This table is shaped to survive both objections while it
+// exists, and to stop existing:
+//
+//   - it keys on (file, enclosing function, method, count), none of which move
+//     when lines above the call are edited;
+//   - every entry names the issue that deletes it, so the justification is a
+//     link to the work rather than a sentence that can go stale;
+//   - the gate FAILS when an entry stops matching — fixing a site without
+//     removing its entry is red, so the table cannot outlive the sites; and
+//   - a second direct call under an existing key is a fresh violation, not a
+//     free ride, because count is exact.
+//
+// The alternative was to leave a gate red on main until every follow-up lands,
+// which is the same information with CI switched off for everyone in between.
+//
+// The type and the machinery below it are shared by every gate in this file
+// for the same reason the scanner is: a second copy of a ratchet is a second
+// place for the rule to drift.
 type pendingSite struct {
 	file  string
 	fn    string
@@ -358,10 +531,79 @@ var pendingConfigChangeSites = []pendingSite{
 	// site, if there is one, has somewhere to go that fails when it is fixed.
 }
 
-// pendingReadSites is TestIntegrationReadsResolveTheLeader's deferred table, empty; waivers are markers, not entries.
+// pendingReadSites is TestIntegrationReadsResolveTheLeader's deferred table,
+// and it is EMPTY.
+//
+// A waiver never belongs here — a waiver is a marker in the file that needs it,
+// and recording one as "deferred" would file a site that is CORRECT as a known
+// violation. What belongs here is a conversion that cannot be made yet, and the
+// entry is the ratchet that fails when it lands.
+//
+// It stays, with its type and its matching machinery, because the next
+// deferred conversion needs somewhere to go that fails when it lands. An empty
+// ratchet is the goal state, not a dead one.
+//
+// The adapter suite's sites route through its own readFromLeader /
+// tryReadFromLeader, except one that is not a conversion at all and carries a
+// waiver (linearizable_test.go, the failover-without-warmup loop — it retries
+// IsTempError on a fixed slice, which is wider and differently budgeted than
+// any leader-resolving helper). Pinned reads go through proposer.TryReadWith,
+// so the pinned-retry loop has one home rather than a waiver blessing a copy
+// of it.
 var pendingReadSites = []pendingSite{}
 
-// TestIntegrationConfigChangesAreIdempotent fails when an integration test issues a membership change directly; use test/membership (AddNode, DeleteNode, TryAddNode, TryDeleteNode) or put directConfigChangeMarker with a reason above it. pendingConfigChangeSites is its ratchet.
+// TestIntegrationConfigChangesAreIdempotent fails when an integration test
+// issues a membership change directly — SyncRequestAddNode,
+// SyncRequestRemoveNode, RequestAddReplica and the rest of configChangeCalls —
+// instead of through the suite's idempotent, leader-resolving helper.
+//
+// # Why this gate exists
+//
+// A config change has everything a proposal has: it is submitted through the
+// leader, and a replica that has just lost leadership refuses it correctly
+// while the test reports a failure the cluster never had, and proposalCalls
+// does not see it.
+//
+// It also has a second unpinned value that a proposal does not. When the
+// response is lost — a leadership move fails every pending request with a
+// *MaybeAppliedError, and a deadline can only fire after delivery — the change
+// is IN THE LOG and can still commit. A retry loop that reads "no answer" as
+// "did not happen" then re-issues it, the engine refuses the duplicate
+// correctly, and the test fails with "node already exists in membership" or
+// "target node not found in membership" on the delete path. test/membership
+// holds the one decision every suite shares: the refusal is accepted ONLY
+// after an
+// attempt in the same loop was genuinely submitted AND a linearizable
+// SyncGetShardMembership confirms the exact requested state — replica present
+// as a full voter at the requested address, or absent in every role. A blanket
+// "not found is fine" is the wrong fix, and
+// TestRetry_AlreadyExistsAtDifferentAddressStillFails in test/membership is
+// where that line is pinned.
+//
+// A shared helper alone does not end the class, any more than it ends the
+// propose class: it covers only the sites that happen to use it. Any test
+// can still call SyncRequestRemoveNode itself, with its own retry, and get none
+// of it. So this is a rule about the CALL, like the propose gate above, and no
+// binding or private retry loop can hide from it.
+//
+// # What a failure means
+//
+// Route the change through test/membership — AddNode / DeleteNode, or the
+// error-returning TryAddNode / TryDeleteNode — with the suite's leader
+// resolver; the decision core is membership.Drive, and every suite binds the
+// same one rather than keeping a copy.
+//
+// If the direct call IS the assertion — a deadline-less context that must be
+// refused, an invalid address, a stale ConfigChangeID, an overlapping change
+// whose rejection is the test, an async RequestState whose ResultC contract is
+// under test — put directConfigChangeMarker and a reason on the line above.
+//
+// # The deferred table
+//
+// pendingConfigChangeSites lists the sites this gate found when installed that
+// sat in files owned by in-flight pull requests. They are reported, not fatal,
+// and the table is a ratchet: an entry that stops matching fails the gate, so
+// the fix for a tracked site includes deleting its entry.
 func TestIntegrationConfigChangesAreIdempotent(t *testing.T) {
 	scan := scanDirectCalls(t, directConfigChangeMarker, configChangeCalls)
 	reportBareMarkers(t, directConfigChangeMarker, scan.bare)
@@ -444,7 +686,43 @@ func pendingSiteFor(c directCall, table []pendingSite, seen []int) int {
 	return -1
 }
 
-// TestIntegrationReadsResolveTheLeader fails when an integration test issues SyncRead or ReadIndex through a directly addressed Host; use readFromLeader, readIndexFromLeader or tryReadFromLeader, or put directReadMarker with a reason above it.
+// TestIntegrationReadsResolveTheLeader fails when an integration test issues a
+// LINEARIZABLE read — SyncRead or ReadIndex — through a Host it addressed
+// directly, instead of through the suite's leader-resolving read helper.
+//
+// # Why this gate exists
+//
+// This is the READ half of the class the two gates above cover: a leader
+// observed once
+//
+//	leaderIdx := cluster.waitForClusterLeader(shardID, timeout)
+//	leaderHost := cluster.hosts[leaderIdx]
+//	...
+//	got, err := leaderHost.SyncRead(ctx, shardID, key)
+//
+// and then read from across a loop. Under load such a read fails with "not
+// leader for shard 1, leader unknown" — refused CORRECTLY by an engine that
+// held an election in the gap, reporting a defect the cluster never had.
+//
+// Converting sites by hand does not stop the next test from reintroducing the
+// pattern. So, like the two gates above,
+// this is a rule about the CALL rather than about how the receiver was
+// obtained, and no binding can hide from it.
+//
+// # What a failure means
+//
+// Route the read through the suite's helper — readFromLeader /
+// readIndexFromLeader, or the error-returning tryReadFromLeader off the test
+// goroutine — which resolves the leader at the point of use and retries ONLY
+// the not-leader rejection. Re-issuing a refused read is always safe: a read
+// that was refused was never answered.
+//
+// If the addressed replica IS the subject — a deposed incumbent whose refusal
+// is the assertion, a follower whose forwarding is what is under test, the
+// target of a leadership transfer whose own lease is the point, a shard that
+// does not exist — keep the direct call and put directReadMarker and a reason
+// on the line above. That is a real category: twenty of the sites across the
+// two trees are in it.
 func TestIntegrationReadsResolveTheLeader(t *testing.T) {
 	scan := scanDirectCalls(t, directReadMarker, linearizableReadCalls)
 	reportBareMarkers(t, directReadMarker, scan.bare)

@@ -24,7 +24,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// testTransportHostConfig returns a HostConfig with QUIC enabled on an ephemeral loopback port and a throwaway mTLS identity.
+// testTransportHostConfig returns a HostConfig with the QUIC transport ENABLED
+// — the production default — bound to an ephemeral loopback port and using a
+// throwaway mTLS identity.
 func testTransportHostConfig(t *testing.T) config.HostConfig {
 	t.Helper()
 	cfg := testHostConfig(t)

@@ -256,7 +256,10 @@ func TestBarrier_ResetAfterRotate(t *testing.T) {
 	assertResetRefusedIntact(t, b, s)
 }
 
-// TestBarrier_ResetAfterUnsealForcedRotation checks Unseal's forced rotation ends the first boot.
+// TestBarrier_ResetAfterUnsealForcedRotation: Unseal's forced rotation (taken
+// when the invocation count is not authoritative) advances the epoch, and that
+// too ends the first boot. invocationsAuthoritative is cleared directly so the
+// rotation is the ONLY thing that can have cleared firstBoot.
 func TestBarrier_ResetAfterUnsealForcedRotation(t *testing.T) {
 	b, s := testInitializedBarrier(t)
 	b.invocationsAuthoritative = false
@@ -361,7 +364,8 @@ func TestBarrier_ResetRefusedWhileEpochPinned(t *testing.T) {
 		t.Fatal("refused Reset changed the barrier's state")
 	}
 
-	// A RegisterInFlightEpoch pin also blocks Reset until the last reference is released.
+	// A pin taken through RegisterInFlightEpoch blocks it too, and Reset stays
+	// refused until the LAST reference is released.
 	b.RegisterInFlightEpoch(epoch)
 	b.DeregisterInFlightEpoch(epoch)
 	if err := b.Reset(); !errors.Is(err, ErrEpochsInFlight) {

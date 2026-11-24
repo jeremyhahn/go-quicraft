@@ -21,7 +21,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Tests for vote denial under a live leader, self-removal, fresh activity flags on re-election, local quiesce setting, dropHighTermVote, purgeDepartedVotes and isVotingMember.
+// Regression tests pinning that:
+//
+//	handleVoteRequest grants no same-term vote while a live leader is known
+//	a self-removed replica cannot campaign or self-elect
+//	becomeLeader does not inherit remote.active flags from a previous tenure
+//	handleQuiesceMessage honours the local quiesce.enabled setting
+//
+// plus direct coverage for dropHighTermVote, purgeDepartedVotes and
+// isVotingMember.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -42,7 +50,10 @@ func newTestRaftQuiesce(replicaID uint64) *raft {
 	return r
 }
 
-// followerWithKnownLeader returns replica 2 following leader 1 at term without having voted.
+// followerWithKnownLeader returns replica 2 as a follower that learned
+// leader 1 at the given term from a heartbeat, WITHOUT having voted. This
+// is the state this guard turns on: term advanced by the leader, so
+// r.vote is noNode while r.leaderID names a live leader.
 func followerWithKnownLeader(t *testing.T, term uint64) *raft {
 	t.Helper()
 	r := newTestRaft(2)
@@ -117,7 +128,12 @@ func TestRaft_VoteRequest_RejectedWhenLeaderKnownAtSameTerm(t *testing.T) {
 	}
 }
 
-// TestRaft_VoteRequest_GrantDoesNotArmVoteBlackout: a stale same-term candidate cannot re-arm dropHighTermVote.
+// TestRaft_VoteRequest_GrantDoesNotArmVoteBlackout is the second half of
+// the defect. Granting sets electionTick = 0 but leaves leaderID
+// pointing at the old leader, which re-arms dropHighTermVote and makes the
+// follower SILENTLY DISCARD every higher-term RequestVote for a full
+// election timeout. With the leader-lease already expired, a stale
+// same-term candidate must not be able to re-arm that guard.
 func TestRaft_VoteRequest_GrantDoesNotArmVoteBlackout(t *testing.T) {
 	r := followerWithKnownLeader(t, 5)
 
@@ -187,7 +203,10 @@ func TestRaft_VoteRequest_GrantedWhenNoLeaderKnown(t *testing.T) {
 	}
 }
 
-// TestRaft_VoteRequest_RepeatVoteStillGranted: a retransmitted request from the voted-for candidate is granted again.
+// TestRaft_VoteRequest_RepeatVoteStillGranted covers the idempotent
+// re-grant arm of canVote: once a vote is cast, a retransmitted request
+// from the SAME candidate is granted again even after that candidate has
+// been installed as leader in this node's view.
 func TestRaft_VoteRequest_RepeatVoteStillGranted(t *testing.T) {
 	r := newTestRaft(2)
 	r.becomeFollower(5, noLeader)
@@ -638,7 +657,9 @@ func TestRaft_BecomeLeader_ClearsStaleRemoteActivity(t *testing.T) {
 	}
 }
 
-// TestRaft_BecomeLeader_StaleActivityDoesNotSatisfyCheckQuorum: a re-elected leader hearing from nobody steps down after its first CheckQuorum window.
+// TestRaft_BecomeLeader_StaleActivityDoesNotSatisfyCheckQuorum is the
+// behavioural half: a re-elected leader that hears from nobody must
+// step down at the end of its FIRST CheckQuorum window.
 func TestRaft_BecomeLeader_StaleActivityDoesNotSatisfyCheckQuorum(t *testing.T) {
 	r := newTestRaft(1)
 	r.preVote = false

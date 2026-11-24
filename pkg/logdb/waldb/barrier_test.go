@@ -353,7 +353,13 @@ func TestEncryptedWALRecovery(t *testing.T) {
 	}
 }
 
-// TestEncryptedWALRecoveryWithoutBarrier verifies a keyed WAL opened without its barrier fails to open.
+// TestEncryptedWALRecoveryWithoutBarrier verifies that a keyed WAL opened
+// without its barrier FAILS TO OPEN rather than recovering nothing. Barrier
+// ciphertext starts with an 8-byte big-endian epoch, so with no decrypt
+// attempted every record decodes as payload type 0x00. Skipping those records
+// booted the node with empty indexes/states/snapshots — a brand-new empty
+// replica that votes in the current term with no memory of prior votes and
+// accepts a log it has already superseded.
 func TestEncryptedWALRecoveryWithoutBarrier(t *testing.T) {
 	barrier := newTestBarrier(t)
 	dir := t.TempDir()
@@ -376,7 +382,7 @@ func TestEncryptedWALRecoveryWithoutBarrier(t *testing.T) {
 	}
 	db.Close()
 
-	// Reopen without the barrier: recovery must fail.
+	// Reopen WITHOUT barrier -- recovery must fail loudly.
 	db2, err := Open(dir,
 		WithNoSync(true),
 		WithBlockSize(1024),
@@ -392,7 +398,8 @@ func TestEncryptedWALRecoveryWithoutBarrier(t *testing.T) {
 		t.Fatalf("Reopen without barrier: err=%v, want ErrUnknownPayloadType", err)
 	}
 
-	// Reopening with the barrier still works.
+	// Reopening WITH the barrier still works: the failed open must not have
+	// damaged the WAL.
 	db3, err := Open(dir,
 		WithNoSync(true),
 		WithBlockSize(1024),
@@ -1034,7 +1041,12 @@ func TestMinLiveEpoch_RecoveryPreservesEpoch(t *testing.T) {
 	}
 }
 
-// TestBarrierRotateWithoutStatePersisterFailsClosed verifies a barrier without a seal.StatePersister refuses to rotate.
+// TestBarrierRotateWithoutStatePersisterFailsClosed verifies that a WAL
+// barrier with no seal.StatePersister refuses to rotate. Without a
+// persister the new epoch's sealed root-key state would never reach durable
+// storage, so every record the WAL wrote under that epoch would be
+// undecryptable after a restart. The barrier must therefore fail closed and
+// keep the WAL pinned to the epoch it can still recover.
 func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
 	_ = seal.AllowWeakKDFParams()
 	strategy, err := newTestSealStrategy([]byte("test-passphrase"))
@@ -1079,7 +1091,21 @@ func TestBarrierRotateWithoutStatePersisterFailsClosed(t *testing.T) {
 	}
 }
 
-// TestAtRestProtection_PlaintextBarrierIsNotEncrypted: a StrategyNone barrier is not reported as encrypted, checked on the raw bytes on disk.
+// TestAtRestProtection_PlaintextBarrierIsNotEncrypted is the regression test for
+// the seventh plaintext-downgrade axis: AtRestProtection asked whether a barrier
+// OBJECT EXISTED, not whether it ENCRYPTS.
+//
+// A seal.Barrier running StrategyNone installs an identity pass-through
+// encryptor. db.barrier is non-nil, so the DB declared AtRestBarrierEncrypted
+// and the host's requireEncryptedLogDB gate — whose stated purpose is to REFUSE
+// rather than silently downgrade — accepted a store that writes every user
+// command to disk in cleartext. The barrier already knew: IsPlaintextMode
+// reports true, and waldb asserts that very interface at Open to pick a warning
+// string. AtRestProtection simply never asked.
+//
+// The assertion is on the RAW BYTES ON DISK, not on a round trip. A round trip
+// succeeds under both a real barrier and a pass-through, which is exactly why
+// the declaration cannot be trusted to a type assertion in the first place.
 func TestAtRestProtection_PlaintextBarrierIsNotEncrypted(t *testing.T) {
 	barrier := newNoneBarrier(t)
 	if !barrier.IsPlaintextMode() {

@@ -26,11 +26,26 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// LeaderHandler executes a request on the shard's leader in term, after the leader committed an entry of it, without touching replicated state; ctx must be honoured, and handlers run concurrently.
+// LeaderHandler executes a leader-executed request (see Host.ExecuteOnLeader)
+// on the shard's leader and returns its reply. It is never appended to the
+// Raft log, so it must not change replicated state; it serves state the
+// leader holds in memory for the term it leads, such as lease deadlines.
+//
+// term is the leadership term the request is executed under: the handler
+// runs only while this replica leads the shard in that term and the leader
+// has committed an entry of it, so every entry committed in an earlier term
+// is committed here too (its apply may still be in flight). ctx ends with the
+// caller's deadline, or when the host closes; a handler must honour it.
+//
+// An error is returned to the caller as a *LeaderHandlerError carrying its
+// text. Handlers for different requests run concurrently.
 type LeaderHandler func(ctx context.Context, term uint64, request []byte) ([]byte, error)
 
 const (
-	// leaderExecMaxInflight bounds concurrent remote requests; excess ones get ErrBusy.
+	// leaderExecMaxInflight bounds the requests a host executes for remote
+	// callers at once. A request beyond it is refused with ErrBusy rather than
+	// queued, so a burst cannot pin an unbounded number of goroutines on a
+	// leader.
 	leaderExecMaxInflight = 1024
 
 	// leaderExecMaxFailureText bounds the handler error text sent back to a
@@ -42,7 +57,9 @@ const (
 // set. leaderExecOK is the unrejected reply.
 const (
 	leaderExecOK uint64 = iota
-	// leaderExecNotLeader: refused before execution; not leader in the term, or the shard stopped or failed.
+	// leaderExecNotLeader: refused BEFORE execution. The replica did not lead
+	// the shard in the request's term, or left it while waiting to be ready,
+	// or its shard has stopped or failed.
 	leaderExecNotLeader
 	// leaderExecDeposed: the handler ran but leadership or the shard was lost by its return; the reply is withheld.
 	leaderExecDeposed
@@ -69,11 +86,18 @@ type leaderExecOutcome struct {
 	status  uint64
 	payload []byte
 
-	// ctxEnded marks a failure that is the handler context ending; in-process only, never on the wire.
+	// ctxEnded marks a handler failure that is the handler's context
+	// ending, the caller's or the host's, rather than an answer of its own.
+	// It is set only by an in-process execution and never crosses the wire:
+	// a forwarded answer's context is the leader's, not this host's.
 	ctxEnded bool
 }
 
-// leaderExecVerdict is what ExecuteOnLeader does with an attempt that returned no reply: fail ends the request, spend burns the term; otherwise retry.
+// leaderExecVerdict is what ExecuteOnLeader does with an attempt that did
+// not return a reply. fail, when set, ends the request with its error. spend
+// marks the attempt's term as one it may have executed under, so no later
+// attempt may use it. Neither means the request was refused before it ran:
+// it is retried once the leadership view moves.
 type leaderExecVerdict struct {
 	spend bool
 	fail  func(shardID, leaderID, term uint64, payload []byte) error
@@ -242,7 +266,11 @@ func (r *leaderExecRouter) close() {
 	r.local.Wait()
 }
 
-// RegisterLeaderHandler sets shardID's handler for ExecuteOnLeader, replacing any earlier one; register it on every replica that can lead.
+// RegisterLeaderHandler registers the handler ExecuteOnLeader requests for
+// shardID are executed by when this replica leads the shard, replacing any
+// handler registered before. It may be called before StartShard, and the
+// registration outlives StopShard. Register it on every replica that can
+// lead the shard: a leader without one answers ErrLeaderHandlerNotRegistered.
 func (h *Host) RegisterLeaderHandler(shardID uint64, handler LeaderHandler) error {
 	if h.closed.Load() {
 		return ErrClosed
@@ -260,7 +288,53 @@ func (h *Host) UnregisterLeaderHandler(shardID uint64) {
 	h.leaderExec.handlers.Delete(shardID)
 }
 
-// ExecuteOnLeader has the shard's leader run request with its LeaderHandler, in-process or forwarded over QUIC, without a log entry; at most once per term, so handlers must be idempotent across leader changes.
+// ExecuteOnLeader has the shard's current leader execute request with its
+// LeaderHandler and returns the reply. The request is NOT appended to the
+// Raft log. Called on the leader it runs in-process; called on any other
+// replica it is forwarded over the host's QUIC transport, through the same
+// receive gate as a forwarded proposal (mTLS, then the sender bound to the
+// replica it claims), to the replica this host knows as leader.
+//
+// Guarantees:
+//
+//   - A request is executed only by the replica that leads the shard in the
+//     term it was sent under, and only once that leader has committed an
+//     entry of the term (the leader's OnLeaderReady). A replica that does not
+//     lead in that term refuses it without executing it.
+//   - A reply is returned only if this replica has seen no later term than
+//     the one it was executed under, and the executor still led that term,
+//     with the shard loaded, when the handler returned. A reply from a
+//     deposed leader is rejected and the request is retried on the new
+//     leader, under the new term; so is any refusal or handler failure
+//     answered under a term this replica has seen superseded.
+//   - A request is never executed twice under one term: an attempt is sent
+//     once, and a term an attempt may have executed under is never used
+//     again. Across terms a request may execute more than once (once per
+//     term at most), so a handler must be idempotent across a leader change.
+//
+// It waits, within ctx, for a leader to be known and for leadership to
+// settle. When ctx ends first it returns a *LeaderUnavailableError whose
+// cause is ErrNoLeader or ErrLeadershipChanged; when ctx ends while an
+// attempt is in flight to a leader the view still names, ErrTimeout or
+// ErrCanceled. A failing handler is reported as a *LeaderHandlerError, a
+// leader without a handler as ErrLeaderHandlerNotRegistered, and a leader
+// already executing leaderExecMaxInflight remote requests as ErrBusy, and a
+// leader whose shard is paused or sealed as ErrShardPaused or
+// ErrBarrierSealed, refused before it ran, as this replica's own are. The
+// request is held to the shard's proposal payload limit (EntryTooLargeError),
+// and so is the reply. ErrStopped means the shard or the host stopped while
+// the request waited, and ErrShardFailed that this replica's failure latch
+// tripped. A leader whose shard stops or fails refuses or withholds as a
+// deposed one does, so a caller elsewhere retries on the next leader.
+//
+// Called on the leader, the handler runs on its own goroutine and the caller
+// watches the leadership view meanwhile, as it does for a forwarded attempt:
+// if leadership moves first, the attempt is abandoned, its term spent, and
+// the request retried on the new leader.
+//
+// Leadership is the executing replica's own view: a leader cut off from its
+// quorum keeps executing until it steps down (Config.CheckQuorum bounds that
+// to an election timeout), exactly as a leader-local read does.
 func (h *Host) ExecuteOnLeader(ctx context.Context, shardID uint64, request []byte) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, mapContextError(err)
@@ -287,7 +361,13 @@ func (h *Host) ExecuteOnLeader(ctx context.Context, shardID uint64, request []by
 	return h.executeOnLeader(ctx, ns, request)
 }
 
-// executeOnLeader makes one attempt per leadership view, each under a term above spent, until a leader answers or ctx ends.
+// executeOnLeader is ExecuteOnLeader past its preflight: one attempt per
+// leadership view, until a leader answers or ctx ends.
+//
+// spent is the highest term an attempt may have executed under. An attempt
+// is made only under a term above it, which is what makes "never twice under
+// one term" structural: the executor checks the term, and no term is offered
+// to it twice once it might have been used.
 func (h *Host) executeOnLeader(ctx context.Context, ns *nodeState, request []byte) ([]byte, error) {
 	r := h.leaderExec
 	var spent uint64
@@ -308,7 +388,10 @@ func (h *Host) executeOnLeader(ctx context.Context, ns *nodeState, request []byt
 		if err != nil {
 			return nil, err
 		}
-		// If this replica has seen a later term, discard the answer, spend the term and retry.
+		// Every answer, reply or refusal, is the leader's for term. If this
+		// replica has already seen a later term, the leader was deposed:
+		// discard the answer whatever it says and retry under the new term.
+		// The term is spent, since the answer may follow an execution.
 		if _, viewTerm, _ := ns.leaderAndTerm(); viewTerm > term {
 			spent = term
 			continue
@@ -342,7 +425,15 @@ func (h *Host) leaderExecShardDown(ns *nodeState) error {
 	return nil
 }
 
-// leaderExecRaftLeads reports whether this replica's Raft leads in term now, from the peer's seqlocked leadership mirror.
+// leaderExecRaftLeads reports whether this replica's Raft leads the shard in
+// term right now. The nodeState view is what the listener dispatcher last
+// delivered, and it delivers asynchronously: Raft may already have stepped
+// down, on a higher term or on CheckQuorum, while the view still says it
+// leads. The peer's own leadership mirror is published on the step worker
+// after every step and tick, under the seqlock the engine reads to detect
+// leadership changes in the first place, so it is safe to read here and never
+// trails the Raft state machine by more than the step in progress. No
+// node, or a node without Raft, does not lead.
 func (h *Host) leaderExecRaftLeads(ns *nodeState, term uint64) bool {
 	n := h.engine.GetNode(ns.shardID)
 	if n == nil {
@@ -378,7 +469,13 @@ func (h *Host) attemptOnLeader(ctx context.Context, ns *nodeState, leaderID, ter
 	return h.forwardToLeader(ctx, ns, leaderID, term, request, changed)
 }
 
-// executeInProcess runs one attempt on this leader on its own goroutine and abandons it as deposed if leadership moves first.
+// executeInProcess runs one attempt on this replica, the leader, on its own
+// goroutine, and waits for it exactly as forwardToLeader waits for a remote
+// leader: if the view leaves (this replica, term) first, the attempt is
+// abandoned as leaderExecDeposed and its term spent, so a handler blocked on
+// a deposed leader does not hold the request there. The abandoned execution
+// runs on, bounded by ctx and the host, on its own copy of the request, and
+// its outcome is discarded.
 func (h *Host) executeInProcess(ctx context.Context, ns *nodeState, term uint64,
 	request []byte, changed <-chan struct{}) (leaderExecOutcome, <-chan struct{}, error) {
 
@@ -386,7 +483,10 @@ func (h *Host) executeInProcess(ctx context.Context, ns *nodeState, term uint64,
 	if !r.startLocal() {
 		return leaderExecOutcome{}, changed, ErrStopped
 	}
-	// The execution may outlive the attempt, so it gets its own copy of the request.
+	// The execution can outlive this attempt, so it gets its own copy of the
+	// request, as the receive path makes for a forwarded one: the caller may
+	// reuse its buffer once it returns, and a handler that edits its input
+	// must not edit the payload a later attempt carries.
 	request = append([]byte(nil), request...)
 	done := make(chan leaderExecOutcome, 1)
 	execCtx, cancel := r.bind(ctx)
@@ -398,12 +498,19 @@ func (h *Host) executeInProcess(ctx context.Context, ns *nodeState, term uint64,
 	return h.awaitAttempt(ctx, ns, ns.replicaID, term, done, changed)
 }
 
-// awaitAttempt waits for the attempt under (leaderID, term), reporting leaderExecDeposed if the view moves or the replica goes down first.
+// awaitAttempt waits for the outcome of the attempt under (leaderID, term).
+// If the view leaves that pair, or this replica goes down, before the
+// outcome arrives, whether the request executed is unknown, so the attempt is
+// reported as leaderExecDeposed: its term is spent and the request moves to
+// the new leader.
 func (h *Host) awaitAttempt(ctx context.Context, ns *nodeState, leaderID, term uint64,
 	done <-chan leaderExecOutcome, changed <-chan struct{}) (leaderExecOutcome, <-chan struct{}, error) {
 
 	r := h.leaderExec
-	// settle maps a failure that is only the context ending to the same error as an ended wait.
+	// settle decides an outcome the execution produced. A failure that is
+	// only the execution's context ending, which this host's close or the
+	// caller's own context caused, is not the handler's answer: it gets
+	// the same error as a wait those contexts ended.
 	settle := func(out leaderExecOutcome) (leaderExecOutcome, <-chan struct{}, error) {
 		if out.ctxEnded {
 			if r.ctx.Err() != nil {
@@ -446,7 +553,9 @@ func (h *Host) awaitAttempt(ctx context.Context, ns *nodeState, leaderID, term u
 	}
 }
 
-// forwardToLeader sends one LeaderExec to leaderID once and waits for its answer; late answers are dropped.
+// forwardToLeader sends one LeaderExec to leaderID and waits for its answer
+// (awaitAttempt). The attempt is sent ONCE. A late answer, for an attempt
+// abandoned when the view moved, finds no call registered and is dropped.
 func (h *Host) forwardToLeader(ctx context.Context, ns *nodeState, leaderID, term uint64,
 	request []byte, changed <-chan struct{}) (leaderExecOutcome, <-chan struct{}, error) {
 
@@ -479,7 +588,17 @@ func (h *Host) forwardToLeader(ctx context.Context, ns *nodeState, leaderID, ter
 	return h.awaitAttempt(ctx, ns, leaderID, term, call.done, changed)
 }
 
-// executeLeaderRequest runs the handler only if this replica leads in term (view, Raft and liveness) and reports whether it still did on return.
+// executeLeaderRequest is the executor: it runs the shard's handler for a
+// request sent under term, if and only if this replica leads the shard in
+// that term, and reports whether it still did when the handler returned.
+// Leading is the cached view AND Raft's own state (leaderExecRaftLeads) AND
+// the replica still live (leaderExecShardDown). The view alone can lag a
+// step-down Raft has already taken. Neither StopShard nor the engine's failure
+// latch clears the view, and a failed node steps no further Raft, so it is
+// deposed without hearing of it.
+// A replica refusing for either reason answers as one that does not lead,
+// so a remote caller retries on the leader the others elect; a local caller
+// finds its own replica down and returns ErrStopped or ErrShardFailed.
 func (h *Host) executeLeaderRequest(ctx context.Context, ns *nodeState, term uint64, request []byte) leaderExecOutcome {
 	// Wait for the term to be ready: a new leader has not yet committed an
 	// entry of its term, so entries an earlier leader committed may not be
@@ -532,7 +651,10 @@ func (h *Host) executeLeaderRequest(ctx context.Context, ns *nodeState, term uin
 	return leaderExecOutcome{status: leaderExecOK, payload: reply}
 }
 
-// callLeaderHandler runs handler, turning an error or panic into text up to leaderExecMaxFailureText; ctxEnded reports ctx's own ending.
+// callLeaderHandler runs handler, converting an error or a panic into its
+// text, bounded to leaderExecMaxFailureText. A remote caller's request must
+// not be able to take the leader's process down with it. ctxEnded reports
+// that the error is ctx's own ending, which the handler passed back.
 func callLeaderHandler(ctx context.Context, handler LeaderHandler, term uint64,
 	request []byte) (reply []byte, failure string, failed, ctxEnded bool) {
 
@@ -567,7 +689,10 @@ func leaderExecBudget(nanos uint64) time.Duration {
 	return budget
 }
 
-// serveLeaderExec executes a remote LeaderExec on its own goroutine and answers msg.From.
+// serveLeaderExec executes a LeaderExec from a remote caller and answers it.
+// The receive gate has bound msg.From to the connection's identity, so the
+// answer goes to the replica that really sent it. Execution runs on its own
+// goroutine: the transport's receive path is never held by a handler.
 func (h *Host) serveLeaderExec(msg *proto.Message) {
 	r := h.leaderExec
 	if len(msg.Entries) != 1 {
@@ -619,7 +744,11 @@ func (h *Host) replyLeaderExec(shardID, from, to, term, id uint64, out leaderExe
 	}})
 }
 
-// completeLeaderExec hands a LeaderExecResp to its waiting attempt if it matches replica, shard and term; an unknown status is taken as deposed.
+// completeLeaderExec hands a LeaderExecResp to the attempt waiting for it.
+// Only the replica the attempt went to may answer it, for the shard and the
+// term it was sent under; anything else is dropped. A status this host does
+// not know is taken as leaderExecDeposed: it cannot tell whether the request
+// ran, so the term is spent rather than offered again.
 func (h *Host) completeLeaderExec(msg *proto.Message) {
 	r := h.leaderExec
 	v, ok := r.calls.Load(msg.Hint)

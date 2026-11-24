@@ -195,7 +195,19 @@ func TestConfig_ToQuicraft_DisableAutoCompactionsPreservesSnapshots(t *testing.T
 	}
 }
 
-// TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled checks SnapshotEntries == 0 keeps auto-snapshots off, as in dragonboat.
+// TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled pins the one place the
+// two projects' zero values disagree.
+//
+// Dragonboat reads SnapshotEntries == 0 as "automatic snapshotting is off; I
+// will call RequestSnapshot myself". In quicraft a zero there means "I did not
+// choose", and SetDefaults
+// substitutes DefaultSnapshotEntries. Passing the zero through would therefore
+// silently ENABLE snapshotting on a config that explicitly asked for it off.
+//
+// The witness case is the sharp one, because dragonboat's own Validate REQUIRES
+// SnapshotEntries == 0 for a witness — so every witness converted by this shim
+// would have started snapshotting, on a replica that holds no entry payloads to
+// snapshot.
 func TestConfig_ToQuicraft_ZeroSnapshotEntriesStaysDisabled(t *testing.T) {
 	t.Run("plain replica", func(t *testing.T) {
 		c := Config{ShardID: 1, ReplicaID: 1, SnapshotEntries: 0}

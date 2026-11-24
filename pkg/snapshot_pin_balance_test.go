@@ -30,7 +30,20 @@ import (
 // Register/Deregister-counting barrier
 // ---------------------------------------------------------------------------
 
-// countingBarrier wraps a Barrier and records the raw net in-flight count per epoch, negatives included: above zero after a cycle is a leak, below zero a double release.
+// countingBarrier wraps a Barrier and records the RAW net in-flight reference
+// count per epoch, INCLUDING negatives.
+//
+// The production seal.Barrier deletes an epoch's entry once its count drops to
+// <= 0 (DeregisterInFlightEpoch, pkg/seal/barrier.go), which makes a
+// double-free look identical to a balanced release. An audit of the snapshot
+// encrypt loops' pin accounting must not inherit that erasure:
+//
+//   - net[e] > 0 after a full cycle  => LEAK. The epoch is pinned forever, so
+//     PurgeEpochsBefore skips it for the life of the process and the DEK is
+//     never retired.
+//   - net[e] < 0 at any point        => DOUBLE-FREE / under-count. One holder's
+//     extra release can drop a count another concurrent writer still needs from
+//     1 to 0, letting a purge drop a live DEK and brick that snapshot.
 type countingBarrier struct {
 	Barrier
 	mu     sync.Mutex
@@ -98,7 +111,8 @@ func (b *countingBarrier) counts() string {
 	return b.countsLocked()
 }
 
-// assertBalanced asserts every epoch's net in-flight count is zero and never went negative.
+// assertBalanced asserts the net in-flight count is exactly ZERO for every
+// epoch and that no epoch ever dipped below zero.
 func (b *countingBarrier) assertBalanced(t *testing.T, what string) {
 	t.Helper()
 	b.mu.Lock()
@@ -222,7 +236,11 @@ var _ snapshotFS = renameFailFS{}
 // encryptSnapshotFrames
 // ---------------------------------------------------------------------------
 
-// TestPinBalance_EncryptSnapshotFrames_SuccessHandsOffExactlyOnePinPerEpoch verifies each sealed epoch is held with a net count of exactly one on return.
+// TestPinBalance_EncryptSnapshotFrames_SuccessHandsOffExactlyOnePinPerEpoch
+// proves the SUCCESS contract: on return every epoch a frame was sealed under
+// is held with a net count of exactly ONE — not zero (the caller must be able
+// to rely on the pin until its durable record exists) and not two (the caller
+// releases each element once, so a duplicate registration leaks forever).
 func TestPinBalance_EncryptSnapshotFrames_SuccessHandsOffExactlyOnePinPerEpoch(t *testing.T) {
 	inner := newRotatingMockBarrier(5, true)
 	b := newCountingBarrier(inner)
@@ -261,7 +279,12 @@ func TestPinBalance_EncryptSnapshotFrames_SuccessHandsOffExactlyOnePinPerEpoch(t
 	b.assertBalanced(t, "encryptSnapshotFrames success + caller release")
 }
 
-// atomicPinCountingBarrier is a countingBarrier that pins atomically with each seal and rotates on a schedule, as seal.Barrier does.
+// atomicPinCountingBarrier is a countingBarrier whose seal-and-pin behaves as
+// the real seal.Barrier's does: the barrier itself takes the in-flight
+// reference under its own lock, with every seal, and it rotates on a schedule.
+// That is the path whose accounting matters: the pinner must NOT re-register,
+// and must release the duplicate reference when the same epoch is sealed
+// twice.
 type atomicPinCountingBarrier struct {
 	*countingBarrier
 	rotateEvery int // seal a new epoch every N frames (0 = never rotate)
@@ -279,7 +302,11 @@ func (b *atomicPinCountingBarrier) EncryptWithEpochPinnedContext(_, pt, contextA
 	return appendTestAADTag(append([]byte(nil), pt...), contextAAD), b.epoch, nil
 }
 
-// TestPinBalance_AtomicPath_BalancesAndDedups verifies the atomic path returns each sealed epoch once and releases duplicate references.
+// TestPinBalance_AtomicPath_BalancesAndDedups covers the ATOMIC seal-and-pin
+// path, which the other balance tests miss because their barrier does not
+// implement the capability. Two properties: every distinct sealed epoch is
+// returned exactly once, and a repeated epoch does not leak the extra reference
+// the barrier took (the pinner releases the duplicate immediately).
 func TestPinBalance_AtomicPath_BalancesAndDedups(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -324,7 +351,12 @@ func TestPinBalance_AtomicPath_BalancesAndDedups(t *testing.T) {
 	}
 }
 
-// TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases verifies each seal error path leaves the count flat and returns a nil pin set.
+// TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases walks all four
+// error returns of a seal — EncryptWithEpoch, the frame-length write, the
+// ciphertext write, and the source read. The first three release inside the
+// frame writer, the last in engine.SealSnapshotFrames. Each must leave the
+// accounting flat AND return a nil pin set, so the caller has nothing to
+// release a second time.
 func TestPinBalance_EncryptSnapshotFrames_EveryErrorPathReleases(t *testing.T) {
 	errInjected := errors.New("injected")
 
@@ -418,7 +450,11 @@ func writePlainSnapshot(t *testing.T, dir string) string {
 	return path
 }
 
-// TestPinBalance_WriteImportedSnapshotData_PostEncryptFailuresRelease verifies Sync and Close failures after encryption release the pins.
+// TestPinBalance_WriteImportedSnapshotData_PostEncryptFailuresRelease drives
+// each failure that can land AFTER encryptSnapshotFrames has already taken its
+// pins but BEFORE the import's data file is durable — Sync and Close. The
+// caller never receives the set on those paths, so the writer itself must
+// release it or the epochs are pinned forever.
 func TestPinBalance_WriteImportedSnapshotData_PostEncryptFailuresRelease(t *testing.T) {
 	cases := []struct {
 		name string
@@ -452,7 +488,10 @@ func TestPinBalance_WriteImportedSnapshotData_PostEncryptFailuresRelease(t *test
 	}
 }
 
-// TestPinBalance_WriteImportedSnapshotData verifies pins are held after a successful data write until released, and none remain on error.
+// TestPinBalance_WriteImportedSnapshotData covers the import handoff: on SUCCESS
+// the pins must still be held when the data write returns (ImportSnapshot's
+// SaveSnapshot has not run yet) and must drop to zero once they are released;
+// on ERROR nothing may be left held.
 func TestPinBalance_WriteImportedSnapshotData(t *testing.T) {
 	t.Run("success_holds_then_releases", func(t *testing.T) {
 		b := newCountingBarrier(newRotatingMockBarrier(11, true))
@@ -508,7 +547,9 @@ func TestPinBalance_WriteImportedSnapshotData(t *testing.T) {
 // reencryptSnapshotFile (the migrate path behind ReencryptSnapshotFile)
 // ---------------------------------------------------------------------------
 
-// TestPinBalance_ReencryptSnapshotFile verifies destination pins balance on success and on a failure after pinning.
+// TestPinBalance_ReencryptSnapshotFile covers the migrate path in both
+// directions that pin the DESTINATION barrier, on success and on a failure
+// landing after the encrypt loop took its pins.
 func TestPinBalance_ReencryptSnapshotFile(t *testing.T) {
 	t.Run("plaintext_to_framed_success", func(t *testing.T) {
 		dst := newCountingBarrier(newRotatingMockBarrier(3, true))
@@ -543,7 +584,9 @@ func TestPinBalance_ReencryptSnapshotFile(t *testing.T) {
 	})
 
 	t.Run("plaintext_to_framed_encrypt_failure", func(t *testing.T) {
-		// The loop already released its pins, so the set it returns must be nil.
+		// The encrypt loop fails after pinning, having already released its own
+		// pins. reencryptSnapshotFile's deferred release then runs over whatever
+		// the loop handed back: a non-nil set here would DOUBLE-FREE.
 		inner := newRotatingMockBarrier(3, true)
 		inner.failAt = 1
 		inner.sealErr = errors.New("injected seal failure")

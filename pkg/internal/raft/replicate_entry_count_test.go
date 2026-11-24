@@ -35,7 +35,12 @@ func proposeTinyEntries(t *testing.T, r *raft, n int) {
 	}
 }
 
-// TestSendAppendBoundsEntryCount verifies a Replicate never exceeds proto.MaxEntriesPerMessage entries.
+// TestSendAppendBoundsEntryCount is the producer half of the transport dial
+// storm: maxReplicationPayload (Config.MaxApplyEntrySize) bounds a Replicate
+// message in BYTES only, so a follower catching up on small entries drew a
+// message with hundreds of thousands of them. Every peer's decoder rejects a
+// message above proto.MaxEntriesPerMessage and resets the stream it arrived
+// on, so the follower could never be fed the entries it was missing.
 func TestSendAppendBoundsEntryCount(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)

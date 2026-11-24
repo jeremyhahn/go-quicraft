@@ -25,7 +25,20 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestSweepStaleDecryptTmp_FailureIsReported checks a failed removal is counted and logged; the failure is injected so it also runs as root.
+// TestSweepStaleDecryptTmp_FailureIsReported is a regression guard.
+//
+// The sweeper cannot report a failure to any caller — it must never abort
+// startup or recovery — so a failed removal is invisible unless the sweeper
+// itself raises it. A read-only mount, a permissions change, or an ownership
+// change therefore leaves a COMPLETE PLAINTEXT COPY of the state machine on
+// disk with nothing anywhere to say so. The counter is the observable a monitor
+// can alert on; the WARN is what an operator reading logs sees.
+// The failure is injected through sweepRemove rather than by chmod-ing the
+// directory. A chmod does not stop root, and the CI container runs the suite
+// as root, so the permission-based version of this test SKIPPED there — which
+// is precisely the environment the regression would ship from. The injected
+// error is the same EACCES a read-only mount produces, and the assertion is
+// unchanged: the sweeper must count and log what it could not reclaim.
 func TestSweepStaleDecryptTmp_FailureIsReported(t *testing.T) {
 	dir := t.TempDir()
 	orphan := filepath.Join(dir, ".send-decrypt-abc.tmp")
@@ -56,7 +69,17 @@ func TestSweepStaleDecryptTmp_FailureIsReported(t *testing.T) {
 	}
 }
 
-// TestSweepStaleDecryptTmp_UnreadableDirectoryIsReported checks an unlistable directory (a regular file, ENOTDIR) is reported like a failed removal.
+// TestSweepStaleDecryptTmp_UnreadableDirectoryIsReported covers the other way
+// the sweep can silently not happen: the directory itself cannot be listed, so
+// whether a plaintext copy is sitting in it is unknown. That is the same
+// operational state as a failed removal and must be reported the same way.
+// The unlistable path is a REGULAR FILE where a directory was expected, not a
+// chmod 000 directory. ENOTDIR is refused for root as well, so this exercises
+// the branch in every environment; the chmod version skipped under the CI
+// container's root user, leaving the reporting path unverified exactly where
+// it ships from. Operationally the two are the same class of fault — the sweep
+// cannot look, so whether a plaintext copy is sitting there is unknown — and
+// the sweeper must report both the same way.
 func TestSweepStaleDecryptTmp_UnreadableDirectoryIsReported(t *testing.T) {
 	parent := t.TempDir()
 	notADir := filepath.Join(parent, "snapshot-dir")
@@ -64,7 +87,9 @@ func TestSweepStaleDecryptTmp_UnreadableDirectoryIsReported(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	// The listing must fail, and not as a missing path.
+	// Guard the premise: a listing that SUCCEEDS would make the assertion
+	// below vacuous, and the failure must not be a missing path (which the
+	// sweeper deliberately ignores).
 	if _, err := os.ReadDir(notADir); err == nil {
 		t.Fatal("os.ReadDir on a regular file succeeded; the failure branch " +
 			"cannot be exercised and this test would assert nothing")
@@ -82,14 +107,29 @@ func TestSweepStaleDecryptTmp_UnreadableDirectoryIsReported(t *testing.T) {
 	}
 }
 
-// TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory checks recovery sweeps the whole shard tree as well as the directory it recovers from.
+// TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory is the TG-18
+// regression guard.
+//
+// recoverSnapshot sweeps TWICE: the whole shard tree, and then the single
+// directory it is about to recover from. Only the tree sweep reclaims a
+// plaintext scratch file orphaned in a DIFFERENT retained directory — which is
+// where the snapshot SEND path left one, before its scratch moved to the
+// replica's own directory, when a leader was killed mid-stream: it decrypted
+// inside whichever directory it was streaming, not the newest. Losing the tree call leaves that plaintext copy on disk for the life
+// of the snapshot directory while the recovery itself succeeds, so nothing else
+// in the system notices.
+//
+// The startup sweep (Host.StartShard) is covered elsewhere; this pins the
+// recovery-path call, which is the one that runs on a follower that just fell
+// behind — exactly when a stale send scratch file is most likely to exist.
 func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	const shardID, replicaID uint64 = 10, 1
 	baseDir := t.TempDir()
 	stopC := make(chan struct{})
 	defer close(stopC)
 
-	// An older retained directory with an orphaned plaintext scratch; recovery does not read it.
+	// An OLDER retained snapshot directory holding an orphaned plaintext
+	// scratch file. Recovery will not read from this directory at all.
 	staleDir := snapshotSaveDir(baseDir, shardID, replicaID, 50)
 	if err := os.MkdirAll(staleDir, 0o750); err != nil {
 		t.Fatalf("mkdir stale dir: %v", err)
@@ -102,7 +142,8 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 		t.Fatalf("write stale metadata: %v", err)
 	}
 
-	// The directory recovery reads, with its own orphan.
+	// The directory recovery WILL read from, with its own orphan so the
+	// single-directory sweep is exercised too.
 	recoverDir := snapshotSaveDir(baseDir, shardID, replicaID, 100)
 	if err := os.MkdirAll(recoverDir, 0o750); err != nil {
 		t.Fatalf("mkdir recover dir: %v", err)
@@ -159,7 +200,15 @@ func TestRecoverSnapshot_SweepsEveryRetainedSnapshotDirectory(t *testing.T) {
 	}
 }
 
-// TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced checks the recovery's sweeps run under the node's write lease, so a stopped node's recovery never runs.
+// TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced pins the fence on the
+// recovery's sweeps: the retry of the import-stage reclaim and the scratch
+// sweep of the replica directory. StartShard sweeps first but
+// only logs a failure, so a recovery retries — under the loaded node's write
+// lease, which proves no import is in flight, rather than the shard's import
+// lock, which a stopped incarnation's late recovery held while the next
+// StartShard failed with ErrImportInProgress. The recovery request holds the
+// lease for its whole run (handleRequest); a stopped node grants none, so its
+// recovery never runs and leaves the stage to the next StartShard.
 func TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -183,7 +232,9 @@ func TestRecoverSnapshot_ImportStageReclaimIsLeaseFenced(t *testing.T) {
 			if err := os.WriteFile(stagedArtifact, []byte("plaintext state machine"), 0o600); err != nil {
 				t.Fatalf("write staged artifact: %v", err)
 			}
-			// A scratch in the replica directory: an orphan for a loaded node, possibly a live recovery scratch for a stopped one.
+			// A scratch in the replica's own directory — a crash's orphan
+			// for a loaded node, but for a stopped one possibly the NEXT
+			// incarnation's live recovery scratch.
 			scratch := filepath.Join(snapshotBaseDir(baseDir, shardID, replicaID), RecoverDecryptTempPrefix+"live"+ScratchTempSuffix)
 			if err := os.WriteFile(scratch, []byte("plaintext state machine"), 0o600); err != nil {
 				t.Fatalf("write scratch: %v", err)

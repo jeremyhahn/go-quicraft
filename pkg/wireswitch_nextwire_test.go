@@ -28,7 +28,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// Rolling upgrade to the next wire version: three QUIC hosts are restarted one at a time onto a window one version ahead; the shard stays on the previous version until all run the new build, then commits the switch and keeps committing.
+// ---------------------------------------------------------------------------
+// Two builds on one wire: a rolling upgrade to the next wire version.
+//
+// The next build is this build with its window moved one version ahead
+// (current = WireVersion+1, previous = WireVersion), which is exactly the
+// window the release that bumps the wire version will ship. Three real hosts
+// on QUIC start on this build's window and are restarted one at a time onto
+// the next build's, on their own directories, address and leaf. While any
+// replica runs the old build the shard must stay on the previous version;
+// once all three run the new build the leader must commit the switch, and
+// the shard must keep committing afterwards.
+// ---------------------------------------------------------------------------
 
 const nextWireShard uint64 = 1
 

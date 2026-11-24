@@ -20,7 +20,10 @@ import (
 	"path/filepath"
 )
 
-// compactor deletes WAL segments once every node that wrote to them has compacted past its last entry there.
+// compactor manages background removal of WAL segment files whose entries
+// have all been compacted. A segment is safe to delete only when every
+// (shardID, replicaID) that wrote to it has compacted past its last entry
+// in that segment.
 type compactor struct {
 	// fs is the filesystem abstraction for directory and file operations.
 	fs FS
@@ -40,7 +43,28 @@ func newCompactor(fs FS, dir string, blockSize int) *compactor {
 	}
 }
 
-// GarbageCollect deletes segment files below maxLiveID, at or below maxCommittedID and absent from liveSegments.
+// GarbageCollect removes segment files that are no longer referenced by
+// any node index. It compares the set of segment files on disk against
+// the set of segment IDs still referenced in the provided liveSegments
+// map. A segment file is deleted only when all of the following hold:
+//
+//   - its ID is strictly less than maxLiveID (the active segment, which may
+//     not yet appear in any index, is never deleted);
+//   - its ID is less than or equal to maxCommittedID (the commit high-water
+//     mark); and
+//   - it is not present in liveSegments.
+//
+// The maxCommittedID guard keeps GC away from any segment whose records are
+// not yet reflected in the in-memory index and meta pins. SaveState writes a
+// record durably in its Phase 1 (possibly rotating to a new segment) but
+// updates the index and pins only in its Phase 3. It holds shard.mu across
+// both, so a concurrent same-shard Compact cannot run in between; the guard
+// keeps GC correct independently of that locking, so a future change that
+// released shard.mu between the phases would not reopen the race.
+// maxCommittedID advances only
+// at the Phase-3 commit point, the writeBootstrap commit and recovery, so a
+// durably-written-but-not-yet-indexed segment has an ID above it and is
+// preserved.
 func (c *compactor) GarbageCollect(liveSegments map[uint64]bool, maxLiveID, maxCommittedID uint64) (int, error) {
 	dirEntries, err := c.fs.ReadDir(c.dir)
 	if err != nil {
@@ -94,7 +118,15 @@ const segmentFilenameDigits = 6
 // maxSegmentID is the largest representable segment ID.
 const maxSegmentID = ^uint64(0)
 
-// parseSegmentFilename returns the ID of a filename in segmentFilename's exact canonical form, and false for anything else.
+// parseSegmentFilename extracts the segment ID from a filename in the exact
+// form segmentFilename produces: six digits, or more than six digits with no
+// leading zero. Returns the ID and true on success.
+//
+// Only the canonical form is accepted. A non-canonical digit string
+// ("0000001.log", "00000000000000000001.log") is a foreign file that would
+// otherwise alias a real segment ID — recovery would adopt it, or GC would
+// delete it believing an unrelated segment was reclaimed — and an
+// arbitrary-length string silently wrapped on uint64 overflow.
 func parseSegmentFilename(name string) (uint64, bool) {
 	// Must end with ".log".
 	if len(name) <= 4 || name[len(name)-4:] != ".log" {

@@ -736,7 +736,12 @@ func TestNonceTracker_Concurrent(t *testing.T) {
 	}
 }
 
-// TestNonceTracker_NoFalsePositives verifies nonces sharing a prefix are distinct and true reuse is still detected.
+// TestNonceTracker_NoFalsePositives verifies that two distinct nonces sharing
+// a prefix are tracked as distinct entries and that true reuse of either is
+// still detected. The 24-byte case is the XChaCha20-Poly1305 regression: a
+// fixed [12]byte key would truncate both nonces to the same key and falsely
+// reject the second unique nonce as reuse (availability bug). The 12-byte case
+// covers the false positives truncated hash fingerprints used to risk.
 func TestNonceTracker_NoFalsePositives(t *testing.T) {
 	t.Parallel()
 
@@ -874,7 +879,20 @@ func TestNonceTracker_ClearConcurrentRaceDetector(t *testing.T) {
 	}
 }
 
-// TestNonceTracker_ClearIsAtomicWithAdmission verifies Count matches the set, stays under the ceiling, and saturation never leaks across a racing Clear.
+// TestNonceTracker_ClearIsAtomicWithAdmission checks the invariants an epoch
+// boundary must preserve when Clear races CheckAndRecordNonce. Every nonce is
+// presented once, so after quiescence the tracked set is exactly the presented
+// nonces Contains still reports, and:
+//
+//   - Count() equals that cardinality: the counter belongs to the same epoch
+//     as the set it counts;
+//   - Count() never exceeds the ceiling;
+//   - Saturated() implies the current epoch actually reached the ceiling, so
+//     saturation from a cleared epoch cannot leak into its successor and leave
+//     a fresh epoch accepting nonces without recording them.
+//
+// The ceiling is small so admission, rollback and saturation all run on every
+// round, inside the window a concurrent Clear can split.
 func TestNonceTracker_ClearIsAtomicWithAdmission(t *testing.T) {
 	captureLogs(t) // saturation logs once per epoch; keep it out of the output
 

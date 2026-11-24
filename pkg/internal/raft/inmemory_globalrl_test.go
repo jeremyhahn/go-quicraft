@@ -30,7 +30,8 @@ func newRateLimitedInMemory(global *server.RateLimiter) *inMemory {
 	return &im
 }
 
-// newGlobalOnlyInMemory builds an in-memory log with only the host-wide limiter configured.
+// newGlobalOnlyInMemory builds an in-memory log with ONLY the host-wide limiter
+// configured (MaxTotalInMemLogSize set, MaxInMemLogSize left at its default 0).
 func newGlobalOnlyInMemory(global *server.RateLimiter) *inMemory {
 	im := newInMemory(0)
 	im.globalRL = global
@@ -104,7 +105,13 @@ func TestGlobalRateLimiter_ShardCannotConsumeAnotherShardsShare(t *testing.T) {
 	}
 }
 
-// TestGlobalRateLimiter_WorksWithoutThePerShardLimiter checks the host-wide cap works with no per-shard limit.
+// TestGlobalRateLimiter_WorksWithoutThePerShardLimiter pins that the two limits
+// are INDEPENDENT knobs. MaxInMemLogSize and MaxTotalInMemLogSize both default
+// to 0 and are not cross-validated, so configuring only the host-wide cap is
+// both legal and the documented way to enable it. Nesting the global accounting
+// inside the per-shard limiter's nil check meant that configuration allocated a
+// limiter that was consulted on every propose and permanently read zero — the
+// cap silently did nothing.
 func TestGlobalRateLimiter_WorksWithoutThePerShardLimiter(t *testing.T) {
 	global := server.NewRateLimiter(1 << 30)
 	shard := newGlobalOnlyInMemory(global)

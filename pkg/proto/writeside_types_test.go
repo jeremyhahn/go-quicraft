@@ -19,9 +19,26 @@ import (
 	"testing"
 )
 
-// Type fields: encoders refuse the enum values and reserved Entry.Type bits decoders refuse, and Message.MarshalTo never drops a snapshot silently.
+// ---------------------------------------------------------------------------
+// The type fields, and the one field a message can lose in silence
+//
+// writeside_limits_test.go covers the LENGTH limits each encoder must mirror.
+// These are the remaining asymmetries: the two enum ranges the decoders check
+// and the encoders did not, the reserved bits of Entry.Type that neither end
+// checked, and the embedded Snapshot that Message.MarshalTo discarded without
+// saying so.
+//
+// The write-side map limits themselves (ErrAddressTooLong,
+// ErrTooManyMembershipEntries) are pinned on Membership in
+// writeside_limits_test.go, which reaches the same checkWritableMap/putMap/getMap
+// helpers on the durable path.
+// ---------------------------------------------------------------------------
 
-// TestEntryMarshalRefusesTypesUnmarshalRefuses verifies the encoder refuses every entry type the decoder refuses.
+// TestEntryMarshalRefusesTypesUnmarshalRefuses drives the durable round trip.
+// An entry is committed to the raft log BEFORE any decoder sees it, so an
+// encoder that emits a type its own decoder rejects writes an entry that every
+// replica — including the one that wrote it — faults on for the life of the
+// shard.
 func TestEntryMarshalRefusesTypesUnmarshalRefuses(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -82,7 +99,10 @@ func TestEntryMarshalAcceptsEveryLegalType(t *testing.T) {
 	}
 }
 
-// TestMessageMarshalRefusesTypesUnmarshalRefuses verifies the encoder refuses every message type the decoder refuses.
+// TestMessageMarshalRefusesTypesUnmarshalRefuses covers the second enum range.
+// Message.Type selects the handler at the receiver, so an out-of-range value is
+// not cosmetic: UnmarshalFrom rejects the whole FRAME, taking every other
+// message batched with it, and the sender sees only a dead connection.
 func TestMessageMarshalRefusesTypesUnmarshalRefuses(t *testing.T) {
 	for _, typ := range []uint64{maxMessageType + 1} {
 		m := Message{Type: typ, From: 1, To: 2}
@@ -134,7 +154,14 @@ func TestMessageBatchMarshalRejectsInvalidNestedTypes(t *testing.T) {
 	})
 }
 
-// TestMessageMarshalRefusesPositionlessSnapshot verifies MarshalTo refuses a snapshot with content but no log position.
+// TestMessageMarshalRefusesPositionlessSnapshot pins that a message cannot
+// drop the field without a word.
+//
+// The presence flag is Snapshot.IsEmpty, which asks only about Index and Term.
+// A snapshot carrying a filepath, a size and a whole membership but no log
+// position therefore encoded as ABSENT: MarshalTo returned success, the frame
+// was well-formed, and the receiver got an InstallSnapshot with nothing in it.
+// No error anywhere on either side.
 func TestMessageMarshalRefusesPositionlessSnapshot(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -254,7 +281,19 @@ func TestGetBytesAndGetStringApplyAZeroLimit(t *testing.T) {
 	}
 }
 
-// TestLengthPrefixPastMaxInt32IsRefusedBeforeTheLimit verifies a length prefix above MaxInt32 reports ErrBufferTooSmall before any limit check.
+// TestLengthPrefixPastMaxInt32IsRefusedBeforeTheLimit pins the ORDER of the two
+// guards, which is the only part of the 32-bit wrap defence a 64-bit test can
+// observe.
+//
+// The guard itself protects `4 + int(dataLen)` from wrapping negative where int
+// is 32 bits. On a 64-bit host that conversion is harmless and both orderings
+// end in a refusal, so no test can tell them apart from the outcome alone —
+// which is exactly how getBytes came to have the guard sequenced BEHIND its
+// limit check, where a caller whose own limit exceeds MaxInt32 (none today, and
+// nothing stops one) skips it entirely. What is observable is the sentinel: with
+// the guard first an over-MaxInt32 prefix reports ErrBufferTooSmall whatever the
+// limit is, which is what getString has always done and what getBytes now
+// matches.
 func TestLengthPrefixPastMaxInt32IsRefusedBeforeTheLimit(t *testing.T) {
 	buf := make([]byte, 8)
 	putUint32(buf, 1<<31) // MaxInt32 + 1
@@ -273,7 +312,9 @@ func TestLengthPrefixPastMaxInt32IsRefusedBeforeTheLimit(t *testing.T) {
 	}
 }
 
-// marshalEntryUnchecked encodes an Entry without the write-side type check, like marshalMembershipUnchecked.
+// marshalEntryUnchecked encodes an Entry with the write-side type check
+// BYPASSED, so the read-side half of the round-trip assertion can be driven. It mirrors
+// marshalMembershipUnchecked in writeside_limits_test.go.
 func marshalEntryUnchecked(e Entry) []byte {
 	buf := make([]byte, e.Size())
 	putUint64(buf[0:], e.Term)

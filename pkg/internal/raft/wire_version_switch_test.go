@@ -76,7 +76,12 @@ func TestUpdateWireVersion_AppliesAtOneIndexAndNeverReverts(t *testing.T) {
 	}
 }
 
-// TestUpdateWireVersion_RefusedWhenMembershipChangedSinceCheck checks a switch is refused when membership changed since the check.
+// TestUpdateWireVersion_RefusedWhenMembershipChangedSinceCheck pins that a
+// switch names the membership its proposer checked: a config change that
+// applies between that check and the proposal reaching the step worker gets
+// the switch refused before append, on the Propose path the host uses as
+// well as ProposeConfigChange, and a switch naming the current membership
+// still commits.
 func TestUpdateWireVersion_RefusedWhenMembershipChangedSinceCheck(t *testing.T) {
 	p := newTestPeer(t, testConfig(), proto.State{}, singleNodeMembership())
 	if err := p.SetWireWindow(nextWindow()); err != nil {

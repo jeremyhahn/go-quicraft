@@ -29,7 +29,11 @@ type Dir interface {
 	Close() error
 }
 
-// MetadataSyncer is a Dir whose Sync omits metadata; SyncDirWith uses SyncMetadata when present.
+// MetadataSyncer is implemented by a Dir whose Sync deliberately omits
+// metadata, for example one that uses fdatasync on Linux. A directory's
+// content IS metadata (the entries created, removed and renamed in it), so
+// SyncDirWith uses SyncMetadata when a handle provides it and Sync only when
+// Sync already covers metadata, as it does for *os.File.
 type MetadataSyncer interface {
 	// SyncMetadata flushes the directory, metadata included, to stable
 	// storage.
@@ -62,7 +66,10 @@ func SyncDir(dir string) error {
 	return SyncDirWith(os.Open, dir)
 }
 
-// SyncDirWith opens, flushes and closes dir; the flush error takes precedence over the close error.
+// SyncDirWith opens dir with open, flushes it and closes it. It flushes with
+// SyncMetadata when the handle implements MetadataSyncer, and with Sync
+// otherwise. The handle is closed even when the flush fails, and the flush
+// error takes precedence over the close error. Errors are returned unwrapped.
 func SyncDirWith[D Dir](open func(string) (D, error), dir string) error {
 	d, err := open(dir)
 	if err != nil {
@@ -81,12 +88,23 @@ func SyncDirWith[D Dir](open func(string) (D, error), dir string) error {
 	return closeErr
 }
 
-// DeepestExistingAncestor returns the deepest existing ancestor of path; record it before MkdirAll and pass it to SyncDirChain.
+// DeepestExistingAncestor returns the deepest ancestor of path that already
+// exists, or path itself when it exists. Record it BEFORE an os.MkdirAll(path)
+// and pass it as the stopAt of the SyncDirChain that follows: the chain then
+// covers every directory the MkdirAll creates, plus the existing ancestor that
+// holds the entry for the first of them, and nothing above that.
 func DeepestExistingAncestor(path string) string {
 	return DeepestExistingAncestorWith(os.Stat, path)
 }
 
-// DeepestExistingAncestorWith walks with the supplied stat; only a nil error counts as present.
+// DeepestExistingAncestorWith performs DeepestExistingAncestor's walk with the
+// supplied stat in place of os.Stat.
+//
+// Only a nil error from stat counts as present. Any other error, including
+// one other than fs.ErrNotExist, leaves that level's existence unknown, so the
+// walk continues upward. That makes the chain sync cover more directories,
+// never fewer: fsyncing a directory that already existed costs one extra
+// fsync, while skipping one that MkdirAll created loses its entry on a crash.
 func DeepestExistingAncestorWith(stat func(string) (fs.FileInfo, error), path string) string {
 	dir := path
 	for {
@@ -101,12 +119,28 @@ func DeepestExistingAncestorWith(stat func(string) (fs.FileInfo, error), path st
 	}
 }
 
-// SyncDirChain fsyncs leaf and each ancestor up to stopAt; with no stopAt, or leaf outside it, only leaf.
+// SyncDirChain fsyncs leaf and each ancestor directory up to and including
+// stopAt. Call it after os.MkdirAll(leaf): each directory that call may have
+// created needs its parent's entry made durable, so the whole chain from the
+// deepest new directory to the pre-existing ancestor must be synced. When
+// stopAt is empty, or leaf is not under stopAt, only leaf is synced.
 func SyncDirChain(leaf, stopAt string) error {
 	return SyncDirChainWith(SyncDir, leaf, stopAt)
 }
 
-// SyncDirChainWith walks with syncDir and stops at the first error; containment uses filepath.Rel.
+// SyncDirChainWith performs SyncDirChain's walk, fsyncing each directory with
+// syncDir in place of SyncDir. It stops at the first error and returns it.
+//
+// Containment is decided with filepath.Rel, NOT a string prefix. The prefix
+// form fails for exactly the two values DeepestExistingAncestor returns when
+// nothing above the leaf already exists: stopAt "/" builds the prefix "//" and
+// stopAt "." builds "./", and a cleaned leaf starts with neither. Both quietly
+// fell back to fsyncing only the leaf, skipping every ancestor MkdirAll had
+// just created. Rel handles both roots and reports a leaf outside stopAt as a
+// ".." prefix.
+//
+// The emptiness test runs BEFORE Clean because filepath.Clean("") is ".", which
+// is a legitimate stopAt (the working directory) rather than "no stop point".
 func SyncDirChainWith(syncDir func(string) error, leaf, stopAt string) error {
 	if stopAt == "" {
 		return syncDir(filepath.Clean(leaf))
@@ -130,7 +164,10 @@ func SyncDirChainWith(syncDir func(string) error, leaf, stopAt string) error {
 	}
 }
 
-// MkdirAllSynced creates path with perm and fsyncs every created directory and the topmost one's parent.
+// MkdirAllSynced creates path and any missing parents with perm, then fsyncs
+// each directory it created and the pre-existing parent of the topmost one, so
+// every new directory entry is durable. For an existing path it fsyncs path
+// alone.
 func MkdirAllSynced(path string, perm fs.FileMode) error {
 	return MkdirAllSyncedWith(osFS{}, SyncDir, path, perm)
 }

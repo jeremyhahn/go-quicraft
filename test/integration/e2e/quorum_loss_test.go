@@ -25,7 +25,14 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// assertKeyAbsentEverywhere fails if key is on any live node's state machine after a settling window; a Propose error alone does not prove the write did not happen.
+// assertKeyAbsentEverywhere fails if key is present on the state machine of any
+// live node, after a settling window long enough for a commit to have
+// propagated had one occurred.
+//
+// This is the assertion that actually says "the write did not happen". An error
+// from Propose says only that the CALLER gave up waiting; an entry can still be
+// in the leader's log, and if it were ever committed and applied without a
+// majority that is the safety violation, whatever the caller was told.
 func assertKeyAbsentEverywhere(
 	t *testing.T,
 	cluster *testCluster,
@@ -61,7 +68,17 @@ func assertKeyAbsentEverywhere(
 	t.Logf("%q is absent from all %d live state machines", key, checked)
 }
 
-// TestE2E_QuorumLoss_RejectsWrites: a 5-node cluster with three followers stopped and the leader still running never applies a proposal on any state machine.
+// TestE2E_QuorumLoss_RejectsWrites verifies that a 5-node cluster cannot commit
+// a proposal once quorum is lost. In a 5-node cluster quorum requires 3 nodes;
+// three followers are stopped, leaving the LEADER plus one follower.
+//
+// The leader is deliberately left RUNNING. The previous version stopped the
+// leader before proposing anything, so every remaining node answered Propose
+// with ErrNotLeader — an outcome produced by the absence of a leader, not by
+// the quorum rule. That test passed identically on a build with no quorum
+// requirement at all. Keeping the old leader up puts the quorum rule itself on
+// the only path to a commit, and the decisive assertion is that the value never
+// reaches ANY state machine rather than that the caller received an error.
 func TestE2E_QuorumLoss_RejectsWrites(t *testing.T) {
 	cluster := newTestCluster(t, 5)
 	defer cluster.close()
@@ -73,7 +90,9 @@ func TestE2E_QuorumLoss_RejectsWrites(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Positive control: the same leader commits while it still has a majority.
+	// Positive control: the SAME leader commits without difficulty while it
+	// still has a majority. Without this, a build that cannot commit anything
+	// would pass the quorum-loss assertion for the wrong reason.
 	proposeAndWait(t, cluster, trackers, 1, "pre-quorum-loss", "intact")
 	waitForReplication(t, cluster, trackers, 1, "pre-quorum-loss", "intact", defaultTimeout)
 

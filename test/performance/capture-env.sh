@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-# capture-env.sh writes env.json describing the benchmark target it runs on; the profile name is the operator's, and anything not obtained is an empty string. Usage: ./capture-env.sh <profile-name> > env.json
+# capture-env.sh — describe the machine this script is running on, as env.json.
+#
+# This runs on the benchmark target, not on the workstation that drives it, so
+# the specification table beside a benchmark number describes the machine that
+# produced it, at the time it produced it.
+#
+# The profile name is the one thing not derived; the operator chooses it.
+#
+# Anything this script cannot obtain is emitted as an empty string, never a
+# guess or a zero. Consumers render an empty field as "not captured", so an
+# uncaptured core count is distinct from a real zero.
+#
+# Usage:
+#   ./capture-env.sh <profile-name> > env.json
 set -uo pipefail
 
 if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
@@ -17,7 +30,10 @@ try() {
   printf '%s' "${out}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
-# lscpu_field extracts one labelled lscpu field, stripping indentation (util-linux 2.38+ nests fields) and anchoring exactly.
+# lscpu_field extracts one labelled field from lscpu. Leading indentation is
+# stripped first, because util-linux 2.38 and later nest the fields under
+# headings; the anchor after that is exact, so "CPU(s):" does not also match
+# "NUMA node0 CPU(s):".
 lscpu_field() {
   command -v lscpu >/dev/null 2>&1 || return 0
   LC_ALL=C lscpu 2>/dev/null |

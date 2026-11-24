@@ -37,34 +37,76 @@ const (
 	// chunks. Corresponds to POSIX PATH_MAX.
 	maxSnapshotFilepathLen = 4096
 
-	// maxSnapshotChunkDataLen is the decoder's chunk Data limit (ErrChunkDataTooLong).
+	// maxSnapshotChunkDataLen is the maximum Data payload length for a single
+	// snapshot chunk. The limit lives in one place: the decoder
+	// (proto.SnapshotChunk.UnmarshalFrom) already rejects a longer Data length
+	// prefix with ErrChunkDataTooLong, so restating it as any other bound —
+	// e.g. MaxFrameSize minus the framing overhead, which is larger — makes
+	// validateChunk's check unreachable and lets the two limits drift.
 	maxSnapshotChunkDataLen = int(proto.MaxSnapshotChunkDataLen)
 )
 
 var (
-	// snapshotChunkStructBytes is the resident size of one retained proto.SnapshotChunk, charged with each chunk.
+	// snapshotChunkStructBytes is the resident size of one retained
+	// proto.SnapshotChunk header. receiveChunks accumulates every accepted
+	// chunk in a slice for the whole transfer, so charging the memory budget
+	// the frame length alone under-counts residency — by ~2.6x for
+	// minimum-size chunks — and lets concurrent transfers hold multiples of
+	// the configured budget.
 	snapshotChunkStructBytes = int64(unsafe.Sizeof(proto.SnapshotChunk{}))
 
-	// minSnapshotChunkResidentBytes is the least memory one chunk occupies: the smallest frame plus its struct.
+	// minSnapshotChunkResidentBytes is the least memory one admitted chunk can
+	// occupy: the smallest frame a valid chunk can arrive in, plus its
+	// retained struct header. It converts a memory budget into a chunk-count
+	// ceiling at admission time.
 	minSnapshotChunkResidentBytes = int64((&proto.SnapshotChunk{}).Size()) + snapshotChunkStructBytes
 
-	// maxSnapshotChunkResidentBytes is the most memory one chunk occupies; it floors the per-peer memory ceiling.
+	// maxSnapshotChunkResidentBytes is the most memory one admitted chunk can
+	// occupy: the smallest valid frame, plus the largest Data payload a chunk
+	// may carry, plus the longest filepath it may name. It is the FLOOR on the
+	// derived per-peer memory ceiling (see snapshotReceiver.maxPerPeerMemory),
+	// so an operator who configures a small MaxSnapshotReceiveMemory cannot end
+	// up with a per-peer ceiling too tight for a single legal chunk — which
+	// would refuse every transfer rather than only unfair ones.
 	maxSnapshotChunkResidentBytes = minSnapshotChunkResidentBytes +
 		int64(maxSnapshotChunkDataLen) + int64(maxSnapshotFilepathLen)
 )
 
-// maxRateLimitChunkSleep caps one rate-limit sleep; the rate still holds on average.
+// maxRateLimitChunkSleep caps the per-chunk rate-limit sleep. A pathologically
+// small MaxSnapshotReceiveRate (combined with a large chunk) could otherwise
+// compute a multi-day sleep, holding the concurrency semaphore and memory
+// budget for the entire duration and stalling availability. The ceiling bounds
+// any single sleep to a few seconds; the configured rate is still honored on
+// average across chunks. TransportConfig.Validate also enforces a sane
+// minimum rate, so this ceiling is a defense-in-depth backstop.
 const maxRateLimitChunkSleep = 5 * time.Second
 
-// Whole-transfer liveness bounds for an inbound snapshot; the per-frame deadline alone bounds nothing.
+// Whole-transfer liveness bounds for an inbound snapshot. The per-frame read
+// deadline is reset on every iteration, so on its own it bounds nothing: a
+// peer that emits one frame header just inside each deadline holds its
+// concurrency slot indefinitely. These bound the transfer as a whole.
 const (
-	// maxSnapshotTransferDuration is the absolute ceiling on one transfer; it clamps transferBudget.
+	// maxSnapshotTransferDuration is the absolute ceiling on one inbound
+	// transfer, regardless of progress and regardless of how much work the
+	// sender declared. It is the clamp on the derived per-transfer budget
+	// (see transferBudget), never the budget itself.
 	maxSnapshotTransferDuration = time.Hour
 
-	// minSnapshotTransferDuration is the floor on the per-transfer budget.
+	// minSnapshotTransferDuration is the floor on the derived per-transfer
+	// budget, so a small snapshot on a congested link is not failed by an
+	// arithmetically tight deadline. It is also the ceiling a peer gets by
+	// declaring the SMALLEST possible transfer — the cheapest way to occupy a
+	// slot — which is why it is minutes rather than a flat hour applied to
+	// every transfer alike.
 	minSnapshotTransferDuration = 5 * time.Minute
 
-	// snapshotTransferRateMultiple is how many times the MaxSnapshotReceiveRate time a transfer may take.
+	// snapshotTransferRateMultiple is how many times the receiver's own
+	// configured rate limit (MaxSnapshotReceiveRate) a transfer is allowed to
+	// take. The rate limit is the operator's statement of the throughput this
+	// deployment expects to move snapshots at; the multiple absorbs the gap
+	// between that and what the link actually delivers under congestion, plus
+	// the sender's disk reads. An operator on a genuinely slow link lowers the
+	// rate limit and the budget widens in proportion.
 	snapshotTransferRateMultiple = 16
 
 	// snapshotProgressGracePeriod is how long a transfer may run before the
@@ -77,7 +119,10 @@ const (
 	// evict a peer trickling bytes to occupy a concurrency slot.
 	minSnapshotReceiveBytesPerSec = 1024
 
-	// maxConsecutiveZeroLengthFrames bounds zero-length chunk frames in a row; senders never emit them.
+	// maxConsecutiveZeroLengthFrames bounds zero-length chunk frames in a row.
+	// A legitimate sender emits none — SendSnapshot and SendSnapshotStreaming
+	// always write a non-empty chunk — so any run of them is a peer burning
+	// the declared ChunkCount to hold its slot.
 	maxConsecutiveZeroLengthFrames = 8
 )
 
@@ -109,17 +154,36 @@ type snapshotReceiver struct {
 	// peerMu protects peerUse.
 	peerMu sync.Mutex
 
-	// peerUse tracks snapshot-receive resources per peer identity (see snapshotFairnessKey).
+	// peerUse tracks the snapshot-receive resources in use per peer IDENTITY —
+	// see snapshotFairnessKey, which derives the key from the peer's
+	// authenticated certificate rather than from anything the peer picks per
+	// connection. Without it the host-global sem and memory budget are both
+	// holdable in full by one peer, after which every legitimate snapshot to a
+	// recovering follower is dropped and the shard cannot restore quorum.
 	peerUse map[string]*peerSnapshotUse
 
 	// maxPerPeer is the ceiling on concurrent receives from a single peer
 	// identity: ceil(maxConcurrent/2), so no peer can occupy the whole budget.
 	maxPerPeer int
 
-	// maxPerPeerMemory caps one peer's in-flight receive memory, in proportion to maxPerPeer.
+	// maxPerPeerMemory is the ceiling on in-flight receive memory a single peer
+	// identity may hold, derived at construction from maxMemory in the same
+	// proportion maxPerPeer bears to the concurrency limit.
+	//
+	// The concurrency limit alone does not bound memory. A peer entitled to two
+	// of four slots was still free to charge the WHOLE of maxMemory against
+	// either of them — the only per-receive ceiling was maxMemory itself — so
+	// one peer could drive the host-global budget to zero and every other
+	// peer's chunks into the exhaustion path, which is exactly the starvation
+	// the per-peer slot limit exists to prevent, one level down.
 	maxPerPeerMemory int64
 
-	// Whole-transfer liveness bounds, seeded from the constants; fields so tests can shorten them.
+	// maxTransferDuration, minTransferDuration, progressGracePeriod and
+	// minBytesPerSec are the whole-transfer liveness bounds, seeded from the
+	// package constants. Fields rather than direct constant references so
+	// tests can exercise the bounds without waiting out production-scale
+	// timeouts. maxTransferDuration and minTransferDuration clamp the
+	// per-transfer budget derived by transferBudget; they are not the budget.
 	maxTransferDuration time.Duration
 	minTransferDuration time.Duration
 	progressGracePeriod time.Duration
@@ -149,7 +213,10 @@ type snapshotReceiver struct {
 	// purge during snapshot receive. Nil when encryption is disabled.
 	epochTracker EpochTracker
 
-	// epochTrackerForShard resolves the in-flight epoch tracker per shard and takes precedence over epochTracker; nil with a single barrier.
+	// epochTrackerForShard, when non-nil, resolves the in-flight epoch
+	// tracker per shard, used when each Raft shard is sealed under its own
+	// barrier. It takes precedence over epochTracker. Nil for the
+	// single-barrier case, preserving the original behavior.
 	epochTrackerForShard func(shardID uint64) EpochTracker
 
 	// snapshotTracker tracks in-flight snapshot receives so Stop() can
@@ -200,13 +267,30 @@ func newSnapshotReceiver(
 	return sr
 }
 
-// peerSnapshotUse is one peer's held transfers and reserved memory, guarded by peerMu; memory is always refunded before its slot is released.
+// peerSnapshotUse is one peer identity's share of the snapshot-receive
+// resources: the concurrent transfers it holds and the memory those transfers
+// have reserved.
+//
+// Both live in ONE entry, guarded by peerMu, because their lifetimes are the
+// same: memory is only ever charged by a transfer that holds a slot, and every
+// charge is refunded before the slot it was taken under is released (the
+// refund runs inside receiveChunks, which returns before receiveSnapshot's
+// deferred releasePeerSlot). Pruning the entry at zero slots therefore cannot
+// discard a live reservation, and the map stays bounded across peer churn.
 type peerSnapshotUse struct {
 	slots    int
 	reserved int64
 }
 
-// perPeerSnapshotMemory derives the per-peer memory ceiling in the slot proportion, floored at one chunk and clamped to the global budget.
+// perPeerSnapshotMemory derives the per-peer receive-memory ceiling from the
+// host-global budget, in the same proportion the per-peer slot limit bears to
+// the host-global concurrency limit: a peer entitled to half the slots gets
+// half the memory.
+//
+// It is floored at maxSnapshotChunkResidentBytes so a single legal chunk always
+// fits — a ceiling below that would refuse every transfer, not just unfair ones
+// — and clamped to the global budget so the sub-limit is never the looser of
+// the two.
 func perPeerSnapshotMemory(maxMemory int64, maxConcurrent, maxPerPeer int) int64 {
 	if maxMemory <= 0 {
 		return maxMemory
@@ -224,7 +308,11 @@ func perPeerSnapshotMemory(maxMemory int64, maxConcurrent, maxPerPeer int) int64
 	return limit
 }
 
-// acquirePeerSlot reserves one of peerKey's concurrent-receive slots; peerKey comes from snapshotFairnessKey, and empty is not accounted.
+// acquirePeerSlot reserves one of a peer identity's concurrent-receive slots.
+// peerKey comes from snapshotFairnessKey and must be an identity the peer
+// cannot vary; keying this on anything a client chooses per connection (an
+// ip:port, say) makes the whole limit a formality. An empty key (unit-test
+// paths with no connection) is not accounted.
 func (sr *snapshotReceiver) acquirePeerSlot(peerKey string) bool {
 	if peerKey == "" {
 		return true
@@ -267,7 +355,10 @@ func (sr *snapshotReceiver) releasePeerSlot(peerKey string) {
 	}
 }
 
-// reservePeerMemory charges n bytes to peerKey's memory budget and reports whether it fit; empty is not accounted.
+// reservePeerMemory charges n bytes to a peer identity's memory sub-budget,
+// reporting whether the charge fit under maxPerPeerMemory. An empty key
+// (unit-test paths with no connection) is not accounted, matching
+// acquirePeerSlot.
 func (sr *snapshotReceiver) reservePeerMemory(peerKey string, n int64) bool {
 	if peerKey == "" || sr.maxPerPeerMemory <= 0 {
 		return true
@@ -317,7 +408,15 @@ type chunkMemoryRejection struct {
 	budget int64
 }
 
-// reserveChunkMemory charges n bytes against the global and per-peer budgets, leaving nothing charged on refusal; pair with releaseChunkMemory.
+// reserveChunkMemory charges n bytes for one inbound chunk against BOTH the
+// host-global budget and the sending peer's sub-budget, returning nil when the
+// charge fit under both. On refusal nothing remains charged: the global
+// reservation is rolled back before the per-peer refusal is reported, so a
+// rejected chunk never leaks budget.
+//
+// Both ceilings are needed and neither subsumes the other. The global budget
+// bounds host memory; the per-peer budget bounds one peer's share of it. Paired
+// with releaseChunkMemory.
 func (sr *snapshotReceiver) reserveChunkMemory(peerKey string, n int64) *chunkMemoryRejection {
 	if remaining := sr.memoryBudget.Add(-n); remaining < 0 {
 		sr.memoryBudget.Add(n)
@@ -336,7 +435,31 @@ func (sr *snapshotReceiver) releaseChunkMemory(peerKey string, n int64) {
 	sr.releasePeerMemory(peerKey, n)
 }
 
-// transferBudget returns how long a transfer of chunkCount maximal chunks may run at snapshotTransferRateMultiple times the rate, plus the grace period, clamped; a non-positive max disables it.
+// transferBudget returns how long ONE inbound transfer of the declared chunk
+// count may run before it is failed regardless of progress.
+//
+// A flat ceiling is the wrong shape for this bound. Combined with the
+// throughput floor it fixes the work a single held slot represents at
+// ceiling * minBytesPerSec — a bit over 3 MB for an hour-and-1 KB/s pair
+// applied to every transfer alike — while saying nothing about how much work
+// the sender actually claimed to be doing. Deriving the budget from
+// the DECLARED work ties the two together: a peer that wants a long slot has
+// to declare a large transfer, and a large declaration is already bounded at
+// the header by maxAdmissibleChunkCount, which the configured memory budget
+// caps.
+//
+// The declared work is valued at its maximum: ChunkCount chunks of the largest
+// payload a chunk may carry. Undershooting here would fail honest transfers, so
+// the estimate is deliberately the generous end, and it is then divided by the
+// receiver's own configured rate limit and multiplied by
+// snapshotTransferRateMultiple. The progress grace period is added on top so
+// the two liveness bounds do not contradict each other — a transfer must not
+// hit its absolute deadline before the throughput floor has even begun to be
+// enforced.
+//
+// The result is clamped to [minTransferDuration, maxTransferDuration]. A zero
+// or negative maxTransferDuration disables the bound entirely, as before, and
+// takes precedence over the floor so a test can still pin a tiny ceiling.
 func (sr *snapshotReceiver) transferBudget(chunkCount uint64) time.Duration {
 	if sr.maxTransferDuration <= 0 {
 		return 0
@@ -354,7 +477,9 @@ func (sr *snapshotReceiver) transferBudget(chunkCount uint64) time.Duration {
 	}
 	declaredBytes := int64(chunkCount) * int64(maxSnapshotChunkDataLen)
 
-	// Compute in seconds and clamp before converting, or nanoseconds overflow.
+	// Work in SECONDS and clamp before converting to a Duration: at a low
+	// configured rate the quotient is large enough that scaling it to
+	// nanoseconds would overflow int64.
 	seconds := declaredBytes / sr.bytesPerSec
 	if seconds > int64(sr.maxTransferDuration/time.Second)/snapshotTransferRateMultiple {
 		return sr.maxTransferDuration
@@ -371,7 +496,13 @@ func (sr *snapshotReceiver) transferBudget(chunkCount uint64) time.Duration {
 	return budget
 }
 
-// cancelSnapshotReadOnStop resets the stream's read side when the transport stops; call the returned release when the transfer ends.
+// cancelSnapshotReadOnStop arms a watcher that resets the read side of an
+// inbound snapshot stream when the transport begins shutting down. receiveChunks
+// only observes stopC at loop boundaries and during the rate-limit sleep; while
+// it is blocked in ReadFrameHeader or io.ReadFull nothing else cancels it, so
+// Stop()'s ShutdownAndWait would stall behind the 30s per-frame deadline. This
+// mirrors cancelSnapshotWriteOnStop on the send side. The returned release func
+// must be called when the transfer ends.
 func cancelSnapshotReadOnStop(stream *quic.Stream, stopC <-chan struct{}) func() {
 	if stream == nil {
 		return func() {}
@@ -387,7 +518,12 @@ func cancelSnapshotReadOnStop(stream *quic.Stream, stopC <-chan struct{}) func()
 	return func() { close(done) }
 }
 
-// receiveSnapshot admits a snapshot stream, pins its non-zero epoch in flight and runs receiveChunks.
+// receiveSnapshot processes a snapshot stream. It enforces the concurrency
+// semaphore, registers the epoch for in-flight protection, and delegates
+// to receiveChunks for the actual I/O. The epoch is derived from the
+// snapshot header's Term field, which carries the barrier epoch when
+// encryption is enabled. When the epoch is 0 (no encryption), in-flight
+// tracking is skipped.
 func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHeader, peerKey string, peer PeerAuth, stopC <-chan struct{}) {
 	// Atomically register this receive operation. TryAdd returns false
 	// if Stop() has already initiated shutdown, preventing the race
@@ -407,7 +543,11 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	default:
 	}
 
-	// Authorize the sender from the header before taking a slot or memory.
+	// Authorize the sender from the header BEFORE taking a slot or any
+	// memory. Authorizing only once the whole transfer had been buffered
+	// would let any cluster-certificate holder — a member of no shard — hold
+	// a peer's slots and half the snapshot memory budget for the length of a
+	// transfer and starve every snapshot the node needed.
 	if err := sr.handler.AuthorizeSnapshot(hdr.ShardID, hdr.ReplicaID, hdr.From, hdr.Index, peer); err != nil {
 		if errors.Is(err, ErrSnapshotNotAccepting) {
 			sr.rejectStream(snapshotRejectNotAccepting, "shard is not accepting snapshots", hdr, 0, err, slog.LevelDebug)
@@ -417,7 +557,10 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 		return
 	}
 
-	// Per-peer fairness first; peerKey is the authenticated identity (see snapshotFairnessKey).
+	// Per-peer fairness first: the host-global semaphore alone lets one peer
+	// hold every slot, silently starving snapshot delivery to every other
+	// recovering follower. peerKey is the peer's authenticated identity, not
+	// its transport address — see snapshotFairnessKey.
 	if !sr.acquirePeerSlot(peerKey) {
 		sr.rejectAuthorizedStream(snapshotRejectConcurrency, "per-peer snapshot concurrency limit reached", hdr)
 		return
@@ -438,7 +581,12 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	// frame read cannot hold Stop() for the full per-frame deadline.
 	defer cancelSnapshotReadOnStop(stream, stopC)()
 
-	// Pin a non-zero epoch in flight, on the shard's barrier, so PurgeEpochsBefore keeps its DEK.
+	// Register in-flight epoch protection if an epoch tracker is available
+	// and the snapshot has a non-zero epoch (barrier-encrypted snapshot).
+	// This prevents PurgeEpochsBefore from removing the DEK while the
+	// snapshot transfer is in progress. With per-shard barriers the tracker
+	// is routed by the snapshot's shardID so the epoch is pinned on the
+	// correct tenant barrier; otherwise the single host-wide tracker is used.
 	if tracker := sr.trackerForShard(hdr.ShardID); tracker != nil && hdr.Epoch > 0 {
 		tracker.RegisterInFlightEpoch(hdr.Epoch)
 		defer tracker.DeregisterInFlightEpoch(hdr.Epoch)
@@ -447,7 +595,11 @@ func (sr *snapshotReceiver) receiveSnapshot(stream *quic.Stream, hdr *SnapshotHe
 	sr.receiveChunks(stream, hdr, peerKey, peer, stopC)
 }
 
-// rateLimitChunkSleep returns the sleep for length bytes at bytesPerSec (> 0), capped at maxRateLimitChunkSleep.
+// rateLimitChunkSleep computes the per-chunk rate-limit sleep for a chunk of
+// length bytes at the given bytesPerSec rate, capped at maxRateLimitChunkSleep.
+// The cap bounds the worst case so an absurdly low rate cannot produce a
+// multi-day sleep that holds the snapshot concurrency semaphore and memory
+// budget. The caller must ensure bytesPerSec > 0.
 func rateLimitChunkSleep(length uint32, bytesPerSec int64) time.Duration {
 	d := time.Duration(length) * time.Second / time.Duration(bytesPerSec)
 	if d > maxRateLimitChunkSleep {
@@ -470,7 +622,11 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		initCap = maxInitialChunkCap
 	}
 	chunks := make([]proto.SnapshotChunk, 0, initCap)
-	// totalBytes counts wire bytes; charged also counts each retained chunk struct.
+	// totalBytes counts WIRE bytes: it drives the throughput floor and the
+	// bytes-received metric. charged counts what was reserved against the
+	// memory budget, which is the wire bytes PLUS the retained struct header
+	// of every accumulated chunk. Keeping them separate stops the accounting
+	// correction from inflating the reported transfer size.
 	var totalBytes, charged int64
 
 	// Restore all reserved memory on every exit.
@@ -488,10 +644,15 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	}
 	defer rateLimitTimer.Stop()
 
-	// The deadline derives from the declared work.
+	// The absolute deadline is derived from the work the sender DECLARED, so a
+	// slot's lifetime is proportional to the transfer it was taken out for
+	// rather than a flat ceiling every transfer inherits alike.
 	transferBudget := sr.transferBudget(hdr.ChunkCount)
 
-	// truncated marks a transfer that ended before all chunks arrived; it is never committed.
+	// truncated tracks whether the transfer ended before all expected chunks
+	// arrived (early EOF or stop). A truncated transfer must NOT be committed
+	// as a snapshot: a partial snapshot persisted as the latest snapshot is
+	// usable for recovery and would corrupt state.
 	truncated := false
 
 	// zeroFrames counts consecutive zero-length chunk frames, which no
@@ -564,7 +725,10 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		}
 		zeroFrames = 0
 
-		// Charge the frame and its retained chunk struct before allocating.
+		// Check memory budget before allocating. The charge covers the frame
+		// buffer AND the SnapshotChunk header that will be retained in chunks
+		// until the transfer completes; charging the frame length alone lets a
+		// flood of minimum-size chunks hold multiples of the accounted memory.
 		chunkCharge := int64(length) + snapshotChunkStructBytes
 		if rejection := sr.reserveChunkMemory(peerKey, chunkCharge); rejection != nil {
 			// Over budget. reserveChunkMemory leaves nothing charged on
@@ -608,7 +772,10 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		totalBytes += int64(length)
 		charged += chunkCharge
 
-		// Bound one receive's memory as well as the global budget.
+		// Guard against unbounded memory growth from a single snapshot
+		// receive. The per-chunk atomic budget check above protects
+		// against global overcommit, but this check ensures a single
+		// receive does not consume the entire budget.
 		if charged > sr.maxMemory {
 			sr.rejectSnapshot(hdr, snapshotRejectMemory, "per-receive memory budget exceeded", totalBytes,
 				&SnapshotMemoryBudgetExceededError{
@@ -641,7 +808,16 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 		}
 	}
 
-	// Commit only a complete transfer; a truncated or empty one is rejected.
+	// Only commit a snapshot when the transfer is COMPLETE: every expected
+	// chunk arrived. A truncated transfer (peer disconnect / early EOF /
+	// shutdown) leaves fewer chunks than hdr.ChunkCount; committing it would
+	// persist a partial snapshot as the latest snapshot, which recovery would
+	// then load as if whole — data corruption. Treat it as a failed receive:
+	// log, fire the rejection listener, and do NOT call HandleSnapshot.
+	//
+	// hdr.ChunkCount == 0 is named explicitly: the count comparison alone
+	// (0 != 0) is false, so an empty transfer would otherwise fall through to
+	// a silent return with no log and no listener callback.
 	if truncated || hdr.ChunkCount == 0 || uint64(len(chunks)) != hdr.ChunkCount {
 		// The rejection is reported before its diagnostic, which is
 		// contained (see rejectStream).
@@ -695,7 +871,16 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	}
 }
 
-// rejectSnapshot reports a discarded transfer: listener first, then a contained warning, then the counter by reason.
+// rejectSnapshot records a discarded inbound snapshot transfer: the
+// IncSnapshotsRejected counter bucketed by reason, a structured warning
+// carrying the transfer's identity, size and free-form detail, plus the
+// OnSnapshotRejected listener — the same failure signal the truncated-transfer
+// path fires — so a dropped receive is observable instead of silently timing
+// out the sender's ack wait.
+//
+// The rejection is reported first (notifyRejected, which hands it to the
+// listener dispatcher), then the diagnostic, contained, then the metric:
+// user code may not stand between a rejection and its report.
 func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason snapshotRejectReason, detail string, receivedBytes int64, err error) {
 	sr.notifyRejected(config.SnapshotInfo{
 		ShardID:   hdr.ShardID,
@@ -722,7 +907,20 @@ func (sr *snapshotReceiver) rejectSnapshot(hdr *SnapshotHeader, reason snapshotR
 	}
 }
 
-// rejectSnapshotStream reports a transfer discarded before any chunk was read; hdr may be nil. The counter uses shard 0 since the sender is unauthorized.
+// rejectSnapshotStream records a snapshot transfer discarded before any chunk
+// was read: an admission failure (shutdown, global or per-peer concurrency
+// limit) or a header-stage failure, where the transfer's identity may not be
+// known yet. It fires the same OnSnapshotRejected listener and structured
+// warning as rejectSnapshot so every discarded transfer is observable through
+// one signal, rather than some paths returning silently and leaving the sender
+// to time out its ack wait. hdr may be nil when the header never parsed.
+//
+// The counter is attributed to shard 0: every caller rejects before the
+// sender was authorized, when the shard the header names is whatever the peer
+// wrote, and using it as a metric label would let any certificate holder mint
+// unbounded series by cycling shard IDs. The log line and the listener still
+// carry the shard the header named. A rejection after authorization goes
+// through rejectAuthorizedStream.
 func (sr *snapshotReceiver) rejectSnapshotStream(reason snapshotRejectReason, detail string, hdr *SnapshotHeader, err error) {
 	sr.rejectStream(reason, detail, hdr, 0, err, slog.LevelWarn)
 }
@@ -758,7 +956,14 @@ func (sr *snapshotReceiver) rejectStream(reason snapshotRejectReason, detail str
 	}
 }
 
-// notifyRejected delivers OnSnapshotRejected through the host's listener dispatcher, or inline when none is installed.
+// notifyRejected delivers OnSnapshotRejected on the host's listener
+// dispatcher, the same delivery every other source of that event uses, so a
+// listener may call any Host API from it, including StopShard, and a slow one
+// does not hold this receive goroutine.
+//
+// The host always installs the dispatcher before the transport starts. Only a
+// receiver built standalone by this package's tests has none, and there the
+// listener runs inline: no engine exists for it to be reentrant against.
 func (sr *snapshotReceiver) notifyRejected(info config.SnapshotInfo) {
 	if sr.listener == nil || sr.listener.OnSnapshotRejected == nil {
 		return
@@ -787,17 +992,26 @@ func (sr *snapshotReceiver) setListenerDispatcher(dispatch func(fn func()) bool)
 	sr.dispatchListener = dispatch
 }
 
-// SetEpochTracker sets the in-flight epoch tracker; call before any receive begins.
+// SetEpochTracker sets the epoch tracker for in-flight epoch protection.
+// Must be called before any snapshot receives begin. When set, the receiver
+// will register/deregister epochs for all encrypted snapshot transfers to
+// prevent premature DEK purge.
 func (sr *snapshotReceiver) SetEpochTracker(tracker EpochTracker) {
 	sr.epochTracker = tracker
 }
 
-// SetShardEpochTrackers sets a per-shard tracker resolver that takes precedence over the single tracker; call before any receive begins.
+// SetShardEpochTrackers sets a per-shard epoch tracker resolver. When non-nil
+// it takes precedence over the single epochTracker, routing in-flight epoch
+// protection to the barrier that owns the snapshot's shard. Must be called
+// before any snapshot receives begin.
 func (sr *snapshotReceiver) SetShardEpochTrackers(fn func(shardID uint64) EpochTracker) {
 	sr.epochTrackerForShard = fn
 }
 
-// trackerForShard returns the shard's epoch tracker, falling back to the single one, or nil when none is configured.
+// trackerForShard resolves the in-flight epoch tracker for a shard. A per-shard
+// resolver takes precedence (falling through to the single tracker only when it
+// returns nil); otherwise the single host-wide tracker is returned. Returns nil
+// when no tracker is configured, in which case in-flight protection is skipped.
 func (sr *snapshotReceiver) trackerForShard(shardID uint64) EpochTracker {
 	if sr.epochTrackerForShard != nil {
 		if t := sr.epochTrackerForShard(shardID); t != nil {
@@ -807,12 +1021,20 @@ func (sr *snapshotReceiver) trackerForShard(shardID uint64) EpochTracker {
 	return sr.epochTracker
 }
 
-// SetSnapshotTracker sets the tracker Stop() uses to refuse new receives and wait for running ones.
+// SetSnapshotTracker sets the shutdown tracker used to track in-flight
+// snapshot receives. This allows Stop() to atomically reject new
+// operations and wait for existing ones to complete before tearing down
+// connections.
 func (sr *snapshotReceiver) SetSnapshotTracker(tracker *shutdownTracker) {
 	sr.snapshotTracker = tracker
 }
 
-// validateChunk bounds-checks a chunk, checks its DeploymentID and requires its ShardID, Index and Epoch to match hdr.
+// validateChunk checks bounds on deserialized snapshot chunk fields,
+// verifies the DeploymentID matches this receiver's configured deployment,
+// and binds the chunk to the stream header (hdr) that was used for epoch
+// pinning: a chunk whose ShardID, Index, or Epoch diverges from the header
+// could otherwise persist under a barrier epoch that was never pinned,
+// letting a concurrent epoch purge strand an undecryptable snapshot.
 func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk, hdr *SnapshotHeader) error {
 	if len(chunk.Filepath) > maxSnapshotFilepathLen {
 		return &ChunkFilepathTooLongError{
@@ -822,7 +1044,16 @@ func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk, hdr *Snaps
 		}
 	}
 	if chunk.Filepath != "" {
-		// Filepath is informational and never written to; reject ".." traversal, and sanitize it if it ever becomes a write path.
+		// chunk.Filepath is INFORMATIONAL and attacker-controllable: the sender
+		// sets it to the snapshot's on-disk directory (an ABSOLUTE path), and
+		// the receiver ignores it when writing — the on-disk location is built
+		// solely from shard/replica/snapshot-index. So absolute paths are
+		// legitimate here and must NOT be rejected. We still reject relative
+		// ".." traversal (which a clean legitimate path never contains) as
+		// defense-in-depth. SECURITY INVARIANT: any future code that turns this
+		// field into a write path MUST sanitize it (extract the base name, or
+		// filepath.Join onto a fixed base then verify the result stays within
+		// that base) — never use it directly.
 		cleaned := filepath.Clean(chunk.Filepath)
 		if cleaned == ".." ||
 			strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) ||
@@ -895,7 +1126,13 @@ func (sr *snapshotReceiver) validateChunk(chunk *proto.SnapshotChunk, hdr *Snaps
 	return nil
 }
 
-// maxAdmissibleChunkCount returns the largest ChunkCount this receiver admits: the protocol ceiling, lowered to what the memory budget can hold.
+// maxAdmissibleChunkCount returns the largest declared ChunkCount this
+// receiver can admit: the fixed protocol ceiling, lowered to what the
+// configured memory budget could actually hold. The fixed ceiling alone is not
+// a memory bound — a peer declaring it and sending minimum-size chunks holds
+// ChunkCount * minSnapshotChunkResidentBytes, which for a small budget is
+// orders of magnitude past it — so the transfer is refused at the header
+// instead of after the memory has been committed.
 func (sr *snapshotReceiver) maxAdmissibleChunkCount() uint64 {
 	limit := uint64(defaultMaxSnapshotChunkCount)
 	if sr.maxMemory > 0 {

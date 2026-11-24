@@ -6,7 +6,24 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestNewRaftLog_RecordsRecoveryClamp asserts a recovered commit index past the last entry is clamped and recorded in Peer.RecoveryClamp.
+// TestNewRaftLog_RecordsRecoveryClamp asserts that a recovered commit index
+// ahead of the last recovered entry is clamped down, and that the clamp is
+// recorded.
+//
+// getConflictIndex skips every entry at or below committed as "committed
+// entries cannot conflict". With committed past the end of the log, tryAppend
+// reports success for indices this replica does not hold, handleAppend replies
+// with a NON-rejecting ReplicateResp, and the leader counts that phantom match
+// toward quorum -- committing entries a majority does not actually have. The
+// invariant in commitTo would panic eventually, but only after the false
+// acknowledgement was already on the wire.
+//
+// Reachable from a torn WAL batch that kept the state record while losing
+// entries behind it, or a snapshot record that outlived them.
+//
+// The clamp is recorded for the Host to
+// log on its own logger (Peer.RecoveryClamp), with the recovered values, and
+// nothing is recorded when the recovered commit index is within the log.
 func TestNewRaftLog_RecordsRecoveryClamp(t *testing.T) {
 	entries := []proto.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 1}, {Index: 3, Term: 1}}
 
@@ -40,7 +57,20 @@ func TestNewRaftLog_RecordsRecoveryClamp(t *testing.T) {
 	}
 }
 
-// TestNewRaftLog_TotalEntryLoss_ClampsCommittedToZero: with no entries and no snapshot, committed is clamped to zero.
+// TestNewRaftLog_TotalEntryLoss_ClampsCommittedToZero covers the case the
+// partial-loss test above does NOT reach: the log holds NOTHING — no entries
+// and no snapshot — while the recovered hard state still claims a commit
+// index.
+//
+// The clamp was VACUOUS here. newRaftLog fabricated the in-memory boundary
+// from state.Commit when the entry range was empty, so newInMemory set
+// markerIndex = state.Commit+1 and lastIndex() fell through to
+// inmem.lastIndex() == state.Commit. `l.committed > l.lastIndex()` therefore
+// compared state.Commit against itself and could never fire, in exactly the
+// scenario the clamp was written for.
+//
+// The in-memory boundary must come only from evidence the log actually holds
+// something: recovered entries or a recovered snapshot.
 func TestNewRaftLog_TotalEntryLoss_ClampsCommittedToZero(t *testing.T) {
 	// Entry records lost (disk wipe, partial restore, truncated WAL); the
 	// state record survived claiming 100.
@@ -72,7 +102,17 @@ func TestNewRaftLog_TotalEntryLoss_ClampsCommittedToZero(t *testing.T) {
 	}
 }
 
-// TestTotalEntryLoss_NoPhantomReplicateAck: a replica that lost its entries does not acknowledge indices it lacks.
+// TestTotalEntryLoss_NoPhantomReplicateAck is the end-to-end consequence of
+// the clamp above: a replica that lost its entries must not ACK indices it
+// does not hold.
+//
+// handleAppend answers any Replicate whose prevLogIndex is BELOW the
+// committed index with a non-rejecting ReplicateResp carrying the committed
+// index. With committed left at the recovered 100 over an empty log, a
+// backtracking leader's probe draws `ReplicateResp{Reject:false,
+// LogIndex:100}` — a claim to hold entries 1..100 that the leader counts
+// toward the commit quorum. A majority containing this replica then commits
+// entries that a majority does not actually hold: Leader Completeness fails.
 func TestTotalEntryLoss_NoPhantomReplicateAck(t *testing.T) {
 	lr := newTestLogReader(nil, proto.State{Term: 5, Commit: 100})
 	lr.membership = threeNodeMembership()
@@ -115,7 +155,19 @@ func TestTotalEntryLoss_NoPhantomReplicateAck(t *testing.T) {
 	}
 }
 
-// The inner clamp: a snapshot outliving its entries must leave processed at or below the clamped committed.
+// TG-3. The INNER clamp — processed down to the clamped committed — has its
+// own reachable case, and TestNewRaftLog_RecordsRecoveryClamp does not
+// reach it: that fixture has no snapshot, so processed is derived as
+// firstIndex-1 == 0 and `processed > committed` compares 0 against 5. The
+// assertion there is vacuously true and would survive deleting the clamp.
+//
+// The real case is a SNAPSHOT record that outlives the entries it was taken
+// over: processed is seeded from the snapshot index, committed is raised to it
+// (a snapshot index is committed by construction), and the outer clamp then
+// pulls committed back down to the last entry the log actually holds. Without
+// the inner clamp processed is left ABOVE committed, which is the exact state
+// commitUpdate asserts against — the first Commit after restart panics and
+// takes the commit worker, and with it every shard on that worker, down.
 func TestNewRaftLog_SnapshotAheadOfEntries_ClampsProcessedToCommitted(t *testing.T) {
 	// Entries 1..5 survived; the snapshot record claims index 10.
 	entries := []proto.Entry{

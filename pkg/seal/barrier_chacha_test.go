@@ -23,7 +23,15 @@ import (
 	"testing"
 )
 
-// Tests the caller-nonce framing, which only the ChaCha20 family uses.
+// The barrier's framing has two shapes, and after the migration to
+// cipher.NewGCMWithRandomNonce the AES-GCM algorithms exercise only one of
+// them: the module generates the nonce and encryptLocked writes none.
+// The caller-nonce shape — encryptLocked drawing the nonce from b.randReader
+// and writing it into the frame, decryptLocked slicing it back out — is
+// reached by the ChaCha20 family and by any injected AEADProvider that returns
+// a caller-nonce cipher.AEAD, so it is still live code and must still be
+// tested. It cannot be tested in a FIPS build, which compiles no caller-nonce
+// AEAD in, hence //go:build !fips.
 
 // chachaBarrier returns an initialized barrier pinned to a caller-nonce AEAD.
 func chachaBarrier(t *testing.T, alg SymmetricAlgorithm) (*Barrier, *SoftwareStrategy) {
@@ -53,7 +61,9 @@ func TestBarrier_CallerNonceAEADRoundTrip(t *testing.T) {
 				t.Fatalf("Encrypt: %v", err)
 			}
 
-			// The frame is header + nonce + ciphertext + tag at the algorithm's nonce width.
+			// The nonce is written into the frame by the barrier, so the frame
+			// is header + nonce + ciphertext + tag with the ALGORITHM's nonce
+			// width, not the module-nonce zero.
 			want := epochSize + algIDSize + alg.NonceSize() + len(plaintext) + aeadTagSize
 			if len(frame) != want {
 				t.Fatalf("frame is %d bytes, want %d", len(frame), want)
@@ -112,7 +122,10 @@ func TestBarrier_CallerNonceEncryptRandFail(t *testing.T) {
 	}
 }
 
-// TestBarrier_CallerNonceRejectsMismatchedAlgID verifies a header naming another nonce width is refused before Open.
+// TestBarrier_CallerNonceRejectsMismatchedAlgID pins the algID cross-check on
+// the caller-nonce path: a header byte naming a different nonce WIDTH than the
+// active cipher would slice a wrong-length nonce and panic inside Open, so it
+// must be refused with the generic error first.
 func TestBarrier_CallerNonceRejectsMismatchedAlgID(t *testing.T) {
 	b, s := chachaBarrier(t, AlgChaCha20Poly1305)
 	defer func() { _ = s.Close() }()

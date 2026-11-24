@@ -20,7 +20,14 @@ import (
 	"strings"
 )
 
-// allowRule accepts some classes of lab value in the files its path matches; every field, including the reason, is required.
+// allowRule accepts some classes of lab value in the files its path pattern
+// matches. It exists for what an inline waiver cannot reach: a whole tree of
+// files, a format with no comment syntax, or a file whose content another owner
+// controls.
+//
+// Every field is required. A rule with no reason is rejected by
+// validateAllowList, because the reason is the entire difference between an
+// allow-list and a blindfold.
 type allowRule struct {
 	// path is a slash-separated pattern. `*` matches within one path
 	// segment; a `**` segment matches any number of segments, including
@@ -40,7 +47,11 @@ const benchmarkProvenance = "Benchmark provenance: profile names record which ma
 	"the numbers. A throughput figure is a property of its machine, so the " +
 	"machine's name is the measurement's meaning, not a leak."
 
-// allowList is this repository's accepted set: benchmark provenance only.
+// allowList is the accepted set for THIS repository. Every entry is a
+// deliberate decision, and the list is meant to shrink. Lab values were removed
+// everywhere they were removable, and the private forge's own configuration is
+// export-ignored rather than allowed (manifest_test.go: privateWorkflowFiles);
+// what remains is benchmark provenance.
 var allowList = []allowRule{
 	{
 		path:    "test/performance/profiles/**",

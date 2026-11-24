@@ -248,7 +248,13 @@ func TestCompact_PartialGCFailureKeepsEpochFloor(t *testing.T) {
 	}
 }
 
-// TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive: the retired-replica registry keeps a removed node removed when shared segments survive replay.
+// TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive pins removal
+// durability through the retired-replica registry. WAL shards are
+// shared by many Raft groups, so a segment holding the removed node's records
+// can stay alive — pinned by another node — long after the removal. Replay of
+// that segment must not resurrect the removed replica. The removal is
+// recorded in the registry, which replay applies after rebuilding, so nothing
+// is pinned for it and the removed node's own segments are ordinary garbage.
 func TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *DB {
@@ -338,7 +344,14 @@ func TestRemoveNodeData_StaysRemovedWhileOlderSegmentsSurvive(t *testing.T) {
 	}
 }
 
-// writeMultiBlockSegment fills segment 0 of shardID's WAL shard across several blocks, one fsynced generation per record: damage recovery must refuse.
+// writeMultiBlockSegment populates segment 0 of the WAL shard serving shardID
+// with enough records to span several blocks, EACH IN ITS OWN DURABILITY
+// GENERATION: every SaveEntries is a separate fsynced batch, so every record
+// carries a generation that a completed fdatasync separates from its
+// neighbours' and recovery can prove each one was acknowledged.
+//
+// That makes it the fixture for damage recovery must REFUSE. Use
+// writeSingleGenerationSegment for a genuine interrupted write.
 func writeMultiBlockSegment(t *testing.T, db *DB, shardID uint64) {
 	t.Helper()
 	for i := uint64(0); i < 15; i++ {
@@ -353,7 +366,25 @@ func writeMultiBlockSegment(t *testing.T, db *DB, shardID uint64) {
 	}
 }
 
-// writeSingleGenerationSegment fills segment 0 of shardID's WAL shard with several blocks in one durability generation, an in-flight batch that may legally be truncated; remove its sync mark with dropSyncMark.
+// writeSingleGenerationSegment populates segment 0 of the WAL shard serving
+// shardID with several blocks' worth of records that ALL belong to ONE
+// durability generation: a single SaveState carrying one Update per replica is
+// written record by record and fsynced exactly once at the end.
+//
+// That is the shape of a batch still in flight when the machine loses power,
+// and it is the only shape a mid-file zero hole may legally be repaired at. One
+// fdatasync covers as many WriteAt calls as the batch had blocks and writeback
+// may persist any subset of those pages, so losing an interior block leaves
+// decodable records above the hole — but none of them has a completed sync
+// behind it, so nothing there was ever acknowledged and truncating to the clean
+// prefix destroys nothing.
+//
+// Replica 1's entry is written first, so it lands in block 0 and survives a
+// tear at block 1.
+//
+// SaveState does complete the batch's fdatasync, which appends a sync mark;
+// a caller modelling the batch as still in flight removes it with
+// dropSyncMark after closing the DB.
 func writeSingleGenerationSegment(t *testing.T, db *DB, shardID uint64) {
 	t.Helper()
 	updates := make([]logdb.Update, 0, 15)
@@ -392,7 +423,13 @@ func corruptSegmentBlock(t *testing.T, path string, blockSize int) {
 	}
 }
 
-// TestRecovery_NonFinalCorruptionDoesNotMutateDisk: fail-stop recovery on a non-final segment changes nothing on disk.
+// TestRecovery_NonFinalCorruptionDoesNotMutateDisk is a regression test.
+// When recovery fails-stop on corruption in a non-final segment it must destroy
+// NOTHING on disk: the corrupt segment is not prefix-truncated and the
+// committed higher segments are not discarded. Any of those mutations would
+// throw away committed entries and regress HardState (term/vote), the exact
+// data loss the fail-stop exists to prevent. The operator restores from
+// snapshot/peers with the on-disk WAL still fully intact for forensics.
 func TestRecovery_NonFinalCorruptionDoesNotMutateDisk(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
@@ -421,7 +458,8 @@ func TestRecovery_NonFinalCorruptionDoesNotMutateDisk(t *testing.T) {
 	// Corrupt segment 0 mid-file: segments 1-2 above hold committed state.
 	corruptSegmentBlock(t, seg0Path, blockSize)
 
-	// Sizes after corruption; fail-stop recovery must leave them unchanged.
+	// Capture the on-disk sizes AFTER corruption; a fail-stop recovery must
+	// leave every one of them byte-for-byte unchanged.
 	sizeBefore := func(p string) int64 {
 		fi, err := defaultFS().Stat(p)
 		if err != nil {
@@ -491,7 +529,12 @@ func (f *dirSyncFailFS) Open(name string) (File, error) {
 	return file, nil
 }
 
-// TestRollback_DirSyncFailurePoisonsDB: a failed directory fsync during rollback poisons the DB (ErrDBPoisoned).
+// TestRollback_DirSyncFailurePoisonsDB is a regression test. When a
+// mid-batch rotation rollback deletes/truncates segments but the directory
+// fsync fails, the rollback cannot be proven durable: a crash could resurrect
+// a deleted segment's directory entry and recovery would replay CRC-valid
+// records from a batch that was reported failed. The failure must fail-stop
+// the DB (poison + ErrDBPoisoned), exactly like a data-fsync failure.
 func TestRollback_DirSyncFailurePoisonsDB(t *testing.T) {
 	dir := t.TempDir()
 	ffs := &dirSyncFailFS{FS: defaultFS()}
@@ -571,7 +614,15 @@ func TestRollback_DirSyncFailurePoisonsDB(t *testing.T) {
 	}
 }
 
-// TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive: recovery truncates the corrupt segment itself, so a later restart does not discard newer committed segments.
+// TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive is the regression
+// test for the recurring truncation-recovery data loss. Before the repair,
+// recover() reported errRecoveryTruncated and discarded the segments ABOVE the
+// corrupt one but never truncated the corrupt segment itself, so its torn tail
+// was frozen on disk forever: restart 1 recovers the prefix and the node runs
+// for hours writing new segments whose entries are acked to Raft as committed;
+// restart 2 re-detects the same corruption and DELETES EVERY SEGMENT WRITTEN
+// SINCE RESTART 1 — committed entries, hard state (term/vote regression, i.e. a
+// double vote), snapshot metadata and compaction markers — recurring forever.
 func TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
@@ -665,7 +716,17 @@ func TestRecovery_CorruptSegmentRepairedSoLaterWritesSurvive(t *testing.T) {
 	}
 }
 
-// TestRecovery_CorruptSegmentTruncateFailureIsFatal: if the corrupt final segment cannot be truncated, Open fails.
+// TestRecovery_CorruptSegmentTruncateFailureIsFatal verifies the repair is
+// fail-stop: if the corrupt segment cannot be truncated, Open must FAIL rather
+// than report a successful recovery over a segment that still carries its
+// damaged tail (which the next restart would re-detect, repeating the repair
+// and the discard forever).
+//
+// The corrupt segment is the FINAL one, which is the only shape that reaches
+// the code the test names: a corruption in a non-final segment is rejected by
+// the prefix rule (ErrNonFinalSegmentCorruption) before the repair path is
+// reached at all, so an injected truncation failure there would never be
+// exercised.
 func TestRecovery_CorruptSegmentTruncateFailureIsFatal(t *testing.T) {
 	const blockSize = 1024
 	dir := t.TempDir()
@@ -751,7 +812,14 @@ func (f *segSyncFailFS) OpenFile(name string, flag int, perm fs.FileMode) (File,
 	return file, nil
 }
 
-// TestRollback_FileSyncFailurePoisonsDB: a failed file fsync during rollback satisfies errors.Is(err, ErrDBPoisoned) and stops writes.
+// TestRollback_FileSyncFailurePoisonsDB is the regression test for the
+// rollback FILE fsync (as opposed to the directory fsync, covered above).
+// truncateClosedSegment and segment.DiscardPending returned a bare
+// SegmentDiscardError, which flowed up as a BatchWriteError that did NOT
+// satisfy errors.Is(err, ErrDBPoisoned). The DB stayed writable, the next
+// batch appended past an un-durable truncation, and a crash resurrected
+// rolled-back records that recovery replays as valid entries the caller was
+// told had FAILED.
 func TestRollback_FileSyncFailurePoisonsDB(t *testing.T) {
 	dir := t.TempDir()
 	ffs := &segSyncFailFS{FS: defaultFS()}
@@ -821,7 +889,12 @@ func TestRollback_FileSyncFailurePoisonsDB(t *testing.T) {
 	}
 }
 
-// TestCompact_DirSyncFailureKeepsEpochFloor: the epoch floor rises only after the post-GC directory fsync succeeds.
+// TestCompact_DirSyncFailureKeepsEpochFloor is the regression test for the
+// post-GC ordering bug: the epoch-floor recompute ran BEFORE the directory
+// fsync. If the fsync fails (or the process crashes first) the unlink is not
+// durable, but MinLiveEpoch already reports the raised floor, the snapshot
+// pool purges the old DEK, and on restart the resurrected segment makes replay
+// die with a fatal WALDecryptError — the node cannot start at all.
 func TestCompact_DirSyncFailureKeepsEpochFloor(t *testing.T) {
 	barrier := newTestBarrier(t)
 	ffs := &dirSyncFailFS{FS: defaultFS()}
@@ -947,7 +1020,26 @@ func TestRemoveNodeData_DirSyncFailureKeepsEpochFloor(t *testing.T) {
 	}
 }
 
-// TestRollback_DeletesHigherSegmentsBeforeCuttingTheCheckpoint: rollback removes segments high to low, so every crash state is a valid prefix.
+// TestRollback_DeletesHigherSegmentsBeforeCuttingTheCheckpoint pins the
+// rotation rollback's ORDER.
+//
+// Truncating the CHECKPOINT segment first and only then deleting the
+// intermediate segments and emptying the active one would be wrong. A crash in
+// that window leaves segment K ending cleanly at a record boundary — no corruption
+// for recovery to detect — while segments K+1..N still hold their fsynced,
+// CRC-valid batch records. The next recovery therefore replays K in full and
+// then every segment above it, resurrecting exactly the records the caller was
+// told had FAILED, with a hole where the truncated ones were. That is the
+// prefix-validity rule inverted by an ordering accident.
+//
+// High to low, every intermediate crash state is instead a valid prefix: the
+// checkpoint segment still carries its batch tail, which is an ordinary
+// interrupted write and is what a crash one instruction earlier would have left
+// anyway.
+//
+// The order is observed at the one point the two steps can be told apart: a
+// truncation of the checkpoint segment that cannot even open the file. The
+// higher segments must already be gone.
 func TestRollback_DeletesHigherSegmentsBeforeCuttingTheCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	ffs := &faultFS{FS: defaultFS()}
@@ -1014,7 +1106,7 @@ func TestRollback_DeletesHigherSegmentsBeforeCuttingTheCheckpoint(t *testing.T) 
 			cp.segID, seg0Size, cp.fileOffset+int64(cp.blockOffset))
 	}
 
-	// Fail only the reopen of the checkpoint segment, which is the truncation.
+	// Fail only the reopen of the CHECKPOINT segment, which is the truncation.
 	truncErr := errors.New("simulated EIO reopening the checkpoint segment")
 	ffs.arm(func(f *faultFS) {
 		f.failNames = map[string]bool{segmentFilename(cp.segID): true}

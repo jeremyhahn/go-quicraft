@@ -26,7 +26,11 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// Shutdown must return a state machine's Close error, its last durability signal.
+// Shutdown is the last durability signal the embedding application ever gets.
+// For an on-disk state machine — go-qrdb's Pebble store — the Close it runs is
+// the store's final flush-and-close, so a failed flush that shutdown only LOGS
+// reports a clean stop for a shard that lost writes. StopShard and Host.Close
+// therefore surface it instead.
 
 // errCloseSM fails Close with a fixed error, modelling a backing store whose
 // final flush failed.
@@ -86,7 +90,10 @@ func TestStopShard_ReportsStateMachineCloseFailure(t *testing.T) {
 	}
 }
 
-// TestHostClose_ReportsIncompleteDrain verifies a timed-out Drain reaches Close's caller.
+// TestHostClose_ReportsIncompleteDrain pins that a Drain which timed out
+// reaches the caller. Close proceeds with shutdown either way — that is the
+// point of the timeout — but a timed-out drain ABANDONED in-flight work, and a
+// nil return says the opposite.
 func TestHostClose_ReportsIncompleteDrain(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -106,7 +113,12 @@ func TestHostClose_ReportsIncompleteDrain(t *testing.T) {
 	}
 }
 
-// TestHostDrain_ConcurrentCallersJoinTheSameAttempt verifies a second Drain waits for and reports the first attempt's result.
+// TestHostDrain_ConcurrentCallersJoinTheSameAttempt pins that a second Drain
+// — Close's, in the case that matters — waits for the attempt already in
+// progress and reports ITS result, instead of returning nil immediately. A
+// second caller that saw draining=true and returned success at once would let a
+// Close racing an explicit Drain tear the engine down under the first drain, and
+// both would report a clean shutdown after aborting accepted work.
 func TestHostDrain_ConcurrentCallersJoinTheSameAttempt(t *testing.T) {
 	cfg := testHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
@@ -186,7 +198,9 @@ func TestHostClose_JoinsEveryShardsCloseFailure(t *testing.T) {
 	}
 }
 
-// closeFailingImportFS fails the data file's Close after a successful Sync.
+// closeFailingImportFS is the real filesystem with the snapshot data file's
+// Close failing AFTER its Sync succeeded, which is how a full volume, an
+// exceeded quota or a network file system delivers a deferred write error.
 type closeFailingImportFS struct {
 	osSnapshotFS
 }
@@ -201,7 +215,15 @@ func (f closeFailingImportFS) OpenFile(name string, flag int, perm fs.FileMode) 
 
 var _ snapshotFS = closeFailingImportFS{}
 
-// TestWriteImportedSnapshotData_ReportsCloseFailure verifies the import returns a post-Sync Close error.
+// TestWriteImportedSnapshotData_ReportsCloseFailure requires the import's
+// post-Sync Close error to be RETURNED.
+//
+// Sync flushes what the process wrote; Close is where a deferred write failure
+// surfaces, and on some platforms it is the only place it is ever delivered.
+// Dropping it let the import continue to SaveSnapshot — recording the artifact
+// as the shard's durable snapshot — and then to RemoveEntriesTo, which DELETES
+// the log entries the snapshot subsumes. The entries are gone and a possibly
+// short snapshot is all that is left to replace them.
 func TestWriteImportedSnapshotData_ReportsCloseFailure(t *testing.T) {
 	h := &Host{}
 	dataPath := filepath.Join(t.TempDir(), "snapshot.dat")

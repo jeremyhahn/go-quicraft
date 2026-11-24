@@ -36,7 +36,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Leader-executed requests, driven deterministically: three hosts share an in-memory network whose delivery the test controls, leadership views are set by hand, and handlers record every execution by (term, replica).
+// ---------------------------------------------------------------------------
+// Leader-executed requests, driven deterministically.
+//
+// Three bare hosts (replicas 1, 2, 3 of shard 1) share an in-memory network:
+// every message a host sends lands in one queue, and the TEST decides when,
+// whether and in what order each is delivered to its target's receive path.
+// The leadership view of each replica is set by hand through the same
+// updateNodeLeader/markLeaderReady calls the engine's callbacks make, so a
+// leader change lands at an exact point of a request's life. Handlers record
+// every execution by (term, replica): "never twice under one term" is checked
+// against that record, not inferred.
+// ---------------------------------------------------------------------------
 
 const execShard uint64 = 1
 
@@ -221,7 +232,8 @@ func (c *execCluster) elect(leader, term uint64, ids ...uint64) {
 	}
 }
 
-// quietView changes replica id's view without waking its waiters.
+// quietView changes replica id's view WITHOUT waking its waiters: the view
+// moved, and its notification has not been observed yet.
 func (c *execCluster) quietView(id, leader, term uint64) {
 	c.raft(id, leader, term)
 	ns := c.nodes[id]
@@ -841,7 +853,11 @@ func TestExecuteOnLeader_ShardStopEndsTheWait(t *testing.T) {
 	})
 }
 
-// TestExecuteOnLeader_LeaderStoppedDuringTheHandlerWithholdsTheReply: a local caller gets ErrStopped, a remote one leaderExecDeposed.
+// TestExecuteOnLeader_LeaderStoppedDuringTheHandlerWithholdsTheReply: a
+// leader whose shard stops while the handler runs no longer leads it when the
+// handler returns, though its cached view still says it does. The reply is
+// withheld: a local caller gets ErrStopped, and a remote caller is answered
+// leaderExecDeposed and takes the request to the next leader.
 func TestExecuteOnLeader_LeaderStoppedDuringTheHandlerWithholdsTheReply(t *testing.T) {
 	t.Run("local", func(t *testing.T) {
 		c := newExecCluster(t)

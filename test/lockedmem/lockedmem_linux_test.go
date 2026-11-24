@@ -23,9 +23,18 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// These tests keep a broken mapping parser from turning every freeze assertion into a skip.
+// This package is a witness for other packages' tests, so a defect in it is
+// invisible where it is used: a parser that reported the wrong mapping, or none,
+// would make every freeze assertion SKIP and every one of them would still read
+// as a pass. These tests exist so that cannot happen quietly.
 
-// TestProtectionOf_ReportsTheRealProtections verifies the parser reports a sized enclave writable and read-only after Freeze.
+// TestProtectionOf_ReportsTheRealProtections runs the parser against the two
+// states it exists to tell apart, on real enclave pages rather than a fixture:
+// a sized enclave is writable and the same enclave is read-only after Freeze.
+//
+// Using go-enclave rather than a hand-rolled mmap is deliberate. What the
+// consumers ask this package is "did MY call to Freeze take", so the thing under
+// test has to be the mapping go-enclave actually produces.
 func TestProtectionOf_ReportsTheRealProtections(t *testing.T) {
 	e, err := enclave.NewMemorySized(32)
 	if err != nil {

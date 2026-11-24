@@ -8,7 +8,16 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 )
 
-// TestNewHost_ShardBarriersWithoutHostBarrierRefused verifies per-shard encryption alone over a plaintext WAL is refused.
+// TestNewHost_ShardBarriersWithoutHostBarrierRefused verifies that configuring
+// per-shard encryption alone is refused rather than silently producing a
+// plaintext WAL.
+//
+// The default WAL takes ONE barrier, so WithShardBarriers cannot reach it.
+// Accepting this combination encrypted snapshots while every Raft log entry --
+// i.e. every user command -- was written to disk in cleartext. An operator
+// checking the snapshot directory would see encryption working and never learn
+// the command log was readable. Same conflation class as the three sealed-vs-nil
+// barrier downgrades already fixed, relocated to host construction.
 func TestNewHost_ShardBarriersWithoutHostBarrierRefused(t *testing.T) {
 	cfg := testHostConfig(t)
 	shardBarrier := createTestBarrier(t)
@@ -43,12 +52,30 @@ func TestNewHost_ShardBarriersWithHostBarrierAccepted(t *testing.T) {
 	defer h.Close()
 }
 
-// TestNewHost_ShardBarriersWithPlaintextLogDBRefused verifies per-shard barriers over a plaintext caller-supplied LogDB are refused.
+// TestNewHost_ShardBarriersWithPlaintextLogDBRefused is the regression
+// test: the SIXTH at-rest plaintext downgrade, and the first on the "which
+// barrier applies to this shard" axis rather than the sealed-vs-nil axis the
+// five before it shared.
+//
+// A refusal written as `if options.logdb == nil` would discriminate on whether
+// a LogDB was SUPPLIED rather than on what that LogDB IS. Supplying one is the
+// natural thing an integrator does to put the WAL on a chosen directory, and it
+// would buy a full bypass: an unencrypted waldb.Open(dir) plus
+// WithShardBarriers and no WithBarrier would produce byte-for-byte the state
+// ErrShardBarriersPlaintextWAL exists to prevent -- encrypted snapshots over a
+// plaintext Raft log, every user command readable off the disk, while the
+// operator's spot-check of the snapshot directory shows encryption working.
+//
+// A type assertion cannot decide this: *waldb.DB implements the per-barrier
+// interfaces in BOTH cases. Only the LogDB's own AtRestProtection declaration
+// separates them, and its zero value is AtRestUnprotected so a store that
+// declares nothing is read as unsafe.
 func TestNewHost_ShardBarriersWithPlaintextLogDBRefused(t *testing.T) {
 	cfg := testHostConfig(t)
 	shardBarrier := createTestBarrier(t)
 
-	// Opened without waldb.WithBarrier: records are cleartext.
+	// Opened WITHOUT waldb.WithBarrier: every record reaches a WAL segment in
+	// cleartext.
 	db, err := waldb.Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("waldb.Open: %v", err)
@@ -110,7 +137,14 @@ func TestNewHost_ShardBarriersWithEncryptedLogDBAccepted(t *testing.T) {
 	defer h.Close()
 }
 
-// TestNewHost_ShardBarriersWithCustomLogDBAccepted verifies a non-durable in-memory LogDB is accepted.
+// TestNewHost_ShardBarriersWithCustomLogDBAccepted verifies that an in-memory
+// LogDB satisfies the requirement.
+//
+// It is accepted because it is NON-DURABLE, not because a LogDB was supplied:
+// nothing is ever written to a file, so there is no at-rest artifact to read
+// off the disk and the guarantee holds vacuously. Generalising this case to
+// "any caller-supplied LogDB is fine" is exactly what produced the bypass
+// pinned by TestNewHost_ShardBarriersWithPlaintextLogDBRefused above.
 func TestNewHost_ShardBarriersWithCustomLogDBAccepted(t *testing.T) {
 	cfg := testHostConfig(t)
 	shardBarrier := createTestBarrier(t)

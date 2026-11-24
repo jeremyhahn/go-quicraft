@@ -124,7 +124,13 @@ func installSnapshotIntoLog(t *testing.T, node *Node, peer *raft.Peer, index, te
 	node.publishLogMarkers()
 }
 
-// TestSnapshotPool_RecoverSnapshot_RefusesSnapshotBehindApplyFrontier verifies recovery refuses a snapshot below lastApplied.
+// TestSnapshotPool_RecoverSnapshot_RefusesSnapshotBehindApplyFrontier pins the
+// lower bound. A leader whose remote.next was driven below the follower's real
+// progress (leader change, rejection walk-down, observer promotion) ships an
+// InstallSnapshot at an index the follower is already past. Raft rejects it;
+// recovering it anyway would REPLACE the state machine with older state and
+// regress lastApplied, so the next committed batch trips ErrApplyGap and fails
+// the shard permanently.
 func TestSnapshotPool_RecoverSnapshot_RefusesSnapshotBehindApplyFrontier(t *testing.T) {
 	stopC := make(chan struct{})
 	defer close(stopC)
@@ -158,7 +164,11 @@ func TestSnapshotPool_RecoverSnapshot_RefusesSnapshotBehindApplyFrontier(t *test
 	}
 }
 
-// TestSnapshotPool_RecoverSnapshot_ChecksLogBeforeTouchingStateMachine verifies the committed check runs before RecoverFromSnapshot.
+// TestSnapshotPool_RecoverSnapshot_ChecksLogBeforeTouchingStateMachine pins the
+// ORDER of the upper-bound check. Were recoverSnapshot to call
+// RecoverFromSnapshot first and read the committed index afterwards, the state
+// machine would be replaced while the markers were refused, and nothing
+// would retry.
 func TestSnapshotPool_RecoverSnapshot_ChecksLogBeforeTouchingStateMachine(t *testing.T) {
 	stopC := make(chan struct{})
 	defer close(stopC)
@@ -186,7 +196,7 @@ func TestSnapshotPool_RecoverSnapshot_ChecksLogBeforeTouchingStateMachine(t *tes
 		t.Errorf("node.LastApplied = %d, want 0 (markers must not move)", got)
 	}
 
-	// Once the step worker installs the snapshot, the same request succeeds.
+	// Once the step worker installs the snapshot, the SAME request succeeds.
 	installSnapshotIntoLog(t, node, node.Peer(), 100, 7)
 	if retryErr := p.recoverSnapshot(snapshotRequest{shardID: 1, replicaID: 1, node: node}); retryErr != nil {
 		t.Fatalf("retry after install failed: %v", retryErr)
@@ -219,7 +229,17 @@ func (s *signallingSnapshotter) RecoverFromSnapshot(ctx context.Context, r io.Re
 	return s.snapshotTestSnapshotter.RecoverFromSnapshot(ctx, r, stopper)
 }
 
-// TestSnapshotPool_Recovery_WaitsForInstallBeforeGatingStepWorker verifies the pool waits for the log to reach the snapshot before gating the step worker.
+// TestSnapshotPool_Recovery_WaitsForInstallBeforeGatingStepWorker pins the
+// gate ordering end to end. handleRequest raises the recovering flag on
+// dequeue, and the step worker skips a recovering node ENTIRELY — including
+// its inbox drain — so the InstallSnapshot that satisfies the committed check
+// could never be processed while a recovery was pending. The pool must
+// therefore wait for the log to reach the snapshot index BEFORE gating and
+// before the state machine is touched.
+//
+// The first phase publishes no log markers at all, so a worker that consults
+// the log before recovering keeps waiting, while a worker that recovers first
+// reaches the state machine and signals it.
 func TestSnapshotPool_Recovery_WaitsForInstallBeforeGatingStepWorker(t *testing.T) {
 	stopC := make(chan struct{})
 	defer close(stopC)

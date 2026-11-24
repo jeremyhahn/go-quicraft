@@ -20,11 +20,30 @@ import (
 	"testing"
 )
 
-// TestCheckDuplicate_RejectsEntryFromAPreviousIncarnation: an entry below the index that created a re-registered session's current incarnation is rejected, not applied again.
+// TestCheckDuplicate_RejectsEntryFromAPreviousIncarnation pins at-most-once
+// across session expiry and re-registration under the SAME clientID.
+//
+// Host.RegisterSession accepts a caller-supplied clientID — that is the
+// documented way a client survives its own restart with a stable ID. So this
+// sequence is reachable:
+//
+//  1. Client X proposes (X, series 7). The entry is appended but not committed.
+//  2. The leader changes; the client times out and stops. The entry survives
+//     in the log of the replicas that received it.
+//  3. X is idle past SessionExpiryEntries and its session expires — the same
+//     way on every replica, deterministically.
+//  4. X restarts and re-registers under the SAME persisted clientID. The new
+//     incarnation has respondedTo 0 and an empty response cache.
+//  5. The old entry finally commits under a later leader.
+//
+// At step 5 the stale entry looked brand new — series 7 > respondedTo 0, no
+// cached result — and was applied a SECOND time, on every replica, with no
+// error raised anywhere. The incarnation floor closes it: an entry below the
+// index that created the current incarnation belongs to a previous one.
 func TestCheckDuplicate_RejectsEntryFromAPreviousIncarnation(t *testing.T) {
 	m := NewManager(10, 10, 0)
 
-	// The client's first incarnation, registered at index 10, proposes at 20.
+	// The client's FIRST incarnation, registered at index 10, proposes at 20.
 	if err := m.Register(1, 0, 10); err != nil {
 		t.Fatalf("Register (first incarnation): %v", err)
 	}
@@ -36,7 +55,7 @@ func TestCheckDuplicate_RejectsEntryFromAPreviousIncarnation(t *testing.T) {
 		t.Fatalf("Register (second incarnation): %v", err)
 	}
 
-	// The stale entry from the first incarnation commits.
+	// The stale entry from the FIRST incarnation finally commits.
 	_, isDup, err := m.CheckDuplicate(1, 7, 20)
 	if !errors.Is(err, ErrSessionNotFound) {
 		t.Fatalf("CheckDuplicate for an entry from a previous incarnation "+
@@ -45,7 +64,7 @@ func TestCheckDuplicate_RejectsEntryFromAPreviousIncarnation(t *testing.T) {
 			"applied a second time on every replica", isDup, err)
 	}
 
-	// Control: an entry from the current incarnation is unaffected.
+	// The control: an entry from the CURRENT incarnation is unaffected.
 	if _, _, err := m.CheckDuplicate(1, 7, 5001); err != nil {
 		t.Fatalf("CheckDuplicate for the current incarnation returned %v; "+
 			"the floor must not reject live traffic", err)

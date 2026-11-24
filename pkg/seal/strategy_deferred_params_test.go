@@ -21,7 +21,11 @@ import (
 	"testing"
 )
 
-// TestKDFParams_RoundTripsEveryConstructor: KDFParams() reports the work factor each constructor was built with; sealed blobs record only the KDF version.
+// TestKDFParams_RoundTripsEveryConstructor pins that KDFParams() reports what
+// the strategy was actually built with, for every constructor that exists.
+//
+// The work factor is not recoverable any other way: a sealed blob records the KDF VERSION byte and nothing else, so the
+// live strategy object is the only place the number exists.
 func TestKDFParams_RoundTripsEveryConstructor(t *testing.T) {
 	restore := AllowWeakKDFParams()
 	defer restore()
@@ -104,7 +108,13 @@ func TestNewDeferredSoftwareStrategyWithParams_ComposesWithKDFParams(t *testing.
 	}
 }
 
-// TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal: a blob sealed at a non-default factor unseals only with that factor.
+// TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal makes
+// the assertion a defaults-only fixture cannot make: default-in/default-out passes whether params are preserved or
+// reset, so it proves nothing.
+//
+// A blob sealed at a NON-default work factor must unseal through a strategy
+// carrying that same factor, and must FAIL through one built at the defaults.
+// The second half is what distinguishes "preserved" from "reset".
 func TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal(t *testing.T) {
 	restore := AllowWeakKDFParams()
 	defer restore()
@@ -150,7 +160,9 @@ func TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal(t *tes
 		t.Fatalf("unsealed %d bytes, want %d", len(got), rootKeySize)
 	}
 
-	// Defaults must fail: a different factor derives a different wrapping key.
+	// Defaults: must FAIL. This is the half that catches a reset work factor —
+	// the blob's metadata records only the KDF version, so a strategy at the
+	// wrong factor derives a different wrapping key and AES-GCM refuses it.
 	reset := NewDeferredSoftwareStrategy()
 	defer reset.Close()
 	if reset.KDFParams() == tuned {
@@ -164,7 +176,14 @@ func TestDeferredStrategy_NonDefaultWorkFactorIsPreservedAcrossSealUnseal(t *tes
 	}
 }
 
-// TestNewDeferredSoftwareStrategyWithParams_FIPS: a -tags fips build returns ErrKDFUnsupportedVersion, runtime FIPS returns ErrKDFNotFIPSApproved.
+// TestNewDeferredSoftwareStrategyWithParams_FIPS pins the FIPS asymmetry
+// explicitly, so a consumer preserving a work factor cannot
+// compile everywhere and fail on the FIPS leg only.
+//
+// The two FIPS mechanisms give different errors, and both are the bound
+// constructors' behaviour exactly: a -tags fips BUILD has no Argon2id deriver
+// (ErrKDFUnsupportedVersion), while runtime FIPS in a build that has one refuses
+// it by policy (ErrKDFNotFIPSApproved).
 func TestNewDeferredSoftwareStrategyWithParams_FIPS(t *testing.T) {
 	restore := AllowWeakKDFParams()
 	defer restore()

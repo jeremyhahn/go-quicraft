@@ -5,7 +5,13 @@ import (
 	"testing"
 )
 
-// TestStampSealedStateMACLetsAnEmbedderRewrapTheRootKey checks a blob re-wrapped outside the barrier and stamped survives Unseal.
+// TestStampSealedStateMACLetsAnEmbedderRewrapTheRootKey covers the case the
+// method exists for: an embedder re-wraps the root key with its own strategy,
+// assembles the new blob outside the barrier, and needs it to survive its own
+// next Unseal.
+//
+// Without the stamp, the blob carries no StateMAC and Unseal refuses it -- the
+// same shape as a stripped MAC, which is why it fails closed.
 func TestStampSealedStateMACLetsAnEmbedderRewrapTheRootKey(t *testing.T) {
 	ctx := context.Background()
 	b, strategy := testInitializedBarrier(t)

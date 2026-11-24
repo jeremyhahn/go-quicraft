@@ -38,7 +38,12 @@ type NodeInfo struct {
 // ConnectionInfo contains connection event details.
 type ConnectionInfo struct {
 	Address string
-	// SnapshotConnection is always false: QuicRaft multiplexes snapshots over the one QUIC connection.
+	// SnapshotConnection indicates whether the connection is used for
+	// snapshot transfers. Known limitation: this field is always false
+	// in the QuicRaft adapter because QuicRaft multiplexes all traffic
+	// over a single QUIC connection and does not expose a per-connection
+	// snapshot indicator. Dragonboat's separate TCP snapshot connections
+	// have no direct equivalent in QuicRaft's transport model.
 	SnapshotConnection bool
 }
 
@@ -117,7 +122,11 @@ type ISystemEventListener interface {
 	LogDBCompacted(info EntryInfo)
 }
 
-// ConvertEventListeners wires dragonboat listener interfaces onto quicraft's EventListener; nil listeners add no callbacks.
+// ConvertEventListeners converts dragonboat event listener interfaces to
+// quicraft's EventListener struct. Each interface method is wired to the
+// corresponding function field on the EventListener, converting info types
+// between the two type systems. Nil listeners are handled gracefully by
+// omitting their callbacks.
 func ConvertEventListeners(raft IRaftEventListener, sys ISystemEventListener) *qcConfig.EventListener {
 	el := &qcConfig.EventListener{}
 
@@ -168,7 +177,17 @@ func ConvertEventListeners(raft IRaftEventListener, sys ISystemEventListener) *q
 		el.OnConnectionEstablished = func(info qcConfig.ConnectionInfo) {
 			sys.ConnectionEstablished(ConnectionInfo{
 				Address: info.Address,
-				// SnapshotConnection is always false: snapshots share the one QUIC connection.
+				// Known limitation: QuicRaft multiplexes all traffic
+				// (Raft messages and snapshots) over a single QUIC
+				// connection, so qcConfig.ConnectionInfo does not
+				// distinguish snapshot connections from regular ones.
+				// SnapshotConnection is always false in this adapter.
+				// Dragonboat users who rely on this field to filter
+				// connection events should be aware that snapshot
+				// connection events will appear as regular connection
+				// events. This does not affect correctness since
+				// snapshots are still transferred; only the event
+				// metadata differs.
 				SnapshotConnection: false,
 			})
 		}
@@ -176,7 +195,10 @@ func ConvertEventListeners(raft IRaftEventListener, sys ISystemEventListener) *q
 		el.OnConnectionFailed = func(info qcConfig.ConnectionInfo) {
 			sys.ConnectionFailed(ConnectionInfo{
 				Address: info.Address,
-				// SnapshotConnection is always false; see OnConnectionEstablished.
+				// Known limitation: see OnConnectionEstablished above.
+				// SnapshotConnection is always false because QuicRaft
+				// does not distinguish snapshot connections from regular
+				// Raft connections at the transport level.
 				SnapshotConnection: false,
 			})
 		}

@@ -138,7 +138,12 @@ func FuzzUnmarshalShareSet(f *testing.F) {
 	})
 }
 
-// FuzzUnmarshalShareSetWith decodes under a fuzzed 0-8 page enclave budget: refusals leave no reservation, accepted sets round-trip.
+// FuzzUnmarshalShareSetWith decodes through a real enclave allocator whose
+// budget, zero to eight pages, comes from the fuzz input, so budgets too small
+// for the set are fuzzed alongside ones that fit. On every input: no panic; a
+// refusal returns no shares and leaves no reservation behind; an accepted set
+// stays within the budget and round-trips; destroying it releases every
+// reservation.
 func FuzzUnmarshalShareSetWith(f *testing.F) {
 	_, sets := shareJSONFuzzSeeds(f)
 	for _, seed := range sets {

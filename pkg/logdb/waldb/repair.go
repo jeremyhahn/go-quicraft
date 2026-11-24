@@ -21,16 +21,62 @@ import (
 	"sort"
 )
 
-// Repair is the operator-run exit from a WAL that recovery refuses to open; it is never reachable from Open or an Option and destroys the records it cuts.
+// Operator-authorized repair of a WAL that recovery refuses to open.
+//
+// Recovery fails closed on ErrMidSegmentCorruption, ErrNonFinalSegmentCorruption,
+// ErrAcknowledgedDataLost and ErrRecordSequenceRegression. The first three mean
+// the same thing: acknowledged records lie in or above the damage — proved by a
+// durability generation above them, by the segment not being the highest-
+// numbered one, or by the survivors' generation start sitting above the damage
+// — so prefix-truncating would silently destroy committed entries and roll
+// term/vote backwards. The fourth means the bytes above the damage carry a
+// generation this writer cannot have produced, so recovery cannot classify them
+// at all. That posture is right, and nothing here changes it — Open still
+// refuses, every time, on its own.
+//
+// What it cannot be is the ONLY exit. An ordinary power loss does not arrive
+// here: a single fdatasync covers as many WriteAt calls as the batch had
+// blocks, writeback can persist an arbitrary subset of those pages, and losing
+// an interior page leaves decodable records above the damage — but every
+// surviving record carries the in-flight batch's generation, so recovery
+// truncates and boots (see segment.ReadAll).
+//
+// What does arrive here is damage below acknowledged data: bit rot, a
+// misdirected write, a lying fsync, tampering. Rare, and not explicable as an
+// interrupted write, but not impossible. "Restore from a peer" answers it for a replicated
+// shard and answers nothing at all for a single-node deployment, which would be
+// left with a node that will not start and no procedure that makes it start.
+//
+// Repair is that procedure. It is deliberately NOT reachable from Open, from an
+// Option, or from any configuration a node could carry into production by
+// accident: it is a separate call an operator makes by hand, naming the exact
+// shard, segment and offset from the error, having decided that losing the
+// records above that offset is preferable to not booting. Every guard below
+// exists to make sure the truncation that happens is the one that was
+// authorized and no other.
+//
+// The lost records are lost. This is data destruction with a signature on it,
+// not a recovery.
 
 // ErrRepairShardOutOfRange is returned when a RepairTarget names a shard index
 // outside [0, DefaultShardCount).
 var ErrRepairShardOutOfRange = errors.New("waldb: repair target names a shard index that does not exist")
 
-// ErrRepairNoCorruption is returned when the named segment scans cleanly to its end.
+// ErrRepairNoCorruption is returned when the named segment scans cleanly to its
+// end. There is nothing to repair, and truncating a healthy segment on an
+// operator's say-so would destroy data for no reason — most likely the target
+// was copied from a stale error, or a previous repair already ran.
 var ErrRepairNoCorruption = errors.New("waldb: the named WAL segment is not corrupt; nothing to repair")
 
-// ErrRepairOffsetMismatch is returned when TruncateAt is not the clean-prefix end the scan computes.
+// ErrRepairOffsetMismatch is returned when TruncateAt is not the clean-prefix
+// end the scan itself computes.
+//
+// This is the interlock that makes the API safe to expose: an operator cannot
+// pick an offset, only CONFIRM the one the WAL named. A mistyped or stale
+// offset is refused rather than applied, so the failure mode is a second look
+// at the error message instead of a segment cut at an arbitrary byte — which
+// would leave a half record at the end and, if the cut landed above the real
+// clean end, silently readmit the corrupt region on the next open.
 var ErrRepairOffsetMismatch = errors.New("waldb: repair offset is not the clean-prefix end of the named segment")
 
 // RepairTarget names exactly one truncation an operator authorizes. Every field
@@ -63,7 +109,24 @@ type RepairResult struct {
 	SegmentsDeleted []uint64
 }
 
-// Repair truncates a corrupt segment to its clean prefix and deletes the segments above it; run it with the database closed and the open-time block size.
+// Repair truncates one corrupt WAL segment to its clean prefix and deletes the
+// segments above it, making a WAL that recovery refuses to open openable again
+// at the cost of every record above TruncateAt.
+//
+// It is the documented exit from ErrMidSegmentCorruption,
+// ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost and
+// ErrRecordSequenceRegression. It must be run with the database CLOSED — no
+// process may hold the directory — and the node it belongs to should be treated
+// as having lost its most recent writes until it has caught up from its peers.
+// On a single-node deployment there is nothing to catch up from and the loss is
+// final.
+//
+// The opts are the same options the DB is opened with; only the filesystem and
+// the block size are consulted, and the block size MUST match the one the
+// directory was written with or the scan reports a clean end computed on the
+// wrong grid. No barrier is needed: the scan works at the CRC framing level and
+// never decrypts a record, so a sealed or unavailable barrier does not stand
+// between an operator and a bootable node.
 func Repair(dir string, target RepairTarget, opts ...Option) (RepairResult, error) {
 	o := defaultDBOptions()
 	for _, opt := range opts {
@@ -72,7 +135,12 @@ func Repair(dir string, target RepairTarget, opts ...Option) (RepairResult, erro
 	if target.ShardIndex < 0 || target.ShardIndex >= DefaultShardCount {
 		return RepairResult{}, ErrRepairShardOutOfRange
 	}
-	// Enforce the same geometry rule as Open.
+	// Hold the repair to the same geometry rule Open enforces. A repair run
+	// under the wrong block size scans a grid the segment was not written on,
+	// so the clean end it computes is meaningless — and this is the one code
+	// path whose entire job is to truncate at that number. The offset interlock
+	// would catch it as a mismatch, but reporting the real cause beats making
+	// an operator wonder why the offset from the error is being rejected.
 	if err := checkRepairGeometry(o, dir); err != nil {
 		return RepairResult{}, err
 	}
@@ -108,7 +176,17 @@ func Repair(dir string, target RepairTarget, opts ...Option) (RepairResult, erro
 		"segments_deleted", orphans,
 	)
 
-	// Remove the segments above first and make it durable, then cut the named segment, so a crash leaves a repeatable repair.
+	// High to low, for the same reason recovery repairs in that order: the
+	// segments above the truncation point go first and their unlinks are made
+	// durable (discardSegmentsAbove fsyncs the directory and reports a failure
+	// to do so), and only then is the named segment cut. A crash between the two
+	// leaves the corrupt segment still corrupt, so a re-run of the repair finds
+	// the same clean end and does the same thing. Cutting first would leave a
+	// segment that ends at a clean record boundary with CRC-valid segments still
+	// sitting above it, and the next recovery would replay straight through both
+	// — readmitting exactly the records the operator authorized destroying, with
+	// a hole where the cut was. That is the double-vote case syncDirFS exists
+	// for, arrived at from the one code path an operator drives by hand.
 	if err := shard.discardSegmentsAbove(orphans); err != nil {
 		return RepairResult{}, err
 	}
@@ -147,7 +225,14 @@ func checkRepairGeometry(o dbOptions, dir string) error {
 	return nil
 }
 
-// repairShard builds the minimal walShard for the recovery truncation primitives.
+// repairShard builds the minimum walShard the repair primitives need.
+//
+// truncateCorruptSegment and discardSegmentsAbove are the SAME code recovery
+// uses for a legal torn tail, and reusing them is the point: an operator repair
+// must leave the directory in a state recovery would itself have produced, down
+// to the fsync of the file and of the shard directory. Only the fields those
+// two touch are populated; the shard is never published to a DB, never written
+// to, and does not outlive the call.
 func repairShard(o dbOptions, shardDir string, idx int) *walShard {
 	return &walShard{
 		fs:            o.fs,

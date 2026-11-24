@@ -12,7 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Adversarial coverage for the raft state machine: every fuzzed message is OriginRemote, as a wire peer would send; fuzz targets are in fuzz_test.go and the seed corpus runs as a unit test.
+// Adversarial / property-based coverage for the raft state machine.
+//
+// The defect class this file targets is the one soak testing structurally
+// cannot find: a WELL-FORMED but hostile message that a peer is authenticated
+// to send. Two shipped criticals were of exactly this shape -- a forged wire
+// InstallSnapshot carrying Term 0 and a full Membership, and a term-less
+// local-control type accepted from the wire -- and both were found by reading
+// code, not by running it under fault injection.
+//
+// pkg/internal/raft is a pure deterministic state machine (messages in,
+// messages out, no I/O), which makes it directly fuzzable. This file holds
+// the harness and the safety-invariant checker; the go-native fuzz targets
+// that drive it live in fuzz_test.go behind the quicraft_fuzz build tag, and
+// the seed corpus below is replayed as an ordinary unit test so the same
+// assertions run in CI on every `go test ./pkg/...`.
+//
+// THE ATTACKER MODEL IS THE ORIGIN STAMP. Every message the harness steps is
+// proto.OriginRemote, because that is the only thing a wire peer can produce:
+// proto.MessageOrigin is process-local state that the wire format cannot
+// express, so OriginLocal is unreachable from the network by construction.
+// Everything else in the message -- type, term, indices, entries, and the
+// snapshot's entire Membership -- is chosen by the fuzzer.
 
 package raft
 
@@ -33,7 +54,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Fuzzer input grammar: fuzzStream decodes bytes into operations, and fuzzEncoder is its inverse.
+// --------------------------------------------------------------------------
+// Fuzzer input grammar
+//
+// The byte stream a fuzzer hands us is decoded into a sequence of operations
+// by fuzzStream. The grammar is deliberately INVERTIBLE (see the fuzzEncoder
+// below) so that a seed corpus entry can be written as readable Go rather
+// than as a hex blob, and so a reported crash can be decoded back into the
+// message sequence that produced it.
+// --------------------------------------------------------------------------
 
 // fuzzStream decodes a fuzzer-supplied byte slice into raft operations.
 // Reads past the end of the slice yield zero, so a truncated input decodes
@@ -71,7 +100,18 @@ var fuzzExtremeValues = [...]uint64{
 	math.MaxInt64,
 }
 
-// u64 decodes one uint64: tag 0 is 0, 1 one byte, 2 eight big-endian bytes, 3 an extreme value, >= 4 is tag-4.
+// u64 decodes one uint64. The encoding is biased toward the small dense
+// values the state machine actually distinguishes (terms and indices in a
+// short synthetic log) while still reaching byte-scale, boundary, and fully
+// arbitrary 64-bit values.
+//
+// Encoding (see fuzzEncoder.u64 for the inverse):
+//
+//	tag 0x00       -> 0
+//	tag 0x01 b     -> uint64(b)
+//	tag 0x02 b0..7 -> big-endian uint64
+//	tag 0x03 b     -> fuzzExtremeValues[b % len]
+//	tag >= 0x04    -> uint64(tag - 4), i.e. 0..251
 func (s *fuzzStream) u64() uint64 {
 	tag := s.next()
 	switch tag {
@@ -167,7 +207,14 @@ const (
 // fire. A burst crosses them in one operation.
 const fuzzMaxTickBurst = 32
 
-// fuzzLiveState is the replica's view when a message is decoded; the align byte snaps fields onto it so accept paths are reachable.
+// fuzzLiveState is the replica's own view at the moment a message is decoded.
+// It is what the align byte (see message) snaps fields onto.
+//
+// Without it the fuzzer is a pure black box and essentially every Replicate
+// is refused by the log-matching check, so the ACCEPT paths -- append,
+// truncate, commit, elect -- stay unreachable and the invariants are checked
+// only over refusals. A real attacker observes the exchange and constructs
+// messages that fit; the align byte gives the fuzzer that same capability.
 type fuzzLiveState struct {
 	term       uint64
 	committed  uint64
@@ -196,7 +243,12 @@ const (
 	alignTermCurrent = 0x01 // Term = current term
 	alignTermNext    = 0x02 // Term = current term + 1
 	alignLogToLast   = 0x04 // (LogIndex, LogTerm) = log tail
-	// alignLogToCommit anchors the append at the commit frontier with a matching term, so the truncation path is reachable.
+	// alignLogToCommit anchors the append at the commit frontier. It sets the
+	// term too: without a matching prevLogTerm the append is refused by the
+	// log-matching check, and the TRUNCATION path -- where a conflicting
+	// batch replaces the uncommitted tail -- is then unreachable. That path
+	// is where a stale commit index turns into a State Machine Safety
+	// violation, so it has to be reachable.
 	alignLogToCommit = 0x08
 
 	alignCommitCurrent = 0x10 // Commit = commit index
@@ -322,7 +374,10 @@ func (s *fuzzStream) snapshot(shardID uint64) proto.Snapshot {
 	}
 	ss.Membership.ConfigChangeID = s.u64()
 	ss.Membership.MaxWitnesses = s.u64()
-	// The flags byte is always consumed; bit 0x04 is retired, and skipping it would shift the stored corpus.
+	// The flags byte is still CONSUMED in full even though only bit 0x01 is
+	// assigned: bit 0x04 is a retired flag.
+	// Skipping the read instead would shift every following field by one byte
+	// and make the stored corpus decode into a different message sequence.
 	flags := s.next()
 	ss.Membership.RequireFullReplicaMajority = flags&0x01 != 0
 	ss.Membership.Addresses = s.idMap()
@@ -572,9 +627,18 @@ func configFingerprint(r *raft) string {
 type raftInvariants struct {
 	// prev is the observation from the previous step.
 	prev raftObservation
-	// baseConfig is the starting configuration, which wire-only messages must never change.
+	// baseConfig is the configuration the replica started with. Under a
+	// wire-only message sequence it must never change: membership mutates
+	// only on a COMMITTED config change (Peer.Commit -> processConfigChanges,
+	// which this harness never drives) or on a snapshot raft legitimately
+	// adopted -- and a wire InstallSnapshot is refused outright.
 	baseConfig string
-	// ledTerms records the terms this replica led, the local witness to Election Safety.
+	// ledTerms records the terms in which THIS replica held leadership. It is
+	// the local witness to Election Safety: combined with vote stability it
+	// says the replica never leads a term it voted away, and it is asserted
+	// against the leader-side branch of check. It deliberately does NOT drive
+	// a "second leader in this term" assertion -- see check for why that one
+	// is outside Raft's failure model.
 	ledTerms map[uint64]bool
 	// votes records the vote cast in each term.
 	votes map[uint64]uint64
@@ -622,7 +686,18 @@ func (inv *raftInvariants) check(tb testing.TB, r *raft, label string) {
 		fatal("commit index regressed %d -> %d", prev.committed, cur.committed)
 	}
 
-	// A replica must never commit past its last index, except while a snapshot is pending within a step.
+	// A replica must never claim to have committed an entry it does not
+	// hold: getConflictIndex treats every index at or below committed as
+	// unable to conflict, so a commit index above lastIndex turns into a
+	// NON-rejecting ReplicateResp for entries this replica has nothing for,
+	// and the leader counts that phantom match toward quorum.
+	//
+	// The exception is exact and narrow: raftLog.restore fast-forwards
+	// committed to the snapshot index while the LogReader has not yet been
+	// told about the snapshot (the engine does that at the persistence
+	// edge). While a snapshot is pending, lastIndex() still reports the old
+	// LogDB range. The harness closes that window itself after every step
+	// (see settlePendingSnapshot), so this only tolerates the in-step state.
 	if cur.committed > cur.lastIndex && r.log.pendingSnapshot() == nil {
 		fatal("commit index %d exceeds last index %d", cur.committed, cur.lastIndex)
 	}
@@ -654,7 +729,26 @@ func (inv *raftInvariants) check(tb testing.TB, r *raft, label string) {
 		fatal("quorum collapsed to %d", cur.quorum)
 	}
 
-	// Local Election Safety: a leader's leaderID and vote are itself; stepping down within a term is legal.
+	// Election Safety, in the form a single replica can actually enforce.
+	//
+	// "No two leaders in one term" is a statement about the CLUSTER, and a
+	// replica cannot check it directly: a peer that claims leadership at a
+	// term it did not win is outside Raft's failure model, and every
+	// reference implementation (etcd/raft stepFollower, dragonboat) adopts
+	// m.From as the leader unconditionally. What a replica CAN enforce is
+	// the local half -- it never holds leadership of a term it did not win
+	// for itself:
+	//
+	//   leader => leaderID == self, AND leader => vote == self.
+	//
+	// Combined with vote stability below, that is exactly "this replica
+	// never leads a term it voted away", which is the local precondition
+	// the cluster-wide property is built out of.
+	//
+	// Note that LOSING leadership within a term is legal and expected:
+	// CheckQuorum steps a leader that has lost contact with a quorum down to
+	// follower at the SAME term (Raft thesis p.42, etcd/raft
+	// becomeFollower(r.Term, None)), so role is not an invariant of the term.
 	if cur.role == leader {
 		if cur.leaderID != r.replicaID {
 			fatal("leader records leaderID %d, not self %d", cur.leaderID, r.replicaID)
@@ -711,7 +805,10 @@ func (inv *raftInvariants) checkOutbound(tb testing.TB, r *raft, label string) {
 			tb.Fatalf("%s: outbound %s carries no term; every peer will drop it",
 				label, proto.MessageTypeName(m.Type))
 		}
-		// A non-rejecting ReplicateResp must not acknowledge an index the log cannot produce.
+		// A non-rejecting ReplicateResp is the leader's evidence that this
+		// replica HOLDS everything through LogIndex; the leader counts it
+		// toward the commit quorum. Acknowledging an index the log cannot
+		// produce is the phantom-match defect.
 		if m.Type == proto.ReplicateResp && !m.Reject && m.LogIndex > 0 {
 			if m.LogIndex > r.log.lastIndex() && r.log.pendingSnapshot() == nil {
 				tb.Fatalf("%s: acknowledged index %d beyond last index %d",
@@ -763,7 +860,12 @@ func newAdversarialRaft(tb testing.TB) (*raft, *testLogReader) {
 	return r, lr
 }
 
-// settlePendingSnapshot registers and acknowledges an accepted snapshot, as Peer.Commit does.
+// settlePendingSnapshot mirrors what the engine does at the persistence edge
+// (Peer.Commit): a snapshot raft accepted is registered with the LogReader
+// and then acknowledged, which clears it from the in-memory log. Without this
+// the harness would leave the log in the transient state where committed is
+// ahead of the LogReader's range indefinitely, and the invariant that catches
+// a phantom commit index would be permanently suppressed.
 func settlePendingSnapshot(r *raft, lr *testLogReader) {
 	ss := r.log.pendingSnapshot()
 	if ss == nil {
@@ -775,7 +877,10 @@ func settlePendingSnapshot(r *raft, lr *testLogReader) {
 	r.log.commitUpdate(proto.UpdateCommit{StableSnapshotTo: ss.Index})
 }
 
-// fuzzPersist acknowledges the leader's durable index, as the engine's fsync ack does.
+// fuzzPersist mirrors the engine's fsync ack: the leader's own match index is
+// its DURABLE index, so without this no commit can ever advance and the whole
+// commit path stays unreachable. It is the local-capability half of the
+// harness; everything the fuzzer controls arrives over the wire.
 func fuzzPersist(r *raft) {
 	last := r.log.lastIndex()
 	if last == 0 || last <= r.log.inmem.savedTo {
@@ -803,7 +908,13 @@ func quietLogs(tb testing.TB) {
 	tb.Cleanup(func() { slog.SetDefault(prev) })
 }
 
-// electSelf elects the replica through ordinary pre-vote and vote grants, so the leader-side handlers are exercised.
+// electSelf drives the replica to leadership through the ordinary protocol:
+// its election timer fires, and its two configured peers grant the pre-vote
+// and the vote. Nothing here is privileged -- the grants are wire messages of
+// exactly the kind a peer sends -- but the sequence is far too specific for a
+// black-box byte stream to hit reliably, and without it the entire leader-side
+// half of the state machine (handleAppendResp, tryCommit, ReadIndex quorum,
+// snapshot status, leader transfer) is never exercised.
 func electSelf(r *raft) {
 	for i := 0; i < 4*len(fuzzExtremeValues)*8 && r.state != leader; i++ {
 		switch r.state {
@@ -835,7 +946,11 @@ func electSelf(r *raft) {
 	r.drainMessages()
 }
 
-// harnessCoverage counts the raft behaviours a run reached; TestAdversarialStepSweep asserts on it.
+// harnessCoverage counts the raft behaviours a run actually reached. A
+// harness that never elects a leader, never accepts an append and never
+// advances a commit index proves nothing no matter how many inputs it runs,
+// and that failure mode is SILENT -- every assertion passes. It is asserted
+// against in TestAdversarialStepSweep.
 type harnessCoverage struct {
 	roles             map[roleState]int
 	committedAdvanced int
@@ -872,7 +987,14 @@ func (c *harnessCoverage) record(r *raft) {
 	}
 }
 
-// runAdversarialStepSequence decodes data into operations, applies them to a fresh replica and checks every invariant; the first byte picks follower or leader.
+// runAdversarialStepSequence is the body shared by the fuzz target and the
+// seed-corpus unit test. It decodes data into an operation sequence, applies
+// it to a freshly built replica, and asserts every safety invariant after
+// each operation.
+//
+// The first byte selects the starting role. Half the inputs therefore attack
+// a follower and half attack a leader; the two halves reach disjoint handler
+// sets, and the leader half is where a forged response turns into a commit.
 func runAdversarialStepSequence(tb testing.TB, data []byte) {
 	tb.Helper()
 	runAdversarialStepSequenceCov(tb, data, nil)
@@ -952,7 +1074,12 @@ type adversarialSeed struct {
 	data []byte
 }
 
-// adversarialSeeds is the shared seed corpus, each seed run against a follower and a pre-elected leader.
+// adversarialSeeds is the seed corpus shared by the fuzz target and the
+// unit test. The first two entries are the shipped criticals.
+//
+// Every seed is emitted twice, once against a follower and once against a
+// pre-elected leader, because the two roles dispatch on disjoint message sets
+// and a message the follower ignores may be the one the leader acts on.
 func adversarialSeeds() []adversarialSeed {
 	var seeds []adversarialSeed
 	add := func(name string, build func(e *fuzzEncoder)) {
@@ -968,7 +1095,12 @@ func adversarialSeeds() []adversarialSeed {
 		}
 	}
 
-	// A forged wire InstallSnapshot at Term 0 with a full membership and a huge ConfigChangeID.
+	// FINDING 1 (critical, shipped): a forged wire InstallSnapshot carrying
+	// Term 0 rewrote the shard's membership. Term 0 was the local-injection
+	// escape hatch, so the message bypassed every term comparison, and
+	// handleSnapshot's non-matching branch feeds ss.Membership straight into
+	// rebuildRemotesFromMembership -- the set quorum() is computed over. The
+	// huge ConfigChangeID makes the forged configuration look newest.
 	add("forged-install-snapshot-term0", func(e *fuzzEncoder) {
 		e.step(seedMessage{
 			Type: proto.InstallSnapshot,
@@ -986,7 +1118,9 @@ func adversarialSeeds() []adversarialSeed {
 		})
 	})
 
-	// The same forgery at a plausible term, stopped by the origin check alone.
+	// The same forgery at a PLAUSIBLE term. The zero-term gate does not
+	// apply here, so this is the variant that has to be stopped by the
+	// process-local origin check alone.
 	add("forged-install-snapshot-live-term", func(e *fuzzEncoder) {
 		e.step(seedMessage{
 			Type: proto.InstallSnapshot,
@@ -1002,7 +1136,10 @@ func adversarialSeeds() []adversarialSeed {
 		})
 	})
 
-	// A term-less local-control message type sent over the wire.
+	// FINDING 2 (critical, shipped): a term-less local-control type accepted
+	// from the wire. Nothing forwards these between replicas, so a peer
+	// naming one is claiming to be this host's own transport or admin API,
+	// and no term, log, or quorum check constrains them.
 	add("wire-local-control-types", func(e *fuzzEncoder) {
 		for _, t := range []uint64{
 			proto.SnapshotStatus, proto.Unreachable, proto.LeaderTransfer, proto.InstallSnapshot,
@@ -1174,7 +1311,18 @@ func sweepInput(rng *mathrand.Rand, buf []byte) []byte {
 	return chunk
 }
 
-// TestAdversarialStepSweep runs a fixed-seed sweep of the grammar and asserts each interesting behaviour was reached.
+// TestAdversarialStepSweep is the deterministic property test: a fixed-seed
+// pseudo-random sweep of the same input grammar. It runs in CI on every
+// commit and covers the space between the hand-written seeds without
+// requiring -fuzz.
+//
+// It is also the anti-vacuity gate. An adversarial harness whose inputs are
+// all refused at the front door asserts nothing: every invariant holds
+// trivially over a state machine that never changed state. That failure is
+// invisible -- the suite is green -- so the reachability of each interesting
+// behaviour is asserted explicitly over the inputs the sweep ran, and a
+// change to the grammar, the config, or the step path that stops reaching
+// them fails this test instead of silently hollowing out the fuzzer.
 func TestAdversarialStepSweep(t *testing.T) {
 	quietLogs(t)
 	const iterations = 3000

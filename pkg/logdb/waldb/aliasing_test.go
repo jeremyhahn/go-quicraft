@@ -39,7 +39,18 @@ func snapshotWithMembership(index uint64) logdb.Snapshot {
 	}
 }
 
-// TestSaveSnapshot_DoesNotAliasCallerMaps: SaveSnapshot keeps its own copy of the caller's maps.
+// TestSaveSnapshot_DoesNotAliasCallerMaps pins the ownership contract on the
+// WRITE side.
+//
+// waldb keeps an in-memory record of the latest snapshot per node and serves
+// it from GetSnapshot. Staging the caller's value verbatim meant retaining the
+// caller's maps, so the owning layer could mutate a record waldb had already
+// reported as persisted — no write, no error, and the mutation visible to
+// every subsequent reader.
+//
+// memdb has deep-copied since it was written. These are two implementations of
+// one LogDB interface, so the asymmetry made code correct against the test
+// backend wrong against the production one.
 func TestSaveSnapshot_DoesNotAliasCallerMaps(t *testing.T) {
 	db := openTestDB(t)
 	defer func() { _ = db.Close() }()
@@ -73,7 +84,9 @@ func TestSaveSnapshot_DoesNotAliasCallerMaps(t *testing.T) {
 	}
 }
 
-// TestGetSnapshot_DoesNotAliasStoredMaps: mutating a returned snapshot does not change the stored one.
+// TestGetSnapshot_DoesNotAliasStoredMaps pins the same contract on the READ
+// side. A caller handed a value may reasonably mutate it; doing so must not
+// rewrite the record waldb still serves to everyone else.
 func TestGetSnapshot_DoesNotAliasStoredMaps(t *testing.T) {
 	db := openTestDB(t)
 	defer func() { _ = db.Close() }()

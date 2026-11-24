@@ -5,7 +5,12 @@ import (
 	"testing"
 )
 
-// TestFits_NoOverflowNearMaxInt checks the decoder's bound check does not overflow int near math.MaxInt on any architecture.
+// TestFits_NoOverflowNearMaxInt pins the decoder's bound check against int
+// overflow on every architecture. The old form, off+n > total, wraps to a
+// negative sum for off near math.MaxInt and accepts an out-of-range span; the
+// regression inputs that drive DecodeBatch can only reach that on a 32-bit
+// int, so this calls the helper directly with values that overflow a 64-bit
+// int as well.
 func TestFits_NoOverflowNearMaxInt(t *testing.T) {
 	cases := []struct {
 		name          string

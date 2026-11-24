@@ -673,7 +673,16 @@ func TestSplitProtected_RandomnessFailure(t *testing.T) {
 	}
 }
 
-// TestNewProtectedShare_RejectsOversizedValue pins the length bound that precedes any mlock'd allocation.
+// TestNewProtectedShare_RejectsOversizedValue pins the locked-memory bound.
+//
+// A value made of arbitrarily many legal base64 characters is syntactically
+// perfect, so the alphabet check passes it: only the length bound stands
+// between an unauthenticated submission and an mlock'd allocation of the
+// submitter's choosing. That matters more here than on the string path —
+// RLIMIT_MEMLOCK is a finite PROCESS-WIDE resource, so what the submission takes
+// is denied to every other caller — and parseRawShare's MaxSecretBytes check is far too
+// late, since it only sees the payload after CombineProtected has already
+// locked it.
 func TestNewProtectedShare_RejectsOversizedValue(t *testing.T) {
 	// One base64 quantum past the largest share this package can produce.
 	oversized := bytes.Repeat([]byte("A"), maxProtectedValueBytes+4)
@@ -803,7 +812,12 @@ func TestUnmarshalShareSet_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestUnmarshalShareSet_BoundsTheSetBeforeAllocating pins that an oversized set is refused before any locked buffer exists.
+// TestUnmarshalShareSet_BoundsTheSetBeforeAllocating covers the collection-level
+// resource bound. Each element below is individually legal — the per-value
+// bound has nothing to say about any of them — and it is the SET that must be
+// refused, before the first locked buffer exists: locked memory is a finite
+// process-wide resource, so an unauthenticated submission must not get to choose how much of
+// it to take.
 func TestUnmarshalShareSet_BoundsTheSetBeforeAllocating(t *testing.T) {
 	small := base64.StdEncoding.EncodeToString([]byte{shareFormatVersion, 0x01, 0xab})
 	// Individually legal at exactly the per-share maximum: it takes only 13 of
@@ -905,7 +919,12 @@ func repeatValue(value string, n int) []string {
 	return values
 }
 
-// TestCombineProtected_MatchesCombineBytes pins the streaming reconstruction against the reference interpolation.
+// TestCombineProtected_MatchesCombineBytes pins the two-pass reconstruction
+// against the reference path. CombineProtected folds each share in as it
+// decodes it, reusing one buffer, rather than holding a decoded copy of every
+// share — the peak locked footprint of a reconstruction must not be
+// proportional to the size of the submitted set. The arithmetic must be
+// identical to the all-at-once interpolation regardless.
 func TestCombineProtected_MatchesCombineBytes(t *testing.T) {
 	for _, secretLen := range []int{1, 2, 31, 32, 33, 1024} {
 		secret := make([]byte, secretLen)
@@ -976,7 +995,12 @@ func TestCombineProtected_ReusedBufferDoesNotLeakBetweenShares(t *testing.T) {
 	}
 }
 
-// TestSplitProtected_RefusesUnlockableCombinations pins the size-times-count bound, checked before any allocation.
+// TestSplitProtected_RefusesUnlockableCombinations covers the cross product the
+// per-dimension bounds miss: a secret size and a share count that are each
+// legal on their own and multiply into a footprint no host can lock. The check
+// is arithmetic and runs before the first allocation, so this test proves the
+// rejection without depending on the host's RLIMIT_MEMLOCK — nothing is
+// allocated on the way to the error.
 func TestSplitProtected_RefusesUnlockableCombinations(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -1046,7 +1070,21 @@ func TestSplitProtected_AcceptsRealCeremonies(t *testing.T) {
 	}
 }
 
-// TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize pins MaxShareSetBytes as a page budget at 4, 16 and 64 KiB pages.
+// TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize pins MaxShareSetBytes as a
+// page budget.
+//
+// A fixed 2 << 20 is 512 pages on a 4 KiB-page host and on no other. Every
+// figure in the derivation is a page count, so stating it in the bytes of one
+// particular host would make the primitive's headline case — the 255-share
+// split of a 32-byte root key — fail everywhere else: the same 260 pages is
+// 4,259,840 bytes at 16 KiB and 17,039,360 at 64 KiB, both refused by a 2 MiB
+// cap. RHEL and CentOS Stream arm64 ship 64 KiB pages, and CI is amd64-only,
+// so no gate would see it.
+//
+// The test does not need a big-page host, because the quantity that matters is
+// page-size independent. It takes the footprint the REAL implementation prices
+// — no second copy of the formula here — converts it to pages using this host's
+// page size, and then asserts the budget holds at 4 KiB, 16 KiB and 64 KiB.
 func TestMaxShareSetBytesIsAPageBudgetAtEveryPageSize(t *testing.T) {
 	page := lockedBytes(1)
 	if page <= 0 {

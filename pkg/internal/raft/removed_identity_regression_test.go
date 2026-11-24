@@ -21,7 +21,20 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// A removal retains the departing member's identity as a deterministic tombstone that survives a snapshot round trip.
+// ---------------------------------------------------------------------------
+// A removal must RETAIN the departing member's identity
+//
+// Deleting it along with the member would leave nothing in replicated state for
+// the receive-side deny-list to evaluate against the AUTHENTICATED peer
+// identity, so the gate could only ever consult the CLAIMED msg.From — which a removed replica evades by naming a different replica ID,
+// while still holding the private key that authenticates it perfectly well.
+//
+// The tests below pin the three properties that make the retained fact usable:
+// it is recorded, it is deterministic (so replicas cannot diverge over it), and
+// it SURVIVES a snapshot round trip like every other membership fact. The last
+// one is not decoration: a tombstone that vanishes on restore is a tombstone
+// that reopens the hole at the next restart.
+// ---------------------------------------------------------------------------
 
 const (
 	testRemovedIdentity = "spki:" +
@@ -75,7 +88,10 @@ func TestRemoveNode_RetainsTheDepartingIdentityAsATombstone(t *testing.T) {
 	}
 }
 
-// TestRemoveNode_TombstoneLookupIsByIdentityNotByClaimedID checks the lookup takes the identity, not a replica ID.
+// TestRemoveNode_TombstoneLookupIsByIdentityNotByClaimedID pins what the
+// receive path actually asks: the question is "is THIS identity removed", with
+// no replica ID involved, because the replica ID is the field the attacker
+// controls.
 func TestRemoveNode_TombstoneLookupIsByIdentityNotByClaimedID(t *testing.T) {
 	m := identityMembership()
 	if err := m.apply(proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}, 10); err != nil {
@@ -102,7 +118,11 @@ func TestRemoveNode_TombstoneLookupIsByIdentityNotByClaimedID(t *testing.T) {
 	}
 }
 
-// TestRemoveNode_IdentitylessMemberRecordsNoTombstone checks a member with no identity leaves no tombstone.
+// TestRemoveNode_IdentitylessMemberRecordsNoTombstone pins the address-only
+// RESIDUAL as a property rather than a comment. A member with no committed
+// identity leaves no tombstone identity behind, because there is nothing to
+// retain — so on such a shard the removal deny-list remains what it always was,
+// a check on the claimed msg.From, and no replicated fact can close it.
 func TestRemoveNode_IdentitylessMemberRecordsNoTombstone(t *testing.T) {
 	m := identityMembership()
 	// Replica 3 was never given an identity.
@@ -156,7 +176,14 @@ func TestRemoveNode_IsUnconditionalAndDeterministic(t *testing.T) {
 	}
 }
 
-// TestRemovedIdentities_SurviveASnapshotRoundTrip checks tombstones survive the snapshot encode, decode and adopt path.
+// TestRemovedIdentities_SurviveASnapshotRoundTrip is the restore half, and it
+// is the one that decides whether any of this is durable.
+//
+// The path exercised is the real one: mutable membership -> published snapshot
+// -> proto.Membership -> marshaled bytes -> decoded proto.Membership -> a fresh
+// membership built the way a snapshot adopt builds one (raft.Peer.Handle ->
+// newMembership). A break anywhere in that chain leaves a restored replica
+// enforcing an empty deny-list while every peer enforces a full one.
 func TestRemovedIdentities_SurviveASnapshotRoundTrip(t *testing.T) {
 	origin := identityMembership()
 	if err := origin.apply(proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}, 10); err != nil {
@@ -202,7 +229,15 @@ func TestRemovedIdentities_SurviveASnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-// TestValidateAdd_RefusesAReAddOfARemovedIdentity checks an add reusing a removed keypair under a new ID is refused at propose time.
+// TestValidateAdd_RefusesAReAddOfARemovedIdentity pins the ergonomic half of
+// "never evict".
+//
+// The tombstone is on the IDENTITY, not on the replica ID it was bound to, and
+// the deny-list refuses that keypair's traffic whatever ID it presents. So an
+// add that reuses a removed replica's keypair under a FRESH replica ID would
+// commit successfully and then be black-holed by every peer: a voter counted in
+// every quorum that can never be heard from, which is worse than a refused
+// config change. It must be refused at PROPOSE time, where a refusal is safe.
 func TestValidateAdd_RefusesAReAddOfARemovedIdentity(t *testing.T) {
 	m := identityMembership()
 	if err := m.apply(proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}, 10); err != nil {
@@ -232,7 +267,9 @@ func TestValidateAdd_RefusesAReAddOfARemovedIdentity(t *testing.T) {
 		}
 	}
 
-	// Control: a fresh keypair at a fresh ID is allowed, as is reusing the departed address.
+	// POSITIVE CONTROL: a fresh keypair at a fresh replica ID is fine, and so is
+	// reusing the departed replica's ADDRESS. Recycling hardware stays legal;
+	// only recycling the private key does not.
 	fresh := proto.ConfigChange{
 		Type:         proto.AddNode,
 		ReplicaID:    77,

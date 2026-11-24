@@ -40,7 +40,13 @@ const (
 // This is injectable for testing without requiring actual disk operations.
 type DiskUsageFunc func(dir string) (usedBytes uint64, err error)
 
-// DiskMonitor checks disk usage every N writes and fires callbacks when thresholds are crossed.
+// DiskMonitor periodically checks disk usage and fires callbacks when
+// configured thresholds are exceeded. Checks are throttled to every N
+// writes to avoid syscall overhead on every WAL write.
+//
+// Thread safety: all fields are either immutable after construction or
+// use atomic operations. MaybeCheck is safe to call from multiple
+// goroutines concurrently.
 type DiskMonitor struct {
 	dir        string
 	maxBytes   uint64
@@ -56,10 +62,16 @@ type DiskMonitor struct {
 	lastWarning atomic.Bool
 	lastFull    atomic.Bool
 
-	// mu serializes check, so the published state is the latest sample's.
+	// mu serializes check: the sample, the lastFull/lastWarning transition,
+	// the onSample publication and the queueing of the sample's callbacks,
+	// so the state last published is the one from the latest sample.
+	// MaybeCheck reads lastFull without it.
 	mu sync.Mutex
 
-	// notifyMu guards pending and draining; callbacks run in sample order with neither lock held.
+	// notifyMu guards pending and draining. The callbacks of each sample
+	// are queued under mu, in sample order, and run by one draining caller
+	// at a time with neither lock held, so a callback may sample this
+	// monitor again: its own callbacks are queued and run after it returns.
 	notifyMu sync.Mutex
 	pending  []func()
 	draining bool
@@ -96,7 +108,14 @@ func WithFullPercent(pct float64) DiskMonitorOption {
 	}
 }
 
-// WithCheckEvery sets the writes between disk usage checks; zero is rejected.
+// WithCheckEvery sets the number of writes between disk usage checks.
+//
+// Zero is rejected, not honored: MaybeCheck samples with count%checkEvery, so a
+// zero interval divides by zero and panics the commit worker on the first
+// monitored write — a configuration typo would take the node down at runtime
+// rather than at setup. It is not read as "check every write" either; that is
+// WithCheckEvery(1), and silently turning a typo into a statfs on every WAL
+// write would be its own outage. Zero falls back to DefaultCheckEvery.
 func WithCheckEvery(n uint64) DiskMonitorOption {
 	return func(dm *DiskMonitor) {
 		if n == 0 {
@@ -118,14 +137,23 @@ func WithOnWarning(fn func(used, maxBytes uint64)) DiskMonitorOption {
 	}
 }
 
-// WithOnFull sets the callback run, with used and maxBytes, when usage crosses the full threshold.
+// WithOnFull sets the callback invoked when usage crosses the full
+// threshold. The callback receives the current used and maxBytes bytes. It
+// runs after the monitor's mutex is released, in sample order with the
+// warning and recovery callbacks, so it may call back into this monitor
+// (free space, then ForceCheck to verify recovery); the callbacks of a sample
+// taken from inside it run after it returns.
 func WithOnFull(fn func(used, maxBytes uint64)) DiskMonitorOption {
 	return func(dm *DiskMonitor) {
 		dm.onFull = fn
 	}
 }
 
-// WithOnRecovery sets the callback run when usage drops back below the full threshold.
+// WithOnRecovery sets the callback invoked when usage drops below the full
+// threshold after being in the full state. This enables clearing external
+// disk-full flags when disk space is freed. The callback receives the
+// current used and maxBytes bytes. It runs like WithOnFull's callback: after
+// the mutex is released, in sample order.
 func WithOnRecovery(fn func(used, maxBytes uint64)) DiskMonitorOption {
 	return func(dm *DiskMonitor) {
 		dm.onRecovery = fn
@@ -146,7 +174,11 @@ type DiskSample struct {
 	MaxBytes uint64
 }
 
-// WithOnSample sets a hook run under the monitor's mutex after every sample; it must not call back into the monitor.
+// WithOnSample sets a hook for internal state publication. fn runs under the
+// monitor's mutex after every successful sample, so the state it publishes
+// is that of the monitor's latest sample; it must not call back into this
+// monitor. The function it returns, if not nil, runs after the mutex is
+// released, in sample order after the sample's other callbacks.
 func WithOnSample(fn func(s DiskSample) func()) DiskMonitorOption {
 	return func(dm *DiskMonitor) {
 		dm.onSample = fn
@@ -184,7 +216,10 @@ func NewDiskMonitor(dir string, maxBytes uint64, opts ...DiskMonitorOption) *Dis
 	for _, opt := range opts {
 		opt(dm)
 	}
-	// A zero checkEvery falls back to DefaultCheckEvery, so MaybeCheck never divides by zero.
+	// Defence in depth for the divisor MaybeCheck relies on: WithCheckEvery
+	// already refuses zero, but any future option (or a hand-built monitor)
+	// that leaves the field at its zero value must not turn the first
+	// monitored write into a division by zero on the commit worker.
 	if dm.checkEvery == 0 {
 		dm.checkEvery = DefaultCheckEvery
 	}
@@ -194,7 +229,12 @@ func NewDiskMonitor(dir string, maxBytes uint64, opts ...DiskMonitorOption) *Dis
 	return dm
 }
 
-// MaybeCheck counts a write and checks usage at the configured interval, returning ErrDiskFull above the full threshold.
+// MaybeCheck increments the write counter and checks disk usage when
+// the counter reaches the configured interval. Returns ErrDiskFull if
+// the disk usage exceeds the full threshold. Returns nil otherwise.
+//
+// When maxBytes is 0 (unlimited), MaybeCheck always returns nil without
+// any syscall overhead.
 func (dm *DiskMonitor) MaybeCheck() error {
 	if dm == nil || dm.maxBytes == 0 {
 		return nil
@@ -202,7 +242,16 @@ func (dm *DiskMonitor) MaybeCheck() error {
 
 	count := dm.writeCount.Add(1)
 
-	// Once full, check on every call until usage recovers.
+	// Once check() has tripped the full state, bypass the sample throttle and
+	// re-check on EVERY call. Otherwise the next checkEvery-1 writes are
+	// admitted UNCHECKED into an already-full disk: a follower's replication
+	// writes reach here through DB.SaveState -> MaybeCheck (the host-level
+	// diskFullFlag gates only client Propose/ReadIndex), so it would keep
+	// accepting up-to-64MB batches until fdatasync hits hard ENOSPC and poisons
+	// the DB. check() keeps returning ErrDiskFull until usage drops below the
+	// threshold, and fires the recovery transition/callback on the way down —
+	// after which lastFull is false and normal throttling resumes. The extra
+	// syscall cost is confined to the already-degraded full state.
 	if count%dm.checkEvery != 0 && !dm.lastFull.Load() {
 		return nil
 	}
@@ -230,7 +279,10 @@ func (dm *DiskMonitor) check() error {
 	return err
 }
 
-// drain runs queued callbacks in order, one drainer at a time.
+// drain runs the queued callbacks in order. One caller drains at a time; a
+// caller that finds a drain in progress (another goroutine's, or its own
+// further up the stack when a callback sampled this monitor) leaves its
+// callbacks to that drain.
 func (dm *DiskMonitor) drain() {
 	dm.notifyMu.Lock()
 	if dm.draining {

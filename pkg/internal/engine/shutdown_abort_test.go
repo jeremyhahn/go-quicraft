@@ -57,7 +57,18 @@ func newCommitTestRig(applyCap int) *commitTestRig {
 	}
 }
 
-// TestCommitWorker_SaveStateRetryCancelledOnShutdown checks shutdown during SaveState backoff fails the batch closed: nodes failed, commitPending cleared, proposals completed with SaveStateError.
+// TestCommitWorker_SaveStateRetryCancelledOnShutdown pins the durability
+// contract of the retry backoff: when shutdown fires WHILE the worker is
+// sleeping between SaveState attempts, the batch was extracted from raft
+// (prevState already advanced) but never persisted. Returning silently would
+// leave every node in the batch with commitPending=true forever and every
+// caller blocked to its context deadline. The worker must instead fail the
+// batch closed — mark each node failed, clear commitPending, and complete the
+// pending proposals with a SaveStateError.
+//
+// This also exercises the real timer path in retryWait (noRetryDelay stays
+// false): stopC is closed from the retry hook before the wait begins, so the
+// select resolves on stopC deterministically without depending on timing.
 func TestCommitWorker_SaveStateRetryCancelledOnShutdown(t *testing.T) {
 	rig := newCommitTestRig(16)
 	diskErr := errors.New("wal fsync failed")
@@ -90,7 +101,8 @@ func TestCommitWorker_SaveStateRetryCancelledOnShutdown(t *testing.T) {
 
 	rig.cw.processBatch()
 
-	// The retry loop must abort at the first backoff.
+	// The retry loop must abort at the FIRST backoff, not burn the whole
+	// budget after shutdown was signalled.
 	if hookCalls != 1 {
 		t.Fatalf("retryWait entered %d times, want 1: the retry loop must abort on shutdown", hookCalls)
 	}
@@ -148,7 +160,12 @@ func TestCommitWorker_RetryWaitCompletesWithoutShutdown(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_ApplyHandoffAbortedOnShutdown checks a full applyC with stopC closed gives up the handoff and releases the pooled slice and item.
+// TestCommitWorker_ApplyHandoffAbortedOnShutdown covers the last-resort branch
+// in processBatch: applyC is full AND stopC is closed (apply worker panicked
+// into its restart delay while the engine tears down). The worker must give up
+// on the handoff rather than block forever, and while doing so it must release
+// the pooled committed-entries slice and the pooled applyItem — otherwise every
+// such shutdown permanently drains proto's entry-slice pool and leaks the item.
 func TestCommitWorker_ApplyHandoffAbortedOnShutdown(t *testing.T) {
 	// Unbuffered applyC with no reader: both the non-blocking and the blocking
 	// send are unsatisfiable, so the select must resolve on stopC.
@@ -249,7 +266,12 @@ func committedUpdateFromPeer(t *testing.T, peer *raft.Peer) proto.Update {
 	return proto.Update{}
 }
 
-// TestSnapshotPool_Recovery_AbortsWhenNodeStopsMidDrain checks recovery does not run while an apply may still be in SM.Apply after stop.
+// TestSnapshotPool_Recovery_AbortsWhenNodeStopsMidDrain pins the
+// state-machine-safety guard in handleRequest. Engine.Stop closes a node's
+// stopC BEFORE the apply workers drain, so a recovery dequeued at that moment
+// can find an apply still inside SM.Apply. RecoverFromSnapshot must NOT run in
+// that window — it would replace state under a concurrent apply and corrupt
+// SM/session state. The recovery has to abort cleanly and leave no flag set.
 func TestSnapshotPool_Recovery_AbortsWhenNodeStopsMidDrain(t *testing.T) {
 	poolStopC := make(chan struct{})
 	defer close(poolStopC)
@@ -351,7 +373,16 @@ func TestEngine_Stop_SurvivesMalformedNodeEntry(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_SaveStateFailure_FailsUncommittedProposals checks a SaveState failure also fails proposals in the batch that are not yet committed.
+// TestCommitWorker_SaveStateFailure_FailsUncommittedProposals pins the case the
+// batch-abandon path must not drop: a proposal that has been accepted
+// into a batch but has NOT yet committed.
+//
+// On a leader this is where every client proposal first appears — in
+// EntriesToSave, with CommittedEntries empty until a later round. Reporting only
+// CommittedEntries meant the most common failure shape (SaveState fails on the
+// very batch carrying a fresh proposal) completed nothing, so the caller blocked
+// to its context deadline against a node that had already been marked
+// permanently failed and could never complete it.
 func TestCommitWorker_SaveStateFailure_FailsUncommittedProposals(t *testing.T) {
 	rig := newCommitTestRig(16)
 	rig.ldb.setSaveError(errors.New("wal fsync failed"))

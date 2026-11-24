@@ -26,7 +26,12 @@ import (
 	"testing"
 )
 
-// gitattributesEntries keep privateWorkflowFiles out of archives; dockerignoreEntries keep agent files and those files out of image build contexts.
+// gitattributesEntries are the .gitattributes entries that keep the private
+// forge's own workflows and the private release trust anchor
+// (privateWorkflowFiles) out of every archive of the tree; nothing else is
+// export-ignored. dockerignoreEntries keep the agent files and those files out
+// of every image build context: an image runs the code, so it carries no
+// development tooling, published or not.
 var (
 	gitattributesEntries = []string{
 		".github/workflows/revert-red-main.yml export-ignore",
@@ -135,7 +140,8 @@ func TestTheAllowListDoesNotReachTheValuesThisChangeRemoved(t *testing.T) {
 			t.Errorf("%s is allow-listed for %v; it must be clean or waived line by line", name, accepted)
 		}
 	}
-	// Baselines may name hosts as provenance, never an address or account.
+	// The baselines are allowed fleet HOST names as provenance, never the
+	// address or the account the old run-host header carried.
 	accepted := acceptedClasses(allowList, "test/performance/baselines/x.txt")
 	if accepted[classLabAddress] || accepted[classOwnerAccount] {
 		t.Errorf("baselines accept %v; only %s is provenance", accepted, classLabHost)

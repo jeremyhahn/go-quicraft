@@ -16,13 +16,41 @@ package engine
 
 import "github.com/jeremyhahn/go-quicraft/pkg/proto"
 
-// MessageSender sends Raft messages to peers; Send must be concurrency-safe and non-blocking, and undeliverable messages are dropped.
+// MessageSender is the interface for sending Raft protocol messages to
+// remote peers. The engine calls Send after producing an Update in the
+// step worker, pipelining message delivery before persistence.
+//
+// Implementations must be safe for concurrent use by multiple step
+// workers. Send must not block; it buffers messages into the transport
+// send queue. Messages that cannot be delivered are silently dropped
+// (Raft handles retransmission via heartbeat/replicate cycles).
 type MessageSender interface {
 	// Send delivers a batch of Raft protocol messages to their
 	// respective target replicas. The msgs slice must not be retained
 	// after Send returns.
 	Send(msgs []proto.Message)
 
-	// SendSnapshot streams msg.Snapshot.Filepath asynchronously and must deliver a SnapshotStatus echoing msg.Hint verbatim (the transfer sequence, not the index).
+	// SendSnapshot initiates an asynchronous snapshot transfer for an
+	// InstallSnapshot message. The implementation reads the snapshot
+	// data file referenced by msg.Snapshot.Filepath, splits it into
+	// transport-level chunks, and streams them to the target replica.
+	//
+	// On completion (success or failure), the implementation must
+	// deliver a SnapshotStatus message back to the sender's raft
+	// layer via the engine, echoing the Hint from the InstallSnapshot
+	// message VERBATIM so the status can be matched to its transfer.
+	// Hint is a transfer sequence number (raft.snapshotSeq), NOT the
+	// snapshot index: the same index can be re-sent, and the leader
+	// discards any status whose Hint does not equal the sequence of the
+	// transfer currently in flight. An implementation that substitutes
+	// the snapshot index would have every status it sends discarded. The status drives
+	// the leader's snapshot ack/retry wait; see the raft package's
+	// remote.snapshotDone for the full protocol. Delivery should be
+	// retried on transient failure — the message is one-shot, and
+	// losing it leaves the peer paused without a countdown armed.
+	//
+	// SendSnapshot is called from the step worker goroutine. The
+	// implementation must not block; it should launch the transfer
+	// asynchronously and return immediately.
 	SendSnapshot(msg proto.Message)
 }

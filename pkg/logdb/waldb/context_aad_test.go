@@ -70,7 +70,10 @@ func readSegmentRecords(t *testing.T, dir string, segID uint64) [][]byte {
 	return records
 }
 
-// rewriteSegment replaces dir/segID with the given records, valid CRCs and untouched envelopes, so only the context AAD detects the move.
+// rewriteSegment replaces the segment file at dir/segID with exactly the given
+// raw records, reframed by the normal chunk encoder. It is the on-disk attacker
+// in these tests: the CRCs are all valid and the barrier envelope bytes are
+// untouched, so ONLY the context-AAD can notice the records moved.
 func rewriteSegment(t *testing.T, dir string, segID uint64, records [][]byte) {
 	t.Helper()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -164,7 +167,10 @@ func TestWALRecordContextDoesNotAllocate(t *testing.T) {
 	}
 }
 
-// TestCiphertextExpansionWithinBound pins maxCiphertextExpansion against a real seal.Barrier.
+// TestCiphertextExpansionWithinBound pins maxCiphertextExpansion against a real
+// seal.Barrier. writeRecord picks a record's landing segment from
+// plaintext+maxCiphertextExpansion BEFORE sealing it, so an under-estimate
+// would let a sealed record overflow the segment it is bound to.
 func TestCiphertextExpansionWithinBound(t *testing.T) {
 	barrier := newTestBarrier(t)
 	for _, n := range []int{0, 1, 64, 4096, 70000} {
@@ -185,7 +191,11 @@ func TestCiphertextExpansionWithinBound(t *testing.T) {
 
 // --- round trips ---
 
-// TestContextAADMultiChunkRecordRoundTrips proves the ordinal counts logical records, not chunks.
+// TestContextAADMultiChunkRecordRoundTrips proves the ordinal counts LOGICAL
+// records, not physical chunks: a record far larger than one block is split
+// into First/Middle/Last chunks on the way out and reassembled into a single
+// entry by ReadAll, so its ordinal must be the same on both sides. Records
+// written after it must therefore still decrypt.
 func TestContextAADMultiChunkRecordRoundTrips(t *testing.T) {
 	barrier := newTestBarrier(t)
 	dir := t.TempDir()
@@ -355,9 +365,14 @@ func TestContextAADRejectsRecordCopiedToAnotherShard(t *testing.T) {
 	requireReopenRejects(t, dir, barrier, "segment moved to another WAL shard")
 }
 
-// Rollback-aware ordinal.
+// --- BLOCKER-2 regression: rollback-aware ordinal ---
 
-// TestContextAADRecoversAfterBatchRollback: a rolled-back batch rewinds the record ordinal with the write offsets.
+// TestContextAADRecoversAfterBatchRollback is the DiscardPending regression
+// test. A failed batch is rolled back, rewinding the segment's write offsets;
+// the record ordinal MUST rewind with them. If it does not, every record
+// written after the rollback is sealed at an ordinal one or more ahead of the
+// index recovery will read it at, and the entire segment tail becomes
+// permanently undecryptable at the next start.
 func TestContextAADRecoversAfterBatchRollback(t *testing.T) {
 	barrier := newTestBarrier(t)
 	dir := t.TempDir()
@@ -373,7 +388,10 @@ func TestContextAADRecoversAfterBatchRollback(t *testing.T) {
 		t.Fatalf("SaveState(prefix): %v", err)
 	}
 
-	// The first update writes, the second is rejected; shards 1 and 17 share WAL shard 1.
+	// A batch whose FIRST update writes records and whose SECOND update is
+	// rejected, forcing rollbackShard -> DiscardPending on a segment that
+	// already advanced. Raft shards 1 and 17 both hash to WAL shard 1, so both
+	// updates share one segment and one checkpoint.
 	oversized := makeBenchEntries(1, 1, 1, 8)
 	oversized[0].Cmd = make([]byte, maxCmdLen+1)
 	err := db.SaveState([]logdb.Update{
@@ -556,7 +574,27 @@ func newSealableTestBarrier(t *testing.T) (*seal.Barrier, seal.SealingStrategy) 
 	return barrier, strategy
 }
 
-// TestOpenRefusesSealedBarrierRatherThanLatchingNoBinding: Open with a sealed barrier fails with ErrBarrierContextUnresolved.
+// TestOpenRefusesSealedBarrierRatherThanLatchingNoBinding is the regression
+// test for the silent context-AAD downgrade on a sealed start.
+//
+// A sealed barrier has no encryptor, so it reports no context-binding
+// capability — the ABSENCE of an answer, not an answer of "no". The WAL
+// resolves that capability exactly once, at open, and writes every record of
+// the process against it. Latching the sealed barrier's "false" would make a
+// node that starts sealed (the Vault-style start-then-unseal flow this stack
+// targets) write epoch-only records FOREVER, including after the operator
+// unseals it with a fully AAD-capable barrier: no error, no log line, and every
+// record spliceable and reorderable at rest.
+//
+// waldb.Open therefore fails closed with ErrBarrierContextUnresolved.
+//
+// The ASSERTION IS ON OPEN, and that is the whole point of the test. Asserting
+// only that a later write fails would be satisfied by a WAL that latched the
+// sealed barrier's "false" too, since the writes would then be rejected by
+// EncryptWithContext anyway while the barrier was still sealed. Open
+// returning ErrBarrierContextUnresolved is the one observable that distinguishes
+// failing closed from latching a downgrade, so it is the one asserted here.
+// TestUnsealedBarrierBindsRecordsPositionally carries the positive half.
 func TestOpenRefusesSealedBarrierRatherThanLatchingNoBinding(t *testing.T) {
 	barrier, _ := newSealableTestBarrier(t)
 	dir := t.TempDir()
@@ -594,7 +632,14 @@ func TestOpenRefusesSealedBarrierRatherThanLatchingNoBinding(t *testing.T) {
 	}
 }
 
-// TestUnsealedBarrierBindsRecordsPositionally: after unseal the records on disk carry the positional binding.
+// TestUnsealedBarrierBindsRecordsPositionally is the positive half: once the
+// operator unseals, the WAL must actually use the capability the barrier now
+// reports, and the bytes on disk must carry the binding.
+//
+// Split out from the refusal test deliberately. Bundled together, a failure
+// here reads as a failure of the fail-closed guard, and — worse — the pair
+// could be satisfied by a WAL that refused the sealed barrier for the wrong
+// reason and then wrote unbound records anyway.
 func TestUnsealedBarrierBindsRecordsPositionally(t *testing.T) {
 	barrier, strategy := newSealableTestBarrier(t)
 	dir := t.TempDir()

@@ -147,7 +147,12 @@ func TestDeriveKey_PBKDF2_CustomKeyLen(t *testing.T) {
 	}
 }
 
-// TestKDFParamsBelowFloor checks the PBKDF2 work-factor floor predicate directly; Argon2id floors are in TestKDFParamsBelowFloor_Argon2id (non-FIPS only).
+// TestKDFParamsBelowFloor verifies the production KDF work-factor floor
+// catches pathological near-free parameter sets
+// (PBKDF2 Iterations=1, tiny KeyLen) while accepting the defaults. It checks
+// the pure predicate directly so it is independent of the package-wide test
+// bypass. The Argon2id work-factor floors are pinned in
+// TestKDFParamsBelowFloor_Argon2id, which only a non-FIPS build compiles.
 func TestKDFParamsBelowFloor(t *testing.T) {
 	cases := []struct {
 		name    string

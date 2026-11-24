@@ -39,7 +39,12 @@ func snapshotPlaintext() []byte {
 	return p
 }
 
-// TestReceiveSnapshotReencryptsPerNode verifies a snapshot sent as plaintext is re-encrypted under the receiver's own barrier.
+// TestReceiveSnapshotReencryptsPerNode is the cross-node regression: a snapshot
+// produced and encrypted by node A is streamed as PLAINTEXT (the sender decrypts
+// before sending — doSendSnapshot), the receiver node B re-encrypts it under its
+// OWN barrier, and B recovers the original data — while node A (a different
+// per-node key) CANNOT decrypt B's at-rest file. This proves per-node snapshot
+// encryption with no shared cross-node key.
 func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	nodeA := createTestBarrier(t) // sender
 	nodeB := createTestBarrier(t) // receiver (independent random root key)
@@ -51,7 +56,7 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 	srcPath := filepath.Join(dir, "a-snapshot.dat")
 	writeEncryptedSnapshotFile(t, nodeA, srcPath, plain)
 
-	// Send: decrypt A's snapshot to the plaintext that goes on the wire.
+	// SEND: decrypt A's snapshot to plaintext (what goes on the wire).
 	wirePath := filepath.Join(dir, "wire.dat")
 	wf, err := os.Create(wirePath)
 	if err != nil {
@@ -70,7 +75,8 @@ func TestReceiveSnapshotReencryptsPerNode(t *testing.T) {
 		t.Fatal("wire bytes are not the original plaintext")
 	}
 
-	// Receive: node B seals the plaintext under its own barrier as it streams in.
+	// RECEIVE: node B seals the plaintext as it streams in, under its OWN
+	// barrier — what HandleSnapshot does with the received chunks.
 	recvPath := filepath.Join(dir, "b-snapshot.dat")
 	rf, err := os.Create(recvPath)
 	if err != nil {
@@ -215,7 +221,12 @@ func TestReencryptSnapshotFile_PlaintextSides(t *testing.T) {
 	}
 }
 
-// TestReencryptSnapshotFile_RefusesCorruptSource verifies a source whose bytes do not match its snapshot.meta is refused.
+// TestReencryptSnapshotFile_RefusesCorruptSource pins that a source
+// snapshot.dat whose bytes no longer match its snapshot.meta is refused before
+// a fresh snapshot.meta is stamped beside the destination. A same-length bit
+// flip in a serialized value is invisible to the FileSize check; restamping
+// would replace the original checksum with one that matches the damage, and
+// recovery would accept the corrupt state.
 func TestReencryptSnapshotFile_RefusesCorruptSource(t *testing.T) {
 	plain := snapshotPlaintext()
 	dir := t.TempDir()
@@ -284,7 +295,12 @@ type pinRecordingBarrier struct {
 	sawEncryptBeforePin bool
 }
 
-// EncryptWithEpochContext records whether a frame was encrypted before the first in-flight epoch was pinned.
+// EncryptWithEpochContext records whether a frame was ever encrypted BEFORE the
+// first in-flight epoch was pinned. A path that pins only AFTER its encrypt loop
+// (leaving the frames exposed to a concurrent rotate+purge mid-loop) trips this.
+// It wraps the CONTEXT form because that is the one the snapshot encrypt loops
+// call; the plain form would never be reached and the assertion would go
+// vacuous.
 func (p *pinRecordingBarrier) EncryptWithEpochContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
 	p.mu.Lock()
 	if len(p.registered) == 0 {
@@ -429,7 +445,14 @@ func TestReencryptSnapshotFile_CreatesNestedDestination(t *testing.T) {
 	}
 }
 
-// TestReencryptSnapshotFile_SealedBarrierFailsClosed verifies a configured but sealed barrier is not treated as plaintext.
+// TestReencryptSnapshotFile_SealedBarrierFailsClosed proves a CONFIGURED but
+// sealed barrier is not treated as a plaintext side.
+//
+// The previous contract said "a nil or sealed barrier denotes a PLAINTEXT
+// side". For the destination that is a silent downgrade. For the SOURCE it is
+// corruption: the source's ciphertext would be read as though it were
+// plaintext and written out recorded as plaintext, producing a destination
+// nothing can decrypt, with no error reported.
 func TestReencryptSnapshotFile_SealedBarrierFailsClosed(t *testing.T) {
 	plain := snapshotPlaintext()
 

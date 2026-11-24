@@ -19,7 +19,15 @@ import (
 	"time"
 )
 
-// TestRoundIsTwiceTheElectionTimeout: one election attempt can take up to two election timeouts, since timers are randomised over [electionTimeout, 2*electionTimeout).
+// TestRoundIsTwiceTheElectionTimeout is the defect this derivation exists to
+// prevent, and the reason the package doc spends a paragraph on the factor.
+//
+// Raft randomises each replica's election timer over
+// [electionTimeout, 2*electionTimeout), so the upper bound on ONE attempt is
+// two election timeouts' worth of ticks. A budget written against the
+// un-randomised value is half the size it appears to be — a constant sold as
+// "10x headroom" is really 5x — and the suites that depended on it flaked under
+// load rather than failing honestly.
 func TestRoundIsTwiceTheElectionTimeout(t *testing.T) {
 	// The configuration the integration suites actually run: ElectionRTT=10,
 	// RTTMillisecond=50. The package doc quotes this case, so a change that
@@ -44,7 +52,13 @@ func TestRoundIsTwiceTheElectionTimeout(t *testing.T) {
 	}
 }
 
-// TestColdStartIsTheLargerBudget: a cold start waits longer than a failover because it pays for QUIC and mTLS handshakes.
+// TestColdStartIsTheLargerBudget pins the ordering a reader is most likely to
+// "fix" back.
+//
+// The names suggest the opposite, so it is worth an assertion rather than a
+// comment alone: a cold start is the HARDER wait, because it pays for the QUIC
+// handshakes and mTLS exchange before the first RequestVote can be answered,
+// while a failover runs between survivors over transport that is already up.
 func TestColdStartIsTheLargerBudget(t *testing.T) {
 	const electionRTT, rttMillisecond = 10, 50
 	cold := LeaderElection(electionRTT, rttMillisecond)
@@ -68,7 +82,12 @@ func TestColdStartIsTheLargerBudget(t *testing.T) {
 	}
 }
 
-// TestBudgetsTrackTheConfiguration: every budget moves proportionally with either input.
+// TestBudgetsTrackTheConfiguration is the property that makes this a derivation
+// rather than a table of constants: change either input and every budget moves
+// with it, proportionally.
+//
+// It is what a per-suite copy could not guarantee. Four copies drifted from one
+// another precisely because each restated the numbers instead of deriving them.
 func TestBudgetsTrackTheConfiguration(t *testing.T) {
 	base := Round(10, 50)
 	if doubled := Round(20, 50); doubled != 2*base {

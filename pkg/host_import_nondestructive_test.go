@@ -43,7 +43,10 @@ type liveImportFixture struct {
 	base      string
 }
 
-// newLiveImportFixture builds a memdb host with a written bootstrap record.
+// newLiveImportFixture builds a host whose LogDB is memdb — a PRODUCTION LogDB that
+// rejects a snapshot save which does not advance the recorded index. The shard's
+// bootstrap record is written directly so the import discovers the layout the
+// same way it would after a StartShard.
 func newLiveImportFixture(t *testing.T, withBarrier bool) *liveImportFixture {
 	t.Helper()
 	const shardID, replicaID uint64 = 7, 3
@@ -116,7 +119,8 @@ func (f *liveImportFixture) capture(t *testing.T) snapshotState {
 // assertUnchanged fails with the specific damage a destructive import causes.
 func assertUnchanged(t *testing.T, before, after snapshotState) {
 	t.Helper()
-	// Compared field by field: logdb.Snapshot is not comparable.
+	// Compared field by field: logdb.Snapshot carries membership maps and is not
+	// comparable, and these are the fields that describe the FILE.
 	if after.record.Index != before.record.Index ||
 		after.record.Term != before.record.Term ||
 		after.record.Filepath != before.record.Filepath ||
@@ -143,7 +147,10 @@ func assertUnchanged(t *testing.T, before, after snapshotState) {
 	}
 }
 
-// TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact verifies a non-advancing import is refused and the live snapshot is unchanged.
+// TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact is the regression
+// guard. A second import of an artifact whose index does not ADVANCE the shard's
+// recorded snapshot must be refused before the tree is touched, and the live
+// snapshot must be byte-for-byte what it was.
 func TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -166,7 +173,9 @@ func TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact(t *testing.T) {
 					"this test cannot observe the Epoch damage it guards")
 			}
 
-			// Retry at the same index with a longer, different payload.
+			// The retry: SAME index, a longer and completely different payload.
+			// Length matters — a shorter rewrite is invisible to a length-only
+			// check, and a longer one proves the file was truncated first.
 			retryErr := f.importArtifact(t, 900,
 				[]byte("A-COMPLETELY-DIFFERENT-AND-MUCH-LONGER-REPLACEMENT-PAYLOAD"))
 			if retryErr == nil {
@@ -187,7 +196,15 @@ func TestImportSnapshot_StaleRetryLeavesTheLiveSnapshotIntact(t *testing.T) {
 	}
 }
 
-// TestImportSnapshot_RefusesAPreExistingDestinationDirectory verifies an unreferenced directory at the artifact's index is refused.
+// TestImportSnapshot_RefusesAPreExistingDestinationDirectory covers the other
+// half of the same hazard, the one the staleness check alone cannot catch: a
+// directory at the artifact's index that the LogDB does NOT reference (an
+// import whose LogDB write was lost, or a retained snapshot older than the
+// recorded one). The import must refuse and leave it alone.
+//
+// Handing discardImportDir this canonical path would let a FAILED import at a
+// colliding index remove the pre-existing snapshot outright while LogDB still
+// pointed at it.
 func TestImportSnapshot_RefusesAPreExistingDestinationDirectory(t *testing.T) {
 	f := newLiveImportFixture(t, false)
 
@@ -195,7 +212,7 @@ func TestImportSnapshot_RefusesAPreExistingDestinationDirectory(t *testing.T) {
 	if err := f.importArtifact(t, 500, []byte("RECORDED-AT-500")); err != nil {
 		t.Fatalf("ImportSnapshot at 500 failed: %v", err)
 	}
-	// ...and a newer directory at 900 that LogDB does not reference.
+	// ...and a NEWER directory at 900 that LogDB does not reference.
 	orphan := engine.SnapshotSaveDir(f.base, f.shardID, f.replicaID, 900)
 	if err := os.MkdirAll(orphan, 0o750); err != nil {
 		t.Fatalf("seeding the colliding directory: %v", err)
@@ -243,7 +260,8 @@ func TestImportSnapshot_FailureMidStreamDiscardsOnlyItsOwnStaging(t *testing.T) 
 	}
 	before := f.capture(t)
 
-	// An artifact at a higher index whose body fails mid-copy.
+	// An artifact at a HIGHER index — every check passes — whose body dies
+	// mid-copy.
 	artifact := buildSnapshotArtifact(t, 1200, 6, 0, proto.Membership{},
 		snapshotEnvelope([]byte("this payload is never fully delivered")))
 	wantErr := errors.New("import test: reader failed mid-stream")
@@ -310,7 +328,10 @@ func TestImportSnapshot_ConcurrentImportsOfTheSameIndex(t *testing.T) {
 	assertShardRecoversPayload(t, f, []byte("CONCURRENT-RESTORE"))
 }
 
-// TestImportSnapshot_RejectsIndexZero verifies index 0, meaning no snapshot, is refused.
+// TestImportSnapshot_RejectsIndexZero pins that index 0 is refused. It means "no snapshot",
+// and as a directory name snapshot-00000000000000000000 sorts FIRST: the
+// restore would be the first thing snapshot GC destroys and would never be the
+// one latestSnapshotDir recovers.
 func TestImportSnapshot_RejectsIndexZero(t *testing.T) {
 	f := newLiveImportFixture(t, false)
 
@@ -328,7 +349,17 @@ func TestImportSnapshot_RejectsIndexZero(t *testing.T) {
 	}
 }
 
-// TestMockLogDB_RejectsStaleSnapshotSave verifies mockLogDB refuses a non-advancing save like memdb and waldb.
+// TestMockLogDB_RejectsStaleSnapshotSave is the mock-fidelity guard.
+//
+// mockLogDB stored every snapshot unconditionally while memdb.MemDB and
+// waldb.DB both refuse a save that does not advance the recorded index. Every
+// ImportSnapshot test in this package runs against the mock, so that one
+// divergence made the entire import suite blind to what production storage
+// actually does on a retried or index-colliding artifact — and the data
+// destruction that behaviour exposed was invisible.
+//
+// The mock is compared against a REAL LogDB rather than against a hard-coded
+// expectation, so the two cannot drift apart again.
 func TestMockLogDB_RejectsStaleSnapshotSave(t *testing.T) {
 	cases := []struct {
 		name string
@@ -357,7 +388,7 @@ func TestMockLogDB_RejectsStaleSnapshotSave(t *testing.T) {
 			if got.Index != 900 || got.FileSize != 16 {
 				t.Fatalf("a refused save mutated the record: %+v, want Index 900 FileSize 16", got)
 			}
-			// A save that does advance still lands.
+			// A save that DOES advance still lands.
 			if err := tc.db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 901, FileSize: 4096}); err != nil {
 				t.Fatalf("SaveSnapshot(index 901): %v", err)
 			}

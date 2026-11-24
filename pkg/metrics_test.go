@@ -32,7 +32,17 @@ func (panickingCollector) RegisterShard(uint64)             { panic("metrics bac
 func (panickingCollector) IncWriteBytes(int64)              { panic("metrics backend exploded") }
 func (panickingCollector) ObserveSendLatency(time.Duration) { panic("metrics backend exploded") }
 
-// TestSafeMetricsCollector_ContainsPanics: the wrapper swallows and records a collector panic, which would otherwise leave raftMu held.
+// TestSafeMetricsCollector_ContainsPanics pins the barrier that keeps an
+// embedder bug from deadlocking the host.
+//
+// The engine calls the collector between node.raftMu.Lock() and a plain
+// node.raftMu.Unlock() in the step and commit workers. A panic escaping there
+// leaves raftMu held forever; the worker's recover-and-restart loop then
+// blocks on it, and with it every shard that worker owns and Host.Close. The
+// symptom is a hung process with no error anywhere.
+//
+// The test asserts the wrapper swallows the panic AND records it, so a broken
+// backend is visible rather than merely survived.
 func TestSafeMetricsCollector_ContainsPanics(t *testing.T) {
 	wrapped := newSafeMetricsCollector(panickingCollector{})
 	safe, ok := wrapped.(*safeMetricsCollector)

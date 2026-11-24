@@ -78,7 +78,18 @@ type pattern struct {
 	guidance string
 }
 
-// patterns is the rule set, naming the placeholder subnet, hostnames, path prefixes and mail domain.
+// patterns is the rule set. It names the placeholder vocabulary the published
+// tree uses for the development fleet's subnet, hostnames, path prefixes and
+// internal mail domain, so a placeholder copied into new prose or a new fixture
+// is caught like the value it stands for.
+//
+// The values a private scan of an unpublished tree needs live outside this
+// repository.
+//
+// Note what is NOT here: the documentation and RFC 1918 ranges at large. Tests
+// across this tree use such literals as opaque addresses that are never dialed;
+// banning whole ranges would bury real findings under them. The placeholder
+// subnet is named precisely instead.
 var patterns = []pattern{
 	{
 		class:    classLabAddress,

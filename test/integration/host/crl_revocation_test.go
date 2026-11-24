@@ -56,7 +56,16 @@ func (r *revokedSerials) has(serial string) bool {
 	return slices.Contains(r.serials, serial)
 }
 
-// TestHostAPI_CRLRevocation_ThreeNode revokes a stopped host's leaf by CRL; on restart it is reported through OnCertRevoked, refused by peers and never applies new writes, while hosts 1 and 2 keep committing.
+// TestHostAPI_CRLRevocation_ThreeNode drives the documented CRL revocation
+// (config.RevocationConfig: CRLPaths, CheckInterval, Mode "crl",
+// OnCertRevoked) across three live hosts. Every host starts from an empty
+// CRL and a shard commits. Host 3 stops; a CRL revoking its leaf is written to
+// every host's CRL file and the test waits past one CheckInterval. Host 3
+// then restarts on its directories, address and leaf: hosts 1 or 2 must
+// report its serial (lowercase hex) through OnCertRevoked, host 3 must never
+// apply a write made after its restart, and a fresh handshake presenting its
+// leaf must be refused by hosts 1 and 2. A proposer running from before the
+// stop to the end proves hosts 1 and 2 keep committing throughout.
 func TestHostAPI_CRLRevocation_ThreeNode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

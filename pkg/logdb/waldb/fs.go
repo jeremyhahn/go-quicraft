@@ -22,7 +22,10 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 )
 
-// File abstracts WAL segment file I/O; osFile wraps *os.File (fdatasync on Linux, fsync elsewhere), and tests may inject errors.
+// File abstracts the file I/O operations used by WAL segments. Production
+// code uses osFile which wraps *os.File with platform-optimized sync
+// (fdatasync on Linux, fsync elsewhere). Test code can provide alternative
+// implementations for error injection.
 type File interface {
 	// Write writes p at the current offset, as io.Writer does.
 	Write(p []byte) (int, error)
@@ -44,10 +47,27 @@ type File interface {
 	Close() error
 }
 
-// FileMetadataSyncer is implemented by Files whose Sync omits metadata (Linux fdatasync); directory syncs must use SyncMetadata. It is fsutil.MetadataSyncer.
+// FileMetadataSyncer is optionally implemented by File implementations whose
+// Sync deliberately omits metadata. On Linux Sync is fdatasync, chosen for the
+// data path where only the written bytes and the file size must reach disk.
+//
+// A DIRECTORY sync has the opposite requirement: what must become durable is
+// precisely the metadata — the dirent creates, deletes and renames. fdatasync
+// is specified to skip metadata not needed to retrieve the file's data, and a
+// dirent removal frequently does not change the directory's size, so on XFS the
+// log force can be skipped entirely where ext4 happens to journal it anyway.
+// Directory syncs must therefore go through SyncMetadata, never Sync.
+//
+// Implementations whose Sync already covers metadata (the non-Linux osFile, and
+// in-memory test filesystems) need not implement this. It is
+// fsutil.MetadataSyncer, the capability fsutil.SyncDirWith checks for.
 type FileMetadataSyncer = fsutil.MetadataSyncer
 
-// FilePreAllocator is implemented by Files that can pre-allocate space: fallocate(2) mode 0 on Linux, ftruncate(2) elsewhere; it may change the file size.
+// FilePreAllocator is optionally implemented by File implementations that
+// support pre-allocating disk space. Preallocation may change the visible
+// file size: on Linux this maps to fallocate(2) with mode 0, which extends a
+// file shorter than size; other platforms fall back to ftruncate(2), which
+// sets the size and may not reserve physical blocks.
 type FilePreAllocator interface {
 	// PreAllocate reserves disk space for size bytes. It may change the
 	// visible file size, and the non-Linux fallback may not reserve
@@ -58,7 +78,15 @@ type FilePreAllocator interface {
 // walLockFilename is the lock file Open holds in the WAL root.
 const walLockFilename = "LOCK"
 
-// DirLocker is implemented by an FS that can lock a directory; Open holds it on the WAL root, so a second Open fails with fsutil.ErrDirLocked. Wrappers should forward it.
+// DirLocker is optionally implemented by FS implementations that can hold an
+// exclusive lock on a directory. Open takes it on the WAL root for the life of
+// the DB, so a second Open of the same directory, in this process or another,
+// fails with fsutil.ErrDirLocked instead of interleaving its records with the
+// first writer's.
+//
+// The production filesystem implements it. An FS that does not (an in-memory
+// test filesystem, whose directories no other process can reach) opens
+// unlocked; an FS that wraps the real filesystem should forward it.
 type DirLocker interface {
 	// LockDir locks dir through the file name inside it, failing
 	// immediately with an error wrapping fsutil.ErrDirLocked when it is
@@ -66,7 +94,16 @@ type DirLocker interface {
 	LockDir(dir, name string) (io.Closer, error)
 }
 
-// FS abstracts the WAL's filesystem operations; osFS delegates to os. Rename is required, since the format marker is published by rename (writeWALFormat).
+// FS abstracts filesystem operations used by the WAL database. Production
+// code uses osFS which delegates to the os package. Test code can provide
+// alternative implementations for error injection and fault simulation.
+//
+// Rename is REQUIRED, not optional: the WAL format marker is published by
+// writing a temporary file, fsyncing it and renaming it into place, which is
+// the only construction under which a reader can never observe a
+// partially-written marker. Making it an optional interface with an in-place
+// fallback would reintroduce exactly the torn-write state the rename exists to
+// remove, so an FS that cannot rename cannot host a WAL. See writeWALFormat.
 type FS interface {
 	// OpenFile opens the named file with the given flags and permissions,
 	// as os.OpenFile does.
@@ -197,7 +234,10 @@ func defaultFS() FS {
 	return osFS{}
 }
 
-// DefaultFS returns the production filesystem, for external test packages that wrap it.
+// DefaultFS returns the production filesystem implementation. It is exported
+// for use by external test packages (e.g., error-injection test suites) that
+// need to construct an ErrorFS wrapping the real OS filesystem without
+// importing os internals directly.
 func DefaultFS() FS {
 	return osFS{}
 }

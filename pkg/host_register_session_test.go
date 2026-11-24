@@ -187,7 +187,11 @@ func TestRegisterSessionClientIDReregisterAfterClose(t *testing.T) {
 		t.Fatalf("RegisterSession(%#x) after CloseSession: %v, want success", clientID, err)
 	}
 
-	// Re-registration re-applied nothing; later entries belong to the new session (docs/client-sessions/user.md).
+	// The re-registration did not re-apply anything the earlier session
+	// committed. An entry SENT after this point is a proposal of the new
+	// session: the log carries no incarnation, so the shard cannot tell it
+	// from one (docs/client-sessions/user.md, "Choose the client ID
+	// yourself").
 	if got := csm.count("b-old"); got != 1 {
 		t.Fatalf("b-old applied %d times after re-registration, want once", got)
 	}

@@ -22,7 +22,13 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestE2E_SnapshotCatchUp_NewNode: a node joining after compaction (SnapshotEntries=20, CompactionOverhead=5, 50 entries) catches up by snapshot to the leader's exact state.
+// TestE2E_SnapshotCatchUp_NewNode verifies that a new node joining a
+// 3-node cluster after log compaction receives a snapshot transfer and
+// catches up with the full state. With SnapshotEntries=20 and
+// CompactionOverhead=5, the log is compacted after 20 entries leaving
+// only ~5 trailing entries. A new node joining after 50 entries cannot
+// receive the compacted log entries and must catch up via snapshot, after
+// which its state machine must equal the leader's exactly.
 func TestE2E_SnapshotCatchUp_NewNode(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	defer cluster.close()
@@ -55,7 +61,9 @@ func TestE2E_SnapshotCatchUp_NewNode(t *testing.T) {
 	// Verify all 50 entries are present on the new node via snapshot catch-up.
 	waitForNodeData(t, result.tracker, 1, 4, expected, membershipTimeout)
 
-	// Check the recovery count, since log replay would yield the same keys.
+	// ...and that it really was a SNAPSHOT. Having the keys is equally
+	// consistent with plain log replay, so the claim in the name of this test
+	// needs the state machine's own recovery count to be checked.
 	assertCaughtUpViaSnapshot(t, result.tracker, 1, 4, membershipTimeout)
 	leaderIdx := cluster.waitForClusterLeader(1, leaderElectionTimeout)
 	assertSnapshotTaken(t, cluster, leaderIdx)

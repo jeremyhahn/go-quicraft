@@ -20,7 +20,19 @@ import (
 	"time"
 )
 
-// The engine re-drives a runtime snapshot recovery rejected before restore began, failing the shard after maxRecoveryAttempts rejections in one holding episode.
+// A runtime snapshot recovery rejected before the state machine restore began
+// leaves the replica holding every committed entry above the snapshot its Raft
+// log adopted (Node.snapshotAdoptionPending): it stays in the protocol, can
+// vote and even lead, but applies nothing. Nothing outside the engine re-queues
+// that recovery — the leader saw the snapshot acknowledged — so the engine
+// re-drives it, and bounds the re-drive: after maxRecoveryAttempts consecutive
+// rejections over one continuous episode of holding entries the shard is
+// failed through the ordinary latch, so a replica cannot hold entries, and as
+// leader commit without applying, for longer than the backoff schedule plus the
+// attempts themselves. The count spans the episode whatever snapshot each
+// attempt was made against: a newer snapshot adopted mid-episode does not grant
+// fresh attempts, or a persistent fault plus a stream of newer snapshots would
+// hold entries indefinitely.
 const (
 	// maxRecoveryAttempts counts every attempt in one holding episode, the
 	// recovery the snapshot receive queued included. The last rejection fails
@@ -55,7 +67,10 @@ type recoveryRedrive struct {
 	dueAt time.Time
 }
 
-// reject records a rejected attempt and returns the episode's count; at maxRecoveryAttempts it reports exhausted and arms nothing.
+// reject records a rejected attempt and reports how many have been rejected in
+// the current holding episode. While that is below maxRecoveryAttempts it arms
+// a re-drive after the backoff; at the limit it reports exhausted and arms
+// nothing, and the caller fails the shard.
 func (r *recoveryRedrive) reject(now time.Time) (rejected int, exhausted bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -82,7 +97,11 @@ func (r *recoveryRedrive) pending() bool {
 	return r.armed.Load()
 }
 
-// deferred re-arms a claimed re-drive the pool could not admit, without consuming an attempt.
+// deferred re-arms a claimed re-drive the snapshot pool could not admit (its
+// request queue was full), after the backoff the current count calls for. The
+// refused admission was not an attempt — nothing ran — so it consumes none,
+// and retrying it on a later step cycle instead of every one keeps a pool that
+// stays busy from being polled at the step worker's rate.
 func (r *recoveryRedrive) deferred(now time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -90,7 +109,13 @@ func (r *recoveryRedrive) deferred(now time.Time) {
 	r.armed.Store(true)
 }
 
-// claim disarms the owed re-drive; it must run before the request is published to the pool.
+// claim disarms the owed re-drive for the attempt about to be queued. It MUST
+// run before the request is published to the pool: from the publish on, a
+// worker may run and reject the attempt at once, and reject re-arms the next
+// re-drive — a disarm after the publish could land on that newer state and
+// leave the node holding entries with nothing owed. The count is kept: the
+// queued attempt's own outcome decides what happens next, and an admission
+// the pool refuses re-arms through deferred.
 func (r *recoveryRedrive) claim() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -105,7 +130,11 @@ func (r *recoveryRedrive) reset() {
 	r.armed.Store(false)
 }
 
-// adoptedSnapshotIndex returns the snapshot index the log adopted ahead of the state machine, and whether entries are held for it.
+// adoptedSnapshotIndex returns the index of the snapshot a node's Raft log has
+// adopted ahead of its state machine, and whether it is holding entries for
+// one at all. It reads the published log markers, so it is safe from the
+// snapshot pool's goroutine: while entries are held the processed marker sits
+// at the adopted snapshot's index, because extraction is what advances it.
 func adoptedSnapshotIndex(node *Node) (uint64, bool) {
 	if node.Peer() == nil {
 		return 0, false

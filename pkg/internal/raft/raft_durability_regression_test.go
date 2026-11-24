@@ -20,7 +20,15 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestTryCommit_LeaderSelfMatchIsDurableIndex verifies tryCommit counts the leader's own match at its durable index (inmem.savedTo).
+// TestTryCommit_LeaderSelfMatchIsDurableIndex verifies that tryCommit
+// counts the leader's own match at its durable index (inmem.savedTo),
+// never at the tip of its in-memory log. In a 3-node cluster a single
+// follower ack plus a non-durable local append is NOT a quorum of
+// durable matches: an entry acknowledged by one follower must stay
+// uncommitted until the leader's own append reaches stable storage,
+// at which point the persistence-edge re-evaluation completes the
+// quorum. Counting the in-memory tip would allow a commit backed by
+// only one durable copy.
 func TestTryCommit_LeaderSelfMatchIsDurableIndex(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)
@@ -69,7 +77,15 @@ func TestTryCommit_LeaderSelfMatchIsDurableIndex(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_MatchingLogAdvancesProcessed verifies a matching-log snapshot advances both committed and processed (Raft figure 13).
+// TestHandleSnapshot_MatchingLogAdvancesProcessed verifies that when an
+// InstallSnapshot matches the local log at the snapshot index (same
+// index and term, Raft Figure 13), handleSnapshot advances BOTH the
+// committed and the processed markers to the snapshot index. The state
+// machine is restored from the snapshot, so entries at or below the
+// snapshot index are already represented in the recovered state; a
+// processed marker left behind would re-emit them to the apply worker
+// and double-apply them on top of the restored state, which is what
+// happens if only committed advances on the matching-log branch.
 func TestHandleSnapshot_MatchingLogAdvancesProcessed(t *testing.T) {
 	const (
 		snapIndex = uint64(10)

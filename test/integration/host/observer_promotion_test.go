@@ -24,7 +24,29 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/membership"
 )
 
-// TestHostAPI_ObserverPromotedInPlace checks an observer promoted by AddNode becomes a voter without restart: reads, votes, and can lead, with and without LeaseRead.
+// TestHostAPI_ObserverPromotedInPlace covers in-place observer promotion end to
+// end.
+//
+// A 3-voter cluster adds a 4th replica as an observer, starts it as one
+// (Config.IsObserver), and promotes it with an AddNode for the same replica
+// ID, address and identity. Without a restart, the promoted replica must then:
+//
+//   - report itself a voter (ShardInfo.IsObserver false);
+//   - serve linearizable reads (a follower ReadIndex forwarded to the leader);
+//   - vote: with one original voter stopped, the three survivors are exactly
+//     a quorum of four, so electing a leader and committing need its vote and
+//     its ack; and
+//   - be elected leader, and serve reads as leader.
+//
+// The failure it guards against: a committed promotion latching a role
+// mismatch on the replica (configured observer, listed voter), so that it
+// refuses every read with ErrWitnessRoleMismatch and every campaign, including
+// a leadership transfer, until its shard is stopped and restarted with
+// IsObserver=false.
+//
+// It runs under the default configuration and under LeaseRead, where the
+// promotion also starts the replica promising vote windows in its heartbeat
+// acks.
 func TestHostAPI_ObserverPromotedInPlace(t *testing.T) {
 	tests := []struct {
 		name  string

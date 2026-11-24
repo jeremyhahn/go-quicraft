@@ -14,7 +14,83 @@
 
 //go:build integration && quicraft_netfault
 
-// Election safety: a vote sink spends a term's votes it cannot win with, and a disruptor that never saw that term must not win it. Run with go test -tags 'integration quicraft_netfault' -run ElectionSafety ./test/integration/e2e/...
+// One vote per term — the invariant no other test in the suite could fail on.
+//
+// # What this file exists to catch
+//
+// Raft's election-safety property (§5.2, §5.4) rests on a single rule: a
+// replica grants at most ONE vote per term. Delete that rule — make
+// handleVoteRequest's canVote ignore r.vote — and two candidates can each
+// collect the same quorum's votes in the same term and both be elected. Every
+// safety argument in the protocol collapses at that point, because two leaders
+// in one term write different entries at the same (index, term) and Log
+// Matching never reconciles them.
+//
+// That mutation was applied to pkg/internal/raft and the suite's own
+// election-safety test — TestLinearizability_4Node_ElectionSafety — PASSED
+// three times out of three, with a clean porcupine verdict on ~7000 operations
+// each run. It is not a weak test; it is the wrong shape. It kills the leader
+// and lets ONE clean election run, and one election never asks a voter for a
+// second vote in a term it has already voted in. Nothing in the suite did.
+//
+// # Why the obvious construction does not work
+//
+// The natural test is "make two candidates race in one term and assert only
+// one wins". It cannot be written reliably, for three separate reasons, and
+// each of them is a deliberate defence in this codebase:
+//
+//   - The CheckQuorum guard (dropHighTermVote) silently discards a higher-term
+//     RequestVote while the voter has heard from its leader within an election
+//     timeout. A candidate can therefore only be HEARD after the voters' own
+//     leases have expired — which is the same instant those voters become
+//     willing to campaign themselves.
+//   - PreVote refuses to advance a term at all unless the pre-candidate is
+//     prospecting ABOVE the voter's term with no leader active, so a second
+//     candidate learns the winner's term from the refusal and moves past it.
+//   - becomeLeader appends a no-op. One round trip after the first candidate
+//     wins, every voter's log is ahead of the loser's, and isUpToDate denies
+//     the loser its vote on log freshness alone — which masks the missing
+//     one-vote-per-term rule rather than enforcing it.
+//
+// Between them, the ONLY window where a same-term second vote can even be
+// requested is the ~1 RTT between two candidates broadcasting. Racing on it
+// produces a flaky test, and a flaky safety test is not a safety test.
+//
+// # The construction this file uses instead
+//
+// The observable is inverted. Rather than trying to catch two leaders in one
+// term, the test SPENDS a term's votes on a candidate that is then prevented
+// from ever winning, and asserts that nobody can subsequently win that term:
+//
+//  1. Five voters. Leadership is transferred to a designated replica so the
+//     roles below are fixed rather than whatever the initial election produced.
+//  2. The vote sink (replica 2) is made unable to win before it ever campaigns:
+//     the two vote-bearing replicas (3 and 4) have their responses TO it
+//     dropped, so their grants never arrive. It can reach at most itself plus
+//     the outgoing leader — two of five.
+//  3. Leadership is transferred TO the vote sink. A transfer campaigns
+//     immediately with Hint == From, which is exactly the case CheckQuorum
+//     exempts, so the vote request is heard by every voter even though the
+//     leader's lease is fresh. Replicas 1, 3 and 4 adopt term T+1 and spend
+//     their T+1 votes on the sink. The sink stays a candidate; nothing is
+//     appended anywhere, so every log stays equal.
+//  4. The disruptor (replica 5) is partitioned from the sink only, so it never
+//     learns that T+1 happened. Its election timer — the only short one in the
+//     shard — expires and it campaigns at T+1, the term whose votes are gone.
+//
+// Under correct code every voter refuses, the disruptor retries at T+2, and
+// wins there: liveness is preserved and the test's final assertion proves it.
+// With one-vote-per-term removed, the voters grant a second time and the
+// disruptor is elected in a term a quorum had already voted away.
+//
+// Nothing here is timing-dependent. Every fault is installed before the
+// election that matters, the only short election timer belongs to the
+// disruptor, and the vote sink's own retry is an order of magnitude further
+// out than the entire test.
+//
+// Run with:
+//
+//	go test -tags 'integration quicraft_netfault' -run ElectionSafety ./test/integration/e2e/...
 package e2e_test
 
 import (
@@ -58,7 +134,19 @@ const (
 	esFastElectionRTT uint64 = 20
 )
 
-// electionSafetyShardConfig gives each replica its role's election timing; only the disruptor runs without PreVote.
+// electionSafetyShardConfig gives every replica its role's election timing.
+//
+// The disruptor also runs with PreVote disabled, and ONLY the disruptor does.
+// Pre-vote is a courtesy the candidate extends to the cluster — it asks whether
+// it could win before burning a term — and it is not what enforces one vote per
+// term; the voters enforce that, and here they all run the stock configuration.
+// Leaving pre-vote on for the disruptor would mean it never reaches the real
+// vote at the spent term at all: its pre-vote for T+1 is refused for being AT
+// rather than above the voters' term, the refusal teaches it T+1, and its next
+// campaign is at T+2 where the votes are unspent and granting them is correct.
+// Pre-vote would hide the defect, not prevent it — and it is bypassed by design
+// on the leadership-transfer path (see broadcastTransferVote), which is a
+// supported production path.
 func electionSafetyShardConfig(shardID, replicaID uint64) config.Config {
 	c := config.Config{
 		ShardID:     shardID,
@@ -115,7 +203,19 @@ func transferLeadershipTo(t *testing.T, cluster *testCluster, shardID, targetRep
 	t.Logf("replica %d holds leadership of shard %d", targetReplica, shardID)
 }
 
-// TestElectionSafety_SpentTermCannotBeWonTwice verifies no replica wins a term whose votes a quorum already granted to another candidate.
+// TestElectionSafety_SpentTermCannotBeWonTwice asserts the one-vote-per-term
+// rule directly: once a quorum has granted its votes for a term, NOTHING may be
+// elected in that term but the candidate those votes were granted to.
+//
+// The file comment explains the construction and why the obvious "race two
+// candidates" test cannot be written reliably. In short: the vote sink spends
+// the whole shard's term-T+1 votes and is structurally unable to win with them,
+// then the disruptor campaigns in that same T+1. A correct voter refuses and
+// the disruptor wins T+2 instead; a voter that has forgotten it already voted
+// elects a second leader in a term the cluster had already decided.
+//
+// This is the test that kills the mutation the rest of the suite could not:
+// removing the r.vote test from canVote in handleVoteRequest.
 func TestElectionSafety_SpentTermCannotBeWonTwice(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -185,7 +285,11 @@ func TestElectionSafety_SpentTermCannotBeWonTwice(t *testing.T) {
 			return ok && term == spentTerm && !isLeader
 		})
 
-	// A quorum must have reached the spent term, which only the sink's RequestVote carries.
+	// And a quorum must have HEARD it. A replica only reaches term T+1 here by
+	// processing the sink's RequestVote — nothing else in the shard is at that
+	// term — so this is the observable proof that their T+1 votes were asked
+	// for. They grant, because their logs are identical to the sink's and they
+	// have cast no other vote in T+1.
 	for _, voter := range []uint64{esVoterA, esVoterB, esOutgoingLeader} {
 		replica := voter
 		waitForCondition(t, failoverTimeout,
@@ -197,7 +301,13 @@ func TestElectionSafety_SpentTermCannotBeWonTwice(t *testing.T) {
 	t.Logf("replicas %d, %d and %d have spent their term-%d votes on replica %d, "+
 		"which cannot win with them", esVoterA, esVoterB, esOutgoingLeader, spentTerm, esVoteSink)
 
-	// Watch until someone is elected: a leader at spentTerm is the violation, a higher term is correct.
+	// The disruptor now campaigns at spentTerm, because it never heard that
+	// the term existed. Watch every replica until some replica is elected.
+	//
+	// A leader at spentTerm is the violation and is never waited out: it is
+	// not a transient state that resolves, it is a decided term being decided
+	// a second time. A leader at a HIGHER term is the correct outcome and ends
+	// the test.
 	var electedTerm, electedReplica uint64
 	waitForCondition(t, failoverTimeout,
 		"a replica is elected in a term above the spent one (the shard should "+

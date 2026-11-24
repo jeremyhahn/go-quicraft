@@ -1647,7 +1647,12 @@ func TestNodeHost_SyncCloseSession_NoDeadlineReturnsError(t *testing.T) {
 }
 
 func TestSyncCloseSession_ClientIDMismatch(t *testing.T) {
-	// validateCloseSessionResult is tested directly: a wrong client ID cannot come from a correct state machine.
+	// validateCloseSessionResult is the extracted check from SyncCloseSession
+	// that verifies result.Value matches cs.ClientID(). Testing through the
+	// real Raft pipeline would require a state machine that returns a wrong
+	// client ID on unregister, which is a protocol violation that cannot
+	// occur with a correctly implemented SM. We test the validation logic
+	// directly.
 	t.Run("Mismatch", func(t *testing.T) {
 		err := validateCloseSessionResult(42, 99)
 		if !errors.Is(err, ErrClientIDMismatch) {
@@ -2522,7 +2527,12 @@ func TestReadLocalNode_UnresolvedFailsFast(t *testing.T) {
 	closed := make(chan RequestResult)
 	close(closed)
 
-	// ReadLocalNode rejects a RequestState with no latched completion instead of blocking.
+	// ReadLocalNode must never block waiting for the ReadIndex: per the
+	// dragonboat contract the caller drains ResultC first, so a second
+	// receive inside ReadLocalNode would deadlock the canonical caller
+	// pattern. A RequestState with no latched completion is rejected
+	// immediately: serving the query without a resolved ReadIndex would
+	// violate linearizability.
 	tests := []struct {
 		name string
 		rs   *RequestState

@@ -70,7 +70,18 @@ var (
 	// (AddNode, RemoveNode, AddNonVoting, AddWitness).
 	ErrInvalidConfigChangeType = errors.New("proto: invalid config change type")
 
-	// ErrUnsupportedVersion is returned when a version stamp is not the one this build decodes: BinVer against WireVersion, or the Membership version byte (as *UnsupportedMembershipVersionError).
+	// ErrUnsupportedVersion is returned when a version stamp in the buffer
+	// does not name the layout this build decodes. Every format is pinned at
+	// version 1 pre-release and every gate is an EXACT match (see the
+	// compatibility contract in the package comment), so this sentinel covers
+	// both version namespaces identically:
+	//
+	//   - transport-scoped: MessageBatch.BinVer and SnapshotChunk.BinVer must
+	//     equal WireVersion.
+	//   - persisted-scoped: the Membership section's leading version byte must
+	//     equal membershipFormatVersion. That case returns the richer
+	//     *UnsupportedMembershipVersionError, which matches this sentinel
+	//     under errors.Is.
 	ErrUnsupportedVersion = errors.New("proto: unsupported wire version")
 
 	// ErrFilepathTooLong is returned when a filepath string exceeds
@@ -85,10 +96,20 @@ var (
 	// exceeds MaxSnapshotChunkDataLen during unmarshal.
 	ErrChunkDataTooLong = errors.New("proto: chunk data exceeds MaxSnapshotChunkDataLen")
 
-	// ErrChunkSizeMismatch is returned when a snapshot chunk's ChunkSize does not equal len(Data).
+	// ErrChunkSizeMismatch is returned when a snapshot chunk's ChunkSize
+	// header does not equal the actual length of its Data payload. The two
+	// are written consistently by the sender, so a mismatch is a malformed
+	// or tampered chunk and is rejected rather than trusted for downstream
+	// allocation or offset math.
 	ErrChunkSizeMismatch = errors.New("proto: chunk size does not match data length")
 
-	// ErrSnapshotWithoutPosition is returned by Message.MarshalTo for a snapshot with content but zero Index and Term.
+	// ErrSnapshotWithoutPosition is returned by Message.MarshalTo when the
+	// embedded Snapshot carries content but has zero Index and zero Term.
+	// The message layout signals snapshot presence with Snapshot.IsEmpty,
+	// which asks only about the log position, so such a snapshot would encode
+	// as absent and be discarded whole. It is refused instead: a raft snapshot
+	// always covers a real log index, so the value is a construction bug at the
+	// sender rather than anything a peer should be asked to interpret.
 	ErrSnapshotWithoutPosition = errors.New("proto: snapshot has content but no log position")
 
 	// ErrLogIndexOutOfRange is returned by Snapshot.CheckBounds when the
@@ -96,11 +117,20 @@ var (
 	// state names such an index. See MaxLogIndex.
 	ErrLogIndexOutOfRange = errors.New("proto: log index at or above MaxLogIndex")
 
-	// ErrTermOutOfRange is returned for a term at or above MaxTerm, or a replicated entry term of 0 or above the leader's. See MaxTerm.
+	// ErrTermOutOfRange is returned by Snapshot.CheckBounds when the snapshot's
+	// Term is at or above MaxTerm, by raft when persisted state names such a
+	// term, and by raft for a replicated batch carrying an entry whose term
+	// is 0 or exceeds the replicating leader's. See MaxTerm.
 	ErrTermOutOfRange = errors.New("proto: term out of range")
 )
 
-// UnsupportedMembershipVersionError reports a Membership version byte other than the supported one, naming both.
+// UnsupportedMembershipVersionError is returned when a persisted Membership
+// section's leading version byte is not the one version this build decodes. It
+// names the version found alongside the supported one so an operator reading a
+// log line can tell the two causes apart without consulting the source: a byte
+// that is a plausible version number means the data was written by a binary
+// speaking a different format generation, and a byte that is not means the
+// section is corrupt or the offset is wrong.
 type UnsupportedMembershipVersionError struct {
 	// Found is the version byte read from the buffer.
 	Found uint8

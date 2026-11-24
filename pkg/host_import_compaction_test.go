@@ -20,7 +20,25 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// TestImportSnapshot_RemovesEntriesAtOrBelowSnapshotIndex checks ImportSnapshot advances the compaction floor, so the bootstrap entry cannot leave a log gap.
+// TestImportSnapshot_RemovesEntriesAtOrBelowSnapshotIndex is the regression
+// guard for the offline disaster-recovery log-gap bug.
+//
+// The offline restore flow bootstraps a shard (StartShard) before importing, so
+// the shard can be imported into at all — ImportSnapshot refuses an unrecorded
+// shard. That bootstrap writes an initial configuration entry at index 1.
+// Importing an artifact whose snapshot index is higher records the snapshot,
+// and without advancing the floor would leave the index-1 entry orphaned below
+// it: because the default CompactionOverhead (5000) dwarfs a freshly restored
+// node's entry count, the running snapshotter's compaction never fires to clean
+// it up. The shard would then append post-restore writes, and on the next
+// restart log recovery would rebuild the entry index as {1, ...tail} whose span
+// exceeds the entry count — reported as ErrLogGapDetected — and host init would
+// fail closed. The restored node would be unrecoverable without wiping and
+// restoring again.
+//
+// ImportSnapshot must therefore advance the compaction floor to the imported
+// snapshot index, exactly as a normal InstallSnapshot does, removing every entry
+// at or below it.
 func TestImportSnapshot_RemovesEntriesAtOrBelowSnapshotIndex(t *testing.T) {
 	f := newLiveImportFixture(t, false)
 
@@ -52,7 +70,9 @@ func TestImportSnapshot_RemovesEntriesAtOrBelowSnapshotIndex(t *testing.T) {
 			"pre-snapshot entry at index 1 survived below the imported snapshot", first, count)
 	}
 
-	// A post-restore write must leave a contiguous log; an orphaned entry reports ErrLogGapDetected.
+	// End-to-end guard: a post-restore write must leave a CONTIGUOUS log. With
+	// the orphan still present the log is {1, 11}, which EntryRange reports as
+	// ErrLogGapDetected — precisely the failure that wedges the next restart.
 	if err := f.db.SaveState([]logdb.Update{{
 		ShardID:   f.shardID,
 		ReplicaID: f.replicaID,

@@ -14,7 +14,15 @@
 
 package proto
 
-// MessageOrigin records how a message reached raft; process-local, never on the wire, zero value OriginRemote.
+// MessageOrigin records how a message reached the raft state machine.
+//
+// It is PROCESS-LOCAL state, deliberately NOT part of the wire format:
+// MarshalTo never writes it, UnmarshalFrom never reads it, and Reset zeroes
+// it. The zero value is therefore OriginRemote, so a message decoded from
+// the network — or recycled through the message pool — is untrusted by
+// construction and no peer can forge a local origin. Only in-process
+// injectors stamp OriginLocal, and they do it through the delivery API
+// (Node.DeliverLocal / Engine.DeliverLocal) rather than by hand.
 type MessageOrigin uint8
 
 const (
@@ -22,7 +30,12 @@ const (
 	// zero value so that "untrusted" is the default for every code path that
 	// forgets to say otherwise.
 	OriginRemote MessageOrigin = iota
-	// OriginLocal marks a message injected by this process, exempt from raft.step's term gate.
+	// OriginLocal marks a message injected by this process: the engine's
+	// Propose/ReadIndex batching, the snapshot receive path's InstallSnapshot,
+	// the transport's SnapshotStatus/Unreachable notifications and the host's
+	// LeaderTransfer request. These carry no term and are exempt from the
+	// term gate in raft.step, so the exemption must never be reachable from
+	// the network.
 	OriginLocal
 )
 
@@ -38,7 +51,17 @@ func (o MessageOrigin) String() string {
 	return "remote"
 }
 
-// Message is a Raft protocol message: 11 fixed uint64 fields, then entries and an inline snapshot. Origin is not on the wire.
+// Message represents a Raft protocol message exchanged between peers.
+// It has 11 fixed uint64 fields (88 bytes) followed by a count-prefixed
+// list of entries and an inline snapshot. The wire format is:
+//
+//	[Type:8][From:8][To:8][ShardID:8][ReplicaID:8][Term:8][LogTerm:8]
+//	[LogIndex:8][Commit:8][Reject:8][Hint:8]
+//	[EntriesCount:4][entries...][HasSnapshot:8][snapshot...]
+//
+// Reject is stored as uint64 on wire (0 or 1) for fixed-width encoding.
+//
+// Origin is process-local and is NOT part of that layout; see MessageOrigin.
 type Message struct {
 	// Type identifies the message type (Replicate, RequestVote, etc.).
 	Type uint64
@@ -74,7 +97,11 @@ type Message struct {
 // messageFixedSize is the wire size of the 11 fixed uint64 fields.
 const messageFixedSize = 11 * 8 // 88 bytes
 
-// HeartbeatMessageSize is the marshaled size of a heartbeat Message: 88 + 4 + 8 = 100.
+// HeartbeatMessageSize is the exact marshaled size of a heartbeat Message
+// (zero entries, empty snapshot). Used by the transport heartbeat fast path
+// to avoid per-message Size() calls.
+//
+// Layout: fixed fields (88) + entries count (4) + hasSnapshot flag (8) = 100.
 const HeartbeatMessageSize = messageFixedSize + 4 + 8 // 100 bytes
 
 // Size returns the total marshaled size of the message in bytes.
@@ -90,16 +117,36 @@ func (m *Message) Size() int {
 	return sz
 }
 
-// MarshalTo writes the message into buf and returns the bytes written: ErrBufferTooSmall, ErrTooManyMessages, ErrInvalidMessageType or ErrSnapshotWithoutPosition on failure.
+// MarshalTo writes the message into buf and returns bytes written.
+// buf must be at least Size() bytes. Returns ErrBufferTooSmall if buf is too
+// short, ErrTooManyMessages if Entries exceeds MaxEntriesPerMessage, or
+// ErrInvalidMessageType if Type is outside the range UnmarshalFrom accepts —
+// the read side's bounds applied on write, so a producer learns at the SENDER
+// that its message is unparseable instead of having every peer silently reject
+// the frame (a rejection the sender cannot tell from a broken connection; see
+// MaxEntriesPerMessage).
+//
+// It also returns ErrSnapshotWithoutPosition rather than silently dropping a
+// snapshot the layout cannot express; see Snapshot.hasContentBeyondPosition.
 func (m *Message) MarshalTo(buf []byte) (int, error) {
 	if len(m.Entries) > MaxEntriesPerMessage {
 		return 0, ErrTooManyMessages
 	}
-	// The same type range gate UnmarshalFrom applies.
+	// The same range gate UnmarshalFrom applies. Message.Type selects the
+	// handler on the receiving side, so a value outside the enum is not a
+	// cosmetic mismatch: the frame is refused wholesale and the sender sees a
+	// dead connection.
 	if m.Type > maxMessageType {
 		return 0, ErrInvalidMessageType
 	}
-	// Refuse a snapshot with content but no log position instead of encoding it as absent.
+	// The snapshot presence flag is derived from Snapshot.IsEmpty, which asks
+	// only about Index and Term. A snapshot carrying a filepath, a membership
+	// and a size but no log position therefore encodes as ABSENT, and every
+	// field of it is discarded with no error — the receiver gets an
+	// InstallSnapshot with nothing in it. Refuse instead: no position is not a
+	// state any producer here can legitimately reach (a raft snapshot always
+	// covers at least index 1), so the value is a construction bug, and the one
+	// outcome that must not happen is losing it quietly.
 	if m.Snapshot.IsEmpty() && m.Snapshot.hasContentBeyondPosition() {
 		return 0, ErrSnapshotWithoutPosition
 	}
@@ -143,13 +190,20 @@ func (m *Message) MarshalTo(buf []byte) (int, error) {
 	return offset, nil
 }
 
-// UnmarshalFrom reads the message from buf: ErrBufferTooSmall, ErrInvalidMessageType or ErrTooManyMessages on failure.
+// UnmarshalFrom reads the message from buf and returns bytes consumed.
+// Validates Message.Type against the known range and entries count
+// against MaxEntriesPerMessage before allocation. Returns ErrBufferTooSmall
+// on truncated input, ErrInvalidMessageType for unknown types, or
+// ErrTooManyMessages if the entry count exceeds the limit.
 func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 	// Need at least fixed fields + entries count
 	if len(buf) < messageFixedSize+4 {
 		return 0, ErrBufferTooSmall
 	}
-	// A decoded message is remote by definition.
+	// Anything reconstructed from bytes is remote by definition. Setting it
+	// here (rather than relying on the caller to have Reset the message)
+	// makes the wire decoder itself the place that establishes the property
+	// raft.step depends on.
 	m.Origin = OriginRemote
 	m.Type = getUint64(buf[0:])
 	m.From = getUint64(buf[8:])
@@ -213,7 +267,16 @@ func (m *Message) UnmarshalFrom(buf []byte) (int, error) {
 	return offset, nil
 }
 
-// maxRetainedEntries bounds the Entries capacity a pooled message keeps across Reset.
+// maxRetainedEntries bounds the Entries capacity a message keeps across
+// Reset, mirroring maxRetainedRequests for MessageBatch.Requests. A message
+// lives inside a pooled MessageBatch, so without this a single crafted frame
+// carrying many oversized messages would pin
+// len(Requests) * cap(Entries) * unsafe.Sizeof(Entry) bytes in the pool for
+// the process lifetime. The bound sits above the legitimate working set —
+// UnmarshalFrom accepts up to MaxEntriesPerMessage (10000) entries per
+// message, while a steady-state append carries at most
+// batch.DefaultMaxBatchSize (1000) proposals — so a normal replication
+// message still reuses its backing array.
 const maxRetainedEntries = 1024
 
 // Reset clears all fields for reuse. An Entries slice grown past
@@ -231,7 +294,9 @@ func (m *Message) Reset() {
 	m.Commit = 0
 	m.Reject = false
 	m.Hint = 0
-	// A pooled message comes back untrusted.
+	// A pooled message must come back as UNTRUSTED. Leaving a stale
+	// OriginLocal on a recycled message would let the next wire decode inherit
+	// the local-injection exemption in raft.step.
 	m.Origin = OriginRemote
 	m.Snapshot.Reset()
 	if cap(m.Entries) > maxRetainedEntries {

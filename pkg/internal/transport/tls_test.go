@@ -310,7 +310,9 @@ func TestVerifyConnectionEmptyPeerCerts(t *testing.T) {
 		t.Fatalf("buildMTLSTLS failed: %v", err)
 	}
 
-	// Empty PeerCertificates must fail closed.
+	// Empty PeerCertificates must FAIL CLOSED: a connection presenting no
+	// certificate cannot be revocation-checked and must be rejected
+	// rather than silently accepted (a latent fail-open).
 	cs := tls.ConnectionState{PeerCertificates: nil}
 	if cbErr := pair.server.VerifyConnection(cs); !errors.Is(cbErr, ErrNoPeerCertificate) {
 		t.Fatalf("nil PeerCertificates: got %v, want ErrNoPeerCertificate", cbErr)
@@ -322,7 +324,16 @@ func TestVerifyConnectionEmptyPeerCerts(t *testing.T) {
 	}
 }
 
-// TestBuildMTLSTLS_CurvePreferences: both roles pin CurvePreferences to this build's list (assertHandshakeCurves).
+// TestBuildMTLSTLS_CurvePreferences verifies that buildMTLSTLS pins
+// CurvePreferences on BOTH roles — an unpinned list negotiates ML-KEM hybrid
+// key exchange and pays ~5% per handshake — and that what it pins is the list
+// this build is allowed to offer.
+//
+// WHICH list that is depends on the `fips` build tag, so the judgement lives in
+// assertHandshakeCurves (tls_curves_fips_test.go / tls_curves_nofips_test.go).
+// Asserting it here against tls.X25519 is what the test did before the tag
+// existed, and it would have to be deleted rather than re-pointed to build a
+// FIPS variant at all.
 func TestBuildMTLSTLS_CurvePreferences(t *testing.T) {
 	caCertPEM, _, certPEM, keyPEM := generateTestCertPair(t)
 
@@ -354,7 +365,12 @@ func TestBuildMTLSTLS_CurvePreferences(t *testing.T) {
 // CA bundle parsing for revocation issuer selection
 // ---------------------------------------------------------------------------
 
-// TestParseCACertificatesReturnsWholeBundle: revocation receives every issuer candidate in the CA bundle.
+// TestParseCACertificatesReturnsWholeBundle is the regression test on the
+// transport side: TLS verification consumes every block of the CA bundle
+// (pool.AppendCertsFromPEM), so revocation must receive every issuer candidate
+// too. Taking only the first PEM block wires revocation to the root in a
+// standard root-first bundle, which can never match an intermediate-issued
+// leaf.
 func TestParseCACertificatesReturnsWholeBundle(t *testing.T) {
 	rootPEM, _, _, _ := generateTestCertPair(t)
 	secondPEM, _, _, _ := generateTestCertPair(t)

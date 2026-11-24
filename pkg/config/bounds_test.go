@@ -19,7 +19,18 @@ import (
 	"testing"
 )
 
-// Pins Validate's three numeric ceilings at the boundary in both directions.
+// The three numeric ceilings in Validate had NO test: no occurrence of
+// MaxUint32, 4294967295, MaxInt32 or 2147483647 existed in any test in this
+// package, so all three guards could be deleted with the suite staying green.
+//
+// They are also the three highest-consequence rules in the file by their own
+// comments: an ElectionRTT at or above 2^63 narrows to a NEGATIVE int and
+// PANICS StartShard, and a ReplicaID above 2^32 silently truncates the
+// proposal-key packing so an applied entry can complete another replica's
+// unrelated pending request.
+//
+// Each is pinned at the boundary in both directions, so an off-by-one in
+// either guard fails too.
 
 func TestConfig_Validate_ReplicaIDCeiling(t *testing.T) {
 	t.Run("at the uint32 maximum is accepted", func(t *testing.T) {
@@ -61,7 +72,12 @@ func TestConfig_Validate_TickCeilings(t *testing.T) {
 	})
 }
 
-// TestConfig_Validate_ElectionHeartbeatMargin pins the rule that an election timeout must be at least two heartbeats.
+// TestConfig_Validate_ElectionHeartbeatMargin pins the election/heartbeat
+// ratio rule inside the 1x..2x band, not only at ratio <= 1: weakening the
+// rule from `ElectionRTT/2 < HeartbeatRTT` to `ElectionRTT <= HeartbeatRTT`
+// must fail, because the 1x..2x band is exactly the configuration the
+// production comment names as harmful — an election timeout under two
+// heartbeat intervals produces election storms.
 func TestConfig_Validate_ElectionHeartbeatMargin(t *testing.T) {
 	t.Run("ratio of exactly 2x is the accepted minimum", func(t *testing.T) {
 		// The rule refuses when ElectionRTT/2 < HeartbeatRTT, so 10/5 gives

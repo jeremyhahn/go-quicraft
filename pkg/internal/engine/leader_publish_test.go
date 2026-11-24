@@ -92,7 +92,20 @@ func driveToLeader(t *testing.T, peer *raft.Peer, self, granter uint64) {
 	}
 }
 
-// TestStepWorker_Tick_PublishesCheckQuorumStepDown verifies a CheckQuorum step-down inside Tick is published to the Host.
+// TestStepWorker_Tick_PublishesCheckQuorumStepDown is the regression test for
+// a leader that stepped down but kept advertising itself as leader.
+//
+// A CheckQuorum step-down happens ENTIRELY inside Tick(): tickLeader sees no
+// quorum of active remotes and calls becomeFollower(r.term, noLeader). That
+// changes neither term, vote nor commit index and produces no message, so
+// Peer.HasUpdate() is false and processReady skips the shard without ever
+// reaching a publish site. The engine's only writer of the shard's leader
+// flag — OnLeaderUpdated — was reachable from just two places, both of which
+// require an update or a non-empty inbox, so the step-down was invisible:
+// Host.ShardInfo().IsLeader kept reporting true, and every `!isLeader`
+// guard in the Host kept admitting writes to a replica that had already
+// relinquished leadership. The stale value survived until the node campaigned,
+// roughly a full election timeout later.
 func TestStepWorker_Tick_PublishesCheckQuorumStepDown(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -141,7 +154,15 @@ func TestStepWorker_Tick_PublishesCheckQuorumStepDown(t *testing.T) {
 	}
 }
 
-// TestStepWorker_CommitPendingInbox_PublishesLeaderChange covers the publish site inside processCommitPendingInbox.
+// TestStepWorker_CommitPendingInbox_PublishesLeaderChange covers the publish
+// site inside processCommitPendingInbox.
+//
+// While commitPending is set the step worker never calls GetUpdate, so
+// processCallbacks — the other publish site — cannot run at all. A node that
+// wins its election from inside this path (the vote response is stepped in
+// phase 2) would therefore be a real Raft leader that the Host reports as a
+// follower, rejecting every write with NotLeaderError, for as long as the
+// write load keeps commitPending set.
 func TestStepWorker_CommitPendingInbox_PublishesLeaderChange(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -158,7 +179,8 @@ func TestStepWorker_CommitPendingInbox_PublishesLeaderChange(t *testing.T) {
 	node := NewNode(peer, newTestApplier(newTestSM()), lr, cfg, nil, "", nil)
 	sw.loadNode(node)
 
-	// Campaign without the winning vote, via the tick path only.
+	// Campaign to pre-candidate/candidate WITHOUT the winning vote, using only
+	// the tick path so nothing is published yet.
 	for range 400 {
 		peer.Tick()
 		if err := peer.Handle(proto.Message{
@@ -194,7 +216,12 @@ func TestStepWorker_CommitPendingInbox_PublishesLeaderChange(t *testing.T) {
 			"(leaderID=%d)", peer.LeaderID())
 	}
 
-	// The cycle that won the election must publish it; the vote response is stepped in phase 2.
+	// The SAME cycle that won the election must publish it. RequestVoteResp is
+	// not a HeartbeatResp, so it is sorted into otherMsgs and stepped in phase
+	// 2 — after the phase 1 publish has already run. With publishing done only
+	// at the end of phase 1, this node stayed a real Raft leader that the Host
+	// reported as a follower until some later cycle happened to publish, and
+	// under sustained write load commitPending keeps that cycle from coming.
 	if got := lastLeader(cb); got != 1 {
 		t.Fatalf("leadership won under commitPending was never published "+
 			"(last published leader=%d, raft leaderID=%d): the Host reports this "+
@@ -246,7 +273,15 @@ func (c *lockProbeCallback) OnLeaderUpdated(shardID, leaderID, term uint64) {
 	}
 }
 
-// TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu pins that OnLeaderUpdated never runs under the node lock.
+// TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu pins the contract
+// publishLeaderChange documents for itself: the callback never executes under
+// the node lock.
+//
+// OnLeaderUpdated runs arbitrary user listener code (and the Host's
+// failPendingRequests). Invoking it under raftMu blocks the commit worker's
+// node.raftMu.Lock() for EVERY shard that worker owns, for as long as the
+// user's listener takes — a head-of-line stall across unrelated shards, gated
+// on third-party code with no time bound.
 func TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -293,7 +328,16 @@ func TestStepWorker_CommitPendingInbox_PublishesOutsideRaftMu(t *testing.T) {
 	}
 }
 
-// TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu pins the phase-1 publish runs outside raftMu.
+// TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu is the PHASE 1
+// half of the lock contract. It is a separate test because the two publish
+// sites need different fixtures and each is otherwise invisible to the other:
+// the phase-2 test wins leadership in phase 2, so the phase-1 publish is a
+// no-op there and its lock probe never fires. Without this test, moving the
+// phase-1 publish back inside raftMu — the exact defect that motivated the
+// change — passes the entire suite.
+//
+// A HeartbeatResp at a higher term forces becomeFollower in phase 1, and since
+// HeartbeatResp is the only type routed to phase 1, phase 2 early-returns.
 func TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)
@@ -338,7 +382,15 @@ func TestStepWorker_CommitPendingInbox_Phase1PublishesOutsideRaftMu(t *testing.T
 	}
 }
 
-// TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering pins that client work stays queued during recovery while Raft traffic flows.
+// TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering pins
+// the backpressure contract on the commitPending path.
+//
+// During a snapshot recovery the apply worker parks on the recovery gate
+// WITHOUT clearing commitPending, so processCommitPendingInbox is the steady
+// state, not a corner case. Draining proposals and ReadIndex requests there
+// took them off the queues that would otherwise answer ErrSystemBusy, while
+// nothing could complete them: the apply pipeline is stopped and lastApplied
+// does not move. Raft protocol traffic must keep flowing regardless.
 func TestStepWorker_CommitPendingInbox_LeavesClientWorkQueuedWhileRecovering(t *testing.T) {
 	sender := newTestSender()
 	ws := NewWorkSignal(1)

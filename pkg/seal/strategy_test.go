@@ -388,7 +388,14 @@ func TestSoftwareStrategy_SealRandSaltFails(t *testing.T) {
 	}
 }
 
-// TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader verifies the wrapping AEAD generates its own nonce.
+// TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader pins that the
+// wrapping AEAD generates its own nonce.
+//
+// Drawing the AES-GCM nonce from s.randReader and handing it to Seal would be a
+// caller-supplied IV, which SP 800-38D forbids. The wrapping AEAD is built by
+// newAESGCM (cipher.NewGCMWithRandomNonce) and generates the nonce itself, so s.randReader supplies the KDF salt and nothing else. A reader that
+// yields exactly the salt and then fails must therefore produce a COMPLETE
+// sealed blob; if it does not, a caller-supplied IV has come back.
 func TestSoftwareStrategy_SealDoesNotDrawTheNonceFromRandReader(t *testing.T) {
 	s, err := newTestStrategy([]byte("test-passphrase"))
 	if err != nil {

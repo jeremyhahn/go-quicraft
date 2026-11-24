@@ -34,9 +34,41 @@ func (s *failingRecoverSnapshotter) RecoverFromSnapshot(context.Context, io.Read
 	return s.err
 }
 
-// TestSnapshotPool_StaleRecovery_DeclinesWithoutFailingTheShard verifies a stale recovery is refused and the shard stays alive.
+// TestSnapshotPool_StaleRecovery_DeclinesWithoutFailingTheShard pins the
+// CONSEQUENCE of the stale-recovery refusal, which is a different question from
+// whether the refusal happens at all (that is
+// TestSnapshotPool_RecoverSnapshot_RefusesSnapshotBehindApplyFrontier).
+//
+// # The condition
+//
+// A leader elected mid-flight rebuilds every remote's next index, and a
+// rejection walk-down can drive one below the compacted floor. The leader then
+// ships an InstallSnapshot to a follower that is NOT behind. raft.handleSnapshot
+// rejects it ("snapshot rejected, behind committed index") and replies with the
+// follower's real committed index, which is how the leader stops sending it —
+// the protocol resolves this by itself.
+//
+// The host, however, queues state-machine recovery on DELIVERY of the
+// InstallSnapshot rather than on raft ACCEPTING it, so the pool still receives a
+// recovery request for a snapshot raft has already discarded.
+//
+// # What must happen
+//
+// The pool refuses the recovery, and the shard STAYS ALIVE. The refusal is
+// produced before the recovering gate is raised and before RecoverFromSnapshot
+// runs, so the state machine is untouched, and it is already at or past the
+// snapshot index — there is nothing to restore and nothing to repair.
+//
+// Failing the shard here turns this benign race into a dead shard under load,
+// taking TestE2E_SnapshotCatchUp_* red on an engine error rather than an
+// assertion:
+//
+//	engine: snapshot recovery for shard 1 replica 1 at index 62 is not ahead
+//	of applied index 63
 func TestSnapshotPool_StaleRecovery_DeclinesWithoutFailingTheShard(t *testing.T) {
-	// Register wg.Wait first so it runs after close(stopC).
+	// Deferred calls run LIFO, so wg.Wait is registered FIRST in order to run
+	// LAST -- after close(stopC). The pool workers only return once stopC is
+	// closed, so the other order deadlocks the test.
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	stopC := make(chan struct{})
@@ -84,9 +116,18 @@ func TestSnapshotPool_StaleRecovery_DeclinesWithoutFailingTheShard(t *testing.T)
 	}
 }
 
-// TestSnapshotPool_FailedRecovery_StillFailsTheShard verifies an error from RecoverFromSnapshot fails the shard.
+// TestSnapshotPool_FailedRecovery_StillFailsTheShard is the other half of the
+// pair above, and the reason the stale-recovery decline is narrow rather than a
+// blanket "recovery errors are not fatal".
+//
+// An error out of RecoverFromSnapshot is terminal: the user state machine is
+// free to have mutated itself before returning, sm.StateMachine promises
+// all-or-nothing only for Update, and resuming applies on a possibly
+// half-restored base diverges the replica with every Raft invariant intact.
 func TestSnapshotPool_FailedRecovery_StillFailsTheShard(t *testing.T) {
-	// Register wg.Wait first so it runs after close(stopC).
+	// Deferred calls run LIFO, so wg.Wait is registered FIRST in order to run
+	// LAST -- after close(stopC). The pool workers only return once stopC is
+	// closed, so the other order deadlocks the test.
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	stopC := make(chan struct{})

@@ -21,7 +21,12 @@ import (
 	"testing"
 )
 
-// FuzzDecodeCommand checks DecodeCommand never panics and accepted commands round-trip.
+// FuzzDecodeCommand feeds arbitrary bytes to DecodeCommand. It asserts
+// only that the decoder never panics and that the canonical encoding of
+// any command it accepts round-trips: decode(encode(c)) == c. It does not
+// assert an acceptance policy: whatever the decoder accepts today (for
+// example bytes after a Get or Delete key, which replay of an existing log
+// relies on) stays accepted.
 func FuzzDecodeCommand(f *testing.F) {
 	type pair struct{ key, value []byte }
 	seeds := []pair{

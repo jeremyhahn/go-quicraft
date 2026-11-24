@@ -280,7 +280,11 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	defer newHost.Close()
 	newAddr := newHost.RaftAddress()
 
-	// Add replica 4 as a voter at newAddr through the leader, confirmed by a linearizable read.
+	// Add the 4th replica to the cluster's membership through the current
+	// leader, confirmed by a linearizable read showing it as a voter at
+	// newAddr. The address half of that confirmation is what this site needs
+	// most: the replica is about to be STARTED at that address, so an
+	// "already exists" for replica 4 elsewhere would be a real conflict.
 	const newReplicaID = 4
 	cluster.addReplicaToLeader(t, 1, newReplicaID, newAddr, newHost.NodeIdentity(), membership.ConfigChangeID, membershipTimeout)
 	t.Logf("replica %d added to membership at address %s", newReplicaID, newAddr)

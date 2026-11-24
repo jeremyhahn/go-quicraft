@@ -35,7 +35,12 @@ func (unreadableRecordLogDB) GetSnapshot(uint64, uint64) (logdb.Snapshot, error)
 	return logdb.Snapshot{}, errors.New("injected: snapshot record unreadable")
 }
 
-// TestSnapshotRecordGuards_FailClosedOnAnUnreadableRecord: an unreadable LogDB record makes GC reclaim nothing and any directory count as possibly recorded.
+// TestSnapshotRecordGuards_FailClosedOnAnUnreadableRecord: the snapshot GC and
+// a receive's publish spare the directory the LogDB record names. Reading an
+// UNREADABLE record as "no record" would let one transient read error make GC,
+// under retention pressure, delete the recorded snapshot whose log below it was
+// already compacted. An unreadable record makes GC reclaim nothing, and makes
+// any directory count as possibly recorded.
 func TestSnapshotRecordGuards_FailClosedOnAnUnreadableRecord(t *testing.T) {
 	const shardID, replicaID = uint64(9), uint64(1)
 	base := t.TempDir()

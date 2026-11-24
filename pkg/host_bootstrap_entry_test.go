@@ -22,7 +22,18 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// bootstrapLogEntry returns the committed EntryInitialMembership at raft.BootstrapMembershipIndex as a logdb.Entry with the given term.
+// bootstrapLogEntry returns the committed EntryInitialMembership that every
+// shard this code base bootstraps lays down at raft.BootstrapMembershipIndex,
+// as a logdb.Entry a fixture can seed straight into a LogDB.
+//
+// A restart fixture that puts an ordinary entry at that index is not modelling
+// any shard this code can create; it is modelling a DAMAGED log, which
+// reconstructShardMembership now refuses (*BootstrapEntryMissingError) rather
+// than re-seeding membership from the caller's members map.
+//
+// term is the fixture's own term for index 1. Reconstruction reads only the
+// entry's type and payload, but keeping the term consistent with the rest of
+// the fixture's entries keeps the log a legal one.
 func bootstrapLogEntry(t *testing.T, term uint64, addresses map[uint64]string) logdb.Entry {
 	t.Helper()
 	e, err := raft.BuildInitialMembershipEntry(proto.Membership{Addresses: addresses})

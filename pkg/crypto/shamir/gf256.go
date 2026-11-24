@@ -14,9 +14,18 @@
 
 package shamir
 
-// Constant-time GF(2^8) arithmetic with the AES polynomial 0x11B: no secret-indexed lookups or secret-dependent branches.
+// Constant-time arithmetic in GF(2^8) with the AES reduction polynomial
+// x^8 + x^4 + x^3 + x + 1 (0x11B).
+//
+// These primitives back a root-key custody path, so they are written to
+// be constant-time with respect to secret operands: no table lookups
+// indexed by secret data, no branches on secret data. All data-dependent
+// selection is done with branchless masks.
 
-// gfMul multiplies a and b in GF(2^8) in constant time with branchless masks.
+// gfMul multiplies a and b in GF(2^8) in constant time using the
+// branchless Russian-peasant method. Each of the 8 iterations performs
+// the same operations regardless of operand bits: conditional XORs are
+// realized as AND with an all-ones/all-zeros mask derived from the bit.
 func gfMul(a, b byte) byte {
 	var r byte
 	for i := 0; i < 8; i++ {
@@ -32,7 +41,10 @@ func gfMul(a, b byte) byte {
 	return r
 }
 
-// gfInv returns a^254, the inverse of a, in constant time; gfInv(0) is 0, so callers reject zero first.
+// gfInv returns the multiplicative inverse of a in GF(2^8), computed as
+// a^254 by a fixed square-and-multiply schedule (254 = 2+4+8+16+32+64+128),
+// which is constant-time: the same 13 multiplications run for every input.
+// gfInv(0) returns 0; callers must reject zero denominators beforehand.
 func gfInv(a byte) byte {
 	sq := gfMul(a, a) // a^2
 	r := sq
@@ -60,7 +72,11 @@ func gfPolyEval(coefficients []byte, x byte) byte {
 	return y
 }
 
-// gfLagrangeZero computes the Lagrange basis at x=0 for public, non-zero, distinct x-coordinates.
+// gfLagrangeZero computes the Lagrange basis coefficients evaluated at
+// x=0 for the given x-coordinates: L_j = Π_{m≠j} x_m / (x_j ⊕ x_m).
+// The x-coordinates are public (share indices), so this is not
+// secret-dependent. All x values must be non-zero and pairwise distinct
+// (enforced by parseRawShare before calling).
 func gfLagrangeZero(xs []byte) []byte {
 	basis := make([]byte, len(xs))
 	for j := range xs {

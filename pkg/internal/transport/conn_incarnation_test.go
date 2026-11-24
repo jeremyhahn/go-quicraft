@@ -63,7 +63,16 @@ func TestEvictStaleOutboundOnRecv_UnattributableOutboundEvicted(t *testing.T) {
 	}
 }
 
-// TestEvictStaleOutboundOnRecv_AttributedOutboundSurvivesRepeatedBatches: eviction converges and leaves an attributed outbound alone.
+// TestEvictStaleOutboundOnRecv_AttributedOutboundSurvivesRepeatedBatches
+// guards the opposite failure: eviction must converge, not cascade.
+//
+// An earlier identity-based heuristic evicted on every re-dial, so A evicting
+// made B see a new inbound and evict in turn, forever. Attribution has the same
+// hazard if the epoch a fresh outbound is stamped with can be forgotten
+// underneath it -- every subsequent batch would then look unattributable and
+// tear down a perfectly good connection. Once a connection has been dialed
+// while the peer's incarnation was known, repeated batches from that same
+// incarnation must be a no-op.
 func TestEvictStaleOutboundOnRecv_AttributedOutboundSurvivesRepeatedBatches(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()
@@ -97,7 +106,16 @@ func TestEvictStaleOutboundOnRecv_AttributedOutboundSurvivesRepeatedBatches(t *t
 	}
 }
 
-// TestEvictStaleOutboundOnRecv_RestartAfterTeardownEvicts: a teardown keeps the peer's incarnation, and a later restart still evicts.
+// TestEvictStaleOutboundOnRecv_RestartAfterTeardownEvicts covers the exact
+// sequence the soak hit: the outbound to a peer is torn down and re-dialed
+// (a write failure, a dead-connection sweep) and the peer then restarts.
+//
+// The teardown must not erase the peer's known incarnation, because the
+// re-dialed connection is stamped from it. If it did, the re-dial would be
+// stamped "unknown", every later batch would look unattributable, and eviction
+// would forget the epoch again -- an endless evict/re-dial loop. Equally, the
+// re-dialed connection must still be recognised as stale once the peer's epoch
+// actually changes.
 func TestEvictStaleOutboundOnRecv_RestartAfterTeardownEvicts(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()

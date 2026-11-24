@@ -121,7 +121,13 @@ func assertWorkerStale(t *testing.T, err error, got uint64) {
 	}
 }
 
-// TestConfigChange_WorkerRefusesStaleIndex verifies the leader's worker refuses an add checked against a superseded index, for every role.
+// TestConfigChange_WorkerRefusesStaleIndex verifies, on the real Host, that an
+// add checked against index C is refused at the leader's worker when another
+// membership change commits between the Host's check and the proposal, for
+// voter, observer and witness, from C > 0 (the index is always bound) and
+// for voter and observer from the initial configuration (C = 0, bound by
+// WithBoundConfigChangeIndex). Nothing enters the log: the same replica is
+// then added successfully against the current index.
 func TestConfigChange_WorkerRefusesStaleIndex(t *testing.T) {
 	for _, kind := range workerAddKinds {
 		for _, fromZero := range []bool{false, true} {
@@ -216,7 +222,12 @@ func TestConfigChange_BoundZeroIndexAccepted(t *testing.T) {
 	}
 }
 
-// TestConfigChange_BoundZeroExpiredBeforeWorkerStaysBound: a bound add from index 0 that expires before the worker takes it is still refused as stale.
+// TestConfigChange_BoundZeroExpiredBeforeWorkerStaysBound: a bound add from
+// index 0 whose deadline expires before the leader's worker takes it keeps
+// its binding. The expiry fails the caller but leaves the entry in the
+// proposal queue, so the worker still validates it later: after another
+// membership change committed in between, it must be refused as stale, not
+// committed as an unbound add.
 func TestConfigChange_BoundZeroExpiredBeforeWorkerStaysBound(t *testing.T) {
 	h := startWorkerShard(t, workerAddKinds[1])
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

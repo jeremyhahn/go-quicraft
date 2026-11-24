@@ -112,7 +112,12 @@ func assertSameFingerprint(t *testing.T, name string, before, after map[string]s
 	}
 }
 
-// TestNewHost_IdentityRestartRefusedLeavesDirectories checks a restart under another DeploymentID fails with ErrHostIdentityMismatch and leaves the directories unchanged.
+// TestNewHost_IdentityRestartRefusedLeavesDirectories starts a Host, applies
+// entries, closes it, and restarts on the same directories under another
+// DeploymentID: the restart is refused with ErrHostIdentityMismatch and
+// leaves both directories unchanged; a restart under the original identity
+// recovers the applied state. pkg/host_dirlock_test.go covers the refusal on
+// directories that hold no shard state.
 func TestNewHost_IdentityRestartRefusedLeavesDirectories(t *testing.T) {
 	const (
 		shardID, replicaID uint64 = 1, 1

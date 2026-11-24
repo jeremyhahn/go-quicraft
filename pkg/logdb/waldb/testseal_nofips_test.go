@@ -22,7 +22,14 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
-// newTestSealStrategy returns a passphrase strategy with the cheapest KDF this build has: Argon2id here, PBKDF2-SHA256 under -tags fips. Requires seal.AllowWeakKDFParams.
+// newTestSealStrategy returns a passphrase sealing strategy with the cheapest
+// KDF this build supports, so tests do not each hard-code one that a FIPS build
+// cannot compile.
+//
+// Argon2id here. A binary built with -tags fips has no Argon2id DERIVER — it is
+// behind //go:build !fips in pkg/seal — so this constructor, which exists in
+// every build, cannot succeed there and the fips variant of this file uses
+// PBKDF2-SHA256 instead. Callers must have enabled seal.AllowWeakKDFParams.
 func newTestSealStrategy(passphrase []byte) (*seal.SoftwareStrategy, error) {
 	return seal.NewSoftwareStrategyWithParams(context.Background(), passphrase, 1, 64*1024, 1)
 }

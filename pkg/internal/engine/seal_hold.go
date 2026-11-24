@@ -23,9 +23,29 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// SealHold lets the commit worker park a shard whose log write the sealed barrier refused; the zero value fails the shard.
+// SealHold lets the commit worker park a shard whose log write was refused
+// because the at-rest barrier is sealed, instead of failing it. A
+// sealed barrier is an operator state, not a disk fault: the WAL refused the
+// record before writing it and rolled the batch back to its checkpoint, so
+// nothing reached disk and the write can be retried, unchanged, once the
+// barrier unseals.
+//
+// The engine does not know which errors mean "sealed", nor where a shard's
+// barrier lives; the host does, and supplies both. A zero SealHold (the
+// default) keeps the old behaviour: every SaveState failure fails the shard.
 type SealHold struct {
-	// IsSealed reports that err is exactly a sealed refusal that left the log unchanged; it must accept each member's single-update refusal too.
+	// IsSealed reports that err is EXACTLY the barrier's sealed refusal of a
+	// write that left the log as it was before the batch. It must report
+	// false for anything that also carries a disk fault — a failed fsync, a
+	// poisoned log, a rollback that did not complete — since those are
+	// permanent and still fail the shard.
+	//
+	// A classifier that accepts a batch's sealed refusal MUST accept every
+	// single-update sealed refusal the same LogDB produces for that batch's
+	// members: holdSealedBatch re-writes each member alone through saveOne,
+	// which gives an error IsSealed rejects the full retry budget and then
+	// fails the shard. A mismatch would spend backoffs on the commit worker
+	// and latch a shard that unsealing would have released.
 	IsSealed func(err error) bool
 
 	// UnsealedC returns a channel closed when shardID's barrier is next
@@ -59,7 +79,17 @@ func (w *commitWorker) isSealedSaveErr(err error) bool {
 	return w.sealHold.IsSealed != nil && w.sealHold.IsSealed(err)
 }
 
-// holdSealedBatch re-writes a sealed-refused batch one update at a time, parking only the sealed shards; it reports whether any update persisted.
+// holdSealedBatch settles a batch whose SaveState the sealed barrier refused,
+// and reports whether it kept any update that is now durable and must carry
+// on through the normal send/commit path.
+//
+// One SaveState covers every shard in the batch, and a refused batch is
+// rolled back whole, so a refusal says only that SOME shard's barrier is
+// sealed. With one barrier per host every shard is, but a multiplexing LogDB
+// gives shards their own barriers, and one sealed shard must not stall the
+// others on the worker. The batch is therefore re-written one update at a
+// time: the updates that persist go on, the ones refused as sealed are
+// parked, and any other failure fails that shard alone, as before.
 func (w *commitWorker) holdSealedBatch() bool {
 	if len(w.batch) == 1 {
 		node, u := w.batchNodes[0], w.batch[0]
@@ -123,7 +153,13 @@ func (w *commitWorker) saveOne(u []logdb.Update) error {
 	return err
 }
 
-// takeOrderedMsgs removes the ordered messages the batch holds for shardID; ambiguous incarnations' messages are dropped.
+// takeOrderedMsgs removes and returns the ordered messages the batch holds
+// for shardID. They are owed to state the refused write carried, so they
+// must leave the batch before any other update's send. orderedMsgsBuf is
+// keyed by shardID; when two incarnations of the shard share the batch their
+// messages cannot be told apart, so they are dropped rather than requeued to
+// either — a lost message costs a retransmit or an election timeout, never
+// safety.
 func (w *commitWorker) takeOrderedMsgs(shardID uint64) []proto.Message {
 	msgs := w.orderedMsgsBuf[shardID]
 	delete(w.orderedMsgsBuf, shardID)
@@ -140,7 +176,25 @@ func (w *commitWorker) takeOrderedMsgs(shardID uint64) []proto.Message {
 	return msgs
 }
 
-// holdSealed restores raft's view of node's refused update, freezes the shard and invalidates the leader lease until releaseHeld.
+// holdSealed parks node: its update u was refused by the sealed barrier, so
+// it neither reached disk nor may be sent, acked or applied.
+//
+// Raft's view is put back exactly as GetUpdate found it — the hard state is
+// marked unpersisted again, the ordered messages owed to it are requeued,
+// and the entries, never marked stable, stay in the unstable log — and the
+// shard is frozen (sealHeld) with commitPending still set, so the step
+// worker neither ticks it, steps its inbox nor extracts another update.
+// When the barrier unseals, releaseHeld clears both and the step worker
+// re-derives the same update — same entries, same indexes and terms, since
+// nothing moved raft in between — and writes it.
+//
+// The leader lease is invalidated: a frozen replica sends no heartbeats and
+// may be deposed while it waits, so on release it must earn a fresh quorum
+// of acks before serving a LeaseRead again.
+//
+// Proposals already in raft's log are neither failed nor acknowledged: they
+// complete when the retried write commits, or their callers' deadlines
+// expire.
 func (w *commitWorker) holdSealed(node *Node, u proto.Update, ordered []proto.Message) {
 	u.ReleaseCommittedEntries()
 	if node.isUnloaded() {
@@ -168,7 +222,13 @@ func (w *commitWorker) holdSealed(node *Node, u proto.Update, ordered []proto.Me
 	w.sealWaiters.Go(func() { w.awaitUnseal(h, unsealC) })
 }
 
-// awaitUnseal waits for the barrier to unseal or the shard or worker to stop, then wakes the run loop.
+// awaitUnseal waits for the held shard's barrier to unseal, for the shard to
+// stop, or for the worker to stop, then wakes the run loop. It never touches
+// the node: the run loop owns the release.
+//
+// Engine stop leaks nothing: every waiter returns on stopC, and run joins them
+// (sealWaiters) and then releases every held shard before the commit tier
+// reports done.
 func (w *commitWorker) awaitUnseal(h *heldShard, unsealC <-chan struct{}) {
 	var poll <-chan time.Time
 	if unsealC == nil {
@@ -221,7 +281,10 @@ func (w *commitWorker) releaseUnloaded(shardID uint64) {
 	w.held = keep
 }
 
-// releaseHeld unfreezes a held node, clearing sealHeld before commitPending.
+// releaseHeld unfreezes a held node and hands it back to the step worker,
+// which re-derives the refused update and writes it again. sealHeld is
+// cleared first so the step worker never sees commitPending clear on a
+// frozen node.
 func releaseHeld(node *Node, workSignal *WorkSignal) {
 	node.sealHeld.Store(false)
 	node.commitPending.Store(false)

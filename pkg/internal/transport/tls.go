@@ -32,7 +32,10 @@ var (
 	// cannot be parsed.
 	ErrInvalidCertKeyPair = errors.New("transport: invalid certificate/key pair")
 
-	// ErrNoPeerCertificate is returned by the revocation VerifyConnection callback for a connection with no peer certificate.
+	// ErrNoPeerCertificate is returned by the revocation VerifyConnection
+	// callback when a connection presents no peer certificate. mTLS makes
+	// this unreachable, but the callback fails closed rather than
+	// accepting an unauthenticated connection.
 	ErrNoPeerCertificate = errors.New("transport: connection presented no peer certificate")
 )
 
@@ -46,7 +49,11 @@ type tlsPair struct {
 	server *tls.Config
 	client *tls.Config
 
-	// leaf is this node's own parsed end-entity certificate, kept for VerifyPeerAddressExclusivity.
+	// leaf is this node's OWN parsed end-entity certificate — the same
+	// certificate peers see in both the server and client roles. It is kept so
+	// the startup exclusivity check (VerifyPeerAddressExclusivity) can ask
+	// whether this node's SANs also cover other members' hosts, which would
+	// collapse every in-band authorization decision the transport makes.
 	leaf *x509.Certificate
 }
 
@@ -89,7 +96,13 @@ func parseCACertificates(caPEM []byte) ([]*x509.Certificate, error) {
 	return issuers, nil
 }
 
-// buildMTLSTLS builds the server and client mTLS configs against the CA, installing a revocation VerifyConnection callback (also run on resumed sessions) when a checker is given.
+// buildMTLSTLS builds a TLS pair from provided mTLS certificate material.
+// Both server and client verify peers using the configured CA. When a
+// revocation checker is provided, a VerifyConnection callback is installed on
+// both server and client configs to reject revoked peer certificates. The
+// callback is deliberately VerifyConnection and not VerifyPeerCertificate:
+// the latter is skipped on resumed TLS sessions, which would let a revoked
+// peer keep reconnecting via session resumption.
 func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, error) {
 	// The node leaf comes from a pre-built Certificate when supplied (e.g. a
 	// hardware-signer-backed key that cannot be exported to PEM), otherwise
@@ -104,7 +117,10 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 			return nil, ErrInvalidCertKeyPair
 		}
 	}
-	// Parse this node's leaf, from DER when Leaf is unset; an unparsable leaf is rejected.
+	// Parse this node's own leaf once. tls.X509KeyPair populates Leaf, but a
+	// pre-built Certificate (hardware signer) may not, so fall back to parsing
+	// the DER. A certificate whose leaf cannot be parsed is rejected outright:
+	// the startup SAN-exclusivity precondition cannot be evaluated without it.
 	leaf := cert.Leaf
 	if leaf == nil {
 		if len(cert.Certificate) == 0 {
@@ -122,17 +138,43 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 		return nil, ErrInvalidCACert
 	}
 
-	// Revocation runs in VerifyConnection, which also covers resumed sessions.
+	// Build the VerifyConnection callback when revocation checking is enabled.
+	// VerifyConnection runs on ALL connections including resumed sessions,
+	// unlike VerifyPeerCertificate which is skipped on resumed sessions.
+	// This ensures revocation checks happen even for TLS session resumption.
 	var verifyConn func(tls.ConnectionState) error
 	if checker != nil {
-		// Resolve issuers against this pair's own bundle snapshot, not the checker's latest reload.
+		// The pair's own issuer snapshot, parsed from the bundle its pool
+		// holds, backs its handshakes' revocation checks. The checker's
+		// shared set follows the latest reload, and a handshake that began
+		// under the previous config was verified against the previous
+		// bundle: resolving its leaf in the new set lost the issuer scope
+		// and with it every issuer-scoped revocation of the CA it chains to.
 		issuers, err := parseCACertificates(mtls.CACert)
 		if err != nil {
 			return nil, err
 		}
 		onRevoked := checker.OnCertRevoked()
 		verifyConn = func(cs tls.ConnectionState) error {
-			// Revocation-check only the leaf (PeerCertificates[0]); fail closed when no certificate is presented.
+			// Only revocation-check the LEAF certificate (PeerCertificates[0]).
+			// The leaf is the end-entity cert that authenticates the peer; it is
+			// the certificate that can be individually revoked when a node is
+			// decommissioned or compromised. Checking the entire presented chain
+			// (intermediates, root) on every handshake added per-handshake OCSP
+			// latency for certificates that change rarely and are governed by the
+			// CA's own lifecycle rather than per-node revocation. The CA trust
+			// pool already validated the chain before VerifyConnection runs.
+			//
+			// On fresh handshakes PeerCertificates contains the verified chain;
+			// on resumed sessions it still contains the peer's certificates from
+			// the original handshake, so leaf checking works on both paths.
+			//
+			// Fail CLOSED on an empty peer-certificate set. With mTLS
+			// (RequireAndVerifyClientCert + RootCAs on both ends) this is
+			// unreachable, but returning nil here would mean "no cert ⇒
+			// accept", a latent fail-open if the TLS config ever changed.
+			// A connection with no presented certificate cannot be
+			// revocation-checked and must be rejected.
 			if len(cs.PeerCertificates) == 0 {
 				return ErrNoPeerCertificate
 			}
@@ -144,7 +186,12 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 			if revoked {
 				serial := leaf.SerialNumber.Text(16)
 				if onRevoked != nil {
-					// The notification is isolated (deliverEvent) and cannot affect the handshake or the rejection.
+					// The notification is user code running inside the TLS
+					// handshake, between the verdict and the rejection it
+					// returns: isolated (deliverEvent) so a panic or
+					// runtime.Goexit in it can neither reach the handshake
+					// goroutine nor keep the revoked peer from being
+					// refused.
 					deliverEvent(func() { onRevoked(serial) })
 				}
 				return &revocation.CertificateRevokedError{Serial: serial}
@@ -153,7 +200,21 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 		}
 	}
 
-	// Key-exchange groups are explicit, post-quantum hybrids first (RFC 10024, FIPS 203 ML-KEM); the list is build-dependent (tls_curves_fips.go, tls_curves_nofips.go).
+	// The key-exchange groups are named explicitly, and post-quantum hybrids
+	// lead both lists (RFC 10024 with FIPS 203 ML-KEM):
+	// these connections carry all replicated user data, and a recorded
+	// classical handshake could be decrypted once a quantum adversary exists.
+	// The larger hybrid key share spans two QUIC Initial packets, which
+	// quic-go reassembles (TestHandshakeCurves_QUIC).
+	//
+	// WHICH groups is build-dependent, because X25519 is not FIPS 140-3
+	// approved: a list holding nothing else fails every intra-cluster
+	// handshake with `tls: no supported elliptic curves for ECDHE` under
+	// GODEBUG=fips140=on as well as =only. A `-tags fips` build offers
+	// SecP256r1MLKEM768, P-256 and P-384 and compiles every X25519 group out
+	// (tls_curves_fips.go); a standard build offers X25519MLKEM768 first and
+	// SecP256r1MLKEM768 and P-256 too, so the two builds still agree on a
+	// hybrid with each other (tls_curves_nofips.go).
 	curves := handshakeCurves()
 
 	serverCfg := &tls.Config{
@@ -166,7 +227,12 @@ func buildMTLSTLS(mtls *MTLSConfig, checker *revocation.Checker) (*tlsPair, erro
 		CurvePreferences: curves,
 		VerifyConnection: verifyConn,
 	}
-	// Seal session tickets with this config's own rotating keys, so tickets from before ReloadMTLS do not resume.
+	// Session tickets are sealed with THIS config's own automatically rotated
+	// ticket keys. Without the two hooks crypto/tls takes the keys from the
+	// listener's base config rather than the one GetConfigForClient returned,
+	// so a ticket issued before ReloadMTLS would still resume after it — with
+	// the old leaf, and with a client chain the new pool never verified. A
+	// ticket this config cannot decrypt yields a full handshake.
 	serverCfg.WrapSession = func(cs tls.ConnectionState, ss *tls.SessionState) ([]byte, error) {
 		return serverCfg.EncryptTicket(cs, ss)
 	}

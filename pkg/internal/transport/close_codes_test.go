@@ -12,7 +12,12 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestInboundCloseCodes pins the close code and redacted reason a dialer receives for a refused or reclaimed inbound connection.
+// TestInboundCloseCodes pins what the DIALING side of a refused or reclaimed
+// inbound connection receives: the application error code is the protocol
+// contract that lets a peer tell a policy close from a resource limit (see
+// errors.go), and an authorization verdict travels with the redacted reason
+// phrase closeReasonRedacted. Swapping two codes, or leaking the verdict into
+// the reason, must fail here.
 func TestInboundCloseCodes(t *testing.T) {
 	t.Run("per-IP limit", func(t *testing.T) {
 		mtls := testMTLSConfig(t)

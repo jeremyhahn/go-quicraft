@@ -37,7 +37,17 @@ const (
 // barrier's AEAD layer, not the KDF.
 var fuzzPassphrase = []byte("fuzz-test-passphrase-32bytes!!")
 
-// newFuzzBarrier returns an unsealed AES-256-GCM software Barrier with a cheap KDF, no nonce tracking, and the no-op StatePersister Rotate requires.
+// newFuzzBarrier returns an initialized, unsealed Barrier backed by the
+// SoftwareStrategy with Argon2id at fuzzKDFMemoryKiB, which is what actually
+// keeps fuzz iterations fast — see that constant. The barrier uses
+// AES-256-GCM with nonce tracking disabled for speed.
+//
+// The no-op StatePersister is REQUIRED, not decoration: Rotate fails closed
+// with ErrNoStatePersister without one — a new epoch that is not durably
+// recorded makes every record written under it unreadable after a restart — so
+// FuzzBarrierDecryptWrongEpoch failed on all five of its own seeds without it.
+// The fixture, not the production requirement, was what needed fixing; CI now
+// runs these targets, which is why nothing caught it before.
 func newFuzzBarrier(t testing.TB) *Barrier {
 	t.Helper()
 

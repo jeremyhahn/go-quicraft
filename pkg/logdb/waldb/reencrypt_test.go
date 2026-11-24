@@ -69,7 +69,9 @@ func writeSampleState(t *testing.T, db *DB, shardID, replicaID uint64, n int) ([
 	return entries, state
 }
 
-// TestReencrypt_NoneToKeyed checks a none-encrypted WAL re-encrypts to a keyed WAL with every record preserved.
+// TestReencrypt_NoneToKeyed is the core proof: a none-encrypted WAL is
+// re-encrypted into a keyed WAL with every Raft record preserved, and the
+// result is genuinely encrypted (the none barrier can no longer read it).
 func TestReencrypt_NoneToKeyed(t *testing.T) {
 	const shardID, replicaID = uint64(1), uint64(1)
 	srcDir := t.TempDir() + "/wal"
@@ -246,7 +248,24 @@ func soleSegmentRel(t *testing.T, dir string, shardID uint64) string {
 	return filepath.Join(shardDir, filepath.Base(matches[0]))
 }
 
-// TestReencrypt_EntriesDurableBeforeState checks a crash at any point of a streamed migration never leaves the commit index past the surviving log.
+// TestReencrypt_EntriesDurableBeforeState is a regression test, and it is also
+// the CX4 regression test: a live log spanning multiple batches must migrate
+// via per-batch streaming (no single oversized destination record / OOM), and
+// the destination must hold the full, in-order entry range.
+//
+// Reencrypt writes the destination WAL through a sequence of independently
+// fsynced SaveState calls, so the destination's durable record order IS that
+// call order and the WAL recovers at a record prefix. Writing the hard state
+// before the entries therefore produced a legal, cleanly-recovering destination
+// carrying HardState.Commit = N over a log ending at k < N — a commit index past
+// the last entry, which nothing in waldb cross-validates on reopen.
+//
+// The test simulates a crash at many points during a migration by truncating
+// the destination segment to a prefix and reopening it, asserting the surviving
+// state never commits past the surviving log. It refuses to pass vacuously: the
+// sweep must reach past the state record at least once (so the invariant is
+// actually evaluated) and must cut the entry stream mid-way at least once (so
+// the inverted ordering has a prefix that would violate it).
 func TestReencrypt_EntriesDurableBeforeState(t *testing.T) {
 	// Stream the entries in many small batches so the destination holds several
 	// entry records and a truncation can land between them.
@@ -461,7 +480,10 @@ func TestReencrypt_SnapshotHookRecordsDstEpoch(t *testing.T) {
 	}
 }
 
-// TestReencrypt_PreservesBootstrapDataDir checks each bootstrap record's DataDir, explicit or empty, is copied as recorded.
+// TestReencrypt_PreservesBootstrapDataDir verifies a migration copies each
+// bootstrap record's DataDir as the source recorded it: an explicit DataDir,
+// and an explicit EMPTY one ("this shard roots its tree under the host's
+// NodeHostDir"), both replay from the destination as recorded.
 func TestReencrypt_PreservesBootstrapDataDir(t *testing.T) {
 	const emptyShard, modernShard, replicaID = uint64(11), uint64(12), uint64(1)
 	srcDir := t.TempDir() + "/wal"

@@ -54,7 +54,15 @@ func payloadLimitEntryPoints() []payloadLimitEntryPoint {
 	}
 }
 
-// TestPayloadLimit_EveryEntryPoint verifies every proposal entry point rejects one byte over effectiveMaxPayload with *EntryTooLargeError and accepts the limit.
+// TestPayloadLimit_EveryEntryPoint checks that every exported proposal entry
+// point rejects a payload one byte over effectiveMaxPayload with
+// *EntryTooLargeError (errors.Is ErrEntryTooLarge) and accepts a payload of
+// exactly that size, whichever of MaxProposalPayloadSize and MaxEntrySize is
+// the binding limit. Earlier single-method coverage:
+// TestPropose_EntryTooLarge and TestProposeWithSession_EntryTooLarge
+// (over MaxEntrySize only) and TestPropose_EntryTooLarge_MaxEntrySize, all in
+// host_test.go; none covers SyncPropose, SyncProposeWithSession or the
+// at-limit success.
 func TestPayloadLimit_EveryEntryPoint(t *testing.T) {
 	limits := []struct {
 		name          string

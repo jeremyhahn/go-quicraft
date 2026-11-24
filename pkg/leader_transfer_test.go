@@ -216,7 +216,12 @@ func (c *transferCluster) transferNext() uint64 {
 	deadline := 10 * c.electionTimeout()
 	leaderID, fromTerm := c.agreedLeader(deadline)
 	target := leaderID%uint64(len(c.hosts)) + 1
-	// An election can overtake the transfer under load; request it again from the current leader toward the same target.
+	// Under -race load a heartbeat can arrive late enough that a replica
+	// times out while the transfer is in flight: the election it starts
+	// supersedes the transfer and can re-elect the old leader in a newer
+	// term. That is Raft working as specified, not a transfer bug, so a
+	// transfer overtaken by an election is requested again of whichever
+	// replica leads now, toward the same target.
 	const attempts = 5
 	var id, term uint64
 	for attempt := range attempts {

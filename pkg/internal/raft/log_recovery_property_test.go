@@ -12,7 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Property tests for newRaftLog recovery and the acknowledgement a recovered replica gives a probe.
+// Property coverage for log recovery (newRaftLog) and for the acknowledgement
+// a recovered replica gives to a probe.
+//
+// The defect this targets has a history in this repository: a recovered
+// HardState.Commit ahead of what the log actually holds. getConflictIndex
+// treats every index at or below committed as unable to conflict, so a
+// replica that comes up claiming a commit index it cannot back with entries
+// answers a probe with a NON-rejecting ReplicateResp for entries it does not
+// have -- and the leader counts that phantom match toward the commit quorum.
+// The clamp in newRaftLog exists for exactly that, and was itself once
+// VACUOUS (the boundary was derived from state.Commit, so the clamp compared
+// state.Commit against itself).
+//
+// A clamp that can be vacuous is a clamp that has to be property-tested over
+// the whole (entries, snapshot, commit) space rather than at the three points
+// someone thought of.
 
 package raft
 
@@ -42,7 +57,27 @@ type logRecoveryCase struct {
 	stateTerm uint64
 }
 
-// reachableFromRecovery reports whether the case is a state real recovery can produce; unreachable cases are still run but held to fewer post-conditions.
+// reachableFromRecovery reports whether the case describes a LogDB state a
+// real recovery can actually hand to newRaftLog.
+//
+// The distinction matters, and getting it wrong in the other direction is a
+// documented trap in this repository: a fixture that manufactures an
+// impossible state produces a "finding" that is really a mock defect. Both
+// exclusions below are properties of the REAL LogReader, checked against it:
+//
+//   - A compacted prefix is only ever produced by a snapshot.
+//     LogReader.setRangeLocked returns ErrLogGapDetected for an entry range
+//     that starts above the reader's marker, so recoverLogReader FAILS
+//     outright on an entry range beginning above 1 with no snapshot record;
+//     the shard never starts, and newRaftLog never sees that pair.
+//
+//   - A snapshot index at the uint64 ceiling overflows newInMemory's
+//     markerIndex (lastIndex+1), which needs 2^64 log entries to reach.
+//
+// Everything outside these two regions is asserted strictly. Inside them the
+// harness still runs the case -- newRaftLog must be TOTAL, it may not panic
+// or wedge on any input -- it just does not hold the stricter frontier
+// post-conditions against a state the recovery path rejects first.
 func (c logRecoveryCase) reachableFromRecovery() bool {
 	if c.snapshotIndex == 0 && c.entryCount > 0 && c.firstIndex > 1 {
 		return false
@@ -133,7 +168,12 @@ func checkRecoveredLog(tb testing.TB, c logRecoveryCase, l *raftLog) {
 		tb.Fatalf("%s: recovered processed=%d exceeds committed=%d", c, l.processed, l.committed)
 	}
 
-	// A snapshot index is committed by construction, so committed must be at or above it.
+	// A snapshot index is COMMITTED by construction -- a snapshot is only
+	// ever taken over committed state -- so a recovered replica must come up
+	// with committed at or above it, whatever the HardState said. Without
+	// this lower bound a replica restoring from a snapshot with a lost or
+	// lagging HardState.Commit comes up with processed > committed and trips
+	// the assertion on its very first commit.
 	if c.snapshotIndex > 0 && l.committed < c.snapshotIndex {
 		tb.Fatalf("%s: recovered committed=%d below snapshot index %d",
 			c, l.committed, c.snapshotIndex)
@@ -153,7 +193,14 @@ func recoveryProbeTerms(c logRecoveryCase) []uint64 {
 	return []uint64{0, 1, c.entryTerm, c.snapshotTerm, c.entryTerm + 1, 9999}
 }
 
-// checkProbeAcknowledgements asserts the replica never acknowledges a probe for an index it cannot produce.
+// checkProbeAcknowledgements is the second half of the property: whatever
+// newRaftLog decided, the replica must never answer a probe with a
+// NON-rejecting ReplicateResp naming an index it cannot produce.
+//
+// A non-rejecting ReplicateResp is the leader's ONLY evidence that this
+// replica holds everything through LogIndex; it is counted directly toward
+// the commit quorum. Acknowledging an index the log has nothing for commits
+// an entry a majority does not hold.
 func checkProbeAcknowledgements(tb testing.TB, c logRecoveryCase, lr *testLogReader, cov *recoveryCoverage) {
 	tb.Helper()
 
@@ -226,7 +273,10 @@ func checkProbeAcknowledgements(tb testing.TB, c logRecoveryCase, lr *testLogRea
 	}
 }
 
-// recoveryCoverage counts what the sweep exercised, so an all-unreachable or all-rejected sweep cannot pass silently.
+// recoveryCoverage counts what the recovery sweep actually exercised. A sweep
+// whose every case lands in the unreachable region, or whose probes are all
+// REJECTED, asserts nothing about the acknowledgement property while still
+// reporting green. See TestLogRecoverySweep.
 type recoveryCoverage struct {
 	cases            int
 	strictlyAsserted int
@@ -313,7 +363,10 @@ func TestLogRecoveryPathologicalCases(t *testing.T) {
 			},
 		},
 		{
-			// A snapshot-only replica whose HardState.Commit was lost or lags behind the snapshot.
+			// A snapshot-only replica whose HardState.Commit was LOST (or
+			// lagged) behind the snapshot. Without the ss.Index lower bound
+			// this comes up with processed > committed and trips the
+			// assertion on the first commit.
 			name: "snapshot-only-lagging-hardstate",
 			c: logRecoveryCase{
 				snapshotIndex: 30, snapshotTerm: 5, commit: 0, stateTerm: 5,
@@ -343,7 +396,12 @@ func TestLogRecoveryPathologicalCases(t *testing.T) {
 			},
 		},
 		{
-			// Snapshot index at the uint64 ceiling: unreachable, but newRaftLog must still be total and newRaft refuses it.
+			// Snapshot index at the uint64 ceiling. Unreachable (it needs
+			// 2^64 entries) and excluded from the frontier assertions by
+			// reachableFromRecovery. newRaftLog must still be total over it
+			// -- newInMemory's markerIndex = lastIndex+1 overflows to 0 here
+			// -- and newRaft refuses to open it (outsideProtocolRange), which
+			// is what keeps that overflow from ever driving a replica.
 			name: "snapshot-index-max",
 			c: logRecoveryCase{
 				snapshotIndex: ^uint64(0), snapshotTerm: 1,
@@ -351,7 +409,13 @@ func TestLogRecoveryPathologicalCases(t *testing.T) {
 			},
 		},
 		{
-			// A log compacted past its commit index with no snapshot record; recoverLogReader rejects it first.
+			// A log compacted PAST its own commit index with no snapshot
+			// record to explain it. recoverLogReader rejects this pair
+			// (LogReader.SetRange -> ErrLogGapDetected) before newRaftLog
+			// sees it, so it is excluded from the frontier assertions -- but
+			// see the report: newRaftLog seeds processed = firstIndex-1 while
+			// committed stays at the recovered commit, so it would come up
+			// with processed > committed if it ever were reached.
 			name: "gapped-start-no-snapshot",
 			c: logRecoveryCase{
 				firstIndex: 100, entryCount: 3, entryTerm: 7,

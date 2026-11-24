@@ -71,7 +71,12 @@ func newCARollover(t *testing.T, rev *revocation.Config, prepare func(oldCA, new
 	return d, before
 }
 
-// TestReloadMTLS_CADropKeepsIssuerOfConfiguredCRL verifies a dropped CA stays retained while a configured CRL it signed remains.
+// TestReloadMTLS_CADropKeepsIssuerOfConfiguredCRL pins that the issuer a CA
+// rollover dropped stays retained while a configured CRL file it signed is
+// still configured. Closing the last old-CA session used to prune it, so the
+// next ReloadCRLs could not verify the old CRL, marked the whole revocation
+// set stale and, under enforcement, refused new-CA handshakes while the sweep
+// closed healthy new-CA sessions.
 func TestReloadMTLS_CADropKeepsIssuerOfConfiguredCRL(t *testing.T) {
 	dir := t.TempDir()
 	oldCRL, newCRL := filepath.Join(dir, "old.crl"), filepath.Join(dir, "new.crl")
@@ -112,7 +117,13 @@ func TestReloadMTLS_CADropKeepsIssuerOfConfiguredCRL(t *testing.T) {
 	}
 }
 
-// TestReloadMTLS_HandshakeStraddlingCADropStillRevoked verifies a handshake checks revocation against the issuer set of its own TLS config.
+// TestReloadMTLS_HandshakeStraddlingCADropStillRevoked pins that a handshake
+// checks revocation against the issuer set of the TLS config it runs under.
+// One that took the old-CA config before a reload dropped that CA, and
+// reached VerifyConnection after it, resolved its old-CA leaf in the new
+// shared issuer set, found no issuer, fell back to the issuer-agnostic scope
+// and missed the old CA's issuer-scoped CRL entry: a revoked certificate
+// authenticated.
 func TestReloadMTLS_HandshakeStraddlingCADropStillRevoked(t *testing.T) {
 	const revokedSerial = 530
 	dir := t.TempDir()

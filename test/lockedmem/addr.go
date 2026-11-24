@@ -16,7 +16,13 @@ package lockedmem
 
 import "unsafe"
 
-// addressOf returns the address of b's first byte without reading it.
+// addressOf reports the address of b's first byte WITHOUT reading it.
+//
+// It is the one unsafe operation in this package and is isolated here so the
+// reason is stated once: the whole point is to inspect a region whose read and
+// write permissions are what the test is asking about, so the address has to be
+// obtained without a dereference. unsafe.SliceData does exactly that — it
+// returns the pointer, and nothing loads through it.
 func addressOf(b []byte) uint64 {
 	return uint64(uintptr(unsafe.Pointer(unsafe.SliceData(b)))) // #nosec G103 -- address only; never dereferenced
 }

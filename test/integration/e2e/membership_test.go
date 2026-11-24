@@ -65,7 +65,15 @@ func TestE2E_AddRemove_RoundTrip(t *testing.T) {
 	waitForNodeData(t, result.tracker, shardID, addedReplicaID, allExpected, membershipTimeout)
 	t.Logf("phase 2: all 10 entries verified on 4 nodes")
 
-	// Every replica, joiners included, must see membership 4 before removal.
+	// Verify membership is 4 before removal, on every replica rather than only
+	// on the leader.
+	//
+	// Querying the leader alone is not enough. A joining node does not learn
+	// the full membership only from a snapshot: initial membership is a
+	// committed EntryInitialMembership at log index 1, and a joiner replays that entry like any other and ends up
+	// with the same configuration as everyone else. Asserting it here is what
+	// keeps that guarantee honest — if a joiner ever again comes up knowing
+	// only its own AddNode, this fails instead of being documented around.
 	leaderIdx = cluster.findLeader(shardID)
 	if leaderIdx < 0 {
 		t.Fatalf("no leader found for membership verification")

@@ -40,7 +40,12 @@ var docCommentRoots = []struct {
 // docCommentAllowlist names package directories whose missing doc comments are not yet enforced; it only shrinks.
 var docCommentAllowlist = map[string]bool{}
 
-// docFieldBaseline names each grandfathered undocumented exported field as "<file>: <Type>.<Field>"; it only shrinks.
+// docFieldBaseline names, one entry per field, the exported struct fields
+// that had neither a doc nor a trailing line comment when the gate began
+// checking fields. Each key is "<repo-relative file>: <Type>.<Field>"; line
+// numbers are not part of it. It only shrinks: an undocumented field it does
+// not list fails and must be documented, and an entry that matches no
+// undocumented field fails and must be deleted.
 var docFieldBaseline = map[string]bool{
 	"contrib/dragonboat/config/errors.go: FileReadError.Err":                       true,
 	"contrib/dragonboat/config/errors.go: FileReadError.Path":                      true,
@@ -276,7 +281,20 @@ type docGap struct {
 	what   string
 }
 
-// TestExportedIdentifiersHaveDocComments fails for each exported declaration, and each package, under pkg/ or contrib/dragonboat/ without a doc comment.
+// TestExportedIdentifiersHaveDocComments fails for each exported type,
+// function, method on an exported type, method declared in an exported
+// interface, constant and variable in a public package under pkg/ or
+// contrib/dragonboat/ that carries no doc comment, and for each such package
+// with no package comment. Exported, named fields of an exported struct need
+// a doc or a trailing line comment too; their gaps are held to the
+// shrink-only docFieldBaseline, which names each grandfathered field by file,
+// type and field (not by count), never to docCommentAllowlist.
+//
+// Public means not under an internal/ directory and not a _test.go file. A
+// grouped const or var block's doc comment counts for its members; each type
+// in a grouped type block and each interface method needs its own.
+// Build tags are not evaluated: every file is parsed, so a declaration behind
+// a tag is held to the same rule.
 func TestExportedIdentifiersHaveDocComments(t *testing.T) {
 	var gaps []docGap
 	scanned := 0

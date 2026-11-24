@@ -22,10 +22,14 @@ import (
 	"testing"
 )
 
-// runnerLabelsTests runs the CI template's test for the preflight runner-labels step against ci.yml.
+// runnerLabelsTests is the preflight step `Runner labels (ruling 633)`'s own
+// test, from the CI template: it reads the step's python out of ci.yml, runs
+// its permitted and forbidden cases, and reads every job's runs-on in ci.yml
+// with the step's own reader.
 const runnerLabelsTests = "testdata/runner-labels-tests.py"
 
-// runTemplateTests runs a CI template python test script and fails unless it exits 0 with ALL PASS.
+// runTemplateTests runs one of the CI template's python test scripts and
+// fails unless it exits 0 and reports ALL PASS.
 func runTemplateTests(t *testing.T, script string) {
 	t.Helper()
 	py, err := exec.LookPath("python3")

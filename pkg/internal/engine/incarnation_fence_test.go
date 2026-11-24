@@ -51,7 +51,12 @@ func newFenceTestNode(shardID uint64) *Node {
 	return NewNode(nil, nil, nil, cfg, nil, "", nil)
 }
 
-// TestCommitWorker_UnloadFenceIsAnsweredWhileForwardIsBackpressured: a blocked forward still answers the unload fence.
+// TestCommitWorker_UnloadFenceIsAnsweredWhileForwardIsBackpressured: the
+// commit worker's forward to the apply tier blocks while the apply dispatcher
+// is backpressured on ANOTHER shard's busy state machine. UnloadNode waits on
+// the commit worker's unload fence, so a forward that did not answer
+// membership made StopShard of one shard wait out an unrelated shard's
+// Apply — and hang outright if that Apply was the one calling StopShard.
 func TestCommitWorker_UnloadFenceIsAnsweredWhileForwardIsBackpressured(t *testing.T) {
 	applyC := make(chan *applyItem, 1)
 	applyC <- &applyItem{} // the dispatcher is not draining: full
@@ -89,7 +94,12 @@ func TestCommitWorker_UnloadFenceIsAnsweredWhileForwardIsBackpressured(t *testin
 	}
 }
 
-// TestCommitWorker_UnloadAppliedMidBatchSkipsTheRestOfTheShard pins that an unload applied mid-batch skips the shard's later items in the batch.
+// TestCommitWorker_UnloadAppliedMidBatchSkipsTheRestOfTheShard pins what makes
+// answering the fence during a blocked forward safe: an unload applied while
+// processBatch is blocked forwarding one shard's item must still keep every
+// later item of the unloaded shard in the same batch from being committed or
+// forwarded — the per-item re-checks, not the between-batches timing, are
+// what the fence rests on.
 func TestCommitWorker_UnloadAppliedMidBatchSkipsTheRestOfTheShard(t *testing.T) {
 	ldb := newTestLogDB()
 	applyC := make(chan *applyItem, 1)
@@ -164,7 +174,12 @@ func TestCommitWorker_UnloadAppliedMidBatchSkipsTheRestOfTheShard(t *testing.T) 
 	}
 }
 
-// TestCommitWorker_UnloadFenceWaitsForInFlightSaveState pins that UnloadNode returns only after any SaveState of the stopped incarnation.
+// TestCommitWorker_UnloadFenceWaitsForInFlightSaveState pins the unload fence.
+// Were UnloadNode to hand the commit worker an asynchronous unload and return,
+// a batch holding the stopped incarnation's update could reach SaveState
+// after a new incarnation of the same shard had loaded LogDB: its HardState
+// (a vote) overwriting the new one's, or its adopted snapshot recorded against
+// an artifact a later receive had already reclaimed.
 func TestCommitWorker_UnloadFenceWaitsForInFlightSaveState(t *testing.T) {
 	ldb := &gatedLogDB{
 		testLogDB: newTestLogDB(),
@@ -270,7 +285,14 @@ func TestCommitWorker_AdmitDropsStoppedIncarnation(t *testing.T) {
 	}
 }
 
-// TestStepWorker_AnswerDroppedInstalls pins that a local install dropped by a recovered step-worker panic is answered, and a node interrupted mid-install is failed.
+// TestStepWorker_AnswerDroppedInstalls pins that a local install dropped by a
+// recovered step-worker panic is answered rather than left waiting. It also
+// pins that the recovery never reads the peer on a poisoned reading and fails a
+// node whose install step was interrupted.
+// A recovered step-worker panic loses the rest of the drained inbox batch, and
+// a local install in it has a receive waiting on its verdict; unanswered, that
+// receive would wait until the shard stopped, holding a transport receive slot
+// the whole time.
 func TestStepWorker_AnswerDroppedInstalls(t *testing.T) {
 	newNode := func(t *testing.T, committed uint64) *Node {
 		t.Helper()
@@ -360,7 +382,12 @@ func TestStepWorker_InboxDrainClearsInboxNode(t *testing.T) {
 	}
 }
 
-// TestCommitWorker_AdmitPersistsDuringEngineShutdown pins that admission drops only unloaded nodes' updates, so the shutdown drain persists.
+// TestCommitWorker_AdmitPersistsDuringEngineShutdown pins the shutdown half of
+// the admission rule. Engine.stop stops every node in step 1 but closes the
+// commit tier's own stopC only in step 3, so gating the drop on stopC dropped
+// every update the step tier handed over in between — the updates the
+// shutdown drain exists to persist. The drop is gated on the node having been
+// UNLOADED instead, which Engine.Stop never marks.
 func TestCommitWorker_AdmitPersistsDuringEngineShutdown(t *testing.T) {
 	commitC := make(chan *commitItem, 16)
 	applyC := make(chan *applyItem, 16)
@@ -527,7 +554,12 @@ func TestEngine_ApplyLoopJoinsWhenStoppedDuringRestart(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_IncarnationGuardKeepsTheShutdownDrain: the guard discards only unloaded incarnations' items, so shutdown still applies.
+// TestApplyWorker_IncarnationGuardKeepsTheShutdownDrain: the dispatcher's
+// incarnation guard read the node's stopC, which Engine.Stop closes for every
+// node long before the apply tier exits — so the shutdown drain discarded
+// committed, durable items and failed their proposals. The guard now reads
+// whether the node was UNLOADED: an unloaded incarnation's item is still
+// discarded, and a node merely stopped by the shutdown is still applied.
 func TestApplyWorker_IncarnationGuardKeepsTheShutdownDrain(t *testing.T) {
 	cb := &testCallback{}
 	aw := newApplyWorker(0, make(chan *applyItem, 1), &sync.Pool{New: func() interface{} { return &applyItem{} }},
@@ -557,7 +589,12 @@ func TestApplyWorker_IncarnationGuardKeepsTheShutdownDrain(t *testing.T) {
 	}
 }
 
-// TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards: a blocked dispatcher delivers during shutdown until the shard goroutine exits.
+// TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards: a
+// dispatcher blocked on a FULL shard channel must not abandon the committed
+// item the moment the engine begins stopping, which would fail proposals whose
+// entries are committed and durable. The shard goroutine keeps consuming during
+// shutdown, so the item is delivered; it is discarded only when that
+// goroutine has exited and can read nothing more.
 func TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards(t *testing.T) {
 	newWorker := func(t *testing.T) (*applyWorker, *testCallback, chan *applyItem, chan struct{}, chan struct{}) {
 		t.Helper()
@@ -613,7 +650,11 @@ func TestApplyWorker_BackpressuredShutdownDeliversRatherThanDiscards(t *testing.
 	})
 }
 
-// TestStepWorker_AnsweredInstallNeverFailsTheNode: a panic after the install's verdict does not fail the node.
+// TestStepWorker_AnsweredInstallNeverFailsTheNode: a panic AFTER the install's
+// step returned — in a log call, or the classification itself — leaves raft's
+// state known and the verdict already delivered; the recovery must not fail a
+// healthy node over it. Nor a stopped one, whose failure would be reported by
+// shard ID to the incarnation that follows.
 func TestStepWorker_AnsweredInstallNeverFailsTheNode(t *testing.T) {
 	for _, tt := range []struct {
 		name  string
@@ -659,7 +700,12 @@ func (s *blockingCapture) SaveSnapshotGated(ctx context.Context, w io.Writer, st
 	return s.snapshotTestSnapshotter.SaveSnapshotGated(ctx, w, stopper, afterCapture)
 }
 
-// TestSnapshotPool_SaveIsFencedByUnload: unload does not wait for the capture, and a save whose node stopped leaves nothing.
+// TestSnapshotPool_SaveIsFencedByUnload: a local save stages its artifact and
+// publishes it onto the canonical snapshot-<index> directory — shared with a
+// snapshot receive at the same index — under the node's write lease. The
+// unload must not wait for the capture (user code: a state machine ignoring
+// the stopper, or waiting on its own shard, would hang StopShard), and a save
+// whose node stopped publishes, records and leaves nothing.
 func TestSnapshotPool_SaveIsFencedByUnload(t *testing.T) {
 	newPool := func(t *testing.T) (*snapshotPool, *snapshotTestLogDB) {
 		t.Helper()
@@ -799,7 +845,20 @@ func TestSnapshotPool_PublishedSaveHasTheDocumentedMode(t *testing.T) {
 	}
 }
 
-// TestGCSnapshotDirs_SparesAHeldDirectory: GC spares pinned (recovery) and claimed (receive) directories.
+// TestGCSnapshotDirs_SparesAHeldDirectory: the GC spared only the directory
+// the record NOW names, so under retention pressure it deleted a directory
+// still in use and failed the shard. Two holds keep a directory out of the
+// removal window:
+//
+//   - a recovery chooses the record's directory and reads it by path for its
+//     whole length, while a receive or save recording a newer snapshot runs
+//     the GC; the pinned directory (Node.PinSnapshotDir) is spared;
+//   - a receive publishes its canonical directory and claims it until raft's
+//     verdict, during which it is unrecorded. Unrecorded directories at higher
+//     indexes — receives a stop abandoned, or a crash left — pushed it into
+//     the removal window, and raft adopting it then recorded a snapshot whose
+//     directory was gone; the claimed directory (Node.ClaimSnapshotDir) is
+//     spared.
 func TestGCSnapshotDirs_SparesAHeldDirectory(t *testing.T) {
 	const shardID, replicaID = uint64(4), uint64(1)
 	for _, tt := range []struct {
@@ -878,7 +937,10 @@ func (s *pinCheckingSnapshotter) RecoverFromSnapshot(ctx context.Context, r io.R
 	return s.snapshotTestSnapshotter.RecoverFromSnapshot(ctx, r, stopper)
 }
 
-// TestRecoverSnapshot_PinsItsDirectoryWhileReading checks recoverSnapshot pins its directory across the read and releases it after.
+// TestRecoverSnapshot_PinsItsDirectoryWhileReading: the GC honours pins
+// (above); this pins that recoverSnapshot actually TAKES one for the
+// directory it reads, holds it across the state machine's read, and releases
+// it after.
 func TestRecoverSnapshot_PinsItsDirectoryWhileReading(t *testing.T) {
 	const shardID, replicaID uint64 = 12, 1
 	stopC := make(chan struct{})
@@ -911,7 +973,12 @@ func TestRecoverSnapshot_PinsItsDirectoryWhileReading(t *testing.T) {
 	}
 }
 
-// TestEngine_StoppedApplyWorkerIsNotRerunAfterItsJoin: a dispatcher that already ran its stop path is not run again.
+// TestEngine_StoppedApplyWorkerIsNotRerunAfterItsJoin: a dispatcher whose
+// panic unwound with stopC already closed ran its deferred stop path — joined
+// every per-shard goroutine and closed joinedC. Running it again could start a
+// per-shard goroutine after joinedC had promised there were none, and a
+// StopShard waiting on joinedC would then close a state machine that
+// goroutine could still apply to.
 func TestEngine_StoppedApplyWorkerIsNotRerunAfterItsJoin(t *testing.T) {
 	e := NewEngine(newTestHostConfig(), newTestLogDB(), newTestSender(), nil, nil, nil)
 	applyC := make(chan *applyItem, 1)

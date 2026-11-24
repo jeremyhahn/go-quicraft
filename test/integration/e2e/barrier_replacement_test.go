@@ -128,7 +128,12 @@ func TestE2E_Barrier_SnapshotCatchUp(t *testing.T) {
 	t.Logf("all 60 entries verified on 4 barrier nodes (snapshot-based catch-up)")
 }
 
-// TestE2E_Barrier_KeyRotation_ReplaceNode writes under epoch 1, rotates to epoch 2, writes more, then replaces a follower that must hold all data.
+// TestE2E_Barrier_KeyRotation_ReplaceNode verifies that a barrier cluster
+// survives key rotation (epoch change) and that a replacement node with a
+// fresh barrier can recover all data spanning multiple encryption epochs.
+// The test writes data under epoch 1, rotates all barriers to epoch 2,
+// writes more data, then replaces a follower and verifies the replacement
+// has all cross-epoch data.
 func TestE2E_Barrier_KeyRotation_ReplaceNode(t *testing.T) {
 	cluster := newBarrierTestCluster(t, 3)
 	defer cluster.close()

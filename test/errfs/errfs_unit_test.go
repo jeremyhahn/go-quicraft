@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// No build tag: the injector itself is verified in an ordinary build.
+// This file deliberately carries NO build tag, unlike the fault-injection suites
+// that use ErrorFS. The injector's own behaviour must be verified in an ordinary
+// build, because a defect in it does not produce a failing test — it produces a
+// suite of recovery tests that pass without ever injecting anything. A test run
+// with WithNoSync(true) can never land an injection on a flush, and a sweep that
+// self-calibrates onto whatever operation happens to fail proves nothing. An
+// injector that silently does nothing reads as coverage.
 package errfs
 
 import (
@@ -74,7 +80,10 @@ func TestInjectAtFiresOnTheNthOperationExactly(t *testing.T) {
 	}
 }
 
-// TestOnlyOpsRestrictsWhichOperationCanFire verifies the op filter limits which operation fails.
+// TestOnlyOpsRestrictsWhichOperationCanFire pins the guard against
+// self-calibrating sweeps: a sweep must fail the operation it NAMES. If the
+// filter were ignored, a test claiming to cover an fsync failure could be
+// passing on an unrelated Open failure instead.
 func TestOnlyOpsRestrictsWhichOperationCanFire(t *testing.T) {
 	delegate, dir := realFS(t)
 	efs := New(delegate, 1, errUnit).OnlyOps("Sync")
@@ -108,7 +117,10 @@ func TestOnlyOpsRestrictsWhichOperationCanFire(t *testing.T) {
 	}
 }
 
-// TestShortWriteDisturbsTheDelegateBeforeFailing verifies a short write writes part of the data before failing.
+// TestShortWriteDisturbsTheDelegateBeforeFailing pins the torn-write mode. A
+// short write that reported an error WITHOUT writing anything would leave the
+// medium clean, and the recovery paths that exist to handle a partial record
+// would never be entered.
 func TestShortWriteDisturbsTheDelegateBeforeFailing(t *testing.T) {
 	delegate, dir := realFS(t)
 	name := filepath.Join(dir, "torn")

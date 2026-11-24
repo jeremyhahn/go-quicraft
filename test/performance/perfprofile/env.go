@@ -30,7 +30,14 @@ const NotCaptured = "**not captured**"
 // EnvFile is the name of the captured machine description inside a profile.
 const EnvFile = "env.json"
 
-// Env is the machine a profile was measured on, captured by capture-env.sh; every field is a string, and an empty one renders as NotCaptured.
+// Env is the machine a profile's numbers were measured on, captured on the
+// target by capture-env.sh at run time rather than written down by hand, so the
+// specification table beside a result can never go stale.
+//
+// Every field is a string, including the counts. A field that could not be
+// obtained is the empty string and renders as NotCaptured; had the core count
+// been an int, an uncaptured value and a genuine zero would be the same byte on
+// disk, and the table would state a hardware fact nobody measured.
 type Env struct {
 	// Profile is the operator-supplied profile name this capture belongs to.
 	// It cannot be inferred from the hardware, so it is passed in.

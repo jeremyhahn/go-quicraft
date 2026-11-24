@@ -36,7 +36,13 @@ func GetEntrySlice() *[]Entry {
 	return entrySlicePool.Get().(*[]Entry)
 }
 
-// PutEntrySlice zeroes the entries and returns the slice to the pool; nil is a no-op.
+// PutEntrySlice returns a []Entry slice to the pool after clearing all
+// elements. Each Entry is zeroed to nil out the Cmd byte slice pointer,
+// allowing the garbage collector to reclaim the referenced data. The
+// slice length is reset to 0 while preserving the underlying capacity
+// for reuse.
+//
+// Passing a nil pointer is a no-op for caller convenience.
 func PutEntrySlice(s *[]Entry) {
 	if s == nil {
 		return

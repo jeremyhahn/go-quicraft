@@ -138,7 +138,14 @@ func TestMembership_RoleQueries(t *testing.T) {
 
 // --- AddNode ---
 
-// TestMembership_AddNode_AlreadyVoter checks apply converges on a committed AddNode for an existing voter; validate still rejects it.
+// TestMembership_AddNode_AlreadyVoter pins the APPLY path's convergence on a
+// committed AddNode whose target the membership already records as a voter.
+//
+// Refusing it was not a safe no-op: configChangeID stops advancing at the
+// skipped entry, so this replica reports a stale ConfigChangeID as the CAS
+// token for every later membership change while its peers have moved on.
+// validate() still rejects the same change at propose time — see the
+// AddNode-existing case of TestMembership_Validate_MatchesApply_AllTypes.
 func TestMembership_AddNode_AlreadyVoter(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
@@ -260,7 +267,14 @@ func TestMembership_RemoveNode_LastVotingWitness(t *testing.T) {
 
 // --- AddNonVoting ---
 
-// TestMembership_AddNonVoting_DemotesSeededVoter checks a committed AddNonVoting demotes an observer seeded as a voter on restart.
+// TestMembership_AddNonVoting_DemotesSeededVoter is the unit-level
+// regression. Host.StartShard seeds Membership.Addresses from the caller's
+// members map on a restart that recovered no snapshot, so an observer the
+// operator lists — as it must, join=false requires self in the map — is seeded
+// as a full VOTER. The committed AddNonVoting that gave it its real role is
+// still in the log and is re-applied on restart; refusing it because the target
+// "already exists" left the observer a voter in its own membership durably,
+// because nothing else repairs the seed.
 func TestMembership_AddNonVoting_DemotesSeededVoter(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
@@ -282,7 +296,9 @@ func TestMembership_AddNonVoting_DemotesSeededVoter(t *testing.T) {
 	}
 }
 
-// TestMembership_AddNonVoting_AlreadyWitness checks AddNonVoting on a witness is refused.
+// TestMembership_AddNonVoting_AlreadyWitness pins the refusal that remains: a
+// witness role can only have been set by an earlier COMMITTED AddWitness, so
+// every replica evaluates this identically and refusing cannot diverge them.
 func TestMembership_AddNonVoting_AlreadyWitness(t *testing.T) {
 	m := testMembership()
 	m.witnesses = map[uint64]string{20: "wit1"}
@@ -320,7 +336,12 @@ func TestMembership_AddNonVoting_NilObserversMap(t *testing.T) {
 
 // --- AddWitness ---
 
-// TestMembership_AddWitness_DemotesSeededVoter checks a committed AddWitness demotes a witness seeded as a voter on restart.
+// TestMembership_AddWitness_DemotesSeededVoter is the unit-level
+// regression for the witness half. A witness listed in the restart members map
+// is seeded into Addresses — the full voter set — and the leader then selects
+// sendAppend over sendWitnessAppend for it, replicating the complete command
+// stream to a replica whose purpose is to hold none of it. The committed
+// AddWitness in the log must put it back.
 func TestMembership_AddWitness_DemotesSeededVoter(t *testing.T) {
 	m := testMembership()
 	cc := proto.ConfigChange{
@@ -342,7 +363,9 @@ func TestMembership_AddWitness_DemotesSeededVoter(t *testing.T) {
 	}
 }
 
-// TestMembership_AddWitness_AlreadyObserver checks AddWitness on an observer is refused.
+// TestMembership_AddWitness_AlreadyObserver pins the refusal that remains: an
+// observer role can only have been set by an earlier COMMITTED AddNonVoting,
+// so every replica evaluates this identically and refusing cannot diverge them.
 func TestMembership_AddWitness_AlreadyObserver(t *testing.T) {
 	m := testMembership()
 	m.observers = map[uint64]string{10: "obs1"}
@@ -399,7 +422,20 @@ func TestMembership_Validate_RemoveNodeLastWitness(t *testing.T) {
 	}
 }
 
-// TestMembership_Validate_MatchesApply_AllTypes checks apply never refuses a change validate accepted.
+// TestMembership_Validate_MatchesApply_AllTypes pins the relationship between
+// the propose-time gate and the deterministic apply.
+//
+// The safety-critical direction is that apply() must NEVER refuse a change
+// validate() accepted: apply runs on already-COMMITTED entries and nothing
+// re-delivers one, so its refusal is final and leaves this replica holding a
+// membership the rest of the shard does not. That is asserted for every case
+// as a subset property, on top of the exact per-case expectation below.
+//
+// The converse does not hold, deliberately. validate() refuses an add whose
+// target is already a member; apply() converges on the role the committed
+// entry names, because the membership it applies to may be a provisional
+// bootstrap-map seed rather than the product of committed entries alone (see
+// the "Convergent application" comment in membership.go).
 func TestMembership_Validate_MatchesApply_AllTypes(t *testing.T) {
 	cases := []struct {
 		name string
@@ -610,7 +646,17 @@ func TestMembership_Validate_RemoveLastFullReplicaWithWitnesses(t *testing.T) {
 	}
 }
 
-// TestMembership_VotingCapEnforced checks the voting cap is enforced at validate time only, never in apply.
+// TestMembership_VotingCapEnforced is the regression test for the voting cap:
+// adding a voting member (full replica or witness) past maxVotingMembers must be
+// rejected at PROPOSE/VALIDATE time (validateAddNode/validateAddWitness) so the
+// over-cap change never enters the log — preventing the later leader-side
+// invariant panic when the ReadIndex ackBits word overflows.
+//
+// Critically, the apply-path handlers (handleAddNode/handleAddWitness) must NOT
+// re-check the cap: apply() runs on already-committed entries (replication,
+// post-truncation rebuildMembershipFromLog), and rejecting a committed change
+// would cause replicas to diverge from the agreed membership — a Raft safety
+// violation. The validate gate is the single enforcement point.
 func TestMembership_VotingCapEnforced(t *testing.T) {
 	m := newMembership(proto.Membership{
 		Addresses: map[uint64]string{},
@@ -747,7 +793,8 @@ func TestMembership_ValidateAdd_ConfigChangeIDBound(t *testing.T) {
 func TestMembership_WitnessPolicy_RequireFullReplicaMajority(t *testing.T) {
 	add := proto.ConfigChange{Type: proto.AddWitness, ReplicaID: 9, Address: "w"}
 
-	// 3 full + 1 witness -> 3 full + 2 witness: quorum 3, full 3: allowed.
+	// 3 full + 1 witness -> after add 3 full + 2 witness = 5 voting, quorum 3,
+	// full 3 >= 3: ALLOWED.
 	if err := validateAddWitness(membershipWith(3, 1, 0, true), add); err != nil {
 		t.Fatalf("3 full + 2nd witness should be allowed, got %v", err)
 	}
@@ -759,7 +806,8 @@ func TestMembership_WitnessPolicy_RequireFullReplicaMajority(t *testing.T) {
 	if err := validateAddWitness(membershipWith(2, 1, 0, true), add); !errors.Is(err, ErrBreaksFullReplicaMajority) {
 		t.Fatalf("2 full + 2nd witness should break full-replica majority, got %v", err)
 	}
-	// 2 full + 0 witness -> 3 voting, quorum 2, full 2: allowed.
+	// 2 full + 0 witness -> after add = 3 voting, quorum 2, full 2 >= 2: ALLOWED
+	// (a valid tiebreaker config where full replicas still form a quorum).
 	if err := validateAddWitness(membershipWith(2, 0, 0, true), add); err != nil {
 		t.Fatalf("2 full + 1st witness should be allowed, got %v", err)
 	}
@@ -799,7 +847,8 @@ func TestMembership_WitnessPolicy_MaxWitnesses(t *testing.T) {
 // quorum over the voting set. Without this check, a remove could silently
 // produce exactly the witness-heavy membership the policy rejects on add.
 func TestMembership_WitnessPolicy_RemoveNodePreservesFullReplicaMajority(t *testing.T) {
-	// 3 full + 2 witness: removing full replica 3 leaves full 2 < quorum 3: reject.
+	// 3 full + 2 witness (full 3 >= quorum 3): removing full replica 3 would
+	// leave 2 full + 2 witness = 4 voting, quorum 3, full 2 < 3: REJECT.
 	rmFull := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 3}
 	if err := validateRemoveNode(membershipWith(3, 2, 0, true), rmFull); !errors.Is(err, ErrBreaksFullReplicaMajority) {
 		t.Fatalf("removing full replica from 3F+2W should break full-replica majority, got %v", err)
@@ -808,11 +857,13 @@ func TestMembership_WitnessPolicy_RemoveNodePreservesFullReplicaMajority(t *test
 	if err := validateRemoveNode(membershipWith(3, 2, 0, false), rmFull); err != nil {
 		t.Fatalf("removal should be allowed with policy off, got %v", err)
 	}
-	// 4 full + 1 witness: removing a full replica leaves full 3 >= quorum 3: allowed.
+	// 4 full + 1 witness: removing a full replica leaves 3 full + 1 witness =
+	// 4 voting, quorum 3, full 3 >= 3: ALLOWED.
 	if err := validateRemoveNode(membershipWith(4, 1, 0, true), rmFull); err != nil {
 		t.Fatalf("removal preserving full-replica majority should be allowed, got %v", err)
 	}
-	// Removing a witness is always allowed under the policy.
+	// Removing a WITNESS only improves the ratio: 3 full + 2 witness minus
+	// witness 100 -> ALLOWED even under the policy.
 	rmWitness := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 100}
 	if err := validateRemoveNode(membershipWith(3, 2, 0, true), rmWitness); err != nil {
 		t.Fatalf("removing a witness should always be allowed by the policy, got %v", err)
@@ -823,7 +874,10 @@ func TestMembership_WitnessPolicy_RemoveNodePreservesFullReplicaMajority(t *test
 	}
 }
 
-// TestMembership_UpdateWitnessPolicy_ApplyAndValidate checks apply replaces the policy unconditionally and validate rejects one the membership fails.
+// TestMembership_UpdateWitnessPolicy_ApplyAndValidate verifies the
+// UpdateWitnessPolicy config change: apply replaces the replicated policy
+// unconditionally (deterministic replay), while validate rejects a new
+// policy the CURRENT membership does not satisfy.
 func TestMembership_UpdateWitnessPolicy_ApplyAndValidate(t *testing.T) {
 	// Apply: policy fields replaced, configChangeID advanced.
 	m := membershipWith(3, 1, 0, false)
@@ -894,7 +948,21 @@ func TestMembership_PolicySurvivesSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-// TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied checks one config change at a time (thesis 4.1) after a batch applies several.
+// TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied pins the
+// one-config-change-at-a-time invariant (PhD thesis 4.1) against the way it was
+// silently lost.
+//
+// Peer.Commit clears pendingConfigChange for every committed EntryConfigChange
+// it applies, without asking whether a LATER config change is still unapplied --
+// and a catching-up follower legitimately applies a batch containing several.
+// handleLeaderPropose then re-derived the flag from the authoritative bound only
+// when it was ALREADY true, so a wrongly-cleared flag was never repaired and the
+// next config change was accepted while one was outstanding.
+//
+// Beyond overlapping configurations, the propose-time validators
+// (ErrRemoveLastFullReplica, ErrRemoveLastVoter, ErrBreaksFullReplicaMajority)
+// then run against a membership that excludes the pending change -- i.e. they
+// vet the wrong configuration.
 func TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied(t *testing.T) {
 	cfg := testConfig()
 	p := newTestPeerWithLog(t, cfg, contiguousEntries(200),
@@ -913,7 +981,8 @@ func TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied(t *testing.T) {
 			p.r.log.confChangeIndex, p.r.log.processed)
 	}
 
-	// Apply a batch [51..150] containing an earlier committed config change, as Peer.Commit does.
+	// The apply pipeline now applies a batch [51..150] that contains an EARLIER
+	// committed config change. This is what Peer.Commit does for each one.
 	p.r.pendingConfigChange = false
 	p.r.log.processed = 150
 
@@ -993,7 +1062,12 @@ func TestVoteDeniedToCandidateOutsideTheConfiguration(t *testing.T) {
 	}
 }
 
-// TestVoteGrantedWhenTheConfigurationIsIncomplete checks a joining replica with an incomplete configuration still grants votes.
+// TestVoteGrantedWhenTheConfigurationIsIncomplete is the liveness half. A
+// replica still joining holds a known-incomplete configuration -- it may name
+// only itself, having applied its own AddNode without yet holding the entry
+// naming the rest of the shard. Applying the guard in that state would make it
+// deny every real member and strand a shard whose quorum needs its vote. An
+// incomplete configuration is not evidence of non-membership.
 func TestVoteGrantedWhenTheConfigurationIsIncomplete(t *testing.T) {
 	p := newTestPeer(t, testConfigWithID(1, 6), proto.State{Term: 5},
 		proto.Membership{Addresses: map[uint64]string{6: "self"}})

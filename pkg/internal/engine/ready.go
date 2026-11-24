@@ -19,7 +19,19 @@ package engine
 
 import "sync"
 
-// ReadyMap is a double-buffered set of shards with pending work: Set marks a shard, Swap collects and resets; a swapped map is valid until the next Swap.
+// ReadyMap is a double-buffered notification map for signaling which
+// shards have pending work. Writers call Set() to mark a shard;
+// consumers call Swap() to atomically collect all marked shards and
+// reset the map.
+//
+// This implementation uses a single mutex with pointer swap, inspired
+// by Dragonboat's readyCluster design. The key insight is that swapping
+// pointers is O(1) and the single lock has negligible contention because:
+// 1. The critical section is extremely short (one map insert)
+// 2. Swap() only holds the lock during pointer swap, not during iteration
+//
+// The returned map from Swap() MUST NOT be retained beyond the next
+// Swap() call; it is recycled via two-map rotation.
 type ReadyMap struct {
 	mu    sync.Mutex
 	ready map[uint64]struct{}
@@ -47,7 +59,16 @@ func (r *ReadyMap) Set(shardID uint64) {
 	r.mu.Unlock()
 }
 
-// Swap returns the shards marked since the last swap, owned by the caller until the next Swap; single goroutine only.
+// Swap atomically swaps the ready map and returns the previous one
+// containing all shards marked since the last swap. The returned map
+// is owned by the caller until the NEXT Swap() call, after which it
+// may be recycled.
+//
+// This is O(1) for the swap operation itself. The caller iterates
+// the returned map outside any lock.
+//
+// Swap is NOT safe for concurrent use; it must be called from a single
+// goroutine (the owning step worker).
 func (r *ReadyMap) Swap() map[uint64]struct{} {
 	// Prepare the alternate map by clearing it.
 	// This happens outside the lock since we own this map.

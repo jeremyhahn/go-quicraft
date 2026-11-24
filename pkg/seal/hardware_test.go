@@ -73,7 +73,12 @@ func (h *hwStrategy) SealRootKey(_ context.Context, rootKey []byte, _ Credential
 	}
 	h.rootKey = make([]byte, len(rootKey))
 	copy(h.rootKey, rootKey)
-	// Copy into Ciphertext: Initialize wipes rootKey after sealing it.
+	// COPY into Ciphertext rather than aliasing the caller's buffer. Initialize
+	// wipes rootKey when it seals it into the enclave, so an aliased Ciphertext
+	// silently becomes 32 zero bytes the moment Initialize returns — the mock
+	// then "unsealed" an all-zero root key on every restart and nothing noticed,
+	// because its encryptor ignores key material. A real strategy persists
+	// bytes; this one now does too.
 	ct := make([]byte, len(rootKey))
 	copy(ct, rootKey)
 	return &SealedRootKey{
@@ -427,7 +432,11 @@ func TestEpochBarrier_IsAlias(t *testing.T) {
 		t.Fatalf("expected deploymentID=42, got %d", b.config.DeploymentID)
 	}
 
-	// EpochBarrier must stay an alias for Barrier.
+	// EpochBarrier must remain an ALIAS for Barrier, not a second defined
+	// type with the same shape: callers on both names hold the same object.
+	// The reflected types are equal exactly when the alias holds. Asserting it
+	// at runtime keeps the check readable — the `var _ *Barrier = b` form this
+	// replaces states the same thing but reads as a redundant declaration.
 	if got, want := reflect.TypeOf(b), reflect.TypeOf((*Barrier)(nil)); got != want {
 		t.Fatalf("MustNewEpochBarrier returned %v, want %v", got, want)
 	}

@@ -32,9 +32,21 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// With a barrier, snapshot plaintext is never written to a named file: recovery decrypts into an unlinked scratch and import seals as it streams.
+// ---------------------------------------------------------------------------
+// No NAMED plaintext at rest
+//
+// With a barrier configured, a snapshot's plaintext must never be written into
+// a file that has a name. A named plaintext file — fsynced or not — is exactly
+// what a power loss or SIGKILL leaves behind as a complete, readable copy of
+// the state machine, and the sweeps that reclaim scratch names run only when
+// the shard starts again. Recovery therefore decrypts into an anonymous
+// scratch (unlinked before the first plaintext byte), and an import seals the
+// payload as it streams in.
+// ---------------------------------------------------------------------------
 
-// namedWriteSpyFS records bytes written to each file while it still has a name.
+// namedWriteSpyFS is the real filesystem that records, per path, every byte
+// written into a file WHILE THAT FILE HAD A NAME. Bytes written into an
+// already-unlinked file are not recorded: nothing after a crash can read them.
 type namedWriteSpyFS struct {
 	osSnapshotFS
 	armed *atomic.Bool

@@ -21,7 +21,19 @@ import (
 	"github.com/jeremyhahn/dragonboat/v4"
 )
 
-// TestProposeFloorVerdict checks the error floor neither fails on one transient error nor passes a run with no samples.
+// TestProposeFloorVerdict pins the floor at both ends, because the failure has
+// two ends and guarding one of them alone reintroduces the other.
+//
+// Calling b.Fatalf on the FIRST error lets a single transient "shard is not
+// ready" destroy a whole run, so the baseline cannot be measured on a host
+// carrying ordinary CI load at all.
+//
+// The naive alternative — tolerate everything and log a count — is worse in a
+// quieter way: a run in which EVERY proposal failed reports no samples and
+// passes clean, so a comparison table could publish percentiles over nothing.
+//
+// The rows below are two real runs, one at each end, plus the boundaries of
+// the threshold between them.
 func TestProposeFloorVerdict(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -45,7 +57,9 @@ func TestProposeFloorVerdict(t *testing.T) {
 		},
 		{
 			name: "calibration probe that could not propose at all IS fatal",
-			// A probe with no successes still fails.
+			// The sample floor withholds the RATE, not the zero check: a probe
+			// that got nothing through is a real failure, and stopping
+			// calibration there is right.
 			completed: 0, errored: 1, fatal: true, wants: "measured nothing",
 		},
 		{
@@ -57,7 +71,7 @@ func TestProposeFloorVerdict(t *testing.T) {
 		},
 		{
 			name: "exactly at the limit is allowed",
-			// 20 of 100 is not above the limit.
+			// 20 of 100 is 20%, which is not GREATER than the limit.
 			completed: 80, errored: 20, fatal: false, wants: "20.0%",
 		},
 		{
@@ -125,7 +139,15 @@ func TestProposeFloorAdmitsTheQuietRunAndRefusesTheLoadedOne(t *testing.T) {
 	}
 }
 
-// TestTolerableAdmitsWeatherAndRefusesRealResults checks only self-clearing errors are tolerated, per test/proposer.
+// TestTolerableAdmitsWeatherAndRefusesRealResults pins the boundary the
+// tolerant loops must not cross.
+//
+// Counting every error as weather would let a PERMANENT failure at 5% -- a
+// payload the engine refuses, a session it does not know -- be published as a
+// clean run with a note. That is the engine answering, and a
+// benchmark that averages past it reports a throughput the engine never
+// delivered. The rule is test/proposer's: a loop may absorb only the
+// conditions that clear on their own.
 func TestTolerableAdmitsWeatherAndRefusesRealResults(t *testing.T) {
 	// The two transient failures actually observed, which the loops MUST keep
 	// tolerating or a single transient aborts the run.

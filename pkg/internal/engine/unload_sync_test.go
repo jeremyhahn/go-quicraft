@@ -44,7 +44,11 @@ func (s *slowUnloadApplier) Apply(entries []proto.Entry, results []sm.Result) er
 	return nil
 }
 
-// TestEngine_UnloadNode_WaitsForInFlightApply checks UnloadNode returns only after an in-flight Apply completes.
+// TestEngine_UnloadNode_WaitsForInFlightApply is a regression test:
+// Engine.UnloadNode must be synchronous end-to-end. A slow SM.Apply that is
+// in flight when UnloadNode is called must COMPLETE before UnloadNode
+// returns — otherwise the caller (Host.StopShard) closes the state machine
+// while Apply is still executing user code on it (use-after-close).
 func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	cfg := newTestHostConfig()
 	cfg.NumWorkers = 1
@@ -118,7 +122,12 @@ func TestEngine_UnloadNode_WaitsForInFlightApply(t *testing.T) {
 	}
 }
 
-// TestEngine_UnloadNode_ReleasesGateParkedApply checks UnloadNode releases an apply parked on the saving gate via stopC.
+// TestEngine_UnloadNode_ReleasesGateParkedApply verifies that the synchronous
+// UnloadNode cannot deadlock behind an apply goroutine parked on the
+// recovering/saving gate: UnloadNode calls node.Stop(), and the closed stopC
+// releases the parked apply (which abandons its batch — safe, the entries are
+// durable in the WAL) so the per-shard goroutine can exit and the unload
+// completes.
 func TestEngine_UnloadNode_ReleasesGateParkedApply(t *testing.T) {
 	cfg := newTestHostConfig()
 	cfg.NumWorkers = 1
@@ -132,7 +141,8 @@ func TestEngine_UnloadNode_ReleasesGateParkedApply(t *testing.T) {
 	node := NewNode(nil, applier, nil, nodeCfg, nil, "", nil)
 	e.LoadNode(node)
 
-	// Hold the saving gate so the apply parks before the state machine, then deliver a batch.
+	// Hold the saving gate so the apply goroutine parks BEFORE touching the
+	// state machine, then deliver a batch.
 	node.SetSaving(true)
 	node.commitPending.Store(true)
 	item := e.applyPool.Get().(*applyItem)
@@ -145,7 +155,14 @@ func TestEngine_UnloadNode_ReleasesGateParkedApply(t *testing.T) {
 	workerID := int(node.shardID % uint64(e.NumWorkers()))
 	e.applyCs[workerID] <- item
 
-	// With the gate held, the unload can only complete through node.Stop releasing the wait.
+	// Wait until the dispatcher has routed the item toward the per-shard
+	// goroutine, which then parks on the held saving gate (applyInFlight
+	// oscillates during the gate's sleep/recheck loop, so it cannot be
+	// polled reliably). Observing the exact park is not required: with the
+	// gate held, the ONLY way the unload below can complete is UnloadNode's
+	// node.Stop() releasing the gate wait via stopC — whether the item is
+	// mid-park or still buffered in the per-shard channel when the channel
+	// closes.
 	waitFor(t, 5*time.Second, time.Millisecond, "dispatcher did not consume the apply item",
 		func() bool { return len(e.applyCs[workerID]) == 0 })
 

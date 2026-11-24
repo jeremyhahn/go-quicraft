@@ -17,7 +17,13 @@ func bumpable(f finding) bool {
 		d.Reason == "" && d.Path == d.Module && f.Latest != forkLatest
 }
 
-// bumpModule runs go get path@latest for each bumpable require in dir and go get path@fixed for each vulnerable module with a fix.
+// bumpModule runs `go get path@latest` for each bumpable require in dir,
+// and `go get path@fixed` for each required module, direct or // indirect,
+// govulncheck reports vulnerable with a fixed version (a floor, skipped
+// once met), then `go mod tidy`, and prints each move. A module that
+// replaces a module moved earlier in the run with a local directory is
+// tidied even when nothing of its own moves. A replace that would move is
+// printed as a hand edit, since go get does not rewrite a replace.
 func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []finding, stdout io.Writer) error {
 	// A failed lookup (go list -e reports it as an Error entry, not a
 	// failing exit) leaves that requirement unchecked: stop before any edit
@@ -32,7 +38,13 @@ func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []find
 		lookups = append(lookups, fmt.Errorf("deps-bump: FAILED: the latest version of %d module(s) in %s could not be looked up; go.mod left unchanged", len(lookups), dir))
 		return errors.Join(lookups...)
 	}
-	// Tidy a module that replaces an earlier-bumped module with a local directory before bumping it.
+	// A module that replaces a module bumped earlier in this run with a
+	// local directory (contrib/dragonboat and test/performance/quicraft
+	// replace the root) has a stale go.mod until it is tidied: the root's
+	// raised requirements raise its floors, and listing its packages for
+	// the scan fails with "updates to go.mod needed". It is tidied first,
+	// then scanned and planned like any module. deps-check does not tidy,
+	// so a stale go.mod there still fails.
 	upstream, err := localUpstreamMoved(dir)
 	if err != nil {
 		return err
@@ -67,7 +79,12 @@ func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []find
 		planned[d.Path] = len(plan)
 		plan = append(plan, step{path: d.Path, from: d.Version, to: f.Latest})
 	}
-	// A fix is a minimum version: skip it when the module is already at or past it.
+	// A fix is a minimum version, not an exact one: an earlier go get can
+	// already have raised the module past it, and an exact go get of the
+	// fix would then lower it and the upgrade that raised it. So each step
+	// re-reads the versions go.mod selects after the steps before it and
+	// is skipped when its module is already at or above its target: no
+	// step selects a version below the current requirement.
 	for _, v := range fixes {
 		if at, ok := planned[v.Module]; ok {
 			if semverLess(plan[at].to, v.fixed) {
@@ -165,7 +182,10 @@ type vulnFix struct {
 	fixed string
 }
 
-// vulnFixes returns, in stable order, each required module govulncheck reports vulnerable with a fixed version.
+// vulnFixes scans dir and returns each required module, direct or
+// // indirect, that govulncheck reports vulnerable and that has a fixed
+// version, in a stable order. A version with an advisory that names no fix
+// is left for deps-check to fail: no bump repairs it.
 func vulnFixes(scan vulnScanner, dir string) ([]vulnFix, error) {
 	hits, err := scan.Scan(dir)
 	if err != nil {

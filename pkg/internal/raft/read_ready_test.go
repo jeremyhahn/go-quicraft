@@ -65,7 +65,8 @@ func TestPeer_ReadReady_LeaderAtFirstCommitOfTerm(t *testing.T) {
 	term := p.r.term
 	assertReadReady(t, p, 1, term, false, 1)
 
-	// The leader has not persisted the no-op and tryCommit counts its durable index, so nothing commits.
+	// The follower acknowledges the no-op, but the leader has not persisted
+	// it: tryCommit counts the leader's DURABLE index, so nothing commits.
 	mustHandle(t, p, proto.Message{
 		Type: proto.ReplicateResp, From: 2, Term: term, LogIndex: p.r.log.lastIndex(),
 	})

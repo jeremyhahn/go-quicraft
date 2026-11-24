@@ -56,7 +56,23 @@ func (d *flakySaveSnapshotDB) SaveSnapshot(shardID, replicaID uint64, ss logdb.S
 	return d.LogDB.SaveSnapshot(shardID, replicaID, ss)
 }
 
-// TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry verifies a LogDB failure after publishing leaves the import retryable.
+// TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry is the
+// regression guard.
+//
+// The publishing rename creates the canonical, index-named directory. An error
+// path AFTER it that returned without touching that directory would leave the
+// destination PUBLISHED, and the retry — the same artifact, the same index,
+// therefore the same directory name — would be refused by the
+// destination-exists precheck with *ImportSnapshotDirExistsError.
+//
+// That refusal is correct for a directory an import did not create, and it is
+// exactly wrong here: the import created it. A transient LogDB error during a
+// DR restore would become a hard lockout whose only remedy was a manual rm -rf,
+// performed against an error message telling the operator that an import never
+// removes a directory it did not touch.
+//
+// The assertion is that the RETRY SUCCEEDS, not merely that some directory is
+// absent: recovering the restore is the property.
 func TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry(t *testing.T) {
 	const shardID, replicaID uint64 = 7, 3
 	const index uint64 = 900
@@ -215,7 +231,21 @@ func TestImportSnapshot_PostPublishFailuresRollBackThePublish(t *testing.T) {
 	}
 }
 
-// TestImportSnapshot_CrashAtEveryStepLeavesAConsistentTree crashes at every filesystem step and requires the canonical directory to be absent or complete.
+// TestImportSnapshot_CrashAtEveryStepLeavesAConsistentTree walks the crash point
+// across EVERY filesystem operation an import performs and asserts the invariant
+// the import's fsync discipline exists to hold: the canonical directory is never
+// reachable after a crash unless it is COMPLETE — both the artifact and the
+// self-describing snapshot.meta, with the content that was written.
+//
+// A half-complete canonical directory is not a cosmetic problem. latestSnapshotDir
+// recovers the highest-numbered directory, and the DEK purge-floor scan reads
+// snapshot.meta from each directory it enumerates and treats a missing file as
+// "imposes no floor" — so an artifact published without its metadata loses the
+// DEK it needs at the next PurgeEpochsBefore.
+//
+// The sweep refuses to pass vacuously: it must reach the point where the
+// directory IS published, otherwise every case is trivially satisfied by an
+// absent directory.
 func TestImportSnapshot_CrashAtEveryStepLeavesAConsistentTree(t *testing.T) {
 	const shardID, replicaID uint64 = 5, 3
 	const index uint64 = 42

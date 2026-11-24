@@ -14,7 +14,12 @@
 
 package proto
 
-// State is the persistent Raft hard state: term, vote, commit index and the vote window this replica may still owe a read lease.
+// State represents the persistent Raft hard state: the current term, the
+// candidate voted for, the highest committed log index, and the vote window
+// this replica may still owe a leader's read lease. The wire format is
+// exactly 32 bytes (4 fixed uint64 fields):
+//
+//	[Term:8][Vote:8][Commit:8][VoteWindow:8]
 type State struct {
 	// Term is the current Raft term.
 	Term uint64
@@ -23,7 +28,13 @@ type State struct {
 	Vote uint64
 	// Commit is the highest log index known to be committed.
 	Commit uint64
-	// VoteWindow is the longest vote window, in nanoseconds, this replica may have promised in a heartbeat acknowledgement and not yet outlived.
+	// VoteWindow is the longest vote window, in nanoseconds, that this
+	// replica may have promised in a heartbeat acknowledgement and not yet
+	// outlived. A leader counts such an acknowledgement toward a read lease
+	// on the promise that the replica helps elect no one else for that long;
+	// the promise must survive a restart, including one into a configuration
+	// that would promise less, so a restarted replica withholds its vote for
+	// at least this long. Zero means nothing is owed.
 	VoteWindow uint64
 }
 

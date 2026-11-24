@@ -156,7 +156,13 @@ func TestSegmentCanFitMatchesWrite_Closed(t *testing.T) {
 	}
 }
 
-// The largest record an empty segment accepts is never ErrRecordTooLarge: a non-empty segment returns ErrSegmentFull.
+// ErrRecordTooLarge is documented as the verdict for a record whose framed
+// size could not fit in ANY segment, and callers treat it as permanent: they
+// do not rotate. So the largest record an empty segment accepts must never be
+// reported as ErrRecordTooLarge, whatever the current segment holds: a
+// non-empty segment refuses it with ErrSegmentFull (rotate and retry), the
+// same verdict from Write, and the fresh segment the caller rotates to takes
+// it.
 func TestSegmentCanFitMatchesWrite_FreshFitIsNeverTooLarge(t *testing.T) {
 	ctx := context.Background()
 	freshLargest := largestCanFit(ctx, t, newCanFitSegment(ctx, t, 0))
@@ -171,7 +177,8 @@ func TestSegmentCanFitMatchesWrite_FreshFitIsNeverTooLarge(t *testing.T) {
 			t.Fatalf("after a %d-byte record (block offset %d), Write(%d) = %v; want nil or ErrSegmentFull",
 				prefix, s.blockOffset, freshLargest, err)
 		}
-		// Close now so the sweep does not hold one descriptor per prefix.
+		// Close now: t.Cleanup runs only when the test ends, and the sweep
+		// would otherwise hold one descriptor per prefix (EMFILE at 1,024).
 		if err := s.Close(); err != nil {
 			t.Fatalf("Close after prefix %d: %v", prefix, err)
 		}

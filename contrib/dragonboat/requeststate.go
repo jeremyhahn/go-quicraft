@@ -124,7 +124,10 @@ type RequestResult struct {
 	// the adapter carries them here for the RaftLogs() method.
 	entries []Entry
 
-	// logRange is the RaftLogs range: the returned entries, or the available range for RequestOutOfRange.
+	// logRange is the range reported by RaftLogs. For a completed query it
+	// covers the returned entries; for a RequestOutOfRange result it is the
+	// range currently available in the log, which is what dragonboat
+	// delivers so that paginating callers can re-anchor.
 	logRange LogRange
 }
 
@@ -146,7 +149,10 @@ func (r RequestResult) Dropped() bool { return r.code == RequestDropped }
 // Aborted returns true if the request was aborted.
 func (r RequestResult) Aborted() bool { return r.code == RequestAborted }
 
-// Committed returns true if the request was committed or completed, as in dragonboat.
+// Committed returns true if the request was committed to the WAL.
+// Per dragonboat semantics, this includes both committed and fully
+// completed (applied) results, since a completed request was also
+// committed.
 func (r RequestResult) Committed() bool {
 	return r.code == RequestCommitted || r.code == RequestCompleted
 }
@@ -164,7 +170,12 @@ func (r RequestResult) RequestOutOfRange() bool {
 	return r.code == RequestOutOfRange
 }
 
-// SnapshotIndex returns the snapshot log index carried in the result value; it is meaningful only for snapshot results.
+// SnapshotIndex returns the log index of the snapshot when the result
+// is from a snapshot request. Quicraft delivers the snapshot index in
+// the result's Value field (see Host.SyncRequestSnapshot), matching
+// dragonboat, which reads the request result's value. The returned
+// value is only meaningful for snapshot-related results; dragonboat
+// panics on misuse, while this adapter returns the raw result value.
 func (r RequestResult) SnapshotIndex() uint64 {
 	return r.inner.Value
 }
@@ -189,11 +200,18 @@ type resultCodeMapping struct {
 // resultCodeMappings is the package-level translation table used by
 // translateResultCode. Order matters: the first match wins.
 var resultCodeMappings = [...]resultCodeMapping{
-	// Session-identity failures map to RequestRejected, as dragonboat documents Rejected().
+	// Session failures. Dragonboat documents Rejected() as "the client
+	// session is not registered or has been evicted on the server side",
+	// so every session-identity failure maps to RequestRejected and never
+	// to the generic RequestAborted.
 	{quicraft.ErrSessionExpired, RequestRejected},
 	{quicraft.ErrSessionNotFound, RequestRejected},
 	{quicraft.ErrSessionAlreadyExists, RequestRejected},
-	// Leader-unavailable and not-ready failures map to RequestDropped, which callers retry.
+	// Leader-unavailable / shard-not-ready failures. Dragonboat documents
+	// Dropped() as "the leader is unavailable or not ready yet ... can
+	// usually be retried", which is exactly what these report; mapping them
+	// to RequestAborted would turn every election and rolling restart into
+	// a hard failure for callers that only retry on Dropped().
 	{quicraft.ErrNotLeader, RequestDropped},
 	{quicraft.ErrReadIndexNotReady, RequestDropped},
 	{quicraft.ErrShardNotReady, RequestDropped},
@@ -259,7 +277,16 @@ type RequestState struct {
 	// goroutine is spawned.
 	released bool
 
-	// aggrC is the lazy cap-2 ResultC channel under NotifyCommit: commit, then apply; it reads inner.CommittedC directly so no notification is dropped.
+	// aggrC is the lazily created cap-2 aggregate channel returned by
+	// ResultC when notifyCommit is set. It delivers the commit
+	// notification followed by the apply result, matching dragonboat's
+	// RequestState.ResultC. Its goroutine reads rs.inner.CommittedC()
+	// directly (the true source, written to synchronously by quicraft's
+	// own commit path) rather than through a separate translating bridge:
+	// racing a bridge's OUTPUT here instead of the source would add an
+	// asynchronous hop between the two — the bridge goroutine not yet
+	// scheduled to relay a value already sitting in the source channel —
+	// which can drop the commit notification.
 	aggrC chan RequestResult
 
 	// shardID records the shard this request belongs to. This is used
@@ -267,7 +294,11 @@ type RequestState struct {
 	// resolves. Set by WrapRequestStateForShard.
 	shardID uint64
 
-	// resolved holds the result of a synchronous op; AppliedC and ResultC return the one preloaded resolvedC.
+	// resolved holds the pre-resolved result for synchronous operations
+	// adapted to the async RequestState API. When non-nil, AppliedC and
+	// ResultC return resolvedC, the single pre-loaded channel built at
+	// construction time. Returning a fresh channel per call would make the
+	// idiomatic dragonboat receive loop spin forever.
 	resolved *RequestResult
 
 	// resolvedC is the single channel handed out for a pre-resolved
@@ -275,7 +306,10 @@ type RequestState struct {
 	// one-value contract of a real request's channel.
 	resolvedC chan RequestResult
 
-	// cancelFunc is the async method's context cancel, called by Release.
+	// cancelFunc holds the context cancel function from async methods
+	// that create a context.WithTimeout. It is called during Release()
+	// to ensure the context is cleaned up after the async operation
+	// completes or the caller is done with the RequestState.
 	cancelFunc context.CancelFunc
 
 	// doneC is closed by Release to signal bridge goroutines to exit.
@@ -287,14 +321,31 @@ type RequestState struct {
 	// Release calls.
 	doneOnce sync.Once
 
-	// wg tracks this RequestState's goroutines; Release waits on it before releasing the pooled inner RequestState.
+	// wg tracks every goroutine spawned on behalf of this RequestState
+	// (the channel bridges and the async-op runner). Release waits on it
+	// after signaling doneC and BEFORE releasing the inner quicraft
+	// RequestState: inner.Release may recycle the pooled object, and a
+	// bridge goroutine still selecting on the recycled result channel
+	// would otherwise race the pool and could steal a successor
+	// request's result.
 	wg sync.WaitGroup
 
-	// latched is the delivered result, read by ReadLocalNode because the caller has already drained ResultC.
+	// latched records the delivered result, stored by the bridge
+	// goroutine immediately before it sends on the adapter channel.
+	// ReadLocalNode consults this instead of receiving from ResultC:
+	// per the dragonboat contract the caller has already drained the
+	// channel, so a second receive would block forever.
 	latched atomic.Pointer[RequestResult]
 }
 
-// wrapRequestState builds the wrapper; notifyCommit selects the ResultC contract, and only the apply bridge starts here.
+// wrapRequestState is the single internal constructor behind the exported
+// Wrap* helpers. The notifyCommit flag threads the host's NotifyCommit
+// setting onto the wrapper: when false, ResultC() returns the apply-only
+// channel, matching dragonboat.
+//
+// Only the apply bridge is spawned here. It cannot be deferred because
+// the deprecated CompletedC field is read directly by callers; the
+// ResultC aggregate is created on first use.
 func wrapRequestState(inner *quicraft.RequestState, shardID uint64, cancel context.CancelFunc, notifyCommit bool) *RequestState {
 	rs := &RequestState{
 		inner:        inner,
@@ -307,7 +358,10 @@ func wrapRequestState(inner *quicraft.RequestState, shardID uint64, cancel conte
 	return rs
 }
 
-// WrapRequestState wraps a quicraft RequestState; notifyCommit must match the owning host's NotifyCommit setting.
+// WrapRequestState wraps a quicraft RequestState for dragonboat API
+// compatibility. notifyCommit must carry the owning host's NotifyCommit
+// setting: quicraft always allocates an inner committed channel, so the
+// wrapper cannot infer it, and a wrong value changes the ResultC contract.
 func WrapRequestState(inner *quicraft.RequestState, notifyCommit bool) *RequestState {
 	return wrapRequestState(inner, 0, nil, notifyCommit)
 }
@@ -319,12 +373,18 @@ func WrapRequestStateForShard(inner *quicraft.RequestState, shardID uint64, noti
 	return wrapRequestState(inner, shardID, nil, notifyCommit)
 }
 
-// WrapRequestStateWithCancel wraps a quicraft RequestState whose context cancel runs on Release.
+// WrapRequestStateWithCancel wraps a quicraft RequestState with an
+// associated context cancel function. The cancel function is invoked
+// when Release() is called, ensuring the context is not canceled
+// prematurely while the async operation is still in flight.
 func WrapRequestStateWithCancel(inner *quicraft.RequestState, cancel context.CancelFunc, notifyCommit bool) *RequestState {
 	return wrapRequestState(inner, 0, cancel, notifyCommit)
 }
 
-// WrapRequestStateForShardWithCancel wraps a quicraft RequestState with its shardID and a context cancel run on Release.
+// WrapRequestStateForShardWithCancel wraps a quicraft RequestState with
+// an explicit shardID and an associated context cancel function. Used by
+// ReadIndex so that ReadLocalNode can determine which shard to query,
+// while ensuring the context outlives the async operation.
 func WrapRequestStateForShardWithCancel(inner *quicraft.RequestState, shardID uint64, cancel context.CancelFunc, notifyCommit bool) *RequestState {
 	return wrapRequestState(inner, shardID, cancel, notifyCommit)
 }
@@ -334,7 +394,10 @@ func (rs *RequestState) ShardID() uint64 {
 	return rs.shardID
 }
 
-// newResolvedRequestState returns a RequestState that already holds result, for synchronous quicraft APIs.
+// newResolvedRequestState creates a pre-resolved RequestState that
+// immediately delivers the given result on its channels. This is used
+// for adapting synchronous quicraft APIs (like QueryRaftLog) to
+// dragonboat's asynchronous RequestState return convention.
 func newResolvedRequestState(result RequestResult) *RequestState {
 	rs := &RequestState{doneC: make(chan struct{})}
 	rs.resolved = &result
@@ -347,12 +410,21 @@ func newResolvedRequestState(result RequestResult) *RequestState {
 	return rs
 }
 
-// AppliedC returns a channel that receives one RequestResult when the request is applied.
+// AppliedC returns a bidirectional channel that receives when the request
+// is applied by the state machine. The returned channel receives exactly
+// one RequestResult value. Dragonboat returns chan (bidirectional), not
+// <-chan (receive-only).
 func (rs *RequestState) AppliedC() chan RequestResult {
 	return rs.CompletedC
 }
 
-// ResultC returns the apply channel, or with NotifyCommit a cap-2 channel delivering commit then apply.
+// ResultC returns a bidirectional channel that receives the result.
+//
+// When NotifyCommit is disabled on the host the returned channel is the
+// apply-only channel, identical to AppliedC. When NotifyCommit is enabled
+// the returned channel is a cap-2 aggregate delivering up to two values in
+// dragonboat's order: the commit notification first, then the apply
+// result. Dragonboat returns chan (bidirectional), not <-chan.
 func (rs *RequestState) ResultC() chan RequestResult {
 	if rs.resolved != nil || !rs.notifyCommit {
 		return rs.CompletedC
@@ -367,7 +439,16 @@ func (rs *RequestState) ResultC() chan RequestResult {
 	if rs.inner == nil || rs.released {
 		return rs.aggrC
 	}
-	// Read inner.CommittedC directly: a relaying goroutine could drop the commit notification.
+	// Read rs.inner.CommittedC() directly -- the true source, written to
+	// synchronously by quicraft's own commit path -- rather than through a
+	// separate translating bridge. See the aggrC field doc for why: the
+	// extra asynchronous hop a bridge adds (the bridge goroutine not yet
+	// scheduled to relay a value already sitting in the source channel)
+	// can drop the commit notification. This mirrors dragonboat's own RequestState.ResultC
+	// (request.go), which races r.committedC/r.CompletedC directly for
+	// the same reason -- they are the fields the raft engine itself
+	// writes into, with nothing relaying between the writer and this
+	// select.
 	committed := rs.inner.CommittedC()
 	if committed == nil {
 		return rs.aggrC
@@ -396,7 +477,15 @@ func (rs *RequestState) ResultC() chan RequestResult {
 			if !ok {
 				return
 			}
-			// Commit happens before apply, so a committed value is already buffered; forward it to keep commit-then-apply order.
+			// The apply result won the race, or the request failed before
+			// it was ever committed. rs.inner's own commitNotify always
+			// happens-before its complete for the same entry (raft
+			// commits before it applies), and both write directly into
+			// rs.inner's own fields -- so if this request actually
+			// committed, the value is already sitting in `committed`'s
+			// buffer by the time `applied` fires, needing no wait. Forward
+			// it if present so the caller still observes dragonboat's
+			// committed-then-applied order.
 			select {
 			case qcn := <-committed:
 				out <- RequestResult{inner: qcn, code: RequestCommitted}
@@ -409,7 +498,21 @@ func (rs *RequestState) ResultC() chan RequestResult {
 	return out
 }
 
-// Release cancels the context, waits for the bridges, then releases the pooled inner RequestState once; repeat calls are no-ops.
+// Release returns the RequestState to the pool and cancels any associated
+// context. After Release, the channels returned by AppliedC and ResultC
+// should not be used.
+//
+// Release waits for every bridge goroutine to exit BEFORE releasing the
+// inner quicraft RequestState. inner.Release may recycle the pooled inner
+// object immediately; a bridge goroutine still selecting on the recycled
+// result channel would race the pool and could steal the result of a new
+// request that was handed the recycled object.
+//
+// Only the FIRST call reaches the inner object. Dragonboat callers may call
+// Release more than once (the v4 contract tolerated it), but the inner
+// RequestState is pooled: a second call after the first returned could find
+// the object already reissued to another request and release THAT one. The
+// adapter's own released flag absorbs the repeats.
 func (rs *RequestState) Release() {
 	rs.mu.Lock()
 	if rs.released {
@@ -430,7 +533,11 @@ func (rs *RequestState) Release() {
 	}
 }
 
-// makeAdaptedChannel bridges the inner result channel to a translated adapter channel on a goroutine tracked by rs.wg.
+// makeAdaptedChannel creates and returns a buffered channel that receives
+// the translated result from the inner quicraft RequestState. A goroutine
+// is spawned to bridge the inner channel to the adapter channel; it is
+// registered on rs.wg so Release can wait for it to exit before the inner
+// RequestState is recycled.
 func (rs *RequestState) makeAdaptedChannel() chan RequestResult {
 	if rs.inner == nil {
 		return nil
@@ -471,7 +578,13 @@ func (rs *RequestState) completedResult() (RequestResult, bool) {
 	return RequestResult{}, false
 }
 
-// newAsyncOpRequestState runs op on a goroutine and delivers its result; op must honour ctx, which Release cancels before waiting.
+// newAsyncOpRequestState runs op in its own goroutine and delivers its
+// result through the RequestState channels. This adapts quicraft
+// operations that have no asynchronous variant (such as session
+// registration via Host.RegisterSession) to dragonboat's non-blocking
+// RequestState return convention. The op must honor the context whose
+// cancel function is passed here: Release cancels the context and then
+// waits for op to return.
 func newAsyncOpRequestState(cancel context.CancelFunc, op func() RequestResult) *RequestState {
 	rs := &RequestState{cancelFunc: cancel, doneC: make(chan struct{})}
 	out := make(chan RequestResult, 1)
@@ -486,7 +599,10 @@ func newAsyncOpRequestState(cancel context.CancelFunc, op func() RequestResult) 
 	return rs
 }
 
-// SysOpState wraps quicraft's RequestState for system operations, signalling completion by closing a channel.
+// SysOpState wraps quicraft's RequestState for system operations such as
+// membership changes and snapshot requests. In dragonboat v4, SysOpState
+// signals completion via a closed struct{} channel, not a RequestResult
+// channel.
 type SysOpState struct {
 	inner *quicraft.RequestState
 
@@ -505,7 +621,10 @@ type SysOpState struct {
 	// Release calls.
 	doneOnce sync.Once
 
-	// wg tracks the bridge goroutine; Release waits on it before releasing the inner RequestState.
+	// wg tracks the bridge goroutine. Release waits on it after
+	// signaling doneC and before releasing the inner RequestState, so
+	// the bridge can never race the pool recycling the inner object
+	// and steal a successor request's result.
 	wg sync.WaitGroup
 }
 
@@ -523,7 +642,10 @@ func WrapSysOpState(inner *quicraft.RequestState) *SysOpState {
 	return s
 }
 
-// waitForCompletion closes completedC when the inner result arrives, or returns when Release closes doneC.
+// waitForCompletion reads from the inner quicraft result channel and
+// closes the completedC channel to signal that the operation is done.
+// The goroutine also monitors doneC so it can exit promptly when
+// Release is called before the inner result arrives.
 func (s *SysOpState) waitForCompletion() {
 	defer s.wg.Done()
 	src := s.inner.ResultC()
@@ -551,7 +673,12 @@ func (s *SysOpState) ResultC() <-chan struct{} {
 	return s.completedC
 }
 
-// Release signals and waits for the bridge, then releases the inner RequestState once.
+// Release returns the RequestState to the pool and signals the bridge
+// goroutine to exit. After Release, the channels returned by CompletedC
+// and ResultC should not be used. The bridge goroutine is waited for
+// before the inner RequestState is released, so it can never observe the
+// recycled inner object (see RequestState.Release for the hazard). Only the
+// first call reaches the inner object, for the reason given there.
 func (s *SysOpState) Release() {
 	if !s.released.CompareAndSwap(false, true) {
 		return

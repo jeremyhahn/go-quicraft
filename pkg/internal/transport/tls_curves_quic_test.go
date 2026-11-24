@@ -23,7 +23,9 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// curveListener is a QUIC listener with its own server curve list and the transport's real TLS settings.
+// curveListener is a QUIC listener whose server role offers its own curve
+// list, built from buildMTLSTLS so everything but the groups is what the
+// transport really runs: TLS 1.3 floor, mutual authentication, ALPN pinned.
 type curveListener struct {
 	ln     *quic.Listener
 	client *tls.Config

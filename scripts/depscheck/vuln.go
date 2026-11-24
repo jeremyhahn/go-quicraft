@@ -119,7 +119,11 @@ func decodeVulns(dir string, r io.Reader) (map[string][]advisory, error) {
 	return out, nil
 }
 
-// vulnFinding is one vulnerable module version in one module directory; only a Required finding fails.
+// vulnFinding is one vulnerable module version in one module directory.
+// Required is true when the module has a require line in that directory's
+// go.mod: only then does the finding fail. The standard library, the
+// toolchain and a module the build list pulls in with no require line are
+// reported, not failed.
 type vulnFinding struct {
 	Dir        string
 	Module     string
@@ -215,7 +219,16 @@ func vulnFindings(dir string, hits map[string][]advisory, required map[string]bo
 	return out
 }
 
-// scanDir returns the directory govulncheck runs in for the module at dir: its first package with Go files, else the root.
+// scanDir is the directory govulncheck runs in for the module at dir. A
+// module scan takes no package pattern and loads the directory it runs in,
+// so a module root with no Go files of its own fails with "no Go files".
+// Any package directory of the same module reads the same go.mod, so the
+// first package `go list ./...` reports with Go files under the current
+// build constraints is used; go list already leaves out nested modules,
+// testdata and the directories go ignores. A module with no such
+// package is scanned at its root, which fails: a module whose every file is
+// behind a build tag names that tag in -vuln-tags. Tags do not change what a
+// module scan reports, which is the go.mod build list.
 func scanDir(goPath, tags, dir string) (string, error) {
 	args := []string{"list", "-e"}
 	if tags != "" {

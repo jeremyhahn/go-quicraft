@@ -25,7 +25,11 @@ import (
 	"github.com/jeremyhahn/go-enclave"
 )
 
-// These tests drive the ...With variants against real go-enclave allocators sized to refuse.
+// The tests in this file drive the ...With variants against REAL go-enclave
+// allocators sized to refuse. That is the point: a budget is a
+// refusal this package can be shown to surface without any seam, because an
+// allocator's budget is local to the test that built it — unlike RLIMIT_MEMLOCK,
+// which every test in the binary shares.
 
 // pageBytes is one page as the allocator charges it.
 func pageBytes() int64 { return enclave.LockedSize(1) }
@@ -115,7 +119,12 @@ func TestSplitProtectedWith_OnePageBudgetIsRefusedWithoutLeaking(t *testing.T) {
 	}
 }
 
-// TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact pins that a split refused mid-loop releases what it took and earlier shares still reconstruct.
+// TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact pins partial
+// refusal on the split path. The budget fits exactly one split's PEAK, so
+// the first split succeeds and keeps its shares; the second gets its scratch
+// admitted and is refused partway through the share loop — the hardest refusal
+// to unwind — and must give back everything it took while the first set still
+// reconstructs.
 func TestSplitProtectedWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	const threshold, total = 2, 3
@@ -300,7 +309,13 @@ func TestUnmarshalShareSetWith_ChargesAndDestroyRefunds(t *testing.T) {
 	}
 }
 
-// TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact pins that a set refused mid-decode releases what it took and earlier shares stay intact.
+// TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact pins partial
+// refusal on the recovery-ceremony ingestion path. An
+// earlier decode holds one page; the second set fits two of its three shares in
+// what is left and is refused on the third — partway through the set, the
+// refusal that has to be unwound — and must give back what it took while the
+// earlier share stays intact. The earlier decode is also the budgeted route for
+// ONE share that UnmarshalJSON documents: a one-element set.
 func TestUnmarshalShareSetWith_BeyondBudgetLeavesEarlierSharesIntact(t *testing.T) {
 	shares, err := SplitProtected([]byte("0123456789abcdef0123456789abcdef"), 2, 3)
 	if err != nil {
