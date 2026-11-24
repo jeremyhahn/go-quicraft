@@ -243,7 +243,7 @@ usage guide. Good places to start:
 etcd-io/raft, Dragonboat and OpenRaft on single-node, 3-node and 5-node
 configurations. Each result set is tied to the machine that measured it. The
 most recent full run is the
-[bench-host profile](test/performance/profiles/bench-01/), a dual-socket
+[`bench-01` profile](test/performance/profiles/bench-01/), a dual-socket
 Xeon Gold 6258R server, measured 2026-10-04 with every engine on one common
 configuration (same timing, keys, warmup, durability and TLS; Dragonboat on its
 Tan LogDB). QuicRaft led Dragonboat in 12 of 18 head-to-head scenarios,

@@ -361,10 +361,11 @@ replicas are not exposed by this one's key):
    sealing strategy and fresh credentials. That draws a new root key and salt.
    Do not overwrite the old sealed blob yet.
 2. With the node's host stopped and both barriers unsealed, copy the WAL into
-   an empty directory with `waldb.Reencrypt(srcDir, oldBarrier, dstDir,
+   an empty directory with `waldb.ReencryptSized(srcDir, oldBarrier, dstDir,
    newBarrier, snapFn, opts...)`, passing the options the node normally opens
-   its WAL with and a `snapFn` that calls `quicraft.ReencryptSnapshotFile` for
-   each snapshot ([log storage](../log-storage/user.md),
+   its WAL with and a `snapFn` that returns the `(epoch, fileSize, err)` of
+   `quicraft.ReencryptSnapshotFile` for each snapshot, so the migrated record
+   carries the re-encrypted file's size ([log storage](../log-storage/user.md),
    [snapshots](../snapshots/user.md)).
 3. Verify the destination, swap it into place, persist the new barrier's
    sealed blob (`SealedRootKeyData`), then destroy the old blob and every backup of it. Snapshot

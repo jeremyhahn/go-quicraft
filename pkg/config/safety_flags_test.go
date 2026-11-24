@@ -17,6 +17,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"log/slog"
 	"strings"
 	"testing"
@@ -28,9 +29,17 @@ import (
 func captureSafetyFlagWarnings(t *testing.T) *bytes.Buffer {
 	t.Helper()
 	var buf bytes.Buffer
+	// slog.SetDefault also redirects the standard log package, so its
+	// writer, flags and prefix are restored with the default logger.
 	prev := slog.Default()
+	prevWriter, prevFlags, prevPrefix := log.Writer(), log.Flags(), log.Prefix()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+		log.SetPrefix(prevPrefix)
+	})
 	return &buf
 }
 

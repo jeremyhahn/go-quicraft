@@ -64,7 +64,10 @@ if err := host.StartShard(members, false, kv.NewMemoryCreateFunc(), shardCfg); e
 ```
 
 Without a transport no identities are needed, and messages to other replicas
-are dropped.
+are dropped. One host runs any number of shards, each its own Raft group with
+its own data: call `StartShard` once per `ShardID`. `Example_multipleShards`
+in `pkg/example_multigroup_test.go` runs two shards on one host this way and
+checks that each read returns its own shard's value.
 
 ### One host per data directory
 
@@ -297,7 +300,8 @@ sessions.
 - Raise `CommitCBufferSize` for write-heavy loads where commit lags the step
   tier.
 - `NumWorkers` (default: CPU count) sets workers per pipeline tier;
-  `MaxApplyWorkers` caps concurrent state machine applies.
+  `MaxApplyWorkers` caps the state machine updates each apply worker runs at
+  once, so the host runs at most `NumWorkers * MaxApplyWorkers`.
 - `Quiesce: true` stops idle shards ticking until traffic returns, which saves
   CPU on hosts with many idle shards.
 - `EntryCompressionType` / `SnapshotCompressionType` = `config.Snappy` trade a
@@ -445,6 +449,8 @@ Only a shard in `error` degrades the host. Shards in `no-leader`, `lagging`,
 `recovering` or `snapshotting` leave it `"ok"`, so alert on `status.Shards`
 yourself if you care about them. `ShardInfo` gives one shard's state,
 including its replicas' progress when asked on the leader.
+`ExampleHost_HealthCheck` in `pkg/example_multigroup_test.go` runs this call
+and prints `Status` and `ShardCount`.
 
 ### Events
 
@@ -498,6 +504,9 @@ err := host.RegisterLeaderHandler(shardID,
 
 reply, err := host.ExecuteOnLeader(ctx, shardID, []byte("renew client-7"))
 ```
+
+`ExampleHost_ExecuteOnLeader` in `pkg/example_multigroup_test.go` registers a
+handler and checks that `ExecuteOnLeader` returns its reply.
 
 You can call it on any replica. A follower forwards the request over the QUIC
 transport, with the same mTLS and sender binding as a forwarded proposal. If
@@ -561,6 +570,11 @@ if err := f.Close(); err != nil {
     return err
 }
 ```
+
+The shard needs a snapshot to export: a new shard has none until
+`SnapshotEntries` entries apply or you call `SyncRequestSnapshot`.
+`ExampleHost_ExportSnapshot` in `pkg/example_multigroup_test.go` takes one on
+demand and exports it to a file.
 
 To restore onto a host:
 
@@ -632,8 +646,9 @@ limit, so a state machine that blocks in `Update` blocks shutdown.
 | a membership add returns `ErrMemberIdentityRequired` | use the `...WithIdentity` form |
 | an add returns `ErrRemovedMemberIdentity` | that key was removed from the shard; issue a new key |
 | an add returns `ErrDuplicateMemberAddress` or `ErrDuplicateMemberIdentity` | another active member already holds that address or key; remove it first, or use a different one |
+| `StartShard` fails with "was started with DataDir ..., refusing DataDir ..." | the replica's records place its data under another `Config.DataDir`; restart with the recorded one the error names |
 | `StartShard` returns `*ReplicaRetiredError` | `RemoveData` retired the ID; use a new replica ID |
-| `StartShard` returns `ErrImportInProgress` or `ErrShardNotReady` | an import or another start of the shard is running; retry |
+| `StartShard` returns `ErrImportInProgress` or `ErrShardNotReady` | an import, another start or a stop of the shard is running; retry |
 | `NewHost` fails opening the WAL with `ErrUnknownPayloadType` | usually an encrypted WAL opened without its barrier; otherwise data from an incompatible build, which must be wiped and re-synced |
 | new replica never catches up, `unknown_member` drops on it | its `MemberIdentities` anchor does not name the replica sending to it; name the leader |
 | `ErrSystemBusy` or `*BusyError` from `Propose` | memory limits reached; back off and retry |

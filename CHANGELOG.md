@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI: ci-template v1.34.1. No Go module proxy list ends in `direct` (`ci.yml`, `nightly.yml`, the devcontainer Dockerfile, `scripts/in-toolchain-image.sh`), so a module the proxy cannot serve fails the build instead of being fetched from its origin.
 - Dependencies: go-enclave v0.11.0-alpha (was v0.10.0-alpha), in the root module, `contrib/dragonboat` and `test/performance/quicraft`. Its additions (a Linux `memfd_secret` backend and `Sealed.OpenIn`) need no change here.
 - Dependencies: go-enclave v0.11.1-alpha (was v0.11.0-alpha), in the same three modules. It is the v0.11.0-alpha commit tagged again, so no code changes; go.sum carries the checksums the public module proxy serves.
+- API: `ReencryptSnapshotFile` returns `(epoch, fileSize, err)`: `fileSize` is the destination data file's length, which re-encryption changes whenever the framing differs. `waldb.ReencryptSized` takes a `SnapshotReencryptSizedFunc` hook returning both and records them as the migrated snapshot's `Epoch` and `FileSize`, so a Host starts the shard on a plaintext-to-encrypted re-key. The re-key runbook (`docs/seal-barrier/user.md`) uses it.
+- `ReencryptSnapshotFile` refuses a source or destination path that is not clean (`filepath.Clean` changes it) with a `*SnapshotDestinationError` matching `fs.ErrInvalid`, before anything is written.
+- `RemoveData` refuses a replica whose `StopShard` has not yet returned with `*ShardNotStoppedError`, and a replica whose bootstrap and snapshot records name different `DataDir` trees with an error matching `ErrInvalidOperation`, before anything is retired, deleted or recorded. `Close` waits for a `RemoveData` in progress; one started after `Close` began returns `ErrClosed`.
+- `StartShard` refuses a `cfg.DataDir` that differs from the `DataDir` the replica was first started with; its snapshots stay under the recorded tree.
+- `ImportSnapshot` is refused with `ErrInvalidOperation` while a `RemoveData` intent for the replica is pending.
+- Reads: a read queued behind `Apply` observes its context, and a read closed by `StopShard` returns `ErrClosed`. Context errors wrap the context's cause, so they match `ErrTimeout` or `ErrCanceled` and, for the `Sync*` calls, `context.DeadlineExceeded` or `context.Canceled`.
+- `OnSnapshotRecovered` carries the recovered snapshot's `Index`.
 
 ### Fixed
 
@@ -1153,7 +1160,7 @@ changes to check:
   membership. A replica the membership lists as an observer behaves as one
   instead of latching a role mismatch.
 - **Makefile offload variables.** The remote-offload variables are renamed
-  `OMEGA_*` → `REMOTE_*`, and `REMOTE_HOST` is required.
+  from a machine-named prefix to `REMOTE_*`, and `REMOTE_HOST` is required.
 
 ### Added
 - **A promoted observer becomes a voter in place.** A replica's non-voting
@@ -1231,7 +1238,7 @@ changes to check:
   Shamir functions charge.
 - **The remote-offload targets have no default host.** `make remote-*` and
   `make remote-tools` require `REMOTE_HOST` and print usage without it.
-  `OMEGA_USER`, `OMEGA_HOST` and `OMEGA_DIR` are renamed `REMOTE_USER`
+  The machine-named `*_USER`, `*_HOST` and `*_DIR` are renamed `REMOTE_USER`
   (optional), `REMOTE_HOST` and `REMOTE_WORKDIR`. `remote-tools` seeds a
   forge host key only when `FORGE_SSH_HOST` (and `FORGE_SSH_PORT`, default 22)
   are set. Target names are unchanged. Lab addresses and hostnames are gone
@@ -2694,13 +2701,13 @@ commit.
   captured on that machine.** `test/performance/profiles/<name>/` holds
   `env.json` (captured by `capture-env.sh` on the target), `results/*.json`,
   generated `charts/` and `<system>.md` documents, and a hand-written
-  `analysis.md`. Two profiles are tracked: `omega` (the single-socket bench
-  host) and `r640` (the dual-socket bench host). The profile name is a
+  `analysis.md`. Two profiles are tracked: `bench-02` (the single-socket desktop
+  bench host) and `r640` (the dual-socket bench host). The profile name is a
   required argument. A field the capture could not obtain renders as
   "not captured", never as zero.
 
 - **One command measures any machine:**
-  `make perf-remote PERF_HOST=user@host PERF_PROFILE=omega`. It stages the tree,
+  `make perf-remote PERF_HOST=user@host PERF_PROFILE=bench-02`. It stages the tree,
   captures `env.json`, runs the suite in Docker, fetches results and capture
   into the profile, and regenerates its documents. The phases remain available
   individually, and the remote run stays detached.
@@ -2711,7 +2718,7 @@ commit.
 - **A system with no results produces no document** rather than one full of
   `N/A` rows, and a stale document for an unmeasured system is deleted.
   Generation still refuses to run when a requested system is missing;
-  `PERF_SYSTEMS` narrows the set explicitly. `omega` has no `etcd.md` for this
+  `PERF_SYSTEMS` narrows the set explicitly. `bench-02` has no `etcd.md` for this
   reason.
 
 - **The R640 baseline is preserved verbatim** in `profiles/r640/analysis.md`

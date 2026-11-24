@@ -892,6 +892,104 @@ func TestSnapshotPool_WriteSnapshotMetadata_InvalidDir(t *testing.T) {
 	}
 }
 
+// TestWriteSnapshotMetaFile_RewriteReplacesRecord pins that rewriting a
+// snapshot.meta over a longer earlier one leaves exactly the new record: a
+// stale tail would make readSnapshotEpoch classify the directory
+// unevaluable, which suppresses DEK purging for the barrier.
+func TestWriteSnapshotMetaFile_RewriteReplacesRecord(t *testing.T) {
+	dir := t.TempDir()
+	metaPath := filepath.Join(dir, snapshotMetadataFile)
+	stale := bytes.Repeat([]byte{0xA5}, 4096)
+	if err := os.WriteFile(metaPath, stale, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := SnapshotMeta{
+		Index:       42,
+		Term:        7,
+		ShardID:     3,
+		ReplicaID:   4,
+		Epoch:       9,
+		Compression: config.NoCompression,
+		DataLen:     1234,
+		DataHash:    0xDEADBEEF,
+	}
+	if err := writeSnapshotMetaFile(dir, want.Index, want.Term, want.ShardID, want.ReplicaID,
+		want.Epoch, want.Compression, want.DataHash, want.DataLen); err != nil {
+		t.Fatalf("writeSnapshotMetaFile: %v", err)
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, MarshalSnapshotMeta(want)) {
+		t.Fatalf("snapshot.meta is %d bytes after the rewrite, want exactly the %d-byte new record",
+			len(data), len(MarshalSnapshotMeta(want)))
+	}
+	got, err := ParseSnapshotMeta(data)
+	if err != nil {
+		t.Fatalf("ParseSnapshotMeta: %v", err)
+	}
+	if got.Index != want.Index || got.Term != want.Term || got.ShardID != want.ShardID ||
+		got.ReplicaID != want.ReplicaID || got.Epoch != want.Epoch ||
+		got.Compression != want.Compression || got.DataLen != want.DataLen ||
+		got.DataHash != want.DataHash {
+		t.Fatalf("ParseSnapshotMeta = %+v, want %+v", got, want)
+	}
+}
+
+// TestSnapshotPool_WriteLeasedSnapshotMetadata_HashesBeforeLease: the
+// snapshot.dat hash is a full read of the artifact, so it must not run under
+// the node's write lease, which UnloadNode waits out. With the hash held,
+// stopping the node and awaiting its leases returns at once; the released
+// save then finds the node stopped and writes no metadata.
+func TestSnapshotPool_WriteLeasedSnapshotMetadata_HashesBeforeLease(t *testing.T) {
+	node := newAuditNode(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, snapshotDataFile), []byte("snapshot"), 0o600); err != nil {
+		t.Fatalf("write data file: %v", err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	orig := stampSnapshotHash
+	stampSnapshotHash = func(path string) (uint64, uint64, error) {
+		close(entered)
+		<-release
+		return orig(path)
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		stampSnapshotHash = orig
+	})
+
+	saveErr := make(chan error, 1)
+	go func() {
+		saveErr <- writeLeasedSnapshotMetadata(node, dir, 5, 1, 10, 1, 0, config.NoCompression)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the metadata write never started its hash")
+	}
+
+	node.Stop()
+	awaitLeasesWithin(t, node, 2*time.Second)
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-saveErr:
+		if !errors.Is(err, ErrStopped) {
+			t.Fatalf("metadata write after the node stopped = %v, want ErrStopped", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the released metadata write never returned")
+	}
+	if _, err := os.Stat(filepath.Join(dir, snapshotMetadataFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a stopped node's save wrote snapshot.meta (stat err %v)", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Barrier/encryption test helpers
 // ---------------------------------------------------------------------------
@@ -3488,8 +3586,34 @@ func TestHandleRequest_CompletionNamesItsOperation(t *testing.T) {
 	if c := calls[0]; c.op != SnapshotSave || c.index != 0 || c.err != nil {
 		t.Fatalf("no-op save completed as %+v, want SnapshotSave at index 0 without error", c)
 	}
-	if c := calls[1]; c.op != SnapshotRecover || c.err != nil {
-		t.Fatalf("recovery completed as %+v, want SnapshotRecover without error", c)
+	// A recovery that restored nothing completes at index 0: the operation,
+	// not the index, tells the host it was a recovery.
+	if c := calls[1]; c.op != SnapshotRecover || c.index != 0 || c.err != nil {
+		t.Fatalf("recovery completed as %+v, want SnapshotRecover at index 0 without error", c)
+	}
+}
+
+// TestHandleRequest_RecoveryReportsTheRecoveredIndex checks that a recovery
+// that restores a recorded snapshot completes with that snapshot's index, so
+// the SnapshotRecovered event carries it rather than 0.
+func TestHandleRequest_RecoveryReportsTheRecoveredIndex(t *testing.T) {
+	f := newRecoverFixture(t, snapshotPayload(100, 4096), 0)
+	stopC := make(chan struct{})
+	defer close(stopC)
+	cb := newTestCallback()
+	pool := newSnapshotPool(1, f.ldb, nil, cb, NewWorkSignal(1), stopC, nil)
+
+	node := f.req.node
+	node.snapshotting.Store(true)
+	pool.inFlight.Store(f.req.shardID, node)
+	pool.handleRequest(f.req)
+
+	calls := cb.getSnapshotCalls()
+	if len(calls) != 1 {
+		t.Fatalf("OnSnapshotCompleted called %d times, want 1", len(calls))
+	}
+	if c := calls[0]; c.op != SnapshotRecover || c.err != nil || c.index != 100 {
+		t.Fatalf("recovery completed as %+v, want SnapshotRecover at index 100 without error", c)
 	}
 }
 

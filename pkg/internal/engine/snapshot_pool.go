@@ -442,9 +442,9 @@ func (p *snapshotPool) drainRequests() {
 //     stopping aborts: an apply may still be in flight (engine Stop closes
 //     stopC before the apply workers drain), and the restore would race it.
 //     The gate is lowered when the outcome is settled.
-func (p *snapshotPool) runRecovery(req snapshotRequest) error {
+func (p *snapshotPool) runRecovery(req snapshotRequest) (uint64, error) {
 	if blocked := rejectBeforeRestore(p.awaitRecoverableLog(req)); blocked != nil {
-		return blocked
+		return 0, blocked
 	}
 	stopped := &SnapshotError{
 		ShardID:   req.shardID,
@@ -453,15 +453,15 @@ func (p *snapshotPool) runRecovery(req snapshotRequest) error {
 		Err:       ErrStopped,
 	}
 	if !req.node.AcquireWriteLease() {
-		return stopped
+		return 0, stopped
 	}
 	defer req.node.ReleaseWriteLease()
 	req.node.SetRecovering(true)
 	if !req.node.WaitForApplyDrain(req.node.StopC()) {
-		return stopped
+		return 0, stopped
 	}
-	_, _, err := p.handleSnapshot(req)
-	return err
+	index, _, err := p.handleSnapshot(req)
+	return index, err
 }
 
 // abandonRequest undoes the per-shard state requestSnapshot established for
@@ -817,7 +817,7 @@ func (p *snapshotPool) handleRequest(req snapshotRequest) {
 	if req.save {
 		index, compaction, err = p.handleSnapshot(req)
 	} else {
-		err = p.runRecovery(req)
+		index, err = p.runRecovery(req)
 	}
 
 	// Mark that the snapshot operation itself finished, so a later panic is
@@ -938,13 +938,13 @@ func (p *snapshotPool) reportCompleted(req snapshotRequest, index uint64, compac
 
 // handleSnapshot executes a single snapshot save or recover operation.
 // Returns the snapshot index and what log compaction did for save operations,
-// or 0 and no compaction for recovers.
+// or the recovered snapshot's index and no compaction for recovers.
 func (p *snapshotPool) handleSnapshot(req snapshotRequest) (uint64, LogCompaction, error) {
 	if req.save {
 		return p.saveSnapshotCompacting(req)
 	}
-	err := p.recoverSnapshot(req)
-	return 0, LogCompaction{}, err
+	index, err := p.recoverSnapshotIndex(req)
+	return index, LogCompaction{}, err
 }
 
 func recordedArtifactExists(rec logdb.Snapshot) bool {
@@ -957,6 +957,11 @@ func recordedArtifactExists(rec logdb.Snapshot) bool {
 	}
 	return true
 }
+
+// saveStageHook, when set by a test, runs on the save path just before the
+// save creates its staging parent and staging directory. Tests use it to
+// hold a save at that point while the node unloads.
+var saveStageHook atomic.Pointer[func(*Node)]
 
 // saveSnapshot is saveSnapshotCompacting for callers that need only the
 // index: the tests that drive a save directly. The pool's own path uses the
@@ -1285,16 +1290,30 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	// can see is touched before the publish, so the capture needs no fence. A save
 	// whose node stops meanwhile is refused the lease and publishes nothing.
 	canonicalDir := snapshotSaveDir(node.SnapshotDir(), req.shardID, req.replicaID, snapshotIndex)
-	stageParent := filepath.Dir(canonicalDir)
-	if err := os.MkdirAll(stageParent, 0o750); err != nil {
-		return 0, LogCompaction{}, &SnapshotError{
-			ShardID:   req.shardID,
-			ReplicaID: req.replicaID,
-			Save:      true,
-			Err:       err,
-		}
+	if hook := saveStageHook.Load(); hook != nil {
+		(*hook)(node)
 	}
-	stageDir, err := MkdirStageDir(stageParent, SaveStageDirPattern)
+	// The stage itself, though, is created UNDER the lease, and only briefly.
+	// Its parent is the replica directory RemoveData deletes once UnloadNode
+	// has passed awaitWriteLeases, so a save that created it after that fence
+	// would bring the directory back, empty, inside a replica that has just
+	// been removed. With the lease held, the fence orders the creation either
+	// before it — so the removal deletes the stage, and every later create in
+	// it fails for want of a parent — or after it, when the node has stopped
+	// and the lease is refused, and nothing is created at all. The lease is
+	// the non-blocking form: the saving gate is held here, and waiting behind
+	// a pending unload while holding it would stall applies on a stopping
+	// node for no purpose.
+	// openLeasedSaveStage defers the release and logs nothing under the
+	// lease, so a user slog.Handler that panics, blocks or calls
+	// runtime.Goexit on the diagnostic below cannot hold it.
+	stageDir, f, cleanupErr, err := openLeasedSaveStage(node, filepath.Dir(canonicalDir))
+	if cleanupErr != nil {
+		slog.Warn("snapshot: failed to remove a save staging directory whose data file could not be created",
+			"path", stageDir,
+			"error", cleanupErr,
+		)
+	}
 	if err != nil {
 		return 0, LogCompaction{}, &SnapshotError{
 			ShardID:   req.shardID,
@@ -1327,19 +1346,7 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 		}
 	}()
 	saveDir := stageDir
-
-	// Open data file. The engine.Snapshotter interface accepts io.Writer,
-	// and *os.File satisfies io.Writer, so we manage the file here.
 	dataPath := filepath.Join(saveDir, snapshotDataFile)
-	f, err := os.OpenFile(dataPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil {
-		return 0, LogCompaction{}, &SnapshotError{
-			ShardID:   req.shardID,
-			ReplicaID: req.replicaID,
-			Save:      true,
-			Err:       err,
-		}
-	}
 
 	// Save SM state to the data file. When Snappy compression is
 	// configured, wrap the file writer with a Snappy buffered writer
@@ -1604,7 +1611,14 @@ func (p *snapshotPool) saveSnapshotCompacting(req snapshotRequest) (uint64, LogC
 	// The (snapshotIndex, term) pair was captured together under the apply
 	// gate above; do NOT re-read lastAppliedTerm here — applies may have
 	// resumed since afterCapture released the gate.
-	if err := writeSnapshotMetadata(saveDir, snapshotIndex, term, req.shardID, req.replicaID, epoch, compression); err != nil {
+	//
+	// The metadata file is a create under the node's snapshot directory, so it
+	// too runs under a brief, non-blocking lease (see the stage creation): a
+	// node that has stopped since the capture is refused here, and the stage
+	// guard removes the stage. The release is deferred inside
+	// writeLeasedSnapshotMetadata, and the write logs nothing.
+	if err := writeLeasedSnapshotMetadata(node, saveDir, snapshotIndex, term, req.shardID, req.replicaID,
+		epoch, compression); err != nil {
 		// The data file is (possibly encrypted) ciphertext with no
 		// snapshot.meta beside it. readSnapshotEpoch classifies such a directory
 		// UNEVALUABLE, which makes the global/per-barrier purge floor fail safe
@@ -2140,7 +2154,14 @@ func (p *snapshotPool) pendingRecoveryIndex(req snapshotRequest) uint64 {
 // The caller holds the node's write lease for the whole call (runRecovery),
 // which fences the sweeps below and keeps the state machine open under the
 // restore.
-func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
+func (p *snapshotPool) recoverSnapshot(req snapshotRequest) error {
+	_, err := p.recoverSnapshotIndex(req)
+	return err
+}
+
+// recoverSnapshotIndex is recoverSnapshot that also returns the index of the
+// snapshot it restored, or 0 when there was none to restore or it failed.
+func (p *snapshotPool) recoverSnapshotIndex(req snapshotRequest) (index uint64, err error) {
 	restoring := false
 	defer func() {
 		if !restoring {
@@ -2170,12 +2191,12 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 	node := req.node
 	snapshotter := node.Snapshotter()
 	if snapshotter == nil {
-		return nil // nothing to recover (e.g. witness node)
+		return 0, nil // nothing to recover (e.g. witness node)
 	}
 
 	// Get the latest snapshot metadata from LogDB.
 	if p.logdb == nil {
-		return nil
+		return 0, nil
 	}
 	// Choose the artifact and PIN it, under the snapshot-directory lock, so
 	// the GC a receive or save runs after recording a newer snapshot cannot
@@ -2195,10 +2216,10 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 		return snap, dir, idx, chooseErr
 	}()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if snapshotDir == "" {
-		return nil // no snapshot to recover
+		return 0, nil // no snapshot to recover
 	}
 	defer func() {
 		node.LockSnapshotDir()
@@ -2210,7 +2231,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 	// Running RecoverFromSnapshot first and checking afterwards leaves the
 	// state machine replaced by a snapshot whose markers were then refused.
 	if err := recoveryBlockedByLog(req, logdbSnap.Index); err != nil {
-		return err
+		return 0, err
 	}
 
 	// When the snapshot was encrypted at rest (non-zero epoch) and a barrier
@@ -2242,7 +2263,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 	// a directory lost whole has no record either, and the missing artifact is
 	// the actionable fact (see the open below).
 	if _, statErr := os.Stat(dataPath); os.IsNotExist(statErr) {
-		return &SnapshotError{
+		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      false,
@@ -2250,7 +2271,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 		}
 	}
 	if verifyErr := verifyRecoveryArtifact(snapshotDir, dataPath, logdbSnap); verifyErr != nil {
-		return &SnapshotError{
+		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      false,
@@ -2294,7 +2315,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 	// the snapshot receive and the (asynchronous, retried) recovery.
 	barrier, barrierErr := p.barrierForShard(req.shardID)
 	if barrierErr != nil {
-		return &SnapshotError{
+		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      false,
@@ -2302,7 +2323,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 		}
 	}
 	if logdbSnap.Epoch > 0 && (barrier == nil || barrier.IsSealed()) {
-		return &SnapshotError{
+		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      false,
@@ -2319,7 +2340,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 		scratch, decryptErr := p.decryptSnapshotToAnonymousScratch(
 			node.ReplicaSnapshotDir(), dataPath, req.shardID, req.replicaID, artifactIndex, logdbSnap.Epoch, barrier)
 		if decryptErr != nil {
-			return &SnapshotError{
+			return 0, &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Save:      false,
@@ -2340,14 +2361,14 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 				// so the leader's ack-expiry -> re-send -> dedup -> re-recovery
 				// path engages, matching the encrypted branch (which already fails
 				// on a missing artifact via SnapshotEncryptError{Op:"read"}).
-				return &SnapshotError{
+				return 0, &SnapshotError{
 					ShardID:   req.shardID,
 					ReplicaID: req.replicaID,
 					Save:      false,
 					Err:       ErrSnapshotArtifactMissing,
 				}
 			}
-			return &SnapshotError{
+			return 0, &SnapshotError{
 				ShardID:   req.shardID,
 				ReplicaID: req.replicaID,
 				Save:      false,
@@ -2374,7 +2395,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 	ctx := context.Background()
 	r, readerErr := DecompressingSnapshotReader(f, logdbSnap.Compression)
 	if readerErr != nil {
-		return &SnapshotError{
+		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      false,
@@ -2385,7 +2406,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 	// overwritten, and a panic fails the shard (see the deferred recover).
 	restoring = true
 	if err := snapshotter.RecoverFromSnapshot(ctx, r, node.stopC); err != nil {
-		return &SnapshotError{
+		return 0, &SnapshotError{
 			ShardID:   req.shardID,
 			ReplicaID: req.replicaID,
 			Save:      false,
@@ -2411,7 +2432,7 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 		setter.SetLastApplied(logdbSnap.Index)
 	}
 
-	return nil
+	return logdbSnap.Index, nil
 }
 
 // chooseRecoverySnapshot reads the snapshot record and resolves the directory
@@ -3867,7 +3888,7 @@ func DecompressingSnapshotReader(r io.Reader, c config.CompressionType) (io.Read
 // uncompressed ones. Both describe the artifact next to it, so a directory
 // that outlives its LogDB record still says how to read itself.
 func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch uint64,
-	compression config.CompressionType) error {
+	compression config.CompressionType) (err error) {
 	// Stamp the integrity fields over the data file AS WRITTEN. This runs
 	// after the data file has been written, encrypted and fsynced, so the
 	// bytes hashed here are exactly the bytes every consumer will later read.
@@ -3884,6 +3905,13 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 	if err != nil {
 		return err
 	}
+	return writeSnapshotMetaFile(dir, index, term, shardID, replicaID, epoch, compression, dataHash, dataLen)
+}
+
+// writeSnapshotMetaFile writes and fsyncs the snapshot.meta record in dir
+// with integrity fields the caller already computed over snapshot.dat.
+func writeSnapshotMetaFile(dir string, index, term, shardID, replicaID, epoch uint64,
+	compression config.CompressionType, dataHash, dataLen uint64) (err error) {
 	metaPath := filepath.Join(dir, snapshotMetadataFile)
 	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -3902,13 +3930,11 @@ func writeSnapshotMetadata(dir string, index, term, shardID, replicaID, epoch ui
 		if closed {
 			return
 		}
+		// The close error joins the write error rather than being logged:
+		// this runs under the node's write lease, and no user slog.Handler
+		// may run under it.
 		if closeErr := f.Close(); closeErr != nil {
-			slog.Debug("snapshot: metadata file close failed after write error",
-				"path", metaPath,
-				"shard_id", shardID,
-				"replica_id", replicaID,
-				"error", closeErr,
-			)
+			err = errors.Join(err, fmt.Errorf("close snapshot metadata %s after write error: %w", metaPath, closeErr))
 		}
 	}()
 

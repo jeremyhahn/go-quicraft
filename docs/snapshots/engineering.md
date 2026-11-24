@@ -40,7 +40,7 @@ func WithImportMemberIdentities(identities map[uint64]string) ImportOption
 
 // Re-encryption (barrier migration)
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-    srcBarrier, dstBarrier Barrier) (uint64, error)
+    srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error)
 ```
 
 From the internal engine package, named because they fix the on-disk format:
@@ -188,6 +188,7 @@ workers, so a large save or recovery cannot stall step, commit or apply.
 | `*SnapshotSendError` / `*SnapshotReceiveError` | the transfer failed | yes |
 | `*SnapshotArtifactError` | an export artifact is malformed or fails verification: bad header, missing or malformed trailer, or a payload that does not match its trailer (which also matches `ErrSnapshotCorrupt`) | yes |
 | `*SnapshotOptionError` (`ErrInvalidSnapshotOption`) | `SnapshotOption.Validate` rejected the request | yes |
+| `*SnapshotDestinationError` | a re-encryption destination already holds `snapshot.dat` (`fs.ErrExist`), cannot be looked up, or the source or destination path is not in clean form (`fs.ErrInvalid`); refused before anything is written | yes |
 | `*SnapshotCommittedNotDurableError` | see below | partially; read this one |
 | `*ImportSnapshotDirExistsError` | the import destination directory already exists | yes |
 | `*ImportSnapshotOutOfDateError` | the imported snapshot is older than what the replica holds | yes |
@@ -204,11 +205,13 @@ committed but not yet durable: the rename succeeded, so `dstPath` already holds
 the migrated artifact sealed at `Epoch`, and only the directory fsync that makes
 the rename survive a crash failed.
 
-It exists because the `(epoch, error)` pair `ReencryptSnapshotFile` returns
-cannot carry this case on its own: the usual `if err != nil { return 0, err }`
-drops exactly the epoch it delivers.
+It exists because the `(epoch, fileSize, err)` triple `ReencryptSnapshotFile`
+returns cannot carry this case on its own: the usual
+`if err != nil { return 0, 0, err }` drops exactly the epoch and size it
+delivers.
 
-**A caller that gets this error must record `Epoch`.** Dropping it lets the next
+**A caller that gets this error must record `Epoch`**, and the `fileSize`
+returned beside it as the record's `FileSize`. Dropping the epoch lets the next
 DEK purge orphan the artifact's key, and the artifact can then never be opened.
 Treat the migration as unverified until the destination is checked again.
 
@@ -368,10 +371,15 @@ running restore; the restore is handed the node's stop channel and should
 return promptly once it closes. A node that has already stopped refuses the
 lease, and its recovery never touches the state machine.
 
-A save takes no lease, so `UnloadNode` does not wait for a snapshot save to
-finish. That is deliberate. A save only reads the state machine, and it can
-stream for a long time after its capture point, so it should not hold up a
-shard stop. The state machine adapter covers the save instead: the stream
+A save holds no lease while it streams, so `UnloadNode` does not wait for a
+snapshot save to finish. That is deliberate. A save only reads the state
+machine, and it can stream for a long time after its capture point, so it
+should not hold up a shard stop. It takes the node's write lease only briefly,
+for each step that writes into the replica's snapshot tree: creating its
+`.save-*` stage, writing `snapshot.meta`, and the rename that publishes it. A
+node that has stopped refuses the lease and the save returns `ErrStopped`, so
+once `UnloadNode` returns no save can create or publish anything in a tree a
+later `RemoveData` deletes. The state machine adapter covers the save instead: the stream
 holds `streamGuard` until it ends, so `Close` waits for it, and a save that
 starts after `Close` returns `ErrClosed` (see
 [state-machines/engineering.md](../state-machines/engineering.md)).

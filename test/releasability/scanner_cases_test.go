@@ -30,7 +30,7 @@ const (
 	plantedAddress   = "198.51.100.51"        // lab-string-ok: planted fixture for the lab-address rule
 	plantedGPUHost   = "gpu-host"             // lab-string-ok: planted fixture for the lab-host rule
 	plantedBenchHost = "bench-node-1"         // lab-string-ok: planted fixture for the lab-host rule
-	plantedRunner    = "ci-node-2"            // lab-string-ok: planted fixture for the lab-host rule
+	plantedRunner    = "ci-node-7"            // lab-string-ok: planted fixture for the lab-host rule
 	plantedAgent     = "vm-host-4"            // lab-string-ok: planted fixture for the lab-host rule
 	plantedHome      = plantedMount + "/home" // lab-string-ok: planted fixture for the owner-path rule, a home under the lab mount
 	plantedMount     = "/mnt/vm-host"         // lab-string-ok: planted fixture for the owner-path rule

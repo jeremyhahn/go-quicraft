@@ -230,6 +230,10 @@ type StateMachine struct {
 	// which is exactly the choice the tiers exist to offer.
 	readGuard sync.RWMutex
 
+	// readWait registers context-aware readers waiting for readGuard, so
+	// lockApply yields to them and unlockApply wakes them (rlockContext).
+	readWait readWaitQueue
+
 	// applyMu serializes everything that owns the apply stream's state: Apply,
 	// the capture phase of SaveSnapshotGated, and RecoverFromSnapshot. That
 	// state is the session manager (not safe for concurrent use), the session
@@ -500,6 +504,13 @@ func (s *StateMachine) IsOnDisk() bool {
 // always agree on the mode.
 func (s *StateMachine) lockApply() {
 	if s.smType == SMTypeRegular {
+		// Readers registered in rlockContext go first: without this a
+		// continuous Update stream keeps a writer pending at every instant
+		// and a context-aware reader never gets the guard. The wait covers
+		// only the readers already registered, so it is bounded.
+		if drained := s.readWait.pending(); drained != nil {
+			<-drained
+		}
 		s.readGuard.Lock()
 	} else {
 		s.readGuard.RLock()
@@ -512,6 +523,7 @@ func (s *StateMachine) unlockApply() {
 	s.applyMu.Unlock()
 	if s.smType == SMTypeRegular {
 		s.readGuard.Unlock()
+		s.readWait.signal()
 	} else {
 		s.readGuard.RUnlock()
 	}
@@ -1049,7 +1061,9 @@ func (s *StateMachine) applyBatch(entries []proto.Entry, results []sm.Result) er
 // comes back as a non-nil interface wrapping a zero-length slice, and stays
 // distinguishable from absence.
 func (s *StateMachine) Lookup(ctx context.Context, query interface{}) (interface{}, error) {
-	s.readGuard.RLock()
+	if err := s.rlockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer s.readGuard.RUnlock()
 	if s.closed {
 		return nil, ErrClosed
@@ -1116,6 +1130,14 @@ func (s *StateMachine) NALookup(key []byte) ([]byte, bool, error) {
 // Returns (nil, nopRelease, false, nil) when the SM supports neither
 // NALookupInto nor NALookup for []byte keys.
 func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), supported bool, err error) {
+	return s.NALookupBufContext(context.Background(), key)
+}
+
+// NALookupBufContext is NALookupBuf that stops waiting for the read guard
+// when ctx is done and returns ctx.Err(). An Update holds the guard for the
+// whole of the user SM's Update call, so without this a read whose caller
+// has given up stays parked behind it.
+func (s *StateMachine) NALookupBufContext(ctx context.Context, key []byte) (result []byte, release func(), supported bool, err error) {
 	// The read guard is held for the LOOKUP ONLY — never for the lifetime of
 	// the returned buffer. release() is called by APPLICATION code (the buffer
 	// is handed out through Host.SyncReadBuf/StaleReadBuf), so a caller that
@@ -1124,7 +1146,9 @@ func (s *StateMachine) NALookupBuf(key []byte) (result []byte, release func(), s
 	// shard queues behind it. Holding it that long is also unnecessary — the
 	// sm.NALookupInto contract requires implementations to COPY the value into
 	// dst, so the returned slice does not alias SM-owned memory.
-	s.readGuard.RLock()
+	if lockErr := s.rlockContext(ctx); lockErr != nil {
+		return nil, nopRelease, false, lockErr
+	}
 	if s.closed {
 		s.readGuard.RUnlock()
 		return nil, nopRelease, false, ErrClosed

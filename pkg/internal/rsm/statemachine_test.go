@@ -20,9 +20,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
@@ -2443,6 +2446,524 @@ func TestStateMachine_NALookupBuf_NotSupported(t *testing.T) {
 		t.Errorf("NALookupBuf result = %v, want nil", result)
 	}
 	release() // must be safe to call even when not supported
+}
+
+// TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine holds the
+// read guard for writing, as a stalled Update does, cancels 100 contended
+// Lookups and requires the goroutine count to return to its baseline while
+// the guard is still held: an abandoned read must leave nothing behind.
+func TestStateMachine_RLockContext_CancelledLookupsLeaveNoGoroutine(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	rsm.readGuard.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			rsm.readGuard.Unlock()
+		}
+	}()
+	baseline := runtime.NumGoroutine()
+
+	const readers = 100
+	ctx, cancel := context.WithCancel(context.Background())
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			_, lookupErr := rsm.Lookup(ctx, "key")
+			errs <- lookupErr
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < readers; i++ {
+		select {
+		case lookupErr := <-errs:
+			if !errors.Is(lookupErr, context.Canceled) {
+				t.Fatalf("Lookup = %v, want context.Canceled", lookupErr)
+			}
+		case <-deadline:
+			t.Fatalf("only %d of %d cancelled Lookups returned within 2s", i, readers)
+		}
+	}
+
+	settle := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baseline && time.Now().Before(settle) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > baseline {
+		t.Fatalf("goroutines = %d with the guard still held, baseline %d: cancelled reads left waiters", n, baseline)
+	}
+
+	rsm.readGuard.Unlock()
+	locked = false
+	if _, lookupErr := rsm.Lookup(context.Background(), "key"); lookupErr != nil {
+		t.Fatalf("Lookup after release = %v", lookupErr)
+	}
+}
+
+// newNALookupIntoStateMachine builds a StateMachine over an SM that
+// implements NALookupInto, holding "key" = "val".
+func newNALookupIntoStateMachine(t *testing.T) *StateMachine {
+	t.Helper()
+	kv := &testNALookupIntoSM{testHasherSM: testHasherSM{testKV: testKV{data: map[string]string{"key": "val"}}}}
+	createFn := func(shardID, replicaID uint64) interface{} {
+		return kv
+	}
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	t.Cleanup(func() { rsm.Close() })
+	return rsm
+}
+
+// TestStateMachine_NALookupBufContext_CancelledWhileGuardHeldLeavesNoWaiter
+// pins that NALookupBufContext, queued behind an apply holding the guard,
+// returns the context's error when the context is cancelled, and leaves no
+// goroutine and no registered waiter behind.
+func TestStateMachine_NALookupBufContext_CancelledWhileGuardHeldLeavesNoWaiter(t *testing.T) {
+	rsm := newNALookupIntoStateMachine(t)
+
+	rsm.readGuard.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			rsm.readGuard.Unlock()
+		}
+	}()
+	baseline := runtime.NumGoroutine()
+
+	const readers = 100
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type outcome struct {
+		result    []byte
+		release   func()
+		supported bool
+		err       error
+	}
+	outs := make(chan outcome, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+			outs <- outcome{r, rel, ok, lookupErr}
+		}()
+	}
+	queued := time.Now().Add(2 * time.Second)
+	for rsm.readWait.waiters.Load() < readers && time.Now().Before(queued) {
+		time.Sleep(time.Millisecond)
+	}
+	if n := rsm.readWait.waiters.Load(); n != readers {
+		t.Fatalf("queued waiters = %d, want %d", n, readers)
+	}
+	cancel()
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < readers; i++ {
+		select {
+		case o := <-outs:
+			if !errors.Is(o.err, context.Canceled) {
+				t.Fatalf("NALookupBufContext err = %v, want context.Canceled", o.err)
+			}
+			if o.result != nil || o.supported {
+				t.Fatalf("NALookupBufContext = (%q, supported=%v), want (nil, false) on cancel", o.result, o.supported)
+			}
+			if o.release == nil {
+				t.Fatal("NALookupBufContext returned a nil release on cancel")
+			}
+			o.release()
+		case <-deadline:
+			t.Fatalf("only %d of %d cancelled NALookupBufContext calls returned within 2s", i, readers)
+		}
+	}
+
+	if n := rsm.readWait.waiters.Load(); n != 0 {
+		t.Fatalf("queued waiters = %d after every cancelled read returned, want 0", n)
+	}
+	settle := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baseline && time.Now().Before(settle) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > baseline {
+		t.Fatalf("goroutines = %d with the guard still held, baseline %d: cancelled reads left waiters", n, baseline)
+	}
+
+	rsm.readGuard.Unlock()
+	locked = false
+	r, rel, ok, lookupErr := rsm.NALookupBufContext(context.Background(), []byte("key"))
+	if lookupErr != nil || !ok || string(r) != "val" {
+		t.Fatalf("NALookupBufContext after release = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+	}
+	rel()
+}
+
+// TestStateMachine_NALookupBufContext_LiveContextFreeGuardReturnsResult pins
+// that NALookupBufContext with a live cancellable context and a free guard
+// returns the state machine's result, on both the NALookupInto path and the
+// NALookup fallback.
+func TestStateMachine_NALookupBufContext_LiveContextFreeGuardReturnsResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Run("NALookupInto", func(t *testing.T) {
+		rsm := newNALookupIntoStateMachine(t)
+		r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+		if lookupErr != nil || !ok || string(r) != "val" {
+			t.Fatalf("NALookupBufContext = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+		}
+		rel()
+	})
+	t.Run("NALookupFallback", func(t *testing.T) {
+		kv := &testHasherSM{testKV: testKV{data: map[string]string{"key": "val"}}}
+		createFn := func(shardID, replicaID uint64) interface{} {
+			return kv
+		}
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+		if err != nil {
+			t.Fatalf("NewStateMachine = %v", err)
+		}
+		defer rsm.Close()
+		r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+		if lookupErr != nil || !ok || string(r) != "val" {
+			t.Fatalf("NALookupBufContext = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+		}
+		rel()
+	})
+	if n := ctx.Err(); n != nil {
+		t.Fatalf("ctx.Err() = %v, want the context still live", n)
+	}
+}
+
+// TestStateMachine_PreCancelledContextFreeGuard_RunsLookup pins today's
+// behavior for a context that is already cancelled when the guard is free:
+// rlockContext's fast path takes the guard before it looks at the context,
+// so Lookup and NALookupBufContext run the lookup and return its result with
+// no error. Only a read that has to queue observes the cancellation.
+func TestStateMachine_PreCancelledContextFreeGuard_RunsLookup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("Lookup", func(t *testing.T) {
+		createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+			kv := newTestKV()
+			kv.data["key"] = "val"
+			return kv
+		})
+		rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+		if err != nil {
+			t.Fatalf("NewStateMachine = %v", err)
+		}
+		defer rsm.Close()
+		got, lookupErr := rsm.Lookup(ctx, "key")
+		if lookupErr != nil {
+			t.Fatalf("Lookup(cancelled ctx, free guard) err = %v, want nil", lookupErr)
+		}
+		if got != "val" {
+			t.Fatalf("Lookup(cancelled ctx, free guard) = %v, want val", got)
+		}
+		if n := rsm.readWait.waiters.Load(); n != 0 {
+			t.Fatalf("queued waiters = %d, want 0", n)
+		}
+	})
+	t.Run("NALookupBufContext", func(t *testing.T) {
+		rsm := newNALookupIntoStateMachine(t)
+		r, rel, ok, lookupErr := rsm.NALookupBufContext(ctx, []byte("key"))
+		if lookupErr != nil || !ok || string(r) != "val" {
+			t.Fatalf("NALookupBufContext(cancelled ctx, free guard) = (%q, supported=%v, %v), want (val, true, nil)", r, ok, lookupErr)
+		}
+		rel()
+		if n := rsm.readWait.waiters.Load(); n != 0 {
+			t.Fatalf("queued waiters = %d, want 0", n)
+		}
+	})
+}
+
+// TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate holds a
+// writer on the read guard at every instant (several goroutines loop on
+// lockApply/unlockApply, as a continuous Update stream does) and requires a
+// Lookup whose context can only be cancelled, never times out, to complete.
+// A TryRLock poll fails whenever a writer is pending, so it starves here; a
+// fair acquisition gets the read guard between two Updates.
+func TestStateMachine_RLockContext_NoStarvationUnderContinuousUpdate(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	// held is true while a writer (the gate or a writer goroutine) holds
+	// the guard. Every read starts only while it is true, so each Lookup
+	// contends with a writer instead of only the first: a reader that has
+	// the guard cannot run its remaining reads on the fast path before a
+	// writer is scheduled, whatever GOMAXPROCS is.
+	var held atomic.Bool
+
+	ctx, cancel := context.WithCancel(context.Background())
+	const reads = 200
+	var completed atomic.Int64
+	done := make(chan error, 1)
+	stop := make(chan struct{})
+	var writers sync.WaitGroup
+	readerJoined := false
+
+	// Gate: the test holds the guard as the initial writer, so the reader
+	// cannot finish its reads before the writer stream starts.
+	rsm.lockApply()
+	held.Store(true)
+	gated := true
+	// One ordered cleanup, whatever line fails: release the gate and cancel
+	// the reader first, so blocked writers can pass lockApply and the reader
+	// can return, and only then join the writers and the reader. Joining the
+	// writers while the gate is still held would hang the package.
+	defer func() {
+		if gated {
+			held.Store(false)
+			rsm.unlockApply()
+		}
+		cancel()
+		close(stop)
+		writers.Wait()
+		if !readerJoined {
+			<-done
+		}
+	}()
+
+	go func() {
+		for i := 0; i < reads; i++ {
+			for !held.Load() {
+				if ctx.Err() != nil {
+					done <- ctx.Err()
+					return
+				}
+				runtime.Gosched()
+			}
+			if _, lookupErr := rsm.Lookup(ctx, "key"); lookupErr != nil {
+				done <- lookupErr
+				return
+			}
+			completed.Add(1)
+		}
+		done <- nil
+	}()
+	waitFor(t, 2*time.Second, "the reader to register in readWait", func() bool {
+		return rsm.readWait.waiters.Load() > 0
+	})
+
+	var entered, cycles atomic.Int64
+	const writerCount = 4
+	for i := 0; i < writerCount; i++ {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				entered.Add(1)
+				rsm.lockApply()
+				held.Store(true)
+				time.Sleep(2 * time.Millisecond)
+				held.Store(false)
+				rsm.unlockApply()
+				cycles.Add(1)
+			}
+		}()
+	}
+	// Contention: every writer is queued behind the gate (or the registered
+	// reader) and the reader is still waiting.
+	waitFor(t, 2*time.Second, "every writer to enter lockApply", func() bool {
+		return entered.Load() >= writerCount
+	})
+	time.Sleep(10 * time.Millisecond)
+	if n := completed.Load(); n != 0 {
+		t.Fatalf("%d reads completed while the gate was held", n)
+	}
+	if n := cycles.Load(); n != 0 {
+		t.Fatalf("%d writer cycles completed while the gate was held", n)
+	}
+
+	cyclesAtRelease := cycles.Load()
+	gated = false
+	held.Store(false)
+	rsm.unlockApply()
+	select {
+	case lookupErr := <-done:
+		readerJoined = true
+		if lookupErr != nil {
+			t.Fatalf("Lookup under continuous Update = %v", lookupErr)
+		}
+	case <-time.After(10 * time.Second):
+		cancel()
+		<-done
+		readerJoined = true
+		t.Fatalf("%d of %d cancel-only Lookups completed within 10s under a continuous Update stream: read starvation", completed.Load(), reads)
+	}
+	// Each read waits for a held guard, so it outlasts a writer cycle of
+	// its own whatever the scheduler does. With the handoff the woken reader
+	// goes before the writers that have not yet passed lockApply's drain
+	// (measured 476-497 cycles for 200 reads, GOMAXPROCS 1 and 4). Without
+	// it the reads starve: none of the measured runs finished 200 reads
+	// within the 10s timeout. A cycle-count bound, unlike a wall-clock one,
+	// holds on a slow runner.
+	n := cycles.Load() - cyclesAtRelease
+	if limit := int64(4 * reads); n > limit {
+		t.Fatalf("%d writer cycles ran while %d reads completed, want at most %d: readers are not handed the guard between Updates", n, reads, limit)
+	}
+}
+
+// waitFor polls cond until it holds or timeout passes.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for %s", timeout, what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// flagCancelCtx reports cancellation through Err only: its Done channel never
+// closes, so a reader parked in rlockContext can wake solely through the
+// readWait signal, the schedule in which a cancelled reader resumes after the
+// guard was released.
+type flagCancelCtx struct {
+	context.Context
+	done      chan struct{}
+	cancelled atomic.Bool
+}
+
+func (c *flagCancelCtx) Done() <-chan struct{} { return c.done }
+
+func (c *flagCancelCtx) Err() error {
+	if c.cancelled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// TestStateMachine_RLockContext_CancelThenUnlockBeforeResume covers a queued
+// reader whose context is cancelled and whose writer releases the guard
+// before the reader resumes: the reader must return ctx.Err() and must not
+// run the lookup or keep the guard.
+func TestStateMachine_RLockContext_CancelThenUnlockBeforeResume(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	rsm.lockApply()
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(rsm.unlockApply) }
+	ctx := &flagCancelCtx{Context: context.Background(), done: make(chan struct{})}
+	errs := make(chan error, 1)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		_, lookupErr := rsm.Lookup(ctx, "key")
+		errs <- lookupErr
+	}()
+	// Runs before the deferred Close (defers are LIFO): a failed line must
+	// not leave the guard held or the reader parked, or Close blocks on the
+	// guard forever. The guard is released exactly once, then the reader is
+	// cancelled through Done and joined.
+	defer func() {
+		unlock()
+		ctx.cancelled.Store(true)
+		close(ctx.done)
+		<-readerDone
+	}()
+	waitFor(t, 2*time.Second, "the reader to register in readWait", func() bool {
+		return rsm.readWait.waiters.Load() > 0
+	})
+	ctx.cancelled.Store(true)
+	unlock()
+
+	select {
+	case lookupErr := <-errs:
+		if !errors.Is(lookupErr, context.Canceled) {
+			t.Fatalf("Lookup after cancel then unlock = %v, want context.Canceled", lookupErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup did not return within 2s after cancel then unlock")
+	}
+	// The cancelled reader released the guard: a writer takes it at once.
+	if !rsm.readGuard.TryLock() {
+		t.Fatal("read guard still held after the cancelled reader returned")
+	}
+	rsm.readGuard.Unlock()
+}
+
+// TestStateMachine_RLockContext_NoDoneContextDoesNotQueue pins rlockContext's
+// branch for a context that can never be cancelled (Done() == nil): the read
+// blocks on the guard without registering in readWait, so lockApply never
+// waits for it to drain, and it completes once the apply releases the guard.
+func TestStateMachine_RLockContext_NoDoneContextDoesNotQueue(t *testing.T) {
+	createFn := sm.NewCreateFunc(func(shardID, replicaID uint64) sm.StateMachine {
+		return newTestKV()
+	})
+	rsm, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, false)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer rsm.Close()
+
+	rsm.lockApply()
+	var unlockOnce sync.Once
+	unlock := func() { unlockOnce.Do(rsm.unlockApply) }
+	errs := make(chan error, 1)
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		_, lookupErr := rsm.Lookup(context.Background(), "key")
+		errs <- lookupErr
+	}()
+	// Runs before the deferred Close: the guard is released and the reader
+	// joined even when a line below fails.
+	defer func() {
+		unlock()
+		<-readerDone
+	}()
+
+	// The reader is blocked on the guard; give it time to (wrongly) register.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case lookupErr := <-errs:
+		t.Fatalf("Lookup returned %v while the apply held the guard", lookupErr)
+	default:
+	}
+	if n := rsm.readWait.waiters.Load(); n != 0 {
+		t.Fatalf("a Background-context reader registered in readWait: waiters = %d", n)
+	}
+	if d := rsm.readWait.pending(); d != nil {
+		t.Fatal("readWait.pending() is non-nil for a reader that cannot be cancelled")
+	}
+	unlock()
+
+	select {
+	case lookupErr := <-errs:
+		if lookupErr != nil {
+			t.Fatalf("Lookup after the apply released the guard = %v, want nil", lookupErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Lookup did not return within 2s after the apply released the guard")
+	}
 }
 
 func TestStateMachine_NALookupBuf_ErrorPropagated(t *testing.T) {

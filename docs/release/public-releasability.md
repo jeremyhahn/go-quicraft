@@ -142,8 +142,13 @@ Preferred: an inline waiver, in the file's own comment syntax, on the
 offending line or the line immediately above it:
 
 ```markdown
-Two profiles are tracked long-term: `<host>` (single-socket, <!-- lab-string-ok: benchmark provenance -->
+The lab-host rule matches names of the form `<prefix>-node-<n>`. <!-- lab-string-ok: documents the rule's own pattern -->
 ```
+
+A waiver never covers a real machine name. Benchmark profiles are named by
+role (`bench-01`, `bench-02`), and the host label and hardware class in a
+profile's `env.json` are inputs to the capture, not the machine's own
+hostname (see [the performance README](../../test/performance/README.md)).
 
 ```go
 expr: regexp.MustCompile(`...`), // lab-string-ok: the hostname this rule exists to find

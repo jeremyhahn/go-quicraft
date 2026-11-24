@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"log/slog"
 	"runtime"
 	"sync"
@@ -1024,9 +1025,27 @@ func (h hostileHandler) WithGroup(string) slog.Handler      { return h }
 // ends.
 func installHostileLogger(t *testing.T, act func()) {
 	t.Helper()
+	installDefaultSlogHandler(t, hostileHandler{act: act})
+}
+
+// installDefaultSlogHandler makes h the default slog handler for the rest of
+// the test. slog.SetDefault with a custom handler also redirects the log
+// package's output into that handler, and restoring the original default (a
+// *defaultHandler) does NOT undo the redirect: the default handler writes
+// through the log package, so every later slog or log call in the package
+// would still reach h. The cleanup restores the log package's writer, flags
+// and prefix too.
+func installDefaultSlogHandler(t *testing.T, h slog.Handler) {
+	t.Helper()
 	prev := slog.Default()
-	slog.SetDefault(slog.New(hostileHandler{act: act}))
-	t.Cleanup(func() { slog.SetDefault(prev) })
+	prevW, prevFlags, prevPrefix := log.Writer(), log.Flags(), log.Prefix()
+	slog.SetDefault(slog.New(h))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevW)
+		log.SetFlags(prevFlags)
+		log.SetPrefix(prevPrefix)
+	})
 }
 
 // hostileExits are the two ways a slog handler can leave its caller.
@@ -1260,7 +1279,7 @@ func TestEngine_CommitWorkerPanic_ClearsOnlyBatchCommitPending(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// SetSender and SetCallback after Start panics
+// Commit-worker panic recovery
 // ---------------------------------------------------------------------------
 
 // TestEngine_RunCommitWorkerOnce_PanicDrainsAndClearsBatch verifies the

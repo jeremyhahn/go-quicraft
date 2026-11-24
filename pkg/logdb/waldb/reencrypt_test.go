@@ -480,6 +480,114 @@ func TestReencrypt_SnapshotHookRecordsDstEpoch(t *testing.T) {
 	}
 }
 
+// TestReencrypt_SnapshotHookRecordsDstFileSize verifies that a migration whose
+// re-encryption changes the data file's length (plaintext to sealed, sealed to
+// plaintext, or a different nonce size) records the DESTINATION length, not the
+// source's. The host checks the LogDB FileSize against snapshot.dat on
+// StartShard, so a stale source length makes the migrated shard fail to start.
+func TestReencrypt_SnapshotHookRecordsDstFileSize(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	noneBarrier := newNoneBarrier(t)
+	keyedBarrier := newTestBarrier(t)
+
+	src := openWALAt(t, srcDir, noneBarrier)
+	writeSampleState(t, src, 3, 1, 5)
+	const srcSize = uint64(1000)
+	if err := src.SaveSnapshot(3, 1, logdb.Snapshot{
+		Index: 4, Term: 1, Filepath: "/snapshots/3-1-4", FileSize: srcSize,
+		Membership: logdb.Membership{Addresses: map[uint64]string{1: "127.0.0.1:1"}},
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatalf("close src: %v", err)
+	}
+
+	const wantEpoch, wantSize = uint64(42), uint64(1064)
+	called := 0
+	if _, err := ReencryptSized(srcDir, noneBarrier, dstDir, keyedBarrier,
+		func(shard, replica uint64, snap logdb.Snapshot) (uint64, uint64, error) {
+			called++
+			if shard != 3 || replica != 1 || snap.FileSize != srcSize {
+				t.Errorf("hook got (%d,%d,size %d), want (3,1,size %d)", shard, replica, snap.FileSize, srcSize)
+			}
+			return wantEpoch, wantSize, nil
+		}); err != nil {
+		t.Fatalf("ReencryptSized: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("snapshot hook called %d times, want 1", called)
+	}
+
+	dst := openWALAt(t, dstDir, keyedBarrier)
+	defer dst.Close()
+	snap, err := dst.GetSnapshot(3, 1)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snap.Epoch != wantEpoch || snap.FileSize != wantSize {
+		t.Fatalf("migrated snapshot (epoch %d, size %d), want (%d, %d): the destination record must describe the re-encrypted file",
+			snap.Epoch, snap.FileSize, wantEpoch, wantSize)
+	}
+	if snap.Index != 4 || snap.Filepath != "/snapshots/3-1-4" {
+		t.Fatalf("migrated snapshot (index %d, path %q), want (4, /snapshots/3-1-4)", snap.Index, snap.Filepath)
+	}
+}
+
+// TestReencrypt_LegacyHookCarriesSourceFileSize pins the legacy Reencrypt
+// wrapper: its hook reports only an epoch, so the migrated snapshot record
+// takes that epoch and keeps the source FileSize unchanged.
+func TestReencrypt_LegacyHookCarriesSourceFileSize(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	noneBarrier := newNoneBarrier(t)
+	keyedBarrier := newTestBarrier(t)
+
+	src := openWALAt(t, srcDir, noneBarrier)
+	writeSampleState(t, src, 3, 1, 5)
+	const srcSize = uint64(1000)
+	if err := src.SaveSnapshot(3, 1, logdb.Snapshot{
+		Index: 4, Term: 1, Filepath: "/snapshots/3-1-4", FileSize: srcSize,
+		Membership: logdb.Membership{Addresses: map[uint64]string{1: "127.0.0.1:1"}},
+	}); err != nil {
+		t.Fatalf("SaveSnapshot: %v", err)
+	}
+	if err := src.Close(); err != nil {
+		t.Fatalf("close src: %v", err)
+	}
+
+	const wantEpoch = uint64(42)
+	called := 0
+	if _, err := Reencrypt(srcDir, noneBarrier, dstDir, keyedBarrier,
+		func(shard, replica uint64, snap logdb.Snapshot) (uint64, error) {
+			called++
+			if shard != 3 || replica != 1 || snap.FileSize != srcSize {
+				t.Errorf("hook got (%d,%d,size %d), want (3,1,size %d)", shard, replica, snap.FileSize, srcSize)
+			}
+			return wantEpoch, nil
+		}); err != nil {
+		t.Fatalf("Reencrypt: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("snapshot hook called %d times, want 1", called)
+	}
+
+	dst := openWALAt(t, dstDir, keyedBarrier)
+	defer dst.Close()
+	snap, err := dst.GetSnapshot(3, 1)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	if snap.Epoch != wantEpoch || snap.FileSize != srcSize {
+		t.Fatalf("migrated snapshot (epoch %d, size %d), want (%d, %d): the legacy hook reports no length, so the source FileSize must carry",
+			snap.Epoch, snap.FileSize, wantEpoch, srcSize)
+	}
+	if snap.Index != 4 || snap.Filepath != "/snapshots/3-1-4" {
+		t.Fatalf("migrated snapshot (index %d, path %q), want (4, /snapshots/3-1-4)", snap.Index, snap.Filepath)
+	}
+}
+
 // TestReencrypt_PreservesBootstrapDataDir verifies a migration copies each
 // bootstrap record's DataDir as the source recorded it: an explicit DataDir,
 // and an explicit EMPTY one ("this shard roots its tree under the host's

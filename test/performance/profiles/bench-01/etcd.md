@@ -12,7 +12,7 @@
 | Specs captured | 2026-10-04T20:00:07Z |
 | QuicRaft run | 2026-10-04T20:00:25Z (version 0.17.0) |
 | Etcd run | 2026-10-04T20:22:14Z (version v3.7.0) |
-| Document generated | 2026-10-04 20:57:58 UTC |
+| Document generated | 2026-11-22 12:58:28 UTC |
 
 Numbers below were measured on this profile's machine only. Nothing here is
 comparable with a number from another profile; do not compute a ratio across two.

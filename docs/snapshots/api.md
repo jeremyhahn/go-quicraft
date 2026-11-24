@@ -91,7 +91,7 @@ func WithImportMemberIdentities(identities map[uint64]string) ImportOption
 |---|---|
 | Request | the shard, a reader, and optionally the shard's data directory, a replacement membership, and node identities for the resulting membership |
 | Response | none |
-| Errors | `*SnapshotArtifactError` (also `ErrSnapshotCorrupt` on a length or hash mismatch), `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `*ReplicaRetiredError`, `ErrSnapshotBarrierSealed`. Before anything is read: `ErrInvalidOperation` (the shard is running on this host, or this host holds data for more than one of its replicas), `ErrShardNotFound` (no replica of the shard on this host), `ErrDiskFull`, `ErrClosed`, `ErrCanceled` / `ErrTimeout` |
+| Errors | `*SnapshotArtifactError` (also `ErrSnapshotCorrupt` on a length or hash mismatch), `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`, `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`, `*ImportMembershipInvalidError`, `*ReplicaRetiredError`, `ErrSnapshotBarrierSealed`. Before anything is read: `ErrInvalidOperation` (the shard is running on this host, this host holds data for more than one of its replicas, or a `RemoveData` of the replica is pending: retry `RemoveData` to finish it), `ErrShardNotFound` (no replica of the shard on this host), `ErrDiskFull`, `ErrClosed`, `ErrCanceled` / `ErrTimeout` |
 | Permission | none in this library |
 
 **This rewrites the replica's membership.** It is an offline, deliberate
@@ -111,14 +111,14 @@ records as removed, is refused with `*ImportMembershipInvalidError`.
 
 ```go
 func ReencryptSnapshotFile(srcPath, dstPath string, shardID, replicaID, index uint64,
-    srcBarrier, dstBarrier Barrier) (uint64, error)
+    srcBarrier, dstBarrier Barrier) (epoch, fileSize uint64, err error)
 ```
 
 | | |
 |---|---|
 | Request | source and destination paths, the snapshot's identity, and both barriers |
-| Response | the destination's lowest at-rest epoch across the written frames. Record it as the migrated snapshot's `Epoch` so the DEK-purge floor protects every frame. `0` for an empty source or a plaintext destination. |
-| Errors | `ErrSnapshotBarrierSealed`, `ErrSnapshotCorrupt` (a source frame is malformed or fails authentication), `*SnapshotCommittedNotDurableError`, and the underlying I/O errors |
+| Response | the destination's lowest at-rest epoch across the written frames, and the destination data file's length. Record the epoch as the migrated snapshot's `Epoch` so the DEK-purge floor protects every frame (`0` for a plaintext destination), and `fileSize` as its `FileSize`: the length changes whenever the framing differs. A `waldb.ReencryptSized` hook returns both and the migrated record carries them. `*SnapshotCommittedNotDurableError` returns both too. |
+| Errors | `ErrSnapshotBarrierSealed`, `ErrSnapshotCorrupt` (a source frame is malformed or fails authentication), `*SnapshotDestinationError` (before anything is written: the destination already holds a `snapshot.dat`, matching `fs.ErrExist`, or the source or destination path is not in clean form, matching `fs.ErrInvalid`), `*SnapshotCommittedNotDurableError`, and the underlying I/O errors |
 | Permission | none in this library; the barriers' credentials are the authorization |
 
 The data streams through an in-memory pipe, so a large snapshot is never fully
@@ -147,7 +147,8 @@ type SnapshotCommittedNotDurableError struct {
 }
 ```
 
-The rename succeeded and only the directory fsync failed. **Record `Epoch`.**
+The rename succeeded and only the directory fsync failed. **Record `Epoch`,
+and the `fileSize` the call returned alongside the error.**
 The usual `if err != nil { return 0, err }` drops exactly the value this case
 delivers, and dropping it lets the next DEK purge orphan the artifact's key.
 
@@ -158,7 +159,7 @@ delivers, and dropping it lets the next DEK purge orphan the artifact's key.
 `ErrInvalidSnapshotOption`, and
 the typed errors `*SnapshotFailedError`, `*SnapshotTooLargeError`,
 `*SnapshotSendError`, `*SnapshotReceiveError`, `*SnapshotArtifactError`,
-`*SnapshotOptionError`, `*SnapshotCommittedNotDurableError`,
+`*SnapshotOptionError`, `*SnapshotDestinationError`, `*SnapshotCommittedNotDurableError`,
 `*ImportSnapshotDirExistsError`, `*ImportSnapshotOutOfDateError`,
 `*ImportDataDirMismatchError`, `*ImportLayoutUnknownError`,
 `*ImportMembershipInvalidError`, `*ReplicaRetiredError`.

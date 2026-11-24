@@ -101,7 +101,14 @@ func newRekeyRunbookHost(t *testing.T, walDir, nodeDir string, b *seal.Barrier) 
 	t.Helper()
 	cfg := testHostConfig(t)
 	cfg.WALDir, cfg.NodeHostDir = walDir, nodeDir
-	h, err := NewHost(cfg, WithoutTransport(), WithBarrier(b))
+	opts := []HostOption{WithoutTransport()}
+	if b != nil {
+		opts = append(opts, WithBarrier(b))
+	} else {
+		// A nil b is a plaintext Host, declared as such.
+		opts = append(opts, WithoutEncryption())
+	}
+	h, err := NewHost(cfg, opts...)
 	if err != nil {
 		t.Fatalf("NewHost: %v", err)
 	}
@@ -181,6 +188,21 @@ func assertReencryptLeftSource(t *testing.T, name string, before, after map[stri
 	}
 }
 
+// rekeyRunbookSnapFn is the runbook's snapshot hook: it re-encrypts each
+// snapshot data file under nodeDir into newNode at the same relative path,
+// from src to dst (a nil Barrier is a plaintext side), counting its calls.
+func rekeyRunbookSnapFn(nodeDir, newNode string, src, dst Barrier, calls *int) waldb.SnapshotReencryptSizedFunc {
+	return func(sid, rid uint64, snap logdb.Snapshot) (uint64, uint64, error) {
+		*calls++
+		rel, relErr := filepath.Rel(nodeDir, snap.Filepath)
+		if relErr != nil || strings.HasPrefix(rel, "..") {
+			return 0, 0, fmt.Errorf("snapshot %s is outside the node directory", snap.Filepath)
+		}
+		return ReencryptSnapshotFile(filepath.Join(snap.Filepath, "snapshot.dat"),
+			filepath.Join(newNode, rel, "snapshot.dat"), sid, rid, snap.Index, src, dst)
+	}
+}
+
 // TestRekeyRunbook_NewBarrierServesOldBarrierRefuses runs the documented
 // root-key compromise runbook (docs/seal-barrier/user.md, "Respond to a key
 // compromise") against a real Host: data written under barrier A, copied
@@ -243,16 +265,8 @@ func TestRekeyRunbook_NewBarrierServesOldBarrierRefuses(t *testing.T) {
 	// node directory at the same relative path.
 	copyTreeExceptSnapshotData(t, nodeDir, newNode)
 	var snapCalls int
-	snapFn := func(sid, rid uint64, snap logdb.Snapshot) (uint64, error) {
-		snapCalls++
-		rel, relErr := filepath.Rel(nodeDir, snap.Filepath)
-		if relErr != nil || strings.HasPrefix(rel, "..") {
-			return 0, fmt.Errorf("snapshot %s is outside the node directory", snap.Filepath)
-		}
-		return ReencryptSnapshotFile(filepath.Join(snap.Filepath, "snapshot.dat"),
-			filepath.Join(newNode, rel, "snapshot.dat"), sid, rid, snap.Index, barrierA, barrierB)
-	}
-	count, err := waldb.Reencrypt(walDir, barrierA, newWAL, barrierB, snapFn)
+	snapFn := rekeyRunbookSnapFn(nodeDir, newNode, barrierA, barrierB, &snapCalls)
+	count, err := waldb.ReencryptSized(walDir, barrierA, newWAL, barrierB, snapFn)
 	if err != nil {
 		t.Fatalf("waldb.Reencrypt: %v", err)
 	}
@@ -322,4 +336,89 @@ func TestRekeyRunbook_NewBarrierServesOldBarrierRefuses(t *testing.T) {
 	}
 	assertReencryptLeftSource(t, "original WALDir", walBefore, dirFingerprint(t, oldWAL))
 	assertReencryptLeftSource(t, "original NodeHostDir", nodeBefore, dirFingerprint(t, oldNode))
+}
+
+// TestRekeyRunbook_PlaintextToEncryptedSnapshotRestarts: a migration that
+// changes the snapshot data file's length (plaintext to encrypted adds frame
+// headers and AEAD tags) must record the DESTINATION length in the migrated
+// LogDB. snapshot.meta is restamped with it, so a LogDB record still carrying
+// the source length makes StartShard refuse the snapshot with
+// SnapshotSizeMismatchError after the directory swap.
+func TestRekeyRunbook_PlaintextToEncryptedSnapshotRestarts(t *testing.T) {
+	const shardID, replicaID uint64 = 1, 1
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	barrierB, strategyB := newRekeyRunbookBarrier(ctx, t, "rekey-runbook-plain-to-sealed")
+
+	root := t.TempDir()
+	walDir, nodeDir := filepath.Join(root, "wal"), filepath.Join(root, "node")
+	newWAL, newNode := filepath.Join(root, "wal.new"), filepath.Join(root, "node.new")
+	members := map[uint64]string{replicaID: "127.0.0.1:5000"}
+	var recoveries atomic.Int64
+	create := func(_, _ uint64) interface{} { return &rekeyRunbookSM{recoveries: &recoveries} }
+
+	// A plaintext Host proposes, snapshots, proposes more, closes.
+	var want []string
+	h := newRekeyRunbookHost(t, walDir, nodeDir, nil)
+	if err := h.StartShard(members, false, create, testShardConfig(shardID, replicaID)); err != nil {
+		mustCloseHost(t, h)
+		t.Fatalf("StartShard plaintext: %v", err)
+	}
+	waitForLeader(t, h, shardID)
+	propose := func(n int) {
+		for i := 0; i < n; i++ {
+			v := fmt.Sprintf("plain-value-%02d", len(want))
+			if _, err := h.SyncPropose(ctx, shardID, []byte(v)); err != nil {
+				mustCloseHost(t, h)
+				t.Fatalf("SyncPropose %q: %v", v, err)
+			}
+			want = append(want, v)
+		}
+	}
+	propose(5)
+	if _, err := h.SyncRequestSnapshot(ctx, shardID,
+		SnapshotOption{CompactionOverhead: 0, OverrideCompactionOverhead: true}); err != nil {
+		mustCloseHost(t, h)
+		t.Fatalf("SyncRequestSnapshot: %v", err)
+	}
+	propose(3)
+	mustCloseHost(t, h)
+
+	// Migrate plaintext -> barrier B and swap the result into place.
+	copyTreeExceptSnapshotData(t, nodeDir, newNode)
+	var snapCalls int
+	snapFn := rekeyRunbookSnapFn(nodeDir, newNode, nil, barrierB, &snapCalls)
+	if _, err := waldb.ReencryptSized(walDir, nil, newWAL, barrierB, snapFn); err != nil {
+		t.Fatalf("waldb.Reencrypt: %v", err)
+	}
+	if snapCalls == 0 {
+		t.Fatal("waldb.Reencrypt never called the snapshot function")
+	}
+	for _, mv := range [][2]string{{walDir, walDir + ".old"}, {nodeDir, nodeDir + ".old"}, {newWAL, walDir}, {newNode, nodeDir}} {
+		if err := os.Rename(mv[0], mv[1]); err != nil {
+			t.Fatalf("swap %s -> %s: %v", mv[0], mv[1], err)
+		}
+	}
+
+	// A Host on barrier B accepts the migrated snapshot and serves the data.
+	recoveries.Store(0)
+	h = newRekeyRunbookHost(t, walDir, nodeDir, barrierB)
+	if err := h.StartShard(members, false, create, testShardConfig(shardID, replicaID)); err != nil {
+		mustCloseHost(t, h)
+		t.Fatalf("StartShard on barrier B after a size-changing migration: %v", err)
+	}
+	waitForLeader(t, h, shardID)
+	got := syncReadRetry(ctx, t, h, shardID)
+	if err := h.StopShard(shardID); err != nil {
+		t.Errorf("StopShard: %v", err)
+	}
+	mustCloseHost(t, h)
+	unsealRekeyRunbookBarrier(ctx, t, barrierB, strategyB)
+	if recoveries.Load() == 0 {
+		t.Error("Host on barrier B never recovered from the migrated snapshot")
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("Host on barrier B read %q, want %q", got, want)
+	}
 }
