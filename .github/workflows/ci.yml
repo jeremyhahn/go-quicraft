@@ -722,7 +722,7 @@ jobs:
     # v1.52 (Tenant Agent order): a pull request from a fork (its head
     # repository is not this one) takes ubuntu-latest whatever the variable
     # holds; a fork never reaches a self-hosted runner.
-    runs-on: ${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
+    runs-on: ${{ github.server_url == 'https://github.com' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}   # v1.52
     # v1.26: a draft PR runs no CI; every job that needs this one skips with it.
     if: ${{ !github.event.pull_request.draft }}
     timeout-minutes: 10       # v1.34: the three jobs had 5 each
@@ -896,10 +896,7 @@ jobs:
       # v1.52 (Tenant Agent order, kept): on a pull request whose head
       # repository is not this repository (a fork, or a fork since deleted),
       # it makes no call and outputs the hosted default with a ::notice: a
-      # fork never reaches a self-hosted runner. An event the self-hosted
-      # runners' job-started hook refuses (anything but a push to main and a
-      # pull request: a schedule, a workflow_dispatch, a push of another
-      # branch) makes no call and outputs the hosted default with a ::notice.
+      # fork never reaches a self-hosted runner. Any event but a push to main or a pull request gets the hosted default.
       # Its tests:
       # test/buildgates/testdata/runner-select-tests.py.
       - name: Balanced runner pool (ruling 1137)
@@ -944,10 +941,7 @@ jobs:
                 exit 0
               fi ;;
           esac
-          # The self-hosted runners take a push to main and a same-repository
-          # pull request only; their job-started hook refuses every other event
-          # (a schedule, a workflow_dispatch, a push of another branch), so such
-          # a run takes the hosted default.
+          # The self-hosted runners refuse every event but a push to main and a pull request.
           case "$EVENT:$REF" in
             push:refs/heads/main | pull_request:*) ;;
             *)

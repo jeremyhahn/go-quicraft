@@ -61,7 +61,7 @@ var hostedOnlyWorkflows = []string{"ci.yml", "release.yml"}
 // selection step writes, hostedRunner unless it picks the self-hosted pool.
 // The preflight step `Runner labels (ruling 633)` checks what each can pick.
 const (
-	preflightRunsOn = `${{ github.server_url == 'https://github.com' && (!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
+	preflightRunsOn = `${{ github.server_url == 'https://github.com' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || '["self-hosted","linux","x64","bigdisk"]') || 'ubuntu-latest' }}`
 	dockerRunsOn    = `${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}`
 	gateRunsOn      = `${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner || '"ubuntu-latest"') || 'ci-gate' }}`
 )
@@ -277,7 +277,7 @@ func TestRunnerProblems(t *testing.T) {
 		{"another job's selection", ci("lint", gateRunsOn), "ci.yml job lint runs on an expression"},
 		{"preflight's expression on another job", ci("ci-gate", preflightRunsOn), "ci.yml job ci-gate runs on an expression"},
 		{"a selection with another overflow label", ci("image", strings.Replace(dockerRunsOn, "'bigdisk'", "'release'", 1)), "ci.yml job image runs on an expression"},
-		{"preflight's fork clause dropped", ci("preflight", strings.Replace(preflightRunsOn, "(!startsWith(github.event_name, 'pull_request') || github.event.pull_request.head.repo.full_name == github.repository) && ", "", 1)), "ci.yml job preflight runs on an expression"},
+		{"preflight's fork clause dropped", ci("preflight", strings.Replace(preflightRunsOn, "((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && ", "", 1)), "ci.yml job preflight runs on an expression"},
 		{"a waived selection", ci("lint", dockerRunsOn+"  "+selfHostedWaiver+"oversize: measured 40 GB of disk"), "ci.yml job lint carries a self-hosted waiver"},
 		{"a selection job put back on the hosted runner is allowed", ci("lint", hostedRunner), ""},
 		{"a hardware waiver is allowed", cr("scope", "bigdisk  "+selfHostedWaiver+"hardware: needs the attached device"), ""},

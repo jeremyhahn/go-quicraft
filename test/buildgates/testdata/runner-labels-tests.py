@@ -315,8 +315,9 @@ case("E7 another job's output is not the selection: (c)",
 PRE_V149 = ("${{ github.server_url == 'https://github.com' && fromJSON(vars.CI_PREFLIGHT_RUNS_ON || "
             "'[\"self-hosted\",\"linux\",\"x64\",\"bigdisk\"]') || 'ubuntu-latest' }}")
 # v1.52: the fork clause before the variable.
-PRE = PRE_V149.replace("&& fromJSON(vars.", "&& (!startsWith(github.event_name, 'pull_request') || "
-                       "github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.")
+PRE = PRE_V149.replace("&& fromJSON(vars.", "&& ((github.event_name == 'push' && github.ref == 'refs/heads/main') || "
+                       "(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) "
+                       "&& fromJSON(vars.")
 PRE_TEXT = (WORKFLOWS / "ci.yml").read_text()
 if PRE_TEXT.count(f"    runs-on: {PRE}   # v1.52\n") != 1:
     fatal("ci.yml's preflight runs-on is not the form part F tests, exactly once")
@@ -462,6 +463,27 @@ case("I3 signatures.yml: the same-repository exemption is code-review.yml's alon
 case("I4 code-review.yml: another self-hosted label for a same-repository head fails (c)",
      {"code-review.yml": wf(CR_ON, job(SAME.replace('"bigdisk"]', '"bigdisk-docker"]'), name="scope"))}, 1,
      ["code-review.yml:scope: (c)"])
+
+# J. preflight takes the Dells only where their hook runs a job: a push to main
+# and a same-repository pull request; with the variable unset every other event is hosted.
+def preflight_labels(event, ref, head):
+    ns = {}
+    exec(SCRIPT.split("\nfiles = sorted(", 1)[0], ns)
+    return ns["runs_on_labels"](PRE, event, ref, head, "unset")
+
+
+for label, event, ref, head, want in (
+        ("a push to main", "push", "refs/heads/main", "", ["self-hosted", "linux", "x64", "bigdisk"]),
+        ("a same-repository pull request", "pull_request", "refs/pull/1/merge", "o/r", ["self-hosted", "linux", "x64", "bigdisk"]),
+        ("a schedule", "schedule", "refs/heads/main", "", ["ubuntu-latest"]),
+        ("a workflow_dispatch on main", "workflow_dispatch", "refs/heads/main", "", ["ubuntu-latest"]),
+        ("a push of another branch", "push", "refs/heads/feature", "", ["ubuntu-latest"])):
+    got = preflight_labels(event, ref, head)
+    ok = got == want
+    print(f"{'PASS' if ok else 'FAIL'}: J1 preflight, CI_PREFLIGHT_RUNS_ON unset, {label}: {want}")
+    if not ok:
+        FAILS += 1
+        print(f"  got {got}")
 
 print(f"{'ALL PASS' if not FAILS else f'{FAILS} FAILED'}")
 sys.exit(1 if FAILS else 0)
