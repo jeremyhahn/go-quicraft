@@ -116,12 +116,26 @@ _integration-test:
 # Keep each command byte-identical to the matching step in ci.yml.
 # ============================================================================
 
+# mod-download fetches the module graph up front, up to three times, so one
+# transient proxy error does not fail the CI targets mid-test.
+.PHONY: mod-download
+mod-download:
+	@n=1; while :; do \
+	  rc=0; $(GO) mod download || rc=$$?; \
+	  [ $$rc -eq 0 ] && exit 0; \
+	  [ $$n -ge 3 ] && exit $$rc; \
+	  if [ $$n -eq 1 ]; then s=5; else s=15; fi; \
+	  n=$$((n + 1)); \
+	  echo "==> retry $$n/3: $(GO) mod download" >&2; \
+	  sleep $$s; \
+	done
+
 .PHONY: ci-test
-ci-test:
+ci-test: mod-download
 	$(GO) test -race -count=1 -timeout=900s ./...
 
 .PHONY: ci-integration
-ci-integration:
+ci-integration: mod-download
 	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
 
 # ============================================================================
