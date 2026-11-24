@@ -38,6 +38,22 @@ func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []find
 		lookups = append(lookups, fmt.Errorf("deps-bump: FAILED: the latest version of %d module(s) in %s could not be looked up; go.mod left unchanged", len(lookups), dir))
 		return errors.Join(lookups...)
 	}
+	// A module that replaces a module bumped earlier in this run with a
+	// local directory (contrib/dragonboat and test/performance/quicraft
+	// replace the root) has a stale go.mod until it is tidied: the root's
+	// raised requirements raise its floors, and listing its packages for
+	// the scan fails with "updates to go.mod needed". It is tidied first,
+	// then scanned and planned like any module. deps-check does not tidy,
+	// so a stale go.mod there still fails.
+	upstream, err := localUpstreamMoved(dir)
+	if err != nil {
+		return err
+	}
+	if upstream {
+		if err := edit.Tidy(dir); err != nil {
+			return err
+		}
+	}
 	// deps-check fails a vulnerable version of any required module, direct
 	// or // indirect, so the bump plans each one with a fixed version too:
 	// to the highest fixed version, or to latest when that is higher.
@@ -99,15 +115,13 @@ func bumpModule(edit moduleEditor, scan vulnScanner, dir string, findings []find
 			return err
 		}
 	}
-	// A module that replaces a module bumped earlier in this run with a
-	// local directory (contrib/dragonboat and test/performance/quicraft
-	// replace the root) has no bump of its own, but the root's raised
-	// requirements raise its floors: it is tidied too.
+	// A module with no move of its own is done: tidied above when its
+	// local upstream moved, untouched otherwise.
 	if !moved {
-		upstream, err := localUpstreamMoved(dir)
-		if err != nil || !upstream {
-			return err
+		if upstream {
+			markMoved(dir)
 		}
+		return nil
 	}
 	if err := edit.Tidy(dir); err != nil {
 		return err

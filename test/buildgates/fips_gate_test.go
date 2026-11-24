@@ -49,9 +49,9 @@ import (
 var (
 	makefilePath = filepath.Join("..", "..", "Makefile")
 
-	// The FIPS job runs in ci.yml's full tier (#293): every event but a pull
-	// request (push to main, nightly, dispatch), and a PR labelled `ci:full`. CI Gate
-	// checks it whenever that tier runs.
+	// The FIPS job runs in ci.yml's full tier (#293; ci-template v1.41): every
+	// event, a non-draft pull request included, but a refused dispatch; a
+	// docs-only PR skips it. CI Gate checks it as `code`.
 	fipsWorkflow = filepath.Join("..", "..", ".github", "workflows", "ci.yml")
 
 	// fipsModePattern captures the GODEBUG=fips140 mode as a WHOLE WORD. The
