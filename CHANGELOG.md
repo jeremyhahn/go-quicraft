@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-11-25
+
 ### Changed
 
 - Membership adds (#1192): `RequestAddNode`, `RequestAddObserver`, `RequestAddWitness`, their `WithIdentity` and `Sync` forms compare a non-zero `configChangeIndex` on the leader's worker as well as in the Host, so a change that commits between the two checks is refused with `*StaleConfigChangeError` (`errors.Is` `ErrStaleConfigChange`) and nothing enters the log. A new variadic `ConfigChangeOption`, `WithBoundConfigChangeIndex()`, binds an add with index 0 to the initial configuration; without it, 0 still skips the check. The binding holds until the entry reaches the leader's validation, including after the caller's deadline expires, and a bound add that reaches a replica that is no longer the leader is refused with `ErrStaleConfigChange` instead of being forwarded. No wire or format change.
