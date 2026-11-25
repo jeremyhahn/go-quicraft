@@ -25,6 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/rsm"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
@@ -1338,6 +1339,40 @@ func (e *InvalidMemberError) Is(target error) bool {
 // ErrNonVotingRoleInMembers is the sentinel for *NonVotingRoleInMembersError.
 var ErrNonVotingRoleInMembers = errors.New(
 	"quicraft: a witness or observer cannot be bootstrapped through the initial members map")
+
+// WireVersionMismatchError is the Raft layer's refusal of a peer whose
+// advertised wire versions cannot interoperate with this host's window
+// (Host.WireWindow): the batch's BinVer is not a member of the window, or the
+// peer's MaxBinVer is below the window's Previous, so the peer could not read
+// what this host sends. Every message of such a batch is dropped before the
+// shard inbox, raft step, elections and the leader-exec router. The refusal
+// lasts only while the peer's values stay outside the window: a peer that
+// comes back inside it is accepted again with no restart.
+//
+// errors.Is(err, proto.ErrUnsupportedVersion) is true.
+type WireVersionMismatchError struct {
+	// ShardID and From name the shard and the sending replica.
+	ShardID uint64
+	From    uint64
+	// PeerBinVer is the version the peer stamped on the batch and
+	// PeerMaxBinVer the newest version it advertises it can read.
+	PeerBinVer    uint64
+	PeerMaxBinVer uint64
+	// Local is this host's window.
+	Local proto.WireWindow
+}
+
+// Error names both sides' versions.
+func (e *WireVersionMismatchError) Error() string {
+	return fmt.Sprintf("quicraft: shard %d replica %d speaks wire version %d (reads up to %d), "+
+		"outside this host's wire window {current %d, previous %d}",
+		e.ShardID, e.From, e.PeerBinVer, e.PeerMaxBinVer, e.Local.Current, e.Local.Previous)
+}
+
+// Is reports whether target is proto.ErrUnsupportedVersion.
+func (e *WireVersionMismatchError) Is(target error) bool {
+	return target == proto.ErrUnsupportedVersion
+}
 
 // NonVotingRoleInMembersError is returned by Host.StartShard when the local
 // replica is configured as a witness (Config.IsWitness) or an observer

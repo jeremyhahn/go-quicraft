@@ -59,6 +59,13 @@ type hostMessageHandler struct {
 	dropLogStamp  atomic.Int64
 	dropsSinceLog atomic.Int64
 
+	// wireRefusals holds the last *WireVersionMismatchError per
+	// wireRefusalKey, so the refusal is logged once per (shard, sender) per
+	// change of the peer's advertised versions; wireRefused counts its
+	// entries, so a host with none pays no map lookup to clear one.
+	wireRefusals sync.Map
+	wireRefused  atomic.Int64
+
 	// inflightSnapshotRecv serializes concurrent HandleSnapshot calls for the
 	// same (shard, replica, index). The snapshot directory is deterministic
 	// per index and the dedup guard only consults LogDB — which is written
@@ -147,6 +154,7 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, peer transp
 	// What each sender advertises is recorded only by a build that has a
 	// newer version to switch to; one (shard, sender) pair per run.
 	trackWire := h.host != nil && h.host.wireSwitchEnabled()
+	local, interoperable := h.wireInteroperates(batch)
 	var lastShard, lastFrom uint64
 	noted := false
 	for i := range batch.Requests {
@@ -155,9 +163,19 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, peer transp
 		if !h.authorizeInbound(msg, batch.SourceAddress, peer) {
 			continue
 		}
-		if trackWire && (!noted || msg.ShardID != lastShard || msg.From != lastFrom) {
+		// A peer that cannot interoperate with this host's window is refused
+		// here, before the inbox, raft step, elections and the leader-exec
+		// router, with an error that names both sides' versions.
+		if !interoperable {
+			h.refuseWireVersion(msg, batch, local)
+			continue
+		}
+		if !noted || msg.ShardID != lastShard || msg.From != lastFrom {
 			noted, lastShard, lastFrom = true, msg.ShardID, msg.From
-			h.host.notePeerWireVersion(msg.ShardID, msg.From, batch.MaxBinVer)
+			h.clearWireRefusal(msg.ShardID, msg.From)
+			if trackWire {
+				h.host.notePeerWireVersion(msg.ShardID, msg.From, batch.MaxBinVer)
+			}
 		}
 
 		// Leader-executed requests and their answers are host traffic, not
@@ -185,6 +203,80 @@ func (h *hostMessageHandler) HandleMessage(batch proto.MessageBatch, peer transp
 		h.engine.NotifyWork(msg.ShardID)
 	}
 	return nil
+}
+
+// wireRefusalKey names one sender of one shard in wireRefusals.
+type wireRefusalKey struct {
+	shardID, from uint64
+}
+
+// wireInteroperates reports this host's wire window and whether a peer that
+// stamped batch can interoperate with it: its BinVer is a member of the
+// window, and its MaxBinVer is not below the window's Previous (below it, the
+// peer cannot read what this host sends).
+//
+// A batch with BinVer zero is not judged: the transport's decoder never
+// accepts zero (no window contains it), so such a batch was built in process
+// rather than read off the wire, and there is no peer version to compare.
+func (h *hostMessageHandler) wireInteroperates(batch proto.MessageBatch) (proto.WireWindow, bool) {
+	local := proto.DefaultWireWindow()
+	if h.host != nil {
+		local = h.host.WireWindow()
+	}
+	if batch.BinVer == 0 {
+		return local, true
+	}
+	return local, local.Accepts(batch.BinVer) && batch.MaxBinVer >= local.Previous
+}
+
+// refuseWireVersion drops msg, whose batch cannot interoperate with local,
+// and records the refusal. It is logged once per (shard, sender) per change
+// of the peer's advertised versions, so a peer stuck outside the window logs
+// once rather than once per batch.
+func (h *hostMessageHandler) refuseWireVersion(msg *proto.Message, batch proto.MessageBatch, local proto.WireWindow) {
+	refusal := &WireVersionMismatchError{
+		ShardID:       msg.ShardID,
+		From:          msg.From,
+		PeerBinVer:    batch.BinVer,
+		PeerMaxBinVer: batch.MaxBinVer,
+		Local:         local,
+	}
+	key := wireRefusalKey{shardID: msg.ShardID, from: msg.From}
+	prev, loaded := h.wireRefusals.Swap(key, refusal)
+	if !loaded {
+		h.wireRefused.Add(1)
+	}
+	if loaded && *prev.(*WireVersionMismatchError) == *refusal {
+		return
+	}
+	slog.Warn("refused raft message: peer wire version outside this host's window",
+		"shard", msg.ShardID,
+		"from", msg.From,
+		"source", batch.SourceAddress,
+		"type", proto.MessageTypeName(msg.Type),
+		"error", refusal,
+	)
+}
+
+// clearWireRefusal forgets a refusal of (shardID, from) once the sender is
+// back inside the window, so a later regression is logged again.
+func (h *hostMessageHandler) clearWireRefusal(shardID, from uint64) {
+	if h.wireRefused.Load() == 0 {
+		return
+	}
+	if _, ok := h.wireRefusals.LoadAndDelete(wireRefusalKey{shardID: shardID, from: from}); ok {
+		h.wireRefused.Add(-1)
+	}
+}
+
+// wireRefusal returns the refusal recorded for (shardID, from) while that
+// sender is outside this host's window, or nil.
+func (h *hostMessageHandler) wireRefusal(shardID, from uint64) *WireVersionMismatchError {
+	v, ok := h.wireRefusals.Load(wireRefusalKey{shardID: shardID, from: from})
+	if !ok {
+		return nil
+	}
+	return v.(*WireVersionMismatchError)
 }
 
 // authorizeInbound decides whether one inbound message may reach raft, and

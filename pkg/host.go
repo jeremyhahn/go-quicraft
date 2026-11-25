@@ -10878,6 +10878,20 @@ func (h *Host) RaftAddress() string {
 	return h.cfg.RaftAddress
 }
 
+// WireWindow returns this host's effective Raft wire version window: the
+// version it advertises (Current) and the one it still reads and sends until
+// a shard commits the switch (Previous). A peer whose advertised versions
+// fall outside it is refused at the Raft layer with a
+// *WireVersionMismatchError. proto.DefaultWireWindow is the same window read
+// at compile time, without a host; the two differ only in tests that emulate
+// another build.
+func (h *Host) WireWindow() proto.WireWindow {
+	if h.wire.Proto == (proto.WireWindow{}) {
+		return proto.DefaultWireWindow()
+	}
+	return h.wire.Proto
+}
+
 // EmergencySeal immediately seals the barrier without waiting for in-flight
 // operations to complete. All in-flight operations will fail with
 // ErrBarrierSealed. This is for security incident response where speed
