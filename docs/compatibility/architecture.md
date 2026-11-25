@@ -110,9 +110,35 @@ log. [engineering.md](engineering.md#version-discriminators) lists all of them.
 directly in `SnapshotChunk`. A `Membership` layout change therefore alters the
 transport bytes.
 
-> **From 1.0 onward:** bump `proto.WireVersion` whenever any type reachable from
-> `MessageBatch` or `SnapshotChunk` changes layout, including the embedded
-> persisted ones.
+> **From v1.0.0-rc.1 onward:** every release that changes the layout of any
+> type reachable from `MessageBatch` or `SnapshotChunk`, including the embedded
+> persisted ones, bumps `proto.WireVersion` and sets `PreviousWireVersion` to
+> the value it replaced. The pre-release pin ends there.
+
+### The wire window and its refusal
+
+A build accepts a closed window of two wire versions, `{current, previous}`
+(`proto.WireWindow`). Consumers read it with `proto.DefaultWireWindow()` at
+compile time or `Host.WireWindow()` on a running host. A peer is
+interoperable when its batch's `BinVer` is in the window and its `MaxBinVer`,
+the highest version it reads, is at least the window's previous.
+
+The transport refuses a frame or batch outside the window before it is
+decoded. The Raft layer repeats the check after the sender is authorized:
+every message of a batch from a peer outside the window is dropped before it
+reaches the shard inbox, the raft step, elections or the leader-exec router.
+The refusal is a `*WireVersionMismatchError` naming the shard, the sender,
+the peer's `BinVer` and `MaxBinVer` and this host's window;
+`errors.Is(err, proto.ErrUnsupportedVersion)` holds. It is logged once per
+`(shard, sender)` each time the peer's values change, not per batch. A peer
+that comes back inside the window is accepted with no restart.
+
+`pkg/proto/testdata/wire_layout.golden` records a fingerprint of the wire
+layout with the `WireVersion` it was taken at. `TestWireLayoutGolden` fails
+when the layout moves without regenerating it, and
+`scripts/check-wire-version.sh`, run by `make release-candidate` and
+`make release` against the newest non-alpha release tag, fails when the
+fingerprint moved and `WireVersion` did not.
 
 The relation is `>=`, not `==`: a transport-only change leaves persisted bytes
 alone. The two constants stay separate and neither is derived from the other,
