@@ -1351,14 +1351,15 @@ var ErrNonVotingRoleInMembers = errors.New(
 //
 // errors.Is(err, proto.ErrUnsupportedVersion) is true.
 type WireVersionMismatchError struct {
-	// ShardID and From name the shard and the sending replica.
+	// ShardID is the shard the refused messages were addressed to.
 	ShardID uint64
-	From    uint64
-	// PeerBinVer is the version the peer stamped on the batch and
-	// PeerMaxBinVer the newest version it advertises it can read.
-	PeerBinVer    uint64
+	// From is the replica ID of the sender whose messages were refused.
+	From uint64
+	// PeerBinVer is the wire version the peer stamped on the batch.
+	PeerBinVer uint64
+	// PeerMaxBinVer is the newest wire version the peer advertises it reads.
 	PeerMaxBinVer uint64
-	// Local is this host's window.
+	// Local is this host's wire window.
 	Local proto.WireWindow
 }
 

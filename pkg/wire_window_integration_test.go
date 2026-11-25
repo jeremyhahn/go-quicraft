@@ -188,7 +188,7 @@ func TestWireWindow_PeerOutsideWindowIsRefused(t *testing.T) {
 	if err := handler.HandleMessage(batch, peer); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
-	refusal := handler.wireRefusal(wwShard, 2)
+	refusal := handler.wireRefusal(wwShard)
 	if refusal == nil {
 		t.Fatal("the far build's RequestVote was not refused at the Raft layer")
 	}

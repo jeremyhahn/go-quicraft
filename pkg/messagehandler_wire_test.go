@@ -94,7 +94,7 @@ func TestHandleMessage_WireWindowRefusal(t *testing.T) {
 				t.Fatalf("HandleMessage: %v", err)
 			}
 			got := deliveredCount(capEng)
-			refusal := handler.wireRefusal(wireTestShard, 2)
+			refusal := handler.wireRefusal(wireTestShard)
 			if !tc.refused {
 				if got != 3 || refusal != nil {
 					t.Fatalf("delivered %d, refusal %v; want 3 delivered and no refusal", got, refusal)
@@ -163,7 +163,7 @@ func TestHandleMessage_WireRefusalLogsOncePerChange(t *testing.T) {
 	if got := deliveredCount(capEng); got != 2 {
 		t.Fatalf("delivered %d after the peer came back inside the window, want 2", got)
 	}
-	if r := handler.wireRefusal(wireTestShard, 2); r != nil {
+	if r := handler.wireRefusal(wireTestShard); r != nil {
 		t.Fatalf("refusal %v still recorded for a peer inside the window", r)
 	}
 	if err := handler.HandleMessage(wireBatch(1, 1, 1), authorizeAllSenders); err != nil {
@@ -183,7 +183,7 @@ func TestHandleMessage_WireRefusalCoversLeaderExec(t *testing.T) {
 	if err := handler.HandleMessage(b, authorizeAllSenders); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
-	if deliveredCount(capEng) != 0 || handler.wireRefusal(wireTestShard, 2) == nil {
+	if deliveredCount(capEng) != 0 || handler.wireRefusal(wireTestShard) == nil {
 		t.Fatal("a leader-exec request from a peer outside the window was not refused")
 	}
 }

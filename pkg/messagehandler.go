@@ -269,14 +269,18 @@ func (h *hostMessageHandler) clearWireRefusal(shardID, from uint64) {
 	}
 }
 
-// wireRefusal returns the refusal recorded for (shardID, from) while that
-// sender is outside this host's window, or nil.
-func (h *hostMessageHandler) wireRefusal(shardID, from uint64) *WireVersionMismatchError {
-	v, ok := h.wireRefusals.Load(wireRefusalKey{shardID: shardID, from: from})
-	if !ok {
-		return nil
-	}
-	return v.(*WireVersionMismatchError)
+// wireRefusal returns a refusal recorded on shardID while its sender is
+// outside this host's window, or nil.
+func (h *hostMessageHandler) wireRefusal(shardID uint64) *WireVersionMismatchError {
+	var refusal *WireVersionMismatchError
+	h.wireRefusals.Range(func(k, v any) bool {
+		if k.(wireRefusalKey).shardID != shardID {
+			return true
+		}
+		refusal = v.(*WireVersionMismatchError)
+		return false
+	})
+	return refusal
 }
 
 // authorizeInbound decides whether one inbound message may reach raft, and
