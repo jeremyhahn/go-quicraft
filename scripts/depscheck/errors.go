@@ -7,7 +7,7 @@ import (
 )
 
 // ErrLookupDisabled is returned when GOPROXY=off: without the proxy and the
-// dev Gitea no latest version can be known, and a check that cannot look
+// private forge no latest version can be known, and a check that cannot look
 // anything up must not report that everything is current.
 var ErrLookupDisabled = errors.New("depscheck: GOPROXY=off disables module version lookup, so the latest release of each dependency cannot be known; run make deps-check with access to the module proxy and the dev Gitea")
 

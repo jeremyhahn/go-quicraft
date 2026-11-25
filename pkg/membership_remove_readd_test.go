@@ -25,15 +25,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// ---------------------------------------------------------------------------
-// Remove, then re-add the same replica ID (#810).
-//
-// Three real hosts on the QUIC transport run one shard. A follower is removed:
-// the linearizable membership must stop listing it, its Host must apply no
-// entry past the removal, and an add of the same replica ID must fail with
-// ErrNodeRemoved, because replica IDs are never recycled. The shard keeps
-// committing proposals before, between and after both changes.
-// ---------------------------------------------------------------------------
+// Remove a follower, then re-add the same replica ID: the add fails with ErrNodeRemoved and the shard keeps committing.
 
 const removeReaddShard uint64 = 1
 

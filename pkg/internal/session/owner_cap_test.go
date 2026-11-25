@@ -59,8 +59,7 @@ func TestOwnerCapStopsOneOwnerExhaustingTheTable(t *testing.T) {
 		}
 	}
 
-	// One past the cap. A distinct, previously unseen clientID, so nothing but
-	// the owner cap can refuse it.
+	// One past the cap, with an unseen clientID.
 	err := m.Register(2000, ownerA, 100)
 	if !errors.Is(err, ErrSessionLimitExceeded) {
 		t.Fatalf("Register #%d for owner A = %v, want ErrSessionLimitExceeded. "+
@@ -84,14 +83,7 @@ func TestOwnerCapStopsOneOwnerExhaustingTheTable(t *testing.T) {
 	}
 }
 
-// TestOwnerCapReleasesOnUnregisterAndExpiry pins that the owner index is not
-// write-only.
-//
-// The cap is counted from a derived secondary index, and a derived index that
-// only ever increments is worse than no index at all: it would refuse an owner
-// that holds nothing, permanently, and it would do so on whichever replica
-// happened to expire a session first. Both removal paths — the explicit one and
-// the deterministic-expiry one — must give the slot back.
+// TestOwnerCapReleasesOnUnregisterAndExpiry verifies unregistering and expiry both release an owner's slot.
 func TestOwnerCapReleasesOnUnregisterAndExpiry(t *testing.T) {
 	const owner = 0xC0FFEE
 
@@ -113,8 +105,7 @@ func TestOwnerCapReleasesOnUnregisterAndExpiry(t *testing.T) {
 			t.Fatalf("Register after Unregister = %v, want nil: the owner "+
 				"released one session, so one slot must come back", err)
 		}
-		// Exactly one slot came back: the owner still holds session 2, so
-		// the release decremented its count rather than clearing it.
+		// Exactly one slot came back; the owner still holds session 2.
 		if err := m.Register(4, owner, 5); !errors.Is(err, ErrSessionLimitExceeded) {
 			t.Fatalf("Register at cap after one release = %v, want "+
 				"ErrSessionLimitExceeded", err)
@@ -182,18 +173,7 @@ func TestOwnerCapDisabledWhenPolicyIsZero(t *testing.T) {
 	}
 }
 
-// TestOwnerCapSurvivesSnapshotRoundTrip pins the owner through
-// MarshalTo/UnmarshalFrom.
-//
-// A snapshot that loses the owner does not fail. The sessions come back looking
-// ownerless, every owner's count comes back at zero, and the recovering replica
-// then admits registrations its peers refuse — a state-machine divergence with
-// every Raft invariant intact, which is the exact failure mode replicating the
-// policy was meant to remove.
-//
-// It also pins that the index is REBUILT rather than trusted: the restored
-// manager must refuse at the cap immediately, without needing a registration
-// first to discover what it holds.
+// TestOwnerCapSurvivesSnapshotRoundTrip verifies owners survive MarshalTo/UnmarshalFrom and the owner index is rebuilt.
 func TestOwnerCapSurvivesSnapshotRoundTrip(t *testing.T) {
 	const owner = 0xBEEF
 

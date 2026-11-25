@@ -31,32 +31,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// ---------------------------------------------------------------------------
-// An import must never damage a snapshot it did not create
-// ---------------------------------------------------------------------------
-//
-// Snapshot directories are named by the snapshot's own INDEX so the tree ORDERS
-// correctly (engine.listSnapshotDirs parses the name; gcSnapshotDirs deletes the
-// lowest, latestSnapshotDir recovers the highest). That name is therefore NOT
-// unique to one import: an operator retry of the same artifact carries the same
-// index by construction, and a disaster-recovery artifact exported from a peer
-// routinely carries an index this replica also reached, because a snapshot is
-// taken at a deterministic trigger (processed - lastSnapshotIndex >=
-// SnapshotEntries).
-//
-// An import that assumed the directory was fresh in every step would be
-// destructive: MkdirAll succeeds on an existing directory, and opening the data
-// file O_RDWR|O_CREATE|O_TRUNC truncates a LIVE snapshot.dat before ANYTHING is
-// validated. The final SaveSnapshot then fails with logdb.ErrSnapshotOutOfDate,
-// so the operator is told nothing happened while the LogDB record describes a
-// file it no longer matches:
-//
-//   - a wrong FileSize is precisely the "ships a short/empty snapshot and erases
-//     the receiving follower's state" hazard guarded on the send path, and
-//   - a wrong Epoch makes StartShard fail closed on an undecryptable snapshot.
-//
-// These tests are written against LogDBs that REFUSE a stale save (memdb and
-// waldb both do), because a LogDB that accepts one cannot observe the bug.
+// An import must never damage a snapshot it did not create.
 
 // liveImportFixture is a stopped shard on a host, wired to a real LogDB, ready to
 // be imported into.

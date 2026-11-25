@@ -393,12 +393,7 @@ func ackedFollower(t *testing.T) *raft {
 	return f
 }
 
-// TestLeaseVotePromise_SurvivesAHigherTermMessage drives the reported
-// scenario: a follower acks leader L, then a delayed higher-term response
-// from an old campaign moves it to a new term with no known leader. The
-// known-leader tests no longer apply, so without the window it would grant the
-// next candidate's vote at once while L still counted its ack. The promise holds
-// in real time until the window has passed.
+// TestLeaseVotePromise_SurvivesAHigherTermMessage verifies a follower keeps its vote promise after a higher-term message.
 func TestLeaseVotePromise_SurvivesAHigherTermMessage(t *testing.T) {
 	for _, preVote := range []bool{false, true} {
 		t.Run(map[bool]string{false: "vote", true: "pre_vote"}[preVote], func(t *testing.T) {
@@ -593,8 +588,7 @@ func TestLeaseVotePromise_DelayedTimeoutNowCannotElectInsideALaterLease(t *testi
 	l.broadcastHeartbeatCtx(0)
 	s.route()
 
-	// The stale TimeoutNow arrives and A campaigns; L no longer hears the
-	// vote traffic.
+	// The stale TimeoutNow arrives and A campaigns, unheard by L.
 	s.partition(1, 2)
 	s.partition(1, 3)
 	for _, m := range stale {

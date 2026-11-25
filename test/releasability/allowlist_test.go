@@ -34,9 +34,7 @@ type allowRule struct {
 	// none. An exact path matches only itself.
 	path string
 
-	// classes are the classes this rule accepts in those files. Naming them
-	// keeps the rule narrow: a tree allowed to mention a fleet hostname is
-	// not thereby allowed to hardcode the owner's home directory.
+	// classes are the classes this rule accepts in those files.
 	classes []class
 
 	// reason says why publishing this value is acceptable, or who owns

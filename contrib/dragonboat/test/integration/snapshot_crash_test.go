@@ -28,10 +28,7 @@ import (
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 )
 
-// TestIntegration_DB_LeaderCrashDuringSnapshot verifies cluster resilience
-// when the leader is stopped while a snapshot is in progress. The remaining
-// two nodes must elect a new leader and continue serving proposals with all
-// previously committed data intact.
+// TestIntegration_DB_LeaderCrashDuringSnapshot verifies the remaining nodes elect a leader and keep committed data when the leader stops mid-snapshot.
 func TestIntegration_DB_LeaderCrashDuringSnapshot(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()

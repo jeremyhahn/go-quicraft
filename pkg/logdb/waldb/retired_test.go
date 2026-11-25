@@ -159,10 +159,7 @@ func TestRemoveNodeData_FailedRegistryWriteChangesNothing(t *testing.T) {
 	}
 }
 
-// TestRemoveNodeData_RegistryDirSyncFailurePoisons verifies a retirement
-// whose registry was renamed into place but whose directory fsync failed
-// fail-stops the DB: whether the retirement survives a crash is unknown, the
-// same uncertainty a failed WAL fsync leaves, and only a restart settles it.
+// TestRemoveNodeData_RegistryDirSyncFailurePoisons checks a failed directory fsync after the registry rename fail-stops the DB.
 func TestRemoveNodeData_RegistryDirSyncFailurePoisons(t *testing.T) {
 	dir := t.TempDir()
 	ffs := &dirSyncFailFS{FS: defaultFS()}

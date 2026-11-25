@@ -618,10 +618,7 @@ func TestDoSendSnapshot_FailedScratchUnlinkFailsTheSend(t *testing.T) {
 	}
 }
 
-// TestDecryptSnapshotForSend_UnloadedShardFailsClosed: the send resolves its
-// scratch directory from the loaded node, never from the artifact's path, so
-// a shard that is no longer loaded — or is loaded as a different replica — is
-// refused before anything is created.
+// TestDecryptSnapshotForSend_UnloadedShardFailsClosed checks the scratch directory comes from the loaded node, so an unloaded shard is refused.
 func TestDecryptSnapshotForSend_UnloadedShardFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.dat")
@@ -662,10 +659,7 @@ func TestDecryptSnapshotForSend_UnloadedShardFailsClosed(t *testing.T) {
 	}
 }
 
-// TestDecryptSnapshotForSend_DoesNotRecreateARemovedReplicaDir: StartShard
-// creates the replica's snapshot directory and no scratch writer does, so a
-// late send whose tree was removed under it fails rather than resurrecting
-// the directory of a replica that is gone.
+// TestDecryptSnapshotForSend_DoesNotRecreateARemovedReplicaDir checks a late send fails rather than recreating a removed replica directory.
 func TestDecryptSnapshotForSend_DoesNotRecreateARemovedReplicaDir(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.dat")

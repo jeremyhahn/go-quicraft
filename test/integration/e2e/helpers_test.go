@@ -380,18 +380,7 @@ func failFastOnEngineFailure(t *testing.T) {
 type kvStateMachine struct {
 	mu   sync.RWMutex
 	data map[string]string
-	// prevIndex is the raft index of the previously applied entry. Every
-	// entry handed to Update must carry a STRICTLY greater index: an index
-	// that repeats or moves backward means the entry was applied twice or
-	// replayed, which no amount of state comparison can detect afterwards on
-	// a last-write-wins store. RecoverFromSnapshot is the only legal reset
-	// point.
-	//
-	// Note: consecutive indices are NOT required. The user state machine only
-	// ever sees user commands; the engine legitimately consumes indices for
-	// the initial-membership entry, each leader's no-op entry, config changes
-	// and session register/unregister entries, so gaps are expected and are
-	// counted rather than failed. See applyGaps.
+	// prevIndex is the previous applied index; each Update must carry a strictly greater one, with gaps allowed. RecoverFromSnapshot is the only reset.
 	prevIndex uint64
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
@@ -650,8 +639,7 @@ type smKey struct {
 	replicaID uint64
 }
 
-// smTracker tracks kvStateMachine instances created by the factory
-// so tests can assert on internal state.
+// smTracker tracks kvStateMachine instances created by the factory.
 type smTracker struct {
 	mu       sync.Mutex
 	machines map[smKey]*kvStateMachine
@@ -796,10 +784,7 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. Read the
-// bound address from Host.RaftAddress once the host exists: a port reserved
-// up front and bound later can be taken by a concurrent CI job that shares the
-// network but not the reservation's lock directory (#386).
+// kernelAddr binds a host on a kernel-assigned loopback port; read it from Host.RaftAddress.
 const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
@@ -886,7 +871,7 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 		cfg := testHostConfig(t, kernelAddr, leaves[i])
 		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
-			// Clean up any previously created hosts.
+			// Clean up any hosts already created.
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
@@ -1135,8 +1120,7 @@ func (c *testCluster) stopNode(idx int) {
 	lk := c.nodeLock(idx)
 	lk.Lock()
 	defer lk.Unlock()
-	// Host.Close drains in-flight operations and can take seconds, so it runs
-	// outside hostsMu: under the write lock it stalled every reader (#309).
+	// Close outside hostsMu; it can take seconds.
 	if h := c.takeHost(idx); h != nil {
 		h.Close()
 	}
@@ -1389,18 +1373,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	}
 }
 
-// resolveStateMachine returns the state machine for node i on the given shard.
-//
-// The cluster's own tracker slice is consulted FIRST because it is the live
-// one: addNodeToCluster appends to it and recovery paths overwrite entries in
-// it, while a trackers slice a test captured from startShard is a snapshot
-// from before those changes and points at state machines that no longer run.
-// The caller's slice is the fallback, which covers a shard whose trackers were
-// never stored on the cluster.
-//
-// The replica ID comes from replicaIDAt — the host's own answer — and falls
-// back to i+1 only when the host cannot be asked at all (it was stopped, or it
-// never started the shard); it is never derived arithmetically.
+// resolveStateMachine returns node i's state machine for shardID, preferring the cluster's live trackers and the host's replica ID.
 func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID uint64, i int) *kvStateMachine {
 	replicaID, ok := cluster.replicaIDAt(shardID, i)
 	if !ok {
@@ -1633,8 +1606,7 @@ func testShardConfigWithSnapshot(shardID, replicaID, snapshotEntries, compaction
 	return c
 }
 
-// startShardWithConfig starts a shard on all nodes in the cluster using
-// a custom config factory. Returns smTrackers for each node.
+// startShardWithConfig starts a shard on all nodes with a config factory and returns their trackers.
 func (c *testCluster) startShardWithConfig(shardID uint64, cfgFn func(shardID, replicaID uint64) config.Config) []*smTracker {
 	c.t.Helper()
 
@@ -1853,21 +1825,7 @@ func proposeNEntries(
 	return expected
 }
 
-// verifyAllData verifies that every KV pair in expected is present on the state
-// machine of EVERY live node, and fails if it did not actually check every one
-// of them.
-//
-// The count is the point, and it is the same point as in waitForReplication.
-// The previous version skipped three separate classes of node in silence: any
-// index past the end of the caller's trackers slice (which is every node a test
-// added after capturing it), any nil tracker entry, and any node whose state
-// machine lookup returned nil. That last one is the damaging case: the tracker
-// records a machine the instant the engine invokes the state-machine factory,
-// so a nil result means the factory was never invoked for that replica — a
-// startup or recovery failure. Skipping it removes the one broken node from
-// every data assertion while the caller logs "verified on N nodes". This helper
-// is the sole final assertion of the rolling-restart tests, where the node that
-// failed to come back is exactly the node being skipped.
+// verifyAllData checks every pair in expected on every live node and fails unless every node was checked.
 func verifyAllData(
 	t *testing.T,
 	cluster *testCluster,
@@ -2296,7 +2254,7 @@ func newBarrierTestCluster(t *testing.T, numNodes int) *barrierTestCluster {
 		b := &countingBarrier{Barrier: seal.MustNewBarrier(testBarrierConfig(1))}
 		s, err := newTestSealStrategy([]byte(fmt.Sprintf("test-passphrase-%d", i)))
 		if err != nil {
-			// Clean up previously created hosts.
+			// Clean up hosts already created.
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
@@ -2371,15 +2329,7 @@ const snapshotDataFileName = "snapshot.dat"
 // is duplicated here rather than read out of the engine, for the same reason.
 const snapshotMetaFileName = "snapshot.meta"
 
-// snapshotArtifacts returns every snapshot payload file beneath dir. The whole
-// tree is walked rather than the documented path being reconstructed so the
-// search still finds the artifacts if the layout changes.
-//
-// An entry that vanishes mid-walk is skipped rather than failed. Snapshot
-// garbage collection removes whole snapshot directories concurrently with the
-// walk, and a directory that no longer exists holds no bytes to assert over;
-// failing on it would report a deleted artifact as an unreadable one. Every
-// other walk error still fails.
+// snapshotArtifacts returns every snapshot payload under dir, skipping entries removed mid-walk.
 func snapshotArtifacts(t *testing.T, dir string) []string {
 	t.Helper()
 	var found []string
@@ -2564,10 +2514,7 @@ func assertSnapshotsSealed(t *testing.T, label, dir string, needles []string) {
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if errors.Is(err, fs.ErrNotExist) {
-			// Snapshot garbage collection reclaimed the whole directory between
-			// the walk and this read. A path that no longer exists holds no
-			// bytes on disk, so there is nothing here to leak and nothing to
-			// assert over; every other read error still fails.
+			// Snapshot GC removed the directory; nothing to check.
 			continue
 		}
 		if err != nil {
@@ -2653,15 +2600,7 @@ func requestSnapshotSync(t *testing.T, host *quicraft.Host, shardID uint64) uint
 	return 0
 }
 
-// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation at the top of
-// this file to the configuration the suite actually starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives testShardConfig an explicit ElectionRTT, or
-// hands testHostConfig a different RTTMillisecond, electionRound silently
-// starts describing a cluster that no longer exists and every budget built on
-// it is wrong by that factor — which is exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
+// TestBudgetsDescribeTheClusterTheyBudgetFor checks the election budget constants match the config builders.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	for _, walSync := range []bool{false, true} {
 		rtt := harnessRTTMillisecond(walSync)

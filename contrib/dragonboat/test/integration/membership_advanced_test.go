@@ -153,7 +153,7 @@ func TestIntegration_DB_SyncRequestDeleteReplica(t *testing.T) {
 	cluster.deleteReplicaToLeader(t, 1, targetReplicaID, membership.ConfigChangeID, membershipTimeout)
 	t.Logf("SyncRequestDeleteReplica removed replica %d", targetReplicaID)
 
-	// Verify the membership no longer includes the removed replica.
+	// Verify the membership excludes the removed replica.
 	updatedMembership := cluster.membershipFromLeader(t, 1, membershipTimeout)
 	if _, exists := updatedMembership.Nodes[targetReplicaID]; exists {
 		t.Fatalf("replica %d should not be in membership after delete", targetReplicaID)
@@ -219,10 +219,7 @@ func TestIntegration_DB_ConcurrentConfigChangeRejected(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()
 
-	// release opens the apply gate. It is closed exactly once, either by the
-	// test body at the point the overlap is no longer needed or by the defer
-	// on any earlier failure — a parked apply loop would otherwise wedge
-	// cluster.close().
+	// release opens the apply gate exactly once, by the test body or the deferred cleanup.
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	openGate := func() { releaseOnce.Do(func() { close(release) }) }

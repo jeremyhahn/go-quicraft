@@ -247,10 +247,7 @@ func TestCRLReloadMissingFile(t *testing.T) {
 	}
 }
 
-// TestCRLReloadReadFailureKeepsPreviousSet verifies that a failed reload
-// preserves the previously loaded revocations (a transiently unreadable
-// CRL must not un-revoke certificates) and that enforcement mode fails
-// closed (ErrCRLStale) for unknown serials until a reload succeeds.
+// TestCRLReloadReadFailureKeepsPreviousSet verifies a failed reload keeps the previous set and enforcement fails closed with ErrCRLStale.
 func TestCRLReloadReadFailureKeepsPreviousSet(t *testing.T) {
 	ca := newTestCA(t)
 	dir := t.TempDir()
@@ -967,8 +964,7 @@ func TestOCSPDefinitiveRevokedNotMaskedByLaterUnavailable(t *testing.T) {
 		t.Fatal("definitive revoked verdict must win over a later unavailable result")
 	}
 
-	// Conversely, an EXPIRED definitive entry is stale and may be replaced by a
-	// negative entry on query failure (correct: the verdict is no longer valid).
+	// An expired definitive entry may be replaced on query failure.
 	checker.ocspMu.Lock()
 	checker.ocspCache[cacheKey].expiresAt = time.Now().Add(-time.Second)
 	checker.ocspMu.Unlock()
@@ -1722,11 +1718,7 @@ func TestIssuerSelectedPerLeafInTwoTierPKI(t *testing.T) {
 	}
 }
 
-// TestOCSPWorksWithIntermediateIssuedLeaf verifies the end-to-end effect of
-// per-leaf issuer selection: an OCSP responder speaking for the intermediate
-// resolves a leaf's status. With only the root wired as issuer this query
-// could never match, making OCSP a silent no-op (or, under enforcement, a
-// total handshake outage).
+// TestOCSPWorksWithIntermediateIssuedLeaf verifies an intermediate's OCSP responder resolves a leaf's status.
 func TestOCSPWorksWithIntermediateIssuedLeaf(t *testing.T) {
 	root := newTestCA(t)
 	intermediate := newTestIntermediate(t, root)
@@ -2276,7 +2268,7 @@ func TestReloadLoopMarksStaleOnCorruptedFile(t *testing.T) {
 		return errors.Is(err, ErrCRLStale)
 	}, 5*time.Second, 5*time.Millisecond, "reload loop must mark the set stale")
 
-	// The previously loaded revocation survives the failed reload.
+	// The earlier revocation survives the failed reload.
 	revoked, _ := checker.IsRevoked(ca.issueLeaf(t, 1300))
 	if !revoked {
 		t.Fatal("a stale set must keep serving known revocations")

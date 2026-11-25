@@ -25,7 +25,7 @@ type finding struct {
 	Released time.Time
 	// Untouched is set, under -base, when the change leaves this line's
 	// path and version as they were at the merge base: a lag behind latest
-	// is then reported, not failed (ruling 640).
+	// is then reported, not failed.
 	Untouched bool
 }
 

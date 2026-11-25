@@ -452,18 +452,7 @@ func requestTransferUntilLeader(t *testing.T, c *testCluster, shardID, targetRep
 	})
 }
 
-// TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica asserts
-// that a requested handover completes, on the requested replica, and leaves a
-// working cluster behind.
-//
-// A leadership transfer is the only mechanism by which leadership moves without
-// an outage: the outgoing leader stops accepting proposals, catches the target
-// up, and sends it TimeoutNow so it campaigns immediately instead of waiting
-// out an election timeout. Every graceful operation in production depends on it
-// — draining a node, rolling a release, moving load off a host about to be
-// rebooted. Nothing in this suite exercised it at all, so a transfer that
-// quietly did nothing would have been invisible: the cluster still has a
-// leader, just not the one that was asked for.
+// TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica checks a transfer lands on the requested replica and the cluster keeps working.
 func TestIntegration_LeadershipTransfer_MovesLeadershipToTheChosenReplica(t *testing.T) {
 	const shardID = uint64(1)
 

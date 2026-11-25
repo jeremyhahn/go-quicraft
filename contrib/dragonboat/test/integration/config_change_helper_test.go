@@ -451,16 +451,7 @@ func TestIntegration_DB_ConfigChangeToLeader_NoLeaderExhaustsBudget(t *testing.T
 	t.Logf("no leader: exhausted after %v against a %v budget: %v", elapsed.Round(time.Millisecond), budget, err)
 }
 
-// TestIntegration_DB_BudgetsDescribeTheClusterTheyBudgetFor pins the
-// derivation beside the budgets to the configuration this suite actually
-// starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives dbTestShardConfig an explicit ElectionRTT, or
-// hands dbTestNodeHostConfig a different RTTMillisecond, electionRound
-// silently starts describing a cluster that no longer exists and every budget
-// built on it is wrong by that factor -- exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
+// TestIntegration_DB_BudgetsDescribeTheClusterTheyBudgetFor pins the budget derivation to the RTT settings this suite starts.
 func TestIntegration_DB_BudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	pki := dbTestPKIFor(t)
 	if got := dbTestNodeHostConfig(t, "127.10.0.5:1", pki.leaf(t)).RTTMillisecond; got != testRTTMillisecond {

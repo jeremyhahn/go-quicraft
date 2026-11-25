@@ -465,9 +465,7 @@ func TestRaft_SelfRemoved_IgnoresTimeoutNow(t *testing.T) {
 	}
 }
 
-// TestRaft_SelfRemoved_OwnVoteNotTallied asserts the removed replica's own
-// vote no longer counts toward a quorum computed over a configuration it is
-// not in. This is defence in depth behind the campaign guard.
+// TestRaft_SelfRemoved_OwnVoteNotTallied: a removed replica's own vote is not tallied.
 func TestRaft_SelfRemoved_OwnVoteNotTallied(t *testing.T) {
 	r := newTestRaft(1)
 	r.votes = map[uint64]bool{1: true, 2: true}

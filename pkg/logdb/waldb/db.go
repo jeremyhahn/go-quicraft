@@ -177,29 +177,7 @@ type plaintextModeReporter interface {
 	IsPlaintextMode() bool
 }
 
-// maxCiphertextExpansion is the largest number of bytes the seal barrier's
-// envelope can add to a record's plaintext. It bounds the framed length used to
-// pick a record's landing segment BEFORE the record is sealed, which is what
-// makes the segment ID in the context-AAD final at encryption time.
-//
-// COUPLING: this mirrors pkg/seal's envelope, whose per-record layout is
-// [epoch:8][algID:1][nonce:N][ciphertext+tag]. The AEAD ciphertext is exactly
-// as long as the plaintext, the tag is 16 bytes for every supported algorithm,
-// and N is at most 24 (XChaCha20-Poly1305; AES-256-GCM and ChaCha20-Poly1305
-// use 12). Those sizes are unexported in pkg/seal, so the bound lives here and
-// TestCiphertextExpansionWithinBound pins it against a real barrier.
-//
-// Over-estimating is safe by construction: segment.CanFit is monotonic in the
-// length it is given, so a slightly generous bound can only rotate a segment a
-// few bytes early, never overflow one.
-//
-// DELEGATED BARRIERS: an encryptor that owns its own envelope (hardware, KMS)
-// is not bound by this figure. Under-estimating it cannot corrupt anything —
-// a record that no longer fits its reserved landing fails closed with
-// ErrLandingSegmentOverflow rather than being written at a position its
-// context-AAD does not name — but a delegated encryptor whose envelope exceeds
-// this bound will surface as that error on records near a segment boundary.
-// Such an encryptor should be paired with a segment size that leaves headroom.
+// maxCiphertextExpansion bounds the seal envelope's overhead ([epoch:8][algID:1][nonce:<=24] plus a 16-byte tag), used to pick a record's segment before sealing; pinned by TestCiphertextExpansionWithinBound.
 const maxCiphertextExpansion = 8 + 1 + 24 + 16
 
 // LogDBMetrics is the metrics interface consumed by the WAL DB for write
@@ -338,11 +316,7 @@ type DB struct {
 	// to Close; nil when the FS is not a DirLocker.
 	lock   io.Closer
 	closed atomic.Bool
-	// poisoned fail-stops the DB after an fsync failure. A failed
-	// fdatasync leaves written-but-unsynced bytes whose durability the
-	// kernel no longer guarantees (it may mark dirty pages clean without
-	// writing them), so every subsequent write is refused with
-	// ErrDBPoisoned and the process must restart into WAL crash recovery.
+	// poisoned fail-stops the DB after an fsync failure; every later write gets ErrDBPoisoned until a restart recovers.
 	poisoned atomic.Bool
 }
 
@@ -2888,14 +2862,7 @@ func (s *walShard) verifyBindingUnchanged() error {
 	return ErrBarrierContextBindingChanged
 }
 
-// reserveLanding makes the active segment the one a record of framedLen bytes
-// will actually land in, rotating first when the record no longer fits. After
-// it returns nil, s.activeSegmentID and s.activeSegment.RecordCount() name the
-// record's final position, so they can be sealed into its context-AAD.
-//
-// framedLen may be an UPPER bound on the record's eventual length;
-// segment.CanFit is monotonic in it, so a generous bound only rotates early.
-// Caller must hold s.mu.
+// reserveLanding makes the active segment the one a record of framedLen (an upper bound) bytes lands in, rotating if needed. Caller holds s.mu.
 func (s *walShard) reserveLanding(framedLen int) error {
 	err := s.activeSegment.CanFit(framedLen)
 	if err == nil {
@@ -2967,13 +2934,7 @@ func (s *walShard) writeRecord(data []byte) (recordLanding, error) {
 			contextAAD = s.recordContext(s.activeSegmentID, s.activeSegment.RecordCount())
 			positional = true
 		} else if err := s.verifyBindingUnchanged(); err != nil {
-			// Suppressing the context is the only direction the barrier cannot
-			// catch for us. The opposite drift — latched "binds" against a
-			// barrier that no longer can — is already fail-closed, because
-			// EncryptWithContext refuses a non-empty context it cannot
-			// authenticate. So the re-check runs ONLY on this branch, which
-			// keeps it off the hot path of every correctly configured
-			// (software or AAD-capable) deployment.
+			// Only this branch needs the drift check; the other direction already fails closed.
 			return recordLanding{}, &WALEncryptError{Err: err}
 		}
 		encrypted, err := s.sealer.EncryptWithContext(nil, data, contextAAD)
@@ -4427,8 +4388,7 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
-	// A retired replica gets no record ever again: a compaction marker would
-	// re-create its floor and pin a segment for a node that no longer exists.
+	// A retired replica gets no further records.
 	if err := db.refuseRetired(key); err != nil {
 		return err
 	}

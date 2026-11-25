@@ -93,13 +93,7 @@ type Peer struct {
 	// persist new hard state.
 	prevState proto.State
 
-	// durableState is the hard state last confirmed on stable storage: the
-	// recovered state at construction, then the State of every update
-	// Commit is handed after SaveState and every piggyback hard state the
-	// engine reports persisted. Unlike prevState it never runs ahead of
-	// the disk, which is what DrainFreeOrderMessages needs: a HeartbeatResp
-	// may leave during an in-flight fsync only while the term, vote and
-	// promised vote window it answers under are already durable (#390).
+	// durableState is the hard state last confirmed on stable storage; it never runs ahead of the disk.
 	durableState proto.State
 
 	// stepMarkIndex and stepMarkTerm are the log's last index and term when
@@ -462,10 +456,7 @@ func (p *Peer) PublishPendingConfig() {
 		(cur.committed == l.committed || len(l.pendingAdds) == 0) {
 		return
 	}
-	// Entries at or below the applied configuration have been folded into
-	// it (or refused) and can never be pending again; forget them here, on
-	// the owner's goroutine, so the map is bounded by the pending window
-	// rather than by the shard's whole history of config changes.
+	// Forget entries at or below the applied configuration so the map stays bounded.
 	l.prunePendingThrough(applied)
 	view := l.pendingIdentities(applied)
 	if view == nil {
@@ -606,20 +597,7 @@ func (p *Peer) SetProcessedIndex(index uint64) (uint64, error) {
 		index = p.r.log.committed
 	}
 	p.r.log.processed = index
-	// The fold's REPORT is the point of calling it. Advancing processed says the
-	// state machine already applied this window; it says nothing about whether
-	// the window's config changes reached the membership. Discarding the report
-	// and advancing anyway is what let an unread window be declared resolved: the
-	// membership stayed at the superseded voting set, configFoldedThrough never
-	// covered the window, and — under the old processed-based lower bound —
-	// resolveStaleStartupConfig's early-out then cleared the watermark and let
-	// the replica campaign against it.
-	//
-	// So an incomplete or undecodable fold ARMS the watermark. The campaign gates
-	// then refuse until the commit pipeline folds the window for real, which is
-	// the right answer for a window that is merely unread. For an UNDECODABLE
-	// entry the watermark is no longer the whole answer: the error is returned so
-	// Host.StartShard can fault the shard, matching the commit path and recovery.
+	// An incomplete or undecodable fold arms the watermark; an undecodable entry is also returned.
 	complete, err := p.replayConfigChangesTo(index)
 	switch {
 	case err == nil && complete:
@@ -860,7 +838,7 @@ func (p *Peer) DrainMessages() []proto.Message {
 //
 // A HeartbeatResp is drained too when heartbeatRespFreeOrder holds: the
 // step that produced it changed nothing the reply depends on, so it need
-// not wait out an fsync it has no part in (#390). See proto.IsFreeOrder.
+// not wait out an fsync it has no part in. See proto.IsFreeOrder.
 //
 // The caller must hold raftMu (or otherwise ensure exclusive access).
 func (p *Peer) DrainFreeOrderMessages() []proto.Message {
@@ -869,25 +847,7 @@ func (p *Peer) DrainFreeOrderMessages() []proto.Message {
 	return msgs
 }
 
-// heartbeatRespFreeOrder reports whether a HeartbeatResp produced since the
-// last drain may leave before the in-flight WAL write completes (#390). It
-// holds when the step left the hard state as it is on disk and appended
-// nothing:
-//
-//   - term, vote and the promised vote window equal durableState. A
-//     Heartbeat that raised the term, a vote granted, or a promise widened
-//     in the same step is not yet durable, and the reply stays ordered;
-//   - the log has not moved since the last drain, and no snapshot waits to
-//     be saved: an append or install in the same step keeps it ordered;
-//   - no extracted update was lost before SaveState (stateUnpersisted).
-//
-// The commit index is deliberately not compared. A HeartbeatResp reports no
-// index of this replica — it echoes the leader's read context (Hint) and
-// lease round (LogIndex) and carries the vote window (LogTerm) — and the
-// leader uses it only for activity (CheckQuorum), ReadIndex and lease
-// confirmation, and to resume replication from its own progress record.
-// None of that reads the follower's commit, and a commit lost in a crash is
-// re-learned from the leader.
+// heartbeatRespFreeOrder reports whether a HeartbeatResp may leave before the WAL write: hard state equals durableState, the log is unmoved, nothing is unpersisted.
 func (p *Peer) heartbeatRespFreeOrder() bool {
 	r := p.r
 	if p.stateUnpersisted || p.hasPendingSnapshot ||
@@ -1889,10 +1849,7 @@ func (p *Peer) appliedReleasePending(lastApplied uint64) bool {
 func (p *Peer) GetUpdate(moreEntriesToApply bool, lastApplied uint64) (proto.Update, error) {
 	hs := p.r.hardState()
 
-	// Detect state change before updating prevState (needed for ReadOnly).
-	// stateUnpersisted forces the change on: a previously extracted update was
-	// lost before SaveState, so prevState is claiming durability it does not
-	// have and this update must carry the hard state back through the WAL.
+	// Detect a state change before updating prevState; stateUnpersisted forces one.
 	stateChanged := p.stateUnpersisted ||
 		hs != p.prevState
 

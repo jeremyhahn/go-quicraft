@@ -31,15 +31,7 @@ import (
 // for a tag. .gitattributes is therefore the one exclusion list.
 const exportIgnoreAttr = "export-ignore"
 
-// privateWorkflowFiles are exact root-relative paths that stay in the private
-// repository: the private forge's own workflows (red-main revert and
-// pull-request review automation, which are not the CI template) and the release
-// trust anchor pinning the internal agent principal, which only the private
-// release recipe reads. Everything else is published -- the agent files
-// (CLAUDE.md, AGENTS.md, .claude/, .serena/) and every other workflow under
-// .github/workflows included (owner ruling on #406 and #407, option (a)) --
-// and scanned like any other file. The list is exact on purpose: a file of
-// the same name elsewhere is published.
+// privateWorkflowFiles are the exact paths that stay private: the private forge workflows and the release trust anchor.
 var privateWorkflowFiles = []string{
 	".github/workflows/revert-red-main.yml",
 	".github/workflows/code-review.yml",

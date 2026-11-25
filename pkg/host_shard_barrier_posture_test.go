@@ -30,9 +30,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
-// These tests pin per-shard barriers in every host-wide posture (#240): a
-// tenant's Raft group keeps its own barrier whether the host runs with sealing
-// disabled (WithoutEncryption) or under a host barrier still in plaintext mode.
+// These tests pin per-shard barriers under every host-wide encryption posture.
 
 // hostRoutedLogDB models a multiplexing LogDB: shards with a dedicated barrier
 // are stored under it, every other shard on one host-wide route. routes lists

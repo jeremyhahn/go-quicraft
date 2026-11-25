@@ -1,33 +1,5 @@
 #!/usr/bin/env bash
-# run-remote.sh — measure a machine profile on the machine it names.
-#
-# One command drives the whole thing:
-#
-#   make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>
-#
-# which is this script's "all": stage the working tree onto the target, capture
-# the target's specifications, run the benchmark suite there, fetch the results
-# AND the capture back into profiles/<name>/, and regenerate that profile's
-# documents locally.
-#
-# The profile name is an argument because hardware description cannot tell
-# which machine profile a host belongs to. Everything else about the machine is
-# captured on the target at run time (see capture-env.sh), so the
-# specification table beside a number is never hand-maintained.
-#
-# The benchmark itself runs under nohup on the target and this script tails it.
-# A dropped ssh session therefore costs you the tail, not the run; reconnect
-# with './run-remote.sh status' or './run-remote.sh wait'.
-#
-# Individual phases, for when you want just one:
-#
-#   ./run-remote.sh stage      rsync the working tree to the target
-#   ./run-remote.sh env        capture the target's specs into the profile
-#   ./run-remote.sh run        start the suite there, in the background
-#   ./run-remote.sh wait       stream the remote log until the run exits
-#   ./run-remote.sh status     tail the remote log once
-#   ./run-remote.sh fetch      copy results and env.json back
-#   ./run-remote.sh generate   regenerate this profile's documents locally
+# Measures a machine profile on its host: make perf-remote PERF_HOST=user@host PERF_PROFILE=<profile>, or phases stage, env, run, wait, status, fetch, generate.
 set -euo pipefail
 
 # ssh destination of the machine being measured. Same variable name as the
@@ -82,10 +54,7 @@ esac
 
 say() { echo ">> $*"; }
 
-# module_auth prints this environment's module credentials as lines a shell
-# sources, with perfcompare's precedence: a composed GOMODAUTH payload verbatim
-# (already sourceable K='V' lines), else GOPRIVATE and the GIT_CONFIG_* rewrite,
-# only when the rewrite is set. It reports presence on stderr, never content.
+# module_auth prints module credentials as sourceable lines, reporting presence on stderr.
 module_auth() {
   if [ -n "${GOMODAUTH:-}" ]; then
     say "module credentials: forwarding the composed GOMODAUTH payload to $HOST over stdin" >&2
@@ -103,12 +72,7 @@ module_auth() {
 }
 
 stage() {
-  # Refuse to stage over an active run: rsync --delete below would clobber the
-  # suite's working tree mid-flight.
-  #
-  # `[p]erfcompare` rather than `perfcompare`: pgrep -f matches full command
-  # lines, and ssh runs this via `bash -c`, so the plain pattern would match
-  # the check's own shell.
+  # Refuse to stage over an active run; [p]erfcompare keeps pgrep from matching itself.
   if ssh "$HOST" "pgrep -f '[p]erfcompare' >/dev/null 2>&1"; then
     echo "ERROR: a perfcompare run is active on $HOST; refusing to stage" >&2
     exit 1
@@ -161,16 +125,7 @@ run() {
     exit 1
   fi
 
-  # The cd is confined to a subshell, because $RUN_PID and $RUN_LOG are
-  # relative to the login home.
-  #
-  # The subshell runs perfcompare and then records its exit status, so $! is
-  # the wrapper's pid. The wrapper exits right after perfcompare, so
-  # `tail --pid` in wait_for_run returns after the status file exists.
-  #
-  # A stale $RUN_RC is removed first: a previous run's status would look
-  # authoritative. It is written via RUN_RC_ABS because the subshell has
-  # already cd'd into $REMOTE_PERF.
+  # Run in a subshell that records perfcompare's exit status, removing a stale $RUN_RC first.
   ssh "$HOST" "rm -f \"$RUN_RC_ABS\""
   # Module credentials cross to the bench host on ssh's stdin, never its
   # command line. The remote shell sources stdin under set -a, so the token
@@ -197,8 +152,7 @@ run() {
 
 wait_for_run() {
   say "streaming $RUN_LOG until the run exits"
-  # tail --pid returns when the benchmark process does, so this blocks for
-  # exactly as long as the run and no longer.
+  # tail --pid returns when the run ends.
   ssh "$HOST" "pid=\$(cat '$RUN_PID' 2>/dev/null); \
     if [ -z \"\$pid\" ]; then echo 'no recorded run'; exit 1; fi; \
     tail -n +1 -f --pid=\"\$pid\" '$RUN_LOG'"
@@ -230,12 +184,7 @@ generate() {
     ./perfcompare generate --profile="$PROFILE_REL" --systems="$PERF_SYSTEMS" )
 }
 
-# require_run_success refuses to touch the local profile when the suite failed.
-#
-# fetch overwrites the local results and generate rewrites the profile's charts
-# and documents, so a failed run would otherwise produce a "refreshed" profile
-# with no new measurement behind it. A profile is a published record; when the
-# run meant to update it failed, it stays as it was.
+# require_run_success leaves the local profile unchanged when the suite failed.
 require_run_success() {
   local rc
   rc="$(ssh "$HOST" "cat \"$RUN_RC_ABS\" 2>/dev/null" || true)"

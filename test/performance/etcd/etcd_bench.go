@@ -164,11 +164,7 @@ func reportClose(tb testing.TB, what string, err error) {
 	}
 }
 
-// saveToStorage records a Ready's hard state and entries in the node's
-// MemoryStorage, which raft reads its log back from. An error means raft's
-// view of its log is no longer what it persisted, so the caller's event loop
-// stops, as it does when the WAL write fails; the benchmark then fails on its
-// own proposal or election timeout.
+// saveToStorage records a Ready's hard state and entries in MemoryStorage; an error stops the event loop.
 func saveToStorage(storage *raft.MemoryStorage, hs *raftpb.HardState, entries []*raftpb.Entry) error {
 	if !raft.IsEmptyHardState(hs) {
 		if err := storage.SetHardState(hs); err != nil {

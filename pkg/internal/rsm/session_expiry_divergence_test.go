@@ -395,16 +395,7 @@ func TestSessionPolicy_SnapshotInstallChecksThePolicy(t *testing.T) {
 	}
 }
 
-// TestSessionExpiry_DisabledSentinelAppliesEverything pins the claim
-// config.SessionExpiryDisabled rests on: that a threshold no log can reach
-// needs no special case in the apply path.
-//
-// Zero can no longer mean "disabled" — it is the default's absence marker — so
-// disabling is expressed as math.MaxUint64. That value takes Apply's SEGMENTED
-// path rather than its expiry-disabled fast path, and the segmented path is the
-// one with a loop that must find no checkpoint and a trailing flush that must
-// still apply every entry. A regression here does not expire anything early; it
-// silently drops entries.
+// TestSessionExpiry_DisabledSentinelAppliesEverything checks SessionExpiryDisabled (math.MaxUint64) applies every entry on the segmented path.
 func TestSessionExpiry_DisabledSentinelAppliesEverything(t *testing.T) {
 	const clientID = 7
 	kv := newTestKV()

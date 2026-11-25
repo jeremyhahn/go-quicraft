@@ -279,12 +279,10 @@ var _ DiskStateMachine = (*testOnDiskStateMachine)(nil)
 // ---------------------------------------------------------------------------
 
 func TestNewCreateFunc_PassesShardAndReplicaIDs(t *testing.T) {
-	// Each constructor passes the shard and replica IDs through to the user
-	// factory and returns a value of the matching state machine type.
+	// Each constructor passes the shard and replica IDs to the user factory and returns the matching state machine type.
 	tests := []struct {
 		name string
-		// build wraps a factory that records its arguments in the constructor
-		// under test.
+		// build wraps an argument-recording factory in the constructor under test.
 		build func(record func(shardID, replicaID uint64)) CreateFunc
 		// isKind reports whether the created value has the expected type.
 		isKind  func(v interface{}) bool

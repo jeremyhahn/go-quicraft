@@ -182,21 +182,7 @@ func TestFIPSExclusionIsOneDocumentedTree(t *testing.T) {
 	}
 }
 
-// TestQUICTransportIsInsideApprovedOnly pins WHICH tree is excluded, not just
-// how many.
-//
-// Counting entries is not enough on its own. The deny-list is applied as a path
-// PREFIX (`grep -v '^$(FIPS_EXCLUDED)'`), so trimming the variable back to a
-// parent directory removes an entire subtree while the list still holds exactly
-// one entry and TestFIPSExclusionIsOneDocumentedTree still passes. Naming the
-// whole pkg/internal/transport tree instead of the revocation package, for
-// example, would put the QUIC transport outside the approved-only gate.
-//
-// quic-go v0.60.0 made that possible by routing packet-protection AEADs through
-// Go's TLS 1.3 AES-GCM implementation instead of the general cipher.NewGCM, so
-// the arbitrary-IV construction RFC 9001 s5.3 requires no longer trips
-// fips140=only. If the transport goes red under `only`, that failure is the
-// finding -- widening this variable to bury it is the forbidden fix.
+// TestQUICTransportIsInsideApprovedOnly checks the excluded prefix does not cover the QUIC transport.
 func TestQUICTransportIsInsideApprovedOnly(t *testing.T) {
 	const (
 		transportPkg  = "github.com/jeremyhahn/go-quicraft/pkg/internal/transport"

@@ -234,8 +234,7 @@ func TestIntegration_DB_SnapshotTransferToNewNode(t *testing.T) {
 	proposeAndWait(t, cluster, trackers, 1, "warmup", "ok")
 	waitForReplication(t, cluster, trackers, 1, "warmup", "ok", defaultTimeout)
 
-	// Propose enough entries to trigger multiple auto-snapshots and
-	// compactions, ensuring old log entries are no longer available.
+	// Propose enough entries to trigger several snapshots and compactions.
 	expected := proposeNEntries(t, cluster, trackers, 1, 50, "snap-xfer")
 	verifyAllData(t, cluster, trackers, 1, expected)
 	t.Logf("50 entries proposed and verified on 3 nodes; snapshots and compaction should have occurred")

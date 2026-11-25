@@ -176,12 +176,7 @@ func TestAppliesResumeWhileSnapshotStreams(t *testing.T) {
 	}
 }
 
-// TestCloseWaitsForStreamingSnapshot pins the other half of streamGuard: moving
-// the Close-blocking job off readGuard must not drop it.
-//
-// Close must not tear the state machine down under a snapshot that is still
-// streaming. readGuard alone can no longer prove that, because the gated save
-// releases it at capture time; streamGuard is what carries the guarantee now.
+// TestCloseWaitsForStreamingSnapshot verifies Close waits for a streaming snapshot.
 func TestCloseWaitsForStreamingSnapshot(t *testing.T) {
 	blocking := newBlockingConcurrentSM()
 	createFn := func(uint64, uint64) interface{} { return blocking }

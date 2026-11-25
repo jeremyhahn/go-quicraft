@@ -837,7 +837,7 @@ func TestBarrier_RegisterDeregisterInFlightEpoch(t *testing.T) {
 		t.Fatalf("PurgeEpochsBefore after deregister failed: %v", err)
 	}
 
-	// Epoch 1 should no longer decrypt.
+	// Epoch 1 no longer decrypts.
 	_, err = b.Decrypt(nil, ct)
 	if !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("expected ErrDecryptionFailed after deregister+purge, got %v", err)
@@ -2309,10 +2309,7 @@ func TestBarrier_EpochAADPreventsCrossEpochSpliceViaDecryptForEpoch(t *testing.T
 		t.Fatalf("Rotate failed: %v", err)
 	}
 
-	// Attempt to decrypt epoch 1 ciphertext using epoch 2 key via
-	// DecryptForEpoch. The epoch in the ciphertext header is 1, but
-	// we request epoch 2. Even if we had epoch 2's key, the AAD
-	// mismatch causes authentication failure.
+	// Decrypting epoch 1 ciphertext as epoch 2 fails on the AAD.
 	_, err = b.DecryptForEpoch(nil, ct, 2)
 	if !errors.Is(err, ErrDecryptionFailed) {
 		t.Fatalf("expected ErrDecryptionFailed for wrong epoch in DecryptForEpoch, got %v", err)
@@ -2409,11 +2406,7 @@ func TestBarrier_BackoffPersistence(t *testing.T) {
 	}
 }
 
-// TestBarrier_BackoffPersistedThroughStatePersister verifies that the backoff
-// counters reach the StatePersister on a failed Unseal, not only the
-// in-memory blob, so an embedder that reloads what it persisted keeps the
-// backoff across a restart, and that a successful Unseal persists the reset
-// (#284).
+// TestBarrier_BackoffPersistedThroughStatePersister verifies backoff counters reach the StatePersister on failure and the reset on success.
 func TestBarrier_BackoffPersistedThroughStatePersister(t *testing.T) {
 	var persisted *SealedRootKey
 	cfg := DefaultBarrierConfig(1)
@@ -2827,7 +2820,7 @@ func TestBarrier_PurgeEpochsPreservesCurrentAndRecentEpochs(t *testing.T) {
 		t.Fatalf("expected 2 epochs purged, got %d", purged)
 	}
 
-	// Epochs 1 and 2 should no longer decrypt.
+	// Epochs 1 and 2 no longer decrypt.
 	for _, ep := range []uint64{1, 2} {
 		_, err := b.Decrypt(nil, ciphertexts[ep])
 		if !errors.Is(err, ErrDecryptionFailed) {

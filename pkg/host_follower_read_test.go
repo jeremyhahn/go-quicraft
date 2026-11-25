@@ -30,17 +30,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// ---------------------------------------------------------------------------
-// FollowerRead on a real follower (#924).
-//
-// Three real hosts on the QUIC transport run one shard of the in-memory KV
-// state machine. FollowerRead is documented to wait until the local state
-// machine has applied up to this replica's committed index as of the start
-// of the read, so a read never reflects less than what the replica already
-// knows is committed. A follower learns a commit on the next append or
-// heartbeat, so each assertion first waits until the follower's committed
-// index covers the acknowledged write, then reads.
-// ---------------------------------------------------------------------------
+// FollowerRead on a real follower over the QUIC transport.
 
 const followerReadShard uint64 = 1
 

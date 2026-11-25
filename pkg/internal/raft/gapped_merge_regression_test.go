@@ -7,29 +7,9 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// The state these tests build is the one every follower passes through between
-// a conflicting append and the commit worker persisting that truncation.
-//
-// tryAppend truncates the log by REPLACING the in-memory suffix (inMemory.merge
-// discards everything at or above the conflict index). The LogReader is not
-// told about the truncation until the commit worker reaches
-// Peer.Commit -> logReader.Append, which is a whole commit/apply/fsync cycle
-// later. In that window the LogReader still reports the OLD range and still
-// serves the OLD terms for indices the log no longer holds, while
-// raftLog.lastIndex() -- which prefers the in-memory tail whenever the buffer
-// is non-empty -- correctly reports the truncated end.
-//
-// Every further message the step worker drains from the inbox is handled inside
-// that window, so a delayed or duplicated Replicate carrying a prevLogIndex
-// above the truncated tail is an ordinary event, not an exotic one.
+// These tests build the follower state between a conflicting append and its persistence, when the LogReader still serves the superseded suffix.
 
-// staleTailLog builds a follower whose in-memory log has just been truncated by
-// a conflicting append while the LogReader still holds the superseded suffix.
-//
-// Layout: indices 1..10 at term 1 are persisted, commit index 5. A leader at
-// term 3 then appends a conflicting entry at index 6, which replaces 6..10 in
-// memory. Afterwards raftLog.lastIndex() == 6 and the LogReader still answers
-// for 7..10.
+// staleTailLog builds a follower with 1..10 at term 1 persisted, commit 5, and a term-3 entry at 6 in memory, so the LogReader still answers for 7..10.
 func staleTailLog(t *testing.T) (*raftLog, *logdb.LogReader) {
 	t.Helper()
 

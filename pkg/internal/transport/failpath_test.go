@@ -630,12 +630,7 @@ func TestSnapshotReceiver_ReleaseUnknownPeerIsNoop(t *testing.T) {
 	}
 }
 
-// TestParseCACertificates_SkipsNonCertificateBlocks pins the bundle scan's
-// tolerance for non-certificate PEM blocks. Operators routinely concatenate
-// keys, CRLs or DH parameters into a bundle; treating such a block as fatal
-// (or, worse, as an issuer) would either refuse a valid bundle at startup or
-// wire revocation to a bogus issuer, which under enforcement is a total
-// handshake outage.
+// TestParseCACertificates_SkipsNonCertificateBlocks verifies non-certificate PEM blocks in a CA bundle are skipped.
 func TestParseCACertificates_SkipsNonCertificateBlocks(t *testing.T) {
 	caPEM, caKeyPEM, _, _ := generateTestCertPair(t)
 
@@ -756,13 +751,7 @@ func TestConfigValidate_RejectsNegativeDialTimeout(t *testing.T) {
 	}
 }
 
-// TestPeerMsgBudget_EntryStaysLiveWhileReferenced: a release that decremented
-// a peer's budget entry to zero and then deleted it could remove the entry a
-// connection from the same peer had counted itself on in between. That live
-// connection's reservations then went to an entry no longer in the map, and
-// the next reservation for the peer created a fresh one, splitting the peer's
-// accounting. While a connection holds a reference, the map must hold a live
-// entry for its peer; once none does, no entry may remain.
+// TestPeerMsgBudget_EntryStaysLiveWhileReferenced verifies a peer's budget entry stays in the map while any connection references it and is removed after.
 func TestPeerMsgBudget_EntryStaysLiveWhileReferenced(t *testing.T) {
 	var tr QUICTransport
 	const key = "spki:peer"

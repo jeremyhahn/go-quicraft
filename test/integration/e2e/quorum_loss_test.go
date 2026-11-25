@@ -314,40 +314,9 @@ func TestE2E_QuorumLoss_Recovery(t *testing.T) {
 	cancel()
 	assertKeyAbsentEverywhere(t, cluster, trackers, 1, "during-loss", time.Second)
 
-	// Restore quorum: remove stopped nodes from membership and add
-	// replacement nodes. We need to restore at least 1 node to get
-	// back to quorum (3 of N). Since we can't modify membership
-	// without quorum, we use a different approach: add a new node
-	// to one of the surviving hosts by restarting the stopped follower
-	// as a fresh node.
-	//
-	// However, since we need quorum to perform membership changes and
-	// we currently don't have it, we simulate recovery by restarting
-	// the third stopped node. Since e2e test nodes use ephemeral dirs,
-	// we add a replacement node instead.
-	//
-	// Strategy: We cannot add nodes without quorum, so we need to
-	// restore at least one stopped node. Since the e2e helpers don't
-	// support WAL-based restart, we instead create a brand new host
-	// and start the shard with the original initial members on it.
-	// This simulates a node that was temporarily partitioned but
-	// comes back with fresh state.
-	//
-	// The practical approach: create a new host, add it to the cluster
-	// addresses as the "returned" third node. Since it starts fresh,
-	// it will bootstrap and connect to the existing members, helping
-	// restore quorum.
+	// Restore quorum by starting a fresh host for a stopped replica with the original initial members; membership changes need quorum.
 
-	// Actually, the simplest correct recovery path is to create a new
-	// host that starts the same shard with the same initial members.
-	// This mimics the stopped node coming back online after losing
-	// its partition.
-	// The returning node presents the LEAF it had before: the shard's
-	// committed identity for this replica is that keypair, and a host with a
-	// fresh one would be refused by every peer as an identity mismatch.
-	// The node lock serializes this restart with the cluster's stop and
-	// close paths, and the host is replaced under hostsMu, as the harness
-	// helpers do (#309). The closure releases the node lock on t.Fatalf too.
+	// The returning node presents its original leaf, the shard's committed identity for it; it is restarted under the node lock and replaced under hostsMu, and the closure releases the lock on t.Fatalf.
 	recoveredReplicaID := uint64(thirdStop + 1)
 	var addr string
 	func() {

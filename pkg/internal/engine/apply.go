@@ -594,9 +594,7 @@ func (w *applyWorker) runShardApply(ch <-chan *applyItem) {
 			node.applyInFlight.Add(1)
 			defer node.applyInFlight.Add(-1)
 			defer func() {
-				// Return pooled committed entries slice before releasing
-				// the applyItem. The entries are no longer referenced
-				// after apply and callback delivery complete.
+				// Return the pooled entries before releasing the applyItem.
 				item.update.ReleaseCommittedEntries()
 				// Release ownership back to step worker. Uses defer to
 				// ensure commitPending is always cleared, even on panic.
@@ -957,23 +955,7 @@ func (w *applyWorker) ackPendingUnloads() {
 	}
 }
 
-// requestReload clears a shard from the unloaded set, allowing dispatch
-// to create a new per-shard goroutine when the next applyItem arrives.
-// This must be called when a previously unloaded shard is re-loaded to
-// prevent the unloaded map from growing without bound and to allow the
-// re-loaded shard to process committed entries.
-//
-// It rendezvouses with the dispatcher (or observes stopC), because the
-// request shares the unbuffered membership channel with requestUnload so
-// the two are applied in the order they were made. The wait is bounded by
-// the dispatcher's liveness only: every dispatcher path either selects on
-// membershipC or on stopC (dispatch's blocking per-shard send services
-// membershipC for exactly this reason), so a slow state machine cannot
-// stall a reload. Engine.LoadNode calls it only after Engine.Start, when a
-// dispatcher goroutine exists to answer.
-//
-// Safe for concurrent use: the actual map deletion happens in the
-// dispatcher goroutine's select loop.
+// requestReload clears a shard from the unloaded set through the dispatcher, ordered with unloads; called only after Engine.Start.
 func (w *applyWorker) requestReload(shardID uint64) {
 	select {
 	case w.membershipC <- applyMembershipRequest{shardID: shardID}:

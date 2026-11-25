@@ -519,13 +519,13 @@ func IsFreeOrderMessage(msgType uint64) bool {
 // nothing of the term has committed), so it has nothing to wait for. Held as
 // ordered it waited out the leader's commit pipeline, which for a leader that
 // has not yet committed in its term is the whole window the refusal covers,
-// and the follower's caller waited with it (#376). An accepted ReadIndexResp
+// and the follower's caller waited with it. An accepted ReadIndexResp
 // stays ordered.
 //
 // HeartbeatResp is ordered here but conditionally free-order in one place:
 // Peer.DrainFreeOrderMessages, the drain the step worker uses while a WAL
 // write is in flight, releases it when the step that produced it left term,
-// vote, owed vote window and log at their durable values (#390). That needs
+// vote, owed vote window and log at their durable values. That needs
 // the follower's durable state, which no message predicate can see, so the
 // decision lives in the raft package.
 func IsFreeOrder(m *Message) bool {

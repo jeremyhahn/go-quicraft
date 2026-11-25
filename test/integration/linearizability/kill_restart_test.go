@@ -16,23 +16,7 @@
 
 package linearizability_test
 
-// Kill-based restart cases (#1165). Every other restart in this suite stops a
-// host with Close, which flushes and syncs the WAL before it returns, so none
-// of them proves that an entry acknowledged to a client survives an abrupt
-// process death. These cases run the node in a child process (this test
-// binary, re-executed with TestKillRestart_Child selected), with WAL fsync
-// ON, SIGKILL it, reopen the same directories and check every acknowledged
-// entry is still there.
-//
-// The child appends one line per acknowledged proposal to an ack file and
-// fsyncs it before it does anything else, so every line the parent reads
-// after the kill names a proposal the engine had acknowledged. A proposal in
-// flight when the kill lands may be present or absent after the restart;
-// it must never be corrupt.
-//
-// SIGKILL keeps the page cache: these cases prove the engine acknowledges
-// only what it has written and that recovery replays it, not that the
-// fdatasync reached the platter.
+// Kill-based restart cases: the node runs in a child process (TestKillRestart_Child) with WAL fsync on, is SIGKILLed and reopened, and every entry it acknowledged (fsynced to an ack file) must survive; in-flight ones may be absent but never corrupt. The page cache survives SIGKILL.
 
 import (
 	"bytes"

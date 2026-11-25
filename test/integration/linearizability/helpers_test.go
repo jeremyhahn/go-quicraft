@@ -284,18 +284,7 @@ type kvStateMachine struct {
 	replicaID uint64
 	mu        sync.RWMutex
 	data      map[string]string
-	// prevIndex is the raft index of the previously applied entry. Every
-	// entry handed to Update must carry a STRICTLY greater index: an index
-	// that repeats or moves backward means the entry was applied twice or
-	// replayed, which no amount of state comparison can detect afterwards
-	// on a last-write-wins store. RecoverFromSnapshot is the only legal
-	// reset point.
-	//
-	// Note: consecutive indices are NOT required. The user state machine
-	// only ever sees user commands; the engine legitimately consumes
-	// indices for the initial-membership entry, each leader's no-op entry,
-	// config changes and session register/unregister entries, so gaps are
-	// expected and are recorded rather than failed. See applyGaps.
+	// prevIndex is the last applied index; every Update entry must be strictly greater (gaps are expected and recorded in applyGaps). Only RecoverFromSnapshot resets it.
 	prevIndex uint64
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
@@ -309,19 +298,7 @@ type kvStateMachine struct {
 	lastWrite map[string]uint64
 }
 
-// applyGates parks kvStateMachine.Update on a put to a chosen key, for a test
-// that needs a replay to stand still: a restarted replica replays its whole
-// log, and the only way to be certain something happens DURING that replay
-// -- rather than to race it against the machine's speed, which fails on a
-// slow CI runner -- is to stop the replay at a known entry until
-// the something is done. Armed by gateApply before the entry is proposed,
-// released by the function it returns. Process-wide, because the state
-// machine that parks is created inside StartShard by a factory the test does
-// not hold; keyed by the replica as well as the KV key, because every replica
-// of a test cluster lives in this process and applies the same entry. A gate
-// keyed by the KV key alone parked every replica that applied the entry after
-// arming, and a peer still behind on it closed parked in the subject's place:
-// the test then went ahead before the subject's replay was at the gate (#309).
+// applyGates parks kvStateMachine.Update on a put to a chosen key for one replica, so a test can act during a replay; process-wide, keyed by replica and key.
 var applyGates sync.Map // applyGateKey -> *applyGate
 
 type applyGateKey struct {
@@ -701,19 +678,7 @@ func harnessHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig,
 		AllowZeroDeploymentID: false,
 		NumWorkers:            1,
 		MaxApplyWorkers:       1,
-		// By default the WAL still writes every record through the real
-		// segment code; only the fdatasync is skipped. Every host of a
-		// cluster shares one disk with whatever else the machine runs, and
-		// on a contended disk a single fdatasync blocks for seconds
-		// (measured 2.5-4.6s under -race and CPU load, finishing in the same
-		// millisecond on independent hosts). Raft must persist term and vote
-		// before a RequestVote or vote grant leaves the node, so no election
-		// fits in a 0.5-1s timeout while the disk is stalled: candidates
-		// time out, re-campaign at a higher term and the shard stays
-		// leaderless long enough to miss the throughput floor (#360).
-		// WAL-sync mode (QUICRAFT_IT_WAL_SYNC=1) runs the fsync-before-ack
-		// path production uses, with a tick (walSyncRTTMillisecond) that
-		// puts the shortest election timeout above that stall.
+		// By default the WAL skips only fdatasync, since a contended disk can stall it for seconds and block elections; QUICRAFT_IT_WAL_SYNC=1 runs the production fsync path with walSyncRTTMillisecond.
 		NoSyncWAL: !walSync,
 		TransportConfig: config.TransportConfig{
 			MTLSConfig: mtls,
@@ -755,10 +720,7 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. Read the
-// bound address from Host.RaftAddress once the host exists: a port reserved
-// up front and bound later can be taken by a concurrent CI job that shares the
-// network but not the reservation's lock directory (#386).
+// kernelAddr binds a host on a kernel-assigned loopback port; read it back from Host.RaftAddress.
 const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
@@ -1020,10 +982,7 @@ func (c *testCluster) stopNode(idx int) {
 	if h == nil {
 		return
 	}
-	// Host.Close drains in-flight client operations, so a stop is a phase of
-	// its own; its length separates a slow drain from a slow election (#309).
-	// It runs outside hostsMu: a drain held under the write lock stalled every
-	// reader, which made a slow drain look like a slow election.
+	// Host.Close drains client operations, so a stop is its own phase; it runs outside hostsMu.
 	start := time.Now()
 	h.Close()
 	c.t.Logf("node[%d] stopped in %v", idx, time.Since(start))
@@ -1588,15 +1547,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, desc string, predicat
 	}
 }
 
-// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation beside the
-// budgets to the configuration the suite actually starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives testShardConfig an explicit ElectionRTT, or
-// hands testHostConfig a different RTTMillisecond, electionRound silently
-// starts describing a cluster that no longer exists and every budget built on
-// it is wrong by that factor — which is exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
+// TestBudgetsDescribeTheClusterTheyBudgetFor pins the budget derivation to the configuration the suite starts.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	for _, walSync := range []bool{false, true} {
 		rtt := harnessRTTMillisecond(walSync)

@@ -639,10 +639,7 @@ func (c *Checker) ReloadCRLs() error {
 				c.markCRLStale()
 				return &CRLNotYetValidError{Path: path, ThisUpdate: crl.ThisUpdate}
 			}
-			// A CRL past NextUpdate no longer proves anything about serials
-			// it does not list; mark stale so enforcement fails closed
-			// until the CA publishes a fresh CRL. (The previous revoked set
-			// is kept: a stale "revoked" remains trustworthy.)
+			// A CRL past NextUpdate marks the set stale; the old revoked set is kept.
 			if !crl.NextUpdate.IsZero() && now.After(crl.NextUpdate.Add(revocationClockSkew)) {
 				c.markCRLStale()
 				return &CRLExpiredError{Path: path, NextUpdate: crl.NextUpdate}
@@ -697,8 +694,7 @@ type reloadedCRL struct {
 	serials int
 }
 
-// markCRLStale records that the revoked set no longer reflects a
-// fully-successful load of every configured CRL file.
+// markCRLStale records that the revoked set no longer reflects a fully successful load.
 func (c *Checker) markCRLStale() {
 	c.mu.Lock()
 	c.crlCurrent = false
@@ -1048,19 +1044,7 @@ func (c *Checker) checkOCSPRaw(cert, issuer *x509.Certificate) (bool, error) {
 	// Query the OCSP responder.
 	revoked, nextUpdate, err := c.queryOCSP(cert, issuer)
 	if err != nil {
-		// Negative-cache the failure for a short window so a flood of
-		// reconnect handshakes does not re-query a dead responder. This never
-		// upgrades to "revoked" or "good"; it only suppresses re-queries.
-		//
-		// Precedence: a definitive cached verdict (revoked or good) always
-		// wins over an unavailable result, so a query failure never clobbers a
-		// revocation status this checker already determined. Without this
-		// guard, a transient responder outage occurring after a definitive
-		// "revoked" verdict would replace that entry with an unavailable one
-		// and, in soft-fail mode, cause the known-revoked peer to be accepted
-		// — masking a verdict a cheap cache lookup would otherwise produce.
-		// We therefore only write the negative entry when no unexpired
-		// definitive entry exists for this serial.
+		// Negative-cache the failure only when no unexpired definitive verdict exists for the serial.
 		c.ocspMu.Lock()
 		if existing, ok := c.ocspCache[key]; !ok || existing.unavailable || !time.Now().Before(existing.expiresAt) {
 			c.evictOCSPCacheLocked(time.Now())

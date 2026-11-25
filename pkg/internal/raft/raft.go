@@ -1866,25 +1866,7 @@ func (r *raft) configCurrentForCampaign() bool {
 	return r.resolveStaleConfig()
 }
 
-// startElection starts a new election. Uses PreVote if enabled.
-//
-// Per the Raft specification (Section 5.2, Section 6, Figure 4), elections
-// are never blocked based on uncommitted log content. The "only one config
-// change pending at a time" constraint applies to the LEADER when PROPOSING
-// new config changes (enforced in becomeLeader via pendingConfigChange),
-// not to followers or candidates starting elections. Blocking elections
-// here would cause a liveness violation: if a leader crashes after
-// replicating an uncommitted config change to a majority, no follower in
-// that majority could ever start an election, permanently stalling the
-// cluster.
-// A replica that is no longer in the configuration never campaigns
-// (dragonboat gates followerTick on !selfRemoved for the same reason). The
-// surviving configuration's quorum is computed without this replica, so a
-// removed replica that still counts its own vote against its own stale
-// voting set can declare itself leader for a term the real configuration is
-// electing a leader in — two leaders in one term. It has no work to do
-// either: it is no longer replicated to and its removal is already
-// committed.
+// startElection starts an election (PreVote if enabled); never blocked on uncommitted log content, and never run by a removed replica.
 func (r *raft) startElection() {
 	if r.isWitness || r.selfRemoved {
 		// Reaching here means the election timeout expired without a heartbeat.
@@ -2151,33 +2133,7 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		r.recordUnreadableLogVoteDenial(msg.From)
 	}
 
-	// Never grant a vote to a replica our configuration does not contain. This
-	// is the counterpart to the receive path's deny-list (Peer.IsRemoved): once
-	// inbound replication is no longer allow-listed, refusing the VOTE is what
-	// stops a replica that is not part of this shard from ever winning a term
-	// and becoming its leader. Denying a vote can only cost liveness, never
-	// safety, which is why the configuration test belongs here rather than on
-	// the receive path where staleness would wedge the replica instead.
-	//
-	// Liveness is preserved because it is gated on knowing a configuration at
-	// all: a replica with no configuration yet (a joiner before the bootstrap
-	// entry arrives) skips the test and votes normally. And a legitimately added
-	// candidate cannot be starved by stale voters — its AddNode could only have
-	// committed if a quorum had already applied it, and those replicas hold it
-	// durably, so a quorum that recognises the candidate always exists.
-	//
-	// The test is skipped while this replica is JOINING, because that flag means
-	// its configuration is known-incomplete by construction — it may hold only
-	// itself, having applied its own AddNode without yet holding the entry that
-	// names the rest of the shard. Denying votes from that state would strand an
-	// otherwise healthy shard: the joiner is a voter its quorum needs, and it
-	// would refuse every real member. An incomplete configuration is not
-	// evidence of non-membership. This is the same reasoning that keeps the
-	// receive path off an allow-list, applied to the one place a configuration
-	// test is still safe.
-	//
-	// hashicorp/raft applies exactly this test, in requestVote and
-	// requestPreVote, under the same "only when a configuration is known" guard.
+	// Never vote for a replica outside our known configuration, unless we are joining or know no configuration.
 	if !r.joining && r.membershipKnown() && !r.isKnownMember(msg.From) {
 		slog.Warn("vote denied: candidate is not in the current configuration",
 			"shard", r.shardID,
@@ -2334,12 +2290,7 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 	return nil
 }
 
-// handleVoteResp processes a RequestVoteResp or RequestPreVoteResp.
-// Responses from replicas outside the CURRENT configuration are discarded:
-// the quorum in tallyVotes is computed over the live voting set, so counting
-// a grant from a replica that was removed mid-election (or was never a
-// member) lets a candidate win with fewer configuration votes than the
-// quorum requires — two leaders in one term.
+// handleVoteResp processes vote and pre-vote responses, discarding those from replicas outside the current configuration.
 func (r *raft) handleVoteResp(msg proto.Message) error {
 	if !r.isVotingMember(msg.From) {
 		slog.Debug("ignoring vote response from outside the configuration",
@@ -3976,9 +3927,7 @@ func (r *raft) rebuildRemotesFromMembership(m proto.Membership) {
 			r.witnesses[id] = newRemote(nextIdx, maxInflightMsgs)
 		}
 	}
-	// A snapshot can carry a configuration this replica is no longer in
-	// (it was removed while it lagged), so self membership is re-derived
-	// here before purgeDepartedVotes drops the now-invalid self vote.
+	// Re-derive self membership before purgeDepartedVotes.
 	r.setSelfMembership(membershipHasSelf(m, r.replicaID))
 	_, listedWitness := m.Witnesses[r.replicaID]
 	_, listedObserver := m.Observers[r.replicaID]
@@ -4345,72 +4294,7 @@ func (r *raft) ackBacksLease(msg proto.Message) bool {
 		time.Duration(msg.LogTerm) >= r.leaseSpan
 }
 
-// voteHeldDown reports whether this replica must still withhold its vote,
-// from other candidates and from itself, because it restarted recently and a
-// leader may still be counting an ack it sent before the restart. A replica
-// that neither runs LeaseRead nor owes a window from before its restart
-// returns false before reading the clock, so its vote handling is unchanged.
-//
-// The hazard it closes: the lease safety argument (hasValidLease) rests on a
-// follower that acked a heartbeat sent at T granting no vote until its
-// election timeout has elapsed. That promise lives in the follower's election
-// timer, which a restart discards: the replica comes back with no known
-// leader, so dropHighTermVote does not fire and handleVoteRequest grants the
-// first up-to-date candidate. In a three-node shard, leader L holds a lease
-// on its own ack plus F1's; F1 restarts and votes for F2, F2 wins with F1 and
-// itself, and L — whose lease still counts F1's pre-restart ack — serves a
-// read that misses F2's writes until that ack's round ages out.
-//
-// The window is anchored at construction (voteHoldStart) on this replica's
-// monotonic clock, and lasts the longer of the window recorded as owed in the
-// hard state and the one this incarnation promises (sizeVoteHoldDown). Every
-// ack this replica sent before the restart promised a window no longer than
-// the one recorded, was sent before construction, and answered a round sent
-// no later than that, so the hold-down ends at least that window after any
-// such round was sent. A leader counts an ack only when the window it
-// promises covers the lease span (ackBacksLease): leaseTimeout =
-// electionTimeout - 2 of the leader's tick intervals, of which the lease is
-// the span less 1% (leaseDriftDivisor), on the leader's clock. With clock
-// rates within that 1% of each other the window outlasts every lease a
-// pre-restart ack can back by about two ticks, which is why the window
-// itself needs no drift allowance of its own. Measuring in ticks instead
-// would reintroduce the pause bug the lease was moved to real time to fix:
-// a descheduled process's ticker coalesces the ticks it missed, so a tick
-// count would declare the window over before the time had passed.
-//
-// Anchoring at the first tick instead would be later, not safer: votes
-// arrive from the moment the peer is constructed, and a tick-anchored window
-// would have to treat "no tick yet" as held anyway.
-//
-// A self-vote is a vote. A candidate counts its own grant, and a quorum that
-// contains this replica's self-vote can omit every other member of the lease
-// quorum just as a quorum containing a vote it granted can (F1 campaigning
-// with F2's grant is the scenario above with the roles swapped), so
-// startElection and handleTimeoutNow consult this too. That includes the
-// leadership-transfer path: the Hint == From exemption is chosen by the
-// sender, and a restarted replica cannot tell whether the leader asking for
-// the transfer is the one whose lease its old ack backs. A transfer that
-// needs this replica during the window times out and is retried by the
-// caller. It costs no normal-case latency: a restarted replica's own
-// election timer is randomized over [electionTimeout, 2*electionTimeout)
-// ticks, which is already about the window.
-//
-// Only vote-granting is held down. The replica still accepts Replicate and
-// Heartbeat from a leader and acks them, so the leader's CheckQuorum counts it
-// active; an ack sent in this incarnation is covered by the ordinary
-// election-timer denial (dropHighTermVote and the leader-active test in
-// handleVoteRequest), which the window does not replace. A refused
-// higher-term RequestVote still advances this replica's term in step(), as
-// any refused vote does. Quiesce neither extends nor ends the window: it
-// changes how often ticks arrive, and the window is not counted in ticks.
-//
-// Until SetTickInterval supplies the tick interval the window's length is
-// unknown, so votes stay held. The leader side of the same peer grants no
-// lease without the interval, but a leader on another host may, and it is
-// that leader's lease this replica's old ack backs.
-//
-// Once the window has elapsed the result is latched, so the clock is read
-// only while the window might still be open.
+// voteHeldDown reports whether a recently restarted replica must still withhold every vote, its own included, because a leader may count a pre-restart ack toward a lease; latched once elapsed.
 func (r *raft) voteHeldDown() bool {
 	if !r.voteHoldArmed || r.voteHoldOver {
 		return false
@@ -4453,10 +4337,7 @@ func (r *raft) nextLeaseRound() uint64 {
 	return r.leaseRound
 }
 
-// leaseRoundSentAt returns when heartbeat round was first sent. It reports
-// false for round 0 (no round: lease tracking was off, or the follower
-// predates rounds), for a round this leader never issued, and for one old
-// enough to have left the window, none of which may renew the lease.
+// leaseRoundSentAt returns when round was first sent; false for round 0, an unissued round, or one outside the window.
 func (r *raft) leaseRoundSentAt(round uint64) (time.Time, bool) {
 	if round <= r.leaseRoundFloor || round > r.leaseRound || r.leaseRound-round >= leaseRoundWindow {
 		return time.Time{}, false
@@ -4876,11 +4757,7 @@ func (r *raft) resumeLeaseAfterTransfer() {
 // handleTimeoutNow processes a TimeoutNow message by immediately
 // starting an election.
 func (r *raft) handleTimeoutNow(msg proto.Message) error {
-	// A removed replica must not campaign even when told to: a TimeoutNow
-	// in flight when the removal committed would otherwise hand leadership
-	// to a replica the configuration no longer contains. The same applies to
-	// a replica whose local role contradicts the replicated configuration —
-	// TimeoutNow is the campaign entry point that bypasses startElection.
+	// A removed or role-mismatched replica ignores TimeoutNow.
 	if r.isWitness || r.selfRemoved {
 		return nil
 	}
@@ -5093,11 +4970,7 @@ func (r *raft) withholdOrderedMessages(msgs []proto.Message) []proto.Message {
 	return msgs[:n]
 }
 
-// requeueMessages puts previously drained messages back at the FRONT of the
-// outbound buffer. Used when the engine drained messages, failed to persist
-// the state they were waiting on, and must hand them back rather than drop
-// them. Front placement preserves emission order: everything currently in
-// r.msgs was produced after these were drained.
+// requeueMessages puts drained messages back at the front of the outbound buffer, preserving order.
 func (r *raft) requeueMessages(msgs []proto.Message) {
 	if len(msgs) == 0 {
 		return
@@ -5115,18 +4988,7 @@ func (r *raft) requeueMessages(msgs []proto.Message) {
 	r.msgs = combined
 }
 
-// drainFreeOrderMessages extracts only free-order messages (Replicate,
-// Ping, Heartbeat, Quiesce) from the outbound buffer, leaving ordered
-// messages (VoteResp, HeartbeatResp, ReplicateResp, etc.) in place.
-// This is used by the step worker during commitPending ticks: heartbeats
-// must be sent immediately for leader liveness, but ordered messages must
-// remain in the buffer until the next GetUpdate after WAL persistence.
-//
-// heartbeatRespFree releases HeartbeatResp as well (#390). The caller
-// (Peer.DrainFreeOrderMessages) sets it only when the step that produced
-// the messages left the hard state durable and appended nothing; a
-// HeartbeatResp held by an earlier drain (the orderedHeld prefix) stays
-// ordered regardless.
+// drainFreeOrderMessages extracts free-order messages, plus HeartbeatResp when heartbeatRespFree and not held, leaving ordered messages for the next GetUpdate.
 func (r *raft) drainFreeOrderMessages(heartbeatRespFree bool) []proto.Message {
 	if len(r.msgs) == 0 {
 		return nil

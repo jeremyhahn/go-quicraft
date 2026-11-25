@@ -1244,9 +1244,7 @@ func TestHostMessageHandler_HandleSnapshot_MetadataWriteError(t *testing.T) {
 	handler := &hostMessageHandler{engine: eng, host: h}
 	authorizeSnapshotPath(t, eng, h, 7, 4, 1)
 
-	// Fail the metadata write. The receive stages in a directory of its own,
-	// so a blocker planted at the canonical path no longer intercepts it — the
-	// failure is injected at the filesystem instead.
+	// Fail the metadata write at the filesystem, since the receive stages in its own directory.
 	node := handler.engine.GetNode(7)
 	cfs := newCrashFS(node.SnapshotDir(), cfg.NodeHostDir)
 	h.fsys = cfs
@@ -1625,9 +1623,7 @@ func TestHandleSnapshot_RejectsInconsistentCount(t *testing.T) {
 	assertNoSnapshotDir(t, handler, 1, 1, 100)
 }
 
-// TestHandleSnapshot_RejectsIdentityMismatch verifies that a chunk whose
-// identity/metadata (here Term) differs from chunk 0 is rejected. This is
-// the core BUG C fix: chunks[0] is no longer blindly trusted for the set.
+// TestHandleSnapshot_RejectsIdentityMismatch: a chunk whose metadata (here Term) differs from chunk 0 is rejected.
 func TestHandleSnapshot_RejectsIdentityMismatch(t *testing.T) {
 	handler, _ := newSnapshotHandler(t)
 
@@ -2004,12 +2000,7 @@ func TestHostMessageHandler_RejectsRemovedSender(t *testing.T) {
 	}
 }
 
-// TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor pins the third
-// source of the sender binding for an ESTABLISHED replica: it was down while
-// replica 8 was added and elected, so neither its committed configuration nor
-// its log names 8. Its operator restarted it with a Config.MemberIdentities
-// that does, and on that — bound to 8's identity — 8's heartbeats are admitted
-// and the replica catches up without a wipe.
+// TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor: a replica restarted with Config.MemberIdentities naming the new leader admits its heartbeats.
 func TestHostMessageHandler_AcceptsSenderNamedByTheOperatorAnchor(t *testing.T) {
 	const leaderAddr = "127.0.0.1:5008"
 	const leaderID = "spki:8888888888888888888888888888888888888888888888888888888888888888"

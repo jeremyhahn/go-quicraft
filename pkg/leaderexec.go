@@ -61,9 +61,7 @@ const (
 	// the shard in the request's term, or left it while waiting to be ready,
 	// or its shard has stopped or failed.
 	leaderExecNotLeader
-	// leaderExecDeposed: the handler ran, and the replica no longer led the
-	// shard in the request's term, or the shard had stopped or failed, when
-	// it returned. The reply is withheld.
+	// leaderExecDeposed: the handler ran but leadership or the shard was lost by its return; the reply is withheld.
 	leaderExecDeposed
 	// leaderExecNoHandler: refused before execution by the ready leader of
 	// the request's term; no handler registered.
@@ -416,11 +414,7 @@ func (h *Host) executeOnLeader(ctx context.Context, ns *nodeState, request []byt
 	}
 }
 
-// leaderExecShardDown reports why this replica of the shard can no longer
-// take part in a leader-executed request: ErrStopped once StopShard has run,
-// ErrShardFailed once the engine node's failure latch has tripped. Neither
-// clears the cached leadership view, so the view alone would keep naming a
-// replica that will never step again. nil while the replica is live.
+// leaderExecShardDown returns ErrStopped or ErrShardFailed once this replica can no longer take part, else nil.
 func (h *Host) leaderExecShardDown(ns *nodeState) error {
 	if ns.stopped.Load() {
 		return ErrStopped

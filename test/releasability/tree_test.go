@@ -148,10 +148,7 @@ func TestTheAllowListDoesNotReachTheValuesThisChangeRemoved(t *testing.T) {
 	}
 }
 
-// agentFilesAndWorkflows are tracked files this repository publishes: the
-// Serena project file and the CI template's workflows, neutralised like the
-// rest of the tree. The other agent files (AGENTS.md, CLAUDE.md, .claude/) are
-// no longer tracked, so the manifest cannot hold them.
+// agentFilesAndWorkflows are the tracked agent file and CI workflows this repository publishes.
 var agentFilesAndWorkflows = []string{
 	".serena/project.yml",
 	".github/workflows/batch.yml",

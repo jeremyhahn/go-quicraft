@@ -33,9 +33,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// testMTLSMaterial generates a valid self-signed CA/cert/key PEM triple for
-// tests. Validation now trial-parses the keypair and CA, so placeholder bytes
-// no longer suffice.
+// testMTLSMaterial generates a valid self-signed CA, cert and key PEM triple, since validation parses them.
 func testMTLSMaterial() (caPEM, certPEM, keyPEM []byte) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

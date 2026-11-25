@@ -634,13 +634,7 @@ func TestIntegrationConfigChangesAreIdempotent(t *testing.T) {
 		len(violations), formatDirectCalls(violations), directConfigChangeMarker)
 }
 
-// matchPending splits direct into the findings a gate must fail on and the
-// ones its deferred table still accounts for, logs the deferred sites with
-// their tracking issue, and fails (without stopping the test) for any entry
-// that no longer matches the tree.
-//
-// kind names the class for the messages ("config change", "read"); table names
-// the variable a reader has to edit.
+// matchPending splits direct into failing findings and those the deferred table covers, logs the deferred ones and fails for stale entries; kind and table name the class and variable in messages.
 func matchPending(t *testing.T, kind, tableName string, direct []directCall, table []pendingSite) []directCall {
 	t.Helper()
 
@@ -657,9 +651,7 @@ func matchPending(t *testing.T, kind, tableName string, direct []directCall, tab
 		deferred = append(deferred, fmt.Sprintf("%s: %s (#%d)", c.pos, c.call, table[i].issue))
 	}
 
-	// An entry that no longer matches has been fixed or moved. Either way it
-	// must leave the table now, or the table starts to be the allowlist it
-	// was designed not to be.
+	// An entry that no longer matches must leave the table.
 	var rotted []string
 	for i, p := range table {
 		if seen[i] != p.count {

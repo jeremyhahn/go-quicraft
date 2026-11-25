@@ -134,9 +134,7 @@ func assertSealedAdmitRefusals(t *testing.T, h *Host, barrier *testHostBarrier) 
 	}
 }
 
-// TestSealedHostBarrier_RefusesClientWork covers the host-wide barrier: every
-// client entry point returns ErrBarrierSealed up front while it is sealed, and
-// the shard serves again once it is unsealed (#296).
+// TestSealedHostBarrier_RefusesClientWork checks every client entry point returns ErrBarrierSealed while the host barrier is sealed, and serves once unsealed.
 func TestSealedHostBarrier_RefusesClientWork(t *testing.T) {
 	barrier := newTestHostBarrier(1)
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithBarrier(barrier))
@@ -147,8 +145,7 @@ func TestSealedHostBarrier_RefusesClientWork(t *testing.T) {
 	assertSealedAdmitRefusals(t, h, barrier)
 }
 
-// TestSealedShardBarrier_RefusesClientWork covers a per-shard barrier: the
-// shard's own barrier, not a host-wide one, gates its entry points (#296).
+// TestSealedShardBarrier_RefusesClientWork checks a per-shard barrier gates that shard's entry points.
 func TestSealedShardBarrier_RefusesClientWork(t *testing.T) {
 	barrier := newTestHostBarrier(1)
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(),

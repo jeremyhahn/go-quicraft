@@ -1065,10 +1065,7 @@ func TestSafety_ReadIndexRequiresLeaderQuorum(t *testing.T) {
 	}
 }
 
-// TestSafety_ReadIndexResetOnStateChange verifies that pending ReadIndex
-// requests are cleared when the node transitions to follower (e.g., due
-// to a higher term). This prevents stale read states from being resolved
-// after the node is no longer leader.
+// TestSafety_ReadIndexResetOnStateChange verifies pending ReadIndex requests are cleared on becoming a follower.
 func TestSafety_ReadIndexResetOnStateChange(t *testing.T) {
 	r := newTestRaftPreVoteDisabled(1)
 	electLeader(r)

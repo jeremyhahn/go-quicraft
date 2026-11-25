@@ -11,8 +11,7 @@ import (
 	"testing"
 )
 
-// The tests below cover -base, -vuln and -bump (ruling 640): fake git,
-// govulncheck and go get seams over the testdata fixtures.
+// Tests for -base, -vuln and -bump using fake git, govulncheck and go get over the testdata fixtures.
 
 // fakeBase answers GoModAt from memory.
 type fakeBase struct {

@@ -354,26 +354,7 @@ func TestHandleSnapshot_ConcurrentSameIndexReceives(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_RestoredMembershipGovernsLaterReceives pins the contract
-// the test above depends on, and states the half of it that is NOT a bug: a
-// snapshot REPLACES the committed membership, and the replacement — not the
-// configuration that authorized the snapshot carrying it — is what every later
-// receive is judged against.
-//
-// So a sender that ships a configuration no longer naming itself has, by that
-// act, given up its own admission. Refusing it afterwards is the documented
-// fail-closed rule (committedSenderBinding: a replica the configuration does
-// not name at all is a drop), not an ordering defect: the snapshot channel is
-// the one inbound path that rewrites the authorization source, which is exactly
-// why HandleSnapshot re-reads committed membership per receive instead of
-// caching a verdict.
-//
-// The adoption is asynchronous — HandleSnapshot queues the InstallSnapshot to
-// the engine worker and returns — so this waits for it rather than assuming it
-// has landed. That asynchrony is the flake's timing element: a concurrent
-// receive authorized before the adoption passes and one authorized after does
-// not, which is why a same-snapshot fixture must not change the configuration
-// at all.
+// TestHandleSnapshot_RestoredMembershipGovernsLaterReceives verifies a restored snapshot's membership authorizes later receives.
 func TestHandleSnapshot_RestoredMembershipGovernsLaterReceives(t *testing.T) {
 	eng, h, handler := newRoutingHandlerFixture(t)
 
@@ -388,8 +369,7 @@ func TestHandleSnapshot_RestoredMembershipGovernsLaterReceives(t *testing.T) {
 		t.Fatalf("precondition: replica %d must be a committed member before the receive", fromReplicaID)
 	}
 
-	// A configuration that keeps this replica and DROPS the sender — the shape
-	// a snapshot taken after the sender was removed carries.
+	// A configuration that keeps this replica and drops the sender.
 	withoutSender := proto.Membership{
 		Addresses: map[uint64]string{localReplicaID: snapshotPathLocalAddr},
 	}

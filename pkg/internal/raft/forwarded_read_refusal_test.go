@@ -55,11 +55,7 @@ func requireReject(t *testing.T, r *raft, to, key uint64) {
 	}
 }
 
-// TestForwardedRead_RejectIsFreeOrder: while the engine's commit pipeline is
-// busy it transmits only what drainFreeOrderMessages returns, and an unready
-// leader's pipeline is busy for exactly the window its refusals cover. The
-// reject must come out of that drain, not wait in r.msgs for the next
-// GetUpdate (#376).
+// TestForwardedRead_RejectIsFreeOrder: an unready leader's reject leaves through drainFreeOrderMessages.
 func TestForwardedRead_RejectIsFreeOrder(t *testing.T) {
 	r := newTestRaft(1)
 	electLeader(r)

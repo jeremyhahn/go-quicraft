@@ -25,10 +25,7 @@ import (
 	"testing"
 )
 
-// unreferencedExportedErrors lists exported Err* values in errors.go that
-// nothing in pkg returns, each with a one-line reason. An entry is dead API
-// to wire or remove before v1.0.0. The test fails when an entry becomes
-// live or is no longer declared, so the list cannot go stale.
+// unreferencedExportedErrors lists exported Err* values nothing in pkg returns, each with a reason; the test fails when one goes live or is removed.
 var unreferencedExportedErrors = map[string]string{
 	"ErrShardNotStarted":       "listed in temporaryErrors, but every registered-but-not-started path returns ErrShardNotReady; returning this from one of them would split one state over two errors",
 	"ErrSessionLimitExceeded":  "declared for the public API; the session manager returns its own internal sentinel and Host maps a registration refusal to a result code",

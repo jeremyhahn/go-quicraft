@@ -130,14 +130,7 @@ func TestFuzzBudgetsAgreeBetweenTheNightlyAndTheReleaseGate(t *testing.T) {
 	}
 }
 
-// TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry pins the two properties the
-// conversion exists for.
-//
-// A DURATION budget makes Go's coordinator race itself at shutdown and report
-// `context deadline exceeded` with no reproducer — a failure that is not a
-// finding. The old recipe worked around that by retrying and classifying the
-// output, which is a filter on failure: with the deadline gone, a failure with
-// no reproducer should simply be a failure.
+// TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry checks the release fuzz gate uses exec counts, not durations, and no retry.
 func TestReleaseFuzzGateBudgetsByCountAndDoesNotRetry(t *testing.T) {
 	raw, err := os.ReadFile(makefilePath)
 	if err != nil {

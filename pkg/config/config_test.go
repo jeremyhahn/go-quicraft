@@ -261,9 +261,7 @@ func TestConfig_Validate_ObserverWitness(t *testing.T) {
 }
 
 func TestConfig_Validate_SnapshotEntries(t *testing.T) {
-	// Validate accepts a zero because SetDefaults runs first at both entry
-	// points and replaces it; the name says "unset", not "disabled", because
-	// zero no longer means disabled — see TestSetDefaults_SnapshotEntries.
+	// Validate accepts zero because SetDefaults replaces it first.
 	t.Run("zero (unset) passes validation, since SetDefaults resolves it", func(t *testing.T) {
 		c := validConfig()
 		c.SnapshotEntries = 0
@@ -590,20 +588,7 @@ func TestConfig_Validate_MaxProposalPayloadSize(t *testing.T) {
 	})
 }
 
-// TestConfig_SetDefaults_SessionExpiryEntries pins the default that replicating
-// the threshold made safe.
-//
-// Defaulting is safe only because of where the threshold lives: a defaulted
-// threshold read from node-local configuration would make a cluster with one
-// un-upgraded replica expire different sessions and diverge silently. The
-// threshold is seeded into the shard's replicated membership at bootstrap and
-// read from there by the apply path
-// (proto.SessionPolicy), so a replica adopts what its shard committed rather
-// than what its binary defaults to, and the default is the fix for the leak an
-// unexpiring session table represents.
-//
-// The third case is the one that would otherwise be lost: zero can no longer
-// mean "disabled", so disabling has to remain expressible.
+// TestConfig_SetDefaults_SessionExpiryEntries checks the default and that disabling stays expressible; the threshold is replicated, so the default is safe.
 func TestConfig_SetDefaults_SessionExpiryEntries(t *testing.T) {
 	t.Run("SetDefaults fills the documented default", func(t *testing.T) {
 		var c Config

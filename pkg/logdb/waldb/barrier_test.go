@@ -1140,9 +1140,7 @@ func TestAtRestProtection_PlaintextBarrierIsNotEncrypted(t *testing.T) {
 			"observing what it claims to", seg0)
 	}
 
-	// AtRestHostRouted, never AtRestBarrierEncrypted: every record goes through
-	// this one barrier, which the host accepts only as its own host-wide route
-	// (#240), and the bytes on the medium are not encrypted.
+	// AtRestHostRouted, never AtRestBarrierEncrypted: the one barrier is plaintext.
 	if got := db.AtRestProtection(); got != logdb.AtRestHostRouted {
 		t.Fatalf("AtRestProtection() = %v, want %v: the user command is sitting in "+
 			"%s at offset %d in cleartext, and a host that requires at-rest "+

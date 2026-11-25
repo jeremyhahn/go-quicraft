@@ -1281,14 +1281,7 @@ type exitingProposalMetrics struct {
 
 func (m exitingProposalMetrics) ObserveProposalLatency(uint64, time.Duration) { m.exit() }
 
-// TestAppliedProposalsAreAnsweredWhateverTheCollectorDoes: OnApplied claims
-// an applied proposal out of pendingProposals and then completes it. The
-// proposal latency used to be observed between the two, so a collector that
-// called runtime.Goexit left a claimed proposal that no path would ever
-// complete — the apply worker's recovery fails only proposals still pending,
-// and the membership branch's own recovery recognised only a panic. Every
-// claimed caller is now answered before any latency is observed, and a
-// Goexit in the membership branch completes its unanswered tail too.
+// TestAppliedProposalsAreAnsweredWhateverTheCollectorDoes: claimed proposals are answered before latency is observed.
 func TestAppliedProposalsAreAnsweredWhateverTheCollectorDoes(t *testing.T) {
 	cc := proto.ConfigChange{Type: proto.AddNonVoting, ReplicaID: 10, Address: "127.0.0.1:6000"}
 	ccBuf := make([]byte, cc.Size())

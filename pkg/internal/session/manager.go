@@ -547,16 +547,7 @@ func (m *Manager) UnmarshalFrom(r io.Reader) error {
 			stagedOwners[sess.ownerID]++
 		}
 	}
-	// The owner index is REBUILT from the decoded table, never read from the
-	// stream. Recomputing it costs one pass over sessions already in hand and
-	// makes a disagreement between the count and the table unrepresentable —
-	// whereas a persisted count is one more thing a corrupt or truncated
-	// snapshot can get wrong, in a way no bounds check would catch and that
-	// would show up only as registrations refused on one replica.
-	//
-	// It is swapped in alongside sessions, so the same all-or-nothing property
-	// UnmarshalFrom already had covers both: a mid-stream failure leaves the
-	// live table AND its index exactly as they were.
+	// Rebuild the owner index from the decoded table and swap it in with sessions.
 	m.sessions = staged
 	m.ownerCounts = stagedOwners
 	return nil

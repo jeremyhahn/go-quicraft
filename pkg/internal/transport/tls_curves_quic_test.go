@@ -90,15 +90,7 @@ func (cl *curveListener) dial(ctx context.Context) (*quic.Conn, error) {
 	})
 }
 
-// TestHandshakeCurves_QUIC runs the cross-build matrix over the transport's
-// real protocol and asserts the group each pairing lands on, from both ends.
-//
-// It is QUIC rather than the TCP harness on purpose: an ML-KEM-768 key share
-// adds about 1.2 KB, so the ClientHello no longer fits in one Initial packet,
-// and the handshake completing here is quic-go reassembling the CRYPTO frames
-// across packets. wantHRR records which pairings cost a HelloRetryRequest —
-// a standard client's first key share is for X25519MLKEM768, which a FIPS
-// server does not offer, so that direction needs the extra round trip.
+// TestHandshakeCurves_QUIC checks the group each cross-build pairing negotiates over QUIC; wantHRR marks pairings needing a HelloRetryRequest.
 func TestHandshakeCurves_QUIC(t *testing.T) {
 	for _, tc := range []struct {
 		name           string

@@ -123,7 +123,7 @@ compile-time guard and the test that hold this are in
 
 ## From v1.0.0
 
-> **Status: ACKNOWLEDGED BY THE OWNER ON 2026-10-20 (#404), EVERY ANSWER AS
+> **Status: ACKNOWLEDGED (#404), EVERY ANSWER AS
 > WRITTEN.** This section restates what the company conventions already bind
 > for a post-1.0 release. Where the conventions are silent it lists the gap
 > under [Open questions for the owner](#open-questions-for-the-owner) with its
@@ -220,7 +220,7 @@ discipline" consists of; the gaps are open questions 2 to 6 below.
 
 These are gaps in the conventions. Each carries an **answer**: a
 recommendation with its reason and its source, which the owner acknowledged
-as written on 2026-10-20 (#404) and which now binds. Every answer takes the
+as written (#404) and which now binds. Every answer takes the
 strict, simple option that keeps Raft safety,
 the fail-closed decoders and the pinned-format rule intact, and none removes a
 feature.
@@ -236,7 +236,7 @@ confirm*.
    breaking change is MAJOR with a `/vN` path. Does §8 read MAJOR from 1.0, with
    every consumer's walk changing imports to the `/vN` path?
 
-   **Answer (acknowledged 2026-10-20): yes.** From v1.0.0, §8 step 1 reads "bump MAJOR and move
+   **Answer: yes.** From v1.0.0, §8 step 1 reads "bump MAJOR and move
    the module path to `/vN`", and every layer of the walk changes its imports.
    A format bump that keeps the read window of question 2 and the upgrade
    window of question 3 is not a break and ships as MINOR; one that drops
@@ -255,7 +255,7 @@ confirm*.
    sealed-root-key version, how many prior versions must a release still read,
    and for how long?
 
-   **Answer (acknowledged 2026-10-20): exactly one prior MINOR.** A release `N.M.x` reads every
+   **Answer: exactly one prior MINOR.** A release `N.M.x` reads every
    layout that `N.(M-1)` wrote, and nothing older. It writes only its own
    layouts (subject to question 3's gate). A MAJOR may drop the window and
    says so under BREAKING. Data older than the window upgrades by stepping
@@ -275,7 +275,7 @@ confirm*.
    if so, by negotiation or by accepting a fixed window? Today the check is
    exact match and mixed-version clusters are unsupported.
 
-   **Answer (acknowledged 2026-10-20): yes, a rolling upgrade across one MINOR, by a fixed
+   **Answer: yes, a rolling upgrade across one MINOR, by a fixed
    window and never by negotiation.** A release `N.M` accepts both its own
    wire version and `N.(M-1)`'s. It keeps sending the previous version, and
    writing the previous persisted layouts, until a cluster-wide switch is
@@ -297,7 +297,7 @@ confirm*.
    separate offline tool, or by re-sync from upgraded peers, and is a
    migration allowed to be one-way?
 
-   **Answer (acknowledged 2026-10-20): in place, by the library, after the switch of
+   **Answer: in place, by the library, after the switch of
    question 3, and one-way.** The library reads the old layout and writes new
    records, segments and snapshots in the new one. It never rewrites an
    existing file in place: old records age out through compaction and
@@ -313,7 +313,7 @@ confirm*.
 
 5. **Downgrades.** Is any downgrade supported after 1.0?
 
-   **Answer (acknowledged 2026-10-20): only to the previous MINOR, and only before the
+   **Answer: only to the previous MINOR, and only before the
    question 3 switch is committed.** Until then no new layout has been
    written, so a node can be replaced with the release it was upgraded from.
    After the switch, no downgrade: the remedy is to restore a backup or
@@ -327,7 +327,7 @@ confirm*.
    deprecation policy yet; it is an open question there. Does a post-1.0
    exported name get a deprecation window before a MAJOR removes it?
 
-   **Answer (acknowledged 2026-10-20): yes.** A name is marked with a `// Deprecated:` comment
+   **Answer: yes.** A name is marked with a `// Deprecated:` comment
    naming its replacement, in a MINOR release at least one release before the
    MAJOR that removes it, and the CHANGELOG lists it under `### Deprecated`
    (Keep a Changelog 1.1.0, which §5 already adopts). The name stays for the
@@ -343,7 +343,7 @@ confirm*.
    rule continue after 1.0, or does a released layout change bump
    `walFormatVersion` instead?
 
-   **Answer (acknowledged 2026-10-20): the rule continues, extended by the read window.** A
+   **Answer: the rule continues, extended by the read window.** A
    record layout change allocates the next free payload-type byte. The old
    byte is still decoded for the window of question 2, then retired: left
    unallocated, never reused, so a stale record falls through to
@@ -360,7 +360,7 @@ confirm*.
    to public GitHub"; CLAUDE.md pins format versions until "the first stable
    production v1 release". Are these the same event, v1.0.0?
 
-   **Answer (acknowledged 2026-10-20): yes, one event: the `v1.0.0` tag, published to GitHub
+   **Answer: yes, one event: the `v1.0.0` tag, published to GitHub
    with it and not before.** §1a: "a plain `vX.Y.Z` is always production", so
    `v1.0.0` is the first stable production release and every `-rc.N` and
    `-alpha` before it stays pre-release. *Why:* if the module were pushed to

@@ -380,8 +380,7 @@ func (sr *snapshotReceiver) reservePeerMemory(peerKey string, n int64) bool {
 	return true
 }
 
-// releasePeerMemory returns n previously-charged bytes to a peer identity's
-// memory sub-budget.
+// releasePeerMemory returns n charged bytes to peerKey's memory budget.
 func (sr *snapshotReceiver) releasePeerMemory(peerKey string, n int64) {
 	if peerKey == "" || sr.maxPerPeerMemory <= 0 {
 		return
@@ -630,10 +629,7 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 	// correction from inflating the reported transfer size.
 	var totalBytes, charged int64
 
-	// Ensure all accumulated memory budget is restored on every exit path.
-	// Without this defer, early returns leak the budget for previously
-	// received chunks whose bytes were reserved but never returned to the
-	// atomic budget counter.
+	// Restore all reserved memory on every exit.
 	defer func() {
 		if charged > 0 {
 			sr.releaseChunkMemory(peerKey, charged)

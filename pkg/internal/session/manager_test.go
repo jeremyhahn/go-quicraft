@@ -1011,12 +1011,7 @@ func TestUnmarshalFrom_BoundsCheckDataLen(t *testing.T) {
 
 }
 
-// TestUnmarshalFrom_Uint32CountsAtMaxRejectedUntruncated pins the bounded
-// behaviour of every uint32 count the snapshot decoder reads (#760): at the
-// top of the uint32 range each is widened to uint64 before it is compared,
-// rejected with a BoundsError carrying the full value, and the rejection
-// leaves the manager empty. A narrowing (to int or a smaller type) before
-// the comparison would show up here as a truncated Value or an allocation.
+// TestUnmarshalFrom_Uint32CountsAtMaxRejectedUntruncated verifies every uint32 count is widened before its bound check.
 func TestUnmarshalFrom_Uint32CountsAtMaxRejectedUntruncated(t *testing.T) {
 	const maxU32 = ^uint32(0)
 	u32 := func(buf *bytes.Buffer, v uint32) {

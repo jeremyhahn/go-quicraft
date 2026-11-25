@@ -78,8 +78,7 @@ func TestPendingConfig_FollowsTheLog(t *testing.T) {
 		t.Fatal("PublishPendingConfig rebuilt the view although nothing moved")
 	}
 
-	// Truncated by a conflicting append: the entry at 2 is replaced, so 4 is
-	// no longer admitted by this log; the replacement admits 7 instead.
+	// A conflicting append replaces the entry at 2, so 4 is no longer admitted and 7 is.
 	if _, ok, _, err := l.tryAppend(1, 1, []proto.Entry{addNodeEntry(t, 2, 2, 7, "spki:7")}); err != nil || !ok {
 		t.Fatalf("tryAppend: ok=%v err=%v", ok, err)
 	}

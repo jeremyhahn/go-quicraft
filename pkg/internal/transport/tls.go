@@ -57,17 +57,7 @@ type tlsPair struct {
 	leaf *x509.Certificate
 }
 
-// parseCACertificates parses every CERTIFICATE block in a PEM CA bundle and
-// returns the candidates that can act as an issuing CA. The full bundle is
-// required because TLS verification consumes all of it
-// (pool.AppendCertsFromPEM), so revocation checking must be able to select
-// the same issuer the peer's leaf was actually signed by — in a root +
-// issuing-intermediate PKI that is never the bundle's first block.
-//
-// It fails fast when the bundle contains no block that could issue a
-// certificate: with no usable issuer, OCSP requests would name the wrong CA
-// (a permanent silent no-op under soft-fail, a total handshake outage under
-// enforcement) and every CRL signature check would fail.
+// parseCACertificates returns every certificate in a PEM CA bundle that can act as an issuer, failing when none can.
 func parseCACertificates(caPEM []byte) ([]*x509.Certificate, error) {
 	var issuers []*x509.Certificate
 	rest := caPEM

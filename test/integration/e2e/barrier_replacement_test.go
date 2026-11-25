@@ -24,11 +24,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestE2E_Barrier_ReplaceNode verifies that a follower in a 3-node
-// encrypted barrier cluster can be stopped, removed from the membership,
-// and replaced by a new node with an independent barrier. The replacement
-// node must catch up on all previously committed data via encrypted
-// replication and then continue accepting new proposals.
+// TestE2E_Barrier_ReplaceNode replaces a follower of a 3-node encrypted cluster with a node on a new barrier, which catches up and keeps accepting proposals.
 func TestE2E_Barrier_ReplaceNode(t *testing.T) {
 	cluster := newBarrierTestCluster(t, 3)
 	defer cluster.close()

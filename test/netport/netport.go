@@ -62,7 +62,7 @@
 //	two SO_REUSEADDR binds on 127.0.0.1:39651 BOTH SUCCEEDED
 //	datagram delivered to: second
 //
-// That silent split is why the transport no longer sets it.
+// That silent split is why the transport does not set it.
 //
 // # Measured
 //

@@ -213,7 +213,7 @@ func TestTransferBudget_DerivedFromDeclaredWork(t *testing.T) {
 	const ratePerSec = 256 * 1024 * 1024
 	sr := newSnapshotReceiver(4, 1<<30, ratePerSec, 0, newTestHandler())
 
-	// The cheapest possible declaration no longer buys the absolute ceiling.
+	// The cheapest declaration does not buy the ceiling.
 	small := sr.transferBudget(1)
 	if small != minSnapshotTransferDuration {
 		t.Fatalf("budget for a 1-chunk declaration = %v, want %v", small, minSnapshotTransferDuration)

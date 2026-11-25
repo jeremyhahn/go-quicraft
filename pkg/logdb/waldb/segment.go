@@ -1091,11 +1091,7 @@ func (s *segment) DiscardPending(cleanFileOffset int64, cleanBlockOffset int, cl
 		}
 	}
 
-	// Restore the open block's pre-batch content. If the failed batch sealed a
-	// block (padAndFlushBlock) the in-memory blockBuf was reused for a later
-	// block and no longer holds the checkpoint block, so reload the pre-batch
-	// tail from disk where the previous successful Sync left it. (After the
-	// truncate above, [cleanFileOffset : cleanEnd] is exactly that tail.)
+	// Reload the open block's pre-batch content from disk.
 	if cleanBlockOffset > 0 {
 		if _, err := s.f.ReadAt(s.blockBuf[:cleanBlockOffset], cleanFileOffset); err != nil {
 			return &SegmentDiscardError{SegmentID: s.id, Err: err}

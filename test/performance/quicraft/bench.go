@@ -113,10 +113,7 @@ func (c *BenchCluster) Leader() *quicraft.Host {
 	return c.Hosts[c.LeaderIdx]
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. A port
-// reserved up front and bound later can be taken by a concurrent job that
-// shares the network but not the reservation's lock directory (#386); a host
-// that binds port 0 holds its port from the moment it exists.
+// kernelAddr binds a host on a kernel-assigned loopback port, held from the moment the host exists.
 const kernelAddr = "127.0.0.1:0"
 
 // boundMembers reads each host's bound address back and builds the initial

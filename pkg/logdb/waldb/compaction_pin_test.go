@@ -78,19 +78,7 @@ func TestRemoveEntriesTo_PinsCompactionMarkerSegment(t *testing.T) {
 	}
 }
 
-// TestCompactionMarkerSurvivesGarbageCollection drives the compaction-marker pin
-// END TO END, which TestRemoveEntriesTo_PinsCompactionMarkerSegment above does
-// not: that test asserts the pin FIELD is set but never calls Compact, so the
-// branch in addMetaSegmentsToLive that actually keeps GC away from the marker's
-// segment was completely uncovered — deleting it left the whole suite green.
-//
-// The hazard it guards is a durability one, and it FAILS OPEN. The compaction
-// floor lives only in that marker record, while its effect (the entries being
-// unlinked) is irreversible. If GC reclaims the segment, the next restart
-// recovers compactedTo=0 over a log whose prefix is physically gone: reads below
-// the real floor then return ErrLogGapDetected instead of ErrCompacted, so raft
-// never falls back to InstallSnapshot, and the monotonic floor guard no longer
-// holds because the floor regressed to zero.
+// TestCompactionMarkerSurvivesGarbageCollection checks GC keeps the compaction marker's segment end to end.
 func TestCompactionMarkerSurvivesGarbageCollection(t *testing.T) {
 	dir := t.TempDir()
 	const shardID, replicaID = uint64(1), uint64(1)

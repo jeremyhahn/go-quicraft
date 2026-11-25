@@ -1,24 +1,4 @@
-//! Benchmark scenarios for single-node and multi-node OpenRaft clusters.
-//!
-//! All scenarios are **time-based**: they run continuously for the specified
-//! `Duration` and report ops/sec plus latency percentiles.  This matches Go's
-//! `testing.B` auto-calibration and ensures fair cross-system comparisons.
-//!
-//! Single-node scenarios come in two flavours:
-//!   - `*_memory`  -- in-memory storage, no-op network (framework overhead only)
-//!   - `*_wal`     -- 16-shard disk WAL with parallel fsync, no-op network
-//!
-//! Multi-node scenarios use a real TCP+TLS transport over loopback with a
-//! 16-shard disk WAL and are labelled `*_{n}n_wal`.
-//!
-//! There is no single-node election scenario. A single-node OpenRaft group
-//! cannot hold a timeout-driven election: `Raft::initialize` campaigns at
-//! once, and a node that restarts as the only voter skips the election
-//! timeout by design (`RaftCore::handle_tick_election`, "this is the only
-//! voter, do election at once"), or resumes leadership outright if its vote
-//! was committed. Rather than measure a different thing under the same
-//! name, `election_memory` and `election_wal` are left out of the result
-//! map, which perfresult renders as N/A and excludes from head-to-head.
+//! Time-based benchmark scenarios for single- and multi-node OpenRaft clusters: *_memory, *_wal and *_{n}n_wal; there is no single-node election scenario.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -68,18 +48,7 @@ type BenchRaft = Raft<TypeConfig>;
 
 // ── single-node bootstrap ───────────────────────────────────────────────────
 
-/// Start a single-node group on `log_store`, make it leader with
-/// `Raft::initialize`, and wait until it reports itself leader.
-///
-/// Tick-driven election is disabled until leadership is established. A sole
-/// voter that is still a candidate re-elects on EVERY tick, without waiting
-/// out an election timeout (`RaftCore::handle_tick_election`, "this is the
-/// only voter, do election at once"); with the pinned 7 ms internal tick, any
-/// `save_vote` slower than a tick (the WAL store's vote write is
-/// write + fsync + rename + directory fsync) supersedes each candidacy
-/// before it is persisted and the node never becomes leader. `initialize`
-/// campaigns directly, so the ticker's election is not needed here, and it
-/// is re-enabled once the node leads. Single-node setups are never timed.
+/// Start a single-node group, initialize it and wait until it leads, with tick-driven election disabled until then.
 async fn start_single_node<LS>(log_store: LS, state_machine: MemStateMachine) -> BenchRaft
 where
     LS: RaftLogStorage<TypeConfig>,
@@ -161,9 +130,7 @@ fn build_result(ops: usize, total_ns: u64, mut recorder: LatencyRecorder) -> Sce
     }
 }
 
-// =============================================================================
-// SINGLE-NODE: MEMORY
-// =============================================================================
+// Single-node: memory.
 
 pub async fn bench_propose_sequential(duration: Duration, payload_size: usize) -> ScenarioResult {
     let raft = boot_single_node().await;
@@ -248,9 +215,7 @@ pub async fn bench_commit_latency(duration: Duration, payload_size: usize) -> Sc
     result
 }
 
-// =============================================================================
-// SINGLE-NODE: WAL (16-shard WAL with parallel fsync)
-// =============================================================================
+// Single-node: WAL (16-shard WAL with parallel fsync).
 
 pub async fn bench_propose_sequential_wal(duration: Duration, payload_size: usize) -> ScenarioResult {
     let raft = boot_single_node_wal().await;
@@ -335,9 +300,7 @@ pub async fn bench_commit_latency_wal(duration: Duration, payload_size: usize) -
     result
 }
 
-// =============================================================================
-// MULTI-NODE: WAL (TCP+TLS + 16-shard WAL)
-// =============================================================================
+// Multi-node: WAL (TCP+TLS and 16-shard WAL).
 
 pub async fn bench_election_cluster(duration: Duration, num_nodes: usize) -> ScenarioResult {
     let mut recorder = LatencyRecorder::new(RECORDER_CAP);

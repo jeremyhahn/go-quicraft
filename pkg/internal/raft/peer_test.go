@@ -2382,11 +2382,7 @@ func TestPeer_LeaderStepsDown_WhenRemovedFromConfig(t *testing.T) {
 		LogIndex: lastIdx,
 	})
 
-	// Run the update cycles: the first persists the config change entry
-	// (its durable leader match completes the quorum with the ack above),
-	// and a follow-up cycle surfaces it as committed. The Commit that
-	// carries the committed config change calls checkLeaderSelfRemoval,
-	// which steps the leader down since it is no longer in membership.
+	// Run update cycles until the config change is persisted and committed.
 	if !p.HasUpdate(0) {
 		t.Fatal("expected HasUpdate to be true")
 	}
@@ -3002,7 +2998,7 @@ func TestPeer_IsMember_SnapshotRestore(t *testing.T) {
 	if !p.IsMember(43) {
 		t.Fatal("expected replica 43 to be member after snapshot restore")
 	}
-	// Old members should no longer be members (unless snapshot includes them).
+	// Old members are no longer members unless the snapshot includes them.
 	if p.IsMember(1) {
 		t.Fatal("expected replica 1 to not be member after snapshot restore with different membership")
 	}
@@ -4067,8 +4063,7 @@ func TestPeer_DrainFreeOrderMessages_AllOrderedReturnsNil(t *testing.T) {
 	ms := threeNodeMembership()
 	p := newTestPeer(t, cfg, proto.State{}, ms)
 
-	// Populate with only ordered messages. HeartbeatResp is left out: it
-	// is free-order here, the hard state being unchanged (#390).
+	// Only ordered messages; HeartbeatResp is free-order here.
 	p.r.msgs = append(p.r.msgs,
 		proto.Message{Type: proto.ReadIndexResp, To: 2},
 		proto.Message{Type: proto.ReplicateResp, To: 3},
@@ -4627,7 +4622,7 @@ func TestPeer_ProposeConfigChange_BlockedDuringLeaderTransfer(t *testing.T) {
 		t.Fatalf("expected transferTarget to be noNode after timeout, got %d", p.r.transferTarget)
 	}
 
-	// Config change should now succeed since transfer is no longer active.
+	// The config change succeeds once the transfer ends.
 	err = p.ProposeConfigChange(cc)
 	if err != nil {
 		t.Fatalf("config change should succeed after transfer timeout: %v", err)
@@ -4665,15 +4660,7 @@ func TestPeer_SyncRaftRemotes_ClearsTransferTargetOnRemoval(t *testing.T) {
 		t.Fatalf("expected transferTarget 2, got %d", p.r.transferTarget)
 	}
 
-	// Remove the transfer target (node 2) via config change.
-	// ProposeConfigChange applies the membership change immediately,
-	// which triggers syncRaftRemotes. This should clear the transfer
-	// state since the target is no longer in the cluster.
-	//
-	// We need to clear the transfer state first to allow the proposal,
-	// because handleLeaderPropose rejects during active transfer. So
-	// instead, directly manipulate the membership and call syncRaftRemotes
-	// to test the fix in isolation.
+	// Removing the transfer target through a config change clears the transfer.
 	p.membership.apply(proto.ConfigChange{
 		Type:      proto.RemoveNode,
 		ReplicaID: 2,
@@ -4958,11 +4945,7 @@ func TestPeer_SyncRaftRemotes_WitnessAckNotDeletedByCleanup(t *testing.T) {
 	}
 }
 
-// TestPeer_InvalidateLease_EndsTheLeaseUntilAFreshRound is the call the
-// engine makes when it parks a shard whose log write a sealed barrier refused
-// (#296): the parked leader stops heartbeating and may be deposed while it
-// waits, so on release it must not serve a LeaseRead from acks it collected
-// before — not even from a late ack for a round it sent before the hold.
+// TestPeer_InvalidateLease_EndsTheLeaseUntilAFreshRound verifies InvalidateLease ends the lease until a fresh heartbeat round.
 func TestPeer_InvalidateLease_EndsTheLeaseUntilAFreshRound(t *testing.T) {
 	cfg := testConfigWithID(1, 1)
 	cfg.PreVote = config.BoolPtr(false)

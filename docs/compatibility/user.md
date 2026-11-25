@@ -136,8 +136,8 @@ it accepts by version and then misreads.
 
 Everything above describes the pre-release policy. The policy from the first
 stable release, with the answer to each open question, is in
-[architecture.md](architecture.md#from-v100). The owner acknowledged it on
-2026-10-20 (#404); until v1.0.0 ships, plan an upgrade as described above.
+[architecture.md](architecture.md#from-v100). It is acknowledged
+(#404); until v1.0.0 ships, plan an upgrade as described above.
 
 ## Bootstrapping and growing a cluster
 

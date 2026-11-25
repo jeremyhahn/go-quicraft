@@ -22,82 +22,15 @@ package proto
 //	[Filepath:len+data][FileSize:8]
 //	[OnDiskIndex:8][Epoch:8][Compression:8]
 //
-// # The removed Imported field
+// An empty Filepath marks a metadata-only snapshot (a witness target, or a
+// state machine that saved nothing); every consumer acts on whether there is
+// payload to stream. The state machine kind is a property of the local process,
+// not of the snapshot.
 //
-// Imported rode this layout and was read by NOTHING outside marshal, unmarshal,
-// IsEmpty and Reset. It had exactly one writer, and that writer set it from the
-// save request's `exported` flag: it recorded "this save is an EXPORT", which is
-// close to the OPPOSITE of what the field's name and doc comment claimed. A
-// field that is written wrongly and read nowhere is worse than an absent one,
-// because the next reader to want the fact takes it and gets the wrong answer.
-//
-// If a wire-level statement that a snapshot was imported is wanted later — an
-// imported snapshot is one whose membership may have been rewritten by a
-// disaster-recovery override, which is genuinely worth knowing — it must arrive
-// with its consumer in the same change, and with a logdb.Snapshot counterpart so
-// it survives a restart.
-//
-// # The removed Type field
-//
-// Type claimed to name the state machine kind (regular/concurrent/on-disk) and
-// had NO writer anywhere in the repository: it was zero on every snapshot ever
-// produced, while both MarshalTo and UnmarshalFrom spent a comparison
-// validating it against maxStateMachineType — a range check on a value no code
-// path could set. The kind of state machine a shard runs is a property of the
-// LOCAL process (it is chosen by the StateMachineFactory the host was
-// constructed with, and logdb.Bootstrap already records it durably), not of an
-// artifact streamed from a peer, so there is no reader for it to grow either.
-// Removing it orphaned maxStateMachineType in constants.go and
-// InvalidSnapshotTypeError in errors.go, which went with it.
-//
-// # The removed Witness field
-//
-// Witness WAS written — sendSnapshot set it in the same three-line branch that
-// cleared Filepath and zeroed FileSize when the target was a witness — and read
-// by nothing. It is not merely unused but redundant: an empty Filepath is
-// ALREADY the repository-wide discriminator for a metadata-only snapshot
-// (forEachSnapshotChunk branches on it to emit the single empty chunk, and
-// recoverLogReader documents that leaving Filepath empty is what turns a
-// replica into a state eraser), so a second, independently-settable statement
-// of the same fact could only ever be a way for the two to disagree.
-//
-// Empty Filepath is deliberately the WIDER predicate: it also covers a state
-// machine that genuinely saved nothing. That is the right shape here, because
-// every consumer acts on "is there payload to stream", not on "was the peer a
-// witness". The one question Witness could have answered that Filepath cannot —
-// a stripped snapshot arriving at a replica that does not consider itself a
-// witness — is a role disagreement, and the raft role-mismatch check
-// (checkSelfRole) owns that, working from replicated membership rather than
-// from a flag the sender chooses.
-//
-// # The removed Checksum field
-//
-// This type carried a `Checksum []byte` through an earlier pre-release layout.
-// It was decoded,
-// bounded, bulk-copied out of the pooled receive buffer and propagated through
-// the whole transfer pipeline — and it was NEVER computed and NEVER verified,
-// anywhere in the repository. Nothing wrote it, so it was empty on every real
-// snapshot, and the receive path paid one allocation and two copies per message
-// to keep an empty slice alive.
-//
-// It was removed rather than implemented, at the format freeze, for one reason
-// that outweighs the cost of a future format break if a real one is wanted: a
-// field named Checksum that rides the wire and is never checked reads as an
-// integrity control to anyone auditing this format, and an integrity control
-// that does not exist is worse than an absent one. Populating it properly is
-// also not a codec change — the value has to be computed over the FINAL artifact
-// bytes (post-compression, post-encryption), stamped where the artifact is
-// produced, and verified in three separate consumers (recovery, streamed
-// receive, ImportSnapshot). Wiring one of those and not the others reproduces
-// exactly the state being removed, so it belongs in its own change with its own
-// tests, not as a side effect of a layout revision.
-//
-// What snapshot integrity rests on meanwhile, stated plainly: TLS in transit,
-// and barrier AEAD at rest. A shard configured with a PLAINTEXT barrier
-// (seal.None) therefore has NO at-rest integrity check on its snapshot
-// artifacts — silent bit rot or a truncated artifact is recovered into the state
-// machine. That was equally true while the field existed; removing it makes the
-// gap visible instead of apparently covered.
+// The format carries no checksum. Snapshot integrity rests on TLS in transit
+// and barrier AEAD at rest, so a shard configured with a plaintext barrier
+// (seal.None) has no at-rest integrity check on its snapshot artifacts: silent
+// bit rot or a truncated artifact is recovered into the state machine.
 type Snapshot struct {
 	// ShardID identifies the Raft shard this snapshot belongs to.
 	ShardID uint64

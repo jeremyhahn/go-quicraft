@@ -54,15 +54,7 @@ func recoveryRedriveBackoff(rejected int) time.Duration {
 	return min(backoff, recoveryRedriveMaxBackoff)
 }
 
-// recoveryRedrive is a node's re-drive state for rejected snapshot recoveries.
-// The snapshot pool records each rejection (reject) and clears the state on a
-// recovery that completes, or once the node is no longer holding entries
-// (reset); the step worker, which alone can tell whether the node is still
-// holding entries, claims the attempt and re-queues the recovery once the
-// backoff has elapsed (due, claim), and re-arms after another backoff when the
-// pool cannot admit it (deferred).
-// It lives on the Node, so a restarted shard — a new Node — starts with none.
-// The zero value is ready to use.
+// recoveryRedrive is a node's re-drive state for rejected snapshot recoveries: the pool records rejections, the step worker claims and re-queues. The zero value is ready to use.
 type recoveryRedrive struct {
 	mu sync.Mutex
 	// rejected counts the attempts rejected in the current holding episode,
@@ -130,8 +122,7 @@ func (r *recoveryRedrive) claim() {
 	r.armed.Store(false)
 }
 
-// reset forgets every rejected attempt: a recovery completed, or the node is
-// no longer holding entries for one.
+// reset forgets every rejected attempt.
 func (r *recoveryRedrive) reset() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -152,15 +143,7 @@ func adoptedSnapshotIndex(node *Node) (uint64, bool) {
 	return processed, processed > node.LastApplied()
 }
 
-// settleRejectedRecovery records a recovery rejected before the state machine
-// restore began with cause, and reports whether the rejection exhausted the
-// attempts, in which case it has failed the shard with a
-// *SnapshotRecoveryExhaustedError wrapping cause and naming the snapshot the
-// last attempt was made against, and the caller must not also report the
-// rejection. A node no longer holding entries for an adopted
-// snapshot owes no recovery, so its state is cleared and nothing is re-driven.
-// The caller holds the node's write lease, so a failure cannot land on a later
-// incarnation of the shard.
+// settleRejectedRecovery records a rejected recovery and reports exhaustion, having failed the shard with *SnapshotRecoveryExhaustedError; the caller holds the write lease.
 func (p *snapshotPool) settleRejectedRecovery(req snapshotRequest, cause error) (exhausted bool) {
 	index, holding := adoptedSnapshotIndex(req.node)
 	if !holding {
@@ -182,19 +165,7 @@ func (p *snapshotPool) settleRejectedRecovery(req snapshotRequest, cause error) 
 	return true
 }
 
-// redriveRecovery re-queues a rejected snapshot recovery for node once its
-// backoff has elapsed, through the same request path a snapshot receive uses.
-// It runs on the step worker with exclusive Peer access, which is what lets it
-// read snapshotAdoptionPending: a node that is no longer holding entries owes
-// no recovery and has its re-drive state cleared. A node whose snapshot slot
-// is busy (a save, or a recovery already queued) is retried on a later cycle.
-// A re-drive the pool cannot admit (its request queue is full) is re-armed
-// after a backoff, consumes no attempt and reports nothing: it is scheduling,
-// not an attempt, and publishing a rejection for each retry would flood the
-// listener queue a terminal event must get through. Each real attempt is
-// reported by its own outcome. It starts no goroutine and no timer: the step
-// worker's own cycles, which run on every tick, are the clock, so a node that
-// stops simply stops being visited.
+// redriveRecovery re-queues a rejected recovery after its backoff, on the step worker; a busy slot or full pool queue is retried later without consuming an attempt.
 func (w *stepWorker) redriveRecovery(node *Node) {
 	if w.snapshots == nil || !node.redrive.pending() {
 		return

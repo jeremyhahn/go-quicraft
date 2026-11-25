@@ -1301,73 +1301,7 @@ func (b *Barrier) claimLoadGenerationLocked(rootKey []byte) error {
 	return nil
 }
 
-// resolveInvocationBudget re-establishes a SOUND NIST SP 800-38D invocation
-// budget after an unseal whose epoch this process did not create. The caller
-// must hold b.mu.
-//
-// The problem it solves: with random 96-bit nonces the 2^32 invocations per DEK
-// is a hard nonce-collision bound (probability below 2^-32), not advice, and the
-// default in-memory counter does not survive a restart. After loading a
-// persisted blob the count already spent under that epoch is not merely unknown
-// — it is UNKNOWABLE, because nothing on disk records it.
-//
-// The previous behaviour seeded the counter to the rotation threshold (95%),
-// leaving 5% — over 2x10^8 encryptions — of headroom "until rotation
-// completes". That headroom was re-granted in full on EVERY restart against the
-// SAME DEK, so ~20 restarts of a deployment that never rotates (and one with no
-// StatePersister provably cannot rotate: Rotate fails closed with
-// ErrNoStatePersister) push the DEK past 2^32 invocations. A GCM nonce collision
-// there yields keystream XOR and recovery of the GHASH authentication key, i.e.
-// arbitrary forgery of at-rest records.
-//
-// An unprovable budget therefore buys nothing, and the barrier takes one of two
-// sound paths instead:
-//
-//   - A fresh epoch, when it can be made durable. Rotating derives a new DEK
-//     whose count genuinely starts at zero, which is the only way to keep
-//     encrypting with a bound anyone can defend. The rotation is performed HERE,
-//     inside Unseal and under the same write lock, rather than left to the
-//     embedder's rotation loop: a loop that reacts a tick later leaves a window
-//     in which writes land on the exhausted DEK, and an embedder without such a
-//     loop leaves it open forever.
-//   - Otherwise, fail closed. The counter is seeded to the FULL limit, so every
-//     Encrypt returns ErrInvocationLimitExceeded until the epoch is rotated,
-//     while Decrypt keeps working — a node with no persister can still read and
-//     serve its data, it just cannot add to a key whose remaining budget it
-//     cannot prove.
-//
-// WHAT THE FRESH EPOCH ASSUMES — SINGLE-WRITER OWNERSHIP OF THE BLOB. The
-// rotation above yields a DEK whose count starts at a provable zero for THIS
-// process. It says nothing about any other process. Every input to
-// deriveDEK — root key, salt, deployment ID, epoch — comes from the loaded
-// blob, and the epoch it rotates to is a pure function of the loaded one
-// (epoch+1), so TWO barriers that load the same blob derive the SAME new DEK,
-// each with a zeroed invocation counter and an empty nonce tracker. That is the
-// duplicate-key-with-reset-counter condition the whole invocation cap exists to
-// prevent: n writers each spend up to the full 2^32 budget against one key,
-// and neither tracker can see the other's nonces.
-//
-// The LOAD-GENERATION FENCE is what makes that state detectable rather than
-// silent: each Unseal claims the blob by writing back LoadGeneration + 1, and a
-// barrier that is later handed a blob naming a higher generation fails closed
-// with ErrBarrierSuperseded. See claimLoadGenerationLocked for what the fence
-// detects and — importantly — what it does not: it is checked at load and
-// enforced at write/encrypt, never polled, so it turns a silently shared DEK
-// into a loud failure at the next load rather than at the instant of sharing.
-//
-// The fence does not make the barrier self-sufficient. Two loaders that read
-// the same generation before either writes both claim the same number.
-// BarrierConfig.MinEpoch does not close that either — it is a floor against
-// REPLAY of an older blob, and this hazard needs no rollback at all — and
-// StateMAC cannot, because both copies are authentic. Exclusive ownership of
-// the blob remains the embedder's to guarantee; see the StatePersister
-// contract in barrier_config.go.
-//
-// ctx is Unseal's. The forced rotation runs on context.WithoutCancel(ctx): by
-// the time it is reached the barrier is already unsealed, so the caller's
-// cancellation can no longer abort the unseal it was bounding, and a rotation
-// cut short here would only leave encryption refused under an unprovable
-// budget. It keeps ctx's values and drops its deadline and cancellation.
+// resolveInvocationBudget rotates to a fresh epoch when it can persist, else fails encryption closed, since a loaded epoch's spent budget is unknowable. The caller must hold b.mu.
 func (b *Barrier) resolveInvocationBudget(ctx context.Context) {
 	if b.invocations == nil || !b.invocations.IsEnabled() {
 		// Counting is off by configuration (InvocationLimit == -1). The
@@ -1907,20 +1841,7 @@ func epochAAD(epoch uint64) []byte {
 	return aad[:]
 }
 
-// aadForEpoch composes the AEAD Additional Authenticated Data from the epoch and
-// an OPTIONAL caller-supplied context. The context lets a caller additionally
-// bind a ciphertext frame to its position or artifact (e.g. a snapshot's
-// SnapshotIndex||ChunkSeq or a WAL segment's SegmentID||RecordSeq), so two frames
-// sealed under the same DEK+epoch no longer authenticate identically and cannot
-// be reordered, spliced, or truncated by an at-rest attacker.
-//
-// The epoch always occupies the fixed 8-byte little-endian prefix and the context
-// is appended after it, so the epoch/context boundary is unambiguous: because the
-// epoch is a fixed width, no context value can shift or alias the epoch bytes.
-//
-// A nil or empty context returns EXACTLY epochAAD(epoch) — the same bytes the
-// epoch-only path uses — so context-free ciphertext produced by Encrypt/Decrypt
-// stays byte-compatible and existing callers and stored ciphertext are unaffected.
+// aadForEpoch returns epochAAD(epoch) followed by the optional context; an empty context gives exactly epochAAD(epoch).
 func aadForEpoch(epoch uint64, contextAAD []byte) []byte {
 	if len(contextAAD) == 0 {
 		return epochAAD(epoch)
@@ -2029,13 +1950,7 @@ func (b *Barrier) encryptLocked(dst, plaintext []byte, epoch uint64, aead cipher
 	ciphertextStart := payloadStart + wireNonceSize
 	aead.Seal(out[ciphertextStart:ciphertextStart], nonce, plaintext, aad) // #nosec G407 -- nonce is random, not hardcoded
 
-	// A module-nonce AEAD only reveals its nonce after the fact, as the leading
-	// bytes of its own output, so reuse detection runs here instead of before
-	// the Seal. The check is still fail-closed — a reused nonce returns the
-	// error and the ciphertext never reaches the caller — but it can no longer
-	// prevent the AEAD invocation that produced it, only refuse to hand it out.
-	// That is the correct trade: the alternative is a caller-chosen IV, which is
-	// the violation this construction exists to remove.
+	// A module-nonce AEAD reveals its nonce only in its output, so reuse is checked after Seal and the ciphertext withheld.
 	if wireNonceSize == 0 && b.nonceTracker != nil {
 		n := b.config.Algorithm.NonceSize()
 		if n > 0 && len(out) >= payloadStart+n {
@@ -2488,7 +2403,7 @@ func (b *Barrier) rotateLocked(ctx context.Context) (uint64, error) {
 	// under the held write lock. After this point the NEW key is active and the
 	// rotation has succeeded; the trackers below are reset against the new epoch.
 	b.epoch = newEpoch
-	// An epoch above the first now exists; Reset may no longer drop the floor.
+	// An epoch above the first exists; Reset may no longer drop the floor.
 	b.firstBoot = false
 	b.currentDEK = dekPK
 	b.cipher = aead
@@ -2558,10 +2473,7 @@ func (b *Barrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, 
 		return 0, ErrBarrierSealed
 	}
 
-	// Purging writes the reduced state through the persister, so a superseded
-	// barrier is refused here for the same reason as in rotateLocked — and with
-	// an extra edge: it would retire DEKs on behalf of a blob it no longer
-	// owns, for epochs the current owner may still be reading.
+	// A superseded barrier must not purge.
 	if b.superseded.Load() {
 		return 0, ErrBarrierSuperseded
 	}
@@ -2620,22 +2532,7 @@ func (b *Barrier) PurgeEpochsBefore(ctx context.Context, minEpoch uint64) (int, 
 	}
 
 	for _, epoch := range purgeable {
-		// Destroy the purged epoch's key enclave and drop its AEAD.
-		//
-		// What this guarantees, stated the same way seal() states it:
-		// Sealed.Destroy WIPES the epoch's sealed DEK, so that copy is
-		// gone rather than merely unreachable. Deleting b.ciphers[epoch] is still only a reference drop:
-		// the cipher.AEAD holds a verbatim copy of the DEK in its key schedule
-		// (x/crypto's ChaCha20-Poly1305 keeps `key [32]byte`; AES-GCM keeps the
-		// expanded round keys, from which the key is recoverable), and neither
-		// stdlib nor x/crypto offers a key-wipe API.
-		//
-		// So purge is still a CAPABILITY revocation rather than crypto-shredding:
-		// after it returns the barrier can no longer decrypt the epoch, but DEK
-		// confidentiality against memory disclosure (a core dump, a live process
-		// read) remains GC-bounded through the cipher cache. Restructuring that
-		// cache to hold wipeable key material is a hot-path change and is
-		// deliberately not made here.
+		// Destroy the epoch's sealed DEK and drop its AEAD; the AEAD's key schedule copy lasts until GC.
 		releaseSealed(b.deks[epoch], "purged epoch DEK")
 		delete(b.deks, epoch)
 		delete(b.ciphers, epoch)
@@ -2742,7 +2639,7 @@ func (b *Barrier) IsSealed() bool {
 //
 // It lets a writer whose write the barrier refused with ErrBarrierSealed wait
 // for the unseal instead of polling IsSealed; the engine parks a shard's
-// refused log write on it (#296).
+// refused log write on it.
 func (b *Barrier) UnsealedC() <-chan struct{} {
 	b.notifyMu.Lock()
 	defer b.notifyMu.Unlock()
@@ -2992,14 +2889,7 @@ func cloneSealedRootKey(src *SealedRootKey) *SealedRootKey {
 // two derivations share a root key and must never share an output.
 const sealedStateMACInfo = "quicraft/barrier/state-mac/v1"
 
-// sealedStateMACVersion is the version byte of the canonical encoding the MAC
-// is computed over. It is the first byte fed to the HMAC, so extending the
-// covered field set later produces unrelated tags rather than an ambiguous
-// re-parse of the same bytes.
-//
-// v2 added LoadGeneration to the covered set. The value 1 is retired and never
-// reallocated: a blob tagged under the v1 encoding no longer authenticates and
-// is refused with ErrSealedStateUnauthenticated, like any other wrong tag.
+// sealedStateMACVersion is the version byte of the MAC's canonical encoding, fed first to the HMAC; version 1 is retired.
 const sealedStateMACVersion byte = 2
 
 // previousSealedStateMACVersion is the second member of the closed read window
@@ -3377,25 +3267,7 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 		return &AlgorithmMismatchError{Sealed: sealed.Algorithm, Configured: b.config.Algorithm}
 	}
 
-	// THE LOAD-GENERATION FENCE, checked last so that a malformed or foreign
-	// blob is rejected on its own merits first and cannot poison a healthy,
-	// running barrier with a fabricated generation.
-	//
-	// A generation above this barrier's own claim means another loader has taken
-	// this sealed state since this barrier claimed it. That is the one thing the
-	// barrier could never previously see, and it is not survivable: both
-	// instances derive the same epoch DEK from the same blob and each believes
-	// it owns the whole NIST SP 800-38D budget. The barrier fails closed
-	// PERMANENTLY — marking comes before returning the error, because a caller
-	// that ignores the error must still not be left encrypting.
-	//
-	// The loaded state is deliberately NOT adopted: this instance is done, and
-	// quietly picking up the winner's epoch would make it a second writer of the
-	// winner's DEK, which is the failure being prevented.
-	//
-	// A barrier that has never claimed a generation (b.loadGeneration == 0 — a
-	// fresh instance, or a blob from before the fence existed) has nothing to be
-	// superseded from and simply adopts what it is given.
+	// Load-generation fence, checked last: a generation above this barrier's claim supersedes it permanently, without adopting the state.
 	if b.loadGeneration > 0 && sealed.LoadGeneration > b.loadGeneration {
 		b.superseded.Store(true)
 		slog.Error("quicraft/seal: sealed root key was claimed by another loader; this barrier is "+
@@ -3430,13 +3302,10 @@ func (b *Barrier) SetSealedRootKey(sealed *SealedRootKey) error {
 	b.sealed = sealed
 	b.salt = sealed.Salt
 	b.epoch = sealed.Epoch
-	// The root key is now one some earlier lifetime used; Reset may no longer
-	// roll it back (see firstBoot).
+	// A loaded root key ends first boot; see firstBoot.
 	b.firstBoot = false
 
-	// The blob describes an epoch some EARLIER process encrypted under, for an
-	// unknown number of invocations. Whatever the in-memory counter holds, it is
-	// no longer a count of this epoch's usage. See resolveInvocationBudget.
+	// The loaded epoch's invocation count is unknown; see resolveInvocationBudget.
 	b.invocationsAuthoritative = false
 
 	// Adopt the blob's generation as the baseline the next Unseal increments.

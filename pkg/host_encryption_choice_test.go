@@ -69,8 +69,7 @@ func TestNewHost_AtRestEncryptionIsAStatedChoice(t *testing.T) {
 			b := createTestBarrier(t)
 			return []HostOption{WithShardBarriers(func(uint64) Barrier { return b })}
 		}},
-		// Per-shard barriers are independent of the host-wide posture (#240):
-		// sealing disabled host-wide still gives each shard its own barrier.
+		// Per-shard barriers are independent of the host-wide posture.
 		{"WithoutEncryption with WithShardBarriers", func(t *testing.T) []HostOption {
 			b := createTestBarrier(t)
 			return []HostOption{WithShardBarriers(func(uint64) Barrier { return b }), WithoutEncryption()}

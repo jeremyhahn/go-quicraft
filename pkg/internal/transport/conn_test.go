@@ -3430,7 +3430,7 @@ func TestCloseTargetRefusesDuringSnapshotTransfer(t *testing.T) {
 		t.Fatal("send queue retired despite the snapshot veto")
 	}
 
-	// Transfer completes: the teardown is no longer vetoed.
+	// The transfer completes; teardown is no longer vetoed.
 	t1.snapshotTracker.Done()
 
 	if !t1.CloseTarget(target) {
@@ -3582,19 +3582,7 @@ func TestIdleInboundConnectionIsReclaimed(t *testing.T) {
 		func() bool { return inboundConnCount(t2) == 0 })
 }
 
-// TestInboundActivityStampKeepsBusyConnectionAlive pins the stamp that makes
-// the idle sweep safe.
-//
-// The stamp is taken on every FRAME, not once at admission and not on stream
-// acceptance, and that distinction is the whole difference between a reclaim
-// policy and an outage: a sender caches and reuses one stream across bursts, so
-// a connection carrying continuous replication traffic accepts no new stream
-// for as long as the burst lasts, and an admission-only stamp ages out under it.
-//
-// The connection's record is backdated past the idle bound before the traffic
-// is sent, so only a stamp taken on the ARRIVING FRAME can save it. Without the
-// backdating the admission stamp alone keeps the connection alive and the test
-// passes against no per-frame stamp at all.
+// TestInboundActivityStampKeepsBusyConnectionAlive verifies traffic refreshes the inbound activity stamp.
 func TestInboundActivityStampKeepsBusyConnectionAlive(t *testing.T) {
 	t1, t2, _, handler2, cleanup := transportPair(t, 42)
 	defer cleanup()

@@ -1,15 +1,5 @@
 #!/usr/bin/env bash
-#
-# check-coverage-packages.sh — enforce a coverage floor on every package in a
-# Go coverage profile, so no package hides under the module total.
-#
-# Usage: scripts/check-coverage-packages.sh <profile> <minimum-percent> [<import-path-prefix>]
-#
-# Percentages match `go test -cover`: covered statements over all statements,
-# with blocks deduplicated by file position (merged profiles can repeat them).
-# Only packages at or beneath the optional prefix are judged; others are
-# reported but never fail. A missing or empty profile, or no package under the
-# prefix, is a failure.
+# check-coverage-packages.sh <profile> <minimum-percent> [<import-path-prefix>] fails when any package under the prefix is below the coverage floor.
 set -euo pipefail
 
 profile=${1:?usage: $0 <profile> <minimum-percent> [<import-path-prefix>]}

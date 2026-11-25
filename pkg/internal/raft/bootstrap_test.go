@@ -140,17 +140,7 @@ func TestInitialMembershipRoundTrip(t *testing.T) {
 	}
 }
 
-// TestJoiningClearsWhenBootstrapEntryApplied is the Stage-4 property: a joiner
-// that started with empty membership ends its joining window the moment it
-// applies the bootstrap membership entry the leader replicates to it. Before
-// config-in-log the window could only be closed by a snapshot, so a joiner
-// caught up by replication alone stayed joining permanently.
-//
-// The window gates CAMPAIGNING (a replica holding an incomplete configuration
-// must not self-elect on a quorum of one) and the configuration test in
-// handleVoteRequest. It is no longer an authorization bypass: per-shard
-// authorization is a removed-tombstone deny-list that needs no bypass. See
-// Peer.IsRemoved.
+// TestJoiningClearsWhenBootstrapEntryApplied verifies a joiner's window closes when it applies the bootstrap entry.
 func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 	// Replica 4 joins a {1,2,3} cluster: it starts knowing no members.
 	p := newTestPeer(t, testConfigWithID(1, 4), proto.State{}, proto.Membership{})
@@ -191,11 +181,7 @@ func TestJoiningClearsWhenBootstrapEntryApplied(t *testing.T) {
 	}
 }
 
-// TestJoiningDoesNotClearBeforeLeaderIsKnown pins that a joiner following a leader that was ADDED AFTER the initial bootstrap must NOT
-// clear the auth bypass merely from learning the founding membership. If
-// replication delivers the bootstrap entry in an earlier batch than that
-// leader's AddNode, clearing on "knows any member" would then reject the current
-// leader's next append and strand the joiner forever.
+// TestJoiningDoesNotClearBeforeLeaderIsKnown verifies a joiner whose leader was added later stays joining after the bootstrap entry.
 func TestJoiningDoesNotClearBeforeLeaderIsKnown(t *testing.T) {
 	// Replica 6 joins a cluster whose founding members are {1,2,3}. The CURRENT
 	// leader is replica 5 — added after bootstrap, so NOT in the index-1 entry.

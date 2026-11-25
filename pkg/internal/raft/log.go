@@ -947,8 +947,7 @@ func (l *raftLog) tryAppend(prevLogIndex, prevLogTerm uint64, ents []proto.Entry
 	// truncation. Only real overwrites require membership rebuild.
 	isOverwrite := conflictIdx <= l.lastIndex()
 	if isOverwrite {
-		// The entries from conflictIdx on are gone; whatever they admitted
-		// is no longer in this log. The replacements re-record their own.
+		// Entries from conflictIdx on are gone; their replacements re-record what they admit.
 		l.dropPendingAbove(conflictIdx - 1)
 	}
 	// Append from the conflict point onward.

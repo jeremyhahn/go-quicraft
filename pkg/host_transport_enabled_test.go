@@ -162,9 +162,7 @@ func TestNewHost_TransportEnabledWithShardBarriers(t *testing.T) {
 	}
 }
 
-// TestNewHost_KernelAssignedPortIsAdvertised verifies that a host configured
-// with port 0 reports, and advertises to peers, the port the kernel bound, so
-// a test can create a host first and read its address afterwards (#386).
+// TestNewHost_KernelAssignedPortIsAdvertised checks a port-0 host advertises the port the kernel bound.
 func TestNewHost_KernelAssignedPortIsAdvertised(t *testing.T) {
 	cfg := testTransportHostConfig(t)
 	h, err := NewHost(cfg, WithMemoryLogDB(), WithoutEncryption())

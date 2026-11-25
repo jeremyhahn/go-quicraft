@@ -122,13 +122,7 @@ func TestFloorNamesTheOperationItJudged(t *testing.T) {
 	}
 }
 
-// TestProposeFloorAdmitsTheQuietRunAndRefusesTheLoadedOne states the reason the
-// threshold sits where it does, as an assertion rather than only a comment.
-//
-// maxProposeErrorRate is not a round number chosen for tidiness: it has to fall
-// BETWEEN the two rates actually measured on 2026-09-10, or it either discards
-// a usable run or publishes an unusable one. If someone tunes the constant,
-// this fails and names both ends.
+// TestProposeFloorAdmitsTheQuietRunAndRefusesTheLoadedOne checks maxProposeErrorRate sits between the two measured rates.
 func TestProposeFloorAdmitsTheQuietRunAndRefusesTheLoadedOne(t *testing.T) {
 	const (
 		quietRate  = 24.0 / 399.0 // benchtime=5s,  load ~3.4/20 cores

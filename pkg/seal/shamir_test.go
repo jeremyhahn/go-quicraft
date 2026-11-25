@@ -48,8 +48,7 @@ func TestShamirInitResult_DestroyWipesEveryShare(t *testing.T) {
 	shares := splitForResult(t, 2, 3)
 	result := ShamirInitResult{Shares: shares, Threshold: 2, TotalShares: 3}
 
-	// Held separately: after Destroy the result no longer references them, so
-	// the check has to be able to reach the shares it wiped.
+	// Held separately, so the check can reach the wiped shares after Destroy.
 	held := make([]*shamir.ProtectedShare, len(shares))
 	copy(held, shares)
 	for i, sh := range held {

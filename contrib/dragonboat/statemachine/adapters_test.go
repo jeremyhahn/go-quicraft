@@ -950,9 +950,7 @@ func TestDiskAdapter_Close_ErrorPropagation(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Factory tests
-// ---------------------------------------------------------------------------
+// Factory tests.
 
 func TestWrapCreateFunc(t *testing.T) {
 	factory := WrapCreateFunc(func(shardID, replicaID uint64) IStateMachine {

@@ -1,25 +1,4 @@
-//! Multi-node OpenRaft cluster for benchmark scenarios.
-//!
-//! Each cluster node runs in the same OS process on separate Tokio tasks,
-//! communicating over loopback TCP+TLS.  This mirrors real network topology
-//! without cross-machine coordination overhead while still exercising the full
-//! Raft replication path.
-//!
-//! # Lifecycle
-//!
-//! Setup is split so the election benchmark can time only what the other
-//! engines' harnesses time (replica start plus the wait for a leader):
-//!
-//! 1. [`prepare_cluster`] (untimed): generate TLS material, bind one
-//!    `TcpListener` per node, build each node's `TlsNetworkFactory` with the
-//!    full peer address map, and create each node's 16-shard WAL seeded with
-//!    the initial membership entry.
-//! 2. [`start_cluster`] (the election span): construct every `Raft` node,
-//!    spawn its RPC server on the pre-bound listener, and wait until a leader
-//!    is known. No node calls `Raft::initialize`, so the first leader is
-//!    chosen by a natural randomized election timeout.
-//! 3. [`setup_cluster`] adds the common setup warmup for the propose and
-//!    commit scenarios.
+//! Multi-node OpenRaft benchmark cluster in one process over loopback TCP+TLS: prepare_cluster (untimed), start_cluster (the timed election span), setup_cluster (adds the shared warmup).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -248,13 +227,7 @@ pub async fn setup_warmup(leader: &Raft<TypeConfig>) {
         let payload = encode_kv(format!("warmup-{i}").as_bytes(), b"ok");
         warmup_write(leader, &payload).await;
     }
-    // Non-fatal, as in the QuicRaft harness's warmup SyncRead. In a cluster,
-    // OpenRaft 0.9 confirms leadership for a read by opening a NEW network
-    // client per voter (`RaftCore::handle_check_is_leader_request`), which
-    // with this transport is a fresh TCP + mutual TLS 1.3 handshake, and
-    // bounds it by `heartbeat_interval` (5 ms). It can miss that deadline
-    // without anything being wrong with the group; no OpenRaft scenario
-    // reads, so the read only warms the path.
+    // Non-fatal: OpenRaft 0.9 confirms read leadership over new connections bounded by heartbeat_interval, which can miss; no scenario reads.
     if let Err(e) = leader.ensure_linearizable().await {
         eprintln!("[openraft-bench] warmup linearizable read (non-fatal): {e}");
     }
