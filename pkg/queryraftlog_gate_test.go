@@ -65,10 +65,15 @@ func TestQueryRaftLog_GatesReads(t *testing.T) {
 	}
 	ns.paused.Store(false)
 
+	// StopShard marks the shard stopped before it is removed from the host;
+	// a query begun in that window reports ErrClosed, not ErrShardNotFound.
 	ns.stopped.Store(true)
-	_, wantErr = h.QueryLocalNode(ctx, 1, "q")
-	if _, err := query(); wantErr == nil || !errors.Is(err, wantErr) {
-		t.Errorf("QueryRaftLog on stopped shard: err = %v, want QueryLocalNode's err %v", err, wantErr)
+	if _, err := query(); !errors.Is(err, ErrClosed) {
+		t.Errorf("QueryRaftLog on stopping shard: err = %v, want ErrClosed", err)
 	}
 	ns.stopped.Store(false)
+
+	if _, err := h.QueryRaftLog(ctx, 99, 1, 2, 1<<20); !errors.Is(err, ErrShardNotFound) {
+		t.Errorf("QueryRaftLog on unloaded shard: err = %v, want ErrShardNotFound", err)
+	}
 }
