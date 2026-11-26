@@ -11,3 +11,10 @@ pkg/sm: reviewed fully
 pkg/batch: reviewed fully
 pkg/writemode: reviewed fully
 pkg/internal/rsm: reviewed fully
+pkg/internal/session: reviewed fully
+pkg/internal/queue: reviewed entryqueue.go (EntryQueue, AddTracked, HandOff, Swap); not reached: swapbuffer.go, the rest of entryqueue.go (Add, Taken, Close, AddOne, SwapBatch, Len, Empty)
+pkg/internal/supervise: not reached supervise.go
+pkg/internal/server: not reached rate.go
+pkg/internal/registry: not reached registry.go, errors.go
+pkg/internal/netaddr: not reached the rest of netaddr.go (CanonicalHost, Host)
+pkg/internal/invariant: not reached assert.go
