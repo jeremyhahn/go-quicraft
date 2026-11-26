@@ -291,7 +291,8 @@ func startConcurrentUnsealedCReaders(ctx context.Context, t *testing.T, b *Barri
 // Initialize run, with no handshake ordering the calls against the
 // transitions. Every open channel a reader took is closed by the first
 // transition to unsealed that completes after the take, and all of them are
-// closed after the final Unseal.
+// closed after the final Unseal. Each sealed period is held until readers
+// have taken an open channel in it, so every run reaches every period.
 func TestBarrier_UnsealedCRace_ConcurrentAcquireDuringTransitions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), unsealedWaitBound)
 	defer cancel()
@@ -310,10 +311,26 @@ func TestBarrier_UnsealedCRace_ConcurrentAcquireDuringTransitions(t *testing.T) 
 	var gen atomic.Int64
 	r := startConcurrentUnsealedCReaders(ctx, t, b, readers, start, stop, &gen, transitions)
 
+	// held blocks, bounded by ctx, until a reader has taken an open channel
+	// in the current sealed period. Readers never wait on it, so their takes
+	// still race the transitions; it only keeps a fast Unseal from ending
+	// the period before any reader has run in it.
+	held := func() error {
+		for r.openAt[gen.Load()].Load() == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+		return nil
+	}
 	cycle := func() error {
 		close(start)
 		for p := 0; p < cycles; p++ {
 			if err := b.Seal(); err != nil {
+				return err
+			}
+			if err := held(); err != nil {
 				return err
 			}
 			if err := b.Unseal(ctx, s, Credentials{}); err != nil {
@@ -324,6 +341,9 @@ func TestBarrier_UnsealedCRace_ConcurrentAcquireDuringTransitions(t *testing.T) 
 		if err := b.Seal(); err != nil {
 			return err
 		}
+		if err := held(); err != nil {
+			return err
+		}
 		if err := b.Reset(); err != nil {
 			return err
 		}
@@ -332,6 +352,9 @@ func TestBarrier_UnsealedCRace_ConcurrentAcquireDuringTransitions(t *testing.T) 
 		}
 		gen.Add(1)
 		if err := b.Seal(); err != nil {
+			return err
+		}
+		if err := held(); err != nil {
 			return err
 		}
 		if err := b.Unseal(ctx, s, Credentials{}); err != nil {
