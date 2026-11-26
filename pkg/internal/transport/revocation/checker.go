@@ -803,17 +803,18 @@ func (c *Checker) IsRevokedUnder(cert *x509.Certificate, issuers []*x509.Certifi
 // request to build.
 func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
 	serial := cert.SerialNumber.Text(16)
-	scope := anyIssuerScope
-	if issuer != nil {
-		scope = issuerScope(issuer)
-	} else if c.unresolvedIssuerGated() {
-		return c.isRevokedUnresolvedIssuer(serial)
+	if issuer == nil {
+		return c.unresolvedIssuerResult(c.dispatchMode(cert, nil, anyIssuerScope, serial))
 	}
+	return c.dispatchMode(cert, issuer, issuerScope(issuer), serial)
+}
 
-	// Dispatch only. Each mode's policy lives in its own method: the bodies
-	// differ in which sources they consult and in what a "not found" means
-	// when nothing was consulted, and inlining all four put this function over
-	// the cyclomatic limit without making any one policy easier to read.
+// dispatchMode runs the configured mode's policy. Each mode's policy lives in
+// its own method: the bodies differ in which sources they consult and in what
+// a "not found" means when nothing was consulted, and inlining all four put
+// isRevoked over the cyclomatic limit without making any one policy easier
+// to read.
+func (c *Checker) dispatchMode(cert, issuer *x509.Certificate, scope, serial string) (bool, error) {
 	switch c.cfg.Mode {
 	case ModeCRL:
 		return c.isRevokedCRL(scope, serial)
@@ -826,25 +827,23 @@ func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
 	}
 }
 
+// unresolvedIssuerResult finishes the answer for a leaf whose issuer is not in
+// the trusted bundle. A "revoked" or an error from the mode policy stands
+// unchanged; only a clean "not found" under the gate becomes an error, since
+// only issuer-agnostic entries could be consulted.
+func (c *Checker) unresolvedIssuerResult(revoked bool, err error) (bool, error) {
+	if revoked || err != nil || !c.unresolvedIssuerGated() {
+		return revoked, err
+	}
+	return false, fmt.Errorf("revocation: no issuer for the certificate was found in the trusted bundle: %w", ErrNoIssuerCertificate)
+}
+
 // unresolvedIssuerGated reports whether an unresolved issuer must fail
 // closed: enforcement is on and the mode consults CRLs, whose entries are
 // scoped to the issuer that signed them. Without the issuer only the
 // issuer-agnostic entries can be consulted, which is not a full answer.
 func (c *Checker) unresolvedIssuerGated() bool {
 	return c.cfg.Mode != ModeOCSP && c.cfg.enforcing()
-}
-
-// isRevokedUnresolvedIssuer answers for a leaf whose issuer is not in the
-// trusted bundle under enforcement: an issuer-agnostic or admin entry is a
-// definite "revoked"; anything else is unknown and reported as an error.
-func (c *Checker) isRevokedUnresolvedIssuer(serial string) (bool, error) {
-	c.mu.RLock()
-	revoked := c.revokedLocked(anyIssuerScope, serial)
-	c.mu.RUnlock()
-	if revoked {
-		return true, nil
-	}
-	return false, fmt.Errorf("revocation: no issuer for the certificate was found in the trusted bundle: %w", ErrNoIssuerCertificate)
 }
 
 // noSourceBackstop reports the missing-source failure when enforcement is on

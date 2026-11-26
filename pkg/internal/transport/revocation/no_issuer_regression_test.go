@@ -3,6 +3,7 @@ package revocation
 import (
 	"crypto/x509"
 	"errors"
+	"path/filepath"
 	"testing"
 )
 
@@ -61,9 +62,41 @@ func TestIsRevokedUnder_UnresolvedIssuerEnforcingFailsClosed(t *testing.T) {
 				if revoked {
 					t.Fatalf("serial %s: revoked = true, want false with an error", leaf.SerialNumber.Text(16))
 				}
-				if !errors.Is(err, ErrNoIssuerCertificate) {
+				if err == nil {
+					t.Fatalf("serial %s: err = nil, want an error", leaf.SerialNumber.Text(16))
+				}
+				// ModeBoth without a responder already fails on its OCSP
+				// leg; that error stands. The other modes reach a clean
+				// "not found" and report the missing issuer.
+				if mode != ModeBoth && !errors.Is(err, ErrNoIssuerCertificate) {
 					t.Fatalf("serial %s: err = %v, want one wrapping ErrNoIssuerCertificate", leaf.SerialNumber.Text(16), err)
 				}
+			}
+		})
+	}
+}
+
+// A stale or never-loaded CRL source keeps its own error when the issuer is
+// also unresolved: the source failure is reported, not the missing issuer.
+func TestIsRevokedUnder_UnresolvedIssuerStaleSourceReportsStale(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	rootOnly := []*x509.Certificate{f.root.cert}
+	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
+	for _, mode := range noIssuerCRLModes {
+		t.Run(string(mode), func(t *testing.T) {
+			c := NewChecker(Config{
+				Mode:     mode,
+				CRLPaths: []string{missing},
+			}, f.root.cert, f.intermediate.cert)
+			revoked, err := c.IsRevokedUnder(f.cleanLeaf, rootOnly)
+			if revoked {
+				t.Fatal("revoked = true, want false with an error")
+			}
+			if !errors.Is(err, ErrCRLStale) {
+				t.Fatalf("err = %v, want one wrapping ErrCRLStale", err)
+			}
+			if errors.Is(err, ErrNoIssuerCertificate) {
+				t.Fatalf("err = %v, must not report ErrNoIssuerCertificate for a stale source", err)
 			}
 		})
 	}
