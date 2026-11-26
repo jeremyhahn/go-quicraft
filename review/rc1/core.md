@@ -10,3 +10,4 @@ pkg: reviewed messagehandler.go (HandleMessage, authorizeInbound, validateSnapsh
 pkg/config: reviewed config.go (validateTiming, validateSizeLimits, validateLeaseRead), transportconfig.go (validateLimits, validateMTLS); not reached: hostconfig.go, compression.go, errors.go, logging.go, the rest of config.go and transportconfig.go
 pkg/sm: reviewed cached.go (Update, Lookup, RecoverFromSnapshot), lru.go (Get, Put); not reached: createfunc.go, errors.go, interfaces.go, types.go, the rest of cached.go and lru.go
 pkg/batch: reviewed decode.go fully, hostproposer.go fully, aggregator.go (submit, awaitResult, Close, flushShard); not reached: errors.go, the rest of aggregator.go (flushLoop, addToBatch, drainQueue, rejectAbandoned, proposeContext, metrics)
+pkg/writemode: reviewed mode.go fully; not reached errors.go
