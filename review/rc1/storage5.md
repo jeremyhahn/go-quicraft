@@ -6,3 +6,7 @@ Reviewed at e616cd74, packages: pkg/logdb, pkg/fsutil, contrib/dragonboat, scrip
 
 pkg/logdb: reviewed waldb/db.go writeState, writeSnapshot, writeBootstrap, saveBootstrap, writeRecord, ensureActiveSegment, Compact, RemoveEntriesTo, Close, ListNodeInfo; memdb/memdb.go ReadState, GetSnapshot, ListNodeInfo, RemoveNodeData, SaveBootstrap, GetBootstrap, readNode; not reached the rest of waldb and memdb
 contrib/dragonboat: reviewed nodehost.go (StartReplica, StartConcurrentReplica, StartOnDiskReplica, startReplica, validateStartReplica, waitShardReady, StopShard, StopReplica, removal markers, RequestCompaction, SyncRequestSnapshot, RequestSnapshot, SnapshotOption, ExportSnapshot, ImportSnapshot, GetLogReader), target.go, raftio/events.go, statemachine/types.go, statemachine/errors.go, statemachine/adapters.go (regular and concurrent adapters: Lookup, PrepareSnapshot, SaveSnapshot, RecoverFromSnapshot, Close), internal/nalookup; not reached raftio/interfaces.go, statemachine/interfaces.go, statemachine/factory.go, the disk adapter, the rest of nodehost.go
+pkg/fsutil: reviewed fsutil.go SyncDirWith, SyncDirChainWith, MkdirAllSyncedWith, lock.go LockDir; not reached lock_unix.go, lock_windows.go, lock_other.go, the rest of fsutil.go
+scripts: not reached (not in this pass's area list)
+Makefile: not reached (not in this pass's area list)
+.github/workflows: not reached (not in this pass's area list)
