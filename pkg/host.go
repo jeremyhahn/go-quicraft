@@ -11713,7 +11713,9 @@ func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex uint
 		return nil, ErrInvalidRange
 	}
 
-	ns, err := h.getNode(shardID)
+	// loadNode, not getNode: getNode hides a stopping shard as
+	// ErrShardNotFound, and a query begun after StopShard reports ErrClosed.
+	ns, err := h.loadNode(shardID)
 	if err != nil {
 		return nil, err
 	}
@@ -12056,6 +12058,19 @@ func (h *Host) requestConfigChange(ctx context.Context, shardID uint64, cc proto
 // getNode retrieves the nodeState for a shard, returning ErrShardNotFound
 // if the shard is not loaded.
 func (h *Host) getNode(shardID uint64) (*nodeState, error) {
+	ns, err := h.loadNode(shardID)
+	if err != nil {
+		return nil, err
+	}
+	if ns.stopped.Load() {
+		return nil, ErrShardNotFound
+	}
+	return ns, nil
+}
+
+// loadNode returns the shard's nodeState whether or not it is stopped, so a
+// caller can tell a stopping shard (still loaded) from one that is not loaded.
+func (h *Host) loadNode(shardID uint64) (*nodeState, error) {
 	v, ok := h.nodes.Load(shardID)
 	if !ok {
 		return nil, ErrShardNotFound
@@ -12067,9 +12082,6 @@ func (h *Host) getNode(shardID uint64) (*nodeState, error) {
 			ExpectedType: "*nodeState",
 			ActualValue:  v,
 		}
-	}
-	if ns.stopped.Load() {
-		return nil, ErrShardNotFound
 	}
 	return ns, nil
 }
