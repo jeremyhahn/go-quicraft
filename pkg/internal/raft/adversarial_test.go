@@ -217,6 +217,7 @@ const fuzzMaxTickBurst = 32
 // messages that fit; the align byte gives the fuzzer that same capability.
 type fuzzLiveState struct {
 	term       uint64
+	leader     uint64
 	committed  uint64
 	commitTerm uint64
 	lastIndex  uint64
@@ -229,6 +230,7 @@ func liveState(r *raft) fuzzLiveState {
 	commitTerm, _ := r.log.term(r.log.committed)
 	return fuzzLiveState{
 		term:       r.term,
+		leader:     r.leaderID,
 		committed:  r.log.committed,
 		commitTerm: commitTerm,
 		lastIndex:  r.log.lastIndex(),
@@ -302,7 +304,16 @@ func (s *fuzzStream) message(shardID, selfID uint64, st fuzzLiveState) proto.Mes
 		m.Commit = st.committed
 	}
 	if align&alignFromLeader != 0 {
+		// The recognized leader when there is a remote one, so a TimeoutNow
+		// (honoured only from that leader at the current term) can reach
+		// the campaign path; replica 2 otherwise.
 		m.From = 2
+		if st.leader != noLeader && st.leader != selfID {
+			m.From = st.leader
+			if m.Type == proto.TimeoutNow {
+				m.Term = st.term
+			}
+		}
 	}
 
 	n := int(s.next()) % (fuzzMaxEntries + 1)
@@ -1249,6 +1260,9 @@ func adversarialSeeds() []adversarialSeed {
 	// entry point that bypasses startElection's gates.
 	add("timeout-now-storm", func(e *fuzzEncoder) {
 		for term := uint64(0); term < 6; term++ {
+			// A TimeoutNow is honoured only from the recognized leader at
+			// the current term, so let 2 lead at this term first.
+			e.step(seedMessage{Type: proto.Heartbeat, From: 2, Term: term})
 			e.step(seedMessage{Type: proto.TimeoutNow, From: 2, Term: term})
 		}
 		e.persist()
