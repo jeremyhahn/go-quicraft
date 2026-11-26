@@ -1031,6 +1031,8 @@ func TestWitnessRoleMismatch_CannotCampaign(t *testing.T) {
 	}
 
 	// TimeoutNow is the other campaign entry point and bypasses startElection.
+	// It is accepted only from the current leader at the current term.
+	r.becomeFollower(1, 2)
 	err = r.step(proto.Message{Type: proto.TimeoutNow, Term: 1, From: 2, To: 1})
 	if !errors.Is(err, ErrWitnessRoleMismatch) {
 		t.Fatalf("TimeoutNow accepted (err = %v) on a role-mismatched replica", err)
@@ -1411,6 +1413,8 @@ func TestObserverRole_ListedObserverCannotCampaignWhateverItsConfig(t *testing.T
 	}
 
 	// TimeoutNow is the other campaign entry point and bypasses startElection.
+	// It is accepted only from the current leader at the current term.
+	r.becomeFollower(1, 2)
 	if err := r.step(proto.Message{Type: proto.TimeoutNow, Term: 1, From: 2, To: 1}); err != nil {
 		t.Fatalf("TimeoutNow on an observer: %v", err)
 	}

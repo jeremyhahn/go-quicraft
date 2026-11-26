@@ -1391,6 +1391,16 @@ func (r *raft) step(msg proto.Message) error {
 		return nil
 	}
 
+	// A remote TimeoutNow at a higher term is checked against the leader and
+	// term this replica recognizes BEFORE the term handling below runs: that
+	// handling adopts a TimeoutNow sender as leader at the new term, after
+	// which handleTimeoutNow's own sender check would pass for any member.
+	if msg.Type == proto.TimeoutNow && msg.Term > r.term {
+		if err := r.checkTimeoutNowSender(msg); err != nil {
+			return err
+		}
+	}
+
 	// Handle term-based transitions first.
 	if msg.Term > 0 {
 		if msg.Term > r.term {
@@ -4833,6 +4843,13 @@ func (r *raft) handleTimeoutNow(msg proto.Message) error {
 	if r.state == leader {
 		return nil
 	}
+	// Only the current leader, at the current term, sends TimeoutNow to
+	// complete a leadership transfer; a local origin is trusted. The gates
+	// above only refuse, so the check sits here, before any election state
+	// changes.
+	if err := r.checkTimeoutNowSender(msg); err != nil {
+		return err
+	}
 	// Refuse to campaign at all when this replica's own last log term is
 	// unreadable, BEFORE becomeCandidate runs.
 	//
@@ -4875,6 +4892,24 @@ func (r *raft) handleTimeoutNow(msg proto.Message) error {
 	r.broadcastTransferVote()
 	r.checkElectionResult()
 	return nil
+}
+
+// checkTimeoutNowSender returns ErrTimeoutNowNotFromLeader when a remote
+// TimeoutNow does not come from this replica's recognized leader at its
+// current term. A local origin is trusted.
+func (r *raft) checkTimeoutNowSender(msg proto.Message) error {
+	if msg.Origin.IsLocal() ||
+		(r.leaderID != noLeader && msg.From == r.leaderID && msg.Term == r.term) {
+		return nil
+	}
+	slog.Warn("ignoring TimeoutNow: sender is not this replica's leader at the current term",
+		"shard", r.shardID,
+		"replica", r.replicaID,
+		"from", msg.From,
+		"leader", r.leaderID,
+		"msg_term", msg.Term,
+		"term", r.term)
+	return ErrTimeoutNowNotFromLeader
 }
 
 // --------------------------------------------------------------------------
