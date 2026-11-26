@@ -36,6 +36,10 @@ on:
   schedule:
     - cron: '5 5 * * *'
 
+# Read-only by default; a job that writes grants its own scope (trivy's SARIF upload).
+permissions:
+  contents: read
+
 env:
   # Must match ci.yml's pin.
   GO_VERSION: "1.27.4"

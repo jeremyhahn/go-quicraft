@@ -217,6 +217,7 @@ const fuzzMaxTickBurst = 32
 // messages that fit; the align byte gives the fuzzer that same capability.
 type fuzzLiveState struct {
 	term       uint64
+	leader     uint64
 	committed  uint64
 	commitTerm uint64
 	lastIndex  uint64
@@ -229,6 +230,7 @@ func liveState(r *raft) fuzzLiveState {
 	commitTerm, _ := r.log.term(r.log.committed)
 	return fuzzLiveState{
 		term:       r.term,
+		leader:     r.leaderID,
 		committed:  r.log.committed,
 		commitTerm: commitTerm,
 		lastIndex:  r.log.lastIndex(),
@@ -302,7 +304,16 @@ func (s *fuzzStream) message(shardID, selfID uint64, st fuzzLiveState) proto.Mes
 		m.Commit = st.committed
 	}
 	if align&alignFromLeader != 0 {
+		// The recognized leader when there is a remote one, so a TimeoutNow
+		// (honoured only from that leader at the current term) can reach
+		// the campaign path; replica 2 otherwise.
 		m.From = 2
+		if st.leader != noLeader && st.leader != selfID {
+			m.From = st.leader
+			if m.Type == proto.TimeoutNow {
+				m.Term = st.term
+			}
+		}
 	}
 
 	n := int(s.next()) % (fuzzMaxEntries + 1)
@@ -960,6 +971,9 @@ type harnessCoverage struct {
 	votesDenied       int
 	snapshotsRefused  int
 	logsTruncated     int
+	// timeoutNowRefused counts TimeoutNow messages refused because the
+	// sender is not the recognized leader at the current term.
+	timeoutNowRefused int
 }
 
 func newHarnessCoverage() *harnessCoverage {
@@ -1033,6 +1047,18 @@ func runAdversarialStepSequenceCov(tb testing.TB, data []byte, cov *harnessCover
 				op, proto.MessageTypeName(m.Type), m.From, m.Term, m.LogTerm,
 				m.LogIndex, m.Commit, m.Hint, m.Reject, len(m.Entries),
 				m.Snapshot.Index, m.Snapshot.Term, m.Snapshot.Membership.ConfigChangeID)
+			if transfer := leadershipTransferPrelude(r, m); transfer != nil {
+				// A valid leadership transfer: replica 2 first establishes
+				// itself as leader at the TimeoutNow's term, so the TimeoutNow
+				// comes from the leader this replica recognizes at its
+				// current term and Candidate stays reachable through the
+				// legitimate path. TimeoutNow without the prelude keeps
+				// exercising the refusal.
+				_ = r.step(*transfer)
+				settlePendingSnapshot(r, lr)
+				inv.check(tb, r, fmt.Sprintf("op %d: transfer prelude heartbeat(from=%d term=%d)", op, transfer.From, transfer.Term))
+				r.drainMessages()
+			}
 			before := r.log.lastIndex()
 			// The step path returns typed errors for refused input; a refusal
 			// is a valid outcome, the invariants are what matter.
@@ -1045,6 +1071,9 @@ func runAdversarialStepSequenceCov(tb testing.TB, data []byte, cov *harnessCover
 				}
 				if m.Type == proto.InstallSnapshot && errors.Is(err, ErrWireLocalMessage) {
 					cov.snapshotsRefused++
+				}
+				if m.Type == proto.TimeoutNow && errors.Is(err, ErrTimeoutNowNotFromLeader) {
+					cov.timeoutNowRefused++
 				}
 			}
 		}
@@ -1060,6 +1089,30 @@ func runAdversarialStepSequenceCov(tb testing.TB, data []byte, cov *harnessCover
 		if r.log.lastIndex() < startLast {
 			cov.logsTruncated++
 		}
+	}
+}
+
+// leadershipTransferPrelude returns the Heartbeat that makes replica 2 the
+// leader r recognizes at m's term, when m is a TimeoutNow from replica 2 at
+// the next term (alignTermNext) that the stream marks as a valid transfer
+// (Reject clear; the flag carries no meaning for TimeoutNow) and r does not
+// already recognize a remote leader. It returns nil otherwise, so the
+// remaining TimeoutNow messages keep reaching the refusal path.
+func leadershipTransferPrelude(r *raft, m proto.Message) *proto.Message {
+	if m.Type != proto.TimeoutNow || m.Reject || m.From != 2 ||
+		m.Term != r.term+1 {
+		return nil
+	}
+	if r.leaderID != noLeader && r.leaderID != r.replicaID {
+		return nil
+	}
+	return &proto.Message{
+		Type:    proto.Heartbeat,
+		ShardID: m.ShardID,
+		From:    m.From,
+		To:      m.To,
+		Term:    m.Term,
+		Origin:  proto.OriginRemote,
 	}
 }
 
@@ -1249,6 +1302,9 @@ func adversarialSeeds() []adversarialSeed {
 	// entry point that bypasses startElection's gates.
 	add("timeout-now-storm", func(e *fuzzEncoder) {
 		for term := uint64(0); term < 6; term++ {
+			// A TimeoutNow is honoured only from the recognized leader at
+			// the current term, so let 2 lead at this term first.
+			e.step(seedMessage{Type: proto.Heartbeat, From: 2, Term: term})
 			e.step(seedMessage{Type: proto.TimeoutNow, From: 2, Term: term})
 		}
 		e.persist()
@@ -1355,6 +1411,7 @@ func TestAdversarialStepSweep(t *testing.T) {
 		{"runs that advanced the commit index", cov.committedAdvanced, 50},
 		{"log truncations", cov.logsTruncated, 5},
 		{"wire InstallSnapshot refusals", cov.snapshotsRefused, 50},
+		{"TimeoutNow sender refusals", cov.timeoutNowRefused, 50},
 	}
 	for _, c := range checks {
 		if c.got < c.min {
@@ -1362,7 +1419,8 @@ func TestAdversarialStepSweep(t *testing.T) {
 				c.name, c.got, c.min)
 		}
 	}
-	t.Logf("reachability: roles=%v appendsAccepted=%d appendsRejected=%d votesGranted=%d votesDenied=%d commitAdvanced=%d truncations=%d wireSnapshotRefusals=%d",
+	t.Logf("reachability: roles=%v appendsAccepted=%d appendsRejected=%d votesGranted=%d votesDenied=%d commitAdvanced=%d truncations=%d wireSnapshotRefusals=%d timeoutNowRefusals=%d",
 		cov.roles, cov.appendsAccepted, cov.appendsRejected, cov.votesGranted,
-		cov.votesDenied, cov.committedAdvanced, cov.logsTruncated, cov.snapshotsRefused)
+		cov.votesDenied, cov.committedAdvanced, cov.logsTruncated, cov.snapshotsRefused,
+		cov.timeoutNowRefused)
 }

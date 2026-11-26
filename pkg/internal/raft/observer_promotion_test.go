@@ -152,6 +152,7 @@ func TestPromotion_PromotedReplicaAcceptsTimeoutNow(t *testing.T) {
 
 	promote(t, p)
 
+	p.r.leaderID = 1 // TimeoutNow is accepted only from the current leader.
 	if err := p.r.handleTimeoutNow(proto.Message{Type: proto.TimeoutNow, From: 1, Term: p.r.term}); err != nil {
 		t.Fatalf("promoted replica refused TimeoutNow: %v", err)
 	}

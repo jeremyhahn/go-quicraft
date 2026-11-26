@@ -63,10 +63,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write   # the one issue for a finding
-  actions: write
+  # Read-only by default; each job grants the write scopes it uses.
+  contents: read
 
 # One run at a time per repository; a newer run waits, never cancels one
 # halfway through its ref update.
@@ -86,6 +84,9 @@ jobs:
     if: ${{ github.server_url == 'https://github.com' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write   # the one issue for a finding
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
@@ -94,6 +95,8 @@ jobs:
       CI_IMAGE_NAMESPACE: ${{ vars.CI_IMAGE_NAMESPACE }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Mask the forge credentials
         run: |
@@ -209,6 +212,10 @@ jobs:
     if: ${{ github.server_url == 'https://github.com' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: write        # the bump branch, its commit and the merged branch's deletion
+      pull-requests: write   # the bump PR, its labels and its branch update
+      actions: write         # the ci.yml dispatch on the bump branch
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}

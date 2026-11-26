@@ -313,9 +313,11 @@ def job_name(text, ctx):
 
 CODE = ("main.go", "pkg/x/y.go", "src/a.c", "inc/a.h", "app/src/main/kotlin/A.kt", "web/a.ts", "tools/a.py",
         "scripts/a.sh", "Makefile", "build/docker/Dockerfile", "api/a.proto", "go.mod", "go.sum",
-        ".github/scripts/runner_labels.py", ".github/workflows/testdata/x-tests.py", "mk/host.mk", ".envrc")
+        ".github/scripts/runner_labels.py", ".github/workflows/testdata/x-tests.py", "mk/host.mk", ".envrc",
+        # LOCAL (security): workflow and action files run in CI, so they are code.
+        ".github/workflows/ci.yml", ".github/actions/x/action.yml")
 NON_CODE = ("README.md", "docs/a/b.png", "docs/x.txt", ".changelog/123.txt", "CHANGELOG.md", "CHANGELOG",
-            "LICENSE", "LICENSE-APACHE", "ROADMAP.md", ".github/workflows/ci.yml", ".github/dependabot.yml",
+            "LICENSE", "LICENSE-APACHE", "ROADMAP.md", ".github/dependabot.yml",
             ".github/ISSUE_TEMPLATE/bug.md", ".github/CODEOWNERS", ".github/PULL_REQUEST_TEMPLATE.md",
             "deploy/values.yaml", "config.toml", "x/y.json", ".env.example", ".gitignore", "sub/.gitignore",
             ".editorconfig", ".gitattributes", ".dockerignore", "pkg/changelog.d/1.md", ".github/actionlint.yaml")
@@ -476,7 +478,8 @@ def main():
     gate = run_script(step(job(src, "gate"), "Require a Codex approval of the head, or a no-review change"))
     genv = dict(base_env, REVIEWER=REVIEWER, EVENT_SHA=HEAD, BASE_SHA=BASE, BASE_REF="main", GITHUB_RUN_ID="77",
                 SCOPE_RESULT="success", REVIEW_RESULT="skipped")
-    for names in (["docs/a.md", ".github/workflows/ci.yml", "go.yaml"], ["LICENSE"]):
+    # LOCAL (security): .github/dependabot.yml for .github/workflows/ci.yml, which is code.
+    for names in (["docs/a.md", ".github/dependabot.yml", "go.yaml"], ["LICENSE"]):
         rc, out, _, _ = run_fake(gate, gate_routes(names, (), None), dict(genv, HEAD_REF="feature/x"))
         check(rc == 0 and "no code changed" in out, f"G1 non-code {names}: the gate passes without a review (rc={rc})")
     rc, out, _, _ = run_fake(gate, gate_routes(["main.go"], ("code-review", "task:ready"), "APPROVED"), dict(genv, HEAD_REF="feature/x"))
