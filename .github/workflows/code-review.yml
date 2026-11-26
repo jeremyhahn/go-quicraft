@@ -752,7 +752,9 @@ env:
   REVIEWER: ${{ github.server_url != 'https://github.com' && 'codex' || vars.CODEX_REVIEWER }}
   TOKEN_FILE: /run/reviewer/token
   # Documentation and configuration (an extended regex over a whole path); a PR changing only these is not code reviewed.
-  NON_CODE_PATHS: '^(docs/.+|\.changelog/.+|(.+/)?changelog\.d/.+|(.+/)?[^/]+\.(md|yml|yaml|toml|json)|(.+/)?[^/]*\.env\.example|(.+/)?(CHANGELOG|LICENSE|ROADMAP)[^/]*|\.github/(CODEOWNERS|ISSUE_TEMPLATE/.+|PULL_REQUEST_TEMPLATE[^/]*)|(.+/)?\.(gitignore|gitattributes|editorconfig|dockerignore|trivyignore|gitleaksignore|markdownlintignore|prettierignore|mailmap))$'
+  # LOCAL (security): workflow and action files are code to the review gate; a .md/.yml/.yaml/.toml/.json
+  # file is non-code only at the root, under a directory not starting with a dot, or directly in .github/.
+  NON_CODE_PATHS: '^(docs/.+|\.changelog/.+|(.+/)?changelog\.d/.+|([^./][^/]*/(.+/)?)?[^/]+\.(md|yml|yaml|toml|json)|\.github/[^/]+\.(md|yml|yaml|toml|json)|(.+/)?[^/]*\.env\.example|(.+/)?(CHANGELOG|LICENSE|ROADMAP)[^/]*|\.github/(CODEOWNERS|ISSUE_TEMPLATE/.+|PULL_REQUEST_TEMPLATE[^/]*)|(.+/)?\.(gitignore|gitattributes|editorconfig|dockerignore|trivyignore|gitleaksignore|markdownlintignore|prettierignore|mailmap))$'
   # A SPEC row branch, as the Row check reads it; code is reviewed only there or under main-fix.
   ROW_BRANCH: '^row/[0-9]+-'
   # Authors whose non-code PR is approved without a review: the owner and the factory Apps.
