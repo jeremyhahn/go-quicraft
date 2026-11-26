@@ -3017,6 +3017,17 @@ func (r *raft) sendSnapshot(to uint64) {
 
 // handleAppend processes an AppendEntries (Replicate) message.
 func (r *raft) handleAppend(msg proto.Message) error {
+	if r.leaderID != noLeader && msg.From != r.leaderID {
+		slog.Warn("dropped replicate from a replica that is not this shard's leader",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"leader", r.leaderID,
+			"msg_term", msg.Term,
+			"term", r.term)
+		return ErrReplicateNotFromLeader
+	}
+
 	r.electionTick = 0
 	r.leaderID = msg.From
 	r.recordActivity()
