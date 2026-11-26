@@ -222,13 +222,16 @@ func newReleaseFixture(t *testing.T, withRemote bool) *releaseFixture {
 	f := &releaseFixture{t: t, dir: t.TempDir()}
 	// The Makefile includes the tool pin file, so it comes along.
 	// contrib/dragonboat/go.mod comes along because the release commit pins
-	// its requirement of the parent.
-	for _, sub := range []string{"scripts", "contrib/dragonboat"} {
+	// its requirement of the parent. Once a non-alpha release tag exists the
+	// release and release-candidate targets run the wire version gate, so
+	// scripts/check-wire-version.sh and the wire layout golden it compares
+	// come along too.
+	for _, sub := range []string{"scripts", "contrib/dragonboat", "pkg/proto/testdata"} {
 		if err := os.MkdirAll(filepath.Join(f.dir, sub), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md", "scripts/tool-pins.sh", "contrib/dragonboat/go.mod"} {
+	for _, name := range []string{"Makefile", "VERSION", "CHANGELOG.md", "scripts/tool-pins.sh", "contrib/dragonboat/go.mod", "scripts/check-wire-version.sh", "pkg/proto/testdata/wire_layout.golden"} {
 		writeFile(t, filepath.Join(f.dir, name), readFile(t, filepath.Join(repoRoot, name)), 0o644)
 	}
 	f.release = bumpPatch("v" + strings.TrimSpace(f.version()))
