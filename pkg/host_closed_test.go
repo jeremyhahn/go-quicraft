@@ -61,6 +61,7 @@ var hostClosedContract = map[string]closedKind{
 	"RaftAddress":             closedGetter,
 	"ShardCount":              closedGetter,
 	"UnregisterLeaderHandler": closedGetter,
+	"WireWindow":              closedGetter,
 
 	// Drain returns ErrClosed once Close has completed; Close's own call to
 	// Drain, made while shutdown runs, is unaffected.
