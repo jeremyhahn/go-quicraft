@@ -10,6 +10,8 @@
 # host is a private IPv4 address, it prints ::add-mask:: for the entry, its
 # host:port and its host, so the runner masks the address in every later
 # line. Public hosts and keywords (proxy.golang.org, direct, off) are left.
+# An entry's userinfo (scheme://user:password@host) is masked on any host,
+# and the host is read after it.
 #
 #   usage: scripts/ci-mask-lan.sh
 set -euo pipefail
@@ -28,12 +30,27 @@ for v in $(compgen -e); do
 	esac
 	IFS='|, ' read -ra entries <<<"${!v}"
 	for entry in "${entries[@]}"; do
-		hostport=${entry#*://}
-		hostport=${hostport%%/*}
+		authority=${entry#*://}
+		authority=${authority%%/*}
+		hostport=${authority##*@}
 		host=${hostport%%:*}
+		if [ "$hostport" != "$authority" ]; then
+			# userinfo: its password, or a user long enough to be a
+			# token, is masked whatever the host. A short user name
+			# such as git is left, or every later "git" would be masked.
+			userinfo=${authority%@*}
+			password=${userinfo#*:}
+			if [ "$password" != "$userinfo" ]; then
+				[ -z "$password" ] || echo "::add-mask::$password"
+				echo "::add-mask::$userinfo"
+			elif [ "${#userinfo}" -gt 8 ]; then
+				echo "::add-mask::$userinfo"
+			fi
+		fi
 		private "$host" || continue
 		echo "::add-mask::$entry"
-		[ "$hostport" = "$entry" ] || echo "::add-mask::$hostport"
+		[ "$authority" = "$entry" ] || echo "::add-mask::$authority"
+		[ "$hostport" = "$authority" ] || echo "::add-mask::$hostport"
 		[ "$host" = "$hostport" ] || echo "::add-mask::$host"
 	done
 done

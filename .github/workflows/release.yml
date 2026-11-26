@@ -8,9 +8,9 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  # Needed by the SARIF uploads in the lint, security and trivy jobs.
-  security-events: write
+  # Read-only by default; the SARIF upload jobs and the publish job grant
+  # themselves the one write scope each uses.
+  contents: read
 
 env:
   # Must match ci.yml, so the tag is certified on the toolchain the push gate
@@ -157,6 +157,11 @@ jobs:
     timeout-minutes: 60
     name: Gate - security
     needs: validate
+    permissions:
+      contents: read
+      actions: read
+      # The gosec SARIF upload.
+      security-events: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -219,6 +224,11 @@ jobs:
     timeout-minutes: 60
     name: Gate - trivy
     needs: validate
+    permissions:
+      contents: read
+      actions: read
+      # The trivy SARIF upload.
+      security-events: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -478,6 +488,9 @@ jobs:
   release:
     name: Publish
     runs-on: ubuntu-latest
+    permissions:
+      # Creates the GitHub release and uploads its assets.
+      contents: write
     # Nothing publishes until every gate above is green.
     needs: [validate, lint, security, trivy, integration, netfault, errfs, fips, zero-rtt, fuzz, modules, contrib-dragonboat]
     timeout-minutes: 30
