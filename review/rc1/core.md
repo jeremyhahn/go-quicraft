@@ -11,3 +11,4 @@ pkg/config: reviewed config.go (validateTiming, validateSizeLimits, validateLeas
 pkg/sm: reviewed cached.go (Update, Lookup, RecoverFromSnapshot), lru.go (Get, Put); not reached: createfunc.go, errors.go, interfaces.go, types.go, the rest of cached.go and lru.go
 pkg/batch: reviewed decode.go fully, hostproposer.go fully, aggregator.go (submit, awaitResult, Close, flushShard); not reached: errors.go, the rest of aggregator.go (flushLoop, addToBatch, drainQueue, rejectAbandoned, proposeContext, metrics)
 pkg/writemode: reviewed mode.go fully; not reached errors.go
+pkg/internal/rsm: reviewed statemachine.go (Apply, applyBatch: gap guard, expiry checkpoints, session register/unregister, duplicate and in-batch mirror handling, response caching); not reached: adapter.go, errors.go, the rest of statemachine.go (Lookup family, snapshot save/recover, Close, session policy)
