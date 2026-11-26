@@ -6,3 +6,5 @@ Reviewed at e616cd74, packages: pkg/internal/transport, pkg/seal, pkg/crypto, pk
 
 pkg/internal/transport: reviewed sockopt_windows.go, conn.go (stream cache, eviction, drain, incarnation tracking), quic.go (SendSnapshot, SendSnapshotStreaming, Start)
 pkg/seal: reviewed algorithm_fips.go, errors.go, interfaces.go, barrier.go (Initialize, initializeWithRootKey, Reset, RootKey, persistBackoffState, restampStateMACLocked, restampStateMACFromEnclaveLocked), strategy_software.go (constructors, SealRootKey, sealRootKeyWith, sealedFromCipher, resolvePassphrase, SealRootKeyProtected, UnsealRootKeyProtected, Close)
+pkg/crypto: reviewed shamir/errors.go, shamir/protected_share.go (splitProtected, evalProtectedShares, splitLockedBytes, unmarshalShareSet, lockValue, lockSized, lockedBytes, release, borrow, WithValue, Destroy, MarshalJSON, UnmarshalJSON)
+pkg/proto: reviewed none in this pass (the scope list names no pkg/proto area); not reached all files
