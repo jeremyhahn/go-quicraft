@@ -278,6 +278,7 @@ func TestRestartStaleConfig_TimeoutNowResolvesBeforeCampaigning(t *testing.T) {
 			{Type: proto.AddNode, ReplicaID: 5, Address: "a5"},
 		})
 
+	p.r.leaderID = 2 // TimeoutNow is accepted only from the current leader.
 	if err := p.Handle(proto.Message{
 		Type: proto.TimeoutNow, From: 2, To: 1, ShardID: 1,
 		Term: p.r.term, Origin: proto.OriginRemote,
