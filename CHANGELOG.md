@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `QueryRaftLog` now honours the seal barrier and returns `ErrBarrierSealed`; it also returns `ErrShardPaused` for a paused shard and `ErrClosed` for a stopping one, as `QueryLocalNode` does.
 - Membership adds (#1192): `RequestAddNode`, `RequestAddObserver`, `RequestAddWitness`, their `WithIdentity` and `Sync` forms compare a non-zero `configChangeIndex` on the leader's worker as well as in the Host, so a change that commits between the two checks is refused with `*StaleConfigChangeError` (`errors.Is` `ErrStaleConfigChange`) and nothing enters the log. A new variadic `ConfigChangeOption`, `WithBoundConfigChangeIndex()`, binds an add with index 0 to the initial configuration; without it, 0 still skips the check. The binding holds until the entry reaches the leader's validation, including after the caller's deadline expires, and a bound add that reaches a replica that is no longer the leader is refused with `ErrStaleConfigChange` instead of being forwarded. No wire or format change.
 - CI: ci-template v1.28.0 (`make deps-check` runs on every pull request, a docs-only PR included, as `make lint` does).
 - CI: ci-template v1.29.2. The integration image's tag hashes the Alpine package index checksum (`scripts/apk-index-sum.sh`, `APK_INDEX_SUM`), and its build re-runs `apk upgrade` when that checksum moves, so a new Alpine package release, a CVE fix among them, rebuilds the image. `make lint-gates` runs without `-k`: the first failing gate ends the step.

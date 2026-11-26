@@ -11694,9 +11694,11 @@ type LogRange struct {
 // total. This is a local operation that reads directly from the
 // host's LogDB and does not require leadership.
 //
-// Returns ErrClosed if the host is closed, ErrShardNotFound if the
-// shard does not exist on this host, and ErrInvalidRange if
-// firstIndex >= lastIndex or maxSize is zero.
+// Returns ErrClosed if the host is closed or the shard is stopping,
+// ErrShardNotFound if the shard does not exist on this host,
+// ErrShardPaused if the shard is paused, ErrBarrierSealed if the
+// barrier is sealed, and ErrInvalidRange if firstIndex >= lastIndex or
+// maxSize is zero.
 func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex uint64, lastIndex uint64, maxSize uint64) ([]proto.Entry, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, mapContextError(err)
@@ -11709,6 +11711,22 @@ func (h *Host) QueryRaftLog(ctx context.Context, shardID uint64, firstIndex uint
 	}
 	if maxSize == 0 {
 		return nil, ErrInvalidRange
+	}
+
+	ns, err := h.getNode(shardID)
+	if err != nil {
+		return nil, err
+	}
+	if ns.stopped.Load() {
+		return nil, ErrClosed
+	}
+	if ns.paused.Load() {
+		return nil, ErrShardPaused
+	}
+	// A sealed barrier withdraws access to the shard's log as well as its
+	// state machine.
+	if ns.barrierSealed() {
+		return nil, ErrBarrierSealed
 	}
 
 	engNode := h.engine.GetNode(shardID)
