@@ -7,3 +7,4 @@ Reviewed at e616cd74, packages: pkg/proto, pkg/internal/transport, pkg/crypto, p
 
 pkg/proto: reviewed fully
 pkg/internal/transport: reviewed recv.go, frame.go, flags.go, tls.go, tls_reload.go, snapshot_recv.go, snapshot_header.go, conn.go (inbound authorization), quic.go (stop, enqueueToTarget); not reached config.go, errors.go, events.go, handler.go, heartbeat.go, shutdown_tracker.go, sockopt_unix.go, sockopt_windows.go, netfault_off.go, netfault_on.go, tls_curves_fips.go, tls_curves_nofips.go, the rest of conn.go and quic.go, revocation/
+pkg/crypto: reviewed shamir/shamir.go, shamir/gf256.go, shamir/protected_share.go (combine, decode, share-set unmarshal); not reached shamir/errors.go, the rest of shamir/protected_share.go
