@@ -12,7 +12,7 @@ import (
 // variables exported, and returns the values it asks the runner to mask.
 func runMaskLAN(t *testing.T, env map[string]string) []string {
 	t.Helper()
-	cmd := exec.Command("bash", filepath.Join("..", "..", "scripts", "ci-mask-lan.sh"))
+	cmd := exec.CommandContext(t.Context(), "bash", filepath.Join("..", "..", "scripts", "ci-mask-lan.sh"))
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
