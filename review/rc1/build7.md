@@ -6,3 +6,4 @@ Reviewed at e616cd74, packages: .github/workflows, scripts, scripts/depscheck
 
 .github/workflows: reviewed ci.yml test jobs publish-images through row (lines 1922–3790) and code-review.yml no-code guard, head checkout, module fetch, post verdict, confirm and gate steps; not reached code-review.yml codex review step, re-arm, hand-on, report and cleanup steps, opencode review and post steps
 scripts: reviewed fully (bench-compare.sh, apk-index-sum.sh, apk-mirror.sh, ci-image-history.sh, tool-pins.sh, trim-ci-caches.sh); no finding
+scripts/depscheck: reviewed bump.go, vuln.go, gomod.go, golist.go, base.go, semver.go fully; no finding; not reached the other depscheck files (outside this slice)
