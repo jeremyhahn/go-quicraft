@@ -1,6 +1,6 @@
 // Command depscheck is `make deps-check`, the CI standard's latest-version
 // stage (handbook ci-standard.md §1, devops.md §9), and `make deps-bump`,
-// the bump the daily deps-bump workflow lands (ruling 640).
+// the bump the daily deps-bump workflow lands.
 //
 // Usage:
 //

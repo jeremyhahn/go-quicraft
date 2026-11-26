@@ -1,10 +1,4 @@
-# Dockerfile for building and running the OpenRaft benchmark binary.
-#
-# Build context must be the go-quicraft repository root so the full source
-# tree is available.  The Makefile drives this build.
-#
-# Usage (via Makefile):
-#   make perf-run PERF_PROFILE=<name> PERF_SYSTEMS=quicraft,openraft
+# OpenRaft benchmark image, built from the repository root by make perf-run.
 
 FROM rust:latest AS builder
 

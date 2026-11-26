@@ -12,52 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package releasability is the release gate that keeps this repository
-// publicly releasable: it reports every published file that names a host, an
-// address, a filesystem path or an identity belonging to the private
-// development fleet, and it pins the exclusion list that keeps the private
-// development workflow out of every published form of the tree.
-//
-// WHY THIS IS A GATE AND NOT A CONVENTION. go-quicraft ships publicly as a Go
-// module and as release archives. Anything committed here is published unless
-// .gitattributes marks it export-ignore (see publishedFiles). Before this gate
-// the Makefile defaulted its remote-offload target to a fleet address and the
-// owner's account, benchmark baselines carried the same pair in their headers,
-// and a test fixture spelled out the private forge's address. None of it was
-// load-bearing and nothing prevented any of it.
-//
-// WHAT IS REPORTED, and why each class is a leak rather than a style problem:
-//
-//   - classLabAddress: an address on the fleet's subnet. Unreachable for every
-//     public reader, so a copy-pasteable example containing one is broken
-//     documentation, and it publishes the operator's network layout.
-//   - classLabHost: a fleet hostname. Same, plus it names the machines an
-//     attacker would go looking for.
-//   - classOwnerPath: a path under the owner's home directory or the lab's NFS
-//     mount. Meaningless off that one machine, and it leaks the account name.
-//   - classOwnerAccount: the owner's account name on its own. It identifies a
-//     person, and it is how the paths above get rebuilt by hand.
-//   - classInternalIdentity: a principal in the internal mail domain, or an
-//     agent principal (`agent-<name>@...`). It publishes who and what holds
-//     signing and write access on the private forge, and no public reader can
-//     do anything with it.
-//
-// TWO WAYS TO ACCEPT A LINE, both explicit:
-//
-//   - An inline waiver: the text `lab-string-ok: <reason>` on the offending
-//     line or the line immediately above it, in whatever comment syntax the
-//     file uses. An empty reason is not a waiver.
-//   - An entry in allowList (allowlist_test.go), for whole trees and for
-//     files that cannot carry a comment. Each entry names the classes it
-//     accepts and a reason.
-//
-// WHERE THIS LIVES. The package is test-only -- every file is a _test.go file
-// -- so it adds nothing to the module's importable API, and it sits in the tree
-// `go test ./...` walks, so `make test` runs the gate with no target to
-// remember. Resolution is textual: it needs no build tags and no parser, so it
-// covers Markdown, YAML, shell and Makefiles as readily as Go.
-//
-// docs/release/public-releasability.md is the policy this package enforces.
+// Package releasability is the release gate that reports published files naming private fleet hosts, addresses, paths or identities; see docs/release/public-releasability.md.
 package releasability
 
 import (
@@ -81,8 +36,7 @@ const (
 	// classLabHost is a hostname belonging to the development fleet.
 	classLabHost class = "lab-host"
 
-	// classOwnerPath is a filesystem path that exists only on the owner's
-	// machine or on the lab's network mount.
+	// classOwnerPath is a filesystem path that exists only on the owner's machine or network mount.
 	classOwnerPath class = "owner-path"
 
 	// classOwnerAccount is the owner's account name outside a path.

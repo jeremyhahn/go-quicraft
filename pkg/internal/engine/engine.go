@@ -452,13 +452,7 @@ func (e *Engine) UnloadNode(shardID uint64) {
 
 	e.stepWorkers[workerID].unloadNode(shardID)
 
-	// Signal the commit worker to skip Peer.Commit for this shard, and WAIT
-	// until it has taken the change: from then on no SaveState for this
-	// incarnation is running or can start (see commitWorker.requestUnload).
-	// A StartShard that follows therefore reads a LogDB the stopped
-	// incarnation can no longer write to — an old HardState landing after the
-	// new one loaded could otherwise grant a second vote in the same term.
-	// Before Start there is no commit goroutine and nothing in flight.
+	// Wait until the commit worker skips this shard, so no stale SaveState can land after a restart.
 	unloaded := e.commitWorkers[workerID].requestUnload(shardID)
 	if e.started.Load() {
 		e.commitWorkers[workerID].awaitMembership(unloaded)
@@ -481,21 +475,7 @@ func (e *Engine) UnloadNode(shardID uint64) {
 		<-e.applyWorkers[workerID].requestUnload(shardID)
 	}
 
-	// Return this shard's share of the SHARED host-wide in-memory rate limiter.
-	// Each shard tracks its own contribution so it can apply deltas without
-	// disturbing the others, and that contribution lives on the raft log and
-	// dies with the Peer — so without this, a stopped shard's bytes stay counted
-	// against a shard that no longer exists and every StartShard/StopShard cycle
-	// leaks more, until the accumulated orphans cross MaxTotalInMemLogSize and
-	// every propose on the host fails ErrSystemBusy with no memory held.
-	//
-	// It happens HERE, last, and under raftMu — not in stepWorker.unloadNode.
-	// That runs before the commit worker has been told to skip Peer.Commit, so
-	// an in-flight Commit could still be inside appliedTo -> subGlobalSize,
-	// mutating the very same accounting: a data race, and one that also corrupts
-	// the shared counter. By this point the step worker has dropped the node,
-	// the commit worker skips it, and the apply goroutine has exited; raftMu
-	// then serialises against any Commit still unwinding.
+	// Return this shard's share of the host-wide in-memory rate limiter, last and under raftMu.
 	if node != nil && node.peer != nil {
 		releaseGlobalRateLimitLocked(node)
 	}

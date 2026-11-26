@@ -2,16 +2,7 @@ FROM golang:1.27.4 AS builder
 WORKDIR /src
 COPY . .
 WORKDIR /src/test/performance/quicraft
-# go mod download (not tidy) so the committed go.mod/go.sum are used
-# verbatim and builds stay reproducible.
-#
-# Optional module credentials for a private module host arrive as a BuildKit
-# secret (K=V lines) mounted for this RUN only. They are sourced into the
-# shell, never written to a layer or a command line; set -a exports them for
-# the git that go invokes. With no secret, modules resolve from the public
-# proxy. Requires BuildKit (docker-buildx); the legacy builder rejects --mount.
-# This RUN is byte-identical in every image that downloads a module only the
-# forge serves (test/buildgates/module_download_test.go).
+# go mod download keeps go.mod/go.sum verbatim; optional module credentials arrive as a BuildKit secret for this RUN only (see test/buildgates/module_download_test.go).
 RUN --mount=type=secret,id=gomodauth \
     set -eu; \
     if [ -s /run/secrets/gomodauth ]; then \

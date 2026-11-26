@@ -143,8 +143,7 @@ func (f *syncAccountingFS) metaSyncCount(path string) int {
 	return f.metaSync[path]
 }
 
-// metaSyncFollowedRename reports whether path was metadata-synced AFTER
-// something was renamed onto renamed, and whether the rename happened at all.
+// metaSyncFollowedRename reports whether path was metadata-synced after a rename onto renamed, and whether the rename happened.
 func (f *syncAccountingFS) metaSyncFollowedRename(dir, renamed string) (renamed_ bool, synced bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

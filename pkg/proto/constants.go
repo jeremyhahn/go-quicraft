@@ -53,6 +53,21 @@
 // that must be taught the old layout, a migration story, and a supported
 // window that widens rather than moves.
 //
+// # The transport pin ends at v1.0.0-rc.1
+//
+// For the TRANSPORT version the pin ends at v1.0.0-rc.1. From that release
+// onward, every release whose diff changes the layout of any type reachable
+// from MessageBatch or SnapshotChunk bumps WireVersion and sets
+// PreviousWireVersion to the value it replaced, so a rolling upgrade runs two
+// adjacent releases side by side and a peer outside the window is refused by
+// name (see the Raft-layer refusal, quicraft.WireVersionMismatchError) rather
+// than misparsed. The release gate enforces it: pkg/proto/testdata/
+// wire_layout.golden fingerprints the reachable layout with the WireVersion it
+// was recorded at, TestWireLayoutGolden fails when the two disagree, and
+// scripts/check-wire-version.sh fails a release whose fingerprint moved since
+// the last release while the version did not. The persisted formats stay
+// pinned as described above.
+//
 // # Why the version byte stays
 //
 // Pinning the VALUE is not the same as removing the mechanism. Every format
@@ -97,7 +112,7 @@
 // alters the transport bytes without altering the discriminator that is
 // supposed to describe them — two dialects stamping one version number.
 //
-// THE RULE, from the first production release onward: bump WireVersion
+// THE RULE, from v1.0.0-rc.1 onward: bump WireVersion
 // whenever ANY type reachable from MessageBatch or SnapshotChunk changes
 // layout, INCLUDING the embedded persisted ones. The transport number is the
 // supremum of every layout version on the wire, never a number that only
@@ -121,11 +136,15 @@ import (
 // for exact equality before unmarshaling; a mismatch is reported as
 // ErrUnsupportedVersion.
 //
-// It is PINNED at 1 for the whole pre-release period and does not move for a
-// layout change — the layout changes in place and every consumer is rebuilt.
-// See the compatibility contract in the package comment for the policy, what
-// it costs (peers from different pre-release commits may be mutually
-// unreadable while both stamp 1), and when the pinning ends.
+// It was pinned at 1 for the pre-release period, and the pin ends at
+// v1.0.0-rc.1: from that release onward, every release whose diff changes the
+// layout of any type reachable from MessageBatch or SnapshotChunk bumps it
+// and sets PreviousWireVersion to the value it replaced. The release gate
+// (TestWireLayoutGolden and scripts/check-wire-version.sh) fails a release
+// whose reachable layout moved while this value did not. Consumers read the
+// window it forms through DefaultWireWindow (compile time) or
+// quicraft.Host.WireWindow (the running host). See the compatibility contract
+// in the package comment.
 //
 // Scope: transport only. Nothing stamped with WireVersion is read back off
 // disk. It is NOT the version of any persisted structure — in particular, the
@@ -136,8 +155,10 @@ const WireVersion uint64 = 1
 // PreviousWireVersion is the WireVersion of the previous MINOR release, the
 // second member of the rolling-upgrade accept set (docs/compatibility,
 // architecture question 3). In v1.0 there is no previous release, so it
-// equals WireVersion and the set has exactly one member. A release that moves
-// WireVersion sets this to the value it replaced.
+// equals WireVersion and the set has exactly one member. From v1.0.0-rc.1
+// onward, the release that bumps WireVersion for a wire layout change sets
+// this to the value it replaced, so the window holds both adjacent versions
+// for the rolling upgrade.
 const PreviousWireVersion uint64 = WireVersion
 
 // WireWindow is the closed set of transport versions a build accepts:
@@ -519,13 +540,13 @@ func IsFreeOrderMessage(msgType uint64) bool {
 // nothing of the term has committed), so it has nothing to wait for. Held as
 // ordered it waited out the leader's commit pipeline, which for a leader that
 // has not yet committed in its term is the whole window the refusal covers,
-// and the follower's caller waited with it (#376). An accepted ReadIndexResp
+// and the follower's caller waited with it. An accepted ReadIndexResp
 // stays ordered.
 //
 // HeartbeatResp is ordered here but conditionally free-order in one place:
 // Peer.DrainFreeOrderMessages, the drain the step worker uses while a WAL
 // write is in flight, releases it when the step that produced it left term,
-// vote, owed vote window and log at their durable values (#390). That needs
+// vote, owed vote window and log at their durable values. That needs
 // the follower's durable state, which no message predicate can see, so the
 // decision lives in the raft package.
 func IsFreeOrder(m *Message) bool {

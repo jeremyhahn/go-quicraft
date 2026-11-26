@@ -490,11 +490,7 @@ func (c *resumeProbeClock) monoNanos() int64 {
 	return c.steppedClock.monoNanos()
 }
 
-// TestHealthCheck_ResumeNeverExposesExpiredWindow checks that a health
-// probe running concurrently with ResumeShard of a leaderless shard whose
-// window expired before the pause never reports not-ready from the
-// pre-pause timestamp (#1175 review round 3): the fresh window is in place
-// before the shard is published as unpaused.
+// TestHealthCheck_ResumeNeverExposesExpiredWindow checks ResumeShard installs a fresh window before publishing the shard as unpaused.
 func TestHealthCheck_ResumeNeverExposesExpiredWindow(t *testing.T) {
 	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
 	if err != nil {
@@ -554,11 +550,7 @@ func TestHealthCheck_ResumeNeverExposesExpiredWindow(t *testing.T) {
 	}
 }
 
-// TestHealthCheck_UnrepresentableGraceNeverNotReady checks a configuration
-// whose nominal election timeout fits time.Duration but whose tripled
-// window does not (#1175 review round 3): a freshly started leaderless
-// shard must not report not-ready, and the window saturates rather than
-// wrapping negative.
+// TestHealthCheck_UnrepresentableGraceNeverNotReady checks the window saturates when tripling the election timeout overflows time.Duration.
 func TestHealthCheck_UnrepresentableGraceNeverNotReady(t *testing.T) {
 	hc := testHostConfig(t)
 	hc.RTTMillisecond = 60000
@@ -655,10 +647,7 @@ func (s *clockedShard) notReady(t *testing.T) bool {
 	return listed
 }
 
-// TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps covers #1175
-// review round 2: the leaderless window is measured on the monotonic
-// clock, so a wall-clock correction neither makes a not-ready host ok
-// again nor fails readiness inside a normal election.
+// TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps checks the window uses the monotonic clock.
 func TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps(t *testing.T) {
 	t.Run("backward step keeps an expired window expired", func(t *testing.T) {
 		s := newClockedShard(t, 21)
@@ -689,10 +678,7 @@ func TestHealthCheck_LeaderlessWindowIgnoresWallClockSteps(t *testing.T) {
 	})
 }
 
-// TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow covers #1175
-// review round 2: a shard that loses its leader long after startup gets a
-// fresh election window from the loss, repeated leaderless updates do not
-// postpone it, and a new leader clears it.
+// TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow checks a later leader loss opens a fresh window that a new leader clears.
 func TestHealthCheck_LeaderLossAfterElectionOpensFreshWindow(t *testing.T) {
 	s := newClockedShard(t, 23)
 	s.clk.advance(s.grace / 2)

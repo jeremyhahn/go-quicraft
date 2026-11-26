@@ -67,23 +67,10 @@ const (
 	// evictionWindow is the period over which evictionBudget applies.
 	evictionWindow = 30 * time.Second
 
-	// staleOutboundDrainGrace is how long an outbound evicted by
-	// evictStaleOutboundOnRecv stays open, out of the pool, before it is
-	// closed. The eviction is decided on attribution, not liveness: an
-	// outbound dialed before the peer's epoch was known is evicted even when
-	// it reached the live incarnation, and closing it on the spot discards
-	// every frame already written to it but not yet read on the far side. A
-	// candidate does not resend a vote request within a term, so each such
-	// loss cost a whole election term (#309). One second is far above a
-	// loopback or LAN delivery and far below MaxIdleTimeout, the bound the
-	// eviction exists to beat for an outbound to a dead incarnation.
+	// staleOutboundDrainGrace is how long an evicted outbound stays open out of the pool so frames already written are delivered.
 	staleOutboundDrainGrace = time.Second
 
-	// peerIncarnationRetention is how long a peer's incarnation record
-	// survives with neither a cached outbound nor an exchanged batch. It is
-	// an order of magnitude above the QUIC MaxIdleTimeout, so an ordinary
-	// outage never loses the epoch a re-dial needs to be stamped with, while
-	// a replica removed from membership is forgotten promptly.
+	// peerIncarnationRetention is how long a peer's incarnation record survives with no outbound and no batch.
 	peerIncarnationRetention = 10 * connectionCleanupInterval
 
 	// inboundIdleRetention is how long an INBOUND connection may carry no
@@ -633,16 +620,7 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 	shard.mu.Lock()
 	if existing, ok := shard.streams[key]; ok {
 		existingOwner := shard.owners[key]
-		// Keep the pooled entry — discarding ours — unless it belongs to a
-		// connection that is already DEAD. An entry owned by the same conn is a
-		// concurrent heartbeat open; an entry owned by an unknown conn is
-		// test-injected; an entry owned by a different but still-live conn may
-		// be a fresher one than ours (dial races leave one conn cached and the
-		// loser draining), and clobbering it here could install our stream over
-		// a live one out of order. Any entry that is merely superseded — owned
-		// by a conn no longer cached for this target — is evicted lazily by
-		// getStream's owner check, which reopens on the current conn. Only a
-		// dead owner is unambiguously safe to replace right now.
+		// Keep the pooled entry unless its connection is dead; superseded entries are evicted lazily by getStream.
 		if existingOwner == nil || existingOwner == conn || existingOwner.Context().Err() == nil {
 			shard.mu.Unlock()
 			if closeErr := s.Close(); closeErr != nil {
@@ -1122,12 +1100,7 @@ func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat 
 			t.removeConnection(target)
 			t.evictStreamsForTarget(target)
 		default:
-			// The stream was opened on a connection that is no longer the
-			// one cached for this target (a superseded conn from a peer
-			// restart / re-dial) or no conn is cached at all. Drop just
-			// this stale stream so the slow path opens a fresh one on the
-			// current connection — WITHOUT tearing down the cached conn,
-			// which may be a healthy replacement.
+			// The stream's connection is superseded: drop the stream, keep the cached conn.
 			t.evictStream(target, shardID, isHeartbeat, stream)
 		}
 	case connOK:
@@ -1364,20 +1337,7 @@ func (t *QUICTransport) sweepConnectionsUntilStopped() {
 	}
 }
 
-// revokeCheckConnections re-runs the revocation verdict against every LIVE
-// connection's verified leaf and tears down any that is no longer admissible.
-//
-// VerifyConnection runs only at handshake, so without this a certificate
-// revoked after admission keeps its session for as long as the process lives:
-// quic-go's keep-alive (10s) sits under MaxIdleTimeout (30s), so the
-// connection never idle-closes, and cleanStaleConnections only reaps
-// connections whose context is ALREADY dead. Revocation stopped a compromised
-// node reconnecting and did nothing about the connection it already had —
-// which, for a process that stays up for months, is close to no revocation.
-//
-// Running it on the existing 30s cleanup tick bounds post-revocation survival
-// to one interval. Both directions are covered: inbound from t.inboundConns,
-// outbound from the connection pool.
+// revokeCheckConnections re-runs the revocation verdict on every live connection each cleanup tick and closes inadmissible ones.
 func (t *QUICTransport) revokeCheckConnections() {
 	if t.revocationChecker == nil {
 		return
@@ -1448,16 +1408,7 @@ func (t *QUICTransport) revokeCheckConnections() {
 // each last did anything, the only inbound connection this node could ever
 // close was one whose certificate had been revoked.
 type inboundConnState struct {
-	// lastActive is the Unix-nanosecond stamp of the last frame HEADER read
-	// from this connection. Stamped by handleStream on every frame rather than
-	// on stream acceptance: senders cache and reuse a stream across bursts, so
-	// a connection carrying continuous replication traffic may accept no new
-	// stream for hours, and reaping it would be a self-inflicted outage.
-	//
-	// Atomic because every stream goroutine on the connection writes it
-	// concurrently with the cleanup tick's read. A monotonically-increasing
-	// stamp does not need the writes ordered against each other: the reaper
-	// only asks whether ANY of them was recent.
+	// lastActive is the Unix-nanosecond time of the last frame header read, written atomically per frame.
 	lastActive atomic.Int64
 }
 
@@ -1509,29 +1460,7 @@ func (t *QUICTransport) reapIdleInboundConns(now time.Time) {
 	})
 }
 
-// closeInboundFromPeer closes every INBOUND connection whose verified leaf
-// authorizes address, and reports how many it closed.
-//
-// It is the inbound counterpart of CloseTarget's outbound teardown, and it is
-// the reason CloseTarget is not just an outbound operation. A committed removal
-// says the peer may no longer talk to this node AT ALL; closing only the
-// connection this node dialed leaves the one the peer dialed fully alive,
-// keep-alived from both ends, holding a global and a per-IP connection slot and
-// free to keep opening streams for the process lifetime. Removing a member has
-// to reach the half the member controls.
-//
-// Matching is by CERTIFICATE, not by remote address: the connection's remote
-// address carries the peer's ephemeral SOURCE PORT, which never equals the
-// Raft address a membership change names. The leaf covering that address is the
-// same fact every other in-band authorization on this transport reduces to, and
-// it is sound for exactly the same reason — per-node exclusive SANs, which
-// refuseInboundPromiscuousCert enforces on admission.
-//
-// Co-located addresses are exempt, using the same predicate every other
-// certificate control here uses. A certificate is matched on HOST alone, so on
-// a single machine every replica's leaf covers every other replica's address;
-// without the exemption, removing one loopback replica would close the healthy
-// inbound connections of all its neighbours. See isCoLocatedCertHost.
+// closeInboundFromPeer closes every inbound connection whose verified leaf authorizes address, except co-located hosts, and returns the count.
 func (t *QUICTransport) closeInboundFromPeer(address string) int {
 	host := canonicalCertHost(certAuthHost(address))
 	if host == "" {
@@ -1724,52 +1653,7 @@ func (t *QUICTransport) evictStreamsForTarget(target string) {
 	}
 }
 
-// evictStaleOutboundOnRecv checks, on the receive path, whether the cached
-// outbound connection to the sender has become stale and evicts it if so.
-//
-// Two signals drive eviction:
-//
-//  1. A change in the sender's boot epoch (srcEpoch). The epoch is stamped
-//     into every MessageBatch and changes ONLY when the peer process
-//     restarts. A genuine restart means the peer has no knowledge of our
-//     previously-dialed outbound connection — that outbound is black-holed
-//     and would otherwise linger until MaxIdleTimeout (~30s), stalling
-//     HeartbeatResp/ReplicateResp and triggering avoidable elections. On an
-//     epoch change we take the cached outbound out of the pool immediately so
-//     the next send redials a fresh connection, and close it after
-//     staleOutboundDrainGrace (see drainOutbound): attribution cannot tell a
-//     black-holed outbound from one that reached the live incarnation, and
-//     the latter may still carry undelivered frames.
-//
-//  2. A dead outbound (context cancelled), as before.
-//
-// Keying restart detection on the epoch — rather than on inbound *quic.Conn
-// identity — is what makes this safe. In normal operation each peer dials
-// independently (two *quic.Conn per pair) and the dial path occasionally
-// re-dials (send-queue idle, MaxIdleTimeout). Those benign re-dials carry the
-// SAME epoch, so they no longer trigger eviction. The earlier identity-based
-// heuristic evicted on every re-dial, producing a self-sustaining cascade
-// (A evicts → redials → B sees new inbound → B evicts → ...) that starved
-// leader election in small clusters.
-//
-// Authenticated binding: srcEpoch and target both arrive in-band in the
-// MessageBatch header, which mTLS does NOT bind to the sending peer's identity.
-// Acting on them unconditionally would let any authenticated cluster member
-// spoof another node's address+epoch and force repeated eviction of our live
-// outbound to that victim (a liveness/DoS vector). Before recording or acting
-// on an epoch we therefore require that the claimed target matches the inbound
-// connection's verified peer certificate (inboundAuthorizedFor). This reuses
-// the same PKI guarantee the dial path relies on: a node reachable at host:port
-// must carry that host in its cert SANs (peers dial it with ServerName=host), so
-// a legitimate sender's certificate always authorizes its own SourceAddress.
-//
-// The dead-outbound branch is intentionally NOT gated by this check: a spoofed
-// batch cannot make our own outbound's context Done, so evicting an
-// already-dead connection is always safe regardless of who prompted it.
-//
-// The fast path is a single map read + RLock + pointer compare, safe to call
-// on every received batch. The certificate check runs only on the rare epoch
-// change / first-contact paths, not on every batch.
+// evictStaleOutboundOnRecv evicts the cached outbound to the sender on a certificate-authorized boot epoch change, or when it is dead.
 func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64, inboundConn *quic.Conn) {
 	if target == "" {
 		return
@@ -2369,11 +2253,7 @@ func (t *QUICTransport) releasePeerMsgBudgetRef(conn *quic.Conn) {
 	t.releasePeerMsgBudgetKey(msgBudgetKey(conn))
 }
 
-// releasePeerMsgBudgetKey drops one connection from key's entry. The last one
-// retires it (0 -> -1) before removing it, and only if no connection counted
-// itself in between: a decrement to zero followed by a plain Delete removed
-// an entry a newly arrived connection had just taken, leaving that live
-// connection's reservations on an entry no longer in the map.
+// releasePeerMsgBudgetKey drops one connection from key's entry, retiring it (0 -> -1) before removal.
 func (t *QUICTransport) releasePeerMsgBudgetKey(key string) {
 	v, ok := t.connMsgBudget.Load(key)
 	if !ok {
@@ -2405,8 +2285,7 @@ func (t *QUICTransport) reserveConnMsgRecvBudget(conn *quic.Conn, n int64) bool 
 	return true
 }
 
-// releaseConnMsgRecvBudget returns n previously-reserved bytes to the
-// per-peer message-receive sub-budget.
+// releaseConnMsgRecvBudget returns n reserved bytes to the per-peer receive budget.
 func (t *QUICTransport) releaseConnMsgRecvBudget(conn *quic.Conn, n int64) {
 	if conn == nil || t.maxConnMsgRecv <= 0 {
 		return

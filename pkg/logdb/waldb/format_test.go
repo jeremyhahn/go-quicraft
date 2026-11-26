@@ -241,8 +241,7 @@ func TestOpen_UnmarkedPopulatedDirectoryIsRefused(t *testing.T) {
 		t.Fatalf("Open error = %v, want ErrWALFormatMissing", err)
 	}
 
-	// Refusing means refusing: nothing on disk may have been touched, or the
-	// error would be describing a directory that no longer exists as described.
+	// A refused open leaves the directory untouched.
 	if got := segmentSizes(t, dir); !sameSizes(got, sizesBefore) {
 		t.Fatalf("a refused open mutated the segments on disk: %v -> %v",
 			sizesBefore, got)

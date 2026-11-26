@@ -137,18 +137,7 @@ func assertApplyOrder(t *testing.T) {
 type kvStateMachine struct {
 	mu   sync.RWMutex
 	data map[string]string
-	// prevIndex is the raft index of the previously applied entry. Every
-	// entry handed to Update must carry a STRICTLY greater index: an index
-	// that repeats or moves backward means the entry was applied twice or
-	// replayed, which no amount of state comparison can detect afterwards on
-	// a last-write-wins store. RecoverFromSnapshot is the only legal reset
-	// point.
-	//
-	// Note: consecutive indices are NOT required. The user state machine only
-	// ever sees user commands; the engine legitimately consumes indices for
-	// the initial-membership entry, each leader's no-op entry, config changes
-	// and session register/unregister entries, so gaps are expected and are
-	// counted rather than failed. See applyGaps.
+	// prevIndex is the index of the previous applied entry; each Update must carry a strictly greater one, gaps allowed. See applyGaps.
 	prevIndex uint64
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
@@ -528,8 +517,7 @@ type smKey struct {
 	replicaID uint64
 }
 
-// smTracker tracks kvStateMachine instances created by the factory
-// so tests can assert on internal state.
+// smTracker tracks the kvStateMachine instances the factory creates.
 type smTracker struct {
 	mu       sync.Mutex
 	machines map[smKey]*kvStateMachine
@@ -1006,16 +994,7 @@ func awaitSnapshot(t *testing.T, h *quicraft.Host, nodeHostDir string, shardID, 
 	}
 }
 
-// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation beside the
-// budgets to the configuration the suite actually starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives testShardConfig an explicit ElectionRTT, or
-// hands testHostConfig a different RTTMillisecond, electionRound silently
-// starts describing a cluster that no longer exists and every budget built on
-// it is wrong by that factor — which is exactly the drift the derivation
-// replaced a literal to prevent. This is the only place that can notice.
-// TestHarness_WALSyncMode pins this suite's mode.
+// TestBudgetsDescribeTheClusterTheyBudgetFor verifies the budget constants match the configuration the suite starts.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	cfg := testHostConfig(t, "127.0.0.1:1", nil)
 	if got := cfg.RTTMillisecond; got != testRTTMillisecond {
@@ -1031,10 +1010,7 @@ func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	}
 }
 
-// TestHarness_WALSyncMode pins this suite to NoSyncWAL whatever the
-// QUICRAFT_IT_WAL_SYNC switch says: a stalled fdatasync holds every election
-// past its timeout (#362), and only the linearizability and e2e harnesses
-// size their elections for WAL-sync mode (make integration-test-walsync).
+// TestHarness_WALSyncMode verifies this suite runs with NoSyncWAL whatever QUICRAFT_IT_WAL_SYNC says.
 func TestHarness_WALSyncMode(t *testing.T) {
 	for _, v := range []string{"", "0", "1"} {
 		t.Setenv("QUICRAFT_IT_WAL_SYNC", v)

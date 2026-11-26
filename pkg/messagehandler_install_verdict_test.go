@@ -176,14 +176,7 @@ func TestHandleSnapshot_FailedShardReturnsAtOnce(t *testing.T) {
 	}
 }
 
-// TestHandleSnapshot_StoppingShardStagesNothing: a stopped incarnation may
-// still hold an adopted-but-unrecorded install in its commit pipeline, and
-// that install's artifact is retained, unrecorded, at the canonical path. A
-// same-index retry against the stopping node must not reach the publish step,
-// which reclaims any unrecorded directory there as an orphan — moments before
-// the old pipeline's record naming it lands. The receive is refused before
-// staging anything; the retry waits for the next incarnation, which UnloadNode
-// releases only once the old one can no longer write LogDB.
+// TestHandleSnapshot_StoppingShardStagesNothing verifies a stopped shard's receive stages nothing.
 func TestHandleSnapshot_StoppingShardStagesNothing(t *testing.T) {
 	eng, h, _ := newRoutingHandlerFixture(t)
 	const shardID, localReplicaID, fromReplicaID = uint64(43), uint64(1), uint64(2)

@@ -262,20 +262,7 @@ func goldenMembershipFixture() Membership {
 	}
 }
 
-// TestMembershipGoldenEncoding asserts the exact bytes this binary writes.
-// These bytes go into the WAL, into snapshot records and exported artifacts,
-// and into the EntryInitialMembership entry at log index 1.
-//
-// Pinning the version at 1 does NOT make this test optional — it makes it the
-// only thing standing between a layout change and a silent one. The version
-// byte no longer moves when the layout does, so a diff that alters these bytes
-// produces two mutually unreadable binaries both stamping 1, which is the cost
-// the pinning policy accepts and this golden makes visible in a diff. A change
-// here means every consuming repo (go-qrdb and any other embedder) is rebuilt in lockstep and every dev cluster is wiped.
-//
-// The golden is spelled as its regions — fixed head, session policy, four maps,
-// Identities, RemovedIdentities — so the layout is checked by construction
-// rather than asserted in a comment.
+// TestMembershipGoldenEncoding checks the exact bytes written, region by region; a change here requires rebuilding every consumer.
 func TestMembershipGoldenEncoding(t *testing.T) {
 	m := goldenMembershipFixture()
 	m.SetSessionPolicy(goldenMembershipSessionPolicy())
@@ -850,12 +837,7 @@ func TestOverLimitSentinelsPerField(t *testing.T) {
 		t.Fatalf("SnapshotFile metadata: got %v, want ErrMetadataTooLong", err)
 	}
 
-	// Snapshot.Filepath over MaxFilepathLen. This replaces the Snapshot.Checksum
-	// case: Checksum was removed from the wire format (never computed, never
-	// verified — see the Snapshot type doc), so Filepath is now the only
-	// length-limited variable field Snapshot owns directly, and it is what pins
-	// that Snapshot still reports its own sentinel rather than whatever the
-	// shared getString helper last defaulted to.
+	// Snapshot.Filepath over MaxFilepathLen reports Snapshot's own sentinel.
 	var emptyMembership Membership
 	msize := emptyMembership.Size()
 	snapBuf := make([]byte, 32+msize+4)

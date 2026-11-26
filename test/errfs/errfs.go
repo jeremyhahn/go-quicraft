@@ -697,9 +697,7 @@ func (ef *ErrorFile) syncMetadata() error {
 	return ef.sync(OpSyncMetadata, ms.SyncMetadata)
 }
 
-// markDurable records the file's post-sync size and drops the undo journal:
-// everything written up to here is on the medium and can no longer be lost by
-// a later failed sync.
+// markDurable records the post-sync size and drops the undo journal.
 func (ef *ErrorFile) markDurable() {
 	if !ef.efs.tracksLoss() {
 		return

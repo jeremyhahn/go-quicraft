@@ -2749,15 +2749,7 @@ func setupPiggybackPeer(t *testing.T, shardID, replicaID uint64) (
 	return peer, lr, update, piggybackIndex
 }
 
-// TestCommitWorker_PiggybackHappyPath verifies the end-to-end piggyback
-// commit optimization: when processBatch commits an update with no
-// committed entries, GetPiggybackUpdate discovers the newly committable
-// entries and forwards them to the apply worker in the same pipeline cycle.
-//
-// OPTIMIZATION: The piggyback path no longer calls SaveState to persist
-// the commit index. The commit index is persisted lazily in the next batch.
-// This eliminates the double fsync and improves throughput. The entries
-// themselves are already durable from the initial batch SaveState.
+// TestCommitWorker_PiggybackHappyPath checks newly committable entries are forwarded to apply in the same cycle; the commit index is persisted with the next batch.
 func TestCommitWorker_PiggybackHappyPath(t *testing.T) {
 	ldb := newTestLogDB()
 	sender := newTestSender()

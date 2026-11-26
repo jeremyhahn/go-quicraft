@@ -55,10 +55,7 @@ func identityMembership() *membership {
 	})
 }
 
-// TestRemoveNode_RetainsTheDepartingIdentityAsATombstone is the core
-// regression. The identity must leave the ACTIVE map (so it no longer
-// authorizes, and so recycling the machine into a new replica ID stays legal)
-// and land in the tombstone map (so the deny-list can still recognise it).
+// TestRemoveNode_RetainsTheDepartingIdentityAsATombstone checks the identity moves from the active map to the tombstone map.
 func TestRemoveNode_RetainsTheDepartingIdentityAsATombstone(t *testing.T) {
 	m := identityMembership()
 	cc := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 1}

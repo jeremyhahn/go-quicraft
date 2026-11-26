@@ -6,14 +6,7 @@ run:
   # language-version-dependent diagnostics staticcheck emits.
   go: "1.27.4"
   timeout: 5m
-  # Test files ARE linted. This was false, which in a repository with ~265k
-  # lines of test code meant the linters examined a minority of the tree — and
-  # test code is where this project's defects have most often hidden (a mock
-  # that manufactured impossible states, tests that passed against unfixed
-  # code). The per-linter exclusions under `exclusions.rules` below already
-  # relax the checks that are genuinely noisy in tests (errcheck on deferred
-  # Close, gocritic style, gocyclo on table-driven tests); everything else now
-  # applies to _test.go as it does to production code.
+  # Test files are linted; the exclusions below relax only the checks that are noisy in tests.
   tests: true
 
 linters:
@@ -44,25 +37,13 @@ linters:
 
   exclusions:
     rules:
-      # Relaxed in tests because the diagnostic is about production hygiene,
-      # not correctness: a deferred Close whose error nobody reads (errcheck),
-      # style preferences (gocritic), and long table-driven test functions
-      # (gocyclo) are all normal and intended in _test.go.
+      # Production-hygiene checks relaxed in tests: deferred Close errors, style and long table-driven tests.
       - path: _test\.go
         linters:
           - errcheck
           - gocritic
           - gocyclo
-      # Added when `run.tests` was turned on. Both fire almost exclusively on
-      # stub and mock implementations of production interfaces, where the
-      # parameter exists to satisfy the signature and its NAME is the
-      # documentation — renaming 48 of them to `_` would make the fakes harder
-      # to read, not safer. Same category as the three above: hygiene, not
-      # correctness. Every other linter now applies to test files.
-      #
-      # This is a strictly smaller exclusion than the `tests: false` it
-      # replaces, which suppressed all 20 linters across all ~265k lines of
-      # test code.
+      # Stub and mock parameters exist to satisfy a signature and their names document them.
       - path: _test\.go
         linters:
           - unparam

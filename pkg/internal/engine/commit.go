@@ -788,12 +788,7 @@ func commitUpdateLocked(node *Node, u *proto.Update, piggyback *proto.Update) (c
 		pb, err := node.peer.GetPiggybackUpdate(node.lastApplied.Load())
 		*piggyback = pb
 		if err == nil && len(pb.CommittedEntries) > 0 {
-			// The piggyback hands entries to apply that the step
-			// worker's own publish never saw: the commit index moved
-			// in the commitPending window. Publish the markers before
-			// the entries reach apply so a proposal acknowledged from
-			// this batch is covered by the published commit index
-			// (#1104), as on the step worker's path.
+			// Publish the commit markers before the piggyback entries reach apply.
 			node.publishLogMarkers()
 		}
 		return commitPiggyback, err
@@ -1167,23 +1162,7 @@ func (w *commitWorker) drainUnloadReload() {
 	}
 }
 
-// requestUnload sends a shard removal request to the commit worker via
-// the membership channel and returns a channel closed once the worker has
-// applied it. Safe for concurrent use by the Host goroutine.
-//
-// The returned channel is what makes an unload a fence rather than a hint.
-// The worker applies membership between batches, and while a forward to the
-// apply tier is blocked (forwardToApply) — never while a SaveState is running.
-// Once it closes: no SaveState of the stopped incarnation is running; every
-// item of it still ahead in the current batch is skipped, because processBatch
-// re-checks the unloaded set and the node's unloaded mark before it commits or
-// persists an item; and every later batch drops its update at admission (see
-// admit). Any new LogDB write added to the batch loop must sit behind those
-// re-checks, or the fence no longer holds. Without the
-// fence, an old incarnation's HardState, entries or adopted snapshot could be
-// written AFTER a new incarnation of the same shard had loaded LogDB.
-//
-// Wait on it with awaitMembership, which also gives up when the worker stops.
+// requestUnload asks the commit worker to unload a shard and returns a channel closed once applied, after which no LogDB write of that incarnation can happen. Wait with awaitMembership.
 func (w *commitWorker) requestUnload(shardID uint64) <-chan struct{} {
 	done := make(chan struct{})
 	select {
@@ -1216,29 +1195,7 @@ func (w *commitWorker) requestReload(shardID uint64) {
 	}
 }
 
-// executePiggyback sends messages with proper free/ordered split, persists the
-// piggybacked commit index, advances the peer, sends ordered responses, and
-// forwards committed entries to the apply worker. Eliminates the second pipeline
-// cycle for multi-node proposals. Called with raftMu already released.
-//
-// Commit-index durability: this path DOES persist the advanced commit index via
-// SaveState before applying or sending ordered responses (see below). An earlier
-// version skipped that fsync as an optimization, but that could leave an on-disk
-// state machine whose durable lastApplied exceeded the recovered HardState.Commit
-// (violating lastApplied <= committed). The state-only SaveState does not truncate
-// entries, so the cost is one fsync without touching the durable log.
-//
-// What it does NOT persist is entries — the logdb.Update below has no Entries
-// field, by design. That is why GetPiggybackUpdate withholds ordered messages
-// whenever the peer has unsaved entries: an ordered message reaching this
-// function is one whose durability requirement this state-only fsync can
-// actually satisfy. Do not "optimize" that withholding away without giving this
-// path an entry write, or the shard resumes acknowledging RAM-only log indices.
-//
-// It returns false only when the worker is shutting down (stopC fired mid-
-// delivery); in that case the caller must stop processing the batch (the shared
-// batch buffers are no longer safe to iterate). It returns true for normal
-// completion AND for per-node errors (the caller continues with the next item).
+// executePiggyback sends free messages, persists the commit index (hard state only, no entries), sends ordered responses and forwards entries to apply; false means shutdown.
 func (w *commitWorker) executePiggyback(node *Node, piggyback proto.Update) bool {
 	// Split messages: free-order may go immediately (they do not depend on
 	// commit-index durability); ordered responses go AFTER the commit index

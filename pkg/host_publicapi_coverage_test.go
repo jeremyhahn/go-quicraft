@@ -207,10 +207,7 @@ func TestQueryRaftLog_RangeErrors(t *testing.T) {
 // RequestLeaderTransfer
 // ---------------------------------------------------------------------------
 
-// TestRequestLeaderTransfer_ObserverAndRemovedTargets verifies that leadership is never
-// handed to a replica that cannot hold it: an observer does not vote, and a
-// removed replica is no longer part of the shard. Accepting either would stall
-// the shard until the election timeout.
+// TestRequestLeaderTransfer_ObserverAndRemovedTargets verifies leadership is never transferred to an observer or removed replica.
 func TestRequestLeaderTransfer_ObserverAndRemovedTargets(t *testing.T) {
 	h := startSingleVoterShard(t)
 

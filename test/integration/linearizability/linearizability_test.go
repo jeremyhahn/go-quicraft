@@ -1021,47 +1021,10 @@ func findAnyLiveHost(cluster *testCluster, shardID uint64) *quicraft.Host {
 // Client Worker
 // ---------------------------------------------------------------------------
 
-// maxAttemptsPerOp bounds how many times a client retries ONE logical
-// operation before giving up on it and moving to the next.
-//
-// It exists to keep the checker decidable, not to hide failures: every attempt
-// is still recorded, and an abandoned attempt is still an indeterminate
-// operation in the history. What it bounds is the length of an UNBROKEN run of
-// indeterminate writes on a single key. The porcupine model is deliberately
-// nondeterministic — an indeterminate write has two legal successor states — so
-// a chain of k of them on one key costs 2^k to search, and a leader outage that
-// lasts several seconds produces chains long enough for the search to exhaust
-// its whole budget. The checker then returns Unknown, which the harness
-// correctly refuses to treat as a pass, and the test fails having found
-// nothing.
-//
-// Moving on collapses the blow-up because the very next operation on that key
-// is a GET, and a successful read pins the state, cutting the chain. A healthy
-// run never reaches the cap: attempt resets to 0 on every success.
+// maxAttemptsPerOp bounds retries of one logical operation, keeping indeterminate chains short enough to check.
 const maxAttemptsPerOp = 10
 
-// minOpInterval is the least time between the starts of two attempts by one
-// client. Without it the workload is bounded only by wall time, so a wider,
-// faster host records more operations in the same window: on a 24-CPU runner
-// a 5s single-key run recorded ~12,900 operations, and porcupine's search
-// over that one partition (whose cache grows with the square of its length)
-// drove the race-instrumented package past the 8g integration cap (#623).
-// Pacing bounds every history at duration/minOpInterval operations per client
-// whatever the host, while keeping load on the cluster for the whole window,
-// so every fault a test injects still lands under traffic.
-//
-// Each wait is jittered up to a second minOpInterval. The clients start
-// together and step through the keys in the same order, so a fixed pace on a
-// host whose operations finish inside one interval holds them in lockstep:
-// every client lands on the same key at once, and porcupine's search over a
-// window of N overlapping operations is exponential in N (one 16-client run
-// alone passed 7.6g). The jitter lets them drift apart as unpaced clients
-// did, and every key is still written and read by every client.
-//
-// The pace allows 50-100 attempts per client-second, ~6-9x the slowest
-// throughput observed (baselineWritesPerClientSecond counts writes, half the
-// attempts) and ~20-30x the floor, so the throughput assertion still separates a slow cluster from
-// a collapsed one.
+// minOpInterval is the least time between one client's attempt starts, jittered, bounding history size on any host.
 const minOpInterval = 10 * time.Millisecond
 
 // clientWorker runs Put and Get operations against the cluster for the given

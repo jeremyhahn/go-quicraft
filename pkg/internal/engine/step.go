@@ -570,22 +570,7 @@ func (w *stepWorker) processReady() {
 		if !hasUpdate {
 			continue
 		}
-		// moreEntriesToApply is false while a snapshot recovery owns the
-		// state machine: committed entries stay in the raft log (the
-		// processed marker does not advance, so they are re-offered once
-		// the gate clears) instead of entering the commit/apply pipeline.
-		// Everything else in the update — hard state, entries to save,
-		// messages — is protocol-level and must keep flowing.
-		//
-		// snapshotAdoptionPending covers the window BEFORE that gate goes up:
-		// the inbox drain above may have just installed a received snapshot,
-		// which moves the log's processed marker to the snapshot index while
-		// the state machine is still at its old lastApplied. Extracting there
-		// hands the apply worker a batch starting above lastApplied+1 —
-		// ErrApplyGap, and a replica that never applies again the moment it
-		// finishes joining. The snapshot pool cannot raise the recovering gate
-		// until it observes this install, so only a check on the owner's own
-		// goroutine closes it.
+		// Extract no committed entries while a recovery owns the state machine or a just-installed snapshot awaits adoption.
 		holdEntries := node.IsRecovering() || node.snapshotAdoptionPending()
 		update, err := node.peer.GetUpdate(!holdEntries, lastApplied)
 		if err != nil {
@@ -1599,8 +1584,7 @@ func (w *stepWorker) processCommitPendingInbox(shardID uint64, node *Node) {
 	if readIndexErr != nil && w.callback != nil {
 		w.callback.OnReadIndexFailed(shardID, w.readKeyBuf, readIndexErr)
 	}
-	// Raft has the keys now, or they have been failed: no longer in flight.
-	// The read states phase 1 took from the Peer are, until delivered below.
+	// Raft has the keys or they failed; the read states taken in phase 1 stay in flight until delivered.
 	w.inFlight.readKeys = nil
 	w.inFlight.readStates = readStates
 

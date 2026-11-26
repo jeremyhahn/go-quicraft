@@ -932,9 +932,7 @@ func TestSendBatch_WriteErrorEvictsConnection(t *testing.T) {
 		t.Fatal("connection was not closed after the write failure")
 	}
 
-	// And it must no longer be the cached connection for the target. Compare
-	// identity rather than presence so a concurrent re-dial cannot hide a
-	// missing eviction.
+	// Compare identity so a re-dial cannot hide a missing eviction.
 	t1.connMu.RLock()
 	cached, cachedOK := t1.conns[t2Addr]
 	t1.connMu.RUnlock()

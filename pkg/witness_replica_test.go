@@ -27,15 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// ---------------------------------------------------------------------------
-// A witness replica on real hosts (#820).
-//
-// Two full replicas and one witness, each on its own host over QUIC. The
-// witness votes and acks, so with one full replica stopped the other still
-// commits; it holds no state machine data, so its state machine applies no
-// user entry; and the replicated witness policy refuses the add that would
-// leave the full replicas unable to form a quorum on their own.
-// ---------------------------------------------------------------------------
+// A witness replica on real hosts: two full replicas and one witness over QUIC; the witness votes and acks but applies no user entry.
 
 const witnessReplicaShard uint64 = 1
 

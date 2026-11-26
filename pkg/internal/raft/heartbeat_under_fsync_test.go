@@ -10,11 +10,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// Tests for heartbeat-under-fsync (#390): while a WAL write is in flight the
-// step worker sends only what Peer.DrainFreeOrderMessages releases, and a
-// HeartbeatResp is released there only when the step that produced it left
-// the hard state (term, vote, owed vote window) at its durable value and
-// appended nothing.
+// Tests for heartbeat-under-fsync: a HeartbeatResp is free-order only when its step left the hard state durable and appended nothing.
 
 var hbMembers = map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"}
 
@@ -143,8 +139,7 @@ func TestHeartbeatUnderFsync_AppendInSameStepStaysOrdered(t *testing.T) {
 	}
 }
 
-// Raising the owed vote window is a hard-state change: a lease ack promising
-// the window may not leave before the window is durable (PR #207).
+// Raising the owed vote window is a hard-state change.
 func TestHeartbeatUnderFsync_VoteWindowRaiseStaysOrdered(t *testing.T) {
 	p := newHBFollower(t, raftTestCfgLeaseRead(1, 2), nil, proto.State{Term: 5})
 	setTestLeaseClock(p.r)

@@ -1116,9 +1116,7 @@ func TestPaper_FreeStuckCandidateWithCheckQuorum(t *testing.T) {
 		t.Fatalf("expected leader to step down, got %s", leader1.state)
 	}
 
-	// Node 2 can now retry and should be able to win the election
-	// since the old leader is no longer sending heartbeats.
-	// Restart the candidate's election.
+	// The old leader no longer sends heartbeats, so restart node 2's election.
 	node2.drainMessages()
 	advanceElection(node2)
 	candidateTerm := node2.term

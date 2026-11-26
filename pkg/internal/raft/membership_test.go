@@ -1016,16 +1016,7 @@ func TestLeaderRejectsConfigChangeWhileAnEarlierOneIsUnapplied(t *testing.T) {
 	}
 }
 
-// TestVoteDeniedToCandidateOutsideTheConfiguration pins the guard that
-// compensates for the receive path no longer being an allow-list.
-//
-// Once any authenticated peer can reach raft, refusing the VOTE is what stops a
-// replica that is not part of this shard from winning a term and becoming its
-// leader. The configuration test belongs here and not on the receive path
-// because denying a vote can only ever cost liveness, never safety, whereas
-// dropping replication on a stale configuration wedges the replica permanently.
-//
-// hashicorp/raft places the identical test in requestVote/requestPreVote.
+// TestVoteDeniedToCandidateOutsideTheConfiguration checks a vote is refused to a candidate outside the configuration.
 func TestVoteDeniedToCandidateOutsideTheConfiguration(t *testing.T) {
 	for _, tc := range []struct {
 		name     string

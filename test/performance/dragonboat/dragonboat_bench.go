@@ -563,10 +563,7 @@ func freeTCPPort(b testing.TB) string {
 	return benchutil.MustReserveTCPPort(b.Fatalf)
 }
 
-// nodeHostConfig returns the NodeHostConfig every benchmark NodeHost uses:
-// WAL and data directories under dir, mutual TLS from cert, and Tan as the
-// LogDB. Dragonboat falls back to its sharded Pebble LogDB when no factory is
-// set, so the factory is explicit to benchmark Dragonboat's own log store.
+// nodeHostConfig returns the benchmark NodeHostConfig: directories under dir, mutual TLS from cert, and Tan as the LogDB.
 func nodeHostConfig(dir, addr string, cert tlsCertBundle) dbconfig.NodeHostConfig {
 	return dbconfig.NodeHostConfig{
 		WALDir:         dir + "/wal",
@@ -1079,20 +1076,7 @@ func BenchDragonboatStaleReadCluster(b *testing.B, cluster *BenchCluster, rec *p
 // Propose-loop error tolerance
 // ---------------------------------------------------------------------------
 
-// maxProposeErrorRate is the share of a propose loop's iterations that may fail
-// before the loop's recorded latencies stop being worth publishing.
-//
-// The number is measured, not chosen for roundness. The Dragonboat baseline was
-// run twice on 2026-09-10 against a host also serving CI:
-//
-//	benchtime=30s, load ~14-24 on 20 cores   21 of 24 proposals failed  (87%)
-//	benchtime=5s,  load ~3.4 on 20 cores     24 of 399 failed           (6%)
-//
-// The quiet run's 6% is ordinary Raft weather -- a leader election completing,
-// a pipeline draining -- and its surviving samples describe the engine. The
-// loaded run's 87% describes the box. A threshold between them lets the first
-// publish and refuses the second, and it does so on the RUN'S OWN evidence
-// rather than on a guess about the host.
+// maxProposeErrorRate is the share of a propose loop's iterations that may fail before its latencies are not published.
 const maxProposeErrorRate = 0.20
 
 // minProposeSample is the number of attempts below which the floor withholds

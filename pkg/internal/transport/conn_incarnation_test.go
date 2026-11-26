@@ -16,32 +16,7 @@ package transport
 
 import "testing"
 
-// TestEvictStaleOutboundOnRecv_UnattributableOutboundEvicted is the regression
-// test for a 20-30 second one-way network black hole that stalled leader
-// election on a cluster with quorum intact.
-//
-// The scenario the soak reproduced: a peer restarts on the same address, and
-// the surviving nodes hold outbound connections dialed to the DEAD incarnation.
-// Writing into such a connection SUCCEEDS locally -- QUIC buffers into the send
-// window and reports no error -- so the sender believes every RequestPreVoteResp
-// was delivered while the restarted peer receives nothing. With 2 of 5 nodes
-// down every surviving voter's grant is required, so one silently broken
-// direction blocks EVERY election until the QUIC MaxIdleTimeout (30s) finally
-// kills the connection.
-//
-// Restart detection is therefore the only thing standing between a peer restart
-// and a multi-second outage, and it must not have holes. Firing only when a
-// PREVIOUS epoch had been recorded for the peer covers a strictly smaller set
-// than "we hold an outbound of unproven provenance": we dial peers before their
-// first batch reaches us, and a connection teardown can drop the epoch record
-// while a later re-dial repopulates the connection cache. In both states a
-// restart is indistinguishable from first contact and the black-holed outbound
-// would survive.
-//
-// The invariant asserted here is the complete one: an outbound that cannot be
-// attributed to the incarnation whose batch just arrived is not trustworthy and
-// must be evicted, whether or not this node happens to remember an earlier
-// epoch for that address.
+// TestEvictStaleOutboundOnRecv_UnattributableOutboundEvicted: an outbound not attributable to the incarnation whose batch arrived is evicted.
 func TestEvictStaleOutboundOnRecv_UnattributableOutboundEvicted(t *testing.T) {
 	t1, t2, _, _, cleanup := transportPair(t, 42)
 	defer cleanup()

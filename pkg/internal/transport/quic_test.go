@@ -3807,12 +3807,7 @@ func TestSend_EachMessageIsPinnedToItsDestination(t *testing.T) {
 	}
 }
 
-// TestSend_ClosesAConnectionWhosePeerIsNoLongerBound: the pin was checked only
-// at dial time, so a connection cached before membership rebound a replica to
-// a new keypair at the same address kept carrying that replica's traffic to
-// the old key's holder. A send whose destination the peer no longer is drops
-// the message and, when the peer is bound to no replica at the address any
-// more, closes the connection so the next send dials whoever is bound now.
+// TestSend_ClosesAConnectionWhosePeerIsNoLongerBound verifies a send drops a message for a rebound replica and closes a connection bound to none.
 func TestSend_ClosesAConnectionWhosePeerIsNoLongerBound(t *testing.T) {
 	ids := &replicaIdentities{}
 	t1, t2, cleanup := transportPairWith(t, 1, newTestHandler(), newTestHandler(), func(c *Config) {

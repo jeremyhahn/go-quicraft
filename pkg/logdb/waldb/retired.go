@@ -182,23 +182,7 @@ func (r *retiredRegistry) keys() []nodeKey {
 	return out
 }
 
-// retire durably adds keys to the registry in dir, in one rewrite however
-// many there are, so carrying a whole registry across (Reencrypt) costs one
-// publication rather than one per key. Keys already retired are skipped;
-// retiring nothing new is a no-op.
-//
-// The new registry is published first. Then, still under writeMu, apply runs
-// — RemoveNodeData drops the node's records there — and only after it are the
-// keys added to the in-memory set. So NodeRemoved reports a retirement only
-// once it is durable AND the node's records are gone from every reader; the
-// two can never be observed out of order.
-//
-// On error, published reports whether the new registry was renamed into
-// place. If it was not, nothing has changed. If it was, only the directory
-// fsync failed: the retirement may or may not survive a crash, the same
-// uncertainty a failed WAL fsync leaves, and the caller must fail-stop the
-// database so the next open decides from what is on disk. apply does not run
-// on any error.
+// retire durably adds keys to the registry in dir in one rewrite, skipping keys already retired.
 func (r *retiredRegistry) retire(filesystem FS, dir string, keys []nodeKey, noSync bool, apply func()) (published bool, err error) {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()

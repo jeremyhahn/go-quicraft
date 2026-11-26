@@ -1166,9 +1166,7 @@ func TestMemDB_NodeRemovedRetiresTheReplica(t *testing.T) {
 	}
 }
 
-// TestRemoveEntriesToRefusesARetiredNode verifies RemoveEntriesTo refuses a
-// node RemoveNodeData retired, as every other writer does, rather than
-// reporting success for a node that no longer exists.
+// TestRemoveEntriesToRefusesARetiredNode verifies RemoveEntriesTo refuses a node RemoveNodeData retired.
 func TestRemoveEntriesToRefusesARetiredNode(t *testing.T) {
 	db := New()
 	if err := db.SaveState([]logdb.Update{{ShardID: 1, ReplicaID: 1,

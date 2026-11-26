@@ -131,12 +131,7 @@ func TestConfig_ToQuicraft_AllFieldsMapped(t *testing.T) {
 	}
 }
 
-// TestConfig_ToQuicraft_WitnessPolicyDisabled pins the adapter-critical
-// witness-policy mapping: dragonboat has no witness membership policy, so
-// the adapter must disable quicraft's RequireFullReplicaMajority default
-// (nil => true) to preserve dragonboat's unrestricted witness-add
-// semantics. Dropping this mapping would silently re-enable the policy
-// and break previously-legal witness adds for adapter users.
+// TestConfig_ToQuicraft_WitnessPolicyDisabled checks the adapter disables RequireFullReplicaMajority, as dragonboat has no witness policy.
 func TestConfig_ToQuicraft_WitnessPolicyDisabled(t *testing.T) {
 	qc := Config{ShardID: 1, ReplicaID: 1, ElectionRTT: 10, HeartbeatRTT: 1}.ToQuicraft()
 	if qc.Witness.RequireFullReplicaMajority == nil || *qc.Witness.RequireFullReplicaMajority {

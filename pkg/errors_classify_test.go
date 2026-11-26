@@ -252,16 +252,7 @@ func declaredSentinels(t *testing.T) map[string]string {
 	return declared
 }
 
-// TestTemporary_ClassifiesEverySentinel holds the classification table and the
-// package's actual declarations against each other in BOTH directions.
-//
-// The one-directional version could only catch an addition. A sentinel that
-// was REMOVED left its table row behind, still asserting a classification for
-// something no longer in the API, and a sentinel declared in any file other
-// than errors.go was never seen at all. Both directions are needed because the
-// table is a record of a human decision and the declarations are the API: they
-// are two independent sources, and the test is only worth anything while it
-// compares them rather than restating one of them.
+// TestTemporary_ClassifiesEverySentinel compares the classification table and the package's declarations in both directions.
 func TestTemporary_ClassifiesEverySentinel(t *testing.T) {
 	declared := declaredSentinels(t)
 

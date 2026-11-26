@@ -198,18 +198,7 @@ func assertApplyOrder(t *testing.T) {
 type kvStateMachine struct {
 	mu   sync.RWMutex
 	data map[string]string
-	// prevIndex is the raft index of the previously applied entry. Every
-	// entry handed to Update must carry a STRICTLY greater index: an index
-	// that repeats or moves backward means the entry was applied twice or
-	// replayed, which no amount of state comparison can detect afterwards on
-	// a last-write-wins store. RecoverFromSnapshot is the only legal reset
-	// point.
-	//
-	// Note: consecutive indices are NOT required. The user state machine only
-	// ever sees user commands; the engine legitimately consumes indices for
-	// the initial-membership entry, each leader's no-op entry, config changes
-	// and session register/unregister entries, so gaps are expected and are
-	// counted rather than failed. See applyGaps.
+	// prevIndex is the last applied raft index; each Update entry must carry a strictly greater one, with gaps counted in applyGaps. RecoverFromSnapshot is the only reset.
 	prevIndex uint64
 	// applyGaps counts skipped index ranges, for diagnostics only.
 	applyGaps atomic.Uint64
@@ -543,11 +532,7 @@ func testHostConfig(t *testing.T, listenAddr string, mtls *config.MTLSConfig) co
 	return cfg
 }
 
-// TestHarness_WALSyncMode pins this suite to NoSyncWAL whatever the
-// QUICRAFT_IT_WAL_SYNC switch says: a stalled fdatasync holds every election
-// past its timeout (#362), and only the linearizability and e2e harnesses
-// size their elections for WAL-sync mode (make integration-test-walsync).
-// Restarted hosts keep the real sync (TestHarness_RestartConfigKeepsWALSync).
+// TestHarness_WALSyncMode pins this suite to NoSyncWAL whatever QUICRAFT_IT_WAL_SYNC says; restarted hosts keep the real sync (TestHarness_RestartConfigKeepsWALSync).
 func TestHarness_WALSyncMode(t *testing.T) {
 	for _, v := range []string{"", "0", "1"} {
 		t.Setenv("QUICRAFT_IT_WAL_SYNC", v)
@@ -577,10 +562,7 @@ func testShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. Read the
-// bound address from Host.RaftAddress once the host exists: a port reserved
-// up front and bound later can be taken by a concurrent CI job that shares the
-// network but not the reservation's lock directory (#386).
+// kernelAddr binds a host on a kernel-assigned loopback port; read it back from Host.RaftAddress.
 const kernelAddr = "127.0.0.1:0"
 
 // ---------------------------------------------------------------------------
@@ -982,15 +964,7 @@ func (c *testCluster) liveNodeIndexes() []int {
 	return live
 }
 
-// resolveStateMachine returns the state machine for node i on the given shard.
-//
-// The cluster's own tracker slice is consulted FIRST because it is the live
-// one: addNodeToCluster appends to it and restartNode overwrites entries in it,
-// while a trackers slice a test captured from startShard is a snapshot from
-// before those changes and points at state machines that no longer run. The
-// caller's slice is the fallback, which covers a shard whose trackers were
-// never stored on the cluster (startShard overwrites cluster.trackers, so only
-// the most recently started shard is there).
+// resolveStateMachine returns node i's state machine for the shard, preferring the cluster's live tracker slice over the caller's.
 func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID uint64, i int) *kvStateMachine {
 	replicaID := uint64(i + 1)
 
@@ -1012,14 +986,7 @@ func resolveStateMachine(cluster *testCluster, trackers []*smTracker, shardID ui
 	return nil
 }
 
-// waitForStateMachine returns node i's state machine for the shard, waiting
-// for the engine to register it if it has not appeared yet.
-//
-// A nil state machine is NOT a reason to skip the node: tracker.Get returns nil
-// exactly when the engine never invoked the state-machine factory for that
-// shard/replica, which is a startup or recovery failure. Waiting (and failing
-// on timeout) is the only treatment that cannot silently drop a node from the
-// verification set.
+// waitForStateMachine returns node i's state machine, waiting for the engine to register it; a nil one is a failure, never a skip.
 func waitForStateMachine(t *testing.T, cluster *testCluster, trackers []*smTracker, shardID uint64, i int, timeout time.Duration) *kvStateMachine {
 	t.Helper()
 	machine := resolveStateMachine(cluster, trackers, shardID, i)
@@ -1083,8 +1050,7 @@ func (c *testCluster) stopNode(idx int) {
 	lk := c.nodeLock(idx)
 	lk.Lock()
 	defer lk.Unlock()
-	// Host.Close drains in-flight operations and can take seconds, so it runs
-	// outside hostsMu: under the write lock it stalled every reader (#309).
+	// Host.Close can take seconds, so it runs outside hostsMu.
 	if h := c.takeHost(idx); h != nil {
 		h.Close()
 	}
@@ -1210,9 +1176,7 @@ func proposeAndWait(t *testing.T, cluster *testCluster, trackers []*smTracker, s
 			continue
 		}
 
-		// Check ANY non-stopped node's SM for the applied value. After
-		// leadership changes, the proposing node may no longer be the
-		// leader, but the entry should still replicate to all nodes.
+		// Check any non-stopped node's state machine; the entry replicates everywhere.
 		applied := waitForConditionNoFatal(5*time.Second,
 			func() bool {
 				for _, i := range cluster.liveNodeIndexes() {
@@ -2066,15 +2030,7 @@ func restartNode(
 	cluster.hostsMu.Unlock()
 }
 
-// TestBudgetsDescribeTheClusterTheyBudgetFor pins the derivation at the top of
-// this file to the configuration the suite actually starts.
-//
-// The constants are only worth having if the config builders keep reading
-// them. If a future change gives testShardConfig an explicit ElectionRTT, or
-// hands hostConfigAt a different RTTMillisecond, electionRound silently starts
-// describing a cluster that no longer exists and every budget built on it is
-// wrong by that factor — which is exactly the drift the derivation replaced a
-// literal to prevent. This is the only place that can notice.
+// TestBudgetsDescribeTheClusterTheyBudgetFor: the budget constants match what the config builders start.
 func TestBudgetsDescribeTheClusterTheyBudgetFor(t *testing.T) {
 	if got := testHostConfig(t, "127.0.0.1:1", nil).RTTMillisecond; got != testRTTMillisecond {
 		t.Fatalf("testHostConfig sets RTTMillisecond=%d but the budgets are derived "+

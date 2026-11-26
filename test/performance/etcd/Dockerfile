@@ -1,11 +1,4 @@
-# Multi-stage build for QuicRaft vs etcd/raft performance benchmarks.
-#
-# Usage:
-#   docker build -t quicraft-bench-etcd -f test/performance/etcd/Dockerfile .
-#   docker run --rm quicraft-bench-etcd
-#
-# The build context must be the repository root so the replace directive
-# in go.mod (replace => ../../../) resolves correctly.
+# QuicRaft vs etcd/raft benchmark image; build from the repository root with -f test/performance/etcd/Dockerfile.
 
 # ---------------------------------------------------------------------------
 # Stage 1: Build the benchmark test binary

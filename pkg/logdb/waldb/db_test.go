@@ -2748,10 +2748,7 @@ func TestWriteStateFailureOnEmptyDBPreservesCleanState(t *testing.T) {
 	}
 }
 
-// TestSaveUpdatePartialFailurePreservesEntries verifies that when a
-// SaveState update contains both entries and state, a failure during
-// state write does not affect the previously successful entries write
-// within the same saveUpdate call.
+// TestSaveUpdatePartialFailurePreservesEntries verifies a failed state write leaves earlier entry writes intact.
 func TestSaveUpdatePartialFailurePreservesEntries(t *testing.T) {
 	db := openTestDB(t)
 	const shardID, replicaID = uint64(1), uint64(1)
@@ -2873,10 +2870,7 @@ func blockNextSegment(t *testing.T, s *walShard) {
 	t.Cleanup(func() { os.Remove(blocked) })
 }
 
-// TestSaveStatePartialWriteDiscardsGhostRecords verifies that when a batch
-// write fails mid-way through processing updates, previously buffered
-// records from successful shards are discarded. This prevents ghost records
-// from being fsynced on the next successful SaveState call.
+// TestSaveStatePartialWriteDiscardsGhostRecords verifies a failed batch discards records buffered for other shards.
 func TestSaveStatePartialWriteDiscardsGhostRecords(t *testing.T) {
 	dir := t.TempDir()
 	// Use sync disabled so we can observe buffer behavior without I/O noise.

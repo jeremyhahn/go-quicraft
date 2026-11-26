@@ -439,9 +439,7 @@ func TestNoneStrategy_ProtectedPair(t *testing.T) {
 		t.Fatal("no-encryption mode must not hand back an enclave")
 	}
 
-	// The enclave is validated even though its contents are never read: a
-	// caller that destroyed or lost its root key before sealing must learn so
-	// here, not at an unseal it can no longer perform.
+	// The enclave is validated even though it is not read.
 	t.Run("refuses a root key it cannot vouch for", func(t *testing.T) {
 		destroyed := mustSized(t, rootKeySize)
 		destroyed.Destroy()

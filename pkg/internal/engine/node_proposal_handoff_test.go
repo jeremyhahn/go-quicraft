@@ -67,11 +67,7 @@ func drainOne(t *testing.T, node *Node, key uint64) uint64 {
 	return id
 }
 
-// assertFenced checks the closed-queue contract shared by Stop and
-// markFailed: the batch drained before the fence (drainedAt, drainedID) can
-// no longer be handed off and is final and untaken, the proposal still queued
-// (queuedAt) is final and untaken, a drain takes nothing and a delivery is
-// refused.
+// assertFenced checks the closed-queue contract shared by Stop and markFailed.
 func assertFenced(t *testing.T, node *Node, drainedAt *uint64, drainedID uint64, queuedAt *uint64) {
 	t.Helper()
 	if node.HandOffProposals(drainedID) {

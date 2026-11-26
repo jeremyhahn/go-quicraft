@@ -207,12 +207,7 @@ func (c *crashFS) Crash() {
 	defer c.mu.Unlock()
 	c.gen++
 
-	// A removal that was never covered by a parent fsync did not happen — with
-	// one exception: an entry that was RENAMED away and whose destination
-	// survives this crash has moved, not been removed. Resurrecting it as well
-	// would leave one file reachable under both names at once, which no
-	// rename(2) can produce. Survivorship is evaluated against the pre-crash
-	// image, before any resurrection perturbs it.
+	// Resurrect undurable removals, except an entry renamed to a destination that survives.
 	survived := make(map[string]bool, len(c.tombs))
 	for _, t := range c.tombs {
 		if t.renamedTo != "" {

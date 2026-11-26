@@ -69,6 +69,17 @@ they all do, the shard's leader commits the switch on its own and
 After the switch a node on the older release cannot rejoin that shard, so
 finish the rollout rather than rolling back.
 
+Each build accepts two wire versions, its current and its previous: read them
+with `proto.DefaultWireWindow()` or, on a running host, `Host.WireWindow()`.
+A peer outside that window is refused at the transport and again at the Raft
+layer, where its messages never reach elections or replication; the refusal
+is a `*WireVersionMismatchError` naming both sides, matched by
+`errors.Is(err, proto.ErrUnsupportedVersion)`, and is logged once per peer
+until its versions change. Bring the peer to a release inside the window and
+it is accepted again with no restart. From v1.0.0-rc.1, every release that
+changes the wire layout bumps the wire version, so two releases more than one
+wire bump apart do not interoperate.
+
 ## Upgrade notes by release
 
 Read the CHANGELOG `BREAKING` sections between your version and the target;
@@ -136,8 +147,8 @@ it accepts by version and then misreads.
 
 Everything above describes the pre-release policy. The policy from the first
 stable release, with the answer to each open question, is in
-[architecture.md](architecture.md#from-v100). The owner acknowledged it on
-2026-10-20 (#404); until v1.0.0 ships, plan an upgrade as described above.
+[architecture.md](architecture.md#from-v100). It is acknowledged
+(#404); until v1.0.0 ships, plan an upgrade as described above.
 
 ## Bootstrapping and growing a cluster
 

@@ -161,10 +161,7 @@ func TestE2E_RemoveNode_ThenPropose(t *testing.T) {
 	leaderIdx = cluster.waitForClusterLeader(shardID, failoverTimeout)
 	waitForMembershipSize(t, cluster.hosts[leaderIdx], shardID, 2, membershipTimeout)
 
-	// Both survivors must agree that the shard is now two voters. This is the
-	// case where a divergent follower is most dangerous: with a 3-voter
-	// configuration still in its head, a survivor sizes quorum at 2 out of 3
-	// and would count a vote from a replica that no longer exists.
+	// Both survivors must agree the shard has two voters.
 	var survivors []uint64
 	for i := range cluster.hosts {
 		if replicaID := uint64(i + 1); replicaID != removedReplicaID {

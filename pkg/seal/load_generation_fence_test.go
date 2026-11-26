@@ -156,7 +156,7 @@ func TestLoadGenerationFenceSupersedesEarlierLoader(t *testing.T) {
 		t.Fatal("losing the claim must be reported at error level")
 	}
 
-	// THE POINT: A may no longer add to the DEK it shares with B.
+	// A may no longer add to the DEK it shares with B.
 	if _, err := first.Encrypt(nil, []byte("A must not write")); !errors.Is(err, ErrBarrierSuperseded) {
 		t.Fatalf("a superseded barrier ENCRYPTED (err=%v); two writers are now sharing one "+
 			"epoch DEK with two independent nonce sequences", err)
@@ -189,10 +189,7 @@ func TestLoadGenerationFenceSupersedesEarlierLoader(t *testing.T) {
 	}
 }
 
-// TestSupersededBarrierStillDecrypts pins the deliberate asymmetry: losing the
-// claim stops this instance from ADDING to a shared key, not from reading data
-// it already holds. A node that cannot serve reads because another process
-// touched its sealed blob would be a worse outage than the hazard.
+// TestSupersededBarrierStillDecrypts: a superseded barrier stops encrypting but can still read its data.
 func TestSupersededBarrierStillDecrypts(t *testing.T) {
 	captureLogs(t)
 	store := bootstrapFenced(t, 102)

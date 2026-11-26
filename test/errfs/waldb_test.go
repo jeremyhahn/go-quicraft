@@ -86,22 +86,7 @@ const walBlockSize = 1024
 // of 1088 bytes spans at least two blocks.
 const largeCmdSize = walBlockSize + 64
 
-// compactionEntryPayload is the Cmd size the compaction fault tests give each
-// entry they write into a smallFileSize (2 KiB) segment.
-//
-// A WAL record must fit a segment WHOLE, and the largest payload waldb accepts
-// is (segmentBlocks-1) * (blockSize-recordHeaderSize) — one block is reserved
-// for the one a record may have to pad past to start. With a 2 KiB segment and
-// 1 KiB blocks that ceiling is 1013 bytes, and the record spends a further 77
-// on the payload-type byte and the per-entry header. A Cmd of walBlockSize
-// therefore no longer fits in ANY 2 KiB segment and SaveEntries rejects it
-// permanently with ErrRecordTooLarge, which is what these two tests were
-// failing on in setup: the ceiling moved when the record header grew and the
-// batch splitter started pre-checking it, and the fixture did not follow.
-//
-// 768 bytes sits under the ceiling with margin and still costs 856 framed
-// bytes, so two entries fill a segment and the eight these tests write span
-// four of them — enough for compaction to have segments to delete.
+// compactionEntryPayload is the Cmd size of each entry the compaction fault tests write into a 2 KiB segment.
 const compactionEntryPayload = 768
 
 // maxSweepOps is the maximum number of injection targets to try in a sweep
@@ -245,20 +230,7 @@ var walWriteOps = []string{errfs.OpWriteAt, errfs.OpWrite}
 // walSyncOps is the flush an acknowledgement rests on.
 var walSyncOps = []string{errfs.OpSync}
 
-// sweepUntilOpError tries injectAt values 1, 2, … until writeFn returns an
-// error wrapping errInjectedIO, with the fault CONSTRAINED to ops. It returns
-// the injectAt that fired and the operation it fired on. Each attempt runs
-// against a fresh copy of srcDir so the operation counter is reproducible.
-//
-// The constraint is the whole point, and it replaces an unconstrained sweep
-// that was self-calibrating in the worst way: it walked the counter until
-// ANYTHING failed, so a test named for a failing write settled just as happily
-// on an OpenFile, a PreAllocate or a Stat, and then asserted only that some
-// injected error had come back. Such a test passes for any implementation that
-// can fail at all — including one in which the write path it names no longer
-// exists. Pinning the sweep to the operations the test is about, and returning
-// the one that fired so the caller can assert it, is what makes the result a
-// statement about that path.
+// sweepUntilOpError tries injectAt 1, 2, ... until writeFn fails with errInjectedIO on one of ops, returning the target and op.
 func sweepUntilOpError(
 	t *testing.T,
 	srcDir string,
@@ -336,16 +308,7 @@ func openDBWithEFS(t *testing.T, dir string, efs *errfs.ErrorFS, opts ...waldb.O
 
 // --- TestErrorFS_WAL_SyncFailure ---
 
-// TestErrorFS_WAL_SyncFailure verifies that when the fdatasync an
-// acknowledgement rests on fails, the error propagates to the caller and
-// previously-committed entries survive recovery.
-//
-// The injection is constrained to File.Sync. Unconstrained, the sweep would
-// settle on whatever operation failed first — routinely an OpenFile or a
-// WriteAt — so a test named for a sync failure would never have to reach one.
-// Every phase runs with fsync enabled, as the whole suite does: under
-// WithNoSync segment.Sync returns before touching the file, and there is no
-// fsync left to fail.
+// TestErrorFS_WAL_SyncFailure verifies a failed fdatasync reaches the caller and committed entries survive recovery.
 func TestErrorFS_WAL_SyncFailure(t *testing.T) {
 	const (
 		shardID   = uint64(2)
@@ -406,9 +369,7 @@ func TestErrorFS_WAL_SyncFailure(t *testing.T) {
 
 // --- TestErrorFS_LogDB_SaveStateWriteFailure ---
 
-// TestErrorFS_LogDB_SaveStateWriteFailure verifies that when a Write fails
-// during the SaveState batch path (logdb.LogDB.SaveState), the typed error
-// propagates to the caller and previously-committed state survives recovery.
+// TestErrorFS_LogDB_SaveStateWriteFailure verifies a failed SaveState write returns the typed error and committed state survives recovery.
 func TestErrorFS_LogDB_SaveStateWriteFailure(t *testing.T) {
 	const (
 		shardID   = uint64(5)

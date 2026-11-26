@@ -285,8 +285,7 @@ func decodeRecord(buf []byte) (data []byte, recordType byte, durSeq, genStart ui
 // scheme are not readable; see CHANGELOG ("Wipe existing data directories
 // before upgrading").
 const (
-	// walContextMagic tags the context-AAD scheme. Changing it invalidates
-	// every previously written encrypted WAL record by construction.
+	// walContextMagic tags the context-AAD scheme.
 	walContextMagic = "QRWAL1"
 
 	// walContextMagicSize is len(walContextMagic).

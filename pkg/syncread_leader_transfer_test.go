@@ -27,17 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
-// ---------------------------------------------------------------------------
-// SyncRead across a leader transfer (#786).
-//
-// A write the leader acknowledged is committed; a linearizable read issued
-// after the acknowledgement must observe it, on whichever replica it is
-// issued and whoever leads by then. A leader transfer is the case the
-// failover suites in test/integration/linearizability do not drive: the old
-// leader steps down voluntarily, the target campaigns at once, and a read
-// can arrive at the old leader, the new leader or a follower while the
-// handover is still settling.
-// ---------------------------------------------------------------------------
+// SyncRead across a leader transfer: a read after an acknowledged write must observe it on any replica.
 
 const srltShard uint64 = 786
 

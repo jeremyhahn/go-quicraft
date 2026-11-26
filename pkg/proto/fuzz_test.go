@@ -371,14 +371,7 @@ func FuzzSnapshotRoundTrip(f *testing.F) {
 		uint64(math.MaxUint64), "/a", uint64(1),
 		[]byte{0xFF}, uint64(ConcurrentStateMachine), true, uint64(math.MaxUint64), true, uint64(math.MaxUint64))
 
-	// Four parameters are unnamed because the fields they fed no longer exist:
-	// the []byte fed Snapshot.Checksum, the uint64 after it fed Snapshot.Type,
-	// and the two bools fed Imported and Witness — all removed from the wire
-	// format (never computed, never read; see the Snapshot type doc). They are
-	// kept in the signature so the seed corpus already in
-	// testdata/fuzz/FuzzSnapshotRoundTrip keeps parsing: the corpus file format
-	// is positional, and dropping an argument would make every stored case
-	// unreadable, losing the inputs rather than the fields.
+	// Four unnamed parameters keep the positional seed corpus in testdata/fuzz/FuzzSnapshotRoundTrip parsing.
 	f.Fuzz(func(t *testing.T, shardID, replicaID, index, term,
 		ccID uint64, filepath string, fileSize uint64,
 		_ []byte, _ uint64, _ bool,

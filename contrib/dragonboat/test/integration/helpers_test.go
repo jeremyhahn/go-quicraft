@@ -891,11 +891,7 @@ func (t *dbGatedSMTracker) Get(shardID, replicaID uint64) *dbGatedKVStateMachine
 	return t.machines[dbSMKey{shardID, replicaID}]
 }
 
-// dbGatedKVCreateFunc returns a factory producing gated KV state machines that
-// all park on the supplied release channel. Two trackers come back: a plain
-// dbSMTracker holding the embedded KV stores, so every existing helper
-// (proposeAndWait, waitForReplication, verifyAllData) works unchanged, and a
-// gated tracker exposing the per-replica gate.
+// dbGatedKVCreateFunc returns a gated KV factory plus a plain dbSMTracker and a gated tracker.
 func dbGatedKVCreateFunc(release <-chan struct{}) (dbSM.CreateStateMachineFunc, *dbSMTracker, *dbGatedSMTracker) {
 	plain := &dbSMTracker{machines: make(map[dbSMKey]*dbKVStateMachine)}
 	gated := &dbGatedSMTracker{machines: make(map[dbSMKey]*dbGatedKVStateMachine)}
@@ -947,10 +943,7 @@ func (p *dbTestPKI) leaf(t *testing.T) dbMTLSFiles {
 	return p.ca.LeafFiles(t, p.dir)
 }
 
-// kernelAddr binds a host on a loopback port the kernel assigns. Read the
-// bound address from NodeHost.RaftAddress once the host exists: a port
-// reserved up front and bound later can be taken by a concurrent CI job that
-// shares the network but not the reservation's lock directory (#386).
+// kernelAddr binds a kernel-assigned loopback port; read it from NodeHost.RaftAddress.
 const kernelAddr = "127.0.0.1:0"
 
 // dbTestNodeHostConfig creates a dragonboat NodeHostConfig for
@@ -2317,14 +2310,7 @@ func (c *dbTestCluster) liveNodes() []int {
 	return live
 }
 
-// resolveStateMachine returns the state machine for node i on the given shard.
-//
-// The cluster's own tracker slice is consulted FIRST because it is the live
-// one: startShard/startShardWithConfig overwrite it whenever a shard is
-// (re)started, while a trackers slice a test captured earlier is a snapshot
-// that may point at state machines which no longer run. The caller's slice is
-// the fallback, which covers a shard whose trackers were never stored on the
-// cluster (startConcurrentShard, per-shard trackers in multi-shard tests).
+// resolveStateMachine returns node i's state machine, from the cluster's live trackers first and the caller's slice second.
 func resolveStateMachine(cluster *dbTestCluster, trackers []*dbSMTracker, shardID uint64, i int) *dbKVStateMachine {
 	replicaID := uint64(i + 1)
 
@@ -2346,17 +2332,7 @@ func resolveStateMachine(cluster *dbTestCluster, trackers []*dbSMTracker, shardI
 	return nil
 }
 
-// waitForReplication waits for a key to appear with the expected value in the
-// state machine of EVERY live node, and fails if it did not actually check
-// every one of them.
-//
-// The count is the point. The previous version skipped any node whose index
-// was past the end of the caller's trackers slice and any node whose state
-// machine had not registered yet, silently and without a word in the log. A
-// nil tracker entry means the engine never invoked the state-machine factory
-// for that replica, which is a startup or recovery failure — exactly the thing
-// a replication assertion exists to catch — so it is a condition to wait for
-// and then fail on, never one to skip.
+// waitForReplication waits for key to hold value on every live node and fails if any node was not checked.
 func waitForReplication(t *testing.T, cluster *dbTestCluster, trackers []*dbSMTracker, shardID uint64, key, expectedVal string, timeout time.Duration) {
 	t.Helper()
 

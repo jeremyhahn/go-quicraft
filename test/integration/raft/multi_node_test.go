@@ -56,15 +56,14 @@ func newTestCluster(t *testing.T, numNodes int) *testCluster {
 	ca := testpki.NewCA(t)
 	hosts := make([]*quicraft.Host, numNodes)
 	nodeHostDirs := make([]string, numNodes)
-	// Each host binds a kernel-assigned port; the member map is built from
-	// the bound addresses before any shard starts (#386).
+	// Each host binds a kernel-assigned port; members come from the bound addresses.
 	addrs := make([]string, numNodes)
 	for i := range numNodes {
 		cfg := testHostConfig(t, "127.0.0.1:0", ca.Leaf(t))
 		nodeHostDirs[i] = cfg.NodeHostDir
 		h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 		if err != nil {
-			// Clean up any previously created hosts.
+			// Clean up previously created hosts.
 			for j := 0; j < i; j++ {
 				hosts[j].Close()
 			}
@@ -181,21 +180,7 @@ func (c *testCluster) shardView(shardID uint64) string {
 	return b.String()
 }
 
-// onLeader runs fn against whichever host leads shardID AT THE MOMENT OF EACH
-// ATTEMPT, re-finding the leader and retrying while fn is refused as
-// not-leader, for at most budget. Any other error is returned on its first
-// occurrence, and so is success: the operation still has to succeed on a
-// leader, it just need not be the leader observed before the call.
-//
-// It exists because observing a leader does not pin it. Between
-// waitForClusterLeader and a leader-only call a loaded host can miss a
-// heartbeat, so a pre-vote or CheckQuorum moves leadership and the call is
-// refused with "leader unknown" (#309). That is Raft working, not the
-// operation failing.
-//
-// Only use it for operations whose not-leader refusal is safe to repeat:
-// a refusal wrapped in MaybeApplied means the first attempt may still take
-// effect, which for a session register leaves at most an unused session.
+// onLeader runs fn on whichever host leads shardID at each attempt, retrying not-leader refusals within budget; only for operations safe to repeat.
 func (c *testCluster) onLeader(shardID uint64, budget time.Duration, fn func(h *quicraft.Host) error) error {
 	retry := time.NewTicker(pollInterval)
 	defer retry.Stop()
@@ -535,8 +520,7 @@ func testSessionOnLeader(t *testing.T, nodes int) {
 	cluster.startShard(1)
 	cluster.waitForClusterLeader(1, leaderElectionTimeout)
 
-	// Both calls go to whoever leads at the moment of the call: leadership
-	// can legitimately move after waitForClusterLeader returns (#309).
+	// Both calls go to whoever leads at the call.
 	var session *quicraft.Session
 	err := cluster.onLeader(1, leaderElectionTimeout, func(h *quicraft.Host) error {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)

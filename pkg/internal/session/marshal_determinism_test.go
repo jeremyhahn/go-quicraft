@@ -59,8 +59,7 @@ const (
 func buildDeterminismManager(t *testing.T, sessionOrder, seriesOrder []uint64) *Manager {
 	t.Helper()
 
-	// maxResponses must exceed determinismSeries or RecordResult starts
-	// evicting and the two managers would no longer hold the same state.
+	// maxResponses exceeds determinismSeries so nothing is evicted.
 	m := NewManager(determinismSessions*2, determinismSeries*2, 0)
 	for _, c := range sessionOrder {
 		clientID := c + 1

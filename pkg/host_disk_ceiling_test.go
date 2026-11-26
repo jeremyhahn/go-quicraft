@@ -317,10 +317,7 @@ func TestDiskGate_ConcurrentRecoveryClearsRefusalAndHealth(t *testing.T) {
 	}
 }
 
-// TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery pins finding 1 of
-// the #911 round 2 review: the proposal gate and the WAL monitor publish into
-// one flag. A WAL sample at 96% that pauses before it publishes must not set
-// the flag after a newer proposal-gate sample below 90% has cleared it.
+// TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery: a stale WAL sample must not set the flag after a newer clear.
 func TestDiskGate_StaleWALFullSampleDoesNotRefuseAfterRecovery(t *testing.T) {
 	const maxBytes = uint64(1000)
 	cfg := config.HostConfig{WALDir: t.TempDir(), MaxWALDiskSize: maxBytes}

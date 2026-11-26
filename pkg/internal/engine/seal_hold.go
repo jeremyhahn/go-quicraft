@@ -23,8 +23,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// SealHold lets the commit worker PARK a shard whose log write was refused
-// because the at-rest barrier is sealed, instead of failing it (#296). A
+// SealHold lets the commit worker park a shard whose log write was refused
+// because the at-rest barrier is sealed, instead of failing it. A
 // sealed barrier is an operator state, not a disk fault: the WAL refused the
 // record before writing it and rolled the batch back to its checkpoint, so
 // nothing reached disk and the write can be retried, unchanged, once the

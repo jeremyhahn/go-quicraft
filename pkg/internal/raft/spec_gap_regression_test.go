@@ -432,18 +432,7 @@ func TestSnapshotMembershipOverVotingCapIsRejected(t *testing.T) {
 	}
 }
 
-// TestSnapshotMembershipAtVotingCapIsAccepted is the other half of the gate
-// above, and the half a clumsy bound breaks: a shard running the maximum
-// supported configuration must still be able to receive a snapshot. A gate
-// that rejects at the cap instead of above it makes 64-member shards
-// unrecoverable, which is a worse failure than the one it was added to stop.
-//
-// The second case is why snapshotVotingBitCount cannot simply count the maps.
-// A snapshot naming 64 voters NONE of which is this replica still consumes 65
-// bit positions, because rebuildReplicaToBit unconditionally seats self at bit
-// 0 whether or not the configuration lists it — which is exactly the state a
-// replica removed while it lagged comes back to. Counting len(Addresses) would
-// wave that one through and leave the panic in place for it.
+// TestSnapshotMembershipAtVotingCapIsAccepted checks a snapshot at the cap is accepted, counting self at bit 0 when unlisted.
 func TestSnapshotMembershipAtVotingCapIsAccepted(t *testing.T) {
 	t.Run("64 voters including self is accepted", func(t *testing.T) {
 		r := newTestRaft(1)

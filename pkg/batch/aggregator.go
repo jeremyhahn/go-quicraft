@@ -702,40 +702,7 @@ func (a *Aggregator) rejectAbandoned(shardID uint64, proposals []*proposal) []*p
 	return live
 }
 
-// proposeContext returns the context a batch's SyncPropose runs under, a
-// cancel func the caller must invoke, and whether the batch should be
-// proposed at all.
-//
-// It reports false when EVERY proposal context is already done. That case used
-// to fall back to context.Background(), which is unbounded: Host.SyncPropose
-// selects on the result channel and ctx.Done(), so with a Background context
-// neither arm can ever fire and the propose blocks forever. It blocks on the
-// SINGLE flush goroutine, so the aggregator then stops flushing entirely —
-// the queue fills, every later Submit returns QueueFullError, and Close hangs
-// on wg.Wait with nothing left to release it. The trigger is worse than
-// incidental: all contexts being cancelled at once is what mass caller
-// cancellation looks like, which is what quorum loss produces, which is
-// precisely when the propose cannot complete. There is also no caller left to
-// receive the result, so the batch is dropped rather than proposed blind.
-//
-// The returned context is NEVER a caller's context, and is never derived from
-// one. A batch is shared by callers who know nothing of each other, so
-// adopting one of them made an arbitrary submitter — whichever landed in the
-// batch first — govern all the rest: a 200ms caller aborted a 30s caller's
-// propose after 200ms of its budget (and an at-least-once retry then
-// duplicated the WHOLE batch), while a caller supplying an hour-long deadline
-// bypassed ProposeTimeout entirely and parked the single flush goroutine for
-// the hour, which is precisely the wedge described above.
-//
-// The parent is instead the aggregator's own lifetime context, and the
-// deadline is min(latest live caller deadline, now+ProposeTimeout):
-//
-//   - the ProposeTimeout ceiling always applies, so no caller can leave the
-//     flush goroutine parked past it;
-//   - taking the LATEST rather than the earliest caller deadline means no
-//     caller is cut short of the budget it asked for — a caller that has
-//     already timed out is simply no longer waiting, and the batch it shares
-//     is still owed to everyone else.
+// proposeContext returns a child of the aggregator's lifetime context with deadline min(latest live caller deadline, now+ProposeTimeout), and false when every caller is gone.
 func (a *Aggregator) proposeContext(proposals []*proposal) (context.Context, context.CancelFunc, bool) {
 	deadline := time.Now().Add(a.cfg.ProposeTimeout)
 	var latest time.Time

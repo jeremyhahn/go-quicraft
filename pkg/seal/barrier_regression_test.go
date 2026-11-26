@@ -550,9 +550,7 @@ func TestUnseal_NoneStrategyWithoutEncryptorFailsClosed(t *testing.T) {
 
 // --- HKDF info domain separation ---
 
-// TestDeriveDEK_V2SeparatesAlgorithmAndKeySize verifies that the v2 info binds
-// the algorithm and key length: the AES-128 DEK is no longer the first half of
-// the AES-256 DEK for the same (deployment, epoch), as it is under v1.
+// TestDeriveDEK_V2SeparatesAlgorithmAndKeySize checks v2 derivation binds the algorithm and key length.
 func TestDeriveDEK_V2SeparatesAlgorithmAndKeySize(t *testing.T) {
 	rootKey := make([]byte, rootKeySize)
 	salt := make([]byte, hkdfSaltSize)

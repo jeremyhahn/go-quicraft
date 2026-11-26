@@ -296,19 +296,7 @@ func (c *diskRestartCluster) requireRestarted(t *testing.T, errs []error, snapId
 	c.propose(t, 1)
 }
 
-// TestOnDiskSM_RestartAfterSnapshotPastAppliedIndex is the regression test
-// for #363: a snapshot captured right after a new leader's no-op sits one
-// index past the applied index the on-disk state machine stored, because the
-// no-op is applied without reaching its Update. After a clean stop of every
-// node, the replica holding that snapshot recovers from it (#295); before
-// that, it looked up the raft term of the index its state machine recovered
-// to, below the snapshot and gone from the log reader, and StartShard failed
-// with ErrRecoveredTermUnknown.
-//
-// The order is driven, not raced: automatic snapshots are off, nothing is
-// proposed after the leader change, and the snapshot is requested only once
-// the snapshot node has applied the no-op and its state machine is verified to
-// sit below it.
+// TestOnDiskSM_RestartAfterSnapshotPastAppliedIndex verifies a replica restarts from a snapshot one index past its state machine's applied index.
 func TestOnDiskSM_RestartAfterSnapshotPastAppliedIndex(t *testing.T) {
 	c := newDiskRestartCluster(t)
 

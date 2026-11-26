@@ -467,10 +467,7 @@ func TestStartShard_RestartHeldToRecoveredIdentities(t *testing.T) {
 		t.Fatalf("restart with a consistent anchor = %v, want nil", err)
 	}
 
-	// The founders' coverage rule is a bootstrap rule. On a restart the
-	// members map is ignored, so a stale map naming a replica the identities
-	// no longer cover must not be refused — that is every remaining
-	// founder's map after a RemoveNode, on its next rolling restart.
+	// The founders' coverage rule applies at bootstrap only; a restart ignores the members map.
 	restarted, err := NewHost(cfg, WithoutEncryption())
 	if err != nil {
 		t.Fatalf("NewHost (restart): %v", err)

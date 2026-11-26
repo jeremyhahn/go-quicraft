@@ -22,9 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// assertReadReady checks the published triple and, on the leader, that it
-// agrees with the gate handleLeaderReadIndex applies: ready exactly when a
-// ReadIndex is no longer refused with ErrReadIndexNotReady.
+// assertReadReady checks the published triple and, on the leader, that it matches handleLeaderReadIndex's ErrReadIndexNotReady gate.
 func assertReadReady(t *testing.T, p *Peer, wantLeader, wantTerm uint64, want bool, probeKey uint64) {
 	t.Helper()
 	leaderID, term, ready := p.LeaderTermReady()

@@ -160,9 +160,7 @@ func TestWireSwitch_SingleMemberRetriesAfterRefusal(t *testing.T) {
 	}
 }
 
-// TestWireSwitch_RetryStopsOnLeadershipLossAndClose pins the retry's bounds:
-// it does not run for a term this replica no longer leads in, and Close
-// joins it, after which no attempt is made.
+// TestWireSwitch_RetryStopsOnLeadershipLossAndClose checks the retry stops on leadership loss and after Close.
 func TestWireSwitch_RetryStopsOnLeadershipLossAndClose(t *testing.T) {
 	var attempts atomic.Int32
 	h, _ := startSingleMemberNextWire(t, func() error {

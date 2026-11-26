@@ -209,18 +209,7 @@ func (s *membershipSnapshot) isRemoved(replicaID uint64) bool {
 	return s.removed[replicaID]
 }
 
-// isRemovedIdentity reports whether identity is one this shard has committed a
-// removal for, whatever replica ID the holder now claims.
-//
-// The empty identity is never removed. A connection with no authenticated
-// identity (an address-only shard, or a peer whose certificate yields none) must
-// fall through to the checks that CAN judge it rather than be matched against a
-// tombstone it cannot be distinguished from — an empty-matches-empty rule would
-// deny every such peer on any shard that had ever removed an identity-less
-// member, which is a shard-wide outage, not a security improvement.
-//
-// Safe for concurrent reads because the snapshot maps are never modified after
-// construction.
+// isRemovedIdentity reports whether identity has a committed removal; the empty identity never does.
 func (s *membershipSnapshot) isRemovedIdentity(identity string) bool {
 	if identity == "" {
 		return false
@@ -255,12 +244,7 @@ func (s *membershipSnapshot) toProto() proto.Membership {
 		RemovedIdentities:          copyStringMap(s.removedIdentities),
 		WireVersion:                s.wireVersion,
 	}
-	// The policy moves as ONE value rather than field by field. This site
-	// silently dropped a policy field once already: it listed the three that
-	// existed when it was written, so a fourth was added to proto.SessionPolicy,
-	// compiled cleanly here, and vanished on every path that reads membership
-	// back out of the raft layer. SetSessionPolicy is total over the struct, so
-	// the next field to be added cannot be forgotten in this direction.
+	// Copy the policy as one value so no field can be dropped.
 	m.SetSessionPolicy(s.sessionPolicy)
 	return m
 }
@@ -683,11 +667,7 @@ func (m *membership) hasMemberOtherThan(replicaID uint64) bool {
 	return false
 }
 
-// isRemoved reports whether the replica carries a Removed tombstone — a
-// committed RemoveNode was applied for it. A tombstone is durable evidence that
-// this replica has learned the committed configuration (its own removal was
-// agreed by the cluster), which is what makes it a valid terminal state for the
-// joining window even though the replica is no longer a member.
+// isRemoved reports whether the replica has a Removed tombstone.
 func (m *membership) isRemoved(replicaID uint64) bool {
 	return m.removed[replicaID]
 }
@@ -746,48 +726,9 @@ func (m *membership) apply(cc proto.ConfigChange, logIndex uint64) error {
 	return nil
 }
 
-// Convergent application of committed adds
-//
-// The three add handlers below place the target in exactly the role the
-// COMMITTED entry names, whatever role the membership currently records for
-// it. They never refuse an entry because the target "already exists".
-//
-// This matters because a membership is not always built purely from committed
-// entries. Host.StartShard seeds proto.Membership.Addresses from the caller's
-// members map whenever recovery restored nothing — the ordinary state of a
-// caught-up replica that has never snapshotted — and that map is the
-// operator's list of replica IDs, with no record of which of them the shard
-// has since made witnesses or observers. Every non-voter listed in it is
-// therefore seeded as a full VOTER. The committed AddWitness / AddNonVoting
-// entries that gave those replicas their real roles are still in the log and
-// are re-applied on restart; refusing them (ErrNodeAlreadyExists) left the
-// wrong roles in place permanently, because the seed is not repaired by
-// anything else and configChangeID never advanced past the skipped entry.
-//
-// Converging is not a weakening of the checks. When the membership WAS built
-// from committed entries only, validate() ran on the leader before the entry
-// was proposed and guaranteed the target was not a member, so the extra
-// deletes below are provably no-ops and the behaviour is byte-for-byte the
-// old one. The rejections that remain all have a precondition that either
-// holds identically on every replica or that the seed can only LOOSEN, never
-// tighten, so none can make replicas diverge:
-//
-//   - the two add refusals (a Removed tombstone, and promoting a witness via
-//     AddNode) — the seed only populates addresses, so it can manufacture
-//     neither a tombstone nor a witness role; the precondition is therefore
-//     identical to the committed-only membership.
-//   - handleRemoveNode's three (ErrNodeNotFound, ErrRemoveLastFullReplica,
-//     ErrRemoveLastVoter) — these read len(m.addresses)/isMember/isWitness,
-//     and seeding every listed non-voter as a voter can only make isMember
-//     more likely true, len(m.addresses) larger, and isWitness less likely
-//     true. Each of those makes the refusal STRICTLY LESS likely to fire than
-//     on the true membership, so a committed remove the true membership would
-//     apply is never refused by the seeded one.
+// The add handlers converge on the role the committed entry names, because a membership seeded by StartShard may list non-voters as voters.
 
-// handleAddNode adds a full voting member. An existing observer is promoted;
-// an existing voter has its address updated (the committed entry is
-// authoritative over a seeded placement). Returns an error if the replica is a
-// witness or was previously removed.
+// handleAddNode adds or promotes a full voter, updating an existing voter's address; it refuses a witness or removed replica.
 func handleAddNode(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress
@@ -880,10 +821,7 @@ func handleRemoveNode(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
-// handleAddNonVoting adds a non-voting observer, demoting a replica the
-// membership currently records as a full voter (a bootstrap-map seed the
-// committed entry overrides). Returns an error if the replica is a witness or
-// was previously removed.
+// handleAddNonVoting adds an observer, demoting a seeded voter; it refuses a witness or removed replica.
 func handleAddNonVoting(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress
@@ -907,10 +845,7 @@ func handleAddNonVoting(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
-// handleAddWitness adds a witness member, demoting a replica the membership
-// currently records as a full voter (a bootstrap-map seed the committed entry
-// overrides). Returns an error if the replica is an observer or was previously
-// removed.
+// handleAddWitness adds a witness, demoting a seeded voter; it refuses an observer or removed replica.
 func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 	if cc.Address == "" {
 		return ErrEmptyAddress

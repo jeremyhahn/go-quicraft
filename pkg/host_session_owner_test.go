@@ -43,10 +43,7 @@ func requireOwnerCapRefusal(t *testing.T, what string, s *Session, err error) {
 	}
 }
 
-// TestHostSessionOwnerCap drives the per-owner session cap through the public
-// Host API: NewSessionWithOwner and RegisterSession hold each owner to
-// MaxSessionsPerOwner, other owners and owner 0 are unaffected, and
-// CloseSession frees the owner's slot.
+// TestHostSessionOwnerCap checks MaxSessionsPerOwner through the Host API.
 func TestHostSessionOwnerCap(t *testing.T) {
 	const (
 		ownerA = uint64(0xA)

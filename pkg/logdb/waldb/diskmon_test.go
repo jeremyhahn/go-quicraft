@@ -600,10 +600,7 @@ func TestDiskMonitorConcurrentRecoveryAfterStaleFullSample(t *testing.T) {
 	}
 }
 
-// TestDiskMonitorOnFullCallbackMayForceCheck pins finding 2 of the #911
-// round 2 review: a WithOnFull callback that frees space and calls
-// ForceCheck to verify recovery must not deadlock on the monitor's mutex,
-// and the recovery it causes is delivered after the full callback returns.
+// TestDiskMonitorOnFullCallbackMayForceCheck checks a WithOnFull callback may call ForceCheck without deadlock, and recovery is delivered after it returns.
 func TestDiskMonitorOnFullCallbackMayForceCheck(t *testing.T) {
 	var usage atomic.Uint64
 	usage.Store(950)
@@ -703,13 +700,7 @@ func TestDiskMonitorRecoveryRepeated(t *testing.T) {
 	}
 }
 
-// TestWithCheckEveryZeroDoesNotDivideByZero pins the sampling-interval guard.
-//
-// MaybeCheck samples with count%checkEvery, so an unguarded zero interval
-// would panic the commit worker on the very first monitored write: waldb.Open
-// would accept WithCheckEvery(0) without complaint and SaveState would then
-// die inside the runtime with an integer divide by zero. A configuration typo must not be a
-// runtime outage.
+// TestWithCheckEveryZeroDoesNotDivideByZero checks WithCheckEvery(0) does not panic MaybeCheck.
 func TestWithCheckEveryZeroDoesNotDivideByZero(t *testing.T) {
 	var usedBytes atomic.Uint64
 	usedBytes.Store(10)

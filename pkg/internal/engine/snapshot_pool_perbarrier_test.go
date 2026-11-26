@@ -448,11 +448,7 @@ func TestSnapshotPool_PerBarrier_CorruptSnapshotMetaFailSafe(t *testing.T) {
 	p.shardBarriers = func(uint64) SnapshotBarrier { return bA }
 	wireSnapshotNodes(p, snapshotDirNode(baseDir, 1, 1))
 
-	// Create a snapshot directory whose metadata file is a TORN write: a valid
-	// record cut short so its body no longer reaches the epoch field. The
-	// header still declares the full body length, so the record decodes as
-	// CORRUPT — distinct from a recognised older version, and equally
-	// fail-safe.
+	// A torn snapshot metadata file whose body stops before the epoch field.
 	dir := snapshotSaveDir(baseDir, 1, 1, 100)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)

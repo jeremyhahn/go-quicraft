@@ -37,9 +37,7 @@ var docCommentRoots = []struct {
 	{dir: filepath.Join(repoRoot, "contrib", "dragonboat"), minFiles: 10},
 }
 
-// docCommentAllowlist names package directories (repository-relative) whose
-// missing doc comments the gate does not yet enforce. An entry that no longer
-// has anything missing fails the gate, so the list only shrinks.
+// docCommentAllowlist names package directories whose missing doc comments are not yet enforced; it only shrinks.
 var docCommentAllowlist = map[string]bool{}
 
 // docFieldBaseline names, one entry per field, the exported struct fields

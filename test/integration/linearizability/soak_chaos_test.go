@@ -504,21 +504,7 @@ func dumpClusterState(t *testing.T, cluster *testCluster, shardID uint64) {
 	}
 }
 
-// TestSoak_LeaderCloseDoesNotStallWrites measures the write outage caused by
-// gracefully closing the LEADER while clients are writing, and guards against
-// that outage regressing into a drain-length one.
-//
-// Measured at HEAD, recovery is BIMODAL: usually ~550-700ms, but roughly one
-// run in three takes ~5s. Host.Close itself is fast (3-25ms), so the tail is
-// not the drain — it tracks the client's own 5s request deadline, i.e. a
-// caller that had a request in flight to the dying leader waits out its
-// deadline before retrying against the new one. Worth understanding further;
-// it is an availability tail, not a safety problem, and it is unchanged by
-// leadership hand-off (measured both ways).
-//
-// The bound is therefore set above that observed tail and far below
-// ShutdownTimeout: it catches a genuine regression to drain-length stalls
-// without failing on the known tail.
+// TestSoak_LeaderCloseDoesNotStallWrites bounds the write outage from gracefully closing the leader: above the observed ~5s client-deadline tail, far below ShutdownTimeout.
 func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	const (
 		numNodes   = 5
@@ -573,15 +559,7 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 		t.Fatal("no operations committed before the leader was closed")
 	}
 
-	// Close the CURRENT leader. The index found before warmup goes stale if
-	// leadership moved during the steady-state phase (a loaded host can miss
-	// heartbeats), and closing a follower instead measures nothing (#309).
-	//
-	// Poll for it rather than looking once: the same loaded host can be
-	// mid-election at this instant (a CheckQuorum stepdown, then a split vote
-	// or two). That is a timing bound, not a fault, and the test needs a
-	// leader to close, not one at an exact instant. The wait ends before the
-	// close, so the outage measured below is unchanged.
+	// Close the current leader, polling for one since a loaded host may be mid-election.
 	leaderIdx = cluster.findLeader(shardID)
 	if leaderIdx < 0 {
 		leaderWaitStart := time.Now()
@@ -599,20 +577,7 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 	cluster.stopNode(leaderIdx)
 	closeElapsed := time.Since(closeStart)
 
-	// Split the outage into "how long until a new leader exists" and "how
-	// long after that until writes actually land". Those have different
-	// causes -- a slow election vs. clients not retrying promptly -- and the
-	// aggregate number cannot distinguish them.
-	// electedAt is written by the election watcher and read by the log line
-	// below while that goroutine may still be running, so it has to be atomic.
-	//
-	// The watcher polls findLeader itself instead of calling
-	// waitForClusterLeader. waitForClusterLeader ends in t.Fatalf, and t.Fatalf
-	// on a NON-TEST goroutine only runs runtime.Goexit on that goroutine: the
-	// test keeps going, electedAt stays 0, and the failure is reported as the
-	// nonsense "new leader after 0s" -- with a real risk of the deferred
-	// failure landing after the test has finished. Errorf is the correct
-	// primitive off the test goroutine (see helpers_test.go leaderTermGuard).
+	// Split the outage into election time and time to the first writes; electedAt is atomic, and the watcher polls findLeader and reports with Errorf off the test goroutine.
 	var electedAt atomic.Int64
 	electionWatcherDone := make(chan struct{})
 	go func() {
@@ -639,10 +604,7 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 		<-electionWatcherDone
 	}()
 
-	// Require SUSTAINED recovery, not a single completion. An operation that
-	// was already in flight when the leader closed will finish moments later
-	// and would otherwise be misread as "the cluster is healthy again",
-	// hiding an outage entirely. Demand a run of new commits instead.
+	// Require a run of new commits, not one completion of an already in-flight operation.
 	const recoveredOps = 50
 	waitForCondition(t, maxOutage+10*time.Second,
 		"a sustained run of commits after closing the leader", func() bool {
@@ -669,13 +631,7 @@ func TestSoak_LeaderCloseDoesNotStallWrites(t *testing.T) {
 			"leadership was not handed off before draining", outage, maxOutage)
 	}
 
-	// The clients serve for the steady-state phase, then stop once
-	// recoveredOps more operations land after the close, so the run is far
-	// shorter than their 20s window. The floor covers the steady-state phase
-	// only: the operations after the close are a fixed count, and their pace
-	// is what the outage check above asserts. Scaling the floor to the 20s
-	// window demanded writes the run never gives the clients time to make,
-	// so a slow but healthy host failed it (#309).
+	// The floor covers the steady-state phase only; post-close operations are a fixed count checked by the outage bound.
 	checkLinearizability(t, recorder, floorFor(numClients, steadyState))
 }
 

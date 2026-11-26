@@ -319,8 +319,7 @@ func TestImportSnapshot_RejectsDataDirContradictingTheRecord(t *testing.T) {
 	artifact := buildSnapshotArtifact(t, 900, 5, 0, proto.Membership{},
 		snapshotEnvelope([]byte("payload")))
 
-	// The omission the old contract could not detect: no DataDir declared for
-	// a DataDir shard. It must no longer land under NodeHostDir.
+	// No DataDir declared for a DataDir shard: the import must not land under NodeHostDir.
 	if impErr := h.ImportSnapshot(context.Background(), shardID,
 		bytes.NewReader(artifact), WithImportDataDir("")); !errorsIsImportMismatch(impErr) {
 		t.Fatalf("declaring no DataDir for a DataDir shard: err = %v, want "+

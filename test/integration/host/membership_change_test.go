@@ -104,8 +104,7 @@ func TestHostAPI_MembershipChange_AddAndRemoveNode(t *testing.T) {
 		[]uint64{newReplicaID}, membershipTimeout)
 	t.Logf("phase 4: membership size confirmed as 3")
 
-	// Stop the removed node so it does not interfere with further
-	// operations (it is no longer part of the cluster).
+	// Stop the removed node.
 	cluster.stopNode(result.idx)
 
 	// Phase 5: Write more data to the 3-node cluster and verify it

@@ -35,8 +35,7 @@ import (
 // Typed Errors for LeaseRead Tests
 // ---------------------------------------------------------------------------
 
-// StaleReadError is returned when a read observes a value that is older
-// than a previously observed value, violating monotonic read guarantees.
+// StaleReadError is returned when a read observes a value older than one already observed.
 type StaleReadError struct {
 	ReaderID int
 	Key      string
@@ -96,16 +95,7 @@ func testLeaseReadShardConfig(shardID, replicaID uint64) config.Config {
 	return c
 }
 
-// TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover verifies that
-// lease-based reads do not return stale values after a leader failover.
-// Per PhD Section 6.4, a new leader must not serve LeaseRead requests
-// until it has established a valid lease through heartbeat acks from a
-// quorum. This test writes data, kills the leader, waits for a new
-// leader election, and immediately issues reads to verify safety:
-//   - Reads either succeed with the latest committed value or fail
-//     with a retriable error (acceptable during lease establishment).
-//   - No stale reads are returned (read value >= previously observed).
-//   - After stabilization, reads consistently return the correct value.
+// TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover checks lease reads are never stale after a leader failover (PhD 6.4).
 func TestHostAPI_LeaseRead_MonotonicReadsAfterLeaderFailover(t *testing.T) {
 	cluster := newTestCluster(t, 3)
 	t.Cleanup(func() { cluster.close() })
@@ -408,15 +398,7 @@ func TestHostAPI_LeaseRead_ConcurrentWritersAndReaders(t *testing.T) {
 		}
 	}
 
-	// Verify final reads match the committed state. Every key must read back
-	// the value its own writer produced, at a sequence number at least as
-	// high as the last one that writer saw committed. The previous version
-	// only logged the value, so a read returning an empty string, a foreign
-	// writer's value, or a rolled-back sequence number all passed.
-	//
-	// The read is retried against the CURRENT leader: sustained write load can
-	// move leadership, and a read that fails because this host is no longer
-	// leader says nothing about the value.
+	// Every key must read back its own writer's value at a sequence at least the last committed; retry on the current leader.
 	leaderSM := trackers[leaderIdx].Get(shardID, uint64(leaderIdx+1))
 	if leaderSM == nil {
 		t.Fatal("leader state machine not found")
@@ -555,14 +537,7 @@ func TestHostAPI_LeaseRead_ReadAfterLeaderTransfer(t *testing.T) {
 
 	newLeaderHost := cluster.hosts[targetIdx]
 
-	// Immediately read from the new leader. The new leader must not
-	// serve reads until it has a valid lease. We retry retriable errors
-	// (expected during lease establishment) but fail on stale values.
-	//
-	// Pinned on purpose. The transfer target was just verified to lead, and
-	// the assertion is about THAT replica's lease: a read through whoever
-	// leads now would still be linearizable, but it would no longer be a
-	// test of read-after-transfer on the transferee.
+	// Read from the transferee, retrying retriable errors and failing on stale values.
 	var readVal string
 	readDeadline := time.Now().Add(defaultTimeout)
 	for time.Now().Before(readDeadline) {

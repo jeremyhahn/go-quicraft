@@ -21,23 +21,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 )
 
-// TestSnapshotPool_WorkerExitReleasesQueuedRequests asserts that a snapshot
-// request still sitting on requestC when the pool shuts down is released
-// rather than stranded.
-//
-// requestSnapshot establishes two pieces of per-shard state BEFORE the request
-// is queued — the inFlight entry that dedupes the shard, and the node's
-// snapshotting flag — and both are cleared only by the goroutine that
-// eventually runs the request. A worker that returns on stopC while requests
-// remain queued therefore wedges those shards permanently: inFlight never
-// clears, so requestSnapshot rejects every future snapshot for the shard with
-// SnapshotDuplicateError, snapshotting stays true, and the caller's pending
-// RequestState waits for a completion callback that can no longer fire.
-//
-// The worker's select has both stopC and requestC ready at shutdown and Go
-// chooses between ready cases at random, so the invariant is exercised over
-// many rounds: with the release in place every round is clean regardless of
-// which branch is taken, and only a regression depends on the coin flips.
+// TestSnapshotPool_WorkerExitReleasesQueuedRequests verifies queued snapshot requests are released at shutdown, over many rounds.
 func TestSnapshotPool_WorkerExitReleasesQueuedRequests(t *testing.T) {
 	const rounds = 40
 

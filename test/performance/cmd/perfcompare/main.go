@@ -420,14 +420,7 @@ const moduleAuthEnv = "GOMODAUTH"
 // decides presence: without the rewrite there is nothing to authenticate.
 var moduleAuthVars = [...]string{"GOPRIVATE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"}
 
-// moduleAuth returns the payload the Dockerfiles source before `go mod
-// download`: GOPRIVATE and the git environment-config rewrite that sends
-// github.com/jeremyhahn/* to Gitea with a token, as K='V' lines. It is taken
-// verbatim from GOMODAUTH when a caller has already composed it, and otherwise
-// assembled from the four variables a Gitea Actions runner injects (or an
-// operator exports). Empty when neither is present -- the correct shape for
-// a public build, which resolves from the proxy alone -- so the same image
-// builds inside and outside the Gitea network.
+// moduleAuth returns the GOPRIVATE and git credential lines the Dockerfiles source before go mod download, from GOMODAUTH or the runner's variables; empty for a public build.
 func moduleAuth(getenv func(string) string) string {
 	if payload := getenv(moduleAuthEnv); payload != "" {
 		return payload
@@ -442,16 +435,7 @@ func moduleAuth(getenv func(string) string) string {
 	return b.String()
 }
 
-// buildImage builds one benchmark image with the repository root as its
-// context. Module credentials, when present, reach `go mod download` as a
-// BuildKit secret: mounted for that one RUN, sourced, and never exported into
-// a layer, so the token appears in neither the image, its metadata, nor a
-// command line -- the payload travels to the docker CLI through its
-// environment, not an argument. The secret is optional at both ends, and a
-// Dockerfile that does not mount it ignores it, so every image is built the
-// same way. Which way was taken is printed, because a build that resolved
-// from the proxy when it needed Gitea fails later with an error that reads
-// like a missing repository.
+// buildImage builds a benchmark image from the repository root, passing module credentials as a BuildKit secret, and prints which way it built.
 func buildImage(ctx context.Context, image, dockerfile, root string) error {
 	fmt.Printf("  building Docker image %s...\n", image)
 	args := []string{"build", "-t", image, "-f", dockerfile}

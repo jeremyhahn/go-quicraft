@@ -1,16 +1,4 @@
-//! TCP+TLS transport for multi-node OpenRaft benchmarks.
-//!
-//! Uses persistent connection pooling with one cached TLS stream per peer and
-//! bincode serialization for all RPC messages.  Each `TlsNetworkConnection`
-//! holds an `Option<TlsStream>` that is lazily established on the first RPC
-//! and reused for all subsequent calls to the same peer.  If a connection
-//! breaks (EOF, broken pipe, etc.) it is transparently re-established with a
-//! single retry.
-//!
-//! Wire format: 4-byte big-endian length prefix followed by a bincode payload.
-//!
-//! TLS certificates are generated at runtime using `rcgen` so no on-disk PEM
-//! files are needed.
+//! TCP+TLS transport for OpenRaft benchmarks: one cached TLS stream per peer, 4-byte big-endian length plus bincode, runtime rcgen certificates.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -267,17 +255,7 @@ impl TlsNetworkConnection {
             .map_err(|e| WireError(format!("deserialize response: {e}")))
     }
 
-    /// Send `msg` over the cached connection, reconnecting once on failure.
-    ///
-    /// Cancellation-safe: the stream is taken out of the cache for the whole
-    /// request/response exchange and put back only after a complete response
-    /// has been read. OpenRaft drops an RPC future when its timeout (the
-    /// `heartbeat_interval`) expires; if the cached stream survived that, the
-    /// abandoned response would still be in flight and the NEXT call on this
-    /// connection would read it as its own reply. A plain
-    /// `AppendEntriesResponse::Success` carries no log id, so the leader
-    /// would count an acknowledgement for entries the follower never
-    /// received. Dropping the stream closes the connection instead.
+    /// Send msg over the cached connection, reconnecting once; the stream is cached again only after a complete response, so a dropped future closes it.
     async fn rpc_call(&mut self, msg: &RpcMessage) -> Result<RpcResponse, WireError> {
         // Ensure we have a connection.
         if self.stream.is_none() {

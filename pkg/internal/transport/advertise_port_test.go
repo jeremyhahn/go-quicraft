@@ -16,9 +16,7 @@ package transport
 
 import "testing"
 
-// TestResolveAdvertisedPort covers the port-0 rewrite Start applies to the
-// advertise address: only port 0 is replaced, by the bound port, and the
-// advertised host is kept (#386).
+// TestResolveAdvertisedPort checks only advertise port 0 is replaced with the bound port.
 func TestResolveAdvertisedPort(t *testing.T) {
 	tests := []struct {
 		name      string

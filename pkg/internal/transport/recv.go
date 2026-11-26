@@ -113,10 +113,7 @@ func (tr *ipConnTracker) tryAcquire(ip string) bool {
 	return true
 }
 
-// release decrements the count for the given IP. The caller must have
-// previously called tryAcquire successfully for the same IP. When the
-// count reaches zero, the entry is removed from the map to prevent
-// unbounded growth from transient connections.
+// release decrements ip's count after a successful tryAcquire and removes the entry at zero.
 func (tr *ipConnTracker) release(ip string) {
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
@@ -525,12 +522,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			return
 		}
 
-		// Read the next frame header. A clean idle gap on a LIVE connection is
-		// NOT a failure: replication streams sit idle between bursts while the
-		// connection is kept alive by heartbeats. Abandoning such a stream here
-		// would leave the leader writing into a stream this receiver no longer
-		// drains — the post-idle replication stall. readFrameHeaderResilient
-		// returns errStreamIdle in that case so we keep the stream open.
+		// A clean idle gap on a live connection returns errStreamIdle and keeps the stream open.
 		length, flags, err := t.readFrameHeaderResilient(inboundConn, stream, idleTimeout, frameReadActiveTimeout)
 		if err != nil {
 			if errors.Is(err, errStreamIdle) {
@@ -543,12 +535,7 @@ func (t *QUICTransport) handleStream(inboundConn *quic.Conn, stream *quic.Stream
 			return
 		}
 
-		// The connection carried a frame, so it is not idle. Stamped on the
-		// frame rather than on stream acceptance because a sender reuses one
-		// cached stream across bursts: a busy connection can accept no new
-		// stream for hours, and reaping it would be a self-inflicted outage.
-		// errStreamIdle above deliberately does NOT reach here — a stream
-		// waiting at a clean frame boundary produced no traffic.
+		// A frame arrived, so the connection is active; stamped per frame because streams are reused.
 		activity.touch(time.Now())
 
 		// A frame has begun arriving: complete its body (and any back-to-back
@@ -1446,8 +1433,7 @@ func (t *QUICTransport) reserveMsgRecvBudget(n int64) bool {
 	return true
 }
 
-// releaseMsgRecvBudget returns n previously-reserved bytes to the aggregate
-// message-receive memory budget.
+// releaseMsgRecvBudget returns n reserved bytes to the aggregate receive budget.
 func (t *QUICTransport) releaseMsgRecvBudget(n int64) {
 	t.msgRecvBudget.Add(n)
 }

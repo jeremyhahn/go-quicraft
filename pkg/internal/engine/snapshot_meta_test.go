@@ -27,10 +27,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
-// mustParseSnapshotMeta decodes a snapshot.meta image or fails the test. Tests
-// assert through the shared decoder rather than re-deriving field offsets, so a
-// layout change cannot leave a test passing against bytes the production
-// purge-floor scan can no longer read.
+// mustParseSnapshotMeta decodes a snapshot.meta image with the shared decoder or fails the test.
 func mustParseSnapshotMeta(t *testing.T, data []byte) SnapshotMeta {
 	t.Helper()
 	meta, err := ParseSnapshotMeta(data)

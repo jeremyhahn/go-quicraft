@@ -121,10 +121,7 @@ func TestIntegration_DB_ProposeSession(t *testing.T) {
 	}
 }
 
-// TestIntegration_DB_DoubleCloseSession_Rejected verifies that closing an
-// already-closed tracked session returns an error. In dragonboat's behavior
-// this manifests as ErrRejected because the session is no longer registered
-// with the state machine.
+// TestIntegration_DB_DoubleCloseSession_Rejected verifies closing an already-closed tracked session returns an error.
 func TestIntegration_DB_DoubleCloseSession_Rejected(t *testing.T) {
 	cluster := newDBTestCluster(t, 3)
 	defer cluster.close()

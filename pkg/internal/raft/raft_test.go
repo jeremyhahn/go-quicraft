@@ -5621,8 +5621,7 @@ func TestRaft_HandleSnapshot_UpdatesRemotes(t *testing.T) {
 	if _, ok := r.remotes[5]; !ok {
 		t.Fatal("expected remote for node 5 after snapshot")
 	}
-	// Old nodes 2 and 3 should no longer be present (they are not in
-	// the new membership's Addresses).
+	// Nodes 2 and 3 are not in the new membership.
 	if _, ok := r.remotes[2]; ok {
 		t.Fatal("node 2 should not be in remotes after snapshot with different membership")
 	}
@@ -7524,10 +7523,7 @@ func TestLeaseRead_RoundReusedWithinGranularity(t *testing.T) {
 }
 
 func TestLeaseRead_InvalidateLeaseRetiresEarlierRounds(t *testing.T) {
-	// The engine invalidates the lease of a leader whose log write a sealed
-	// barrier refused (#296). The lease must end at once, a late ack for a
-	// round sent before the invalidation must not rebuild it, and only an
-	// ack for a round opened afterwards renews it.
+	// An invalidated lease ends at once; only an ack for a round opened afterwards renews it.
 	r := newTestRaftLeaseRead(1)
 	electLeader(r)
 	commitNoOp(r)

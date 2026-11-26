@@ -76,27 +76,7 @@ type crashFS struct {
 // partial writeback without naming one. Real writeback is per page-cache page.
 const crashDefaultPageSize = 4096
 
-// crashWriteback models the fact that the page cache does NOT flush a file's
-// dirty pages as a unit.
-//
-// Without it crashFS loses every unsynced byte of every file, which can only
-// ever produce a clean truncation of the tail. That is one shape of power loss,
-// and it is the shape the durability-sequence scheme (see record.go) does not
-// need: a WAL that simply ends early has no damage under acknowledged data to
-// classify. The shape the scheme EXISTS for is the other one — a batch spanning
-// several blocks issues one WriteAt per block before a single fdatasync, and
-// writeback may persist an arbitrary SUBSET of those pages, leaving decodable
-// records sitting above a zero-filled hole. Recovery must read that as an
-// interrupted write and truncate, not as damage under acknowledged data and
-// refuse to open. Modelling it requires losing page N while keeping page N+1,
-// which the whole-file model cannot express at all.
-//
-// retained reports whether the page's CURRENT content reached the medium. A
-// page that did not reverts to the file's durable image, exactly as a real lost
-// writeback leaves the previously persisted content in place — which is why an
-// acknowledged byte sharing a page with an in-flight one is never destroyed by
-// this model, only the in-flight byte is. Pages that never existed in the
-// durable image read back as zeros: a hole.
+// crashWriteback decides per page whether dirty content reached the medium at a crash; lost pages revert to the durable image or read as zeros.
 type crashWriteback struct {
 	pageSize int
 	retained func(path string, page int) bool
@@ -360,8 +340,7 @@ func (c *crashFS) OpenFile(name string, flag int, perm fs.FileMode) (File, error
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// A hook that crashed mid-operation fences the caller out: the process
-	// that issued this call no longer exists.
+	// A hook that crashed mid-operation fences the caller out.
 	if gen != c.gen {
 		return nil, errCrashedFS
 	}

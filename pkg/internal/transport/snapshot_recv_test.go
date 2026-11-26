@@ -2255,14 +2255,7 @@ func TestReceiveSnapshot_ConcurrencyLimitCountsRejection(t *testing.T) {
 	}
 }
 
-// TestPerPeerSnapshotMemoryDerivation pins the ceiling perPeerSnapshotMemory
-// derives, including both guards.
-//
-// The derivation is the whole of the per-peer memory control: get it wrong in
-// the loose direction and the cap is the global budget again (inert), get it
-// wrong in the tight direction and a legal chunk no longer fits (every transfer
-// refused). Neither failure is visible from a transfer-level test that happens
-// to use small chunks.
+// TestPerPeerSnapshotMemoryDerivation checks the ceiling perPeerSnapshotMemory derives, including both guards.
 func TestPerPeerSnapshotMemoryDerivation(t *testing.T) {
 	const gb = int64(1) << 30
 	cases := []struct {

@@ -46,15 +46,7 @@ func rlEntries(first, count uint64) []proto.Entry {
 	return entries
 }
 
-// TestGlobalRateLimiter_IsSharedAndUpdatedByDelta pins the accounting model of
-// the global (cross-shard) limiter. It is ONE counter shared by every shard on
-// the host, so a shard may only ever apply DELTAS to it. Writing an absolute
-// size — which is correct for the per-shard limiter — silently overwrites every
-// other shard's contribution, so the host-wide total no longer reflects the
-// memory actually held and MaxTotalInMemLogSize stops applying backpressure.
-//
-// The snapshot-restore path is the sharpest case: one shard restoring would
-// zero the total for all of them.
+// TestGlobalRateLimiter_IsSharedAndUpdatedByDelta checks shards update the shared global limiter by deltas only.
 func TestGlobalRateLimiter_IsSharedAndUpdatedByDelta(t *testing.T) {
 	global := server.NewRateLimiter(1 << 30)
 	shardA := newRateLimitedInMemory(global)
@@ -144,14 +136,7 @@ func TestGlobalRateLimiter_WorksWithoutThePerShardLimiter(t *testing.T) {
 	}
 }
 
-// TestGlobalRateLimiter_ReleasedOnShardTeardown pins the teardown half of the
-// shared-counter contract. Each shard tracks its own share so it can apply
-// deltas without disturbing the others, but that share lives on the raft log
-// and dies with the Peer. Without an explicit release, a stopped shard's bytes
-// stay counted against a shard that no longer exists, and every
-// StartShard/StopShard cycle leaks a little more until the accumulated orphan
-// total crosses MaxTotalInMemLogSize — at which point every propose on the host
-// fails with ErrSystemBusy, permanently, with no memory actually held.
+// TestGlobalRateLimiter_ReleasedOnShardTeardown checks a stopped shard releases its share of the global limiter.
 func TestGlobalRateLimiter_ReleasedOnShardTeardown(t *testing.T) {
 	global := server.NewRateLimiter(1 << 30)
 	survivor := newRateLimitedInMemory(global)

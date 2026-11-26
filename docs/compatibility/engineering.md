@@ -309,6 +309,32 @@ widens silently when a constant moves.
 The persisted sets are question 2's read window; the two wire sets are
 question 3's upgrade window.
 
+### Raft-layer refusal and the release gate
+
+`hostMessageHandler.HandleMessage` (`pkg/messagehandler.go`) checks each
+batch against the host's `proto.WireWindow` after `authorizeInbound`: a
+`BinVer` the window does not accept, or a `MaxBinVer` below the window's
+previous, drops every message of the batch before the inbox, the raft step,
+elections and the leader-exec router. The refusal is a
+`*WireVersionMismatchError` (`pkg/errors.go`; `ShardID`, `From`, `PeerBinVer`,
+`PeerMaxBinVer`, `Local`) that matches `proto.ErrUnsupportedVersion`. It is
+logged once per `(shard, sender)` per change of the peer's values, and
+cleared when the peer is back inside the window. A zero `BinVer` (an
+in-process batch) is not checked. Consumers read the window through
+`proto.DefaultWireWindow()` (compile time) or `Host.WireWindow()`.
+
+From v1.0.0-rc.1, every release that changes the layout of a type reachable
+from `MessageBatch` or `SnapshotChunk` bumps `proto.WireVersion` and sets
+`PreviousWireVersion` to the old value. `TestWireLayoutGolden`
+(`pkg/proto/wire_layout_test.go`) fingerprints those types by reflection
+(field names, types and order, recursively, sorted, SHA-256) against
+`pkg/proto/testdata/wire_layout.golden`; regenerate it with
+`go test ./pkg/proto/ -run TestWireLayoutGolden -update`.
+`scripts/check-wire-version.sh <tag>` fails when the golden differs between
+the tag and HEAD while its `version` line is unchanged; the `release` and
+`release-candidate` targets run it against the newest non-alpha `v*` tag and
+skip it when there is none.
+
 ### Member-version knowledge
 
 A v1.1 leader must know that every member of a shard runs v1.1 before it

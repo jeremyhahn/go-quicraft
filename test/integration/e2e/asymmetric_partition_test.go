@@ -591,16 +591,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated(t *testing.T) {
 		cluster.liveNodes(), len(expected))
 }
 
-// TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup verifies
-// that an isolated follower's replacement catches up via snapshot transfer
-// when the log has been compacted during the partition. This exercises
-// the snapshot-based recovery path rather than log replication.
-//
-// The test uses aggressive snapshot settings (SnapshotEntries=5,
-// CompactionOverhead=2) to force log compaction while the follower
-// is isolated. After healing, the replacement node must receive a
-// snapshot to catch up since the compacted log entries are no longer
-// available.
+// TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup checks the replacement catches up by snapshot after compaction during the partition.
 func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) {
 	const shardID uint64 = 1
 
@@ -680,9 +671,7 @@ func TestE2E_AsymmetricPartition_FollowerIsolated_SnapshotCatchup(t *testing.T) 
 	t.Logf("added replacement node[%d] (replica=%d) for snapshot catchup",
 		result.idx, newReplicaID)
 
-	// The replacement node should catch up via snapshot transfer since
-	// the log entries before compaction are no longer available.
-	// Verify it has all expected data.
+	// The replacement catches up by snapshot; verify its data.
 	waitForNodeData(t, result.tracker, shardID, newReplicaID, expected, membershipTimeout)
 
 	// ...and verify the recovery path itself. This test exists to exercise

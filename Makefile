@@ -2146,6 +2146,9 @@ release: export override REL_TARGET  := release
 release: export override REL_FORM    := vX.Y.Z
 release: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$$
 release:
+	@tag="$$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-alpha$$' | head -n 1)"; \
+	if [ -z "$$tag" ]; then echo "check-wire-version: no non-alpha v* release tag yet; skipping the wire version gate"; \
+	else bash scripts/check-wire-version.sh "$$tag"; fi
 	$(release-body)
 
 # release-candidate cuts a release candidate, vX.Y.Z-rc.N (release-versioning.md
@@ -2160,6 +2163,9 @@ release-candidate: export override REL_TARGET  := release-candidate
 release-candidate: export override REL_FORM    := vX.Y.Z-rc.N
 release-candidate: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[1-9][0-9]*$$
 release-candidate:
+	@tag="$$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-alpha$$' | head -n 1)"; \
+	if [ -z "$$tag" ]; then echo "check-wire-version: no non-alpha v* release tag yet; skipping the wire version gate"; \
+	else bash scripts/check-wire-version.sh "$$tag"; fi
 	$(release-body)
 
 deps-latest:

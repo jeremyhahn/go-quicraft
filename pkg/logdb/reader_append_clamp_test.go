@@ -7,20 +7,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
-// TestLogReaderAppend_DoesNotCacheTermsBelowMarker verifies that Append caches
-// terms only for entries that are actually inside the tracked range.
-//
-// setRangeLocked clamps an append whose head falls below the current first
-// index — those entries are already superseded by a snapshot or compaction —
-// but the term cache is populated from the caller's slice. Caching the trimmed
-// prefix leaves terms for indices the log no longer holds, and termLocked
-// consults termBuf BEFORE the range check, so those indices answer with a term
-// instead of ErrCompacted.
-//
-// The consequence is not a stale read: the leader's sendAppend resolves
-// term(prevLogIndex) for a slow follower, gets a term for an index that was
-// compacted away instead of the ErrCompacted that triggers the snapshot
-// fallback, and so never sends InstallSnapshot. The follower can never catch up.
+// TestLogReaderAppend_DoesNotCacheTermsBelowMarker verifies Append caches no terms below the marker, so compacted indices return ErrCompacted.
 func TestLogReaderAppend_DoesNotCacheTermsBelowMarker(t *testing.T) {
 	lr := NewLogReader(1, 1, nil)
 

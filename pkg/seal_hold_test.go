@@ -22,8 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 )
 
-// Only the barrier's clean sealed refusal takes the commit worker's hold
-// (#296); a sealed error that also carries a disk fault still latches.
+// Only the barrier's clean sealed refusal takes the commit worker's hold; a sealed error that also carries a disk fault still latches.
 func TestIsSealedLogWrite(t *testing.T) {
 	cases := []struct {
 		name string

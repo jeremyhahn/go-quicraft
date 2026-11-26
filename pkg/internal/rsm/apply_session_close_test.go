@@ -22,11 +22,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
-// Apply must never fail on legal committed log content: a failed Apply marks
-// the shard permanently failed on EVERY replica (the log is identical), which
-// turns ordinary client API usage into a cluster-wide outage. The tests below
-// cover batches whose in-log session lifecycle removes a session that entries
-// in the same batch were admitted against.
+// Apply must not fail on legal committed log content, which would fail the shard on every replica.
 
 // TestApply_SessionEntryAndCloseInSameBatch is the reproduction of the
 // client-triggerable shard kill: ProposeWithSession immediately followed by
@@ -81,10 +77,7 @@ func TestApply_SessionEntryAndCloseInSameBatch(t *testing.T) {
 	}
 }
 
-// TestApply_CloseBeforeSessionEntryInSameBatch pins the in-log ordering
-// semantics of the opposite arrangement: an entry that follows the close in
-// the log operates on a session that no longer exists and must be reported as
-// SESSION_EXPIRED without ever reaching the user SM.
+// TestApply_CloseBeforeSessionEntryInSameBatch verifies an entry after its session's close reports the session as unknown.
 func TestApply_CloseBeforeSessionEntryInSameBatch(t *testing.T) {
 	cs := newCountingSM()
 	rsm, err := NewStateMachine(1, 1, func(_, _ uint64) interface{} {

@@ -295,8 +295,7 @@ func (im *inMemory) savedSnapshot(index uint64) {
 	}
 }
 
-// appliedLogTo advances the applied marker and truncates entries that
-// have been applied. This frees memory for entries no longer needed.
+// appliedLogTo advances the applied marker and truncates applied entries.
 func (im *inMemory) appliedLogTo(index uint64) {
 	if index < im.markerIndex {
 		return

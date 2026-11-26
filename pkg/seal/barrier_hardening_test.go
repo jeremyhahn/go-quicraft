@@ -660,10 +660,7 @@ func TestContextAAD_ResistsReorderAndSpliceButNotTruncation(t *testing.T) {
 		}
 	}
 
-	// And the shape of the fix the caller must supply: fold the frame COUNT
-	// into every frame's context, and a truncated artifact stops
-	// authenticating, because the count the reader is told to expect no longer
-	// matches the one the writer bound.
+	// The caller's fix: bind the frame count into every frame's context, so a truncated artifact fails.
 	countedAAD := func(artifact uint64, ordinal, total int) []byte {
 		return []byte{byte(artifact), byte(ordinal), byte(total)}
 	}

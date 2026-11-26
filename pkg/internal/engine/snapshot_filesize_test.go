@@ -104,12 +104,7 @@ func TestRecoverSnapshot_RefusesATruncatedArtifact(t *testing.T) {
 	const full = 4096
 	f := newRecoverFixture(t, snapshotPayload(100, full), full)
 
-	// Truncate the artifact AFTER it was recorded, and re-stamp snapshot.meta
-	// over the truncated bytes: the file and its record replaced TOGETHER — a
-	// partial restore that brought both from the wrong place — so the meta
-	// hash agrees with the file and FileSize, which lives in LogDB, is the
-	// only check that can see the difference. The record still claims the full
-	// size; the file no longer has it.
+	// Truncate the artifact and re-stamp snapshot.meta, so only the LogDB FileSize can see the difference.
 	if err := os.Truncate(f.dataPath, full/2); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}

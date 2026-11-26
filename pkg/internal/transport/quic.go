@@ -107,8 +107,7 @@ func (sh *streamShard) put(key streamKey, stream *quic.Stream, conn *quic.Conn) 
 	}
 }
 
-// drop removes key from both the stream pool and the owner map. The caller must
-// hold sh.mu. delete on a nil map is a no-op, so no owners guard is needed.
+// drop removes key from the stream pool and the owner map; the caller holds sh.mu.
 func (sh *streamShard) drop(key streamKey) {
 	delete(sh.streams, key)
 	delete(sh.owners, key)
@@ -120,28 +119,7 @@ type streamKey struct {
 	idx    uint64
 }
 
-// sendQueue is a per-target async send queue. Each remote host address gets
-// its own channel and sender goroutine. Messages are enqueued non-blocking
-// by Send() and delivered by the background worker. This decouples the
-// step worker from transport latency (QUIC dial, stream open, write with
-// sendWriteDeadline), preventing heartbeat starvation and multi-node stalls.
-//
-// Heartbeat messages are routed to a separate high-priority channel (hbCh)
-// so they are never blocked behind a backlog of data messages. The worker
-// always drains hbCh before processing the regular data channel, ensuring
-// leader liveness even under heavy replication load.
-//
-// The pattern matches dragonboat's per-target send queue architecture.
-//
-// closed is set true by the worker (under sendQueuesMu) immediately before
-// it removes itself from the sendQueues map and exits on idle timeout. The
-// enqueue path in Send checks this flag after a successful channel send: a
-// producer may have obtained this *sendQueue from getOrCreateSendQueue and
-// then enqueued into a channel that no longer has a drainer (the worker
-// already pruned the map entry and returned). On observing closed, the
-// producer re-acquires a fresh queue via getOrCreateSendQueue and re-enqueues
-// once, so the message is delivered by the newly started worker instead of
-// being orphaned.
+// sendQueue is a per-target async send queue with a priority heartbeat channel (hbCh); closed tells a producer the worker exited, so it re-enqueues once on a fresh queue.
 type sendQueue struct {
 	ch     chan proto.Message
 	hbCh   chan proto.Message // high-priority heartbeat channel

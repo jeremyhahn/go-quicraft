@@ -1354,11 +1354,7 @@ func TestHandleConnection_StreamErrorAfterNormalClose(t *testing.T) {
 // getStream fast path eviction detection (conn.go:258-265)
 // ---------------------------------------------------------------------------
 
-// TestGetStream_FastPathEvictionBetweenReads exercises the path in
-// getStream where a stream is found in the fast-path RLock read, but
-// is evicted by another goroutine between the stream read and the
-// connection liveness check. The stream is no longer in the shard,
-// so getStream falls through to the slow path.
+// TestGetStream_FastPathEvictionBetweenReads: a stream evicted between the fast-path read and the liveness check sends getStream to the slow path.
 
 // ---------------------------------------------------------------------------
 // SourceAddress / certificate binding (recv.go handleMessageFrame, Bug A)

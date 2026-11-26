@@ -168,11 +168,7 @@ func TestCIGateRunsEvenWhenADependencyFails(t *testing.T) {
 	}
 }
 
-// fullTierIf is the condition every full-tier job carries, and the
-// expression of the workflow's CI_FULL_TIER, which ci-gate reads into
-// FULL_TIER (ci-template v1.41, ruling 742 (2): PR/main parity. Every event,
-// a pull request included, but a workflow_dispatch off main and off
-// ci/deps-bump, which the schedule guard refuses).
+// fullTierIf is the condition every full-tier job carries, the workflow's CI_FULL_TIER expression.
 const fullTierIf = `github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump'`
 
 // fullLabelEnv is the workflow's CI_FULL_LABEL (ci-template v1.41): `ci:full`
@@ -184,15 +180,10 @@ const fullLabelEnv = `contains(github.event.pull_request.labels.*.name, 'ci:full
 // request only. CI Gate checks it as `pull`.
 const pullIf = `github.event_name == 'pull_request' && !github.event.pull_request.draft`
 
-// nightlyIf is the condition every nightly job carries, and the expression
-// ci-gate reads into NIGHTLY (ci-template v1.24, Company Agent m751 (e): the
-// schedule and workflow_dispatch only).
+// nightlyIf is the condition every nightly job carries: schedule and workflow_dispatch only.
 const nightlyIf = `github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'`
 
-// notDraft is the ci-template v1.26 guard (ruling 137): a draft pull request
-// runs no CI. A PR-tier job with no skipped dependency carries it as its only
-// `if:`, and a full-tier job with none ANDs it onto fullTierIf; a job that
-// needs a guarded job skips with it and keeps its plain condition.
+// notDraft is the guard that runs no CI for a draft pull request.
 const notDraft = `!github.event.pull_request.draft`
 
 // draftFullTierIf is fullTierIf with the v1.26 draft guard.
@@ -261,7 +252,7 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	if !strings.Contains(body, `if [ "$EVENT" = pull_request ] && [ "$CI_FULL_LABEL" != true ]; then`) {
 		t.Errorf("the changed-files step does not turn the path scopes off on CI_FULL_LABEL (ci-template v1.41)")
 	}
-	// ci-template v1.41: ci:full selects no tier, so no job's `if:` reads it.
+	// ci:full selects no tier, so no job's if: reads it.
 	for _, j := range ciJobs(t, body) {
 		job := regexp.MustCompile(`(?m)^  ` + regexp.QuoteMeta(j) + `:\n(?:(?:    |      |\n).*\n)*`).FindString(body)
 		if cond, _ := jobCondition(job); strings.Contains(cond, "ci:full") {
@@ -278,8 +269,7 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 		!strings.Contains(body, draftGateFail) {
 		t.Errorf("%s does not fail a draft pull request (ci-template v1.26)", gateJobName)
 	}
-	// ci-template v1.26.1: a docs-only PR skips make coverage, so it runs the
-	// releasability test alone, and only when the workflow names one.
+	// A docs-only PR skips make coverage and runs only the releasability test, when the workflow names one.
 	if !regexp.MustCompile(`(?m)^  RELEASABILITY_TEST: "\./test/releasability/\.\.\."`).MatchString(body) {
 		t.Errorf("the workflow's RELEASABILITY_TEST is not ./test/releasability/... (ci-template v1.26.1)")
 	}
@@ -291,7 +281,7 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	for _, c := range regexp.MustCompile(`(?m)^\s+check\s+(\S+)\s+"[^"]*"\s*(\S*)\s*$`).FindAllStringSubmatch(body, -1) {
 		tiers[c[1]] = c[2]
 	}
-	// ci-template v1.30: lint-gates is path-scoped on a pull request.
+	// lint-gates is path-scoped on a pull request.
 	if tiers["lint-gates"] != "scoped" {
 		t.Errorf("%s checks lint-gates as %q; want scoped (ci-template v1.30)", gateJobName, tiers["lint-gates"])
 	}
@@ -312,17 +302,17 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 				t.Errorf("job %q is tagged nightly in %s but lacks `if: ${{ %s }}`", j, gateJobName, nightlyIf)
 			}
 		case "code":
-			// ci-template v1.30: a code job skips on a docs-only PR alone.
+			// A code job skips on a docs-only PR alone.
 			if !strings.Contains(cond, "needs.preflight.outputs.docs_only != 'true'") {
 				t.Errorf("job %q is tagged code in %s but its `if:` does not skip on docs_only", j, gateJobName)
 			}
 		case "scoped":
-			// ci-template v1.30: a scoped job skips when no file matches LINT_GATES_PATTERN.
+			// A scoped job skips when no file matches LINT_GATES_PATTERN.
 			if !strings.Contains(cond, "needs.preflight.outputs.lint_gates != 'false'") {
 				t.Errorf("job %q is tagged scoped in %s but its `if:` does not test lint_gates", j, gateJobName)
 			}
 		case "pull":
-			// ci-template v1.55: the Row job runs on a non-draft pull request only.
+			// The Row job runs on a non-draft pull request only.
 			if cond != pullIf {
 				t.Errorf("job %q is tagged pull in %s but lacks `if: ${{ %s }}`", j, gateJobName, pullIf)
 			}

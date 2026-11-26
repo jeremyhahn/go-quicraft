@@ -1,28 +1,6 @@
 #!/usr/bin/env bash
-#
-# bench-compare.sh — statistically defensible hot-path benchmark comparison.
-#
-# Single `go test -bench` runs on a loaded machine are too noisy to detect a
-# regression. The method:
-#
-#   1. Compile both sides on the invoking machine with the same toolchain and
-#      GOWORK=off, so the binaries differ only by source revision.
-#   2. Run them locally (PERF_HOST unset, the default, also used in CI) or on
-#      PERF_HOST=user@host over ssh. A quiet dedicated host gives tighter
-#      confidence intervals.
-#   3. Interleave the sides round-robin (cur, base, cur, base, ...) so slow
-#      thermal or scheduler drift is shared by both instead of landing on
-#      whichever block ran second.
-#   4. Use a fixed iteration count (-test.benchtime=Nx), never a duration, so
-#      both sides do the same work.
-#   5. Take many rounds and compare distributions with benchstat (median, CI,
-#      p-value).
-#
-# Usage:
-#   scripts/bench-compare.sh compare    # baseline vs working tree (default)
-#   scripts/bench-compare.sh baseline   # record working tree as a stored baseline
-#
-# See docs/testing/benchmarking.md for how to read the output.
+# bench-compare.sh compares hot-path benchmarks: both sides built with GOWORK=off, run interleaved at a fixed iteration count locally or on PERF_HOST, compared with benchstat.
+# Usage: scripts/bench-compare.sh compare|baseline; see docs/testing/benchmarking.md.
 
 set -euo pipefail
 
@@ -49,10 +27,7 @@ MODE="${1:-compare}"
 # Git ref to compare against. Anything `git rev-parse` accepts.
 BASELINE="${BASELINE:-origin/main}"
 
-# Where the compiled benchmark binaries are executed.
-#   unset/empty  -> run on this machine (supported default, including in CI)
-#   user@host    -> ssh the binaries there and run them on that host
-# Set it to a quiet, dedicated machine when you want the tightest intervals.
+# Where binaries run: unset runs locally (also in CI), user@host runs them there over ssh.
 PERF_HOST="${PERF_HOST:-}"
 
 # Packages to benchmark. The default is the hot path: append (raft log),
@@ -140,10 +115,7 @@ META_OUT="$BENCH_OUT_DIR/metadata.txt"
 : >"$CUR_RESULTS"
 [[ "$MODE" == compare ]] && : >"$BASE_RESULTS"
 
-# ---------------------------------------------------------------------------
-# Cleanup. Runs on every exit path so a failed build never leaves a stale
-# worktree or a pile of test binaries on the remote host.
-# ---------------------------------------------------------------------------
+# Cleanup on every exit: the worktree and remote test binaries.
 
 LOCAL_TMP=""
 REMOTE_TMP=""
@@ -173,22 +145,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Scratch space for the compiled test binaries, under the gitignored build/
-# rather than TMPDIR, which on a CI runner may be small or not shared between
-# steps.
+# Scratch for compiled binaries under the gitignored build/.
 mkdir -p "$REPO_ROOT/build/bench-compare"
 LOCAL_TMP="$(mktemp -d "$REPO_ROOT/build/bench-compare/tmp-XXXXXXXX")" ||
 	die "cannot create a scratch directory under $REPO_ROOT/build/bench-compare"
 
-# ---------------------------------------------------------------------------
-# Resolve the baseline ref up front: it is instant, and a typo here should not
-# cost the caller an ssh connect timeout first.
-# ---------------------------------------------------------------------------
+# Resolve the baseline ref first.
 
-# compare mode always needs a baseline ref. baseline mode measures the working
-# tree by default, but accepts BASELINE_REF to record a clean, committed
-# revision instead - a stored baseline built from a dirty tree is not
-# reproducible and should not be committed.
+# compare needs a baseline ref; baseline measures the working tree unless BASELINE_REF names a committed revision.
 BASELINE_SHA=""
 BASELINE_DESC=""
 WORKTREE_REF=""
@@ -219,11 +183,7 @@ if [[ -n "$WORKTREE_REF" ]]; then
 	BASELINE_DESC="$WORKTREE_REF ($(git -C "$REPO_ROOT" rev-parse --short "$BASELINE_SHA"))"
 fi
 
-# ---------------------------------------------------------------------------
-# Execution host: local (PERF_HOST unset) or remote (PERF_HOST=user@host), with
-# an identical method. There is no fallback from remote to local, which would
-# attach the wrong provenance to the result.
-# ---------------------------------------------------------------------------
+# Execution host: local, or PERF_HOST=user@host; no fallback between them.
 
 RUN_HOSTNAME=""
 RUN_CPU_MODEL=""
@@ -335,10 +295,7 @@ else
 	fi
 fi
 
-# ---------------------------------------------------------------------------
-# Build. Both sides use GOWORK=off so neither picks up the shared go.work; the
-# binaries then differ only by source revision.
-# ---------------------------------------------------------------------------
+# Build both sides with GOWORK=off.
 
 slug() {
 	# ./pkg/internal/raft/ -> pkg_internal_raft
@@ -471,10 +428,7 @@ INVOCATION="$INVOCATION BENCH_ITERS='$BENCH_ITERS' make bench-$MODE"
 # Comparison.
 # ---------------------------------------------------------------------------
 
-# Fallback comparison used only when benchstat is unavailable. It reports the
-# median ns/op per benchmark and the percentage delta. It is deliberately much
-# weaker than benchstat: no confidence intervals, no significance test. A small
-# delta here means nothing.
+# Fallback without benchstat: median ns/op and percentage delta, with no significance test.
 median_compare() {
 	local base="$1" cur="$2"
 	awk '

@@ -49,12 +49,7 @@ func startSingleVoterShard(t *testing.T) *Host {
 // SyncRequestRemoveNode
 // ---------------------------------------------------------------------------
 
-// TestSyncRequestRemoveNode_RemovesObserver verifies the committed path of the
-// public synchronous membership removal: an observer that was added through
-// consensus is removed through consensus, the call returns only once the
-// change is applied, and the shard membership no longer lists the replica.
-// Observers do not count toward quorum, so the removal commits on the single
-// voter without any peer being reachable.
+// TestSyncRequestRemoveNode_RemovesObserver verifies a synchronous removal returns once applied and the observer is gone.
 func TestSyncRequestRemoveNode_RemovesObserver(t *testing.T) {
 	h := startSingleVoterShard(t)
 
@@ -132,8 +127,7 @@ func TestSyncRequestRemoveNode_ContextEndsUncommittedWait(t *testing.T) {
 			if err := h.SyncRequestAddNode(setupCtx, 1, 4, "127.0.0.1:6001", 0); err != nil {
 				t.Fatalf("SyncRequestAddNode: %v", err)
 			}
-			// Read locally: with two voters and one of them absent, a
-			// linearizable read can no longer reach quorum.
+			// Read locally: the shard has no quorum.
 			members, err := h.ShardMembership(1)
 			if err != nil {
 				t.Fatalf("ShardMembership: %v", err)
