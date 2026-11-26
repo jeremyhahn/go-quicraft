@@ -294,6 +294,14 @@ var (
 	// PreVote, so only the current leader completing a leadership transfer,
 	// or a local origin, may send it.
 	ErrTimeoutNowNotFromLeader = errors.New("raft: TimeoutNow from a replica that is not this shard's leader")
+	// ErrReplicateNotFromLeader is returned when a Replicate names a sender
+	// that is not the leader this replica already recognises for the current
+	// term. A Replicate installs its sender as leader, resets the election
+	// timer and appends to the log, so at the current term only the one
+	// leader Election Safety allows may send it. A replica with no leader yet
+	// (leaderID == noLeader) accepts, and a higher term has already installed
+	// msg.From as leader in step() before the handler runs.
+	ErrReplicateNotFromLeader = errors.New("raft: replicate from a replica that is not this shard's leader")
 
 	// ErrSnapshotNotFromLeader is returned when an InstallSnapshot names a
 	// sender that is not the leader this replica already recognises for the
