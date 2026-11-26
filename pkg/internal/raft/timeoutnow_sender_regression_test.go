@@ -66,6 +66,35 @@ func TestTimeoutNowSender_RemoteNonLeaderIsRefused(t *testing.T) {
 	}
 }
 
+// TestTimeoutNowSender_HigherTermNonLeaderIsRefusedByStep checks that a
+// TimeoutNow at a higher term is validated against the leader and term this
+// replica recognized before step's term handling adopts the sender as leader
+// at the new term.
+func TestTimeoutNowSender_HigherTermNonLeaderIsRefusedByStep(t *testing.T) {
+	ctx := t.Context()
+	r := staleConfigFollower(ctx, t, nil)
+	voteBefore := r.vote
+	msg := proto.Message{Type: proto.TimeoutNow, From: 3, To: 1, ShardID: 1, Term: staleConfigTerm + 1}
+
+	err := r.step(msg)
+	if !errors.Is(err, ErrTimeoutNowNotFromLeader) {
+		t.Fatalf("step(TimeoutNow) = %v, want ErrTimeoutNowNotFromLeader", err)
+	}
+	if r.term != staleConfigTerm {
+		t.Errorf("term = %d, want %d unchanged", r.term, staleConfigTerm)
+	}
+	if r.leaderID != staleConfigLeader {
+		t.Errorf("leaderID = %d, want %d unchanged", r.leaderID, staleConfigLeader)
+	}
+	if r.vote != voteBefore {
+		t.Errorf("vote = %d, want %d unchanged", r.vote, voteBefore)
+	}
+	if r.state != follower {
+		t.Errorf("state = %v, want follower", r.state)
+	}
+	assertNoVoteRequest(ctx, t, r, "after a higher-term TimeoutNow from a non-leader")
+}
+
 // TestTimeoutNowSender_LeaderAtCurrentTermCampaigns checks that the leader's
 // TimeoutNow at the current term still starts the election.
 func TestTimeoutNowSender_LeaderAtCurrentTermCampaigns(t *testing.T) {
