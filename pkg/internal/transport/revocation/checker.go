@@ -477,19 +477,28 @@ func (c *Checker) issuerFor(leaf *x509.Certificate) *x509.Certificate {
 // matchIssuer returns the candidate in set that signed leaf, falling back to
 // an AuthorityKeyId match, or nil when none did.
 func matchIssuer(leaf *x509.Certificate, set []*x509.Certificate) *x509.Certificate {
+	issuer, _ := resolveIssuer(leaf, set)
+	return issuer
+}
+
+// resolveIssuer selects leaf's issuer from set like matchIssuer and reports
+// whether the selected candidate's signature verifies leaf. A candidate
+// chosen only because its SubjectKeyId equals the leaf's AuthorityKeyId is
+// returned with verified false.
+func resolveIssuer(leaf *x509.Certificate, set []*x509.Certificate) (*x509.Certificate, bool) {
 	for _, candidate := range set {
 		if leaf.CheckSignatureFrom(candidate) == nil {
-			return candidate
+			return candidate, true
 		}
 	}
 	if len(leaf.AuthorityKeyId) > 0 {
 		for _, candidate := range set {
 			if bytes.Equal(candidate.SubjectKeyId, leaf.AuthorityKeyId) {
-				return candidate
+				return candidate, false
 			}
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // crlIssuerFor selects the configured CA that signed crl, or nil when none
@@ -770,7 +779,8 @@ func (c *Checker) RevokedCount() int {
 // mode. "Unknown" (stale CRL, unreachable OCSP responder) is governed by
 // AllowSoftFail: fail closed when enforcing, accept when soft-fail.
 func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
-	return c.isRevoked(cert, c.issuerFor(cert))
+	issuer, verified := resolveIssuer(cert, c.issuerSet())
+	return c.isRevoked(cert, issuer, verified)
 }
 
 // IsRevokedEstablished is IsRevoked for the leaf of a session that is
@@ -779,11 +789,13 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 // under a CA the bundle has since dropped keeps its issuer-scoped CRL entries
 // and its OCSP lookups. It must never be used to admit a new handshake.
 func (c *Checker) IsRevokedEstablished(cert *x509.Certificate) (bool, error) {
-	issuer := c.issuerFor(cert)
-	if issuer == nil {
-		issuer = matchIssuer(cert, c.retainedSet())
+	issuer, verified := resolveIssuer(cert, c.issuerSet())
+	if !verified {
+		if retained, ok := resolveIssuer(cert, c.retainedSet()); retained != nil && (ok || issuer == nil) {
+			issuer, verified = retained, ok
+		}
 	}
-	return c.isRevoked(cert, issuer)
+	return c.isRevoked(cert, issuer, verified)
 }
 
 // IsRevokedUnder reports whether cert is revoked, resolving its issuer in
@@ -793,7 +805,8 @@ func (c *Checker) IsRevokedEstablished(cert *x509.Certificate) (bool, error) {
 // resolving its leaf in the replaced set would miss the issuer-scoped
 // revocations of the CA it actually chains to.
 func (c *Checker) IsRevokedUnder(cert *x509.Certificate, issuers []*x509.Certificate) (bool, error) {
-	return c.isRevoked(cert, matchIssuer(cert, issuers))
+	issuer, verified := resolveIssuer(cert, issuers)
+	return c.isRevoked(cert, issuer, verified)
 }
 
 // isRevoked dispatches on the mode with the issuer the caller resolved for
@@ -801,12 +814,18 @@ func (c *Checker) IsRevokedUnder(cert *x509.Certificate, issuers []*x509.Certifi
 // fails closed unless an issuer-agnostic entry revokes the serial; otherwise
 // the CRL lookup is scoped to the issuer-agnostic entries and OCSP has no
 // request to build.
-func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
+func (c *Checker) isRevoked(cert, issuer *x509.Certificate, verified bool) (bool, error) {
 	serial := cert.SerialNumber.Text(16)
 	if issuer == nil {
 		return c.unresolvedIssuerResult(c.dispatchMode(cert, nil, anyIssuerScope, serial))
 	}
-	return c.dispatchMode(cert, issuer, issuerScope(issuer), serial)
+	revoked, err := c.dispatchMode(cert, issuer, issuerScope(issuer), serial)
+	if !verified {
+		// Matched only by AuthorityKeyId: the candidate's signature does
+		// not verify the leaf, so its CRL does not speak for the leaf.
+		return c.unresolvedIssuerResult(revoked, err)
+	}
+	return revoked, err
 }
 
 // dispatchMode runs the configured mode's policy. Each mode's policy lives in
