@@ -149,7 +149,7 @@ ENV GOPROXY=off
 FROM base AS toolchain
 ENV HOME=/tmp
 RUN apk add --no-cache bash make git curl jq shellcheck \
-      coreutils grep sed gawk findutils diffutils tar xz; \
+      coreutils grep sed gawk findutils diffutils tar xz openssh-keygen; \
     git config --system --add safe.directory '*'
 COPY --from=tools /out/ /usr/local/bin/
 WORKDIR /src
