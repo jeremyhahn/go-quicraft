@@ -14,3 +14,8 @@ pkg/writemode: reviewed mode.go fully; not reached errors.go
 pkg/internal/rsm: reviewed statemachine.go (Apply, applyBatch: gap guard, expiry checkpoints, session register/unregister, duplicate and in-batch mirror handling, response caching); not reached: adapter.go, errors.go, the rest of statemachine.go (Lookup family, snapshot save/recover, Close, session policy)
 pkg/internal/session: reviewed manager.go (UnmarshalFrom, unmarshalSession: count and length bounds); not reached: errors.go, session.go, the rest of manager.go
 pkg/internal/queue: reviewed entryqueue.go (AddTracked); not reached: swapbuffer.go, the rest of entryqueue.go
+pkg/internal/supervise: reviewed none; not reached supervise.go
+pkg/internal/server: reviewed none; not reached rate.go
+pkg/internal/registry: reviewed none; not reached registry.go, errors.go
+pkg/internal/netaddr: reviewed netaddr.go (Canonical, canonicalPort); not reached: the rest of netaddr.go (CanonicalHost, Host)
+pkg/internal/invariant: reviewed none; not reached assert.go
