@@ -1,0 +1,256 @@
+package revocation
+
+import (
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"testing"
+)
+
+// noIssuerFixture holds a root, an intermediate under it, a leaf issued by
+// the intermediate and listed in the intermediate's CRL, and a second leaf
+// from the same intermediate that no CRL lists.
+type noIssuerFixture struct {
+	root, intermediate *testCA
+	revokedLeaf        *x509.Certificate
+	cleanLeaf          *x509.Certificate
+	crlPath            string
+}
+
+const (
+	noIssuerRevokedSerial = 0x1258
+	noIssuerCleanSerial   = 0x1259
+)
+
+func newNoIssuerFixture(t *testing.T) *noIssuerFixture {
+	t.Helper()
+	f := &noIssuerFixture{root: newTestCA(t)}
+	f.intermediate = newTestIntermediate(t, f.root)
+	f.revokedLeaf = f.intermediate.issueLeaf(t, noIssuerRevokedSerial)
+	f.cleanLeaf = f.intermediate.issueLeaf(t, noIssuerCleanSerial)
+	f.crlPath = writeCRLFile(t, t.TempDir(), "inter.crl.pem", f.intermediate.createCRL(t, noIssuerRevokedSerial))
+	return f
+}
+
+// checker builds a checker that trusts both CAs, so the intermediate's CRL
+// loads and its entries are scoped to the intermediate.
+func (f *noIssuerFixture) checker(t *testing.T, mode Mode, softFail bool) *Checker {
+	t.Helper()
+	c := NewChecker(Config{
+		Mode:          mode,
+		CRLPaths:      []string{f.crlPath},
+		AllowSoftFail: softFail,
+	}, f.root.cert, f.intermediate.cert)
+	if err := c.ReloadCRLs(); err != nil {
+		t.Fatalf("ReloadCRLs: %v", err)
+	}
+	return c
+}
+
+var noIssuerCRLModes = []Mode{ModeCRL, ModeBoth, ModeAny}
+
+// An enforcing check whose bundle cannot resolve the leaf's issuer must not
+// report a clean "not revoked": it reports that the issuer is unknown.
+func TestIsRevokedUnder_UnresolvedIssuerEnforcingFailsClosed(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	rootOnly := []*x509.Certificate{f.root.cert}
+	for _, mode := range noIssuerCRLModes {
+		t.Run(string(mode), func(t *testing.T) {
+			c := f.checker(t, mode, false)
+			for _, leaf := range []*x509.Certificate{f.revokedLeaf, f.cleanLeaf} {
+				revoked, err := c.IsRevokedUnder(leaf, rootOnly)
+				if revoked {
+					t.Fatalf("serial %s: revoked = true, want false with an error", leaf.SerialNumber.Text(16))
+				}
+				if err == nil {
+					t.Fatalf("serial %s: err = nil, want an error", leaf.SerialNumber.Text(16))
+				}
+				// ModeBoth without a responder already fails on its OCSP
+				// leg; that error stands. The other modes reach a clean
+				// "not found" and report the missing issuer.
+				if mode != ModeBoth && !errors.Is(err, ErrNoIssuerCertificate) {
+					t.Fatalf("serial %s: err = %v, want one wrapping ErrNoIssuerCertificate", leaf.SerialNumber.Text(16), err)
+				}
+			}
+		})
+	}
+}
+
+// A stale or never-loaded CRL source keeps its own error when the issuer is
+// also unresolved: the source failure is reported, not the missing issuer.
+func TestIsRevokedUnder_UnresolvedIssuerStaleSourceReportsStale(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	rootOnly := []*x509.Certificate{f.root.cert}
+	missing := filepath.Join(t.TempDir(), "absent.crl.pem")
+	for _, mode := range noIssuerCRLModes {
+		t.Run(string(mode), func(t *testing.T) {
+			c := NewChecker(Config{
+				Mode:     mode,
+				CRLPaths: []string{missing},
+			}, f.root.cert, f.intermediate.cert)
+			revoked, err := c.IsRevokedUnder(f.cleanLeaf, rootOnly)
+			if revoked {
+				t.Fatal("revoked = true, want false with an error")
+			}
+			if !errors.Is(err, ErrCRLStale) {
+				t.Fatalf("err = %v, want one wrapping ErrCRLStale", err)
+			}
+			if errors.Is(err, ErrNoIssuerCertificate) {
+				t.Fatalf("err = %v, must not report ErrNoIssuerCertificate for a stale source", err)
+			}
+		})
+	}
+}
+
+// Soft-fail keeps the issuer-agnostic lookup: an unresolved issuer is
+// accepted without an error.
+func TestIsRevokedUnder_UnresolvedIssuerSoftFailUnchanged(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	rootOnly := []*x509.Certificate{f.root.cert}
+	for _, mode := range noIssuerCRLModes {
+		t.Run(string(mode), func(t *testing.T) {
+			c := f.checker(t, mode, true)
+			revoked, err := c.IsRevokedUnder(f.revokedLeaf, rootOnly)
+			if err != nil || revoked {
+				t.Fatalf("IsRevokedUnder = (%v, %v), want (false, nil)", revoked, err)
+			}
+		})
+	}
+}
+
+// An issuer-agnostic or admin entry for the serial is a definite answer even
+// when the issuer is unresolved.
+func TestIsRevokedUnder_UnresolvedIssuerAgnosticEntryRevokes(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	rootOnly := []*x509.Certificate{f.root.cert}
+	for _, mode := range noIssuerCRLModes {
+		t.Run(string(mode), func(t *testing.T) {
+			c := f.checker(t, mode, false)
+			c.AddRevokedSerial(f.cleanLeaf.SerialNumber.Text(16))
+			revoked, err := c.IsRevokedUnder(f.cleanLeaf, rootOnly)
+			if err != nil || !revoked {
+				t.Fatalf("IsRevokedUnder = (%v, %v), want (true, nil)", revoked, err)
+			}
+		})
+	}
+}
+
+// With the issuer in the bundle, the issuer-scoped verdicts are unchanged.
+func TestIsRevokedUnder_ResolvedIssuerUnchanged(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	full := []*x509.Certificate{f.root.cert, f.intermediate.cert}
+	c := f.checker(t, ModeCRL, false)
+	assertRevokedUnder(t, c, f.revokedLeaf, full, true, "listed leaf under the full bundle")
+	assertRevokedUnder(t, c, f.cleanLeaf, full, false, "unlisted leaf under the full bundle")
+}
+
+// A leaf from an intermediate the bundle does not list, whose AuthorityKeyId
+// names a listed root, matches that root only by key identifier: the root's
+// signature does not verify the leaf. An enforcing check must treat that as
+// an unresolved issuer, even with a fresh CRL loaded for the root.
+func TestIsRevokedUnder_AuthorityKeyIdOnlyMatchFailsClosed(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	if len(f.root.cert.SubjectKeyId) == 0 {
+		t.Fatal("setup: root has no SubjectKeyId to match against")
+	}
+	unlisted := newTestIntermediate(t, f.root)
+	leaf := issueLeafWithAKI(t, unlisted, noIssuerCleanSerial, f.root.cert.SubjectKeyId)
+	if leaf.CheckSignatureFrom(f.root.cert) == nil {
+		t.Fatal("setup: leaf must not verify against the root")
+	}
+	rootCRL := writeCRLFile(t, t.TempDir(), "root.crl.pem", f.root.createCRL(t, noIssuerRevokedSerial))
+	rootOnly := []*x509.Certificate{f.root.cert}
+	for _, mode := range noIssuerCRLModes {
+		if mode == ModeBoth {
+			// Needs a responder; TestIsRevokedUnder_AuthorityKeyIdOnlyMatchModeBoth.
+			continue
+		}
+		t.Run(string(mode), func(t *testing.T) {
+			c := NewChecker(Config{
+				Mode:     mode,
+				CRLPaths: []string{f.crlPath, rootCRL},
+			}, f.root.cert, f.intermediate.cert)
+			if err := c.ReloadCRLs(); err != nil {
+				t.Fatalf("ReloadCRLs: %v", err)
+			}
+			revoked, err := c.IsRevokedUnder(leaf, rootOnly)
+			if revoked {
+				t.Fatal("revoked = true, want false with an error")
+			}
+			if err == nil {
+				t.Fatal("err = nil, want an error for an issuer matched only by key identifier")
+			}
+			if !errors.Is(err, ErrNoIssuerCertificate) {
+				t.Fatalf("err = %v, want one wrapping ErrNoIssuerCertificate", err)
+			}
+		})
+	}
+}
+
+// TestIsRevokedUnder_AuthorityKeyIdOnlyMatchModeBoth covers ModeBoth with both
+// legs answering: a fresh CRL without the serial and an OCSP "good" signed by
+// the key-identifier candidate. Neither leg speaks for a leaf the candidate
+// did not sign, so enforcement reports the missing issuer; soft-fail accepts.
+func TestIsRevokedUnder_AuthorityKeyIdOnlyMatchModeBoth(t *testing.T) {
+	f := newNoIssuerFixture(t)
+	unlisted := newTestIntermediate(t, f.root)
+	leaf := issueLeafWithAKI(t, unlisted, noIssuerCleanSerial, f.root.cert.SubjectKeyId)
+	rootCRL := writeCRLFile(t, t.TempDir(), "root.crl.pem", f.root.createCRL(t, noIssuerRevokedSerial))
+	server := newMockOCSPServer(t, f.root, nil)
+	defer server.Close()
+	rootOnly := []*x509.Certificate{f.root.cert}
+	for _, softFail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("softFail=%v", softFail), func(t *testing.T) {
+			c := NewChecker(Config{
+				Mode:               ModeBoth,
+				CRLPaths:           []string{f.crlPath, rootCRL},
+				OCSPResponderURL:   server.URL,
+				OCSPTimeoutSeconds: 5,
+				AllowSoftFail:      softFail,
+			}, f.root.cert, f.intermediate.cert)
+			if err := c.ReloadCRLs(); err != nil {
+				t.Fatalf("ReloadCRLs: %v", err)
+			}
+			revoked, err := c.IsRevokedUnder(leaf, rootOnly)
+			if revoked {
+				t.Fatal("revoked = true, want false")
+			}
+			if softFail {
+				if err != nil {
+					t.Fatalf("soft-fail err = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrNoIssuerCertificate) {
+				t.Fatalf("err = %v, want one wrapping ErrNoIssuerCertificate", err)
+			}
+		})
+	}
+}
+
+// TestPruneRetainedIssuers_KeepsVerifiedRetainedIssuer checks that pruning
+// keeps a retained issuer while a live leaf depends on it, even when the
+// current bundle offers a candidate matched only by AuthorityKeyId.
+func TestPruneRetainedIssuers_KeepsVerifiedRetainedIssuer(t *testing.T) {
+	oldCA := newTestCA(t)
+	newCA := newTestCA(t)
+	// Signed by the old CA, but its AuthorityKeyId names the new CA.
+	leaf := issueLeafWithAKI(t, oldCA, noIssuerRevokedSerial, newCA.cert.SubjectKeyId)
+	c := NewChecker(Config{Mode: ModeCRL}, oldCA.cert)
+	c.mu.Lock()
+	c.revokedSet[scopedSerial(issuerScope(oldCA.cert), leaf.SerialNumber.Text(16))] = struct{}{}
+	c.mu.Unlock()
+	c.SetIssuers(newCA.cert)
+
+	if revoked, err := c.IsRevokedEstablished(leaf); !revoked || err != nil {
+		t.Fatalf("IsRevokedEstablished before prune = %v, %v; want revoked", revoked, err)
+	}
+	c.PruneRetainedIssuers([]*x509.Certificate{leaf})
+	if got := c.retainedSet(); len(got) != 1 || !got[0].Equal(oldCA.cert) {
+		t.Fatalf("retained after prune = %d entries, want the old CA alone", len(got))
+	}
+	if revoked, err := c.IsRevokedEstablished(leaf); !revoked || err != nil {
+		t.Fatalf("IsRevokedEstablished after prune = %v, %v; want revoked", revoked, err)
+	}
+}

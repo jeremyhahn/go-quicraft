@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -374,8 +375,8 @@ func (c *Checker) SetIssuers(issuers ...*x509.Certificate) {
 	c.retained.Store(&retained)
 }
 
-// PruneRetainedIssuers releases every retained issuer that no certificate in
-// live was issued by. The transport passes the leaves of all its established
+// PruneRetainedIssuers releases every retained issuer that IsRevokedEstablished
+// would not select for any certificate in live. The transport passes the leaves of all its established
 // connections after each revocation sweep, so an issuer a CA reload dropped
 // is held exactly as long as a session that needs it, or as long as a
 // configured CRL file it signed: such a source retires together with its
@@ -390,10 +391,10 @@ func (c *Checker) PruneRetainedIssuers(live []*x509.Certificate) {
 	trusted := c.issuerSet()
 	var needed []*x509.Certificate
 	for _, leaf := range live {
-		if leaf == nil || matchIssuer(leaf, trusted) != nil {
+		if leaf == nil {
 			continue
 		}
-		if issuer := matchIssuer(leaf, retained); issuer != nil && !containsCert(needed, issuer) {
+		if issuer, _, fromRetained := establishedIssuer(leaf, trusted, retained); fromRetained && !containsCert(needed, issuer) {
 			needed = append(needed, issuer)
 		}
 	}
@@ -476,19 +477,28 @@ func (c *Checker) issuerFor(leaf *x509.Certificate) *x509.Certificate {
 // matchIssuer returns the candidate in set that signed leaf, falling back to
 // an AuthorityKeyId match, or nil when none did.
 func matchIssuer(leaf *x509.Certificate, set []*x509.Certificate) *x509.Certificate {
+	issuer, _ := resolveIssuer(leaf, set)
+	return issuer
+}
+
+// resolveIssuer selects leaf's issuer from set like matchIssuer and reports
+// whether the selected candidate's signature verifies leaf. A candidate
+// chosen only because its SubjectKeyId equals the leaf's AuthorityKeyId is
+// returned with verified false.
+func resolveIssuer(leaf *x509.Certificate, set []*x509.Certificate) (*x509.Certificate, bool) {
 	for _, candidate := range set {
 		if leaf.CheckSignatureFrom(candidate) == nil {
-			return candidate
+			return candidate, true
 		}
 	}
 	if len(leaf.AuthorityKeyId) > 0 {
 		for _, candidate := range set {
 			if bytes.Equal(candidate.SubjectKeyId, leaf.AuthorityKeyId) {
-				return candidate
+				return candidate, false
 			}
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // crlIssuerFor selects the configured CA that signed crl, or nil when none
@@ -769,7 +779,8 @@ func (c *Checker) RevokedCount() int {
 // mode. "Unknown" (stale CRL, unreachable OCSP responder) is governed by
 // AllowSoftFail: fail closed when enforcing, accept when soft-fail.
 func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
-	return c.isRevoked(cert, c.issuerFor(cert))
+	issuer, verified := resolveIssuer(cert, c.issuerSet())
+	return c.isRevoked(cert, issuer, verified)
 }
 
 // IsRevokedEstablished is IsRevoked for the leaf of a session that is
@@ -778,11 +789,24 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 // under a CA the bundle has since dropped keeps its issuer-scoped CRL entries
 // and its OCSP lookups. It must never be used to admit a new handshake.
 func (c *Checker) IsRevokedEstablished(cert *x509.Certificate) (bool, error) {
-	issuer := c.issuerFor(cert)
-	if issuer == nil {
-		issuer = matchIssuer(cert, c.retainedSet())
+	issuer, verified, _ := establishedIssuer(cert, c.issuerSet(), c.retainedSet())
+	return c.isRevoked(cert, issuer, verified)
+}
+
+// establishedIssuer selects the issuer an established-session check uses: a
+// signature-verified trusted issuer first, then a retained one when it
+// verifies the leaf or the trusted set offers no candidate at all. It reports
+// whether the choice verifies the leaf and whether it came from retained, so
+// PruneRetainedIssuers keeps exactly the retained issuers a check would use.
+func establishedIssuer(leaf *x509.Certificate, trusted, retained []*x509.Certificate) (issuer *x509.Certificate, verified, fromRetained bool) {
+	issuer, verified = resolveIssuer(leaf, trusted)
+	if verified {
+		return issuer, true, false
 	}
-	return c.isRevoked(cert, issuer)
+	if r, ok := resolveIssuer(leaf, retained); r != nil && (ok || issuer == nil) {
+		return r, ok, true
+	}
+	return issuer, false, false
 }
 
 // IsRevokedUnder reports whether cert is revoked, resolving its issuer in
@@ -792,23 +816,35 @@ func (c *Checker) IsRevokedEstablished(cert *x509.Certificate) (bool, error) {
 // resolving its leaf in the replaced set would miss the issuer-scoped
 // revocations of the CA it actually chains to.
 func (c *Checker) IsRevokedUnder(cert *x509.Certificate, issuers []*x509.Certificate) (bool, error) {
-	return c.isRevoked(cert, matchIssuer(cert, issuers))
+	issuer, verified := resolveIssuer(cert, issuers)
+	return c.isRevoked(cert, issuer, verified)
 }
 
 // isRevoked dispatches on the mode with the issuer the caller resolved for
-// cert; nil means none is known, which scopes the CRL lookup to the
-// issuer-agnostic entries and leaves OCSP without a request to build.
-func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
+// cert; nil means none is known. Under enforcement a CRL-consulting mode then
+// fails closed unless an issuer-agnostic entry revokes the serial; otherwise
+// the CRL lookup is scoped to the issuer-agnostic entries and OCSP has no
+// request to build.
+func (c *Checker) isRevoked(cert, issuer *x509.Certificate, verified bool) (bool, error) {
 	serial := cert.SerialNumber.Text(16)
-	scope := anyIssuerScope
-	if issuer != nil {
-		scope = issuerScope(issuer)
+	if issuer == nil {
+		return c.unresolvedIssuerResult(c.dispatchMode(cert, nil, anyIssuerScope, serial))
 	}
+	revoked, err := c.dispatchMode(cert, issuer, issuerScope(issuer), serial)
+	if !verified {
+		// Matched only by AuthorityKeyId: the candidate's signature does
+		// not verify the leaf, so its CRL does not speak for the leaf.
+		return c.unresolvedIssuerResult(revoked, err)
+	}
+	return revoked, err
+}
 
-	// Dispatch only. Each mode's policy lives in its own method: the bodies
-	// differ in which sources they consult and in what a "not found" means
-	// when nothing was consulted, and inlining all four put this function over
-	// the cyclomatic limit without making any one policy easier to read.
+// dispatchMode runs the configured mode's policy. Each mode's policy lives in
+// its own method: the bodies differ in which sources they consult and in what
+// a "not found" means when nothing was consulted, and inlining all four put
+// isRevoked over the cyclomatic limit without making any one policy easier
+// to read.
+func (c *Checker) dispatchMode(cert, issuer *x509.Certificate, scope, serial string) (bool, error) {
 	switch c.cfg.Mode {
 	case ModeCRL:
 		return c.isRevokedCRL(scope, serial)
@@ -819,6 +855,25 @@ func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
 	default: // ModeAny
 		return c.isRevokedAny(cert, issuer, scope, serial)
 	}
+}
+
+// unresolvedIssuerResult finishes the answer for a leaf whose issuer is not in
+// the trusted bundle. A "revoked" or an error from the mode policy stands
+// unchanged; only a clean "not found" under the gate becomes an error, since
+// only issuer-agnostic entries could be consulted.
+func (c *Checker) unresolvedIssuerResult(revoked bool, err error) (bool, error) {
+	if revoked || err != nil || !c.unresolvedIssuerGated() {
+		return revoked, err
+	}
+	return false, fmt.Errorf("revocation: no issuer for the certificate was found in the trusted bundle: %w", ErrNoIssuerCertificate)
+}
+
+// unresolvedIssuerGated reports whether an unresolved issuer must fail
+// closed: enforcement is on and the mode consults CRLs, whose entries are
+// scoped to the issuer that signed them. Without the issuer only the
+// issuer-agnostic entries can be consulted, which is not a full answer.
+func (c *Checker) unresolvedIssuerGated() bool {
+	return c.cfg.Mode != ModeOCSP && c.cfg.enforcing()
 }
 
 // noSourceBackstop reports the missing-source failure when enforcement is on
