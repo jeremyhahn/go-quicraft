@@ -20,6 +20,11 @@ const sigFixtureEmail = "signer@example.com"
 func newSigFixture(t *testing.T) *sigFixture {
 	t.Helper()
 	if _, err := exec.LookPath("ssh-keygen"); err != nil {
+		// CI must run these regressions: the toolchain image installs
+		// ssh-keygen, so its absence there is a broken image, not a skip.
+		if os.Getenv("CI") != "" {
+			t.Fatal("ssh-keygen is not on PATH; install the openssh-keygen package")
+		}
 		t.Skip("ssh-keygen is not on PATH")
 	}
 	root := t.TempDir()
