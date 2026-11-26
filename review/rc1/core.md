@@ -13,3 +13,4 @@ pkg/batch: reviewed decode.go fully, hostproposer.go fully, aggregator.go (submi
 pkg/writemode: reviewed mode.go fully; not reached errors.go
 pkg/internal/rsm: reviewed statemachine.go (Apply, applyBatch: gap guard, expiry checkpoints, session register/unregister, duplicate and in-batch mirror handling, response caching); not reached: adapter.go, errors.go, the rest of statemachine.go (Lookup family, snapshot save/recover, Close, session policy)
 pkg/internal/session: reviewed manager.go (UnmarshalFrom, unmarshalSession: count and length bounds); not reached: errors.go, session.go, the rest of manager.go
+pkg/internal/queue: reviewed entryqueue.go (AddTracked); not reached: swapbuffer.go, the rest of entryqueue.go
