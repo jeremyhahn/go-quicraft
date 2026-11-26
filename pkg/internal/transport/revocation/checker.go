@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -796,13 +797,17 @@ func (c *Checker) IsRevokedUnder(cert *x509.Certificate, issuers []*x509.Certifi
 }
 
 // isRevoked dispatches on the mode with the issuer the caller resolved for
-// cert; nil means none is known, which scopes the CRL lookup to the
-// issuer-agnostic entries and leaves OCSP without a request to build.
+// cert; nil means none is known. Under enforcement a CRL-consulting mode then
+// fails closed unless an issuer-agnostic entry revokes the serial; otherwise
+// the CRL lookup is scoped to the issuer-agnostic entries and OCSP has no
+// request to build.
 func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
 	serial := cert.SerialNumber.Text(16)
 	scope := anyIssuerScope
 	if issuer != nil {
 		scope = issuerScope(issuer)
+	} else if c.unresolvedIssuerGated() {
+		return c.isRevokedUnresolvedIssuer(serial)
 	}
 
 	// Dispatch only. Each mode's policy lives in its own method: the bodies
@@ -819,6 +824,27 @@ func (c *Checker) isRevoked(cert, issuer *x509.Certificate) (bool, error) {
 	default: // ModeAny
 		return c.isRevokedAny(cert, issuer, scope, serial)
 	}
+}
+
+// unresolvedIssuerGated reports whether an unresolved issuer must fail
+// closed: enforcement is on and the mode consults CRLs, whose entries are
+// scoped to the issuer that signed them. Without the issuer only the
+// issuer-agnostic entries can be consulted, which is not a full answer.
+func (c *Checker) unresolvedIssuerGated() bool {
+	return c.cfg.Mode != ModeOCSP && c.cfg.enforcing()
+}
+
+// isRevokedUnresolvedIssuer answers for a leaf whose issuer is not in the
+// trusted bundle under enforcement: an issuer-agnostic or admin entry is a
+// definite "revoked"; anything else is unknown and reported as an error.
+func (c *Checker) isRevokedUnresolvedIssuer(serial string) (bool, error) {
+	c.mu.RLock()
+	revoked := c.revokedLocked(anyIssuerScope, serial)
+	c.mu.RUnlock()
+	if revoked {
+		return true, nil
+	}
+	return false, fmt.Errorf("revocation: no issuer for the certificate was found in the trusted bundle: %w", ErrNoIssuerCertificate)
 }
 
 // noSourceBackstop reports the missing-source failure when enforcement is on

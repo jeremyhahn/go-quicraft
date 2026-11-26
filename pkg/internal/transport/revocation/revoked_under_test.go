@@ -2,6 +2,7 @@ package revocation
 
 import (
 	"crypto/x509"
+	"errors"
 	"testing"
 )
 
@@ -68,7 +69,12 @@ func TestIsRevokedUnder_NoIssuerInBundleAppliesIssuerAgnosticOnly(t *testing.T) 
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			assertRevokedUnder(t, f.checker, adminLeaf, tc.issuers, true, "AddRevokedSerial leaf under "+tc.name)
-			assertRevokedUnder(t, f.checker, f.leafA, tc.issuers, false, "A-scoped leaf under "+tc.name)
+			// Under enforcement an A-scoped entry cannot be consulted without
+			// A, so the verdict is unknown rather than a clean "not revoked".
+			revoked, err := f.checker.IsRevokedUnder(f.leafA, tc.issuers)
+			if revoked || !errors.Is(err, ErrNoIssuerCertificate) {
+				t.Fatalf("A-scoped leaf under %s: IsRevokedUnder = (%v, %v), want (false, ErrNoIssuerCertificate)", tc.name, revoked, err)
+			}
 		})
 	}
 }
@@ -78,11 +84,11 @@ func TestIsRevokedUnder_SurvivesCADrop(t *testing.T) {
 	f.checker.SetIssuers(f.caB.cert)
 	assertRevokedUnder(t, f.checker, f.leafA, []*x509.Certificate{f.caA.cert}, true, "CA A leaf under [A] after SetIssuers(B)")
 	revoked, err := f.checker.IsRevoked(f.leafA)
-	if err != nil {
-		t.Fatalf("IsRevoked after SetIssuers(B): %v", err)
-	}
 	if revoked {
 		t.Fatal("IsRevoked resolved the dropped CA A: the current set holds only B")
+	}
+	if !errors.Is(err, ErrNoIssuerCertificate) {
+		t.Fatalf("IsRevoked after SetIssuers(B): err = %v, want one wrapping ErrNoIssuerCertificate", err)
 	}
 }
 

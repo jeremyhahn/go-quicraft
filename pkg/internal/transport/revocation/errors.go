@@ -312,8 +312,10 @@ func (e *ConfigError) Error() string {
 // ErrNoOCSPResponderURL is returned when no OCSP responder URL is configured.
 var ErrNoOCSPResponderURL = &ConfigError{Field: "OCSPResponderURL", Message: "no OCSP responder URL configured"}
 
-// ErrNoIssuerCertificate is returned when no issuer certificate is configured for OCSP.
-var ErrNoIssuerCertificate = &ConfigError{Field: "IssuerCertificate", Message: "no issuer certificate configured for OCSP"}
+// ErrNoIssuerCertificate is returned when the leaf's issuer certificate is not
+// among the configured or trusted issuers, so an issuer-scoped source (an OCSP
+// request, a CRL's entries) cannot be consulted for it.
+var ErrNoIssuerCertificate = &ConfigError{Field: "IssuerCertificate", Message: "no issuer certificate available for the leaf"}
 
 // ErrNoCRLSources is returned by Config.Validate when the selected mode
 // consults CRLs but no CRL file is configured. Under enforcement such
