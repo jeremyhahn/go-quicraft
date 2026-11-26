@@ -375,8 +375,8 @@ func (c *Checker) SetIssuers(issuers ...*x509.Certificate) {
 	c.retained.Store(&retained)
 }
 
-// PruneRetainedIssuers releases every retained issuer that no certificate in
-// live was issued by. The transport passes the leaves of all its established
+// PruneRetainedIssuers releases every retained issuer that IsRevokedEstablished
+// would not select for any certificate in live. The transport passes the leaves of all its established
 // connections after each revocation sweep, so an issuer a CA reload dropped
 // is held exactly as long as a session that needs it, or as long as a
 // configured CRL file it signed: such a source retires together with its
@@ -391,10 +391,10 @@ func (c *Checker) PruneRetainedIssuers(live []*x509.Certificate) {
 	trusted := c.issuerSet()
 	var needed []*x509.Certificate
 	for _, leaf := range live {
-		if leaf == nil || matchIssuer(leaf, trusted) != nil {
+		if leaf == nil {
 			continue
 		}
-		if issuer := matchIssuer(leaf, retained); issuer != nil && !containsCert(needed, issuer) {
+		if issuer, _, fromRetained := establishedIssuer(leaf, trusted, retained); fromRetained && !containsCert(needed, issuer) {
 			needed = append(needed, issuer)
 		}
 	}
@@ -789,13 +789,24 @@ func (c *Checker) IsRevoked(cert *x509.Certificate) (bool, error) {
 // under a CA the bundle has since dropped keeps its issuer-scoped CRL entries
 // and its OCSP lookups. It must never be used to admit a new handshake.
 func (c *Checker) IsRevokedEstablished(cert *x509.Certificate) (bool, error) {
-	issuer, verified := resolveIssuer(cert, c.issuerSet())
-	if !verified {
-		if retained, ok := resolveIssuer(cert, c.retainedSet()); retained != nil && (ok || issuer == nil) {
-			issuer, verified = retained, ok
-		}
-	}
+	issuer, verified, _ := establishedIssuer(cert, c.issuerSet(), c.retainedSet())
 	return c.isRevoked(cert, issuer, verified)
+}
+
+// establishedIssuer selects the issuer an established-session check uses: a
+// signature-verified trusted issuer first, then a retained one when it
+// verifies the leaf or the trusted set offers no candidate at all. It reports
+// whether the choice verifies the leaf and whether it came from retained, so
+// PruneRetainedIssuers keeps exactly the retained issuers a check would use.
+func establishedIssuer(leaf *x509.Certificate, trusted, retained []*x509.Certificate) (issuer *x509.Certificate, verified, fromRetained bool) {
+	issuer, verified = resolveIssuer(leaf, trusted)
+	if verified {
+		return issuer, true, false
+	}
+	if r, ok := resolveIssuer(leaf, retained); r != nil && (ok || issuer == nil) {
+		return r, ok, true
+	}
+	return issuer, false, false
 }
 
 // IsRevokedUnder reports whether cert is revoked, resolving its issuer in
