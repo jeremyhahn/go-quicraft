@@ -246,6 +246,7 @@ func TestLeaseVoteHoldDown_TimeoutNowRefusedInsideWindow(t *testing.T) {
 	}
 
 	passVoteHoldDown(r)
+	r.leaderID = 1 // TimeoutNow is accepted only from the current leader.
 	if err := r.step(proto.Message{Type: proto.TimeoutNow, From: 1, Term: r.term}); err != nil {
 		t.Fatalf("TimeoutNow after the window: %v", err)
 	}

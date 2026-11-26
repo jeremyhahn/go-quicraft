@@ -4822,6 +4822,21 @@ func (r *raft) handleTimeoutNow(msg proto.Message) error {
 	if r.state == leader {
 		return nil
 	}
+	// Only the current leader, at the current term, sends TimeoutNow to
+	// complete a leadership transfer; a local origin is trusted. The gates
+	// above only refuse, so the check sits here, before any election state
+	// changes.
+	if !msg.Origin.IsLocal() &&
+		(r.leaderID == noLeader || msg.From != r.leaderID || msg.Term != r.term) {
+		slog.Warn("ignoring TimeoutNow: sender is not this replica's leader at the current term",
+			"shard", r.shardID,
+			"replica", r.replicaID,
+			"from", msg.From,
+			"leader", r.leaderID,
+			"msg_term", msg.Term,
+			"term", r.term)
+		return ErrTimeoutNowNotFromLeader
+	}
 	// Refuse to campaign at all when this replica's own last log term is
 	// unreadable, BEFORE becomeCandidate runs.
 	//

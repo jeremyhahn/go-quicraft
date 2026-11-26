@@ -40,9 +40,8 @@ func TestTimeoutNowSender_RemoteNonLeaderIsRefused(t *testing.T) {
 			msg:  proto.Message{Type: proto.TimeoutNow, From: staleConfigLeader, To: 1, ShardID: 1, Term: staleConfigTerm - 1},
 		},
 		{
-			name:    "leader without a term",
-			msg:     proto.Message{Type: proto.TimeoutNow, From: staleConfigLeader, To: 1, ShardID: 1},
-			viaStep: true,
+			name: "leader without a term",
+			msg:  proto.Message{Type: proto.TimeoutNow, From: staleConfigLeader, To: 1, ShardID: 1},
 		},
 	}
 	for _, tc := range cases {

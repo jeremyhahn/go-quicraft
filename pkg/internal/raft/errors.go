@@ -288,6 +288,13 @@ var (
 	// not move the commit index.
 	ErrHeartbeatNotFromLeader = errors.New("raft: heartbeat from a replica that is not this shard's leader")
 
+	// ErrTimeoutNowNotFromLeader is returned when a remote TimeoutNow names a
+	// sender that is not the leader this replica recognises, or carries a term
+	// other than the current one. TimeoutNow starts an election that skips
+	// PreVote, so only the current leader completing a leadership transfer,
+	// or a local origin, may send it.
+	ErrTimeoutNowNotFromLeader = errors.New("raft: TimeoutNow from a replica that is not this shard's leader")
+
 	// ErrSnapshotNotFromLeader is returned when an InstallSnapshot names a
 	// sender that is not the leader this replica already recognises for the
 	// current term.
