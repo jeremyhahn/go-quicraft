@@ -3646,6 +3646,16 @@ jobs:
           else RANGE="$HEAD_SHA -1"; fi
           # shellcheck disable=SC2086 # RANGE is one or two words on purpose
           COMMITS=$(git rev-list --reverse $RANGE) || { echo "FAIL cannot list the range $RANGE"; exit 1; }
+          # LOCAL (security): a push to main also checks the last 50 first-parent
+          # commits, HEAD~50..HEAD (from the root when main has fewer), so a commit
+          # whose own run was cancelled or superseded is still checked by a later run.
+          if [ "$EVENT" = push ] && [ "${GITHUB_REF:-}" = refs/heads/main ]; then
+            if isrev "$HEAD_SHA~50"; then WIN="$HEAD_SHA~50..$HEAD_SHA"; else WIN="$HEAD_SHA"; fi
+            # shellcheck disable=SC2086 # WIN is a range or one commit
+            W=$(git rev-list --reverse $WIN) || { echo "FAIL cannot list the window $WIN"; exit 1; }
+            COMMITS=$(printf '%s\n%s\n' "$W" "$COMMITS" | awk 'NF && !seen[$0]++')
+            RANGE="$RANGE and $WIN"
+          fi
           N=$(printf '%s\n' "$COMMITS" | grep -c . || true)
           echo "checking $N commit(s) in $RANGE"
           reg_principals=$(awk '!/^[[:space:]]*(#|$)/ {print $1}' "$ASF")
