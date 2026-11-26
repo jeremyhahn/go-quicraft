@@ -88,7 +88,23 @@ func TestScansCheckoutsDropCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, step := range checkoutsWithoutPersistFalse(string(b)) {
+	// The one exception: the bump job deletes its merged branch with
+	// git push, so its checkout keeps the credentials that push uses.
+	// Every other job's checkout must drop them.
+	before, bump, ok := strings.Cut(string(b), "\n  bump:\n")
+	if !ok {
+		t.Fatal("scans.yml has no bump job")
+	}
+	// Jobs after bump, if any, are checked too.
+	rest := ""
+	for _, l := range strings.Split(bump, "\n") {
+		if len(l) > 2 && strings.HasPrefix(l, "  ") && l[2] != ' ' && l[2] != '#' {
+			_, rest, _ = strings.Cut(bump, "\n"+l+"\n")
+			rest = l + "\n" + rest
+			break
+		}
+	}
+	for _, step := range checkoutsWithoutPersistFalse(before + "\n" + rest) {
 		t.Errorf("scans.yml: %s keeps its credentials", step)
 	}
 }
