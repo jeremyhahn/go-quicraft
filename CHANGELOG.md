@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- contrib/dragonboat (#1240): `SnapshotOption.Validate`, and so `SyncRequestSnapshot` and `RequestSnapshot`, now refuse any non-zero `CompactionIndex` with `*CompactionIndexNotSupportedError` (`errors.Is` `ErrInvalidOption`), as documented, instead of silently ignoring it. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

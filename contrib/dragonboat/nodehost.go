@@ -232,16 +232,12 @@ type SnapshotOption struct {
 	Exported bool
 }
 
-// Validate checks that the SnapshotOption fields are consistent and
-// valid. CompactionOverhead and CompactionIndex are mutually exclusive:
-// setting both is an error. Additionally, setting CompactionIndex when
-// OverrideCompactionOverhead is true is always rejected because quicraft
-// does not support index-based compaction.
+// Validate checks that the SnapshotOption fields are valid. Any non-zero
+// CompactionIndex is refused with *CompactionIndexNotSupportedError
+// (errors.Is ErrInvalidOption), whatever the other fields hold, because
+// quicraft does not support index-based compaction.
 func (o SnapshotOption) Validate() error {
-	if o.CompactionOverhead > 0 && o.CompactionIndex > 0 {
-		return &CompactionIndexNotSupportedError{}
-	}
-	if o.OverrideCompactionOverhead && o.CompactionIndex > 0 {
+	if o.CompactionIndex > 0 {
 		return &CompactionIndexNotSupportedError{}
 	}
 	return nil
