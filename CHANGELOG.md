@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/api-check.sh` now exits 2 when `go list` cannot list a module's packages at the base or the working tree, instead of reporting the API compatible (#1253).
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
