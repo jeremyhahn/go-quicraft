@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Transport (#1241): removing a dead outbound connection is now compare-and-delete against the connection the caller observed, and only that connection's streams are evicted. A caller that saw a connection fail after a concurrent sender had already re-dialed no longer drops the live replacement from the pool unclosed (where it held a peer inbound slot until stop) or closes the replacement's fresh streams.
 - Snapshot recovery on a basic `sm.StateMachine` (#1238) now excludes `Lookup`, `NALookup` and `GetHash`, as `Apply` already does, so a state machine without its own locking no longer sees a read run beside the recovery that replaces its state. Locking on the concurrent and on-disk tiers is unchanged.
 - `BarrierConfig.RequireFIPS` now requires the FIPS 140-3 module to be active (`crypto/fips140.Enabled()`); a `GOFIPS140` value in the run-time environment no longer satisfies it, and `Validate`/`NewBarrier` return `ErrFIPSUnavailable`. KDF and cipher restrictions still honour `GOFIPS140`.
+- Snapshot recovery (#1249): recovery from a snapshot record without a file path now reads only the snapshot directory at the recorded index and refuses with `ErrSnapshotNotFound` when that directory is missing, instead of restoring from the newest directory on disk. No wire or format change.
 
 ## [1.0.0-rc.1] - 2026-11-25
 
