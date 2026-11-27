@@ -4,4 +4,4 @@
 # and, from v1.0.0-rc.1 on, bump WireVersion in the same release when it moves.
 version 1
 derivation encoded-fixtures
-sha256 32334b003809b2c637c1c3ea145143b3beae1b5d6a6cc9e10fe9d9016bb90fc7
+sha256 b2e071a1535b64b0dd1ce84ad955e96f16ba4cf371669fd97406c53924c299d8

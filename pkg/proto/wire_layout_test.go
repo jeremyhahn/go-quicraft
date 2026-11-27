@@ -57,21 +57,25 @@ func wireFingerprintFixtures() []wireFixture {
 			MaxTotalSessions:           base + 4,
 			MaxResponsesPerSession:     base + 5,
 			MaxSessionsPerOwner:        base + 6,
-			WireVersion:                WireVersion,
-			Addresses:                  map[uint64]string{base + 11: "addr-a:1", base + 12: "addr-b:2"},
-			Observers:                  map[uint64]string{base + 13: "obs-c:3"},
-			Witnesses:                  map[uint64]string{base + 14: "wit-d:4"},
-			Removed:                    map[uint64]bool{base + 15: true},
-			Identities:                 map[uint64]string{base + 11: "id-a", base + 12: "id-b"},
-			RemovedIdentities:          map[uint64]string{base + 15: "id-e"},
+			// Synthetic, never 0 or 1: a version equal to a boolean's
+			// encoding would hide a swap with RequireFullReplicaMajority.
+			// The fixture is never decoded, so no version gate applies.
+			WireVersion:       base + 7,
+			Addresses:         map[uint64]string{base + 11: fmt.Sprintf("addr-a-%d:1", base), base + 12: fmt.Sprintf("addr-b-%d:2", base)},
+			Observers:         map[uint64]string{base + 13: fmt.Sprintf("obs-c-%d:3", base)},
+			Witnesses:         map[uint64]string{base + 14: fmt.Sprintf("wit-d-%d:4", base)},
+			Removed:           map[uint64]bool{base + 15: true},
+			Identities:        map[uint64]string{base + 11: fmt.Sprintf("id-a-%d", base), base + 12: fmt.Sprintf("id-b-%d", base)},
+			RemovedIdentities: map[uint64]string{base + 15: fmt.Sprintf("id-e-%d", base)},
 		}
 	}
 	batch := &MessageBatch{
-		BinVer:       WireVersion,
-		DeploymentID: 101,
-		SourceEpoch:  102,
-		// Distinct from BinVer so a swap of their encoder offsets moves the
+		// Synthetic versions, distinct from each other and from every
+		// boolean encoding, so a swap of any two of these offsets moves the
 		// fingerprint; the fixture is never decoded against a window.
+		BinVer:        7,
+		DeploymentID:  101,
+		SourceEpoch:   102,
 		MaxBinVer:     103,
 		SourceAddress: "source:9",
 		Requests: []Message{{
@@ -99,7 +103,7 @@ func wireFingerprintFixtures() []wireFixture {
 				Compression: 4,
 			},
 			Entries: []Entry{
-				{Term: 131, Index: 132, Type: EntryConfigChange, Key: 133, ClientID: 134,
+				{Term: 131, Index: 132, Type: EntryEncodedEntry, Key: 133, ClientID: 134,
 					SeriesID: 135, RespondedTo: 136, OwnerID: 137, Cmd: []byte("cmd-one")},
 				{Term: 141, Index: 142, Type: EntryEncodedEntry | EntryCompressFlag, Key: 143, ClientID: 144,
 					SeriesID: 145, RespondedTo: 146, OwnerID: 147, Cmd: []byte("cmd-two")},
@@ -130,7 +134,7 @@ func wireFingerprintFixtures() []wireFixture {
 		Membership:   membership(400),
 		OnDiskIndex:  313,
 		DeploymentID: 314,
-		BinVer:       WireVersion,
+		BinVer:       9, // synthetic; distinct from HasFileInfo's encoding
 		Epoch:        315,
 		Data:         data,
 	}
@@ -184,22 +188,37 @@ func TestWireFingerprintFixturesComplete(t *testing.T) {
 	excluded := map[string]string{
 		"Message.Origin": "never crosses the wire; set only on the receive or inject path",
 	}
-	// Serialized and pinned to WireVersion, so exempt from the distinctness
-	// map, but at most one pinned field per struct type: MaxBinVer is not
-	// pinned, so it must differ from BinVer and a swap of their encoder
-	// offsets moves the fingerprint.
-	pinned := map[string]string{
-		"MessageBatch.BinVer":    "senders stamp WireVersion",
-		"SnapshotChunk.BinVer":   "receivers require exact WireVersion equality",
-		"Membership.WireVersion": "the committed shard transport version",
+	// Every encoded leaf, whatever its kind, holds a value no other leaf
+	// holds, so a swap of any two encoder offsets moves the fingerprint.
+	// Version fields get no exemption: they carry synthetic values. A true
+	// boolean encodes as the integer 1, so it is compared with the
+	// integers; two booleans may share that encoding only when they sit in
+	// different structs, where no single encoder can swap them.
+	type numLeaf struct {
+		path, owner string
+		isBool      bool
 	}
-	leaves := make(map[uint64]string)
-	pinnedIn := make(map[string]string) // struct type -> its pinned field
-	var walk func(path string, v reflect.Value)
-	walk = func(path string, v reflect.Value) {
+	nums := make(map[uint64]numLeaf)
+	strs := make(map[string]string)
+	addNum := func(path, owner string, v uint64, isBool bool) {
+		if prev, dup := nums[v]; dup && (!isBool || !prev.isBool || prev.owner == owner) {
+			t.Errorf("%s and %s both encode %d", prev.path, path, v)
+			return
+		}
+		nums[v] = numLeaf{path, owner, isBool}
+	}
+	addStr := func(path, s string) {
+		if prev, dup := strs[s]; dup {
+			t.Errorf("%s and %s both hold %q", prev, path, s)
+			return
+		}
+		strs[s] = path
+	}
+	var walk func(path, owner string, v reflect.Value)
+	walk = func(path, owner string, v reflect.Value) {
 		switch v.Kind() {
 		case reflect.Pointer:
-			walk(path, v.Elem())
+			walk(path, owner, v.Elem())
 		case reflect.Struct:
 			typ := v.Type()
 			for i := range typ.NumField() {
@@ -220,40 +239,38 @@ func TestWireFingerprintFixturesComplete(t *testing.T) {
 					t.Errorf("%s: zero; every serialized field must be set", fpath)
 					continue
 				}
-				if fv.Kind() == reflect.Uint64 {
-					if _, ok := pinned[key]; ok {
-						if fv.Uint() != WireVersion {
-							t.Errorf("%s = %d, want WireVersion", fpath, fv.Uint())
-						}
-						if prev, ok := pinnedIn[typ.Name()]; ok && prev != key {
-							t.Errorf("%s and %s are both pinned to WireVersion in one struct", prev, key)
-						}
-						pinnedIn[typ.Name()] = key
-						continue
-					}
-					if prev, dup := leaves[fv.Uint()]; dup {
-						t.Errorf("%s and %s both hold %d", prev, fpath, fv.Uint())
-					}
-					leaves[fv.Uint()] = fpath
-					continue
-				}
-				walk(fpath, fv)
+				walk(fpath, path, fv)
 			}
+		case reflect.Bool:
+			if !v.Bool() {
+				t.Errorf("%s: false; a set boolean must be true", path)
+				return
+			}
+			addNum(path, owner, 1, true)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			addNum(path, owner, v.Uint(), false)
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			addNum(path, owner, uint64(v.Int()), false)
+		case reflect.String:
+			addStr(path, v.String())
 		case reflect.Slice:
 			if v.Type().Elem().Kind() == reflect.Uint8 {
+				addStr(path, string(v.Bytes()))
 				return
 			}
 			for i := range v.Len() {
-				walk(fmt.Sprintf("%s[%d]", path, i), v.Index(i))
+				walk(fmt.Sprintf("%s[%d]", path, i), path, v.Index(i))
 			}
 		case reflect.Map:
 			for _, k := range v.MapKeys() {
-				walk(fmt.Sprintf("%s[%v]", path, k), v.MapIndex(k))
+				walk(fmt.Sprintf("%s[%v]", path, k), path, v.MapIndex(k))
 			}
+		default:
+			t.Errorf("%s: unhandled kind %s", path, v.Kind())
 		}
 	}
 	for _, f := range wireFingerprintFixtures() {
-		walk(f.name, reflect.ValueOf(f.value))
+		walk(f.name, "", reflect.ValueOf(f.value))
 	}
 }
 
