@@ -412,6 +412,70 @@ func TestImportSnapshot_RetryWithMalformedArtifactIsRefused(t *testing.T) {
 	}
 }
 
+// TestImportSnapshot_RetryWithDifferentPayloadIsRefused: a retry whose
+// header matches the recorded snapshot (Index, Term, OnDiskIndex,
+// membership) but whose payload differs, with a valid trailer of its own, is
+// a different artifact. Completing it would report success for a restore
+// whose bytes were never adopted; it is refused, the floor stays where it
+// was, and the retry of the recorded artifact still completes.
+func TestImportSnapshot_RetryWithDifferentPayloadIsRefused(t *testing.T) {
+	const index uint64 = 900
+	artifact := func(payload string) []byte {
+		return buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+			snapshotEnvelope([]byte(payload)))
+	}
+	f := newImportRetryFixture(t, index, artifact("DISASTER-RECOVERY-RESTORE"))
+
+	err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact("A-DIFFERENT-RESTORE-PAYLOAD")))
+	var outOfDate *ImportSnapshotOutOfDateError
+	if !errors.As(err, &outOfDate) {
+		t.Fatalf("retry with a different payload = %v, want *ImportSnapshotOutOfDateError", err)
+	}
+	f.requireFloorUntouched(t)
+
+	if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact("DISASTER-RECOVERY-RESTORE"))); err != nil {
+		t.Fatalf("retry with the recorded artifact after the refusal: %v", err)
+	}
+}
+
+// TestImportSnapshot_RetryWithEmptyEntryRangeCompletes: the pending floor
+// advance is recorded explicitly, not inferred from the log. A shard whose
+// log holds no entry at all (bootstrap only) still has a floor advance
+// pending after RemoveEntriesTo fails, and the identical retry completes it.
+func TestImportSnapshot_RetryWithEmptyEntryRangeCompletes(t *testing.T) {
+	const index uint64 = 900
+	real := memdb.New()
+	db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	if bsErr := real.SaveBootstrap(importRetryShard, importRetryReplica, logdb.Bootstrap{
+		Addresses: map[uint64]string{importRetryReplica: "127.0.0.1:5000"},
+	}); bsErr != nil {
+		t.Fatalf("SaveBootstrap failed: %v", bsErr)
+	}
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+
+	firstErr := h.ImportSnapshot(context.Background(), importRetryShard, bytes.NewReader(artifact))
+	if !errors.Is(firstErr, errImportTransient) {
+		t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+	}
+	if err := h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact)); err != nil {
+		t.Fatalf("retry with an empty entry range was refused: %v", err)
+	}
+	err = h.ImportSnapshot(context.Background(), importRetryShard, bytes.NewReader(artifact))
+	var outOfDate *ImportSnapshotOutOfDateError
+	if !errors.As(err, &outOfDate) {
+		t.Fatalf("re-import after the completed retry = %v, want *ImportSnapshotOutOfDateError", err)
+	}
+}
+
 // TestImportSnapshot_PostPublishFailuresRollBackThePublish covers the other two
 // error paths after the rename — the directory-chain fsync and the
 // context check — through the injected filesystem, and asserts the same
