@@ -23,9 +23,11 @@ func TestReleaseWireGateFetchesItsBaseline(t *testing.T) {
 			for _, sc := range []struct {
 				name, localTag string
 				// pruneTags sets these git config keys to true in the fixture
-				// clone. With either, git adds refs/tags/*:refs/tags/* to a
-				// pruning fetch even under --no-tags, so the baseline fetch
-				// would delete every local-only tag.
+				// clone. git adds refs/tags/*:refs/tags/* to a pruning fetch
+				// only when no refspec is named on the command line (the
+				// baseline fetches always name one, and also turn tag pruning
+				// off), so the local-only tag must survive the gate; a
+				// refspec-less fetch afterwards proves the config is live.
 				pruneTags []string
 			}{
 				{"remote-only baseline is used", "", nil},
@@ -76,6 +78,12 @@ func TestReleaseWireGateFetchesItsBaseline(t *testing.T) {
 					if sc.localTag != "" {
 						if got := strings.TrimSpace(f.git("tag", "-l", sc.localTag)); got != sc.localTag {
 							t.Errorf("local-only tag %s was deleted by the baseline fetch (config %v)", sc.localTag, sc.pruneTags)
+						}
+					}
+					if len(sc.pruneTags) > 0 {
+						f.git("fetch", "--quiet", "--no-tags", fixtureRemote)
+						if got := strings.TrimSpace(f.git("tag", "-l", sc.localTag)); got != "" {
+							t.Errorf("config %v did not make a refspec-less fetch prune local-only tag %s; the case above proves nothing", sc.pruneTags, sc.localTag)
 						}
 					}
 				})
