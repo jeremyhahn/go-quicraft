@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Transport (#1241): removing a dead outbound connection is now compare-and-delete against the connection the caller observed, and only that connection's streams are evicted. A caller that saw a connection fail after a concurrent sender had already re-dialed no longer drops the live replacement from the pool unclosed (where it held a peer inbound slot until stop) or closes the replacement's fresh streams.
 - seal: `Rotate` now refuses with `ErrKnownEpochsExhausted`, persisting
   nothing, once the known-epoch set names `MaxKnownEpochs` epochs, so the
   restart rotation can no longer write a sealed blob that `SetSealedRootKey`
