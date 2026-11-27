@@ -22,7 +22,7 @@ set -euo pipefail
 
 golden=pkg/proto/testdata/wire_layout.golden
 migration_from=fbdf0062f194b1a5a23a19f06cf316c4193fcaacd5313f31d175ea347662b899
-migration_to=32334b003809b2c637c1c3ea145143b3beae1b5d6a6cc9e10fe9d9016bb90fc7
+migration_to=b2e071a1535b64b0dd1ce84ad955e96f16ba4cf371669fd97406c53924c299d8
 
 if [ $# -ne 1 ] || [ -z "$1" ]; then
 	echo "usage: $0 <last-release-tag>" >&2
