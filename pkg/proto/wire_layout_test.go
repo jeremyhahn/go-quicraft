@@ -407,6 +407,15 @@ func TestWireFingerprintCatchesEncodingOnlyChange(t *testing.T) {
 			// Epoch (315).
 			return swapWireRange(b, wireUint64Offset(b, 310)+8, wireUint64Offset(b, 315)-8, 8)
 		}},
+		{"swap Message Reject and HasSnapshot", func(name string, b []byte) []byte {
+			if name != "Message" {
+				return b
+			}
+			// Reject precedes Hint (519); with no entries, HasSnapshot
+			// follows Hint and the 4-byte entries count.
+			h := wireUint64Offset(b, 519)
+			return swapWireRange(b, h-8, h+12, 8)
+		}},
 	}
 	for _, m := range mutations {
 		got := wireFingerprintWith(m.mutate)
