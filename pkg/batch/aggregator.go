@@ -252,6 +252,13 @@ type Aggregator struct {
 	shardMu   sync.Mutex
 	shardHeld map[uint64][][]*proposal
 	shardWG   sync.WaitGroup
+	// shardPending counts, per shard, the proposals admitted by submit whose
+	// result flushShard has not yet delivered: queued, in the current batch,
+	// held behind a busy shard, or in flight. submit refuses a shard already
+	// at QueueSize, so a shard whose propose stalls hits QueueFullError
+	// instead of accumulating held batches without bound, while every other
+	// shard keeps its own budget. Protected by shardMu.
+	shardPending map[uint64]int
 
 	// Metrics.
 	metrics     *aggregatorMetrics
@@ -269,13 +276,14 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 	}
 
 	a := &Aggregator{
-		cfg:       DefaultConfig(),
-		proposer:  proposer,
-		logger:    slog.Default(),
-		registry:  prometheus.DefaultRegisterer,
-		closeChan: make(chan struct{}),
-		flushDone: make(chan struct{}),
-		shardHeld: make(map[uint64][][]*proposal),
+		cfg:          DefaultConfig(),
+		proposer:     proposer,
+		logger:       slog.Default(),
+		registry:     prometheus.DefaultRegisterer,
+		closeChan:    make(chan struct{}),
+		flushDone:    make(chan struct{}),
+		shardHeld:    make(map[uint64][][]*proposal),
+		shardPending: make(map[uint64]int),
 	}
 	a.lifetimeCtx, a.lifetimeCancel = context.WithCancel(context.Background())
 
@@ -358,14 +366,35 @@ func (a *Aggregator) submit(ctx context.Context, shardID uint64, data []byte) er
 		resultCh: make(chan error, 1),
 	}
 
+	a.shardMu.Lock()
+	if a.shardPending[shardID] >= a.cfg.QueueSize {
+		a.shardMu.Unlock()
+		return &QueueFullError{QueueSize: a.cfg.QueueSize}
+	}
+	a.shardPending[shardID]++
+	a.shardMu.Unlock()
+
 	select {
 	case a.queue <- p:
 		a.metrics.queueDepth.Set(float64(len(a.queue)))
 	default:
+		a.releasePending(shardID, 1)
 		return &QueueFullError{QueueSize: a.cfg.QueueSize}
 	}
 
 	return a.awaitResult(ctx, p)
+}
+
+// releasePending returns n admitted proposals of shardID to the shard's
+// budget, deleting the key once the shard has none outstanding.
+func (a *Aggregator) releasePending(shardID uint64, n int) {
+	a.shardMu.Lock()
+	if left := a.shardPending[shardID] - n; left > 0 {
+		a.shardPending[shardID] = left
+	} else {
+		delete(a.shardPending, shardID)
+	}
+	a.shardMu.Unlock()
 }
 
 // awaitResult blocks until p's batch reports a result, the caller's context
@@ -651,6 +680,18 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	// replica applied it. Encode only the survivors.
 	live := a.rejectAbandoned(shardID, proposals)
 	batchLen := len(live)
+
+	// Every proposal of the batch receives exactly one result: the abandoned
+	// ones above, the live ones through finish. Each returns its slot in the
+	// shard's admission budget BEFORE its caller is woken, so a caller that
+	// resubmits at once is not refused for a slot it already gave back.
+	a.releasePending(shardID, len(proposals)-batchLen)
+	finish := func(err error) {
+		a.releasePending(shardID, batchLen)
+		for _, p := range live {
+			p.resultCh <- err
+		}
+	}
 	if batchLen == 0 {
 		// Nobody is left to receive a result, and proposing anyway would
 		// replicate a batch whose outcome no one observes while occupying the
@@ -678,9 +719,7 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 			slog.String("error", encErr.Error()),
 		)
 		flushErr := &FlushError{ShardID: shardID, Err: encErr, Indeterminate: false}
-		for _, p := range live {
-			p.resultCh <- flushErr
-		}
+		finish(flushErr)
 		return
 	}
 
@@ -691,9 +730,7 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	if !ok {
 		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
 		flushErr := &FlushError{ShardID: shardID, Err: context.Canceled, Indeterminate: false}
-		for _, p := range live {
-			p.resultCh <- flushErr
-		}
+		finish(flushErr)
 		return
 	}
 	defer cancel()
@@ -721,17 +758,13 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 			slog.String("error", err.Error()),
 		)
 		flushErr := &FlushError{ShardID: shardID, Err: err, Indeterminate: indeterminate}
-		for _, p := range live {
-			p.resultCh <- flushErr
-		}
+		finish(flushErr)
 		return
 	}
 
 	a.metrics.batchesTotal.WithLabelValues(shardLabel, "success").Inc()
 
-	for _, p := range live {
-		p.resultCh <- nil
-	}
+	finish(nil)
 }
 
 // rejectAbandoned returns the proposals whose callers are still waiting, and
