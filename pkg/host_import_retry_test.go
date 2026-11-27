@@ -476,6 +476,153 @@ func TestImportSnapshot_RetryWithEmptyEntryRangeCompletes(t *testing.T) {
 	}
 }
 
+// TestImportSnapshot_CleanupFailureAfterDurableFloorSucceeds covers the step
+// after the log floor has advanced durably: removing the floor-pending marker
+// and fsyncing the snapshot directory. A failure there must not fail the
+// import. Once the marker is gone a retry has nothing left to complete and is
+// refused as out of date, so an error at this point would report a completed
+// import as failed with no way to make it succeed.
+func TestImportSnapshot_CleanupFailureAfterDurableFloorSucceeds(t *testing.T) {
+	const index uint64 = 900
+	tests := []struct {
+		name string
+		// failRemove selects the operation that fails: the marker's removal
+		// itself, or the directory fsync that follows it.
+		failRemove bool
+	}{
+		{name: "marker removal fails", failRemove: true},
+		{name: "final directory fsync fails", failRemove: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testHostConfig(t)
+			db := memdb.New()
+			cfs := newCrashFS(cfg.NodeHostDir)
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs), WithoutEncryption())
+			if err != nil {
+				t.Fatalf("NewHost failed: %v", err)
+			}
+			t.Cleanup(func() { _ = h.Close() })
+			if bsErr := db.SaveBootstrap(importRetryShard, importRetryReplica, logdb.Bootstrap{
+				Addresses: map[uint64]string{importRetryReplica: "127.0.0.1:5000"},
+			}); bsErr != nil {
+				t.Fatalf("SaveBootstrap failed: %v", bsErr)
+			}
+			if seedErr := db.SaveState([]logdb.Update{{
+				ShardID:   importRetryShard,
+				ReplicaID: importRetryReplica,
+				Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+			}}); seedErr != nil {
+				t.Fatalf("seed bootstrap entry: %v", seedErr)
+			}
+			base := shardSnapshotBaseDir(cfg.NodeHostDir, "", importRetryShard)
+			snapDir := engine.SnapshotSaveDir(base, importRetryShard, importRetryReplica, index)
+			marker := filepath.Join(snapDir, importFloorPendingFile)
+
+			removed := false
+			cfs.setHook(func(op crashOp, path string) error {
+				switch {
+				case op == opRemove && path == marker:
+					if tt.failRemove {
+						return errImportTransient
+					}
+					removed = true
+				case op == opDirSync && path == snapDir && removed:
+					return errImportTransient
+				}
+				return nil
+			})
+			artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+				snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+			if err := h.ImportSnapshot(context.Background(), importRetryShard,
+				bytes.NewReader(artifact)); err != nil {
+				t.Fatalf("ImportSnapshot with a cleanup failure after the durable floor "+
+					"advance = %v, want nil", err)
+			}
+			cfs.setHook(nil)
+			first, count, rangeErr := db.EntryRange(importRetryShard, importRetryReplica)
+			if rangeErr != nil {
+				t.Fatalf("EntryRange: %v", rangeErr)
+			}
+			if count != 0 && first <= index {
+				t.Fatalf("EntryRange = (first=%d, count=%d): the floor did not advance "+
+					"past %d", first, count, index)
+			}
+		})
+	}
+}
+
+// TestImportSnapshot_RetryWithChangedLayoutIsRefused retries an import whose
+// floor advance failed with layout options that contradict the recorded
+// snapshot directory. The retry must be refused exactly as a fresh import
+// with those options is, and must not advance the floor.
+func TestImportSnapshot_RetryWithChangedLayoutIsRefused(t *testing.T) {
+	const index uint64 = 900
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+
+	t.Run("with bootstrap metadata", func(t *testing.T) {
+		f := newImportRetryFixture(t, index, artifact)
+		err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(t.TempDir()))
+		var mismatch *ImportDataDirMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("retry with a contradictory WithImportDataDir = %v, "+
+				"want *ImportDataDirMismatchError", err)
+		}
+		f.requireFloorUntouched(t)
+		if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact)); err != nil {
+			t.Fatalf("retry with the recorded layout = %v, want nil", err)
+		}
+	})
+
+	t.Run("without bootstrap metadata", func(t *testing.T) {
+		real := memdb.New()
+		db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+		h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost failed: %v", err)
+		}
+		t.Cleanup(func() { _ = h.Close() })
+		if seedErr := real.SaveState([]logdb.Update{{
+			ShardID:   importRetryShard,
+			ReplicaID: importRetryReplica,
+			Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+		}}); seedErr != nil {
+			t.Fatalf("seed entry: %v", seedErr)
+		}
+		f := &importRetryFixture{h: h, real: real, index: index}
+		recordedDir := t.TempDir()
+		firstErr := h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(recordedDir))
+		if !errors.Is(firstErr, errImportTransient) {
+			t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+		}
+
+		err = h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(t.TempDir()))
+		var mismatch *ImportDataDirMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("retry with a contradictory WithImportDataDir = %v, "+
+				"want *ImportDataDirMismatchError", err)
+		}
+		f.requireFloorUntouched(t)
+
+		err = h.ImportSnapshot(context.Background(), importRetryShard, bytes.NewReader(artifact))
+		var unknown *ImportLayoutUnknownError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("retry without WithImportDataDir = %v, want *ImportLayoutUnknownError", err)
+		}
+		f.requireFloorUntouched(t)
+
+		if err := h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(recordedDir)); err != nil {
+			t.Fatalf("retry with the recorded layout = %v, want nil", err)
+		}
+	})
+}
+
 // TestImportSnapshot_PostPublishFailuresRollBackThePublish covers the other two
 // error paths after the rename — the directory-chain fsync and the
 // context check — through the injected filesystem, and asserts the same
