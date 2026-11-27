@@ -681,6 +681,25 @@ func (t *QUICTransport) recordProtocolViolation(msg string, conn *quic.Conn, err
 	)
 }
 
+// reportWireVersionRefused hands a frame or batch refused for its version
+// (*FrameVersionError, *proto.BatchVersionError) to Config.OnWireVersionRefused.
+// Any other error, or a nil callback, is ignored. The callback runs through
+// supervise.LogContained: off the receive goroutine, so it never delays the
+// stream's teardown, and contained, so its panic cannot reach the caller.
+func (t *QUICTransport) reportWireVersionRefused(conn *quic.Conn, err error) {
+	cb := t.cfg.OnWireVersionRefused
+	if cb == nil {
+		return
+	}
+	var frameErr *FrameVersionError
+	var batchErr *proto.BatchVersionError
+	if !errors.As(err, &frameErr) && !errors.As(err, &batchErr) {
+		return
+	}
+	remote := remoteAddrOf(conn)
+	supervise.LogContained(func() { cb(remote, err) })
+}
+
 // isProtocolViolation reports whether err indicates a peer that is speaking a
 // protocol this node cannot accept, as opposed to a transient transport error.
 func isProtocolViolation(err error) bool {
@@ -762,6 +781,7 @@ func (t *QUICTransport) readFrameHeaderResilient(conn *quic.Conn, stream *quic.S
 	}
 
 	if verr := ValidateFrameHeaderWindow(header[:], t.cfg.Wire); verr != nil {
+		t.reportWireVersionRefused(conn, verr)
 		return 0, FlagNone, verr
 	}
 	return binary.BigEndian.Uint32(header[4:8]), FrameFlags(header[3]), nil
@@ -985,6 +1005,7 @@ func (t *QUICTransport) handleMessageFrame(inboundConn *quic.Conn, stream io.Rea
 
 	batch := batchPool.Get().(*proto.MessageBatch)
 	if _, err := batch.UnmarshalFromWindow(payload, t.cfg.Wire.Proto); err != nil {
+		t.reportWireVersionRefused(inboundConn, err)
 		batch.Reset()
 		batchPool.Put(batch)
 		if buf != nil {

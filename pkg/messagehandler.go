@@ -66,6 +66,13 @@ type hostMessageHandler struct {
 	wireRefusals sync.Map
 	wireRefused  atomic.Int64
 
+	// recvRefusals holds the last *WireVersionMismatchError per remote
+	// address for traffic the transport refused before the batch was parsed
+	// (transport.Config.OnWireVersionRefused), so each is logged once per
+	// change of the peer's versions. recvRefused bounds its entries.
+	recvRefusals sync.Map
+	recvRefused  atomic.Int64
+
 	// inflightSnapshotRecv serializes concurrent HandleSnapshot calls for the
 	// same (shard, replica, index). The snapshot directory is deterministic
 	// per index and the dedup guard only consults LogDB — which is written
@@ -277,6 +284,73 @@ func (h *hostMessageHandler) wireRefusal(shardID uint64) *WireVersionMismatchErr
 		if k.(wireRefusalKey).shardID != shardID {
 			return true
 		}
+		refusal = v.(*WireVersionMismatchError)
+		return false
+	})
+	return refusal
+}
+
+// maxRecvRefusals bounds recvRefusals: past it a refusal from a new remote
+// address is not recorded or logged here (the transport still counts it as a
+// protocol violation), so a flood of addresses cannot grow the map.
+const maxRecvRefusals = 1024
+
+// refuseReceivedWireVersion is the host's transport.Config.OnWireVersionRefused:
+// the transport refused a frame (*transport.FrameVersionError) or a batch
+// (*proto.BatchVersionError) from remote because its version is outside this
+// host's window, before any message reached HandleMessage. It records the
+// refusal as a *WireVersionMismatchError naming both sides' versions and
+// logs it once per (remote, advertised versions), as refuseWireVersion does
+// for refusals at the Raft layer.
+func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error) {
+	refusal := &WireVersionMismatchError{Source: remote, Local: proto.DefaultWireWindow()}
+	if h.host != nil {
+		refusal.Local = h.host.WireWindow()
+	}
+	var frameErr *transport.FrameVersionError
+	var batchErr *proto.BatchVersionError
+	switch {
+	case errors.As(err, &frameErr):
+		refusal.Frame = true
+		refusal.PeerFrameVersion = frameErr.Found
+		refusal.LocalFrameCurrent = frameErr.Current
+		refusal.LocalFramePrevious = frameErr.Previous
+	case errors.As(err, &batchErr):
+		refusal.PeerBinVer = batchErr.BinVer
+		refusal.PeerMaxBinVer = batchErr.MaxBinVer
+		refusal.Local = batchErr.Local
+	default:
+		return
+	}
+	if prev, ok := h.recvRefusals.Load(remote); ok {
+		if *prev.(*WireVersionMismatchError) == *refusal {
+			return
+		}
+		h.recvRefusals.Store(remote, refusal)
+	} else {
+		if h.recvRefused.Add(1) > maxRecvRefusals {
+			h.recvRefused.Add(-1)
+			return
+		}
+		if prev, loaded := h.recvRefusals.LoadOrStore(remote, refusal); loaded {
+			h.recvRefused.Add(-1)
+			if *prev.(*WireVersionMismatchError) == *refusal {
+				return
+			}
+			h.recvRefusals.Store(remote, refusal)
+		}
+	}
+	slog.Warn("refused inbound traffic: peer wire version outside this host's window",
+		"source", remote,
+		"error", refusal,
+	)
+}
+
+// receiveWireRefusal returns a refusal recorded by refuseReceivedWireVersion,
+// or nil.
+func (h *hostMessageHandler) receiveWireRefusal() *WireVersionMismatchError {
+	var refusal *WireVersionMismatchError
+	h.recvRefusals.Range(func(_, v any) bool {
 		refusal = v.(*WireVersionMismatchError)
 		return false
 	})

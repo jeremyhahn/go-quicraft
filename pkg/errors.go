@@ -1361,10 +1361,32 @@ type WireVersionMismatchError struct {
 	PeerMaxBinVer uint64
 	// Local is this host's wire window.
 	Local proto.WireWindow
+
+	// Source is the remote address of the connection the refused traffic
+	// arrived on, set when the transport refused it before the batch was
+	// parsed; ShardID and From are then zero.
+	Source string
+	// Frame is true when the refusal was of the frame header's version, not
+	// the batch's: PeerFrameVersion is the version the peer sent and
+	// LocalFrameCurrent/LocalFramePrevious are this host's frame window.
+	Frame              bool
+	PeerFrameVersion   uint8
+	LocalFrameCurrent  uint8
+	LocalFramePrevious uint8
 }
 
 // Error names both sides' versions.
 func (e *WireVersionMismatchError) Error() string {
+	if e.Frame {
+		return fmt.Sprintf("quicraft: peer %s speaks frame version %d, "+
+			"outside this host's frame window {current %d, previous %d}",
+			e.Source, e.PeerFrameVersion, e.LocalFrameCurrent, e.LocalFramePrevious)
+	}
+	if e.Source != "" && e.ShardID == 0 && e.From == 0 {
+		return fmt.Sprintf("quicraft: peer %s speaks wire version %d (reads up to %d), "+
+			"outside this host's wire window {current %d, previous %d}",
+			e.Source, e.PeerBinVer, e.PeerMaxBinVer, e.Local.Current, e.Local.Previous)
+	}
 	return fmt.Sprintf("quicraft: shard %d replica %d speaks wire version %d (reads up to %d), "+
 		"outside this host's wire window {current %d, previous %d}",
 		e.ShardID, e.From, e.PeerBinVer, e.PeerMaxBinVer, e.Local.Current, e.Local.Previous)

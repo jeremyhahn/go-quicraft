@@ -131,7 +131,7 @@ func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, erro
 	// never persisted, so a rejection costs one connection rather than
 	// stranding data at rest.
 	if !w.Accepts(mb.BinVer) {
-		return 0, ErrUnsupportedVersion
+		return 0, &BatchVersionError{BinVer: mb.BinVer, MaxBinVer: getUint64(buf[24:]), Local: w}
 	}
 	mb.DeploymentID = getUint64(buf[8:])
 	mb.SourceEpoch = getUint64(buf[16:])

@@ -444,6 +444,16 @@ type Config struct {
 	// address also satisfies. Nil disables pinning; the host always sets it.
 	ReplicaIdentity func(shardID, replicaID uint64) string
 
+	// OnWireVersionRefused, when set, is told of every inbound frame or
+	// message batch refused because its version is outside Wire: remote is
+	// the connection's remote address and err is a *FrameVersionError or a
+	// *proto.BatchVersionError naming the peer's and the local versions. It
+	// is called in addition to the protocol-violation accounting, off the
+	// receive goroutine and panic-contained (supervise.LogContained), so a
+	// slow or panicking callback cannot hold or tear down a stream. Nil is a
+	// no-op.
+	OnWireVersionRefused func(remote string, err error)
+
 	// EventListener holds optional event callbacks for connection and
 	// snapshot lifecycle events. May be nil.
 	EventListener *config.EventListener

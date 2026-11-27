@@ -403,7 +403,7 @@ func TestValidateFrameHeaderVersionIsExact(t *testing.T) {
 func TestValidateFrameHeaderVersionErrorIsUnchanged(t *testing.T) {
 	header := [FrameHeaderSize]byte{MagicByte0, MagicByte1, WireVersion + 1, 0x00, 0, 0, 0, 10}
 	err := ValidateFrameHeader(header[:])
-	if err != ErrUnsupportedVersion {
+	if !errors.Is(err, ErrUnsupportedVersion) {
 		t.Fatalf("ValidateFrameHeader returned %v (%T), want the ErrUnsupportedVersion "+
 			"sentinel itself", err, err)
 	}

@@ -255,7 +255,7 @@ func ValidateFrameHeaderWindow(buf []byte, w WireWindow) error {
 	// pinning policy exists to prevent. A peer speaking any other dialect is
 	// refused outright rather than misparsed.
 	if !w.AcceptsFrame(buf[2]) {
-		return ErrUnsupportedVersion
+		return &FrameVersionError{Found: buf[2], Current: w.FrameCurrent, Previous: w.FramePrevious}
 	}
 	length := binary.BigEndian.Uint32(buf[4:8])
 	if length > MaxFrameSize {

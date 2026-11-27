@@ -3513,6 +3513,8 @@ type Host struct {
 	registry              *registry.Registry
 	sender                engine.MessageSender
 	transport             *transport.QUICTransport // nil when transport is disabled
+	// msgHandler is the handler installed on transport, nil without one.
+	msgHandler *hostMessageHandler
 	// dirLock is the exclusive lock on NodeHostDir (hostLockFileName),
 	// held from NewHost until Close.
 	dirLock     *fsutil.DirLock
@@ -4183,6 +4185,9 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		// Outbound traffic is held to the identity membership binds to the
 		// replica it is for, as inbound senders are (see replicaIdentity).
 		trCfg.ReplicaIdentity = msgHandler.replicaIdentity
+		// Frames and batches the transport refuses for their version never
+		// reach HandleMessage; the handler records and logs them by peer.
+		trCfg.OnWireVersionRefused = msgHandler.refuseReceivedWireVersion
 
 		var trErr error
 		tr, trErr = transport.NewQUICTransport(trCfg, msgHandler, reg)
@@ -4324,6 +4329,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 	// snapshot processing.
 	if msgHandler != nil {
 		msgHandler.host = h
+		h.msgHandler = msgHandler
 	}
 
 	// Wire the engine callback so applied entries and leader changes
