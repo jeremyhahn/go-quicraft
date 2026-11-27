@@ -786,6 +786,77 @@ func TestMembership_ValidateAdd_ConfigChangeIDBound(t *testing.T) {
 	}
 }
 
+// TestMembership_ValidateRemoveAndWitnessPolicy_ConfigChangeIDBound verifies
+// that RemoveNode and UpdateWitnessPolicy are refused on the leader's worker
+// when bound to a configuration other than the current one, exactly as the
+// add validators are: two removals bound to the same index must not both
+// commit, and two racing policy changes must not lose an update.
+func TestMembership_ValidateRemoveAndWitnessPolicy_ConfigChangeIDBound(t *testing.T) {
+	validators := []struct {
+		name     string
+		cc       proto.ConfigChange
+		validate func(*membership, proto.ConfigChange) error
+	}{
+		{"RemoveNode", proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 2}, validateRemoveNode},
+		{"UpdateWitnessPolicy", proto.ConfigChange{Type: proto.UpdateWitnessPolicy,
+			MaxWitnesses: 1, RequireFullReplicaMajority: true}, validateUpdateWitnessPolicy},
+	}
+	cases := []struct {
+		name      string
+		current   uint64
+		ccID      uint64
+		mustMatch bool
+		wantStale bool
+	}{
+		{"matching non-zero", 7, 7, false, false},
+		{"older non-zero", 7, 5, false, true},
+		{"newer non-zero", 7, 9, false, true},
+		{"unbound zero at non-zero", 7, 0, false, false},
+		{"bound zero at non-zero", 7, 0, true, true},
+		{"bound zero at zero", 0, 0, true, false},
+		{"unbound zero at zero", 0, 0, false, false},
+		{"bound non-zero at zero", 0, 3, true, true},
+	}
+	for _, v := range validators {
+		for _, tc := range cases {
+			t.Run(v.name+"/"+tc.name, func(t *testing.T) {
+				m := membershipWith(3, 0, 0, false)
+				m.configChangeID = tc.current
+				cc := v.cc
+				cc.ConfigChangeID = tc.ccID
+				cc.MustMatchConfigChangeID = tc.mustMatch
+				err := v.validate(m, cc)
+				if tc.wantStale {
+					if !errors.Is(err, ErrStaleConfigChange) {
+						t.Fatalf("validate = %v, want ErrStaleConfigChange", err)
+					}
+					var stale *StaleConfigChangeError
+					if !errors.As(err, &stale) || stale.Expected != tc.current || stale.Got != tc.ccID {
+						t.Fatalf("validate = %#v, want *StaleConfigChangeError{Expected: %d, Got: %d}",
+							err, tc.current, tc.ccID)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("validate = %v, want nil", err)
+				}
+			})
+		}
+	}
+
+	// Through the peer: a removal bound to a superseded index is refused.
+	t.Run("Peer/RemoveNode superseded", func(t *testing.T) {
+		p := newTestPeer(t, testConfig(), proto.State{}, proto.Membership{
+			ConfigChangeID: 12,
+			Addresses:      map[uint64]string{1: "addr1", 2: "addr2", 3: "addr3"},
+		})
+		cc := proto.ConfigChange{Type: proto.RemoveNode, ReplicaID: 3, ConfigChangeID: 10}
+		if err := p.ValidateConfigChange(cc); !errors.Is(err, ErrStaleConfigChange) {
+			t.Fatalf("ValidateConfigChange(remove bound to superseded index) = %v, want ErrStaleConfigChange", err)
+		}
+	})
+}
+
 // TestMembership_WitnessPolicy_RequireFullReplicaMajority verifies that the
 // default RequireFullReplicaMajority policy rejects a witness add that would
 // leave the full replicas unable to form a quorum on their own, while allowing
