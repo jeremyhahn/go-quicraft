@@ -207,14 +207,18 @@ type releaseFixture struct {
 	dir     string // the checkout make runs in
 	remote  string // bare repository registered as fixtureRemote; "" when none
 	release string // the next patch version; CHANGELOG.md has a heading for it
-	// published is the remote's ls-remote output after make last pushed the
-	// local main to it: what a refused release must leave there unchanged.
+	// published is the remote's ls-remote output after pushMain last ran:
+	// what a refused release must leave there unchanged.
 	published string
-	// unsyncedMain stops make pushing the local main to the remote first.
-	// A release is cut from a main the remote already holds (it landed
-	// through a PR), so make publishes the local main before each run unless
-	// a test is checking the refusal of a main the remote does not hold.
-	unsyncedMain bool
+}
+
+// pushMain publishes the local main to the remote, as landing it through a
+// PR would: a release is cut from a main the remote already holds, and the
+// recipe refuses any other (#1251).
+func (f *releaseFixture) pushMain() {
+	f.t.Helper()
+	f.git("push", "-q", "--force", f.remote, "refs/heads/main:refs/heads/main")
+	f.published = f.remoteRefs()
 }
 
 // newReleaseFixture builds the fixture. With withRemote it also registers a bare
@@ -311,10 +315,6 @@ func (f *releaseFixture) gitIn(dir string, args ...string) string {
 // output and exit error.
 func (f *releaseFixture) make(target string, vars ...string) (string, error) {
 	f.t.Helper()
-	if f.remote != "" && !f.unsyncedMain {
-		f.git("push", "-q", "--force", f.remote, "refs/heads/main:refs/heads/main")
-		f.published = f.remoteRefs()
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "make", append([]string{"-C", f.dir, target}, vars...)...)
@@ -329,6 +329,7 @@ func (f *releaseFixture) make(target string, vars ...string) (string, error) {
 // releaseAlpha runs release-alpha for f.release against fixtureRemote.
 func (f *releaseFixture) releaseAlpha(vars ...string) (string, error) {
 	f.t.Helper()
+	f.pushMain()
 	return f.make("release-alpha", append([]string{"VERSION=" + f.release, "RELEASE_REMOTE=" + fixtureRemote}, vars...)...)
 }
 
@@ -599,6 +600,7 @@ func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
 	f.git("commit", "-qm", "changelog for the candidate")
 
 	run := func(version string) (string, error) {
+		f.pushMain()
 		return f.make("release-candidate", "VERSION="+version, "RELEASE_REMOTE="+fixtureRemote, "RELEASE_ALLOWED_SIGNERS="+signers)
 	}
 
@@ -666,7 +668,6 @@ func TestReleaseRefusesALocalMainTheRemoteDoesNotHold(t *testing.T) {
 				}
 				f.git("add", "CHANGELOG.md")
 				f.git("commit", "-qm", "local only, never pushed")
-				f.unsyncedMain = true
 				f.published = f.remoteRefs()
 				versionBefore := f.version()
 				localMain := strings.TrimSpace(f.git("rev-parse", "refs/heads/main"))

@@ -2041,6 +2041,15 @@ export GOWORK=off
 # REL_FORM, so every guard applies to all three.
 # release.yml publishes a tag with no alpha/beta/rc suffix as a full release.
 #
+# Before VERSION is written, the recipe fetches $$REL_REMOTE's main into
+# FETCH_HEAD and refuses unless the local main is that same commit, so the
+# atomic push can only publish the release commit on top of a main the remote
+# already holds; a local commit that never landed through a PR (and never
+# passed its CI) is refused, not published and tagged. A failed fetch refuses:
+# an unreachable remote is not a matching main. The fetch passes --refmap=
+# (empty) and turns pruning off, as release-wire-gate's fetches do, so a
+# configured remote.<name>.fetch mapping cannot move or delete a local ref.
+#
 # The write, verify, push and read-back steps run as one shell, so the object
 # IDs resolved after the writes are the ones verified, pushed and compared.
 #
@@ -2079,6 +2088,9 @@ esac
 @ver="## [$${REL_VERSION#v}]"; awk -v ver="$$ver" 'index($$0, ver) == 1 { f = 1 } END { exit f ? 0 : 1 }' CHANGELOG.md || { echo "ERROR: CHANGELOG.md has no \"$$ver\" section heading. Matched LITERALLY and anchored at the line start, at least as strictly as .github/workflows/release.yml matches it -- an unanchored prose mention does not count, and neither does a near-miss heading"; exit 1; }
 @$(release-contrib-pin) contrib/dragonboat/go.mod >/dev/null || { echo "ERROR: contrib/dragonboat/go.mod does not hold exactly one 'require github.com/jeremyhahn/go-quicraft <version>' line. The release commit pins it to $$REL_VERSION so the contrib/dragonboat/$$REL_VERSION tag is importable; nothing has been written."; exit 1; }
 @! git rev-parse -q --verify "refs/tags/contrib/dragonboat/$$REL_VERSION" >/dev/null || { echo "ERROR: tag contrib/dragonboat/$$REL_VERSION already exists locally"; exit 1; }
+@git -c fetch.pruneTags=false -c "remote.$$REL_REMOTE.pruneTags=false" fetch --quiet --no-tags --refmap= --no-prune --no-prune-tags "$$REL_REMOTE" refs/heads/main || { echo "ERROR: could not fetch main from $$REL_REMOTE to compare it with the local main. Refusing to continue: an unreachable remote is not a matching main. Nothing has been written."; exit 1; }; \
+local_main="$$(git rev-parse --verify -q 'refs/heads/main^{commit}')" && remote_main="$$(git rev-parse --verify -q 'FETCH_HEAD^{commit}')" || { echo "ERROR: could not resolve the local main or the main fetched from $$REL_REMOTE. Nothing has been written."; exit 1; }; \
+test "$$local_main" = "$$remote_main" || { echo "ERROR: the local main $$local_main is not $$REL_REMOTE's main $$remote_main. A release is cut from the main the remote holds, which landed through a PR and passed its CI; publishing a local commit the remote does not hold would put it on main untested. Bring the local main to $$REL_REMOTE's main and run the release again. Nothing has been written."; exit 1; }
 @url="$$(git remote get-url "$$REL_REMOTE")" && base="$$(git rev-parse --verify -q 'refs/heads/main^{commit}')" || { echo "ERROR: could not resolve $$REL_REMOTE's URL or main before writing anything"; exit 1; }; \
 relgit() { printf '%s\n' "$$REL_GIT $$*"; $$REL_GIT "$$@"; }; \
 cmod=contrib/dragonboat/go.mod; \
