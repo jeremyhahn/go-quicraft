@@ -2127,6 +2127,20 @@ test $$rc -eq 0 || { echo "ERROR: RELEASE_GIT reported a successful push, but $$
 echo "Released $$REL_VERSION (signed, annotated; root, test/performance and contrib/dragonboat tags pushed atomically and read back from $$url)"
 endef
 
+# release-wire-gate runs scripts/check-wire-version.sh against the newest
+# non-alpha v* tag before release and release-candidate write anything. The
+# baseline is read after fetching tags from $$REL_REMOTE, so a --no-tags or
+# single-branch clone does not skip the gate or compare against an older tag,
+# and a failed fetch refuses: an unreachable remote is not an absent baseline.
+# The gate is skipped only when the release remote holds no non-alpha v* tag.
+# An empty or unresolved $$REL_REMOTE is left to release-body, which refuses it.
+release-wire-gate = @if test -n "$$REL_REMOTE" && git remote get-url "$$REL_REMOTE" >/dev/null 2>&1; then \
+	git fetch --quiet --tags "$$REL_REMOTE" || { echo "ERROR: could not fetch tags from $$REL_REMOTE to choose the wire version baseline. Refusing to continue: an unreachable remote is not an absent baseline. Nothing has been written."; exit 1; }; \
+	tag="$$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-alpha$$' | head -n 1)"; \
+	if [ -z "$$tag" ]; then echo "check-wire-version: no non-alpha v* release tag yet; skipping the wire version gate"; \
+	else bash scripts/check-wire-version.sh "$$tag"; fi; \
+	fi
+
 release-alpha: export override REL_VERSION := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)
 release-alpha: export override REL_REMOTE  := $(value RELEASE_REMOTE)
 release-alpha: export override REL_GIT     := $(value RELEASE_GIT)
@@ -2146,9 +2160,7 @@ release: export override REL_TARGET  := release
 release: export override REL_FORM    := vX.Y.Z
 release: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$$
 release:
-	@tag="$$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-alpha$$' | head -n 1)"; \
-	if [ -z "$$tag" ]; then echo "check-wire-version: no non-alpha v* release tag yet; skipping the wire version gate"; \
-	else bash scripts/check-wire-version.sh "$$tag"; fi
+	$(release-wire-gate)
 	$(release-body)
 
 # release-candidate cuts a release candidate, vX.Y.Z-rc.N (release-versioning.md
@@ -2163,9 +2175,7 @@ release-candidate: export override REL_TARGET  := release-candidate
 release-candidate: export override REL_FORM    := vX.Y.Z-rc.N
 release-candidate: export override REL_PATTERN := ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-rc\.[1-9][0-9]*$$
 release-candidate:
-	@tag="$$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-alpha$$' | head -n 1)"; \
-	if [ -z "$$tag" ]; then echo "check-wire-version: no non-alpha v* release tag yet; skipping the wire version gate"; \
-	else bash scripts/check-wire-version.sh "$$tag"; fi
+	$(release-wire-gate)
 	$(release-body)
 
 deps-latest:
