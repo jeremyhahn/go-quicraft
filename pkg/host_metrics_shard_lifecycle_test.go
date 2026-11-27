@@ -223,6 +223,117 @@ func TestStartShard_CollectorCallsShardInfo_NoDeadlock(t *testing.T) {
 	}
 }
 
+// pausingCollector records lifecycle calls like lifecycleCollector, and its
+// first RegisterShard for shardID signals entered and then blocks until
+// release is closed.
+type pausingCollector struct {
+	lifecycleCollector
+	shardID uint64
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *pausingCollector) RegisterShard(shardID uint64) {
+	if shardID == c.shardID {
+		c.once.Do(func() {
+			close(c.entered)
+			<-c.release
+		})
+	}
+	c.lifecycleCollector.RegisterShard(shardID)
+}
+
+// TestStartShard_StopShardWaitsForInFlightRegister checks that a StopShard
+// which claims teardown while StartShard is inside the collector's
+// RegisterShard waits on teardownShard's lifecycleMu barrier until that
+// registration completes, and that it then removes both the metric series and
+// the member addresses the registration added.
+func TestStartShard_StopShardWaitsForInFlightRegister(t *testing.T) {
+	const shardID = 79
+	pc := &pausingCollector{
+		shardID: shardID,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	h := newMetricsLifecycleHost(t, pc)
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	var releaseOnce sync.Once
+	releaseRegister := func() { releaseOnce.Do(func() { close(pc.release) }) }
+	t.Cleanup(releaseRegister)
+
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- h.StartShard(members, false, testCreateFunc, testShardConfig(shardID, 1))
+	}()
+	select {
+	case <-pc.entered:
+	case err := <-startDone:
+		t.Fatalf("StartShard returned %v before RegisterShard(%d) was called", err, shardID)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("RegisterShard(%d) not called within 10s", shardID)
+	}
+	v, ok := h.nodes.Load(uint64(shardID))
+	if !ok {
+		t.Fatalf("h.nodes does not hold shard %d while RegisterShard runs", shardID)
+	}
+	ns := v.(*nodeState)
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- h.StopShard(shardID) }()
+
+	// Wait until StopShard has claimed teardown, so it is past its stopped
+	// CAS and heading for the barrier, then give it time to (wrongly) finish.
+	deadline := time.Now().Add(10 * time.Second)
+	for !ns.stopped.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("StopShard did not claim teardown within 10s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-stopDone:
+		t.Fatalf("StopShard returned %v while RegisterShard(%d) was in flight; teardown must wait on lifecycleMu", err, shardID)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseRegister()
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Fatalf("StartShard: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("StartShard did not return within 10s after RegisterShard was released")
+	}
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("StopShard: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("StopShard did not return within 10s after RegisterShard was released")
+	}
+
+	calls := pc.snapshot()
+	regs := lifecycleIndices(calls, "RegisterShard", shardID)
+	unregs := lifecycleIndices(calls, "UnregisterShard", shardID)
+	if len(regs) != 1 {
+		t.Fatalf("RegisterShard(%d) calls = %d, want 1: %v", shardID, len(regs), calls)
+	}
+	if len(unregs) == 0 || regs[len(regs)-1] > unregs[len(unregs)-1] {
+		t.Fatalf("RegisterShard(%d) left after the last UnregisterShard: %v", shardID, calls)
+	}
+	for replicaID := range members {
+		if addr, rerr := h.registry.Resolve(shardID, replicaID); rerr == nil {
+			t.Fatalf("replica %d still resolves to %q after StopShard", replicaID, addr)
+		}
+	}
+	if _, ok := h.nodes.Load(uint64(shardID)); ok {
+		t.Fatalf("h.nodes still holds shard %d", shardID)
+	}
+}
+
 // TestHostMetricsShardLifecycle_RecordingCollector checks that a Host calls
 // RegisterShard on StartShard before any per-shard sample, UnregisterShard on
 // StopShard for that shard only, and RegisterShard again on a restart.
