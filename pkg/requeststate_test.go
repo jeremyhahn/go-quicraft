@@ -15,6 +15,7 @@
 package quicraft
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
@@ -841,5 +842,57 @@ func TestTryAcquireRef_ConcurrentWithRelease(t *testing.T) {
 		if !rs.recycled.Load() {
 			t.Fatalf("iteration %d: object was not recycled", i)
 		}
+	}
+}
+
+// TestWait_OnAClosedQueueIsDefinite pins that Wait classifies a lost wait
+// through the request: a proposal its node's queue closed on before the step
+// worker took it can never reach Raft, so the caller's deadline and its
+// cancellation are both definite, as Result reports them
+// (TestProposalWaitOnAClosedQueueIsDefinite).
+func TestWait_OnAClosedQueueIsDefinite(t *testing.T) {
+	cases := []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+		want error
+	}{
+		{"deadline", func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 50*time.Millisecond)
+		}, ErrTimeout},
+		{"cancel", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			time.AfterFunc(50*time.Millisecond, cancel)
+			return ctx, cancel
+		}, ErrCanceled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, _ := newLatchableHost(t)
+			rs := registerTestProposal(t, h, time.Now().Add(30*time.Second))
+			defer rs.Release()
+			// The node stops — its queue closes — without the host draining.
+			h.engine.GetNode(1).Stop()
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			_, err := rs.Wait(ctx)
+			if !errors.Is(err, tc.want) || MaybeApplied(err) {
+				t.Fatalf("Wait on a proposal never taken from a closed queue = %v, want a definite %v", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestWait_ReturnsTheDeliveredResult pins that Wait returns a completed
+// request's result and error.
+func TestWait_ReturnsTheDeliveredResult(t *testing.T) {
+	pool := NewRequestStatePool()
+	rs := newRequestState(pool, 1, time.Time{}, false)
+	defer rs.Release()
+	rs.complete(RequestResult{Value: 7})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := rs.Wait(ctx)
+	if err != nil || result.Value != 7 {
+		t.Fatalf("Wait = (%v, %v), want (Value 7, nil)", result, err)
 	}
 }

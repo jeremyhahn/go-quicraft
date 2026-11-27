@@ -808,6 +808,11 @@ func (nh *NodeHost) StopReplica(shardID, replicaID uint64) error {
 // SyncPropose makes a synchronous proposal through Raft consensus.
 // For no-op sessions, the simpler SyncPropose path is used. For tracked
 // sessions, SyncProposeWithSession handles at-most-once semantics.
+//
+// A context that ends after the proposal was handed to the host is
+// reported with quicraft.MaybeApplied true (a *quicraft.MaybeAppliedError
+// wrapping ErrTimeout or ErrCanceled) for both session kinds: the entry
+// may still commit and apply.
 func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, cmd []byte) (dbSM.Result, error) {
 	if err := checkContextDeadline(ctx); err != nil {
 		return dbSM.Result{}, err
@@ -848,18 +853,21 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 	}
 	defer rs.Release()
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return dbSM.Result{}, translateError(result.Err)
-		}
-		return dbSM.Result{Value: result.Value, Data: result.Data}, nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return dbSM.Result{}, ErrTimeout
-		}
-		return dbSM.Result{}, ErrCanceled
+	// The host classifies a lost wait from the request, as the no-op
+	// session path's SyncPropose does: maybe-applied once the proposal may
+	// have been handed off, definite when its queue closed before hand-off.
+	result, err := waitRequest(ctx, rs)
+	if err != nil {
+		return dbSM.Result{}, translateError(err)
 	}
+	return dbSM.Result{Value: result.Value, Data: result.Data}, nil
+}
+
+// waitRequest waits for a request the adapter submitted asynchronously. It
+// is RequestState.Wait, which classifies a lost wait from the request; tests
+// replace it to drive a classification the public API cannot stage.
+var waitRequest = func(ctx context.Context, rs *quicraft.RequestState) (quicraft.RequestResult, error) {
+	return rs.Wait(ctx)
 }
 
 // SyncRead performs a linearizable read via ReadIndex + Lookup.
@@ -910,7 +918,10 @@ func (nh *NodeHost) SyncGetSession(ctx context.Context, shardID uint64) (*dbClie
 
 // SyncCloseSession closes a client session by proposing unregistration
 // through Raft consensus. Blocks until the session is closed or the
-// context is canceled.
+// context is canceled. A context that ends after the request was handed
+// to the host is reported with quicraft.MaybeApplied true (a
+// *quicraft.MaybeAppliedError wrapping ErrTimeout or ErrCanceled): the
+// unregistration may still apply.
 func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) error {
 	if err := checkContextDeadline(ctx); err != nil {
 		return err
@@ -922,18 +933,14 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) 
 	}
 	defer rs.Release()
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return translateError(result.Err)
-		}
-		return validateCloseSessionResult(result.Value, cs.ClientID())
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
+	// The host classifies a lost wait from the request: maybe-applied once
+	// the close may have been handed off, definite when its queue closed
+	// before hand-off.
+	result, err := waitRequest(ctx, rs)
+	if err != nil {
+		return translateError(err)
 	}
+	return validateCloseSessionResult(result.Value, cs.ClientID())
 }
 
 // requireNoOPSessionOnDisk enforces dragonboat's rule that replicas backed
