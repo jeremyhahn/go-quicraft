@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- WAL records are pinned to their seal epoch until committed, so a purge between seal and commit cannot drop the key of an acknowledged record (#1246).
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
