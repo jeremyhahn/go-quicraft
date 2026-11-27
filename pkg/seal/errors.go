@@ -196,8 +196,9 @@ var (
 		"quicraft/seal: AEAD invocation budget for the current epoch is unrecoverable and the epoch cannot rotate")
 
 	// ErrFIPSUnavailable is returned by BarrierConfig.Validate when
-	// RequireFIPS is set but FIPSEnabled() is false — the binary was not built
-	// with the FIPS 140-3 module and GOFIPS140 is unset. Without this the two
+	// RequireFIPS is set but the FIPS 140-3 module is not active
+	// (crypto/fips140.Enabled() is false). GOFIPS140 in the run-time
+	// environment does not count. Without this the two
 	// states "FIPS not requested" and "FIPS requested but unavailable" are
 	// indistinguishable and the second fails open.
 	ErrFIPSUnavailable = errors.New("quicraft/seal: RequireFIPS is set but the FIPS 140-3 module is not active")
