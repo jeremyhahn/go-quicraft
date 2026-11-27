@@ -45,7 +45,10 @@ const (
 // requested" or "FIPS was requested but this binary has no module" — and the
 // second would otherwise fail open onto Argon2id and ChaCha20-Poly1305. A
 // deployment that requires FIPS must say so with BarrierConfig.RequireFIPS,
-// which turns that ambiguity into a refusal at NewBarrier.
+// which turns that ambiguity into a refusal at NewBarrier. RequireFIPS is
+// gated on crypto/fips140.Enabled() alone: the GOFIPS140 environment fallback
+// here drives the KDF and cipher policy only, because setting GOFIPS140 at
+// run time does not put the module into approved mode.
 //
 // THIS FUNCTION IS THE RUNTIME POLICY, NOT THE STRONGEST FORM. Everything it
 // governs is a check standing between a caller and an algorithm that is still
