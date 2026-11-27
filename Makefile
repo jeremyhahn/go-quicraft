@@ -2135,17 +2135,21 @@ endef
 # --no-tags or single-branch clone does not skip the gate. Both fetches turn
 # tag pruning off (fetch.pruneTags / remote.<name>.pruneTags would otherwise
 # add refs/tags/*:refs/tags/* and delete local-only tags); only
-# refs/release-baseline/ is pruned. The chosen tag is
+# refs/release-baseline/ is pruned. Both fetches also pass --refmap= (empty):
+# a refspec named on the command line does not stop git applying the
+# configured remote.<name>.fetch mappings to matching local refs, so a
+# configured +refs/tags/*:refs/tags/* would otherwise force-overwrite a
+# clashing local v* tag before the clash check below. The chosen tag is
 # then fetched explicitly into refs/tags/ without force: a clashing local tag
 # refuses. A failed fetch refuses: an unreachable remote is not an absent
 # baseline. The gate is skipped only when the release remote advertises no
 # non-alpha v* tag. An empty or unresolved $$REL_REMOTE is left to
 # release-body, which refuses it.
 release-wire-gate = @if test -n "$$REL_REMOTE" && git remote get-url "$$REL_REMOTE" >/dev/null 2>&1; then \
-	git -c fetch.pruneTags=false -c "remote.$$REL_REMOTE.pruneTags=false" fetch --quiet --no-tags --prune --no-prune-tags "$$REL_REMOTE" '+refs/tags/v*:refs/release-baseline/v*' || { echo "ERROR: could not fetch tags from $$REL_REMOTE to choose the wire version baseline. Refusing to continue: an unreachable remote is not an absent baseline. Nothing has been written."; exit 1; }; \
+	git -c fetch.pruneTags=false -c "remote.$$REL_REMOTE.pruneTags=false" fetch --quiet --no-tags --refmap= --prune --no-prune-tags "$$REL_REMOTE" '+refs/tags/v*:refs/release-baseline/v*' || { echo "ERROR: could not fetch tags from $$REL_REMOTE to choose the wire version baseline. Refusing to continue: an unreachable remote is not an absent baseline. Nothing has been written."; exit 1; }; \
 	tag="$$(git for-each-ref --sort=-v:refname --format='%(refname:lstrip=2)' refs/release-baseline/ | grep -v -- '-alpha$$' | head -n 1)"; \
 	if [ -z "$$tag" ]; then echo "check-wire-version: no non-alpha v* release tag yet; skipping the wire version gate"; \
-	else git -c fetch.pruneTags=false -c "remote.$$REL_REMOTE.pruneTags=false" fetch --quiet --no-tags --no-prune --no-prune-tags "$$REL_REMOTE" "refs/tags/$$tag:refs/tags/$$tag" || { echo "ERROR: could not fetch the wire version baseline tag $$tag from $$REL_REMOTE into refs/tags/$$tag (a local tag of that name that differs from the remote's refuses). Nothing has been written."; exit 1; }; \
+	else git -c fetch.pruneTags=false -c "remote.$$REL_REMOTE.pruneTags=false" fetch --quiet --no-tags --refmap= --no-prune --no-prune-tags "$$REL_REMOTE" "refs/tags/$$tag:refs/tags/$$tag" || { echo "ERROR: could not fetch the wire version baseline tag $$tag from $$REL_REMOTE into refs/tags/$$tag (a local tag of that name that differs from the remote's refuses). Nothing has been written."; exit 1; }; \
 	bash scripts/check-wire-version.sh "$$tag"; fi; \
 	fi
 
