@@ -5730,23 +5730,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// which takes ns.nodesMu. On the stopped path the claimant owns the
 	// shard: the check above saw stopped false, so its UnloadNode runs after
 	// LoadNode and there is nothing to undo.
-	ns.lifecycleMu.Lock()
-	if ns.stopped.Load() {
-		ns.lifecycleMu.Unlock()
+	if !h.registerStartedShard(ns, cfg.ShardID, effectiveNodes) {
 		h.logger.Warn("shard start aborted: host is closing or the shard was stopped",
 			"shard_id", cfg.ShardID, "replica_id", cfg.ReplicaID)
 		return ErrClosed
 	}
-	// Pre-bind metrics for this shard to avoid expensive label lookups
-	// in hot paths. This must be called before any metrics are recorded.
-	if h.metrics != nil {
-		h.metrics.RegisterShard(cfg.ShardID)
-	}
-	// Register all members in the registry for address resolution.
-	for replicaID, addr := range effectiveNodes {
-		h.registry.Register(cfg.ShardID, replicaID, addr)
-	}
-	ns.lifecycleMu.Unlock()
 
 	// Notify the engine that this shard has work so the Raft peer
 	// can begin election or heartbeat processing.
@@ -5769,6 +5757,30 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	)
 
 	return nil
+}
+
+// registerStartedShard registers the shard's metrics and member addresses
+// under ns.lifecycleMu, and only while ns is not stopped. It reports false,
+// registering nothing, when ns is stopped. The lock is released with defer:
+// RegisterShard is embedder code, and a runtime.Goexit there passes
+// safeMetricsCollector's recover, so an ordinary unlock would leave
+// lifecycleMu held and block teardownShard's barrier forever.
+func (h *Host) registerStartedShard(ns *nodeState, shardID uint64, members map[uint64]string) bool {
+	ns.lifecycleMu.Lock()
+	defer ns.lifecycleMu.Unlock()
+	if ns.stopped.Load() {
+		return false
+	}
+	// Pre-bind metrics for this shard to avoid expensive label lookups
+	// in hot paths. This must be called before any metrics are recorded.
+	if h.metrics != nil {
+		h.metrics.RegisterShard(shardID)
+	}
+	// Register all members in the registry for address resolution.
+	for replicaID, addr := range members {
+		h.registry.Register(shardID, replicaID, addr)
+	}
+	return true
 }
 
 // testHookStartShardBeforeRegister, when non-nil, is called by StartShard
