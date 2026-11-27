@@ -16,6 +16,7 @@ package quicraft
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -125,6 +126,56 @@ func waitForLifecycleCall(ctx context.Context, t *testing.T, rc *lifecycleCollec
 			t.Fatalf("no %s(%d) recorded before deadline: %v", method, shardID, ctx.Err())
 			return nil
 		case <-tick.C:
+		}
+	}
+}
+
+// TestStartShard_StopShardBeforeRegister_NoLeak checks that a StopShard which
+// claims teardown after StartShard's TOCTOU check but before its metrics and
+// registry registration leaves no per-shard metric series and no member
+// address behind, that StartShard reports ErrClosed, and that a restart of the
+// same shard then works.
+func TestStartShard_StopShardBeforeRegister_NoLeak(t *testing.T) {
+	rc := &lifecycleCollector{}
+	h := newMetricsLifecycleHost(t, rc)
+	const shardID = 77
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+
+	var stopErr error
+	testHookStartShardBeforeRegister = func(id uint64) {
+		testHookStartShardBeforeRegister = nil
+		stopErr = h.StopShard(id)
+	}
+	t.Cleanup(func() { testHookStartShardBeforeRegister = nil })
+
+	err := h.StartShard(members, false, testCreateFunc, testShardConfig(shardID, 1))
+	if stopErr != nil {
+		t.Fatalf("StopShard from hook: %v", stopErr)
+	}
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("StartShard = %v, want ErrClosed", err)
+	}
+
+	calls := rc.snapshot()
+	regs := lifecycleIndices(calls, "RegisterShard", shardID)
+	unregs := lifecycleIndices(calls, "UnregisterShard", shardID)
+	if len(regs) > 0 && (len(unregs) == 0 || regs[len(regs)-1] > unregs[len(unregs)-1]) {
+		t.Fatalf("RegisterShard(%d) left after the last UnregisterShard: %v", shardID, calls)
+	}
+	for replicaID := range members {
+		if addr, rerr := h.registry.Resolve(shardID, replicaID); rerr == nil {
+			t.Fatalf("replica %d still resolves to %q after StopShard", replicaID, addr)
+		}
+	}
+	if _, ok := h.nodes.Load(uint64(shardID)); ok {
+		t.Fatalf("h.nodes still holds shard %d", shardID)
+	}
+
+	startLifecycleShard(t, h, shardID)
+	for replicaID, want := range members {
+		addr, rerr := h.registry.Resolve(shardID, replicaID)
+		if rerr != nil || addr != want {
+			t.Fatalf("restart: Resolve(%d, %d) = %q, %v; want %q", shardID, replicaID, addr, rerr, want)
 		}
 	}
 }

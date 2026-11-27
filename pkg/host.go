@@ -5705,6 +5705,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return ErrClosed
 	}
 
+	if hook := testHookStartShardBeforeRegister; hook != nil {
+		hook(cfg.ShardID)
+	}
+
 	// Pre-bind metrics for this shard to avoid expensive label lookups
 	// in hot paths. This must be called before any metrics are recorded.
 	if h.metrics != nil {
@@ -5738,6 +5742,11 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 
 	return nil
 }
+
+// testHookStartShardBeforeRegister, when non-nil, is called by StartShard
+// after its Close/StopShard TOCTOU check and immediately before it registers
+// the shard's metrics and member addresses. Tests only.
+var testHookStartShardBeforeRegister func(shardID uint64)
 
 // logRecoveryClamp reports, on the Host's logger, a recovered commit index the
 // raft log clamped down to what the recovered log actually holds (see
