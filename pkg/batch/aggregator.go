@@ -206,8 +206,10 @@ type aggregatorMetrics struct {
 //
 // Thread safety: Submit may be called concurrently from multiple
 // goroutines. The aggregator manages its own background flush loop, which
-// flushes each shard's batch concurrently so one slow shard cannot stall
-// the others.
+// hands each shard's batch to a per-shard worker and returns to the queue
+// without waiting, so one slow shard cannot stall the others. Each shard has
+// at most one flush in flight; later batches for a busy shard are held and
+// proposed in order after it.
 type Aggregator struct {
 	cfg      Config
 	proposer Proposer
@@ -273,6 +275,7 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 		registry:  prometheus.DefaultRegisterer,
 		closeChan: make(chan struct{}),
 		flushDone: make(chan struct{}),
+		shardHeld: make(map[uint64][][]*proposal),
 	}
 	a.lifetimeCtx, a.lifetimeCancel = context.WithCancel(context.Background())
 
@@ -439,7 +442,8 @@ func (a *Aggregator) BatchLen() int {
 }
 
 // Close signals the aggregator to stop accepting new proposals, flushes
-// any remaining batched proposals, and waits for all goroutines to exit.
+// any remaining batched proposals, and waits for all goroutines to exit,
+// including every shard flush still in flight or held.
 // Close is safe to call multiple times; subsequent calls are no-ops.
 func (a *Aggregator) Close() error {
 	a.closeOnce.Do(func() {
@@ -457,7 +461,9 @@ func (a *Aggregator) Close() error {
 
 // flushLoop is the background goroutine that dequeues proposals, adds
 // them to the current batch, and triggers flushes on size threshold or
-// timer expiry.
+// timer expiry. A flush only dispatches to the shard workers, so the loop
+// never waits on a propose; on close it drains the queue, flushes, and waits
+// for the shard workers before it returns.
 func (a *Aggregator) flushLoop() {
 	defer a.wg.Done()
 	// Signal Submit's close-path waiters that no further flushing will occur.
@@ -499,6 +505,10 @@ func (a *Aggregator) flushLoop() {
 			if hasPending {
 				a.flush(flushReasonClose)
 			}
+			// Wait for every shard worker, in-flight and held batches alike,
+			// before returning: the deferred close of flushDone tells
+			// Submit's close-path waiters that nothing more will be flushed.
+			a.shardWG.Wait()
 			return
 		}
 	}
@@ -555,9 +565,10 @@ func (a *Aggregator) drainQueue() {
 	}
 }
 
-// flush takes ownership of the current batch under the lock, encodes all
-// proposals as a length-prefixed batch, submits the batch to the proposer,
-// and distributes the result to all waiting callers.
+// flush takes ownership of the current batch under the lock, groups it by
+// shard, and hands each shard's batch to that shard's worker (see
+// dispatchShard), which proposes it through flushShard and delivers the
+// result to its callers. flush does not wait for any propose.
 func (a *Aggregator) flush(reason string) {
 	a.mu.Lock()
 	batch := a.currentBatch
@@ -577,25 +588,53 @@ func (a *Aggregator) flush(reason string) {
 		shardBatches[p.shardID] = append(shardBatches[p.shardID], p)
 	}
 
-	// Flush every shard concurrently. Flushing them in sequence on the single
-	// flushLoop goroutine lets one slow or leaderless shard block every other
-	// shard's flush for the full proposal timeout, backing the queue up to
-	// QueueSize and producing QueueFullError for unrelated shards.
-	if len(shardBatches) == 1 {
-		for shardID, shardProposals := range shardBatches {
-			a.flushShard(shardID, shardProposals)
-		}
+	// Hand each shard's batch to that shard's worker and return without
+	// waiting. Waiting here, even for concurrent flushes, keeps flushLoop off
+	// the queue until the slowest shard's propose returns, so one slow or
+	// leaderless shard stalls every other shard for up to ProposeTimeout,
+	// backing the queue up to QueueSize and producing QueueFullError for
+	// unrelated shards.
+	for shardID, shardProposals := range shardBatches {
+		a.dispatchShard(shardID, shardProposals)
+	}
+}
+
+// dispatchShard gives one shard's batch to that shard's flush worker. If the
+// shard has no worker running, one is started for the batch; otherwise the
+// batch is held, as flushed, behind the batches already waiting, so a shard
+// has at most one propose in flight and its batches are proposed in order.
+func (a *Aggregator) dispatchShard(shardID uint64, proposals []*proposal) {
+	a.shardMu.Lock()
+	if held, busy := a.shardHeld[shardID]; busy {
+		a.shardHeld[shardID] = append(held, proposals)
+		a.shardMu.Unlock()
 		return
 	}
-	var wg sync.WaitGroup
-	wg.Add(len(shardBatches))
-	for shardID, shardProposals := range shardBatches {
-		go func() {
-			defer wg.Done()
-			a.flushShard(shardID, shardProposals)
-		}()
+	a.shardHeld[shardID] = nil
+	a.shardWG.Add(1)
+	a.shardMu.Unlock()
+	go a.shardWorker(shardID, proposals)
+}
+
+// shardWorker flushes proposals for shardID, then each batch held for the
+// shard in arrival order, and exits when nothing more is held.
+func (a *Aggregator) shardWorker(shardID uint64, proposals []*proposal) {
+	defer a.shardWG.Done()
+	for {
+		a.flushShard(shardID, proposals)
+
+		a.shardMu.Lock()
+		held := a.shardHeld[shardID]
+		if len(held) == 0 {
+			delete(a.shardHeld, shardID)
+			a.shardMu.Unlock()
+			return
+		}
+		proposals = held[0]
+		held[0] = nil
+		a.shardHeld[shardID] = held[1:]
+		a.shardMu.Unlock()
 	}
-	wg.Wait()
 }
 
 // flushShard encodes and submits a batch of proposals for a single shard,

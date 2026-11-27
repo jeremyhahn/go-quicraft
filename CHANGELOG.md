@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Batch aggregator (#1237): a slow or leaderless shard no longer stops other shards' batches from flushing. Each shard has one flush in flight; later batches for that shard are held and flushed in order after it. No API change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
