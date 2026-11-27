@@ -139,6 +139,113 @@ func TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry(t *testing.
 	}
 }
 
+// flakyRemoveEntriesToDB fails the first n RemoveEntriesTo calls and then
+// behaves exactly like the LogDB it wraps, modelling a transient error while
+// an import advances the log floor after the snapshot is already recorded.
+type flakyRemoveEntriesToDB struct {
+	logdb.LogDB
+	mu        sync.Mutex
+	remaining int
+}
+
+func (d *flakyRemoveEntriesToDB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
+	d.mu.Lock()
+	if d.remaining > 0 {
+		d.remaining--
+		d.mu.Unlock()
+		return errImportTransient
+	}
+	d.mu.Unlock()
+	return d.LogDB.RemoveEntriesTo(shardID, replicaID, index)
+}
+
+// TestImportSnapshot_RemoveEntriesToFailureDoesNotBlockItsOwnRetry: a
+// transient failure while advancing the log floor arrives after the snapshot
+// is recorded. The retry of the same artifact must complete the floor advance
+// rather than be refused as out of date, or the entries at or below the
+// snapshot index stay behind and the next restart fails with a log gap.
+func TestImportSnapshot_RemoveEntriesToFailureDoesNotBlockItsOwnRetry(t *testing.T) {
+	const shardID, replicaID uint64 = 7, 3
+	const index uint64 = 900
+	payload := []byte("DISASTER-RECOVERY-RESTORE")
+
+	cfg := testHostConfig(t)
+	real := memdb.New()
+	db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	if bsErr := real.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+		Addresses: map[uint64]string{replicaID: "127.0.0.1:5000"},
+	}); bsErr != nil {
+		t.Fatalf("SaveBootstrap failed: %v", bsErr)
+	}
+	// The bootstrap entry StartShard writes before an offline import.
+	if seedErr := real.SaveState([]logdb.Update{{
+		ShardID:   shardID,
+		ReplicaID: replicaID,
+		Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+	}}); seedErr != nil {
+		t.Fatalf("seed bootstrap entry: %v", seedErr)
+	}
+
+	artifact := func(term uint64) []byte {
+		return buildSnapshotArtifact(t, index, term, 0, proto.Membership{},
+			snapshotEnvelope(payload))
+	}
+
+	firstErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact(5)))
+	if !errors.Is(firstErr, errImportTransient) {
+		t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+	}
+
+	t.Run("different term at the same index is refused", func(t *testing.T) {
+		err := h.ImportSnapshot(context.Background(), shardID,
+			bytes.NewReader(artifact(6)))
+		var outOfDate *ImportSnapshotOutOfDateError
+		if !errors.As(err, &outOfDate) {
+			t.Fatalf("ImportSnapshot of a different artifact at the recorded index = %v, "+
+				"want *ImportSnapshotOutOfDateError", err)
+		}
+	})
+
+	if retryErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact(5))); retryErr != nil {
+		t.Fatalf("the retry after a RemoveEntriesTo failure was refused: %v; the "+
+			"entries below the recorded snapshot can then never be removed", retryErr)
+	}
+
+	rec, getErr := real.GetSnapshot(shardID, replicaID)
+	if getErr != nil {
+		t.Fatalf("GetSnapshot after the retry: %v", getErr)
+	}
+	if rec.Index != index {
+		t.Fatalf("recorded snapshot Index = %d, want %d", rec.Index, index)
+	}
+	first, count, rangeErr := real.EntryRange(shardID, replicaID)
+	if rangeErr != nil {
+		t.Fatalf("EntryRange after the retry: %v", rangeErr)
+	}
+	if count != 0 && first <= index {
+		t.Fatalf("EntryRange after the retry = (first=%d, count=%d): an entry at or "+
+			"below the snapshot index %d survived", first, count, index)
+	}
+
+	t.Run("completed import is not retried again", func(t *testing.T) {
+		err := h.ImportSnapshot(context.Background(), shardID,
+			bytes.NewReader(artifact(5)))
+		var outOfDate *ImportSnapshotOutOfDateError
+		if !errors.As(err, &outOfDate) {
+			t.Fatalf("re-import after a completed import = %v, "+
+				"want *ImportSnapshotOutOfDateError", err)
+		}
+	})
+}
+
 // TestImportSnapshot_PostPublishFailuresRollBackThePublish covers the other two
 // error paths after the rename — the directory-chain fsync and the
 // context check — through the injected filesystem, and asserts the same
