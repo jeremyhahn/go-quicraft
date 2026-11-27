@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Snapshot recovery on a basic `sm.StateMachine` (#1238) now excludes `Lookup`, `NALookup` and `GetHash`, as `Apply` already does, so a state machine without its own locking no longer sees a read run beside the recovery that replaces its state. Locking on the concurrent and on-disk tiers is unchanged.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
