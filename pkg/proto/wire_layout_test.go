@@ -333,7 +333,7 @@ func wireUint64Offset(b []byte, v uint64) int {
 	var enc [8]byte
 	binary.LittleEndian.PutUint64(enc[:], v)
 	i := bytes.Index(b, enc[:])
-	if i < 0 || bytes.Index(b[i+1:], enc[:]) >= 0 {
+	if i < 0 || bytes.Contains(b[i+1:], enc[:]) {
 		panic(fmt.Sprintf("wire fixture value %d does not occur exactly once", v))
 	}
 	return i
