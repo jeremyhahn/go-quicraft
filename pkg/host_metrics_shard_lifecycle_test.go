@@ -17,6 +17,7 @@ package quicraft
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -328,6 +329,64 @@ func TestStartShard_StopShardWaitsForInFlightRegister(t *testing.T) {
 		if addr, rerr := h.registry.Resolve(shardID, replicaID); rerr == nil {
 			t.Fatalf("replica %d still resolves to %q after StopShard", replicaID, addr)
 		}
+	}
+	if _, ok := h.nodes.Load(uint64(shardID)); ok {
+		t.Fatalf("h.nodes still holds shard %d", shardID)
+	}
+}
+
+// goexitCollector ends the calling goroutine with runtime.Goexit inside
+// RegisterShard for one shard. recover cannot stop a Goexit, so the
+// safeMetricsCollector guard lets it through.
+type goexitCollector struct {
+	lifecycleCollector
+	shardID uint64
+	entered chan struct{}
+}
+
+func (c *goexitCollector) RegisterShard(shardID uint64) {
+	if shardID == c.shardID {
+		close(c.entered)
+		runtime.Goexit()
+	}
+	c.lifecycleCollector.RegisterShard(shardID)
+}
+
+// TestStartShard_CollectorGoexit_StopShardCompletes checks that StartShard
+// releases ns.lifecycleMu when the embedder's RegisterShard ends the goroutine
+// with runtime.Goexit, so a later StopShard passes teardownShard's
+// lifecycleMu barrier instead of blocking forever.
+func TestStartShard_CollectorGoexit_StopShardCompletes(t *testing.T) {
+	const shardID = 83
+	gc := &goexitCollector{shardID: shardID, entered: make(chan struct{})}
+	h := newMetricsLifecycleHost(t, gc)
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+
+	startExited := make(chan struct{})
+	go func() {
+		defer close(startExited)
+		_ = h.StartShard(members, false, testCreateFunc, testShardConfig(shardID, 1))
+	}()
+	select {
+	case <-startExited:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("StartShard goroutine did not exit within 10s")
+	}
+	select {
+	case <-gc.entered:
+	default:
+		t.Fatalf("RegisterShard(%d) was not called", shardID)
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- h.StopShard(shardID) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("StopShard: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("StopShard blocked for 10s: StartShard left ns.lifecycleMu locked after the collector's Goexit")
 	}
 	if _, ok := h.nodes.Load(uint64(shardID)); ok {
 		t.Fatalf("h.nodes still holds shard %d", shardID)
