@@ -128,8 +128,8 @@ func (t *QUICTransport) getConnection(target, want string) (*quic.Conn, error) {
 			// Connection is dead, remove it and evict all associated
 			// streams so callers don't get stale stream handles. The
 			// diagnostic follows the eviction it reports.
-			t.removeConnection(target)
-			t.evictStreamsForTarget(target)
+			t.removeConnection(target, conn)
+			t.evictStreamsOwnedBy(target, conn)
 			slog.Debug("stale connection detected, reconnecting",
 				"target", target,
 			)
@@ -661,11 +661,17 @@ func (t *QUICTransport) preOpenHeartbeatStream(target string, conn *quic.Conn) {
 // too, so dropping the record there has exactly the same effect. The record is
 // aged out by reapPeerIncarnations instead, which forgets only an address that
 // has been both disconnected AND silent for peerIncarnationRetention.
-func (t *QUICTransport) removeConnection(target string) {
+//
+// The removal is compare-and-delete against the observed connection dead: a
+// caller that saw dead fail after a concurrent sender already re-dialed leaves
+// the live replacement pooled.
+func (t *QUICTransport) removeConnection(target string, dead *quic.Conn) {
 	t.connMu.Lock()
-	delete(t.connPeer, t.conns[target])
-	delete(t.conns, target)
-	delete(t.connEpoch, target)
+	if t.conns[target] == dead {
+		delete(t.connPeer, dead)
+		delete(t.conns, target)
+		delete(t.connEpoch, target)
+	}
 	t.connMu.Unlock()
 }
 
@@ -1097,8 +1103,8 @@ func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat 
 		case connOK && conn == owner:
 			// The stream's owner IS the cached conn, but it is dead: evict
 			// the whole connection and its streams, then reconnect.
-			t.removeConnection(target)
-			t.evictStreamsForTarget(target)
+			t.removeConnection(target, conn)
+			t.evictStreamsOwnedBy(target, conn)
 		default:
 			// The stream's connection is superseded: drop the stream, keep the cached conn.
 			t.evictStream(target, shardID, isHeartbeat, stream)
@@ -1109,8 +1115,8 @@ func (t *QUICTransport) cachedStream(target string, shardID uint64, isHeartbeat 
 		select {
 		case <-conn.Context().Done():
 			// Connection is dead. Evict all streams and reconnect.
-			t.removeConnection(target)
-			t.evictStreamsForTarget(target)
+			t.removeConnection(target, conn)
+			t.evictStreamsOwnedBy(target, conn)
 		default:
 			if !connServesWant {
 				return nil, false
@@ -1238,8 +1244,8 @@ func (t *QUICTransport) getStream(target string, shardID uint64, isHeartbeat boo
 		shard.mu.Unlock()
 		closeStreamQuietly(existing, "transport: stale stream close failed during getStream dedup", target, shardID)
 		closeStreamQuietly(s, "transport: new stream close failed during getStream dedup", target, shardID)
-		t.removeConnection(target)
-		t.evictStreamsForTarget(target)
+		t.removeConnection(target, conn)
+		t.evictStreamsOwnedBy(target, conn)
 		retryConn, retryErr := t.getConnection(target, want)
 		if retryErr != nil {
 			return nil, retryErr
@@ -1653,6 +1659,52 @@ func (t *QUICTransport) evictStreamsForTarget(target string) {
 	}
 }
 
+// evictStreamsOwnedBy drops and closes the pooled streams for target that
+// were opened on dead, plus any whose owner is unknown (owners nil or the key
+// absent, which only a manually-constructed test transport produces). Streams
+// owned by another connection, such as the live replacement a concurrent
+// sender pooled after dead failed, are left pooled and open.
+func (t *QUICTransport) evictStreamsOwnedBy(target string, dead *quic.Conn) {
+	for i := range t.streamShards {
+		shard := &t.streamShards[i]
+
+		// Collect streams to close outside the lock.
+		var toClose []*quic.Stream
+
+		shard.mu.Lock()
+		for key, stream := range shard.streams {
+			if key.target != target {
+				continue
+			}
+			if owner, known := shard.owners[key]; known && owner != dead {
+				continue
+			}
+			toClose = append(toClose, stream)
+			shard.drop(key)
+		}
+		shard.mu.Unlock()
+
+		// As in evictStreamsForTarget: close every dropped stream before any
+		// diagnostic.
+		var closeErrs []error
+		for _, s := range toClose {
+			if s != nil {
+				if closeErr := s.Close(); closeErr != nil {
+					closeErrs = append(closeErrs, closeErr)
+				}
+			}
+		}
+		if len(closeErrs) > 0 {
+			supervise.LogContained(func() {
+				for _, closeErr := range closeErrs {
+					slog.Debug("transport: stream close failed during eviction",
+						"target", target, "error", closeErr)
+				}
+			})
+		}
+	}
+}
+
 // evictStaleOutboundOnRecv evicts the cached outbound to the sender on a certificate-authorized boot epoch change, or when it is dead.
 func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64, inboundConn *quic.Conn) {
 	if target == "" {
@@ -1686,8 +1738,8 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 	select {
 	case <-outbound.Context().Done():
 		// Dead outbound — always evict.
-		t.removeConnection(target)
-		t.evictStreamsForTarget(target)
+		t.removeConnection(target, outbound)
+		t.evictStreamsOwnedBy(target, outbound)
 	default:
 		// Alive outbound. Evict only when it cannot be attributed to the
 		// incarnation this batch came from. In the steady state stamp ==
@@ -1722,7 +1774,7 @@ func (t *QUICTransport) evictStaleOutboundOnRecv(target string, srcEpoch uint64,
 		// incarnation the frames already written to it (typically the vote
 		// request whose reply triggered this eviction) are still delivered.
 		t.drainOutbound(target, outbound)
-		t.evictStreamsForTarget(target)
+		t.evictStreamsOwnedBy(target, outbound)
 		supervise.LogContained(func() {
 			slog.Info("evicting outbound not attributable to the sending peer incarnation",
 				"target", target, "peer_epoch", srcEpoch, "dialed_under_epoch", stamp,

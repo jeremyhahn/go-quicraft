@@ -211,6 +211,8 @@ type StateMachine struct {
 	//     snapshots: the snapshot pool sets the saving gate and drains applies
 	//     before a regular SM's whole-state save (see
 	//     internal/engine/snapshot_pool.go and rsm/adapter.go).
+	//     RecoverFromSnapshot takes the same WRITE lock, so recovery is
+	//     serialized with reads on this tier as well.
 	//
 	//   - sm.ConcurrentStateMachine and sm.DiskStateMachine: Apply takes the
 	//     READ lock. Both document Lookup as "May be called concurrently with
@@ -1285,10 +1287,12 @@ func (s *StateMachine) RecoverFromSnapshot(ctx context.Context, r io.Reader, sto
 	// until it finishes; the stopper aborts it promptly once the node stops.
 	// applyMu excludes Apply on every tier for the same span, because the
 	// recovery replaces the session table and policy Apply works against.
-	s.readGuard.RLock()
-	defer s.readGuard.RUnlock()
-	s.applyMu.Lock()
-	defer s.applyMu.Unlock()
+	// The guards are taken exactly as Apply takes them (lockApply): on the
+	// basic tier readGuard is held exclusively, because recovery replaces
+	// all user state and that tier promises its reads never run beside a
+	// writer; the concurrent and on-disk tiers keep the read lock.
+	s.lockApply()
+	defer s.unlockApply()
 	if s.closed {
 		return ErrClosed
 	}
