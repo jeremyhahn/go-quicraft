@@ -332,6 +332,12 @@ func TestWireFingerprintCatchesEncodingOnlyChange(t *testing.T) {
 			}
 			return swapWireRange(b, 8, 16, 8)
 		}},
+		{"swap MessageBatch BinVer and MaxBinVer", func(name string, b []byte) []byte {
+			if name != "MessageBatch" {
+				return b
+			}
+			return swapWireRange(b, 0, 24, 8)
+		}},
 		{"widen MessageBatch DeploymentID to 12 bytes", func(name string, b []byte) []byte {
 			if name != "MessageBatch" {
 				return b
