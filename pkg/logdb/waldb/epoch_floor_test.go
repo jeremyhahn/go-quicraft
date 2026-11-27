@@ -394,7 +394,11 @@ func TestWriteRecord_SealEpochPinnedUntilCommit(t *testing.T) {
 		}
 		purge(t, barrier, 0, "the commit released more than its own pin")
 		barrier.DeregisterInFlightEpoch(1)
-		purge(t, barrier, 1, "the commit did not release the seal pin")
+		purge(t, barrier, 0, "the shard must hold the seal pin while epoch 1 is live")
+		if err := db.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		purge(t, barrier, 1, "close did not release the shard's seal pin")
 	})
 
 	t.Run("rollback", func(t *testing.T) {

@@ -147,8 +147,9 @@ type walContextBarrier interface {
 // lands between a record's seal and its commit point.
 //
 // A pin taken by EncryptWithEpochPinnedContext is released exactly once with
-// DeregisterInFlightEpoch: when the record's epoch is folded into the shard's
-// floor (applyEpochLocked), when a rollback proves the record gone
+// DeregisterInFlightEpoch: by the shard, which takes it over when the record
+// commits (applyEpochLocked) and keeps one per live epoch until the floor rises
+// past it (recomputeMinWriteEpoch) or the shard closes; when a rollback proves the record gone
 // (rollbackBatch), or when writeRecord fails after the seal.
 type walEpochPinner interface {
 	EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error)
@@ -509,6 +510,17 @@ type walShard struct {
 	// garbage collection without re-scanning ciphertext headers. Protected
 	// by dataMu, alongside the minWriteEpoch it derives.
 	segmentEpochs map[uint64]uint64
+
+	// pinnedEpochs holds one barrier in-flight reference (see walEpochPinner)
+	// per epoch at or above minWriteEpoch that a committed record of this
+	// shard was sealed under. MinLiveEpoch alone cannot protect such an
+	// epoch: the host samples the floor and purges later, unsynchronized, so
+	// a purge can act on a floor sampled before the record committed. The
+	// shard therefore keeps the pin while the epoch is live, and releases it
+	// only when recomputeMinWriteEpoch raises the floor past it or the shard
+	// closes. Empty when the barrier does not provide walEpochPinner.
+	// Protected by dataMu.
+	pinnedEpochs map[uint64]struct{}
 
 	// metaSegments tracks, per node, the segment ID that holds the latest
 	// durable State, Snapshot, Bootstrap and Compaction-marker record. Unlike
@@ -2788,8 +2800,9 @@ func (s *walShard) getOrCreateIndex(key nodeKey) *index {
 // epoch (zero when none was taken; see walEpochPinner). Until the landing is in
 // the floor the epoch is held by nothing else, so a purge in that window would
 // drop the DEK of a record the write acknowledges. Whoever holds the landing
-// must release the pin exactly once: applyEpochLocked does so when it folds the
-// epoch in, and rollbackBatch when it discards a staged landing.
+// must consume the pin exactly once: applyEpochLocked hands it to the shard
+// (walShard.pinnedEpochs) when it folds the epoch in, and rollbackBatch
+// releases it when it discards a staged landing.
 type recordLanding struct {
 	segID       uint64
 	epoch       uint64
@@ -2820,14 +2833,27 @@ func (s *walShard) releaseSealPin(l *recordLanding) {
 // segment's entry. Each writer therefore applies its own landing once its
 // record is durable, and a rolled-back batch applies nothing.
 //
-// Once the epoch is in the floor it is retained by MinLiveEpoch, so the
-// landing's seal pin (see recordLanding) is released here, exactly once.
+// The landing's seal pin (see recordLanding) is consumed here, exactly once:
+// the first committed record of an epoch moves its pin into s.pinnedEpochs,
+// where it stays until recomputeMinWriteEpoch raises the floor past the epoch
+// or the shard closes; a later record of an epoch the shard already holds
+// releases its own pin. Being in the floor is not enough on its own, because a
+// purge may act on a floor sampled before this commit.
 //
 // Caller must hold s.dataMu for writing (and, on a live shard, s.mu).
 func (s *walShard) applyEpochLocked(l *recordLanding) {
 	defer s.releaseSealPin(l)
 	if l.epoch == 0 {
 		return
+	}
+	if l.pinnedEpoch != 0 {
+		if _, held := s.pinnedEpochs[l.pinnedEpoch]; !held {
+			if s.pinnedEpochs == nil {
+				s.pinnedEpochs = make(map[uint64]struct{})
+			}
+			s.pinnedEpochs[l.pinnedEpoch] = struct{}{}
+			l.pinnedEpoch = 0 // now held by the shard
+		}
 	}
 	if s.minWriteEpoch == 0 || l.epoch < s.minWriteEpoch {
 		s.minWriteEpoch = l.epoch
@@ -3093,6 +3119,13 @@ func (s *walShard) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closed = true
+	// Release every seal pin the shard holds (see pinnedEpochs).
+	s.dataMu.Lock()
+	for epoch := range s.pinnedEpochs {
+		delete(s.pinnedEpochs, epoch)
+		s.pinner.DeregisterInFlightEpoch(epoch)
+	}
+	s.dataMu.Unlock()
 	if s.activeSegment != nil {
 		err := s.activeSegment.Close()
 		s.activeSegment = nil
@@ -5348,6 +5381,14 @@ func (s *walShard) recomputeMinWriteEpoch(liveSegments map[uint64]bool) {
 		}
 	}
 	s.minWriteEpoch = newMin
+
+	// Release the seal pins of epochs no live record is sealed under any more.
+	for epoch := range s.pinnedEpochs {
+		if newMin == 0 || epoch < newMin {
+			delete(s.pinnedEpochs, epoch)
+			s.pinner.DeregisterInFlightEpoch(epoch)
+		}
+	}
 }
 
 // DBOpenError is returned when the database fails to open or create
