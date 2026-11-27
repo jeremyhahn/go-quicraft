@@ -119,7 +119,7 @@ func TestRemoveConnection(t *testing.T) {
 	defer cleanup()
 
 	target := t2.Addr().String()
-	_, err := t1.getConnection(target, "")
+	conn, err := t1.getConnection(target, "")
 	if err != nil {
 		t.Fatalf("getConnection failed: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestRemoveConnection(t *testing.T) {
 		t.Fatalf("expected 1 connection, got %d", t1.ConnectionCount())
 	}
 
-	t1.removeConnection(target)
+	t1.removeConnection(target, conn)
 
 	if t1.ConnectionCount() != 0 {
 		t.Fatalf("expected 0 connections after removal, got %d", t1.ConnectionCount())
@@ -1171,7 +1171,7 @@ func TestGetStreamReturnesFreshStreamAfterEviction(t *testing.T) {
 
 	// Remove the connection and evict all streams, simulating the race
 	// where another goroutine evicts between stream read and conn read.
-	t1.removeConnection(target)
+	t1.removeConnection(target, conn)
 	t1.evictStreamsForTarget(target)
 
 	// Now getStream should detect the stale stream and fall through to
@@ -1227,7 +1227,7 @@ func TestGetStreamFreshStreamUnderConcurrentEviction(t *testing.T) {
 			t1.connMu.RUnlock()
 			if ok {
 				c.CloseWithError(0, "concurrent eviction test")
-				t1.removeConnection(target)
+				t1.removeConnection(target, c)
 				t1.evictStreamsForTarget(target)
 			}
 			// Paces the churn on purpose: one eviction per millisecond
@@ -2206,7 +2206,7 @@ func TestGetStream_SlowPathStaleDedup(t *testing.T) {
 	// Remove the connection from the pool but leave streams in the shards.
 	// This simulates the race: another goroutine cached a stream on a
 	// now-dead connection.
-	t1.removeConnection(t2Addr)
+	t1.removeConnection(t2Addr, dead)
 
 	// Restart t2 on the same address so the retry can succeed.
 	t2b, err := NewQUICTransport(Config{
@@ -2586,7 +2586,7 @@ func TestGetStream_StaleStreamInShardDedupRetry(t *testing.T) {
 	// in the shard map. This is the key setup: getStream slow path will
 	// find this stale stream during dedup, detect no connection in conns,
 	// and trigger the retry path.
-	t1.removeConnection(t2Addr)
+	t1.removeConnection(t2Addr, dead)
 	// Also evict all streams, then re-inject just the stale one.
 	t1.evictStreamsForTarget(t2Addr)
 
@@ -3003,7 +3003,10 @@ func TestGetStream_StaleDedup_ConnRemovedDuringSlowPath(t *testing.T) {
 			defer wg.Done()
 			// Repeatedly remove the connection.
 			for i := 0; i < 100; i++ {
-				t1.removeConnection(t2Addr)
+				t1.connMu.RLock()
+				pooled := t1.conns[t2Addr]
+				t1.connMu.RUnlock()
+				t1.removeConnection(t2Addr, pooled)
 			}
 		}()
 

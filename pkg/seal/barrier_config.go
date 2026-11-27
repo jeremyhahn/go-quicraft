@@ -14,6 +14,8 @@
 
 package seal
 
+import "crypto/fips140"
+
 // StatePersister durably writes the barrier's sealed root-key state to the
 // embedder's storage. The barrier owns no storage of its own: go-qrdb (or
 // whichever embedder loads the blob at boot via SetSealedRootKey) owns the
@@ -216,7 +218,10 @@ type BarrierConfig struct {
 
 	// RequireFIPS declares that this deployment REQUIRES the FIPS 140-3 module.
 	// When true, Validate (and therefore NewBarrier) fails closed with
-	// ErrFIPSUnavailable unless FIPSEnabled() reports the module active.
+	// ErrFIPSUnavailable unless crypto/fips140.Enabled() reports the module
+	// active. A GOFIPS140 value in the run-time environment does not count:
+	// it is a build-time toolchain setting and does not put the module into
+	// approved mode.
 	//
 	// It exists because FIPS enforcement is otherwise entirely ENVIRONMENT
 	// derived: without this flag "FIPS was not requested" and "FIPS was
@@ -289,7 +294,8 @@ func DefaultBarrierConfig(deploymentID uint64) BarrierConfig {
 // Barrier, returning ErrUnsupportedAlgorithm for an unknown algorithm,
 // ErrAlgorithmNotFIPSApproved when FIPS mode is active and the configured
 // cipher is not FIPS-approved, and ErrFIPSUnavailable when RequireFIPS is set
-// but the FIPS 140-3 module is not active.
+// but the FIPS 140-3 module is not active (crypto/fips140.Enabled() is false;
+// GOFIPS140 in the environment does not satisfy RequireFIPS).
 //
 // NewBarrier applies exactly these rules and returns this error, so calling
 // Validate first is an optimization, not a safety requirement. It is useful
@@ -304,7 +310,9 @@ func (c *BarrierConfig) Validate() error {
 	// A deployment that DEMANDS FIPS must not start on a binary that cannot
 	// provide it. Checked before the cipher rule below so the operator is told
 	// the module is missing rather than that some algorithm is unapproved.
-	if c.RequireFIPS && !FIPSEnabled() {
+	// Gated on the module itself, not FIPSEnabled: GOFIPS140 in the run-time
+	// environment does not put the module into approved mode.
+	if c.RequireFIPS && !fips140.Enabled() {
 		return ErrFIPSUnavailable
 	}
 	// FIPS 140 mode constrains the data-path cipher: the ChaCha20 family

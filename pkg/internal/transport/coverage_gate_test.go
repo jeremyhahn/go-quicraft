@@ -157,7 +157,7 @@ func TestGetStream_UnownedEntryAfterRemoveConnectionReturnsExisting(t *testing.T
 	t1.connMu.RLock()
 	oldConn := t1.conns[target]
 	t1.connMu.RUnlock()
-	t1.removeConnection(target)
+	t1.removeConnection(target, oldConn)
 
 	got, err := t1.getStream(target, 1, false, "")
 	if err != nil {
@@ -277,7 +277,7 @@ func stageStaleEntry(t *testing.T, tr *QUICTransport, target string, shardID uin
 	tr.connMu.RLock()
 	owner := tr.conns[target]
 	tr.connMu.RUnlock()
-	tr.removeConnection(target)
+	tr.removeConnection(target, owner)
 	return s, owner
 }
 
@@ -347,7 +347,7 @@ func TestGetStream_StaleEntryAndDroppedConnectionRetries(t *testing.T) {
 		openedOn = t1.conns[target]
 		t1.connMu.RUnlock()
 		reinsert(t1, target, 1, stale, oldConn)
-		t1.removeConnection(target)
+		t1.removeConnection(target, openedOn)
 	}
 
 	got, err := t1.getStream(target, 1, false, "")
