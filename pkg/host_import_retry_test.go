@@ -18,10 +18,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
+	"testing/iotest"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -244,6 +247,169 @@ func TestImportSnapshot_RemoveEntriesToFailureDoesNotBlockItsOwnRetry(t *testing
 				"want *ImportSnapshotOutOfDateError", err)
 		}
 	})
+}
+
+// importRetryFixture is a host whose first import of artifact (with
+// firstOpts) recorded its snapshot and then failed in RemoveEntriesTo, so the
+// LogDB still holds the bootstrap entry below the recorded snapshot index.
+type importRetryFixture struct {
+	h     *Host
+	real  logdb.LogDB
+	index uint64
+}
+
+const importRetryShard, importRetryReplica uint64 = 7, 3
+
+func newImportRetryFixture(t *testing.T, index uint64, artifact []byte,
+	firstOpts ...ImportOption) *importRetryFixture {
+	t.Helper()
+	real := memdb.New()
+	db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	if bsErr := real.SaveBootstrap(importRetryShard, importRetryReplica, logdb.Bootstrap{
+		Addresses: map[uint64]string{importRetryReplica: "127.0.0.1:5000"},
+	}); bsErr != nil {
+		t.Fatalf("SaveBootstrap failed: %v", bsErr)
+	}
+	if seedErr := real.SaveState([]logdb.Update{{
+		ShardID:   importRetryShard,
+		ReplicaID: importRetryReplica,
+		Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+	}}); seedErr != nil {
+		t.Fatalf("seed bootstrap entry: %v", seedErr)
+	}
+	firstErr := h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact), firstOpts...)
+	if !errors.Is(firstErr, errImportTransient) {
+		t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+	}
+	return &importRetryFixture{h: h, real: real, index: index}
+}
+
+// recorded returns the recorded snapshot's membership.
+func (f *importRetryFixture) recorded(t *testing.T) logdb.Membership {
+	t.Helper()
+	rec, err := f.real.GetSnapshot(importRetryShard, importRetryReplica)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	return rec.Membership
+}
+
+// requireFloorUntouched fails unless an entry at or below the recorded
+// snapshot index is still in the LogDB.
+func (f *importRetryFixture) requireFloorUntouched(t *testing.T) {
+	t.Helper()
+	first, count, err := f.real.EntryRange(importRetryShard, importRetryReplica)
+	if err != nil {
+		t.Fatalf("EntryRange: %v", err)
+	}
+	if count == 0 || first > f.index {
+		t.Fatalf("EntryRange = (first=%d, count=%d): the refused retry advanced the "+
+			"log floor past the snapshot index %d", first, count, f.index)
+	}
+}
+
+// TestImportSnapshot_RetryWithChangedMembershipIsRefused checks that the
+// retry of an import that recorded its snapshot is only completed when it
+// resolves the same membership: a retry asking for another membership would
+// otherwise return nil while the shard restarts into the recorded one.
+func TestImportSnapshot_RetryWithChangedMembershipIsRefused(t *testing.T) {
+	const index uint64 = 900
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+	members := map[uint64]string{importRetryReplica: "127.0.0.1:5000"}
+
+	cases := []struct {
+		name  string
+		first []ImportOption
+		retry []ImportOption
+	}{
+		{
+			name:  "changed members",
+			first: []ImportOption{WithImportMembership(members)},
+			retry: []ImportOption{WithImportMembership(map[uint64]string{
+				importRetryReplica: "127.0.0.1:6000",
+			})},
+		},
+		{
+			name:  "changed identities",
+			first: []ImportOption{WithImportMembership(members)},
+			retry: []ImportOption{
+				WithImportMembership(members),
+				WithImportMemberIdentities(map[uint64]string{importRetryReplica: "node-retry"}),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newImportRetryFixture(t, index, artifact, tc.first...)
+			before := f.recorded(t)
+
+			err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+				bytes.NewReader(artifact), tc.retry...)
+			var outOfDate *ImportSnapshotOutOfDateError
+			if !errors.As(err, &outOfDate) {
+				t.Fatalf("retry with a changed membership = %v, "+
+					"want *ImportSnapshotOutOfDateError", err)
+			}
+			if after := f.recorded(t); !reflect.DeepEqual(after, before) {
+				t.Fatalf("recorded membership changed by a refused retry: %+v, want %+v",
+					after, before)
+			}
+			f.requireFloorUntouched(t)
+		})
+	}
+}
+
+// TestImportSnapshot_RetryWithMalformedArtifactIsRefused checks that the
+// retry of an import that recorded its snapshot verifies the whole artifact
+// before it advances the log floor: a stream with a matching header and a
+// truncated, damaged or unreadable body is not the artifact that was recorded.
+func TestImportSnapshot_RetryWithMalformedArtifactIsRefused(t *testing.T) {
+	const index uint64 = 900
+	full := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+	hdr, err := marshalSnapshotArtifactHeader(snapshotArtifactHeader{Index: index, Term: 5})
+	if err != nil {
+		t.Fatalf("marshalSnapshotArtifactHeader: %v", err)
+	}
+	flipped := bytes.Clone(full)
+	flipped[len(hdr)+2] ^= 0xff
+	errRead := errors.New("artifact source failed")
+
+	cases := []struct {
+		name string
+		r    func() io.Reader
+	}{
+		{"header only", func() io.Reader { return bytes.NewReader(full[:len(hdr)]) }},
+		{"flipped payload byte", func() io.Reader { return bytes.NewReader(flipped) }},
+		{"no trailer", func() io.Reader {
+			return bytes.NewReader(full[:len(full)-snapshotArtifactTrailerSize])
+		}},
+		{"reader error", func() io.Reader {
+			return io.MultiReader(bytes.NewReader(full[:len(hdr)+4]), iotest.ErrReader(errRead))
+		}},
+	}
+	f := newImportRetryFixture(t, index, full)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+				tc.r()); err == nil {
+				t.Fatal("retry with a malformed artifact returned nil")
+			}
+			f.requireFloorUntouched(t)
+		})
+	}
+
+	if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(full)); err != nil {
+		t.Fatalf("retry with the intact artifact after the refusals: %v", err)
+	}
 }
 
 // TestImportSnapshot_PostPublishFailuresRollBackThePublish covers the other two
