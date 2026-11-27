@@ -5,10 +5,13 @@
 # check-wire-version.sh <last-release-tag>
 #
 # Release gate for the Raft wire version. pkg/proto/testdata/wire_layout.golden
-# records a fingerprint of every type reachable from MessageBatch and
-# SnapshotChunk together with the WireVersion it was recorded at. When the
+# records a fingerprint of the encoded MessageBatch and SnapshotChunk fixtures,
+# how it was derived and the WireVersion it was recorded at. When the
 # fingerprint differs between <last-release-tag> and HEAD while the version line
-# did not move, the wire layout changed without a WireVersion bump: fail.
+# did not move, the wire layout changed without a WireVersion bump: fail. When
+# only the derivation line changed (a tag without one reads as empty), the
+# fingerprints are not comparable: pass only if the pinned encoded fixtures in
+# pkg/proto/testdata/golden/ are unchanged since the tag, else fail.
 set -euo pipefail
 
 golden=pkg/proto/testdata/wire_layout.golden
@@ -37,6 +40,14 @@ line() { printf '%s\n' "$1" | grep -m 1 "^$2 " || true; }
 
 if [ "$old" = "$new" ]; then
 	echo "check-wire-version: wire layout unchanged since $tag ($(line "$new" version))"
+	exit 0
+fi
+if [ "$(line "$old" derivation)" != "$(line "$new" derivation)" ] &&
+	[ "$(line "$old" version)" = "$(line "$new" version)" ] &&
+	git diff --quiet "$tag" HEAD -- pkg/proto/testdata/golden/; then
+	echo "check-wire-version: fingerprint derivation changed since $tag" \
+		"('$(line "$old" derivation)' -> '$(line "$new" derivation)'), pkg/proto/testdata/golden/" \
+		"unchanged ($(line "$new" version))"
 	exit 0
 fi
 if [ "$(line "$old" version)" = "$(line "$new" version)" ]; then

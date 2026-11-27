@@ -326,12 +326,20 @@ in-process batch) is not checked. Consumers read the window through
 From v1.0.0-rc.1, every release that changes the layout of a type reachable
 from `MessageBatch` or `SnapshotChunk` bumps `proto.WireVersion` and sets
 `PreviousWireVersion` to the old value. `TestWireLayoutGolden`
-(`pkg/proto/wire_layout_test.go`) fingerprints those types by reflection
-(field names, types and order, recursively, sorted, SHA-256) against
-`pkg/proto/testdata/wire_layout.golden`; regenerate it with
+(`pkg/proto/wire_layout_test.go`) takes the fingerprint from the encoded
+bytes, not by reflection: the SHA-256 of the `MarshalTo` output of one
+`MessageBatch` and one `SnapshotChunk` fixture that set every serialized field
+of every type they carry to a distinct non-zero value (`Message.Origin`, which
+never crosses the wire, stays zero), so a change to field order, width or
+offset moves it. It is recorded in `pkg/proto/testdata/wire_layout.golden`
+with a `derivation` line; regenerate it with
 `go test ./pkg/proto/ -run TestWireLayoutGolden -update`.
 `scripts/check-wire-version.sh <tag>` fails when the golden differs between
-the tag and HEAD while its `version` line is unchanged; the `release` and
+the tag and HEAD while its `version` line is unchanged. When only the
+fingerprint's derivation changed (a `derivation` line differs, a golden
+without one reading as empty) at the same `version`, the two fingerprints are
+not comparable: it passes only when the pinned encoded fixtures in
+`pkg/proto/testdata/golden/` are unchanged since the tag. The `release` and
 `release-candidate` targets run it against the newest non-alpha `v*` tag and
 skip it when there is none.
 
