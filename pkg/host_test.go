@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2535,6 +2536,143 @@ func TestLoadOrGenerateHostID_PublishesViaTempFile(t *testing.T) {
 		if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
 			t.Errorf("stale=%v: temp file stat err = %v, want not-exist", stale, statErr)
 		}
+	}
+}
+
+// swapHostIDFileOps replaces the host ID publication seam for one test and
+// restores the defaults when the test ends. Tests using it must not run in
+// parallel.
+func swapHostIDFileOps(t *testing.T) {
+	t.Helper()
+	saved := hostIDFileOps
+	t.Cleanup(func() { hostIDFileOps = saved })
+}
+
+func TestWriteHostIDFile_DurableOrder(t *testing.T) {
+	swapHostIDFileOps(t)
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, hostIDTempFileName)
+	idPath := filepath.Join(dir, hostIDFileName)
+
+	var steps []string
+	var syncedContents, renamedContents, publishedContents string
+	defaults := hostIDFileOps
+	hostIDFileOps.openFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		steps = append(steps, "open")
+		return defaults.openFile(name, flag, perm)
+	}
+	hostIDFileOps.write = func(f *os.File, s string) (int, error) {
+		steps = append(steps, "write")
+		return defaults.write(f, s)
+	}
+	hostIDFileOps.sync = func(f *os.File) error {
+		if err := defaults.sync(f); err != nil {
+			return err
+		}
+		steps = append(steps, "sync")
+		data, err := os.ReadFile(tmpPath)
+		if err != nil {
+			t.Errorf("read temp file after sync: %v", err)
+		}
+		syncedContents = string(data)
+		return nil
+	}
+	hostIDFileOps.rename = func(oldpath, newpath string) error {
+		steps = append(steps, "rename")
+		if oldpath != tmpPath || newpath != idPath {
+			t.Errorf("rename(%q, %q), want (%q, %q)", oldpath, newpath, tmpPath, idPath)
+		}
+		data, err := os.ReadFile(oldpath)
+		if err != nil {
+			t.Errorf("read temp file before rename: %v", err)
+		}
+		renamedContents = string(data)
+		if _, statErr := os.Stat(newpath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("host.id exists before rename: stat err = %v", statErr)
+		}
+		return defaults.rename(oldpath, newpath)
+	}
+	hostIDFileOps.syncDir = func(d string) error {
+		steps = append(steps, "syncDir")
+		if d != dir {
+			t.Errorf("syncDir(%q), want %q", d, dir)
+		}
+		data, err := os.ReadFile(idPath)
+		if err != nil {
+			t.Errorf("read host.id before directory sync: %v", err)
+		}
+		publishedContents = string(data)
+		return defaults.syncDir(d)
+	}
+
+	id, err := loadOrGenerateHostID(slog.Default(), dir, "")
+	if err != nil {
+		t.Fatalf("loadOrGenerateHostID failed: %v", err)
+	}
+	want := []string{"open", "write", "sync", "rename", "syncDir"}
+	if !slices.Equal(steps, want) {
+		t.Fatalf("steps = %v, want %v", steps, want)
+	}
+	if syncedContents != id {
+		t.Errorf("temp file contents at sync = %q, want %q", syncedContents, id)
+	}
+	if renamedContents != id {
+		t.Errorf("temp file contents at rename = %q, want %q", renamedContents, id)
+	}
+	if publishedContents != id {
+		t.Errorf("host.id contents at directory sync = %q, want %q", publishedContents, id)
+	}
+	if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("temp file stat err = %v, want not-exist", statErr)
+	}
+}
+
+func TestWriteHostIDFile_StepFailure(t *testing.T) {
+	injected := errors.New("injected host ID step failure")
+	tests := []struct {
+		name          string
+		inject        func()
+		publishedWant bool
+	}{
+		{name: "open", inject: func() {
+			hostIDFileOps.openFile = func(string, int, os.FileMode) (*os.File, error) { return nil, injected }
+		}},
+		{name: "write", inject: func() {
+			hostIDFileOps.write = func(*os.File, string) (int, error) { return 0, injected }
+		}},
+		{name: "sync", inject: func() {
+			hostIDFileOps.sync = func(*os.File) error { return injected }
+		}},
+		{name: "rename", inject: func() {
+			hostIDFileOps.rename = func(string, string) error { return injected }
+		}},
+		{name: "syncDir", publishedWant: true, inject: func() {
+			hostIDFileOps.syncDir = func(string) error { return injected }
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			swapHostIDFileOps(t)
+			tc.inject()
+			dir := t.TempDir()
+			_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+			assertHostIDInitError(t, err)
+			if !errors.Is(err, injected) {
+				t.Errorf("error = %v, want it to wrap the injected error", err)
+			}
+			tmpPath := filepath.Join(dir, hostIDTempFileName)
+			if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("temp file stat err = %v, want not-exist", statErr)
+			}
+			_, statErr := os.Stat(filepath.Join(dir, hostIDFileName))
+			if tc.publishedWant {
+				if statErr != nil {
+					t.Errorf("host.id stat err = %v, want published file", statErr)
+				}
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("host.id stat err = %v, want not-exist", statErr)
+			}
+		})
 	}
 }
 

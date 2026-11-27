@@ -12342,23 +12342,39 @@ func writeHostIDFile(dir, id string) (err error) {
 	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hostIDFilePerms)
+	f, err := hostIDFileOps.openFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hostIDFilePerms)
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteString(id); err != nil {
+	if _, err := hostIDFileOps.write(f, id); err != nil {
 		return errors.Join(err, f.Close())
 	}
-	if err := f.Sync(); err != nil {
+	if err := hostIDFileOps.sync(f); err != nil {
 		return errors.Join(err, f.Close())
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Join(dir, hostIDFileName)); err != nil {
+	if err := hostIDFileOps.rename(tmp, filepath.Join(dir, hostIDFileName)); err != nil {
 		return err
 	}
-	return fsutil.SyncDir(dir)
+	return hostIDFileOps.syncDir(dir)
+}
+
+// hostIDFileOps holds the filesystem steps writeHostIDFile publishes a host
+// ID through. Tests replace it to record the step order and inject failures.
+var hostIDFileOps = struct {
+	openFile func(name string, flag int, perm os.FileMode) (*os.File, error)
+	write    func(f *os.File, s string) (int, error)
+	sync     func(f *os.File) error
+	rename   func(oldpath, newpath string) error
+	syncDir  func(dir string) error
+}{
+	openFile: os.OpenFile,
+	write:    (*os.File).WriteString,
+	sync:     (*os.File).Sync,
+	rename:   os.Rename,
+	syncDir:  fsutil.SyncDir,
 }
 
 // buildTransportConfig maps a HostConfig into the internal
