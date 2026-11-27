@@ -18,10 +18,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
+	"testing/iotest"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
@@ -137,6 +140,487 @@ func TestImportSnapshot_TransientLogDBFailureDoesNotBlockItsOwnRetry(t *testing.
 		t.Errorf("recorded FileSize %d does not match the %d bytes on disk",
 			rec.FileSize, len(data))
 	}
+}
+
+// flakyRemoveEntriesToDB fails the first n RemoveEntriesTo calls and then
+// behaves exactly like the LogDB it wraps, modelling a transient error while
+// an import advances the log floor after the snapshot is already recorded.
+type flakyRemoveEntriesToDB struct {
+	logdb.LogDB
+	mu        sync.Mutex
+	remaining int
+}
+
+func (d *flakyRemoveEntriesToDB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
+	d.mu.Lock()
+	if d.remaining > 0 {
+		d.remaining--
+		d.mu.Unlock()
+		return errImportTransient
+	}
+	d.mu.Unlock()
+	return d.LogDB.RemoveEntriesTo(shardID, replicaID, index)
+}
+
+// TestImportSnapshot_RemoveEntriesToFailureDoesNotBlockItsOwnRetry: a
+// transient failure while advancing the log floor arrives after the snapshot
+// is recorded. The retry of the same artifact must complete the floor advance
+// rather than be refused as out of date, or the entries at or below the
+// snapshot index stay behind and the next restart fails with a log gap.
+func TestImportSnapshot_RemoveEntriesToFailureDoesNotBlockItsOwnRetry(t *testing.T) {
+	const shardID, replicaID uint64 = 7, 3
+	const index uint64 = 900
+	payload := []byte("DISASTER-RECOVERY-RESTORE")
+
+	cfg := testHostConfig(t)
+	real := memdb.New()
+	db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+	h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	defer h.Close()
+
+	if bsErr := real.SaveBootstrap(shardID, replicaID, logdb.Bootstrap{
+		Addresses: map[uint64]string{replicaID: "127.0.0.1:5000"},
+	}); bsErr != nil {
+		t.Fatalf("SaveBootstrap failed: %v", bsErr)
+	}
+	// The bootstrap entry StartShard writes before an offline import.
+	if seedErr := real.SaveState([]logdb.Update{{
+		ShardID:   shardID,
+		ReplicaID: replicaID,
+		Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+	}}); seedErr != nil {
+		t.Fatalf("seed bootstrap entry: %v", seedErr)
+	}
+
+	artifact := func(term uint64) []byte {
+		return buildSnapshotArtifact(t, index, term, 0, proto.Membership{},
+			snapshotEnvelope(payload))
+	}
+
+	firstErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact(5)))
+	if !errors.Is(firstErr, errImportTransient) {
+		t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+	}
+
+	t.Run("different term at the same index is refused", func(t *testing.T) {
+		err := h.ImportSnapshot(context.Background(), shardID,
+			bytes.NewReader(artifact(6)))
+		var outOfDate *ImportSnapshotOutOfDateError
+		if !errors.As(err, &outOfDate) {
+			t.Fatalf("ImportSnapshot of a different artifact at the recorded index = %v, "+
+				"want *ImportSnapshotOutOfDateError", err)
+		}
+	})
+
+	if retryErr := h.ImportSnapshot(context.Background(), shardID,
+		bytes.NewReader(artifact(5))); retryErr != nil {
+		t.Fatalf("the retry after a RemoveEntriesTo failure was refused: %v; the "+
+			"entries below the recorded snapshot can then never be removed", retryErr)
+	}
+
+	rec, getErr := real.GetSnapshot(shardID, replicaID)
+	if getErr != nil {
+		t.Fatalf("GetSnapshot after the retry: %v", getErr)
+	}
+	if rec.Index != index {
+		t.Fatalf("recorded snapshot Index = %d, want %d", rec.Index, index)
+	}
+	first, count, rangeErr := real.EntryRange(shardID, replicaID)
+	if rangeErr != nil {
+		t.Fatalf("EntryRange after the retry: %v", rangeErr)
+	}
+	if count != 0 && first <= index {
+		t.Fatalf("EntryRange after the retry = (first=%d, count=%d): an entry at or "+
+			"below the snapshot index %d survived", first, count, index)
+	}
+
+	t.Run("completed import is not retried again", func(t *testing.T) {
+		err := h.ImportSnapshot(context.Background(), shardID,
+			bytes.NewReader(artifact(5)))
+		var outOfDate *ImportSnapshotOutOfDateError
+		if !errors.As(err, &outOfDate) {
+			t.Fatalf("re-import after a completed import = %v, "+
+				"want *ImportSnapshotOutOfDateError", err)
+		}
+	})
+}
+
+// importRetryFixture is a host whose first import of artifact (with
+// firstOpts) recorded its snapshot and then failed in RemoveEntriesTo, so the
+// LogDB still holds the bootstrap entry below the recorded snapshot index.
+type importRetryFixture struct {
+	h     *Host
+	real  logdb.LogDB
+	index uint64
+}
+
+const importRetryShard, importRetryReplica uint64 = 7, 3
+
+func newImportRetryFixture(t *testing.T, index uint64, artifact []byte,
+	firstOpts ...ImportOption) *importRetryFixture {
+	t.Helper()
+	real := memdb.New()
+	db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	if bsErr := real.SaveBootstrap(importRetryShard, importRetryReplica, logdb.Bootstrap{
+		Addresses: map[uint64]string{importRetryReplica: "127.0.0.1:5000"},
+	}); bsErr != nil {
+		t.Fatalf("SaveBootstrap failed: %v", bsErr)
+	}
+	if seedErr := real.SaveState([]logdb.Update{{
+		ShardID:   importRetryShard,
+		ReplicaID: importRetryReplica,
+		Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+	}}); seedErr != nil {
+		t.Fatalf("seed bootstrap entry: %v", seedErr)
+	}
+	firstErr := h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact), firstOpts...)
+	if !errors.Is(firstErr, errImportTransient) {
+		t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+	}
+	return &importRetryFixture{h: h, real: real, index: index}
+}
+
+// recorded returns the recorded snapshot's membership.
+func (f *importRetryFixture) recorded(t *testing.T) logdb.Membership {
+	t.Helper()
+	rec, err := f.real.GetSnapshot(importRetryShard, importRetryReplica)
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+	return rec.Membership
+}
+
+// requireFloorUntouched fails unless an entry at or below the recorded
+// snapshot index is still in the LogDB.
+func (f *importRetryFixture) requireFloorUntouched(t *testing.T) {
+	t.Helper()
+	first, count, err := f.real.EntryRange(importRetryShard, importRetryReplica)
+	if err != nil {
+		t.Fatalf("EntryRange: %v", err)
+	}
+	if count == 0 || first > f.index {
+		t.Fatalf("EntryRange = (first=%d, count=%d): the refused retry advanced the "+
+			"log floor past the snapshot index %d", first, count, f.index)
+	}
+}
+
+// TestImportSnapshot_RetryWithChangedMembershipIsRefused checks that the
+// retry of an import that recorded its snapshot is only completed when it
+// resolves the same membership: a retry asking for another membership would
+// otherwise return nil while the shard restarts into the recorded one.
+func TestImportSnapshot_RetryWithChangedMembershipIsRefused(t *testing.T) {
+	const index uint64 = 900
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+	members := map[uint64]string{importRetryReplica: "127.0.0.1:5000"}
+
+	cases := []struct {
+		name  string
+		first []ImportOption
+		retry []ImportOption
+	}{
+		{
+			name:  "changed members",
+			first: []ImportOption{WithImportMembership(members)},
+			retry: []ImportOption{WithImportMembership(map[uint64]string{
+				importRetryReplica: "127.0.0.1:6000",
+			})},
+		},
+		{
+			name:  "changed identities",
+			first: []ImportOption{WithImportMembership(members)},
+			retry: []ImportOption{
+				WithImportMembership(members),
+				WithImportMemberIdentities(map[uint64]string{importRetryReplica: "node-retry"}),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newImportRetryFixture(t, index, artifact, tc.first...)
+			before := f.recorded(t)
+
+			err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+				bytes.NewReader(artifact), tc.retry...)
+			var outOfDate *ImportSnapshotOutOfDateError
+			if !errors.As(err, &outOfDate) {
+				t.Fatalf("retry with a changed membership = %v, "+
+					"want *ImportSnapshotOutOfDateError", err)
+			}
+			if after := f.recorded(t); !reflect.DeepEqual(after, before) {
+				t.Fatalf("recorded membership changed by a refused retry: %+v, want %+v",
+					after, before)
+			}
+			f.requireFloorUntouched(t)
+		})
+	}
+}
+
+// TestImportSnapshot_RetryWithMalformedArtifactIsRefused checks that the
+// retry of an import that recorded its snapshot verifies the whole artifact
+// before it advances the log floor: a stream with a matching header and a
+// truncated, damaged or unreadable body is not the artifact that was recorded.
+func TestImportSnapshot_RetryWithMalformedArtifactIsRefused(t *testing.T) {
+	const index uint64 = 900
+	full := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+	hdr, err := marshalSnapshotArtifactHeader(snapshotArtifactHeader{Index: index, Term: 5})
+	if err != nil {
+		t.Fatalf("marshalSnapshotArtifactHeader: %v", err)
+	}
+	flipped := bytes.Clone(full)
+	flipped[len(hdr)+2] ^= 0xff
+	errRead := errors.New("artifact source failed")
+
+	cases := []struct {
+		name string
+		r    func() io.Reader
+	}{
+		{"header only", func() io.Reader { return bytes.NewReader(full[:len(hdr)]) }},
+		{"flipped payload byte", func() io.Reader { return bytes.NewReader(flipped) }},
+		{"no trailer", func() io.Reader {
+			return bytes.NewReader(full[:len(full)-snapshotArtifactTrailerSize])
+		}},
+		{"reader error", func() io.Reader {
+			return io.MultiReader(bytes.NewReader(full[:len(hdr)+4]), iotest.ErrReader(errRead))
+		}},
+	}
+	f := newImportRetryFixture(t, index, full)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+				tc.r()); err == nil {
+				t.Fatal("retry with a malformed artifact returned nil")
+			}
+			f.requireFloorUntouched(t)
+		})
+	}
+
+	if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(full)); err != nil {
+		t.Fatalf("retry with the intact artifact after the refusals: %v", err)
+	}
+}
+
+// TestImportSnapshot_RetryWithDifferentPayloadIsRefused: a retry whose
+// header matches the recorded snapshot (Index, Term, OnDiskIndex,
+// membership) but whose payload differs, with a valid trailer of its own, is
+// a different artifact. Completing it would report success for a restore
+// whose bytes were never adopted; it is refused, the floor stays where it
+// was, and the retry of the recorded artifact still completes.
+func TestImportSnapshot_RetryWithDifferentPayloadIsRefused(t *testing.T) {
+	const index uint64 = 900
+	artifact := func(payload string) []byte {
+		return buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+			snapshotEnvelope([]byte(payload)))
+	}
+	f := newImportRetryFixture(t, index, artifact("DISASTER-RECOVERY-RESTORE"))
+
+	err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact("A-DIFFERENT-RESTORE-PAYLOAD")))
+	var outOfDate *ImportSnapshotOutOfDateError
+	if !errors.As(err, &outOfDate) {
+		t.Fatalf("retry with a different payload = %v, want *ImportSnapshotOutOfDateError", err)
+	}
+	f.requireFloorUntouched(t)
+
+	if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact("DISASTER-RECOVERY-RESTORE"))); err != nil {
+		t.Fatalf("retry with the recorded artifact after the refusal: %v", err)
+	}
+}
+
+// TestImportSnapshot_RetryWithEmptyEntryRangeCompletes: the pending floor
+// advance is recorded explicitly, not inferred from the log. A shard whose
+// log holds no entry at all (bootstrap only) still has a floor advance
+// pending after RemoveEntriesTo fails, and the identical retry completes it.
+func TestImportSnapshot_RetryWithEmptyEntryRangeCompletes(t *testing.T) {
+	const index uint64 = 900
+	real := memdb.New()
+	db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	if bsErr := real.SaveBootstrap(importRetryShard, importRetryReplica, logdb.Bootstrap{
+		Addresses: map[uint64]string{importRetryReplica: "127.0.0.1:5000"},
+	}); bsErr != nil {
+		t.Fatalf("SaveBootstrap failed: %v", bsErr)
+	}
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+
+	firstErr := h.ImportSnapshot(context.Background(), importRetryShard, bytes.NewReader(artifact))
+	if !errors.Is(firstErr, errImportTransient) {
+		t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+	}
+	if err := h.ImportSnapshot(context.Background(), importRetryShard,
+		bytes.NewReader(artifact)); err != nil {
+		t.Fatalf("retry with an empty entry range was refused: %v", err)
+	}
+	err = h.ImportSnapshot(context.Background(), importRetryShard, bytes.NewReader(artifact))
+	var outOfDate *ImportSnapshotOutOfDateError
+	if !errors.As(err, &outOfDate) {
+		t.Fatalf("re-import after the completed retry = %v, want *ImportSnapshotOutOfDateError", err)
+	}
+}
+
+// TestImportSnapshot_CleanupFailureAfterDurableFloorSucceeds covers the step
+// after the log floor has advanced durably: removing the floor-pending marker
+// and fsyncing the snapshot directory. A failure there must not fail the
+// import. Once the marker is gone a retry has nothing left to complete and is
+// refused as out of date, so an error at this point would report a completed
+// import as failed with no way to make it succeed.
+func TestImportSnapshot_CleanupFailureAfterDurableFloorSucceeds(t *testing.T) {
+	const index uint64 = 900
+	tests := []struct {
+		name string
+		// failRemove selects the operation that fails: the marker's removal
+		// itself, or the directory fsync that follows it.
+		failRemove bool
+	}{
+		{name: "marker removal fails", failRemove: true},
+		{name: "final directory fsync fails", failRemove: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testHostConfig(t)
+			db := memdb.New()
+			cfs := newCrashFS(cfg.NodeHostDir)
+			h, err := NewHost(cfg, WithLogDB(db), WithoutTransport(), withSnapshotFS(cfs), WithoutEncryption())
+			if err != nil {
+				t.Fatalf("NewHost failed: %v", err)
+			}
+			t.Cleanup(func() { _ = h.Close() })
+			if bsErr := db.SaveBootstrap(importRetryShard, importRetryReplica, logdb.Bootstrap{
+				Addresses: map[uint64]string{importRetryReplica: "127.0.0.1:5000"},
+			}); bsErr != nil {
+				t.Fatalf("SaveBootstrap failed: %v", bsErr)
+			}
+			if seedErr := db.SaveState([]logdb.Update{{
+				ShardID:   importRetryShard,
+				ReplicaID: importRetryReplica,
+				Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+			}}); seedErr != nil {
+				t.Fatalf("seed bootstrap entry: %v", seedErr)
+			}
+			base := shardSnapshotBaseDir(cfg.NodeHostDir, "", importRetryShard)
+			snapDir := engine.SnapshotSaveDir(base, importRetryShard, importRetryReplica, index)
+			marker := filepath.Join(snapDir, importFloorPendingFile)
+
+			removed := false
+			cfs.setHook(func(op crashOp, path string) error {
+				switch {
+				case op == opRemove && path == marker:
+					if tt.failRemove {
+						return errImportTransient
+					}
+					removed = true
+				case op == opDirSync && path == snapDir && removed:
+					return errImportTransient
+				}
+				return nil
+			})
+			artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+				snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+			if err := h.ImportSnapshot(context.Background(), importRetryShard,
+				bytes.NewReader(artifact)); err != nil {
+				t.Fatalf("ImportSnapshot with a cleanup failure after the durable floor "+
+					"advance = %v, want nil", err)
+			}
+			cfs.setHook(nil)
+			first, count, rangeErr := db.EntryRange(importRetryShard, importRetryReplica)
+			if rangeErr != nil {
+				t.Fatalf("EntryRange: %v", rangeErr)
+			}
+			if count != 0 && first <= index {
+				t.Fatalf("EntryRange = (first=%d, count=%d): the floor did not advance "+
+					"past %d", first, count, index)
+			}
+		})
+	}
+}
+
+// TestImportSnapshot_RetryWithChangedLayoutIsRefused retries an import whose
+// floor advance failed with layout options that contradict the recorded
+// snapshot directory. The retry must be refused exactly as a fresh import
+// with those options is, and must not advance the floor.
+func TestImportSnapshot_RetryWithChangedLayoutIsRefused(t *testing.T) {
+	const index uint64 = 900
+	artifact := buildSnapshotArtifact(t, index, 5, 0, proto.Membership{},
+		snapshotEnvelope([]byte("DISASTER-RECOVERY-RESTORE")))
+
+	t.Run("with bootstrap metadata", func(t *testing.T) {
+		f := newImportRetryFixture(t, index, artifact)
+		err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(t.TempDir()))
+		var mismatch *ImportDataDirMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("retry with a contradictory WithImportDataDir = %v, "+
+				"want *ImportDataDirMismatchError", err)
+		}
+		f.requireFloorUntouched(t)
+		if err := f.h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact)); err != nil {
+			t.Fatalf("retry with the recorded layout = %v, want nil", err)
+		}
+	})
+
+	t.Run("without bootstrap metadata", func(t *testing.T) {
+		real := memdb.New()
+		db := &flakyRemoveEntriesToDB{LogDB: real, remaining: 1}
+		h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(), WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost failed: %v", err)
+		}
+		t.Cleanup(func() { _ = h.Close() })
+		if seedErr := real.SaveState([]logdb.Update{{
+			ShardID:   importRetryShard,
+			ReplicaID: importRetryReplica,
+			Entries:   []logdb.Entry{{Index: 1, Term: 1}},
+		}}); seedErr != nil {
+			t.Fatalf("seed entry: %v", seedErr)
+		}
+		f := &importRetryFixture{h: h, real: real, index: index}
+		recordedDir := t.TempDir()
+		firstErr := h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(recordedDir))
+		if !errors.Is(firstErr, errImportTransient) {
+			t.Fatalf("first ImportSnapshot error = %v, want the transient LogDB error", firstErr)
+		}
+
+		err = h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(t.TempDir()))
+		var mismatch *ImportDataDirMismatchError
+		if !errors.As(err, &mismatch) {
+			t.Fatalf("retry with a contradictory WithImportDataDir = %v, "+
+				"want *ImportDataDirMismatchError", err)
+		}
+		f.requireFloorUntouched(t)
+
+		err = h.ImportSnapshot(context.Background(), importRetryShard, bytes.NewReader(artifact))
+		var unknown *ImportLayoutUnknownError
+		if !errors.As(err, &unknown) {
+			t.Fatalf("retry without WithImportDataDir = %v, want *ImportLayoutUnknownError", err)
+		}
+		f.requireFloorUntouched(t)
+
+		if err := h.ImportSnapshot(context.Background(), importRetryShard,
+			bytes.NewReader(artifact), WithImportDataDir(recordedDir)); err != nil {
+			t.Fatalf("retry with the recorded layout = %v, want nil", err)
+		}
+	})
 }
 
 // TestImportSnapshot_PostPublishFailuresRollBackThePublish covers the other two
