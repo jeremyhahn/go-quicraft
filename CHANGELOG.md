@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- StartShard racing StopShard of the same shard (#1235) no longer leaves per-shard metric series or member addresses registered for the stopped shard; StartShard returns `ErrClosed` in that case. No API, wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

@@ -5688,6 +5688,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// teardown and owns it; this call must not tear the shard down a second
 	// time. It must still UNDO its own publication into the engine, because the
 	// claimant's UnloadNode ran before LoadNode and could not have removed it.
+	//
+	// A StopShard that claims teardown after this check is handled by the
+	// metrics and registry registration below, which runs under ns.nodesMu
+	// and re-checks ns.stopped there.
 	if h.closed.Load() || h.draining.Load() || ns.stopped.Load() {
 		if ns.stopped.CompareAndSwap(false, true) {
 			// ErrClosed is the caller's answer here — the shard never became
@@ -5709,16 +5713,33 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		hook(cfg.ShardID)
 	}
 
+	// Register metrics and member addresses under ns.nodesMu, and only while
+	// the shard is not stopped. A StopShard that claims teardown AFTER the
+	// check above would otherwise run its registry Remove loop and
+	// UnregisterShard before this registration, leaving metric series and
+	// member addresses behind for a shard that no longer exists. Teardown
+	// takes ns.nodesMu only after its ns.stopped CAS, so either the CAS came
+	// first and the re-check below sees it, or teardown's removal runs after
+	// this unlock and removes what was registered here. On the stopped path
+	// the claimant owns the shard: the check above saw stopped false, so its
+	// UnloadNode runs after LoadNode and there is nothing to undo.
+	ns.nodesMu.Lock()
+	if ns.stopped.Load() {
+		ns.nodesMu.Unlock()
+		h.logger.Warn("shard start aborted: host is closing or the shard was stopped",
+			"shard_id", cfg.ShardID, "replica_id", cfg.ReplicaID)
+		return ErrClosed
+	}
 	// Pre-bind metrics for this shard to avoid expensive label lookups
 	// in hot paths. This must be called before any metrics are recorded.
 	if h.metrics != nil {
 		h.metrics.RegisterShard(cfg.ShardID)
 	}
-
 	// Register all members in the registry for address resolution.
 	for replicaID, addr := range effectiveNodes {
 		h.registry.Register(cfg.ShardID, replicaID, addr)
 	}
+	ns.nodesMu.Unlock()
 
 	// Notify the engine that this shard has work so the Raft peer
 	// can begin election or heartbeat processing.
