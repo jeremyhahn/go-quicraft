@@ -1,4 +1,7 @@
-# ci-template: v1.61 (customized)
+# ci-template: v1.62 pool overflow + v1.61 main-push group on v1.61 (customized)
+# v1.62 (2026-11-27, Tenant Agent order 18:13Z): `Balanced runner pool (ruling 1137)`
+# is the handbook v1.62 step; a public repository whose oldest queued self-hosted
+# job waited past WAIT_LIMIT (600 s) goes hosted when hosted has a free slot.
 # v1.61: each push to main gets its own concurrency group, main-push-<sha>, so a later push no longer cancels an earlier commit's run.
 # v1.60: a selection tie goes self-hosted; preflight and the selection go self-hosted only on a push to main or a same-repository pull request (the rule landed in #1207).
 # LOCAL against v1.60 (kept on purpose):
@@ -936,6 +939,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           JOB_TOKEN: ${{ github.token }}
           HS: ${{ vars.CI_HOSTED_SHARE }}
+          PRIVATE: ${{ github.event.repository.private }}
+          WAIT_LIMIT: 600
           C1: ${{ vars.CI_SELF_HOSTED_BIGDISK }}
           C2: ${{ vars.CI_SELF_HOSTED_BIGDISK_DOCKER }}
         run: |
@@ -1028,11 +1033,15 @@ jobs:
           done
           # H, S1, S2: hosted, bigdisk (not bigdisk-docker) and bigdisk-docker
           # jobs in progress plus queued; HQ, SQ: the queued hosted and
-          # self-hosted (both kinds) ones. A job of this run is not counted.
-          read -r H S1 S2 HQ SQ < <(jq -rs --argjson run "$RUN_ID" '
+          # self-hosted (both kinds) ones; W1, W2: the seconds the oldest
+          # queued bigdisk and bigdisk-docker job has waited (0 for none,
+          # v1.62). A job of this run is not counted.
+          read -r H S1 S2 HQ SQ W1 W2 < <(jq -rs --argjson run "$RUN_ID" --argjson now "$(date -u +%s)" '
               [.[] | select(.run_id != $run and (.status == "queued" or .status == "in_progress"))
                    | (.labels // []) as $l
                    | {q: (.status == "queued"),
+                      w: ((try (.created_at | sub("\\.[0-9]+"; "") | fromdateiso8601) catch $now) as $c
+                          | if $now > $c then ($now - $c | floor) else 0 end),
                       p: (if ($l | any(. == "self-hosted")) then
                             (if ($l | any(. == "bigdisk-docker")) then "s2"
                              elif ($l | any(. == "bigdisk")) then "s1" else "x" end)
@@ -1040,10 +1049,12 @@ jobs:
                           else "x" end)}] as $j
               | def n(f): $j | map(select(f)) | length;
               [n(.p == "h"), n(.p == "s1"), n(.p == "s2"), n(.p == "h" and .q),
-               n((.p == "s1" or .p == "s2") and .q)]
+               n((.p == "s1" or .p == "s2") and .q),
+               ([$j[] | select(.p == "s1" and .q) | .w] | max // 0),
+               ([$j[] | select(.p == "s2" and .q) | .w] | max // 0)]
               | map(tostring) | join(" ")' "$RUNNER_TEMP/sel-jobs.jsonl") || hosted "the job list could not be counted"
-          [ -n "${SQ:-}" ] || hosted "the job list could not be counted"
-          echo "this repository: hosted $H of CI_HOSTED_SHARE=$HS ($HQ queued); bigdisk $S1 of CI_SELF_HOSTED_BIGDISK=$C1, bigdisk-docker $S2 of CI_SELF_HOSTED_BIGDISK_DOCKER=$C2 ($SQ self-hosted queued)"
+          [ -n "${W2:-}" ] || hosted "the job list could not be counted"
+          echo "this repository: hosted $H of CI_HOSTED_SHARE=$HS ($HQ queued); bigdisk $S1 of CI_SELF_HOSTED_BIGDISK=$C1, bigdisk-docker $S2 of CI_SELF_HOSTED_BIGDISK_DOCKER=$C2 ($SQ self-hosted queued); oldest queued bigdisk ${W1}s, bigdisk-docker ${W2}s"
           # v1.59: a short listing is a lower bound; still choose.
           [ -z "$SHORT" ] || echo "::notice::runner selection: the listing returned fewer entries than its total ($SHORT); the counts are a lower bound and the choice below uses them (ci-template v1.59)"
           pick=hosted hfull=0 sfull=0
@@ -1056,6 +1067,10 @@ jobs:
             pick=self; why="the hosted pool is full ($H of $HS)"
           elif [ "$sfull" = 1 ]; then
             why="the self-hosted pool is full (bigdisk $S1 of $C1, bigdisk-docker $S2 of $C2)"
+          elif [ "${PRIVATE:-}" = false ] && { [ "$W1" -gt "$WAIT_LIMIT" ] || [ "$W2" -gt "$WAIT_LIMIT" ]; }; then
+            # v1.62 overflow: a self-hosted wait past WAIT_LIMIT with a free
+            # hosted slot goes hosted (public repositories, no spend).
+            why="overflow: the oldest queued self-hosted job waited past ${WAIT_LIMIT}s (bigdisk ${W1}s, bigdisk-docker ${W2}s) and hosted has a free slot ($H of $HS) (ci-template v1.62)"
           else
             # self-hosted use, max(S1/C1, S2/C2), at or below hosted use H/HS.
             [ $((S1 * HS)) -le $((H * C1)) ] && [ $((S2 * HS)) -le $((H * C2)) ] && pick=self
