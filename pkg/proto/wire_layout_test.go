@@ -15,6 +15,7 @@
 package proto
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -308,6 +309,19 @@ func swapWireRange(b []byte, i, j, n int) []byte {
 	return out
 }
 
+// wireUint64Offset returns the offset of the one little-endian eight-byte
+// encoding of v in b, so a mutation can find a field by its distinct fixture
+// value. It panics unless v occurs exactly once.
+func wireUint64Offset(b []byte, v uint64) int {
+	var enc [8]byte
+	binary.LittleEndian.PutUint64(enc[:], v)
+	i := bytes.Index(b, enc[:])
+	if i < 0 || bytes.Index(b[i+1:], enc[:]) >= 0 {
+		panic(fmt.Sprintf("wire fixture value %d does not occur exactly once", v))
+	}
+	return i
+}
+
 // insertWireZeros returns a copy of b with n zero bytes inserted at off.
 func insertWireZeros(b []byte, off, n int) []byte {
 	out := make([]byte, 0, len(b)+n)
@@ -358,6 +372,23 @@ func TestWireFingerprintCatchesEncodingOnlyChange(t *testing.T) {
 				return b
 			}
 			return swapWireRange(b, 0, 8, 8)
+		}},
+		{"swap Membership RequireFullReplicaMajority and WireVersion", func(name string, b []byte) []byte {
+			if name != "SnapshotChunk" {
+				return b
+			}
+			// The chunk's Membership starts one format byte before its
+			// ConfigChangeID (base 400 + 1).
+			m := wireUint64Offset(b, 401) - 1
+			return swapWireRange(b, m+17, m+wireVersionOffset, 8)
+		}},
+		{"swap SnapshotChunk HasFileInfo and BinVer", func(name string, b []byte) []byte {
+			if name != "SnapshotChunk" {
+				return b
+			}
+			// HasFileInfo follows FileChunkCount (310); BinVer precedes
+			// Epoch (315).
+			return swapWireRange(b, wireUint64Offset(b, 310)+8, wireUint64Offset(b, 315)-8, 8)
 		}},
 	}
 	for _, m := range mutations {
