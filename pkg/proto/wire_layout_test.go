@@ -122,3 +122,76 @@ func TestWireLayoutCoversEmbeddedTypes(t *testing.T) {
 		}
 	}
 }
+
+// wireFingerprintWith returns the wire layout fingerprint, applying mutate to
+// each fixture's encoded bytes first when it is non-nil.
+func wireFingerprintWith(mutate func(name string, b []byte) []byte) string {
+	_ = mutate
+	sum := sha256.Sum256([]byte(strings.Join(wireLayout(), "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+// swapWireRange returns a copy of b with the n-byte ranges at i and j swapped.
+func swapWireRange(b []byte, i, j, n int) []byte {
+	out := append([]byte(nil), b...)
+	copy(out[i:i+n], b[j:j+n])
+	copy(out[j:j+n], b[i:i+n])
+	return out
+}
+
+// insertWireZeros returns a copy of b with n zero bytes inserted at off.
+func insertWireZeros(b []byte, off, n int) []byte {
+	out := make([]byte, 0, len(b)+n)
+	out = append(out, b[:off]...)
+	out = append(out, make([]byte, n)...)
+	return append(out, b[off:]...)
+}
+
+// TestWireFingerprintCatchesEncodingOnlyChange: a change to the encoded bytes
+// that leaves every Go struct untouched (field order, field width) moves the
+// fingerprint.
+func TestWireFingerprintCatchesEncodingOnlyChange(t *testing.T) {
+	golden, err := os.ReadFile(wireLayoutGolden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded string
+	for _, l := range strings.Split(string(golden), "\n") {
+		if s, ok := strings.CutPrefix(l, "sha256 "); ok {
+			recorded = s
+		}
+	}
+	base := wireFingerprintWith(nil)
+	mutations := []struct {
+		name   string
+		mutate func(name string, b []byte) []byte
+	}{
+		{"swap MessageBatch DeploymentID and SourceEpoch", func(name string, b []byte) []byte {
+			if name != "MessageBatch" {
+				return b
+			}
+			return swapWireRange(b, 8, 16, 8)
+		}},
+		{"widen MessageBatch DeploymentID to 12 bytes", func(name string, b []byte) []byte {
+			if name != "MessageBatch" {
+				return b
+			}
+			return insertWireZeros(b, 16, 4)
+		}},
+		{"swap SnapshotChunk ShardID and ReplicaID", func(name string, b []byte) []byte {
+			if name != "SnapshotChunk" {
+				return b
+			}
+			return swapWireRange(b, 0, 8, 8)
+		}},
+	}
+	for _, m := range mutations {
+		got := wireFingerprintWith(m.mutate)
+		if got == base {
+			t.Errorf("%s: fingerprint unchanged from the unmutated encoding", m.name)
+		}
+		if got == recorded {
+			t.Errorf("%s: fingerprint equals the recorded golden", m.name)
+		}
+	}
+}
