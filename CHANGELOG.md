@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- contrib/dragonboat `NodeHost.SyncPropose` with a tracked session and `NodeHost.SyncCloseSession` now report a context deadline or cancellation that ends the wait after submission as `*quicraft.MaybeAppliedError` wrapping `ErrTimeout` / `ErrCanceled` (`quicraft.MaybeApplied` true), as the no-op session path already did. `errors.Is` results are unchanged; no wire or format change. (#1229)
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

@@ -808,6 +808,11 @@ func (nh *NodeHost) StopReplica(shardID, replicaID uint64) error {
 // SyncPropose makes a synchronous proposal through Raft consensus.
 // For no-op sessions, the simpler SyncPropose path is used. For tracked
 // sessions, SyncProposeWithSession handles at-most-once semantics.
+//
+// A context that ends after the proposal was handed to the host is
+// reported with quicraft.MaybeApplied true (a *quicraft.MaybeAppliedError
+// wrapping ErrTimeout or ErrCanceled) for both session kinds: the entry
+// may still commit and apply.
 func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, cmd []byte) (dbSM.Result, error) {
 	if err := checkContextDeadline(ctx); err != nil {
 		return dbSM.Result{}, err
@@ -855,10 +860,13 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 		}
 		return dbSM.Result{Value: result.Value, Data: result.Data}, nil
 	case <-ctx.Done():
+		// The proposal was already handed to the host and may still
+		// commit and apply: report the lost wait as maybe-applied, as the
+		// no-op session path does.
 		if ctx.Err() == context.DeadlineExceeded {
-			return dbSM.Result{}, ErrTimeout
+			return dbSM.Result{}, &quicraft.MaybeAppliedError{Err: ErrTimeout}
 		}
-		return dbSM.Result{}, ErrCanceled
+		return dbSM.Result{}, &quicraft.MaybeAppliedError{Err: ErrCanceled}
 	}
 }
 
@@ -910,7 +918,10 @@ func (nh *NodeHost) SyncGetSession(ctx context.Context, shardID uint64) (*dbClie
 
 // SyncCloseSession closes a client session by proposing unregistration
 // through Raft consensus. Blocks until the session is closed or the
-// context is canceled.
+// context is canceled. A context that ends after the request was handed
+// to the host is reported with quicraft.MaybeApplied true (a
+// *quicraft.MaybeAppliedError wrapping ErrTimeout or ErrCanceled): the
+// unregistration may still apply.
 func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) error {
 	if err := checkContextDeadline(ctx); err != nil {
 		return err
@@ -929,10 +940,12 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) 
 		}
 		return validateCloseSessionResult(result.Value, cs.ClientID())
 	case <-ctx.Done():
+		// The close request was already handed to the host and may still
+		// apply: report the lost wait as maybe-applied.
 		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
+			return &quicraft.MaybeAppliedError{Err: ErrTimeout}
 		}
-		return ErrCanceled
+		return &quicraft.MaybeAppliedError{Err: ErrCanceled}
 	}
 }
 
