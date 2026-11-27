@@ -257,8 +257,17 @@ type Aggregator struct {
 	// held behind a busy shard, or in flight. submit refuses a shard already
 	// at QueueSize, so a shard whose propose stalls hits QueueFullError
 	// instead of accumulating held batches without bound, while every other
-	// shard keeps its own budget. Protected by shardMu.
+	// shard keeps its own budget within the aggregate bound (totalPending).
+	// Protected by shardMu.
 	shardPending map[uint64]int
+	// totalPending is the sum of shardPending over every shard. flushLoop
+	// keeps draining the shared queue into held batches, so a per-shard
+	// limit alone would let a quorum outage across many shards accumulate
+	// QueueSize proposals per stalled shard. submit also refuses once
+	// totalPending reaches pendingLimit (QueueSize plus one batch), which
+	// bounds outstanding proposals in aggregate. Protected by shardMu.
+	totalPending int
+	pendingLimit int
 
 	// Metrics.
 	metrics     *aggregatorMetrics
@@ -292,6 +301,7 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 	}
 
 	a.queue = make(chan *proposal, a.cfg.QueueSize)
+	a.pendingLimit = a.cfg.QueueSize + a.cfg.MaxBatchSize
 	a.currentBatch = make([]*proposal, 0, a.cfg.MaxBatchSize)
 
 	a.initMetrics()
@@ -367,11 +377,12 @@ func (a *Aggregator) submit(ctx context.Context, shardID uint64, data []byte) er
 	}
 
 	a.shardMu.Lock()
-	if a.shardPending[shardID] >= a.cfg.QueueSize {
+	if a.shardPending[shardID] >= a.cfg.QueueSize || a.totalPending >= a.pendingLimit {
 		a.shardMu.Unlock()
 		return &QueueFullError{QueueSize: a.cfg.QueueSize}
 	}
 	a.shardPending[shardID]++
+	a.totalPending++
 	a.shardMu.Unlock()
 
 	select {
@@ -389,6 +400,7 @@ func (a *Aggregator) submit(ctx context.Context, shardID uint64, data []byte) er
 // budget, deleting the key once the shard has none outstanding.
 func (a *Aggregator) releasePending(shardID uint64, n int) {
 	a.shardMu.Lock()
+	a.totalPending -= n
 	if left := a.shardPending[shardID] - n; left > 0 {
 		a.shardPending[shardID] = left
 	} else {
