@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- contrib/dragonboat: `WrapCreateFunc`, `WrapConcurrentCreateFunc` and `WrapOnDiskCreateFunc` return nil for a nil create result, so starting the replica fails with `ErrInvalidSMType` instead of the shard panicking on first use; no wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
