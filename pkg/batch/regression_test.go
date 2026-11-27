@@ -1026,18 +1026,15 @@ func TestSubmit_BlockedShardReturnsQueueFull(t *testing.T) {
 }
 
 // stallAllProposer blocks every shard's propose until release is closed,
-// modelling a quorum outage that affects many shards at once.
+// ignoring the propose context, modelling a quorum outage that affects many
+// shards at once.
 type stallAllProposer struct {
 	release chan struct{}
 }
 
-func (s *stallAllProposer) SyncPropose(ctx context.Context, _ uint64, _ []byte) error {
-	select {
-	case <-s.release:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func (s *stallAllProposer) SyncPropose(_ context.Context, _ uint64, _ []byte) error {
+	<-s.release
+	return nil
 }
 
 // TestSubmit_ManyStalledShardsBoundedInAggregate checks that the admission
