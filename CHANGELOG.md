@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Snapshot recovery (#1249): recovery from a snapshot record without a file path now reads only the snapshot directory at the recorded index and refuses with `ErrSnapshotNotFound` when that directory is missing, instead of restoring from the newest directory on disk. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
