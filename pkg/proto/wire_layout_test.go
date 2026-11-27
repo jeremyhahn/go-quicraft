@@ -138,13 +138,35 @@ func wireFingerprintFixtures() []wireFixture {
 		Epoch:        315,
 		Data:         data,
 	}
-	return []wireFixture{{"MessageBatch", batch}, {"SnapshotChunk", chunk}}
+	// The batch's Message sets Reject and a non-empty Snapshot, so Reject
+	// and the derived HasSnapshot flag both encode as 1 there. This one
+	// sets Reject with an empty Snapshot and no entries, so the two flags
+	// differ and a swap of their offsets moves the fingerprint. It is
+	// partial by design and so exempt from the completeness walk.
+	flags := &Message{
+		Type:      ReplicateResp,
+		From:      511,
+		To:        512,
+		ShardID:   513,
+		ReplicaID: 514,
+		Term:      515,
+		LogTerm:   516,
+		LogIndex:  517,
+		Commit:    518,
+		Reject:    true,
+		Hint:      519,
+	}
+	return []wireFixture{{"MessageBatch", batch}, {"SnapshotChunk", chunk}, {wireFlagsFixture, flags}}
 }
+
+// wireFlagsFixture names the partial Message fixture whose Reject and
+// HasSnapshot flags differ; TestWireFingerprintFixturesComplete skips it.
+const wireFlagsFixture = "Message"
 
 // wireLayoutGoldenContent is the golden file this build would write.
 func wireLayoutGoldenContent() string {
-	return fmt.Sprintf("# Raft wire layout fingerprint: SHA-256 of the encoded MessageBatch and\n"+
-		"# SnapshotChunk fixtures in wire_layout_test.go. Regenerate with\n"+
+	return fmt.Sprintf("# Raft wire layout fingerprint: SHA-256 of the encoded MessageBatch,\n"+
+		"# SnapshotChunk and Message fixtures in wire_layout_test.go. Regenerate with\n"+
 		"#   go test ./pkg/proto/ -run TestWireLayoutGolden -update\n"+
 		"# and, from v1.0.0-rc.1 on, bump WireVersion in the same release when it moves.\n"+
 		"version %d\nderivation encoded-fixtures\nsha256 %s\n", WireVersion, wireFingerprintWith(nil))
@@ -270,6 +292,13 @@ func TestWireFingerprintFixturesComplete(t *testing.T) {
 		}
 	}
 	for _, f := range wireFingerprintFixtures() {
+		if f.name == wireFlagsFixture {
+			m, ok := f.value.(*Message)
+			if !ok || m.Reject == !m.Snapshot.IsEmpty() {
+				t.Errorf("%s: Reject and HasSnapshot must encode differently", f.name)
+			}
+			continue
+		}
 		walk(f.name, "", reflect.ValueOf(f.value))
 	}
 }
@@ -408,7 +437,7 @@ func TestWireFingerprintCatchesEncodingOnlyChange(t *testing.T) {
 			return swapWireRange(b, wireUint64Offset(b, 310)+8, wireUint64Offset(b, 315)-8, 8)
 		}},
 		{"swap Message Reject and HasSnapshot", func(name string, b []byte) []byte {
-			if name != "Message" {
+			if name != wireFlagsFixture {
 				return b
 			}
 			// Reject precedes Hint (519); with no entries, HasSnapshot

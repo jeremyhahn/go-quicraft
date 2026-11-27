@@ -1,7 +1,7 @@
-# Raft wire layout fingerprint: SHA-256 of the encoded MessageBatch and
-# SnapshotChunk fixtures in wire_layout_test.go. Regenerate with
+# Raft wire layout fingerprint: SHA-256 of the encoded MessageBatch,
+# SnapshotChunk and Message fixtures in wire_layout_test.go. Regenerate with
 #   go test ./pkg/proto/ -run TestWireLayoutGolden -update
 # and, from v1.0.0-rc.1 on, bump WireVersion in the same release when it moves.
 version 1
 derivation encoded-fixtures
-sha256 b2e071a1535b64b0dd1ce84ad955e96f16ba4cf371669fd97406c53924c299d8
+sha256 28b9142a380d437c1f2efd5ed388bcbd0bfce5ce5fe7e6f302a71be6cad62a36
