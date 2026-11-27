@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `ImportSnapshot` (#1232): an import that failed after recording the snapshot, while advancing the log floor, can now be retried with the same artifact. The retry completes the floor advance and returns nil instead of being refused with `*ImportSnapshotOutOfDateError`; any other artifact at a non-advancing index is still refused. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

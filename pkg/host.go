@@ -9146,6 +9146,30 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	}
 	defer release()
 
+	// Term is floored at 1 (the minimum valid term) so the Raft engine never
+	// treats the imported snapshot as uninitialized. It is computed here, once,
+	// because the retry check below, the staged snapshot.meta and the LogDB
+	// record must all describe this snapshot identically.
+	term := header.Term
+	if term == 0 {
+		term = 1
+	}
+
+	// The retry of an import that recorded this very snapshot and then failed
+	// while advancing the log floor. The snapshot and its directory are already
+	// in place; only the floor advance is left, and no later compaction would
+	// perform it, so the retry completes it instead of being refused below.
+	retry, err := h.importAwaitsLogFloor(shardID, replicaID, header.Index, term, header.OnDiskIndex)
+	if err != nil {
+		return err
+	}
+	if retry {
+		if err := ctx.Err(); err != nil {
+			return mapContextError(err)
+		}
+		return h.advanceImportLogFloor(shardID, replicaID, header.Index)
+	}
+
 	// Refuse an artifact that does not ADVANCE the shard's recorded snapshot,
 	// before the tree is touched. Every production LogDB refuses such a save
 	// with logdb.ErrSnapshotOutOfDate, so deferring the check to the final
@@ -9198,15 +9222,6 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	stageDir, tempErr := fsys.MkdirTemp(stageParent, importStageDirPattern)
 	if tempErr != nil {
 		return tempErr
-	}
-
-	// Term is floored at 1 (the minimum valid term) so the Raft engine never
-	// treats the imported snapshot as uninitialized. It is computed here, once,
-	// because the staged snapshot.meta and the LogDB record below must describe
-	// this snapshot identically.
-	term := header.Term
-	if term == 0 {
-		term = 1
 	}
 
 	fileSize, epoch, unpin, stageErr := h.stageImportedArtifact(
@@ -9328,6 +9343,15 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 
 	h.gcShardSnapshots(snapBaseDir, shardID, replicaID)
 
+	return h.advanceImportLogFloor(shardID, replicaID, header.Index)
+}
+
+// advanceImportLogFloor advances the log compaction floor of a stopped shard
+// to the index of the snapshot an import has just recorded, removing every
+// entry at or below it. ImportSnapshot calls it after SaveSnapshot, and again
+// on the retry of an import whose earlier attempt recorded the snapshot but
+// failed here.
+func (h *Host) advanceImportLogFloor(shardID, replicaID, index uint64) error {
 	// Advance the log compaction floor to the imported snapshot index, removing
 	// every entry at or below it.
 	//
@@ -9355,7 +9379,12 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// no follower depending on its pre-snapshot log tail (a follower behind the
 	// snapshot is caught up via InstallSnapshot), so entries below the imported
 	// snapshot index serve no purpose.
-	if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, header.Index); rmErr != nil {
+	//
+	// A failure here is returned: the snapshot is recorded but the floor is not
+	// advanced, and no later compaction would advance it. The operator's retry
+	// of the same artifact is recognised by importAwaitsLogFloor and completes
+	// this step.
+	if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, index); rmErr != nil {
 		return rmErr
 	}
 	// Compact only garbage-collects segments the marker RemoveEntriesTo just
@@ -9363,8 +9392,8 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// and durable: the snapshot is recorded and the compaction floor is set. A
 	// failure here reclaims no space but loses no correctness — and returning it
 	// would report a successful restore as failed, with no way to retry, because
-	// the snapshot index and directory now exist (a re-import of the same artifact
-	// is refused). Log it for the operator instead.
+	// the floor is already advanced (a re-import of the same artifact is then
+	// refused as out of date). Log it for the operator instead.
 	if compactErr := h.logdb.Compact(shardID, replicaID); compactErr != nil {
 		h.logger.Warn("imported snapshot recorded and log floor advanced, but WAL "+
 			"segment garbage collection failed; the restore is complete and the "+
@@ -9533,6 +9562,30 @@ func (h *Host) checkImportAdvancesSnapshot(shardID, replicaID, index uint64) err
 		Index:     index,
 		Recorded:  existing.Index,
 	}
+}
+
+// importAwaitsLogFloor reports whether an import of the snapshot (index, term,
+// onDiskIndex) is the retry of an earlier import that recorded this same
+// snapshot and then failed while advancing the log floor: the recorded
+// snapshot has the same Index, floored Term and OnDiskIndex, and the LogDB
+// still holds an entry at or below that index. Any other artifact at a
+// non-advancing index is left to checkImportAdvancesSnapshot to refuse.
+func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex uint64) (bool, error) {
+	existing, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil {
+		if errors.Is(err, logdb.ErrNoSnapshot) {
+			return false, nil
+		}
+		return false, err
+	}
+	if existing.Index != index || existing.Term != term || existing.OnDiskIndex != onDiskIndex {
+		return false, nil
+	}
+	first, _, err := h.logdb.EntryRange(shardID, replicaID)
+	if err != nil {
+		return false, err
+	}
+	return first != 0 && first <= index, nil
 }
 
 // importSnapshotDir resolves the canonical on-disk directory an imported
