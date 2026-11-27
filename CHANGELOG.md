@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `RemoveData` concurrent with `StopShard` of the same replica (#1234) now returns the retryable `ErrShardNotReady` until the node is unloaded, so the commit worker cannot re-create removed state. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
