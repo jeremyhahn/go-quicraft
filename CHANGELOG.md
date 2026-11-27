@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- contrib/dragonboat: `NodeHostConfig.Validate` and `Prepare` refuse `DefaultNodeRegistryEnabled` with a `*ValidationError` (`Field` `"DefaultNodeRegistryEnabled"`) instead of accepting a setting quicraft ignores, so the mismatch surfaces at `NewNodeHost` rather than at the first `StartReplica` with a NodeHostID target. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

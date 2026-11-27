@@ -62,7 +62,6 @@ func TestCompatFields_ToQuicraftIgnoresCompatibilityOnlyFields(t *testing.T) {
 		{"EnableMetrics", func(c *NodeHostConfig) { c.EnableMetrics = true }},
 		{"MaxSendQueueSize", func(c *NodeHostConfig) { c.MaxSendQueueSize = 1 << 20 }},
 		{"MaxReceiveQueueSize", func(c *NodeHostConfig) { c.MaxReceiveQueueSize = 1 << 20 }},
-		{"DefaultNodeRegistryEnabled", func(c *NodeHostConfig) { c.DefaultNodeRegistryEnabled = true }},
 		{"ExpertEngineCommitShards", func(c *NodeHostConfig) { c.Expert.Engine.CommitShards = 16 }},
 		{"ExpertEngineSnapshotShards", func(c *NodeHostConfig) { c.Expert.Engine.SnapshotShards = 48 }},
 		{"ExpertEngineCloseShards", func(c *NodeHostConfig) { c.Expert.Engine.CloseShards = 32 }},
@@ -71,7 +70,6 @@ func TestCompatFields_ToQuicraftIgnoresCompatibilityOnlyFields(t *testing.T) {
 			c.EnableMetrics = true
 			c.MaxSendQueueSize = 1 << 20
 			c.MaxReceiveQueueSize = 1 << 20
-			c.DefaultNodeRegistryEnabled = true
 			c.Expert.Engine.CommitShards = 16
 			c.Expert.Engine.SnapshotShards = 48
 			c.Expert.Engine.CloseShards = 32
