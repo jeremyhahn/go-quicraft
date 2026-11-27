@@ -8768,6 +8768,66 @@ func TestRemoveData_ShardStopped(t *testing.T) {
 	}
 }
 
+// TestRemoveData_DuringStopShardTeardownIsRefused: a nodeState still in
+// h.nodes with stopped set is a StopShard teardown that has not yet unloaded
+// the node; RemoveData refuses it as transient and removes nothing.
+func TestRemoveData_DuringStopShardTeardownIsRefused(t *testing.T) {
+	h := newTestHost(t)
+	addTestNodeState(h, 1, 1)
+	v, ok := h.nodes.Load(uint64(1))
+	if !ok {
+		t.Fatal("nodeState not loaded")
+	}
+	v.(*nodeState).stopped.Store(true)
+
+	err := h.RemoveData(1, 1)
+	if !errors.Is(err, ErrShardNotReady) {
+		t.Fatalf("RemoveData during teardown: got %v, want ErrShardNotReady", err)
+	}
+	if removed, _ := h.logdb.NodeRemoved(1, 1); removed {
+		t.Fatal("RemoveData during teardown removed the replica's data")
+	}
+}
+
+// TestRemoveData_RacingStopShardRemovesOnlyAfterUnload: RemoveData racing a
+// StopShard of the same replica succeeds only once teardown removed the node.
+func TestRemoveData_RacingStopShardRemovesOnlyAfterUnload(t *testing.T) {
+	h, err := NewHost(testHostConfig(t), WithMemoryLogDB(), WithoutTransport(), WithoutEncryption())
+	if err != nil {
+		t.Fatalf("NewHost: %v", err)
+	}
+	defer h.Close()
+
+	for shard := uint64(1); shard <= 20; shard++ {
+		if err := h.StartShard(map[uint64]string{1: "127.0.0.1:5000"}, false, testCreateFunc, testShardConfig(shard, 1)); err != nil {
+			t.Fatalf("StartShard(%d): %v", shard, err)
+		}
+		stopErr := make(chan error, 1)
+		go func() { stopErr <- h.StopShard(shard) }()
+
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			err := h.RemoveData(shard, 1)
+			if err == nil {
+				if _, loaded := h.nodes.Load(shard); loaded {
+					t.Fatalf("shard %d: RemoveData succeeded while the node was still loaded", shard)
+				}
+				break
+			}
+			if !errors.Is(err, ErrShardNotReady) && !errors.Is(err, ErrShardNotStopped) {
+				t.Fatalf("shard %d: RemoveData: %v", shard, err)
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("shard %d: RemoveData still refused: %v", shard, err)
+			}
+			runtime.Gosched()
+		}
+		if err := <-stopErr; err != nil {
+			t.Fatalf("StopShard(%d): %v", shard, err)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // SyncRemoveData
 // ---------------------------------------------------------------------------
