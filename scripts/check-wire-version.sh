@@ -8,13 +8,21 @@
 # records a fingerprint of the encoded MessageBatch and SnapshotChunk fixtures,
 # how it was derived and the WireVersion it was recorded at. When the
 # fingerprint differs between <last-release-tag> and HEAD while the version line
-# did not move, the wire layout changed without a WireVersion bump: fail. When
-# only the derivation line changed (a tag without one reads as empty), the
-# fingerprints are not comparable: pass only if the pinned encoded fixtures in
-# pkg/proto/testdata/golden/ are unchanged since the tag, else fail.
+# did not move, the wire layout changed without a WireVersion bump: fail.
+#
+# One exception: the one-time move of the fingerprint derivation to
+# encoded-fixtures. Fingerprints across that move are not comparable, so the
+# gate passes it only for the exact verified pair below (the v1.0.0-rc.1
+# baseline, recorded without a derivation line, to the first encoded-fixtures
+# fingerprint), with the version unchanged and the pinned encoded fixtures in
+# pkg/proto/testdata/golden/ unchanged since the tag. Any other fingerprint
+# change without a WireVersion bump fails, including a later encoding change
+# with a regenerated fingerprint.
 set -euo pipefail
 
 golden=pkg/proto/testdata/wire_layout.golden
+migration_from=fbdf0062f194b1a5a23a19f06cf316c4193fcaacd5313f31d175ea347662b899
+migration_to=32334b003809b2c637c1c3ea145143b3beae1b5d6a6cc9e10fe9d9016bb90fc7
 
 if [ $# -ne 1 ] || [ -z "$1" ]; then
 	echo "usage: $0 <last-release-tag>" >&2
@@ -42,7 +50,10 @@ if [ "$old" = "$new" ]; then
 	echo "check-wire-version: wire layout unchanged since $tag ($(line "$new" version))"
 	exit 0
 fi
-if [ "$(line "$old" derivation)" != "$(line "$new" derivation)" ] &&
+if [ "$(line "$old" derivation)" = "" ] &&
+	[ "$(line "$old" sha256)" = "sha256 $migration_from" ] &&
+	[ "$(line "$new" derivation)" = "derivation encoded-fixtures" ] &&
+	[ "$(line "$new" sha256)" = "sha256 $migration_to" ] &&
 	[ "$(line "$old" version)" = "$(line "$new" version)" ] &&
 	git diff --quiet "$tag" HEAD -- pkg/proto/testdata/golden/; then
 	echo "check-wire-version: fingerprint derivation changed since $tag" \

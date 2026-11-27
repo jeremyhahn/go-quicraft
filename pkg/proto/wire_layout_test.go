@@ -66,10 +66,12 @@ func wireFingerprintFixtures() []wireFixture {
 		}
 	}
 	batch := &MessageBatch{
-		BinVer:        WireVersion,
-		DeploymentID:  101,
-		SourceEpoch:   102,
-		MaxBinVer:     WireVersion,
+		BinVer:       WireVersion,
+		DeploymentID: 101,
+		SourceEpoch:  102,
+		// Distinct from BinVer so a swap of their encoder offsets moves the
+		// fingerprint; the fixture is never decoded against a window.
+		MaxBinVer:     103,
 		SourceAddress: "source:9",
 		Requests: []Message{{
 			Type:      Replicate,
@@ -181,14 +183,17 @@ func TestWireFingerprintFixturesComplete(t *testing.T) {
 	excluded := map[string]string{
 		"Message.Origin": "never crosses the wire; set only on the receive or inject path",
 	}
-	// Serialized but pinned to WireVersion, so exempt from distinctness.
+	// Serialized and pinned to WireVersion, so exempt from the distinctness
+	// map, but at most one pinned field per struct type: MaxBinVer is not
+	// pinned, so it must differ from BinVer and a swap of their encoder
+	// offsets moves the fingerprint.
 	pinned := map[string]string{
 		"MessageBatch.BinVer":    "senders stamp WireVersion",
-		"MessageBatch.MaxBinVer": "advertises this build's WireWindow.Current",
 		"SnapshotChunk.BinVer":   "receivers require exact WireVersion equality",
 		"Membership.WireVersion": "the committed shard transport version",
 	}
 	leaves := make(map[uint64]string)
+	pinnedIn := make(map[string]string) // struct type -> its pinned field
 	var walk func(path string, v reflect.Value)
 	walk = func(path string, v reflect.Value) {
 		switch v.Kind() {
@@ -219,6 +224,10 @@ func TestWireFingerprintFixturesComplete(t *testing.T) {
 						if fv.Uint() != WireVersion {
 							t.Errorf("%s = %d, want WireVersion", fpath, fv.Uint())
 						}
+						if prev, ok := pinnedIn[typ.Name()]; ok && prev != key {
+							t.Errorf("%s and %s are both pinned to WireVersion in one struct", prev, key)
+						}
+						pinnedIn[typ.Name()] = key
 						continue
 					}
 					if prev, dup := leaves[fv.Uint()]; dup {
