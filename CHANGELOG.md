@@ -13,9 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Snapshot recovery on a basic `sm.StateMachine` (#1238) now excludes `Lookup`, `NALookup` and `GetHash`, as `Apply` already does, so a state machine without its own locking no longer sees a read run beside the recovery that replaces its state. Locking on the concurrent and on-disk tiers is unchanged.
 - `BarrierConfig.RequireFIPS` now requires the FIPS 140-3 module to be active (`crypto/fips140.Enabled()`); a `GOFIPS140` value in the run-time environment no longer satisfies it, and `Validate`/`NewBarrier` return `ErrFIPSUnavailable`. KDF and cipher restrictions still honour `GOFIPS140`.
 - Snapshot recovery (#1249): recovery from a snapshot record without a file path now reads only the snapshot directory at the recorded index and refuses with `ErrSnapshotNotFound` when that directory is missing, instead of restoring from the newest directory on disk. No wire or format change.
-### Changed
-
-- The wire layout fingerprint (`pkg/proto/testdata/wire_layout.golden`) is taken from the encoded bytes of fixtures that set every serialized field, so an encoding-only change moves it. `scripts/check-wire-version.sh` accepts a fingerprint derivation change only when the pinned encoded fixtures are unchanged. No wire or format change; `WireVersion` stays 1.
 
 ## [1.0.0-rc.1] - 2026-11-25
 
