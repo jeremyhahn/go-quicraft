@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Recovery-time membership reconstruction (#1231) now refuses a committed wire-version switch this build cannot read, returning an error that matches `proto.ErrUnsupportedVersion` and names the entry's index and term, instead of silently keeping the old wire version. This is the decision the runtime commit path already makes. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

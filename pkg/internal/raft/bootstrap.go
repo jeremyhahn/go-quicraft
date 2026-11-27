@@ -136,6 +136,14 @@ func initialMembershipFromEntry(e proto.Entry) (proto.Membership, error) {
 // no legitimate producer emits one (the propose-time gate refuses any payload
 // that does not decode).
 //
+// A committed UpdateWireVersion to a version outside this build's wire window
+// is fatal here exactly as on the runtime path: the return is the apply error
+// (matching proto.ErrUnsupportedVersion) wrapped with the entry's index and
+// term, and NOT ErrCorruptConfigEntry, because the bytes decode. Skipping it
+// would rebuild a membership that silently keeps the old wire version while
+// every replica that can read the new one has switched. Every other refusal
+// from the fold stays the deterministic skip described above.
+//
 // It does not log the failure: the caller owns the logger. A config change
 // that does not decode names its index and term in the error; the bootstrap
 // entry is always at BootstrapMembershipIndex.
@@ -169,7 +177,10 @@ func ReconstructMembership(entries []proto.Entry) (proto.Membership, error) {
 				return proto.Membership{}, errors.Join(ErrCorruptConfigEntry,
 					fmt.Errorf("config change entry %d (term %d): %w", entries[i].Index, entries[i].Term, err))
 			}
-			_ = m.apply(cc, entries[i].Index)
+			if err := m.apply(cc, entries[i].Index); errors.Is(err, proto.ErrUnsupportedVersion) {
+				return proto.Membership{}, fmt.Errorf("config change entry %d (term %d): %w",
+					entries[i].Index, entries[i].Term, err)
+			}
 		}
 	}
 	return m.snapshot().toProto(), nil
