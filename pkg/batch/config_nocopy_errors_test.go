@@ -18,8 +18,11 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // submitFunc is the shared signature of Submit and SubmitNoCopy.
@@ -181,7 +184,15 @@ func TestSubmitNoCopy_QueueFullError(t *testing.T) {
 			})
 			// Cleanups run last-registered first, so a failing test releases
 			// the proposer before the aggregator's Close waits on it.
-			release := sync.OnceFunc(func() { close(bp.unblock) })
+			// The per-shard hand-off, once held, is released before the
+			// proposer so the held flush can complete.
+			var handoffHeld atomic.Bool
+			release := sync.OnceFunc(func() {
+				if handoffHeld.Load() {
+					agg.shardMu.Unlock()
+				}
+				close(bp.unblock)
+			})
 			t.Cleanup(release)
 			submit := v.of(agg)
 
@@ -193,13 +204,25 @@ func TestSubmitNoCopy_QueueFullError(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("the proposer was never called for the first proposal")
 			}
-			// The second proposal occupies the only queue slot.
+			// Flush no longer waits on a shard's propose, so a busy shard's
+			// later batches are held off the queue. Hold the per-shard
+			// hand-off instead: the second proposal parks the flush loop in
+			// dispatchShard, and nothing drains the queue after it.
+			agg.shardMu.Lock()
+			handoffHeld.Store(true)
 			second := submitAsync(ctx, t, submit, []byte("second"))
-			waitForCondition(t, 5*time.Second, "the second proposal never reached the queue", func() bool {
+			// Its size flush is counted before dispatch, so a count of two
+			// means the queue is no longer drained.
+			waitForCondition(t, 5*time.Second, "the second proposal never reached the hand-off", func() bool {
+				return testutil.ToFloat64(agg.metrics.flushReasonTotal.WithLabelValues(flushReasonSize)) == 2
+			})
+			// The third proposal occupies the only queue slot.
+			third := submitAsync(ctx, t, submit, []byte("third"))
+			waitForCondition(t, 5*time.Second, "the third proposal never reached the queue", func() bool {
 				return len(agg.queue) == 1
 			})
 
-			err := submit(ctx, 1, []byte("third"))
+			err := submit(ctx, 1, []byte("fourth"))
 			var qf *QueueFullError
 			if !errors.As(err, &qf) {
 				t.Fatalf("%s at capacity = %v (%T), want *QueueFullError", v.name, err, err)
@@ -217,6 +240,9 @@ func TestSubmitNoCopy_QueueFullError(t *testing.T) {
 			}
 			if err := awaitSubmit(ctx, t, second); err != nil {
 				t.Errorf("second submit = %v, want nil", err)
+			}
+			if err := awaitSubmit(ctx, t, third); err != nil {
+				t.Errorf("third submit = %v, want nil", err)
 			}
 		})
 	}
