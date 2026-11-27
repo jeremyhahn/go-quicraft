@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
+	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 )
 
 // shardEpochState reads a shard's epoch floor and per-segment epoch map the
@@ -292,4 +293,134 @@ func TestEpochFloorTracksCommittedWrites(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWriteRecord_SealEpochPinnedUntilCommit checks that a record's seal epoch
+// is held against PurgeEpochsBefore from the moment it is sealed until it is in
+// the shard's epoch floor, or until the record is proven gone. Between the seal
+// and the commit point the epoch is in neither the floor nor the barrier's
+// in-flight set unless writeRecord pins it, so a rotation plus a purge in that
+// window would drop the DEK of a record the write then acknowledges.
+//
+// Each subcase also takes an extra in-flight reference on epoch 1 before the
+// release point and checks that the purge still keeps the DEK: a double release
+// would consume that reference and let the purge through.
+func TestWriteRecord_SealEpochPinnedUntilCommit(t *testing.T) {
+	ctx := context.Background()
+
+	open := func(t *testing.T) (*DB, *seal.Barrier, *walShard, int) {
+		t.Helper()
+		barrier := newTestBarrier(t)
+		db, err := Open(t.TempDir(),
+			WithBlockSize(1024),
+			WithMaxFileSize(64*1024),
+			WithBarrier(barrier),
+		)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		shard := db.getShard(1)
+		idx := -1
+		for i := range db.shards {
+			if db.shards[i] == shard {
+				idx = i
+			}
+		}
+		if idx < 0 {
+			t.Fatal("shard not found in db.shards")
+		}
+		return db, barrier, shard, idx
+	}
+
+	// writeUncommitted writes one record in batch mode under the shard's mu,
+	// returning its landing and the checkpoint taken before the write.
+	writeUncommitted := func(t *testing.T, shard *walShard) (recordLanding, shardCheckpoint) {
+		t.Helper()
+		shard.mu.Lock()
+		defer shard.mu.Unlock()
+		if err := shard.ensureActiveSegment(); err != nil {
+			t.Fatalf("ensureActiveSegment: %v", err)
+		}
+		cp := shardCheckpoint{
+			fileOffset:  shard.activeSegment.fileOffset,
+			blockOffset: shard.activeSegment.blockOffset,
+			recordCount: shard.activeSegment.RecordCount(),
+			seg:         shard.activeSegment,
+			segID:       shard.activeSegmentID,
+			valid:       true,
+		}
+		shard.batchMode = true
+		landing, err := shard.writeRecord([]byte{payloadTypeCompact, 0})
+		shard.batchMode = false
+		if err != nil {
+			t.Fatalf("writeRecord: %v", err)
+		}
+		if landing.epoch != 1 {
+			t.Fatalf("landing epoch = %d, want 1", landing.epoch)
+		}
+		return landing, cp
+	}
+
+	purge := func(t *testing.T, b *seal.Barrier, want int, why string) {
+		t.Helper()
+		n, err := b.PurgeEpochsBefore(ctx, 2)
+		if err != nil {
+			t.Fatalf("PurgeEpochsBefore: %v", err)
+		}
+		if n != want {
+			t.Fatalf("PurgeEpochsBefore(2) purged %d epochs, want %d: %s", n, want, why)
+		}
+	}
+
+	t.Run("commit", func(t *testing.T) {
+		db, barrier, shard, _ := open(t)
+		landing, _ := writeUncommitted(t, shard)
+
+		rotateBarrierTo(t, db, 2)
+		purge(t, barrier, 0, "epoch 1 was sealed into an uncommitted record and must stay pinned")
+
+		// Commit the landing the way a SaveState batch does.
+		barrier.RegisterInFlightEpoch(1)
+		shard.mu.Lock()
+		var pending pendingMemUpdates
+		pending.stageEpoch(landing)
+		pending.applyTo(shard)
+		shard.mu.Unlock()
+
+		minEpoch, _ := shardEpochState(shard)
+		if minEpoch != 1 {
+			t.Fatalf("minWriteEpoch = %d after commit, want 1", minEpoch)
+		}
+		purge(t, barrier, 0, "the commit released more than its own pin")
+		barrier.DeregisterInFlightEpoch(1)
+		purge(t, barrier, 1, "the commit did not release the seal pin")
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		db, barrier, shard, idx := open(t)
+		landing, cp := writeUncommitted(t, shard)
+
+		var checkpoints [DefaultShardCount]shardCheckpoint
+		var pending [DefaultShardCount]pendingMemUpdates
+		checkpoints[idx] = cp
+		pending[idx].stageEpoch(landing)
+
+		barrier.RegisterInFlightEpoch(1)
+		simulated := errors.New("simulated write failure")
+		shard.mu.Lock()
+		err := db.rollbackBatch(&checkpoints, &pending, simulated)
+		shard.mu.Unlock()
+		if !errors.Is(err, simulated) {
+			t.Fatalf("rollbackBatch = %v, want the write error", err)
+		}
+		if db.poisoned.Load() {
+			t.Fatal("rollback poisoned the DB")
+		}
+
+		rotateBarrierTo(t, db, 2)
+		purge(t, barrier, 0, "the rollback released more than its own pin")
+		barrier.DeregisterInFlightEpoch(1)
+		purge(t, barrier, 1, "the rollback did not release the discarded record's pin")
+	})
 }
