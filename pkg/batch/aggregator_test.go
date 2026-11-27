@@ -317,12 +317,7 @@ func TestSubmit_QueueFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewAggregator failed: %v", err)
 	}
-	// The hand-off is released before the proposer, so Close can drain.
-	handoffHeld := false
 	defer func() {
-		if handoffHeld {
-			agg.shardMu.Unlock()
-		}
 		close(blocking.unblock)
 		_ = agg.Close()
 	}()
@@ -335,27 +330,13 @@ func TestSubmit_QueueFull(t *testing.T) {
 		t.Fatal("the first proposal never reached the proposer")
 	}
 
-	// Flush no longer waits on a shard's propose, so a busy shard's later
-	// batches are held off the queue. Hold the per-shard hand-off instead:
-	// the next batch parks the flush goroutine in dispatchShard, and nothing
-	// drains the queue after it.
-	agg.shardMu.Lock()
-	handoffHeld = true
-
-	// The second proposal parks the flush goroutine in the hand-off. Its
-	// size flush is counted before dispatch, so a count of two means the
-	// queue is no longer drained.
-	go func() { _ = agg.Submit(context.Background(), 1, []byte("parks-the-handoff")) }()
-	waitForCondition(t, 10*time.Second, "the flush goroutine never reached the hand-off", func() bool {
-		return testutil.ToFloat64(agg.metrics.flushReasonTotal.WithLabelValues(flushReasonSize)) == 2
-	})
-
-	// Fill the queue exactly, one at a time, so none races the flush
-	// goroutine for a slot. Each stays enqueued and its caller blocks.
-	for i := range queueSize {
+	// Fill shard 1's budget, one at a time. Flush hands each batch to the
+	// busy shard's worker without waiting, so these are held behind the
+	// parked propose rather than left on the queue; each caller blocks.
+	for i := 1; i < queueSize; i++ {
 		go func() { _ = agg.Submit(context.Background(), 1, []byte{byte(i)}) }()
-		waitForCondition(t, 10*time.Second, "the queue never reached capacity", func() bool {
-			return len(agg.queue) == i+1
+		waitForCondition(t, 10*time.Second, "the proposal was never handed to the busy shard", func() bool {
+			return testutil.ToFloat64(agg.metrics.flushReasonTotal.WithLabelValues(flushReasonSize)) == float64(i+1)
 		})
 	}
 

@@ -973,3 +973,54 @@ func TestClose_WaitsForInFlightShardFlush(t *testing.T) {
 		t.Fatal("Close never returned")
 	}
 }
+
+// TestSubmit_BlockedShardReturnsQueueFull proves that a shard whose propose
+// stalls cannot accumulate proposals without bound. Flush hands a busy
+// shard's later batches to its worker without waiting, so the shared queue
+// keeps draining; the shard's own budget of QueueSize admitted-but-unfinished
+// proposals is what must push back with QueueFullError. Callers that give up
+// still count until their proposal is resolved, because the proposal and its
+// buffer stay held until then. Another shard keeps its own budget.
+func TestSubmit_BlockedShardReturnsQueueFull(t *testing.T) {
+	const queueSize = 4
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 1, queueSize)
+	defer func() {
+		close(g.release)
+		_ = agg.Close()
+	}()
+
+	parked := make(chan error, 1)
+	go func() { parked <- agg.Submit(context.Background(), 1, []byte("parked")) }()
+	g.awaitEntry(t)
+
+	var qfe *QueueFullError
+	rejectedAt := -1
+	for i := 0; i < 4*queueSize; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		err := agg.Submit(ctx, 1, []byte{byte(i)})
+		cancel()
+		if errors.As(err, &qfe) {
+			rejectedAt = i
+			break
+		}
+		if err == nil {
+			t.Fatalf("Submit %d to the blocked shard succeeded", i)
+		}
+	}
+	if rejectedAt < 0 {
+		t.Fatalf("%d submissions to a blocked shard never returned QueueFullError", 4*queueSize)
+	}
+	if rejectedAt >= queueSize {
+		t.Errorf("QueueFullError after %d submissions, want fewer than QueueSize (%d)", rejectedAt, queueSize)
+	}
+	if qfe.QueueSize != queueSize {
+		t.Errorf("QueueFullError.QueueSize = %d, want %d", qfe.QueueSize, queueSize)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := agg.Submit(ctx, 2, []byte("other-shard")); err != nil {
+		t.Fatalf("Submit to shard 2 while shard 1 is full = %v, want nil", err)
+	}
+}
