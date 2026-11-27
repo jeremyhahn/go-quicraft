@@ -9150,24 +9150,15 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// treats the imported snapshot as uninitialized. It is computed here, once,
 	// because the retry check below, the staged snapshot.meta and the LogDB
 	// record must all describe this snapshot identically.
-	term := header.Term
-	if term == 0 {
-		term = 1
-	}
+	term := max(header.Term, 1)
 
 	// The retry of an import that recorded this very snapshot and then failed
 	// while advancing the log floor. The snapshot and its directory are already
 	// in place; only the floor advance is left, and no later compaction would
 	// perform it, so the retry completes it instead of being refused below.
-	retry, err := h.importAwaitsLogFloor(shardID, replicaID, header.Index, term, header.OnDiskIndex)
-	if err != nil {
+	if done, err := h.completeRecordedImport(ctx, shardID, replicaID, header.Index, term,
+		header.OnDiskIndex); err != nil || done {
 		return err
-	}
-	if retry {
-		if err := ctx.Err(); err != nil {
-			return mapContextError(err)
-		}
-		return h.advanceImportLogFloor(shardID, replicaID, header.Index)
 	}
 
 	// Refuse an artifact that does not ADVANCE the shard's recorded snapshot,
@@ -9586,6 +9577,23 @@ func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex
 		return false, err
 	}
 	return first != 0 && first <= index, nil
+}
+
+// completeRecordedImport finishes the retry of an import that recorded its
+// snapshot and then failed while advancing the log floor (importAwaitsLogFloor).
+// done reports that the artifact was such a retry and err the outcome of
+// completing it; done is false for every other artifact, which then takes the
+// normal import path.
+func (h *Host) completeRecordedImport(ctx context.Context, shardID, replicaID, index, term,
+	onDiskIndex uint64) (done bool, err error) {
+	retry, err := h.importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex)
+	if err != nil || !retry {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return true, mapContextError(err)
+	}
+	return true, h.advanceImportLogFloor(shardID, replicaID, index)
 }
 
 // importSnapshotDir resolves the canonical on-disk directory an imported
