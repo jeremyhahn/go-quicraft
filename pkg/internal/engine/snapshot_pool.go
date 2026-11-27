@@ -2418,12 +2418,12 @@ func (p *snapshotPool) recoverSnapshot(req snapshotRequest) (err error) {
 // a recovery reads, returning an empty directory when there is nothing to
 // recover. The caller holds the snapshot-directory lock.
 //
-// artifactIndex tracks the index of the directory ACTUALLY being read, not
-// the one LogDB recorded. The two agree on the recorded-filepath branch (the
-// directory is named snapshot-<Index>), but the discovery branch picks the
-// newest directory on disk, which may be a different index — and that
-// directory's frames were sealed under ITS OWN index. Using the record's index
-// as the frame context there would fail authentication on a valid artifact.
+// artifactIndex is the index of the directory being read, and both branches
+// read the directory at the recorded index: the recorded-filepath branch names
+// it directly, and the discovery branch accepts only the snapshot-<Index>
+// directory on disk, failing closed with ErrSnapshotNotFound when it is
+// missing. Recovery stamps the apply frontier with the record's index, so a
+// directory at any other index would double-apply or skip entries on replay.
 func (p *snapshotPool) chooseRecoverySnapshot(req snapshotRequest) (logdb.Snapshot, string, uint64, error) {
 	logdbSnap, err := p.logdb.GetSnapshot(req.shardID, req.replicaID)
 	switch {
@@ -2443,12 +2443,12 @@ func (p *snapshotPool) chooseRecoverySnapshot(req snapshotRequest) (logdb.Snapsh
 	case logdbSnap.Index == 0:
 		return logdb.Snapshot{}, "", 0, nil
 	}
-	// Prefer the filepath stored in LogDB metadata; fall back to discovering
-	// the latest directory on disk.
+	// Prefer the filepath stored in LogDB metadata; fall back to the directory
+	// on disk named for the recorded index.
 	if logdbSnap.Filepath != "" {
 		return logdbSnap, logdbSnap.Filepath, logdbSnap.Index, nil
 	}
-	dir, dirIndex, dirErr := latestSnapshotDir(req.node.SnapshotDir(), req.shardID, req.replicaID)
+	dirs, dirErr := listSnapshotDirs(req.node.SnapshotDir(), req.shardID, req.replicaID)
 	if dirErr != nil {
 		return logdb.Snapshot{}, "", 0, &SnapshotError{
 			ShardID:   req.shardID,
@@ -2457,7 +2457,20 @@ func (p *snapshotPool) chooseRecoverySnapshot(req snapshotRequest) (logdb.Snapsh
 			Err:       dirErr,
 		}
 	}
-	return logdbSnap, dir, dirIndex, nil
+	for _, d := range dirs {
+		if d.index == logdbSnap.Index {
+			return logdbSnap, d.path, logdbSnap.Index, nil
+		}
+	}
+	// Any other directory holds state at a different index than the one the
+	// apply frontier is stamped with: a newer one would replay entries twice,
+	// an older one would skip them. Refuse rather than guess.
+	return logdb.Snapshot{}, "", 0, &SnapshotError{
+		ShardID:   req.shardID,
+		ReplicaID: req.replicaID,
+		Save:      false,
+		Err:       ErrSnapshotNotFound,
+	}
 }
 
 // decryptSnapshotToAnonymousScratch decrypts the encrypted snapshot data file
