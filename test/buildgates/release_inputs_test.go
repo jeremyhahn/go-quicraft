@@ -664,7 +664,7 @@ func TestReleaseRefusesAnExistingLockstepTag(t *testing.T) {
 			if got := f.git("rev-parse", "HEAD"); got != headBefore {
 				t.Errorf("a refused release moved HEAD: %s -> %s", strings.TrimSpace(headBefore), strings.TrimSpace(got))
 			}
-			if err := exec.Command("git", "-C", f.dir, "rev-parse", "-q", "--verify", "refs/tags/"+f.release).Run(); err == nil {
+			if strings.TrimSpace(f.git("tag", "-l", f.release)) != "" {
 				t.Errorf("a refused release created the root tag %s", f.release)
 			}
 			if got := f.remoteRefs(); got != refsBefore {

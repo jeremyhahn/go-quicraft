@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Release targets (#1230): `make release-alpha`, `make release-candidate` and `make release` now refuse, before writing VERSION, when the `test/performance/<version>` tag exists locally or on the remote, or the `contrib/dragonboat/<version>` tag exists on the remote. Before, the recipe committed VERSION and created the root tag, then failed at tagging or at the push, leaving a half-cut release. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
