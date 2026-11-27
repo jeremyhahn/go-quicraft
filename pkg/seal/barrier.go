@@ -1344,16 +1344,15 @@ func (b *Barrier) resolveInvocationBudget(ctx context.Context) {
 			)
 			// This forced rotation is what grows KnownEpochs by one PER
 			// RESTART, and SetSealedRootKey refuses to load a blob naming more
-			// than MaxKnownEpochs. Nothing in this package reconciles the two:
-			// the bound exists as a DoS guard against a forged blob, and it
-			// also caps the barrier's own legitimate growth.
+			// than MaxKnownEpochs. rotateLocked refuses the rotation once the
+			// set reaches the bound (ErrKnownEpochsExhausted), so the blob
+			// stays loadable and this path falls back to Seed(limit) below:
+			// encryption is refused, decryption is unaffected.
 			//
 			// An embedder that has not wired up PurgeEpochsBefore — or one in
 			// a crash loop, which reaches 4096 in minutes rather than years —
-			// therefore walks into a node that cannot start at all, with data
-			// that needs bespoke tooling to recover (unwrap the root key, trim
-			// KnownEpochs, re-stamp the MAC). Warn while there is still room
-			// to act rather than at the point of failure.
+			// therefore walks into a node that cannot write. Warn while there
+			// is still room to act rather than at the point of failure.
 			if len(b.knownEpochs) > MaxKnownEpochs/2 {
 				slog.Error("quicraft/seal: the known-epoch set is approaching the "+
 					"load-time bound; a blob naming more than MaxKnownEpochs epochs "+
@@ -2236,6 +2235,11 @@ func (b *Barrier) decryptLocked(dst, ciphertext []byte, aead cipher.AEAD, alg Sy
 // persister reports the state durable. With no persister configured Rotate
 // fails closed with ErrNoStatePersister and changes nothing.
 //
+// Rotate also fails closed with ErrKnownEpochsExhausted, changing nothing,
+// once the known-epoch set names MaxKnownEpochs epochs: one more would persist
+// a blob SetSealedRootKey refuses to load. Call PurgeEpochsBefore with the
+// minimum live epoch to make room.
+//
 // Ordering — derive, persist, commit, then fail-safe tracker reset:
 //
 //  1. Derive the new DEK and AEAD cipher. On a derivation error nothing has
@@ -2318,6 +2322,12 @@ func (b *Barrier) rotateLocked(ctx context.Context) (uint64, error) {
 	persist := b.config.StatePersister
 	if persist == nil {
 		return 0, ErrNoStatePersister
+	}
+	// One more epoch would persist a blob SetSealedRootKey refuses to load
+	// (ErrTooManyKnownEpochs), leaving a node that cannot start. Refuse
+	// before deriving or persisting anything.
+	if len(b.knownEpochs) >= MaxKnownEpochs {
+		return 0, ErrKnownEpochsExhausted
 	}
 
 	oldEpoch := b.epoch

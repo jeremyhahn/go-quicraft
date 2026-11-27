@@ -50,6 +50,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
@@ -4348,6 +4349,19 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		// No caller can see h yet, and the receive path never reads it.
 		cfg.RaftAddress = tr.AdvertisedAddr()
 		h.cfg.RaftAddress = cfg.RaftAddress
+	}
+
+	// Recover an exhausted invocation budget before any shard can write the
+	// WAL. A host restarted with a full known-epoch set is refused rotation
+	// by Unseal, which seeds the invocation counter at its limit, so every
+	// encrypted write fails until a purge-and-rotate runs. The loop below
+	// would only do that on its first threshold tick (30 s away), and a
+	// shard's first WAL write before it fails the shard. rotateBarrierKey
+	// purges under the configured retention and retries once. No shard is
+	// loaded yet, so the safe floor comes from the LogDB alone.
+	if options.barrier != nil && !options.barrier.IsSealed() && options.barrier.ShouldRotateKey() {
+		h.logger.Info("invocation budget exhausted at startup, rotating before shards start")
+		h.rotateBarrierKey(context.Background())
 	}
 
 	// Start the key rotation loop whenever a barrier is configured. With
@@ -10607,6 +10621,17 @@ func (h *Host) rotateBarrierKey(ctx context.Context) {
 		return
 	}
 	newEpoch, err := h.barrier.Rotate(ctx)
+	if err != nil && errors.Is(err, seal.ErrKnownEpochsExhausted) {
+		// A host restarted with a full known-epoch set refuses every
+		// rotation, and the retention purge below only runs after a
+		// successful one, so the set would never shrink. Purge under the
+		// configured retention (clamped to the global safe floor, exactly
+		// as after a rotation) and retry once when that freed an epoch.
+		// Without retention, or with nothing purgeable, the refusal stands.
+		if h.purgeRetainedEpochs(ctx, h.barrier.CurrentEpoch()) > 0 {
+			newEpoch, err = h.barrier.Rotate(ctx)
+		}
+	}
 	if err != nil && endedBy(ctx, err) {
 		// The host is closing and cancelled the rotation. Nothing was
 		// persisted, the current epoch stays active, and the misconfiguration
@@ -10629,58 +10654,70 @@ func (h *Host) rotateBarrierKey(ctx context.Context) {
 		return
 	}
 	h.logger.Info("key rotation completed", "epoch", newEpoch)
+	h.purgeRetainedEpochs(ctx, newEpoch)
+}
 
-	if h.cfg.MaxRetainedEpochs > 0 && newEpoch > h.cfg.MaxRetainedEpochs {
-		purgeThreshold := newEpoch - h.cfg.MaxRetainedEpochs
-
-		// Clamp the retention-based threshold to the GLOBAL safe-purge
-		// floor: the minimum epoch still needed by ANY shard's retained
-		// encrypted snapshot or any live WAL record. Without this clamp,
-		// rotation alone could purge a DEK still required to decrypt a
-		// persisted snapshot or WAL, permanently bricking encrypted data.
-		//
-		// Fail safe: when the floor cannot be determined (errors scanning
-		// snapshot dirs / MinLiveEpoch error, or nothing encrypted is
-		// retained), skip purging entirely rather than purge on uncertainty.
-		safeFloor, ok := h.engine.GlobalSafePurgeFloor()
-		if !ok {
-			h.logger.Debug("epoch purge after rotation skipped: global safe floor unknown",
-				"purge_threshold", purgeThreshold,
-			)
-			return
-		}
-		purgeFloor := purgeThreshold
-		if safeFloor < purgeFloor {
-			purgeFloor = safeFloor
-		}
-
-		purged, purgeErr := h.barrier.PurgeEpochsBefore(ctx, purgeFloor)
-		if purgeErr != nil && endedBy(ctx, purgeErr) {
-			// The host is closing and cancelled the purge before anything was
-			// persisted or dropped; the next rotation after a restart purges
-			// again.
-			h.logger.Debug("epoch purge after rotation abandoned: host is closing",
-				"purge_floor", purgeFloor,
-				"error", purgeErr,
-			)
-			return
-		}
-		if purgeErr != nil {
-			h.logger.Error("epoch purge after rotation failed",
-				"purge_floor", purgeFloor,
-				"retention_threshold", purgeThreshold,
-				"global_safe_floor", safeFloor,
-				"error", purgeErr,
-			)
-		} else if purged > 0 {
-			h.logger.Info("purged old encryption epochs",
-				"purged", purged,
-				"purge_floor", purgeFloor,
-				"retention_threshold", purgeThreshold,
-				"global_safe_floor", safeFloor,
-			)
-		}
+// purgeRetainedEpochs purges the epochs older than the MaxRetainedEpochs
+// window ending at epoch, clamped to the global safe-purge floor, and returns
+// how many epochs it dropped. It does nothing (returns 0) without retention
+// configured, when epoch is still inside the window, or when the floor is
+// unknown.
+func (h *Host) purgeRetainedEpochs(ctx context.Context, epoch uint64) int {
+	if h.cfg.MaxRetainedEpochs == 0 || epoch <= h.cfg.MaxRetainedEpochs {
+		return 0
 	}
+	purgeThreshold := epoch - h.cfg.MaxRetainedEpochs
+
+	// Clamp the retention-based threshold to the GLOBAL safe-purge
+	// floor: the minimum epoch still needed by ANY shard's retained
+	// encrypted snapshot or any live WAL record. Without this clamp,
+	// rotation alone could purge a DEK still required to decrypt a
+	// persisted snapshot or WAL, permanently bricking encrypted data.
+	//
+	// Fail safe: when the floor cannot be determined (errors scanning
+	// snapshot dirs / MinLiveEpoch error, or nothing encrypted is
+	// retained), skip purging entirely rather than purge on uncertainty.
+	safeFloor, ok := h.engine.GlobalSafePurgeFloor()
+	if !ok {
+		h.logger.Debug("epoch purge after rotation skipped: global safe floor unknown",
+			"purge_threshold", purgeThreshold,
+		)
+		return 0
+	}
+	purgeFloor := purgeThreshold
+	if safeFloor < purgeFloor {
+		purgeFloor = safeFloor
+	}
+
+	purged, purgeErr := h.barrier.PurgeEpochsBefore(ctx, purgeFloor)
+	if purgeErr != nil && endedBy(ctx, purgeErr) {
+		// The host is closing and cancelled the purge before anything was
+		// persisted or dropped; the next rotation after a restart purges
+		// again.
+		h.logger.Debug("epoch purge after rotation abandoned: host is closing",
+			"purge_floor", purgeFloor,
+			"error", purgeErr,
+		)
+		return 0
+	}
+	if purgeErr != nil {
+		h.logger.Error("epoch purge after rotation failed",
+			"purge_floor", purgeFloor,
+			"retention_threshold", purgeThreshold,
+			"global_safe_floor", safeFloor,
+			"error", purgeErr,
+		)
+		return 0
+	}
+	if purged > 0 {
+		h.logger.Info("purged old encryption epochs",
+			"purged", purged,
+			"purge_floor", purgeFloor,
+			"retention_threshold", purgeThreshold,
+			"global_safe_floor", safeFloor,
+		)
+	}
+	return purged
 }
 
 // pendingSweepLoop periodically scans all node states and completes
