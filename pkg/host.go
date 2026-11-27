@@ -9157,7 +9157,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// in place; only the floor advance is left, and no later compaction would
 	// perform it, so the retry completes it instead of being refused below.
 	if done, err := h.completeRecordedImport(ctx, shardID, replicaID, header.Index, term,
-		header.OnDiskIndex, recoveredMembership, rawHeader, r); err != nil || done {
+		header.OnDiskIndex, recoveredMembership, rawHeader, r, opts); err != nil || done {
 		return err
 	}
 
@@ -9618,11 +9618,36 @@ func logdbMembershipEqual(a, b logdb.Membership) bool {
 // completing it; done is false for every other artifact, which then takes the
 // normal import path.
 func (h *Host) completeRecordedImport(ctx context.Context, shardID, replicaID, index, term,
-	onDiskIndex uint64, membership proto.Membership, rawHeader []byte, r io.Reader) (done bool, err error) {
+	onDiskIndex uint64, membership proto.Membership, rawHeader []byte, r io.Reader,
+	opts []ImportOption) (done bool, err error) {
 	snapDir, pending, err := h.importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex,
 		protoMembershipToLogDB(membership))
 	if err != nil || pending == nil {
 		return false, err
+	}
+	// The retry must declare the layout a fresh import would accept, and that
+	// layout must place the snapshot where the recorded import put it. A
+	// contradictory WithImportDataDir is refused here as the normal path
+	// refuses it, rather than completing an import under a layout it never
+	// used. importSnapshotDir itself refuses a declaration that contradicts
+	// the bootstrap record, and one that is missing when there is none.
+	_, wantDir, err := h.importSnapshotDir(shardID, replicaID, index, opts)
+	if err != nil {
+		return true, err
+	}
+	if filepath.Clean(wantDir) != filepath.Clean(snapDir) {
+		var iopts importOptions
+		for _, opt := range opts {
+			opt(&iopts)
+		}
+		// No bootstrap record states the layout, so the recorded snapshot
+		// directory is the only record of it.
+		return true, &ImportDataDirMismatchError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Declared:  iopts.dataDir,
+			Recorded:  snapDir,
+		}
 	}
 	// Only the header has been read. The rest of the stream must still be the
 	// complete, trailer-verified artifact before the floor moves, or a
@@ -9724,17 +9749,30 @@ func readImportFloorPending(fsys snapshotFS, dir string) ([]byte, error) {
 }
 
 // finishImportLogFloor advances the log floor and then clears the pending
-// marker. A failed removal is returned: the retry repeats the floor advance,
-// which is idempotent, and removes the marker.
+// marker. Only a failed floor advance is returned; once the floor is durable a
+// failed marker removal or directory fsync is logged and the import succeeds.
 func (h *Host) finishImportLogFloor(shardID, replicaID, index uint64, snapDir string) error {
 	if err := h.advanceImportLogFloor(shardID, replicaID, index); err != nil {
 		return err
 	}
+	// The floor is durable: the import is complete. Clearing the marker is
+	// cleanup, and a failure in it must not be reported as a failed import.
+	// Once the marker is gone a retry has nothing to complete and is refused
+	// as out of date, so an error here would leave a finished import reported
+	// as failed with no retry that succeeds. A marker that survives only makes
+	// a retry re-run the floor advance, which is idempotent.
 	fsys := h.snapshotFsys()
 	if err := fsys.Remove(filepath.Join(snapDir, importFloorPendingFile)); err != nil && !os.IsNotExist(err) {
-		return err
+		slog.Warn("quicraft: snapshot import complete but its floor-pending marker was not removed",
+			"shard", shardID, "replica", replicaID, "dir", snapDir, "error", err)
+		return nil
 	}
-	return syncDir(fsys, snapDir)
+	if err := syncDir(fsys, snapDir); err != nil {
+		slog.Warn("quicraft: snapshot import complete but its directory fsync after the "+
+			"marker removal failed",
+			"shard", shardID, "replica", replicaID, "dir", snapDir, "error", err)
+	}
+	return nil
 }
 
 // importSnapshotDir resolves the canonical on-disk directory an imported
