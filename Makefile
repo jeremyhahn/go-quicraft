@@ -2128,17 +2128,22 @@ echo "Released $$REL_VERSION (signed, annotated; root, test/performance and cont
 endef
 
 # release-wire-gate runs scripts/check-wire-version.sh against the newest
-# non-alpha v* tag before release and release-candidate write anything. The
-# baseline is read after fetching tags from $$REL_REMOTE, so a --no-tags or
-# single-branch clone does not skip the gate or compare against an older tag,
-# and a failed fetch refuses: an unreachable remote is not an absent baseline.
-# The gate is skipped only when the release remote holds no non-alpha v* tag.
-# An empty or unresolved $$REL_REMOTE is left to release-body, which refuses it.
+# non-alpha v* tag the release remote $$REL_REMOTE advertises, before release
+# and release-candidate write anything. The remote's v* tags are fetched into
+# refs/release-baseline/ and the baseline is chosen from that namespace only,
+# so a local-only tag (even one sorting higher) is never the baseline, and a
+# --no-tags or single-branch clone does not skip the gate. The chosen tag is
+# then fetched explicitly into refs/tags/ without force: a clashing local tag
+# refuses. A failed fetch refuses: an unreachable remote is not an absent
+# baseline. The gate is skipped only when the release remote advertises no
+# non-alpha v* tag. An empty or unresolved $$REL_REMOTE is left to
+# release-body, which refuses it.
 release-wire-gate = @if test -n "$$REL_REMOTE" && git remote get-url "$$REL_REMOTE" >/dev/null 2>&1; then \
-	git fetch --quiet --tags "$$REL_REMOTE" || { echo "ERROR: could not fetch tags from $$REL_REMOTE to choose the wire version baseline. Refusing to continue: an unreachable remote is not an absent baseline. Nothing has been written."; exit 1; }; \
-	tag="$$(git tag -l 'v*' --sort=-v:refname | grep -v -- '-alpha$$' | head -n 1)"; \
+	git fetch --quiet --no-tags --prune "$$REL_REMOTE" '+refs/tags/v*:refs/release-baseline/v*' || { echo "ERROR: could not fetch tags from $$REL_REMOTE to choose the wire version baseline. Refusing to continue: an unreachable remote is not an absent baseline. Nothing has been written."; exit 1; }; \
+	tag="$$(git for-each-ref --sort=-v:refname --format='%(refname:lstrip=2)' refs/release-baseline/ | grep -v -- '-alpha$$' | head -n 1)"; \
 	if [ -z "$$tag" ]; then echo "check-wire-version: no non-alpha v* release tag yet; skipping the wire version gate"; \
-	else bash scripts/check-wire-version.sh "$$tag"; fi; \
+	else git fetch --quiet --no-tags "$$REL_REMOTE" "refs/tags/$$tag:refs/tags/$$tag" || { echo "ERROR: could not fetch the wire version baseline tag $$tag from $$REL_REMOTE into refs/tags/$$tag (a local tag of that name that differs from the remote's refuses). Nothing has been written."; exit 1; }; \
+	bash scripts/check-wire-version.sh "$$tag"; fi; \
 	fi
 
 release-alpha: export override REL_VERSION := $(if $(filter command line,$(origin VERSION)),$(value VERSION),)

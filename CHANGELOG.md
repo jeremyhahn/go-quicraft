@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Release wire version gate (#1252): `make release` and `make release-candidate` fetch tags from `RELEASE_REMOTE` before choosing the wire-version baseline and refuse when that fetch fails, so a `--no-tags` or single-branch clone no longer skips `scripts/check-wire-version.sh` or compares against an older tag. The gate is skipped only when the release remote holds no non-alpha release tag.
+- Release wire version gate (#1252): `make release` and `make release-candidate` take the wire-version baseline as the newest non-alpha `v*` tag `RELEASE_REMOTE` advertises, never a local-only tag, fetch that tag explicitly (a clashing local tag refuses) and refuse when either fetch fails, so a `--no-tags` or single-branch clone no longer skips `scripts/check-wire-version.sh` or compares against an older or local-only tag. The gate is skipped only when the release remote advertises no non-alpha release tag.
 
 ## [1.0.0-rc.1] - 2026-11-25
 
