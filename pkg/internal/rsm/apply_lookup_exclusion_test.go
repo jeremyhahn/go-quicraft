@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
@@ -40,9 +41,16 @@ type overlapDetectorSM struct {
 	inUpdate   atomic.Int32
 	violations atomic.Int64
 	spin       int
+
+	// reads counts every entry into Lookup or GetHash.
+	reads atomic.Int64
+	// recoverHook, when set, runs inside RecoverFromSnapshot while the
+	// writer counter is raised. The recovery test uses it to park recovery.
+	recoverHook func()
 }
 
 func (o *overlapDetectorSM) observe() {
+	o.reads.Add(1)
 	if o.inUpdate.Load() != 0 {
 		o.violations.Add(1)
 	}
@@ -85,6 +93,9 @@ func (o *overlapDetectorSM) SaveSnapshot(_ context.Context, w io.Writer, _ <-cha
 func (o *overlapDetectorSM) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct{}) error {
 	o.inUpdate.Add(1)
 	defer o.inUpdate.Add(-1)
+	if o.recoverHook != nil {
+		o.recoverHook()
+	}
 	for i := 0; i < o.spin; i++ {
 		_ = i * i
 	}
@@ -180,7 +191,7 @@ func TestApplyExcludesLookupOnBasicTier(t *testing.T) {
 // on every tier, this reports violations. With the write lock on the basic
 // tier (the mode Apply uses) it reports none.
 func TestRecoverFromSnapshotExcludesLookupOnBasicTier(t *testing.T) {
-	detector := &overlapDetectorSM{spin: 2000}
+	detector := &overlapDetectorSM{}
 	createFn := func(uint64, uint64) interface{} { return detector }
 
 	machine, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, true)
@@ -196,51 +207,103 @@ func TestRecoverFromSnapshotExcludesLookupOnBasicTier(t *testing.T) {
 	image := snap.Bytes()
 
 	const (
-		recoverRounds = 400
-		readers       = 4
+		rounds = 3
+		// parkedWait bounds how long a read is given to (wrongly) reach the
+		// user state machine while recovery is parked. It only bounds the
+		// negative check: ordering comes from the channels, not from it.
+		parkedWait = 100 * time.Millisecond
+		// settleWait bounds how long a released read may take to finish.
+		settleWait = 10 * time.Second
 	)
 
-	var wg sync.WaitGroup
-	var reads atomic.Int64
-	stop := make(chan struct{})
+	for round := 1; round <= rounds; round++ {
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		detector.recoverHook = func() {
+			close(entered)
+			<-release
+		}
+		readsBefore := detector.reads.Load()
 
-	for i := 0; i < readers; i++ {
-		wg.Add(1)
+		recoverErr := make(chan error, 1)
 		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				if _, err := machine.Lookup(context.Background(), []byte("k")); err != nil {
-					return
-				}
-				if _, _, err := machine.GetHash(); err != nil {
-					return
-				}
-				reads.Add(1)
-			}
+			recoverErr <- machine.RecoverFromSnapshot(context.Background(), bytes.NewReader(image), nil)
 		}()
-	}
+		select {
+		case <-entered:
+		case err := <-recoverErr:
+			t.Fatalf("round %d: RecoverFromSnapshot returned %v before reaching the state machine", round, err)
+		case <-time.After(settleWait):
+			t.Fatalf("round %d: RecoverFromSnapshot never reached the state machine", round)
+		}
 
-	for i := 0; i < recoverRounds; i++ {
-		if err := machine.RecoverFromSnapshot(context.Background(), bytes.NewReader(image), nil); err != nil {
-			close(stop)
-			wg.Wait()
-			t.Fatalf("RecoverFromSnapshot round %d = %v", i+1, err)
+		// Recovery is now parked inside the user state machine with every
+		// guard RecoverFromSnapshot takes still held.
+		lookupErr := make(chan error, 1)
+		hashErr := make(chan error, 1)
+		go func() {
+			_, err := machine.Lookup(context.Background(), []byte("k"))
+			lookupErr <- err
+		}()
+		go func() {
+			_, _, err := machine.GetHash()
+			hashErr <- err
+		}()
+
+		// Neither read may complete, or enter the state machine, while
+		// recovery is held.
+		overlapped := false
+		timer := time.NewTimer(parkedWait)
+		select {
+		case err := <-lookupErr:
+			t.Errorf("round %d: Lookup returned (err=%v) while RecoverFromSnapshot was in progress", round, err)
+			lookupErr <- err
+			overlapped = true
+		case err := <-hashErr:
+			t.Errorf("round %d: GetHash returned (err=%v) while RecoverFromSnapshot was in progress", round, err)
+			hashErr <- err
+			overlapped = true
+		case <-timer.C:
+		}
+		timer.Stop()
+		if n := detector.reads.Load() - readsBefore; n != 0 {
+			t.Errorf("round %d: %d read(s) entered the state machine while RecoverFromSnapshot was in progress; "+
+				"sm.StateMachine documents that its methods are never called concurrently", round, n)
+			overlapped = true
+		}
+
+		close(release)
+		select {
+		case err := <-recoverErr:
+			if err != nil {
+				t.Fatalf("round %d: RecoverFromSnapshot = %v", round, err)
+			}
+		case <-time.After(settleWait):
+			t.Fatalf("round %d: RecoverFromSnapshot did not return after release", round)
+		}
+
+		// Released, both parked reads must complete cleanly.
+		for name, ch := range map[string]chan error{"Lookup": lookupErr, "GetHash": hashErr} {
+			select {
+			case err := <-ch:
+				if err != nil {
+					t.Fatalf("round %d: %s after recovery = %v", round, name, err)
+				}
+			case <-time.After(settleWait):
+				t.Fatalf("round %d: %s did not complete after recovery returned", round, name)
+			}
+		}
+		if n := detector.reads.Load() - readsBefore; n != 2 {
+			t.Fatalf("round %d: %d read(s) reached the state machine, want 2", round, n)
+		}
+		if overlapped {
+			break
 		}
 	}
-
-	close(stop)
-	wg.Wait()
+	detector.recoverHook = nil
 
 	if got := detector.inUpdate.Load(); got != 0 {
 		t.Fatalf("writer counter did not settle: %d", got)
-	}
-	if reads.Load() == 0 {
-		t.Fatal("readers never completed a read; the test proved nothing")
 	}
 	if v := detector.violations.Load(); v != 0 {
 		t.Errorf("RecoverFromSnapshot overlapped a read %d time(s); sm.StateMachine documents that "+
