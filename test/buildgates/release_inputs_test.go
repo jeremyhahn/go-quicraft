@@ -207,6 +207,14 @@ type releaseFixture struct {
 	dir     string // the checkout make runs in
 	remote  string // bare repository registered as fixtureRemote; "" when none
 	release string // the next patch version; CHANGELOG.md has a heading for it
+	// published is the remote's ls-remote output after make last pushed the
+	// local main to it: what a refused release must leave there unchanged.
+	published string
+	// unsyncedMain stops make pushing the local main to the remote first.
+	// A release is cut from a main the remote already holds (it landed
+	// through a PR), so make publishes the local main before each run unless
+	// a test is checking the refusal of a main the remote does not hold.
+	unsyncedMain bool
 }
 
 // newReleaseFixture builds the fixture. With withRemote it also registers a bare
@@ -303,6 +311,10 @@ func (f *releaseFixture) gitIn(dir string, args ...string) string {
 // output and exit error.
 func (f *releaseFixture) make(target string, vars ...string) (string, error) {
 	f.t.Helper()
+	if f.remote != "" && !f.unsyncedMain {
+		f.git("push", "-q", "--force", f.remote, "refs/heads/main:refs/heads/main")
+		f.published = f.remoteRefs()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "make", append([]string{"-C", f.dir, target}, vars...)...)
@@ -336,8 +348,8 @@ func (f *releaseFixture) remoteRefs() string {
 // cannot be retracted.
 func (f *releaseFixture) requireNothingPublished() {
 	f.t.Helper()
-	if refs := f.remoteRefs(); refs != "" {
-		f.t.Fatalf("a REFUSED release published refs to the remote:\n%s", refs)
+	if refs := f.remoteRefs(); refs != f.published {
+		f.t.Fatalf("a REFUSED release published refs to the remote:\n%s\nbefore the release it held:\n%s", refs, f.published)
 	}
 }
 
@@ -614,6 +626,78 @@ func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
 	// The same candidate cannot be cut twice.
 	if out, err := run(rc); err == nil || !strings.Contains(out, "already exists") {
 		t.Errorf("a second %s was not refused as a duplicate (err=%v):\n%s", rc, err, out)
+	}
+}
+
+// TestReleaseRefusesALocalMainTheRemoteDoesNotHold cuts a release from a local
+// main one commit ahead of the release remote's main (#1251). The recipe
+// checked only that the release commit sits on the local main, so the atomic
+// push published the unpushed commit, which never passed a PR's CI, to main
+// and tagged it. It must refuse before VERSION is written, and a remote with
+// no main to compare against refuses too. The fetch that reads the remote's
+// main must not move a remote-tracking ref either.
+func TestReleaseRefusesALocalMainTheRemoteDoesNotHold(t *testing.T) {
+	const maintainer = "release@example.invalid"
+	key, pub := newSigningKey(t)
+
+	for _, tc := range []struct{ target, version, heading string }{
+		{"release-alpha", "", ""},
+		{"release-candidate", "v0.9.5-rc.2", "\n## [0.9.5-rc.2] - 2026-01-02\n\n- fixture rc\n"},
+	} {
+		for _, emptyRemote := range []bool{false, true} {
+			name := tc.target + "/ahead"
+			if emptyRemote {
+				name = tc.target + "/remote-without-main"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newReleaseFixture(t, true)
+				f.signWith(maintainer, key, true, true)
+				signers := writeSigners(t, maintainer+" "+pub)
+				if !emptyRemote {
+					f.git("push", "-q", f.remote, "refs/heads/main:refs/heads/main")
+				}
+				// The commit the remote does not hold. It is one the release
+				// needs (the candidate's CHANGELOG heading) or a harmless
+				// change, so every other guard passes on it.
+				if tc.heading != "" {
+					appendFile(t, filepath.Join(f.dir, "CHANGELOG.md"), tc.heading)
+				} else {
+					appendFile(t, filepath.Join(f.dir, "CHANGELOG.md"), "\n")
+				}
+				f.git("add", "CHANGELOG.md")
+				f.git("commit", "-qm", "local only, never pushed")
+				f.unsyncedMain = true
+				f.published = f.remoteRefs()
+				versionBefore := f.version()
+				localMain := strings.TrimSpace(f.git("rev-parse", "refs/heads/main"))
+
+				version := tc.version
+				if version == "" {
+					version = f.release
+				}
+				out, err := f.make(tc.target, "VERSION="+version, "RELEASE_REMOTE="+fixtureRemote, "RELEASE_ALLOWED_SIGNERS="+signers)
+				if err == nil {
+					t.Fatalf("%s SUCCEEDED from a local main %s does not hold:\n%s\nremote:\n%s", tc.target, fixtureRemote, out, f.remoteRefs())
+				}
+				want := "is not " + fixtureRemote + "'s main"
+				if emptyRemote {
+					want = "could not fetch main from " + fixtureRemote
+				}
+				if !strings.Contains(out, want) || !strings.Contains(out, "Nothing has been written") {
+					t.Errorf("refused, but not by the remote main check (want %q):\n%s", want, out)
+				}
+				if got := f.version(); got != versionBefore {
+					t.Errorf("a REFUSED release rewrote VERSION: %q -> %q", versionBefore, got)
+				}
+				if got := strings.TrimSpace(f.git("rev-parse", "refs/heads/main")); got != localMain {
+					t.Errorf("a REFUSED release moved local main: %s -> %s", localMain, got)
+				}
+				if out, err := exec.Command("git", "-C", f.dir, "rev-parse", "--verify", "-q", "refs/remotes/"+fixtureRemote+"/main").CombinedOutput(); err == nil {
+					t.Errorf("the remote main fetch wrote refs/remotes/%s/main (%s); it must pass --refmap= and touch only FETCH_HEAD", fixtureRemote, strings.TrimSpace(string(out)))
+				}
+				f.requireNothingPublished()
+			})
+		}
 	}
 }
 
