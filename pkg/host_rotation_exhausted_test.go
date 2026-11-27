@@ -16,10 +16,14 @@ package quicraft
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/pkg/seal"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
 )
 
 // exhaustedHostBarrier models a barrier restarted with a full known-epoch
@@ -132,5 +136,86 @@ func TestRotateBarrierKey_ExhaustedNoSafeFloorNoPurge(t *testing.T) {
 	}
 	if got := rb.rotateCount.Load(); got != 1 {
 		t.Fatalf("rotate calls = %d, want 1", got)
+	}
+}
+
+// startExhaustedRestartHost starts the live-rotation shard on a real WAL with
+// retention 2 and a rotation interval far beyond the test's lifetime, so no
+// rotation tick (scheduled or threshold) can run before the first proposal.
+func startExhaustedRestartHost(t *testing.T, walDir, nodeDir string, b *seal.Barrier) *Host {
+	t.Helper()
+	cfg := testHostConfig(t)
+	cfg.WALDir, cfg.NodeHostDir = walDir, nodeDir
+	cfg.KeyRotationInterval = time.Hour
+	cfg.MaxRetainedEpochs = 2
+	db, err := waldb.Open(walDir, waldb.WithBarrier(b), waldb.WithBlockSize(4096),
+		waldb.WithMaxFileSize(keyRotationLiveSegmentSize), waldb.WithNoSync(true))
+	if err != nil {
+		t.Fatalf("waldb.Open: %v", err)
+	}
+	h, err := NewHost(cfg, WithoutTransport(), WithBarrier(b), WithLogDB(db))
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("NewHost: %v", err)
+	}
+	members := map[uint64]string{keyRotationLiveReplicaID: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, kv.NewMemoryCreateFunc(),
+		testShardConfig(keyRotationLiveShardID, keyRotationLiveReplicaID)); err != nil {
+		mustCloseHost(t, h)
+		t.Fatalf("StartShard: %v", err)
+	}
+	waitForLeader(t, h, keyRotationLiveShardID)
+	return h
+}
+
+// TestNewHost_RestartAtMaxKnownEpochsRecoversBeforeFirstWrite pins the
+// startup recovery for a full keyring. A host restarted with MaxKnownEpochs
+// known epochs is refused rotation by Unseal, which seeds the invocation
+// counter at its limit, so every WAL write fails ErrInvocationLimitExceeded
+// until a purge-and-rotate runs. That recovery must run while the host is
+// built, not on the first rotation tick (30 s away by default): a proposal
+// made at once must commit, and the shard must keep serving.
+func TestNewHost_RestartAtMaxKnownEpochsRecoversBeforeFirstWrite(t *testing.T) {
+	ctx := context.Background()
+	store := &liveSealedStore{}
+	walDir, nodeDir := t.TempDir(), t.TempDir()
+
+	// First life: fill the known-epoch set to the bound, then write WAL
+	// records under the last epoch so the WAL floor sits at the top.
+	b1 := newLiveRotationBarrier(ctx, t, store, nil)
+	for i := 1; i < seal.MaxKnownEpochs; i++ {
+		if _, err := b1.Rotate(ctx); err != nil {
+			t.Fatalf("fixture rotation %d: %v", i, err)
+		}
+	}
+	top := b1.CurrentEpoch()
+	if _, err := b1.Rotate(ctx); !errors.Is(err, seal.ErrKnownEpochsExhausted) {
+		t.Fatalf("fixture: rotation at the bound = %v, want ErrKnownEpochsExhausted", err)
+	}
+	h1 := startExhaustedRestartHost(t, walDir, nodeDir, b1)
+	propCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	proposeLiveValue(propCtx, t, h1, "before", "restart")
+	cancel()
+	mustCloseHost(t, h1)
+	if !b1.IsSealed() {
+		if err := b1.Seal(); err != nil {
+			t.Fatalf("seal first-life barrier: %v", err)
+		}
+	}
+
+	// Second life: Unseal refuses the rotation at the bound and seeds the
+	// invocation limit. Propose at once, long before any rotation tick.
+	b2 := newLiveRotationBarrier(ctx, t, store, store.load())
+	h2 := startExhaustedRestartHost(t, walDir, nodeDir, b2)
+	defer mustCloseHost(t, h2)
+	propCtx, cancel = context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	proposeLiveValue(propCtx, t, h2, "after", "restart")
+
+	if got := b2.CurrentEpoch(); got <= top {
+		t.Fatalf("epoch = %d after restart, want > %d (recovered by rotation)", got, top)
+	}
+	if b2.ShouldRotateKey() {
+		t.Fatal("barrier still reports its invocation budget exhausted after startup recovery")
 	}
 }
