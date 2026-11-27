@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- seal: `Rotate` now refuses with `ErrKnownEpochsExhausted`, persisting
+  nothing, once the known-epoch set names `MaxKnownEpochs` epochs, so the
+  restart rotation can no longer write a sealed blob that `SetSealedRootKey`
+  refuses to load; at the bound a restart refuses encryption (decryption is
+  unaffected) until `PurgeEpochsBefore` makes room.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

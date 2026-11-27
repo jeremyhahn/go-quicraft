@@ -158,6 +158,13 @@ var (
 	// denial-of-service against every subsequent start — no passphrase needed.
 	ErrTooManyKnownEpochs = errors.New("quicraft/seal: sealed root key names too many known epochs")
 
+	// ErrKnownEpochsExhausted is returned by Rotate when the known-epoch set
+	// already names MaxKnownEpochs epochs. One more would persist a blob that
+	// SetSealedRootKey refuses with ErrTooManyKnownEpochs, so the rotation is
+	// refused before anything is derived or persisted. Call PurgeEpochsBefore
+	// with the minimum live epoch to make room.
+	ErrKnownEpochsExhausted = errors.New("quicraft/seal: known-epoch set is at MaxKnownEpochs; call PurgeEpochsBefore before rotating")
+
 	// ErrKnownEpochAboveCurrent is returned when SetSealedRootKey receives a
 	// sealed key whose KnownEpochs contains an epoch greater than its Epoch.
 	// Epochs only ever advance, and the blob records the highest one reached,
