@@ -18,8 +18,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/fsutil"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
@@ -92,16 +94,19 @@ func TestRepair_MakesAFailClosedWALOpenableAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after Repair: %v", err)
 	}
-	defer db.Close()
-
 	// It boots on the clean prefix, and the cost is explicit: the hard state
 	// was written above the corruption, so the repair destroyed it. This is
 	// asserted rather than glossed over — a repair that appeared to lose
 	// nothing would mean the truncation had not actually happened, and an
 	// operator has to understand that this node's newest writes are gone.
 	if _, _, err := db.ReadState(1, 1); !errors.Is(err, logdb.ErrNoState) {
+		db.Close()
 		t.Fatalf("ReadState after Repair = %v, want logdb.ErrNoState: the hard "+
 			"state sat above the truncation point and must not have survived it", err)
+	}
+	// Repair refuses a directory a live DB holds, so close it first.
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 
 	// Repair is idempotent in the sense that matters: a second run finds
@@ -113,6 +118,78 @@ func TestRepair_MakesAFailClosedWALOpenableAgain(t *testing.T) {
 	}, WithBlockSize(blockSize), WithMaxFileSize(64*1024)); !errors.Is(err, ErrRepairNoCorruption) {
 		t.Fatalf("second Repair = %v, want ErrRepairNoCorruption", err)
 	}
+}
+
+// TestRepair_RefusesADirectoryAnOpenDBHolds pins the CLOSED requirement. A
+// repair run under a live writer unlinks and truncates segments that writer
+// still appends to at its old offsets, and the next restart replays a log with
+// a hole where acknowledged writes were. Repair must take the same directory
+// lock Open holds and refuse, touching nothing, while it is held.
+func TestRepair_RefusesADirectoryAnOpenDBHolds(t *testing.T) {
+	const blockSize = 1024
+	dir, corrupt := corruptWALForRepair(t, blockSize)
+	segPath := walSegmentPath(dir, corrupt.ShardIndex, corrupt.SegmentID)
+	sizeBefore := statSize(t, segPath)
+	segsBefore := shardEntryNames(t, walShardDirByIndex(dir, corrupt.ShardIndex))
+
+	target := RepairTarget{
+		ShardIndex: corrupt.ShardIndex,
+		SegmentID:  corrupt.SegmentID,
+		TruncateAt: corrupt.CleanEnd,
+	}
+	opts := []Option{WithBlockSize(blockSize), WithMaxFileSize(64 * 1024)}
+
+	// A live opener's lock. Open itself refuses a corrupt WAL, so the lock is
+	// taken directly, exactly as Open takes it.
+	lock, err := fsutil.LockDir(dir, walLockFilename)
+	if err != nil {
+		t.Fatalf("LockDir: %v", err)
+	}
+	_, err = Repair(dir, target, opts...)
+	if !errors.Is(err, fsutil.ErrDirLocked) {
+		lock.Close()
+		t.Fatalf("Repair of a held directory = %v, want fsutil.ErrDirLocked", err)
+	}
+	var openErr *DBOpenError
+	if !errors.As(err, &openErr) {
+		lock.Close()
+		t.Fatalf("Repair of a held directory = %v, want a *DBOpenError", err)
+	}
+	if size := statSize(t, segPath); size != sizeBefore {
+		lock.Close()
+		t.Fatalf("a refused repair truncated the segment: %d -> %d", sizeBefore, size)
+	}
+	if segs := shardEntryNames(t, walShardDirByIndex(dir, corrupt.ShardIndex)); !slices.Equal(segs, segsBefore) {
+		lock.Close()
+		t.Fatalf("a refused repair changed the shard's segments: %v -> %v", segsBefore, segs)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatalf("releasing the lock: %v", err)
+	}
+
+	// The refusal leaked no lock: with the writer gone the repair runs.
+	if _, err := Repair(dir, target, opts...); err != nil {
+		t.Fatalf("Repair after the lock was released: %v", err)
+	}
+	// And the repair released its own lock: a re-run gets past the lock to
+	// find nothing left to cut.
+	if _, err := Repair(dir, target, opts...); !errors.Is(err, ErrRepairNoCorruption) {
+		t.Fatalf("third Repair = %v, want ErrRepairNoCorruption", err)
+	}
+}
+
+// shardEntryNames returns the sorted names of the entries in a shard directory.
+func shardEntryNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", dir, err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }
 
 // TestRepair_RefusesAnOffsetItDidNotComputeIsTheInterlock pins the guard that
