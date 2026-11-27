@@ -20,11 +20,20 @@ func TestReleaseWireGateFetchesItsBaseline(t *testing.T) {
 		{"release-candidate", "v0.9.5-rc.1"},
 	} {
 		t.Run(tc.target, func(t *testing.T) {
-			for _, sc := range []struct{ name, localTag string }{
-				{"remote-only baseline is used", ""},
+			for _, sc := range []struct {
+				name, localTag string
+				// pruneTags sets these git config keys to true in the fixture
+				// clone. With either, git adds refs/tags/*:refs/tags/* to a
+				// pruning fetch even under --no-tags, so the baseline fetch
+				// would delete every local-only tag.
+				pruneTags []string
+			}{
+				{"remote-only baseline is used", "", nil},
 				// A local tag the remote never advertised must not become the
 				// baseline, even when it sorts above every remote tag.
-				{"higher local-only tag is ignored", "v0.9.9-rc.1"},
+				{"higher local-only tag is ignored", "v0.9.9-rc.1", nil},
+				{"fetch.pruneTags keeps local-only tags", "v0.9.9-rc.1", []string{"fetch.pruneTags", "fetch.prune"}},
+				{"remote pruneTags keeps local-only tags", "v0.9.9-rc.1", []string{"remote." + fixtureRemote + ".pruneTags", "remote." + fixtureRemote + ".prune"}},
 			} {
 				t.Run(sc.name, func(t *testing.T) {
 					key, pub := newSigningKey(t)
@@ -46,6 +55,9 @@ func TestReleaseWireGateFetchesItsBaseline(t *testing.T) {
 					if sc.localTag != "" {
 						f.git("-c", "tag.gpgsign=false", "tag", sc.localTag)
 					}
+					for _, key := range sc.pruneTags {
+						f.git("config", key, "true")
+					}
 					before := f.version()
 
 					out, err := f.make(tc.target, "VERSION="+tc.version, "RELEASE_REMOTE="+fixtureRemote, "RELEASE_ALLOWED_SIGNERS="+signers)
@@ -60,6 +72,11 @@ func TestReleaseWireGateFetchesItsBaseline(t *testing.T) {
 					}
 					if refs := f.remoteRefs(); refs != pushed {
 						t.Errorf("the remote changed after a refused release:\n%s\nwant:\n%s", refs, pushed)
+					}
+					if sc.localTag != "" {
+						if got := strings.TrimSpace(f.git("tag", "-l", sc.localTag)); got != sc.localTag {
+							t.Errorf("local-only tag %s was deleted by the baseline fetch (config %v)", sc.localTag, sc.pruneTags)
+						}
 					}
 				})
 			}
