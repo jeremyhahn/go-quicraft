@@ -403,12 +403,15 @@ func (a *Aggregator) awaitResult(ctx context.Context, p *proposal) error {
 			return err
 		case <-ctx.Done():
 			// Same drain-first rule as above: a result already delivered beats
-			// the context error it tied with.
+			// the context error it tied with. Otherwise INDETERMINATE, as in
+			// the first branch: the proposal is in the queue or currentBatch,
+			// and flushLoop's close branch drains and proposes it, so the
+			// batch may still commit.
 			select {
 			case err := <-p.resultCh:
 				return err
 			default:
-				return ctx.Err()
+				return &FlushError{ShardID: p.shardID, Err: ctx.Err(), Indeterminate: true}
 			}
 		case <-a.flushDone:
 			select {
