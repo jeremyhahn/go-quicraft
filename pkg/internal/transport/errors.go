@@ -38,6 +38,12 @@ var (
 	// MaxFrameSize (16MB).
 	ErrFrameTooLarge = errors.New("transport: frame exceeds max size")
 
+	// ErrUnknownFrameFlags is returned when a frame header sets a flag bit
+	// outside the defined set (FlagCompressed, FlagSnapshot). The body of
+	// such a frame would be parsed under a meaning the sender did not
+	// intend, so the frame is refused rather than misread.
+	ErrUnknownFrameFlags = errors.New("transport: frame header sets undefined flag bits")
+
 	// ErrPeerIdentityMismatch is returned when the peer certificate SAN
 	// does not match the expected node address from the registry.
 	ErrPeerIdentityMismatch = errors.New("transport: peer identity mismatch")
