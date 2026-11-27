@@ -693,7 +693,7 @@ func TestReleaseRefusesALocalMainTheRemoteDoesNotHold(t *testing.T) {
 				if got := strings.TrimSpace(f.git("rev-parse", "refs/heads/main")); got != localMain {
 					t.Errorf("a REFUSED release moved local main: %s -> %s", localMain, got)
 				}
-				if out, err := exec.Command("git", "-C", f.dir, "rev-parse", "--verify", "-q", "refs/remotes/"+fixtureRemote+"/main").CombinedOutput(); err == nil {
+				if out, err := exec.CommandContext(t.Context(), "git", "-C", f.dir, "rev-parse", "--verify", "-q", "refs/remotes/"+fixtureRemote+"/main").CombinedOutput(); err == nil {
 					t.Errorf("the remote main fetch wrote refs/remotes/%s/main (%s); it must pass --refmap= and touch only FETCH_HEAD", fixtureRemote, strings.TrimSpace(string(out)))
 				}
 				f.requireNothingPublished()
