@@ -1367,11 +1367,13 @@ type WireVersionMismatchError struct {
 	// parsed; ShardID and From are then zero.
 	Source string
 	// Frame is true when the refusal was of the frame header's version, not
-	// the batch's: PeerFrameVersion is the version the peer sent and
-	// LocalFrameCurrent/LocalFramePrevious are this host's frame window.
-	Frame              bool
-	PeerFrameVersion   uint8
-	LocalFrameCurrent  uint8
+	// the batch's; the three fields below are then set.
+	Frame bool
+	// PeerFrameVersion is the frame version the peer sent.
+	PeerFrameVersion uint8
+	// LocalFrameCurrent is the current version of this host's frame window.
+	LocalFrameCurrent uint8
+	// LocalFramePrevious is the previous version of this host's frame window.
 	LocalFramePrevious uint8
 }
 
