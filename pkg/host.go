@@ -4351,6 +4351,19 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		h.cfg.RaftAddress = cfg.RaftAddress
 	}
 
+	// Recover an exhausted invocation budget before any shard can write the
+	// WAL. A host restarted with a full known-epoch set is refused rotation
+	// by Unseal, which seeds the invocation counter at its limit, so every
+	// encrypted write fails until a purge-and-rotate runs. The loop below
+	// would only do that on its first threshold tick (30 s away), and a
+	// shard's first WAL write before it fails the shard. rotateBarrierKey
+	// purges under the configured retention and retries once. No shard is
+	// loaded yet, so the safe floor comes from the LogDB alone.
+	if options.barrier != nil && !options.barrier.IsSealed() && options.barrier.ShouldRotateKey() {
+		h.logger.Info("invocation budget exhausted at startup, rotating before shards start")
+		h.rotateBarrierKey(context.Background())
+	}
+
 	// Start the key rotation loop whenever a barrier is configured. With
 	// KeyRotationInterval == 0 scheduled rotation is disabled, but the
 	// invocation-threshold check must still run: it is what rotates the
