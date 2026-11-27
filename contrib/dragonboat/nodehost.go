@@ -853,21 +853,21 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 	}
 	defer rs.Release()
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return dbSM.Result{}, translateError(result.Err)
-		}
-		return dbSM.Result{Value: result.Value, Data: result.Data}, nil
-	case <-ctx.Done():
-		// The proposal was already handed to the host and may still
-		// commit and apply: report the lost wait as maybe-applied, as the
-		// no-op session path does.
-		if ctx.Err() == context.DeadlineExceeded {
-			return dbSM.Result{}, &quicraft.MaybeAppliedError{Err: ErrTimeout}
-		}
-		return dbSM.Result{}, &quicraft.MaybeAppliedError{Err: ErrCanceled}
+	// The host classifies a lost wait from the request, as the no-op
+	// session path's SyncPropose does: maybe-applied once the proposal may
+	// have been handed off, definite when its queue closed before hand-off.
+	result, err := waitRequest(ctx, rs)
+	if err != nil {
+		return dbSM.Result{}, translateError(err)
 	}
+	return dbSM.Result{Value: result.Value, Data: result.Data}, nil
+}
+
+// waitRequest waits for a request the adapter submitted asynchronously. It
+// is RequestState.Wait, which classifies a lost wait from the request; tests
+// replace it to drive a classification the public API cannot stage.
+var waitRequest = func(ctx context.Context, rs *quicraft.RequestState) (quicraft.RequestResult, error) {
+	return rs.Wait(ctx)
 }
 
 // SyncRead performs a linearizable read via ReadIndex + Lookup.
@@ -933,20 +933,14 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) 
 	}
 	defer rs.Release()
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return translateError(result.Err)
-		}
-		return validateCloseSessionResult(result.Value, cs.ClientID())
-	case <-ctx.Done():
-		// The close request was already handed to the host and may still
-		// apply: report the lost wait as maybe-applied.
-		if ctx.Err() == context.DeadlineExceeded {
-			return &quicraft.MaybeAppliedError{Err: ErrTimeout}
-		}
-		return &quicraft.MaybeAppliedError{Err: ErrCanceled}
+	// The host classifies a lost wait from the request: maybe-applied once
+	// the close may have been handed off, definite when its queue closed
+	// before hand-off.
+	result, err := waitRequest(ctx, rs)
+	if err != nil {
+		return translateError(err)
 	}
+	return validateCloseSessionResult(result.Value, cs.ClientID())
 }
 
 // requireNoOPSessionOnDisk enforces dragonboat's rule that replicas backed
