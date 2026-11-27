@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `BarrierConfig.RequireFIPS` now requires the FIPS 140-3 module to be active (`crypto/fips140.Enabled()`); a `GOFIPS140` value in the run-time environment no longer satisfies it, and `Validate`/`NewBarrier` return `ErrFIPSUnavailable`. KDF and cipher restrictions still honour `GOFIPS140`.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
