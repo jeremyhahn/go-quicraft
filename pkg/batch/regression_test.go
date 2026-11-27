@@ -1024,3 +1024,79 @@ func TestSubmit_BlockedShardReturnsQueueFull(t *testing.T) {
 		t.Fatalf("Submit to shard 2 while shard 1 is full = %v, want nil", err)
 	}
 }
+
+// stallAllProposer blocks every shard's propose until release is closed,
+// modelling a quorum outage that affects many shards at once.
+type stallAllProposer struct {
+	release chan struct{}
+}
+
+func (s *stallAllProposer) SyncPropose(ctx context.Context, _ uint64, _ []byte) error {
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// TestSubmit_ManyStalledShardsBoundedInAggregate checks that the admission
+// budget is global as well as per shard: with every shard stalled, flushLoop
+// keeps draining the shared queue into held batches, so a per-shard limit
+// alone lets outstanding proposals grow to QueueSize times the number of
+// stalled shards. Submit must return QueueFullError once about QueueSize
+// plus one batch are outstanding in total.
+func TestSubmit_ManyStalledShardsBoundedInAggregate(t *testing.T) {
+	const (
+		queueSize = 4
+		maxBatch  = 1
+		shards    = 8
+	)
+	s := &stallAllProposer{release: make(chan struct{})}
+	agg, err := NewAggregator(s,
+		WithConfig(Config{
+			MaxBatchSize:   maxBatch,
+			FlushInterval:  2 * time.Millisecond,
+			QueueSize:      queueSize,
+			ProposeTimeout: 30 * time.Second,
+		}),
+		WithLogger(slog.Default()),
+		WithRegistry(newTestRegistry(t)),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	defer func() {
+		close(s.release)
+		_ = agg.Close()
+	}()
+
+	admitted := 0
+	sawFull := false
+	for shard := uint64(1); shard <= shards; shard++ {
+		for i := 0; i < queueSize; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			err := agg.Submit(ctx, shard, []byte{byte(shard), byte(i)})
+			cancel()
+			var qfe *QueueFullError
+			if errors.As(err, &qfe) {
+				sawFull = true
+				if qfe.QueueSize != queueSize {
+					t.Errorf("QueueFullError.QueueSize = %d, want %d", qfe.QueueSize, queueSize)
+				}
+				continue
+			}
+			if err == nil {
+				t.Fatalf("Submit to stalled shard %d succeeded", shard)
+			}
+			admitted++
+		}
+	}
+	if !sawFull {
+		t.Fatalf("%d submissions across %d stalled shards never returned QueueFullError", shards*queueSize, shards)
+	}
+	if limit := queueSize + maxBatch; admitted > limit {
+		t.Errorf("admitted %d proposals across %d stalled shards, want at most %d (QueueSize + one batch)",
+			admitted, shards, limit)
+	}
+}
