@@ -108,6 +108,45 @@ func TestReleaseWireGateFetchesItsBaseline(t *testing.T) {
 					t.Errorf("VERSION = %q after a refused release, want %q", got, before)
 				}
 			})
+			// A configured remote.<name>.fetch mapping still updates matching
+			// local refs when a refspec is named on the command line, unless
+			// the fetch passes --refmap=. A forced tag mapping must not
+			// overwrite a local baseline tag that differs from the remote's.
+			t.Run("forced tag mapping keeps a clashing local tag", func(t *testing.T) {
+				key, pub := newSigningKey(t)
+				const maintainer = "release@example.invalid"
+				f := newReleaseFixture(t, true)
+				f.signWith(maintainer, key, true, true)
+				signers := writeSigners(t, maintainer+" "+pub)
+
+				const baseline = "v0.9.4"
+				f.git("-c", "tag.gpgsign=false", "tag", baseline)
+				f.git("push", "-q", fixtureRemote, "refs/tags/"+baseline)
+				f.git("tag", "-d", baseline)
+				pushed := f.remoteRefs()
+				f.git("-c", "commit.gpgsign=false", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "diverge")
+				f.git("-c", "tag.gpgsign=false", "tag", baseline)
+				local := strings.TrimSpace(f.git("rev-parse", "refs/tags/"+baseline))
+				f.git("config", "--add", "remote."+fixtureRemote+".fetch", "+refs/tags/*:refs/tags/*")
+				before := f.version()
+
+				out, err := f.make(tc.target, "VERSION="+tc.version, "RELEASE_REMOTE="+fixtureRemote, "RELEASE_ALLOWED_SIGNERS="+signers)
+				if err == nil {
+					t.Fatalf("%s succeeded with a local %s that differs from the remote's:\n%s", tc.target, baseline, out)
+				}
+				if !strings.Contains(out, "could not fetch the wire version baseline tag "+baseline) {
+					t.Errorf("%s was not refused by the clashing baseline tag:\n%s", tc.target, out)
+				}
+				if got := strings.TrimSpace(f.git("rev-parse", "refs/tags/"+baseline)); got != local {
+					t.Errorf("local tag %s = %s after the gate, want %s: the configured forced mapping overwrote it", baseline, got, local)
+				}
+				if got := f.version(); got != before {
+					t.Errorf("VERSION = %q after a refused release, want %q", got, before)
+				}
+				if refs := f.remoteRefs(); refs != pushed {
+					t.Errorf("the remote changed after a refused release:\n%s\nwant:\n%s", refs, pushed)
+				}
+			})
 		})
 	}
 }
