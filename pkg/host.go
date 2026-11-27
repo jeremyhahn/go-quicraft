@@ -1684,9 +1684,14 @@ type nodeState struct {
 	// takes no lock for it.
 	leaderlessSince atomic.Int64
 
-	health      atomic.Uint32 // stores ShardHealth as uint32
-	nodes       map[uint64]string
-	nodesMu     sync.RWMutex
+	health  atomic.Uint32 // stores ShardHealth as uint32
+	nodes   map[uint64]string
+	nodesMu sync.RWMutex
+	// lifecycleMu orders StartShard's metrics/registry registration with
+	// teardownShard's removal of the same. It is held across embedder code
+	// (MetricsCollector.RegisterShard), so it must never be nodesMu: a
+	// collector that calls back into ShardInfo takes nodesMu.RLock.
+	lifecycleMu sync.Mutex
 	requestPool *sync.Pool
 	stopped     atomic.Bool
 	rsm         *rsm.StateMachine // for local reads (Lookup)
@@ -5702,6 +5707,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// teardown and owns it; this call must not tear the shard down a second
 	// time. It must still UNDO its own publication into the engine, because the
 	// claimant's UnloadNode ran before LoadNode and could not have removed it.
+	//
+	// A StopShard that claims teardown after this check is handled by the
+	// metrics and registry registration below, which runs under ns.nodesMu
+	// and re-checks ns.stopped there.
 	if h.closed.Load() || h.draining.Load() || ns.stopped.Load() {
 		if ns.stopped.CompareAndSwap(false, true) {
 			// ErrClosed is the caller's answer here — the shard never became
@@ -5719,15 +5728,26 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return ErrClosed
 	}
 
-	// Pre-bind metrics for this shard to avoid expensive label lookups
-	// in hot paths. This must be called before any metrics are recorded.
-	if h.metrics != nil {
-		h.metrics.RegisterShard(cfg.ShardID)
+	if hook := testHookStartShardBeforeRegister; hook != nil {
+		hook(cfg.ShardID)
 	}
 
-	// Register all members in the registry for address resolution.
-	for replicaID, addr := range effectiveNodes {
-		h.registry.Register(cfg.ShardID, replicaID, addr)
+	// Register metrics and member addresses under ns.lifecycleMu, and only
+	// while the shard is not stopped. A StopShard that claims teardown AFTER
+	// the check above would otherwise run its registry Remove loop and
+	// UnregisterShard before this registration, leaving metric series and
+	// member addresses behind for a shard that no longer exists. Teardown
+	// takes ns.lifecycleMu only after its ns.stopped CAS, so either the CAS
+	// came first and the re-check below sees it, or teardown's removal runs
+	// after this unlock and removes what was registered here. The lock is
+	// not ns.nodesMu: RegisterShard is embedder code and may call ShardInfo,
+	// which takes ns.nodesMu. On the stopped path the claimant owns the
+	// shard: the check above saw stopped false, so its UnloadNode runs after
+	// LoadNode and there is nothing to undo.
+	if !h.registerStartedShard(ns, cfg.ShardID, effectiveNodes) {
+		h.logger.Warn("shard start aborted: host is closing or the shard was stopped",
+			"shard_id", cfg.ShardID, "replica_id", cfg.ReplicaID)
+		return ErrClosed
 	}
 
 	// Notify the engine that this shard has work so the Raft peer
@@ -5752,6 +5772,35 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 
 	return nil
 }
+
+// registerStartedShard registers the shard's metrics and member addresses
+// under ns.lifecycleMu, and only while ns is not stopped. It reports false,
+// registering nothing, when ns is stopped. The lock is released with defer:
+// RegisterShard is embedder code, and a runtime.Goexit there passes
+// safeMetricsCollector's recover, so an ordinary unlock would leave
+// lifecycleMu held and block teardownShard's barrier forever.
+func (h *Host) registerStartedShard(ns *nodeState, shardID uint64, members map[uint64]string) bool {
+	ns.lifecycleMu.Lock()
+	defer ns.lifecycleMu.Unlock()
+	if ns.stopped.Load() {
+		return false
+	}
+	// Pre-bind metrics for this shard to avoid expensive label lookups
+	// in hot paths. This must be called before any metrics are recorded.
+	if h.metrics != nil {
+		h.metrics.RegisterShard(shardID)
+	}
+	// Register all members in the registry for address resolution.
+	for replicaID, addr := range members {
+		h.registry.Register(shardID, replicaID, addr)
+	}
+	return true
+}
+
+// testHookStartShardBeforeRegister, when non-nil, is called by StartShard
+// after its Close/StopShard TOCTOU check and immediately before it registers
+// the shard's metrics and member addresses. Tests only.
+var testHookStartShardBeforeRegister func(shardID uint64)
 
 // logRecoveryClamp reports, on the Host's logger, a recovered commit index the
 // raft log clamped down to what the recovered log actually holds (see
@@ -5922,6 +5971,13 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) er
 	// the removal AFTER h.nodes.Delete opened exactly that window: the restart
 	// pre-registers the members, and the still-running teardown's registry
 	// removal black-holes the leader's Replicate traffic to them.
+	//
+	// Take and release ns.lifecycleMu first: ns.stopped is already set, so a
+	// StartShard registration in flight completes before the removal below,
+	// and any later one sees stopped and registers nothing.
+	ns.lifecycleMu.Lock()
+	//nolint:staticcheck // SA2001: empty critical section is the barrier.
+	ns.lifecycleMu.Unlock()
 	ns.nodesMu.RLock()
 	for replicaID := range ns.nodes {
 		h.registry.Remove(shardID, replicaID)
