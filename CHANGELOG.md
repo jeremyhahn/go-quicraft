@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The `Temporary` documentation now lists `ErrShardPaused`, which `Temporary` has always reported as temporary. No behaviour change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
