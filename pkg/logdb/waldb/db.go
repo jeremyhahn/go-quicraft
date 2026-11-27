@@ -2841,8 +2841,13 @@ func (s *walShard) releaseSealPin(l *recordLanding) {
 // purge may act on a floor sampled before this commit.
 //
 // Caller must hold s.dataMu for writing (and, on a live shard, s.mu).
+//
+// It never releases a pin itself: a pin it does not take over stays in
+// l.pinnedEpoch, and the caller passes l to releaseSealPin only after it has
+// unlocked dataMu. DeregisterInFlightEpoch waits for the barrier's
+// inFlightMu, which PurgeEpochsBefore holds across root-key and persister
+// I/O; releasing under dataMu would stall every reader of the shard on it.
 func (s *walShard) applyEpochLocked(l *recordLanding) {
-	defer s.releaseSealPin(l)
 	if l.epoch == 0 {
 		return
 	}
@@ -2874,6 +2879,7 @@ func (s *walShard) commitEpoch(l recordLanding) {
 	s.dataMu.Lock()
 	s.applyEpochLocked(&l)
 	s.dataMu.Unlock()
+	s.releaseSealPin(&l)
 }
 
 // recordContext builds the positional context-AAD for a record at (segID,
@@ -3121,11 +3127,15 @@ func (s *walShard) close() error {
 	s.closed = true
 	// Release every seal pin the shard holds (see pinnedEpochs).
 	s.dataMu.Lock()
+	held := make([]uint64, 0, len(s.pinnedEpochs))
 	for epoch := range s.pinnedEpochs {
 		delete(s.pinnedEpochs, epoch)
-		s.pinner.DeregisterInFlightEpoch(epoch)
+		held = append(held, epoch)
 	}
 	s.dataMu.Unlock()
+	for _, epoch := range held {
+		s.pinner.DeregisterInFlightEpoch(epoch)
+	}
 	if s.activeSegment != nil {
 		err := s.activeSegment.Close()
 		s.activeSegment = nil
@@ -3487,6 +3497,13 @@ func (p *pendingMemUpdates) stageEpoch(l recordLanding) {
 // half-applied. The section is pure memory work — no write, fsync or
 // rotation happens under dataMu.
 func (p *pendingMemUpdates) applyTo(s *walShard) {
+	// Registered first so it runs after the dataMu unlock (see
+	// applyEpochLocked).
+	defer func() {
+		for i := range p.epochs {
+			s.releaseSealPin(&p.epochs[i])
+		}
+	}()
 	s.dataMu.Lock()
 	defer s.dataMu.Unlock()
 
@@ -3620,6 +3637,9 @@ func (db *DB) commitPendingEpochs(pending *[DefaultShardCount]pendingMemUpdates)
 			s.applyEpochLocked(&pending[i].epochs[j])
 		}
 		s.dataMu.Unlock()
+		for j := range pending[i].epochs {
+			s.releaseSealPin(&pending[i].epochs[j])
+		}
 	}
 }
 
@@ -4297,6 +4317,7 @@ func (s *walShard) writeBootstrap(key nodeKey, shardID, replicaID uint64, bs log
 	s.advanceCommittedHWM(landing.segID)
 	s.applyEpochLocked(&landing)
 	s.dataMu.Unlock()
+	s.releaseSealPin(&landing)
 	return nil
 }
 
@@ -4536,7 +4557,9 @@ func (db *DB) RemoveEntriesTo(shardID, replicaID, index uint64) error {
 	// the marker's segment once its entries are compacted away, and compactedTo
 	// would reset to 0 on recovery. The marker's own epoch joins the floor in
 	// the same section. The write is durable here (non-batch writeRecord
-	// fdatasyncs inline).
+	// fdatasyncs inline). The seal pin is released after the unlock (the
+	// defer below runs last; see applyEpochLocked).
+	defer shard.releaseSealPin(&landing)
 	shard.dataMu.Lock()
 	defer shard.dataMu.Unlock()
 
@@ -5354,8 +5377,11 @@ func (s *walShard) recomputeMinWriteEpochFromDisk() {
 	// The directory scan above is I/O and stays outside dataMu; only the map
 	// rewrite it feeds is taken under the lock.
 	s.dataMu.Lock()
-	s.recomputeMinWriteEpoch(surviving)
+	released := s.recomputeMinWriteEpoch(surviving)
 	s.dataMu.Unlock()
+	for _, epoch := range released {
+		s.pinner.DeregisterInFlightEpoch(epoch)
+	}
 }
 
 // recomputeMinWriteEpoch recalculates the shard's minWriteEpoch from the
@@ -5365,7 +5391,7 @@ func (s *walShard) recomputeMinWriteEpochFromDisk() {
 //
 // It rewrites segmentEpochs and minWriteEpoch, so the caller must hold s.mu
 // and s.dataMu for writing.
-func (s *walShard) recomputeMinWriteEpoch(liveSegments map[uint64]bool) {
+func (s *walShard) recomputeMinWriteEpoch(liveSegments map[uint64]bool) []uint64 {
 	// Remove dead segments from the epoch map.
 	for segID := range s.segmentEpochs {
 		if !liveSegments[segID] && segID != s.activeSegmentID {
@@ -5382,13 +5408,17 @@ func (s *walShard) recomputeMinWriteEpoch(liveSegments map[uint64]bool) {
 	}
 	s.minWriteEpoch = newMin
 
-	// Release the seal pins of epochs no live record is sealed under any more.
+	// Drop the seal pins of epochs no live record is sealed under any more.
+	// The caller deregisters them after unlocking dataMu (see
+	// applyEpochLocked).
+	var released []uint64
 	for epoch := range s.pinnedEpochs {
 		if newMin == 0 || epoch < newMin {
 			delete(s.pinnedEpochs, epoch)
-			s.pinner.DeregisterInFlightEpoch(epoch)
+			released = append(released, epoch)
 		}
 	}
+	return released
 }
 
 // DBOpenError is returned when the database fails to open or create
