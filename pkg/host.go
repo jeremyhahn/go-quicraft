@@ -9334,7 +9334,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 
 	h.gcShardSnapshots(snapBaseDir, shardID, replicaID)
 
-	return h.advanceImportLogFloor(shardID, replicaID, header.Index)
+	return h.finishImportLogFloor(shardID, replicaID, header.Index, snapDir)
 }
 
 // advanceImportLogFloor advances the log compaction floor of a stopped shard
@@ -9562,16 +9562,16 @@ func (h *Host) checkImportAdvancesSnapshot(shardID, replicaID, index uint64) err
 // still holds an entry at or below that index. Any other artifact at a
 // non-advancing index is left to checkImportAdvancesSnapshot to refuse.
 func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex uint64,
-	membership logdb.Membership) (bool, error) {
+	membership logdb.Membership) (snapDir string, pending []byte, err error) {
 	existing, err := h.logdb.GetSnapshot(shardID, replicaID)
 	if err != nil {
 		if errors.Is(err, logdb.ErrNoSnapshot) {
-			return false, nil
+			return "", nil, nil
 		}
-		return false, err
+		return "", nil, err
 	}
 	if existing.Index != index || existing.Term != term || existing.OnDiskIndex != onDiskIndex {
-		return false, nil
+		return "", nil, nil
 	}
 	// A retry that resolves a different membership (another
 	// WithImportMembership or WithImportMemberIdentities) is a different
@@ -9579,13 +9579,18 @@ func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex
 	// the recorded membership in place and report success for an override
 	// that was never applied. It goes down the normal path, which refuses it.
 	if !logdbMembershipEqual(existing.Membership, membership) {
-		return false, nil
+		return "", nil, nil
 	}
-	first, _, err := h.logdb.EntryRange(shardID, replicaID)
+	// The pending floor advance is recorded explicitly, in the snapshot's own
+	// directory, by the import that published it, and cleared once the floor
+	// has moved. The log itself cannot say: a bootstrap-only shard has no
+	// entry, and a log already compacted past the index has none below it,
+	// yet either may still have the advance pending.
+	pending, err = readImportFloorPending(h.snapshotFsys(), existing.Filepath)
 	if err != nil {
-		return false, err
+		return "", nil, err
 	}
-	return first != 0 && first <= index, nil
+	return existing.Filepath, pending, nil
 }
 
 // logdbMembershipEqual reports whether a and b describe the same membership.
@@ -9614,19 +9619,20 @@ func logdbMembershipEqual(a, b logdb.Membership) bool {
 // normal import path.
 func (h *Host) completeRecordedImport(ctx context.Context, shardID, replicaID, index, term,
 	onDiskIndex uint64, membership proto.Membership, rawHeader []byte, r io.Reader) (done bool, err error) {
-	retry, err := h.importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex,
+	snapDir, pending, err := h.importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex,
 		protoMembershipToLogDB(membership))
-	if err != nil || !retry {
+	if err != nil || pending == nil {
 		return false, err
 	}
 	// Only the header has been read. The rest of the stream must still be the
 	// complete, trailer-verified artifact before the floor moves, or a
 	// truncated or damaged stream would complete an import a fresh one would
 	// refuse. Same bounded, ctx-aware reader stageImportedArtifact uses.
+	tail := &artifactTailReader{r: r}
 	src := &importPayloadReader{
 		ctx: ctx,
 		r: newArtifactPayloadReader(rawHeader,
-			io.LimitReader(r, int64(config.DefaultMaxSnapshotSize)+1+snapshotArtifactTrailerSize)),
+			io.LimitReader(tail, int64(config.DefaultMaxSnapshotSize)+1+snapshotArtifactTrailerSize)),
 		maxSize: config.DefaultMaxSnapshotSize,
 		shardID: shardID,
 	}
@@ -9636,7 +9642,99 @@ func (h *Host) completeRecordedImport(ctx context.Context, shardID, replicaID, i
 	if err := ctx.Err(); err != nil {
 		return true, mapContextError(err)
 	}
-	return true, h.advanceImportLogFloor(shardID, replicaID, index)
+	// A verified stream proves only that it is A sound artifact. It is the
+	// retry of THE recorded one only if its trailer — the length and hash
+	// over header and payload — is the one the recorded import verified. Any
+	// other artifact at this index is refused exactly as the normal path
+	// refuses an import that does not advance the recorded snapshot.
+	if !bytesEqual(tail.trailer(), pending) {
+		if refuse := h.checkImportAdvancesSnapshot(shardID, replicaID, index); refuse != nil {
+			return true, refuse
+		}
+		return true, &SnapshotArtifactError{Reason: "artifact differs from the recorded import it retries"}
+	}
+	return true, h.finishImportLogFloor(shardID, replicaID, index, snapDir)
+}
+
+// importFloorPendingFile is the marker an import writes into the snapshot
+// directory it publishes, holding the verified artifact trailer. Its presence
+// means the floor advance is still pending; finishImportLogFloor removes it.
+const importFloorPendingFile = "import.floor-pending"
+
+// artifactTailReader passes r through and keeps the last
+// snapshotArtifactTrailerSize bytes read from it: once the payload reader has
+// verified the stream to its end, that tail is the artifact's trailer.
+type artifactTailReader struct {
+	r    io.Reader
+	tail []byte
+}
+
+// Read reads from the source and records the trailing bytes.
+func (a *artifactTailReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.tail = append(a.tail, p[:n]...)
+		if extra := len(a.tail) - snapshotArtifactTrailerSize; extra > 0 {
+			a.tail = a.tail[:copy(a.tail, a.tail[extra:])]
+		}
+	}
+	return n, err
+}
+
+// trailer returns the last snapshotArtifactTrailerSize bytes read.
+func (a *artifactTailReader) trailer() []byte { return a.tail }
+
+// writeImportFloorPending records trailer as dir's pending floor marker.
+func writeImportFloorPending(fsys snapshotFS, dir string, trailer []byte) error {
+	f, err := fsys.OpenFile(filepath.Join(dir, importFloorPendingFile),
+		os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(trailer)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+// readImportFloorPending returns dir's pending floor marker, or nil when the
+// floor advance is not pending. A marker of the wrong size fails closed.
+func readImportFloorPending(fsys snapshotFS, dir string) ([]byte, error) {
+	f, err := fsys.Open(filepath.Join(dir, importFloorPendingFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	b, readErr := io.ReadAll(io.LimitReader(f, snapshotArtifactTrailerSize+1))
+	_ = f.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if len(b) != snapshotArtifactTrailerSize {
+		return nil, &SnapshotArtifactError{Reason: "malformed pending import floor marker in " + dir}
+	}
+	return b, nil
+}
+
+// finishImportLogFloor advances the log floor and then clears the pending
+// marker. A failed removal is returned: the retry repeats the floor advance,
+// which is idempotent, and removes the marker.
+func (h *Host) finishImportLogFloor(shardID, replicaID, index uint64, snapDir string) error {
+	if err := h.advanceImportLogFloor(shardID, replicaID, index); err != nil {
+		return err
+	}
+	fsys := h.snapshotFsys()
+	if err := fsys.Remove(filepath.Join(snapDir, importFloorPendingFile)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDir(fsys, snapDir)
 }
 
 // importSnapshotDir resolves the canonical on-disk directory an imported
@@ -9871,8 +9969,9 @@ func (h *Host) stageImportedArtifact(
 		return 0, 0, unpin, ErrSnapshotBarrierSealed
 	}
 	dataPath := filepath.Join(stageDir, "snapshot.dat")
+	tail := &artifactTailReader{r: r}
 	epoch, pinned, writeErr := h.writeImportedSnapshotData(ctx, fsys, shardID, replicaID, header.Index,
-		dataPath, rawHeader, r, importBarrier)
+		dataPath, rawHeader, tail, importBarrier)
 	if writeErr != nil {
 		// Do not leave a partial (possibly multi-gigabyte) artifact behind
 		// for an import that will never be recorded in LogDB.
@@ -9886,6 +9985,12 @@ func (h *Host) stageImportedArtifact(
 		for _, e := range pinned {
 			importBarrier.DeregisterInFlightEpoch(e)
 		}
+	}
+	// The verified trailer marks the floor advance pending until
+	// finishImportLogFloor clears it; the retry must reproduce it.
+	if markErr := writeImportFloorPending(fsys, stageDir, tail.trailer()); markErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return 0, 0, unpin, markErr
 	}
 
 	// Write the snapshot metadata file beside the artifact, recording the epoch
