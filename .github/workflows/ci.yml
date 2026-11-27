@@ -1,5 +1,7 @@
-# ci-template: v1.59 (customized)
-# LOCAL against v1.59 (kept on purpose):
+# ci-template: v1.61 (customized)
+# v1.61: each push to main gets its own concurrency group, main-push-<sha>, so a later push no longer cancels an earlier commit's run.
+# v1.60: a selection tie goes self-hosted; preflight and the selection go self-hosted only on a push to main or a same-repository pull request (the rule landed in #1207).
+# LOCAL against v1.60 (kept on purpose):
 # - The `Runner labels` unset-variable exemption also skips a pull_request
 #   fork head (a fork pull request never reaches the pool), beside the
 #   `not fork_target` term, even in a workflow without the pull_request
@@ -627,7 +629,7 @@ on:
 # at a time. It is tested first, so a schedule run never takes a main group.
 # The push, pull_request and workflow_dispatch groups do not change.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && format('schedule-{0}', github.repository) || github.ref == 'refs/heads/main' && format('main-{0}', github.event_name) || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && format('schedule-{0}', github.repository) || github.ref == 'refs/heads/main' && github.event_name == 'push' && format('main-push-{0}', github.sha) || github.ref == 'refs/heads/main' && format('main-{0}', github.event_name) || github.ref }}
   cancel-in-progress: true
 
 permissions:
