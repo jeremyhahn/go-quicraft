@@ -16,13 +16,16 @@ package quicraft
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 )
 
 // Sentinels for the individual filesystem failures injected below. Each is a
@@ -221,6 +224,124 @@ func TestDecryptSnapshotToAnonymousScratch_FailedUnlinkFailsClosed(t *testing.T)
 	if !bytes.Equal(original, after) {
 		t.Fatal("the failed decrypt modified the canonical encrypted snapshot")
 	}
+}
+
+// writeExportTestSnapshot creates a real snapshot directory under the test's
+// temp dir holding data as snapshot.dat with its metadata stamped, and
+// returns the directory.
+func writeExportTestSnapshot(t *testing.T, name string, data []byte) string {
+	t.Helper()
+	snapDir := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(snapDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll failed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(snapDir, "snapshot.dat"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	stampTestSnapshotMeta(t, snapDir, 1, 1)
+	return snapDir
+}
+
+// newExportTestHost starts shard 1 replica 1 on a host using db and the
+// given snapshot filesystem.
+func newExportTestHost(t *testing.T, db *mockLogDB, fsys snapshotFS) *Host {
+	t.Helper()
+	h, err := NewHost(testHostConfig(t), WithLogDB(db), WithoutTransport(),
+		WithoutEncryption(), withSnapshotFS(fsys))
+	if err != nil {
+		t.Fatalf("NewHost failed: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+	if err := h.StartShard(members, false, testCreateFunc, testShardConfig(1, 1)); err != nil {
+		t.Fatalf("StartShard failed: %v", err)
+	}
+	return h
+}
+
+// TestExportSnapshot_OpenErrorIsNotSnapshotNotFound checks that an open
+// failure other than "does not exist" is returned wrapped and is not
+// reported as ErrSnapshotNotFound.
+func TestExportSnapshot_OpenErrorIsNotSnapshotNotFound(t *testing.T) {
+	db := newMockLogDB()
+	h := newExportTestHost(t, db, faultySnapshotFS{failOpen: true})
+	snapDir := writeExportTestSnapshot(t, "snap-open-fail", []byte("data"))
+	db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 500, Filepath: snapDir})
+
+	var buf bytes.Buffer
+	err := h.ExportSnapshot(context.Background(), 1, &buf)
+	if !errors.Is(err, errTestOpenFailed) {
+		t.Fatalf("ExportSnapshot error = %v, want errTestOpenFailed", err)
+	}
+	if errors.Is(err, ErrSnapshotNotFound) {
+		t.Fatalf("ExportSnapshot error = %v, must not be ErrSnapshotNotFound", err)
+	}
+}
+
+// gcRaceSnapshotFS reports the stale snapshot.dat as missing on Open, first
+// running onStale (which may record a newer snapshot, as GC racing a new
+// snapshot would).
+type gcRaceSnapshotFS struct {
+	osSnapshotFS
+	stalePath string
+	onStale   func()
+}
+
+func (g gcRaceSnapshotFS) Open(name string) (snapshotFile, error) {
+	if name == g.stalePath {
+		if g.onStale != nil {
+			g.onStale()
+		}
+		return nil, fmt.Errorf("open %s: %w", name, fs.ErrNotExist)
+	}
+	return g.osSnapshotFS.Open(name)
+}
+
+// TestExportSnapshot_GCRaceRetriesLookupOnce checks that when the recorded
+// snapshot file was removed and a newer snapshot is now recorded, the export
+// retries once against the newer record; and that when the record has not
+// changed, the export reports ErrSnapshotNotFound.
+func TestExportSnapshot_GCRaceRetriesLookupOnce(t *testing.T) {
+	t.Run("newer snapshot recorded", func(t *testing.T) {
+		db := newMockLogDB()
+		staleDir := writeExportTestSnapshot(t, "snap-stale", []byte("stale"))
+		freshData := []byte("fresh snapshot data")
+		freshDir := writeExportTestSnapshot(t, "snap-fresh", freshData)
+		h := newExportTestHost(t, db, gcRaceSnapshotFS{
+			stalePath: filepath.Join(staleDir, "snapshot.dat"),
+			onStale: func() {
+				db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 600, Filepath: freshDir})
+			},
+		})
+		db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 500, Filepath: staleDir})
+
+		var buf bytes.Buffer
+		if err := h.ExportSnapshot(context.Background(), 1, &buf); err != nil {
+			t.Fatalf("ExportSnapshot failed: %v", err)
+		}
+		hdr := stripArtifactTrailer(t, &buf)
+		if hdr.Index != 600 {
+			t.Errorf("artifact Index = %d, want 600", hdr.Index)
+		}
+		if !bytes.Equal(buf.Bytes(), freshData) {
+			t.Errorf("exported data = %q, want %q", buf.Bytes(), freshData)
+		}
+	})
+
+	t.Run("record unchanged", func(t *testing.T) {
+		db := newMockLogDB()
+		staleDir := writeExportTestSnapshot(t, "snap-stale", []byte("stale"))
+		h := newExportTestHost(t, db, gcRaceSnapshotFS{
+			stalePath: filepath.Join(staleDir, "snapshot.dat"),
+		})
+		db.SaveSnapshot(1, 1, logdb.Snapshot{Index: 500, Filepath: staleDir})
+
+		var buf bytes.Buffer
+		err := h.ExportSnapshot(context.Background(), 1, &buf)
+		if !errors.Is(err, ErrSnapshotNotFound) {
+			t.Fatalf("ExportSnapshot error = %v, want ErrSnapshotNotFound", err)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
