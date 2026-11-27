@@ -424,3 +424,72 @@ func TestWriteRecord_SealEpochPinnedUntilCommit(t *testing.T) {
 		purge(t, barrier, 1, "the rollback did not release the discarded record's pin")
 	})
 }
+
+// TestSealPinHeldAcrossStalePurgeFloor pins the fix for a purge acting on a
+// floor sampled before a record committed. The host samples the floor
+// (MinLiveEpoch) and calls PurgeEpochsBefore later, unsynchronized: an epoch-1
+// record pending in an otherwise empty shard, a rotation to 2 and another
+// shard committing epoch 2 let a purge sample floor 2 before the epoch-1
+// record commits. If the commit dropped the record's seal pin, that purge
+// would then destroy epoch 1's DEK under an acknowledged record. The shard
+// must keep an in-flight reference on epoch 1 for as long as epoch 1 is live.
+func TestSealPinHeldAcrossStalePurgeFloor(t *testing.T) {
+	ctx := context.Background()
+	barrier := newTestBarrier(t)
+	db, err := Open(t.TempDir(),
+		WithBlockSize(1024),
+		WithMaxFileSize(64*1024),
+		WithBarrier(barrier),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	shard := db.getShard(1)
+
+	// Write one epoch-1 record and commit it the way a SaveState batch does.
+	shard.mu.Lock()
+	if err := shard.ensureActiveSegment(); err != nil {
+		shard.mu.Unlock()
+		t.Fatalf("ensureActiveSegment: %v", err)
+	}
+	shard.batchMode = true
+	landing, err := shard.writeRecord([]byte{payloadTypeCompact, 0})
+	shard.batchMode = false
+	if err != nil {
+		shard.mu.Unlock()
+		t.Fatalf("writeRecord: %v", err)
+	}
+	if landing.epoch != 1 {
+		shard.mu.Unlock()
+		t.Fatalf("landing epoch = %d, want 1", landing.epoch)
+	}
+	var pending pendingMemUpdates
+	pending.stageEpoch(landing)
+	pending.applyTo(shard)
+	shard.mu.Unlock()
+
+	// The purge acts on floor 2, sampled before the commit above.
+	rotateBarrierTo(t, db, 2)
+	n, err := barrier.PurgeEpochsBefore(ctx, 2)
+	if err != nil {
+		t.Fatalf("PurgeEpochsBefore: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("PurgeEpochsBefore(2) on a stale floor purged %d epochs, want 0: "+
+			"the committed epoch-1 record lost its seal pin", n)
+	}
+
+	// Closing the shard releases the pin it held.
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	n, err = barrier.PurgeEpochsBefore(ctx, 2)
+	if err != nil {
+		t.Fatalf("PurgeEpochsBefore after Close: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("PurgeEpochsBefore(2) after Close purged %d epochs, want 1: "+
+			"close did not release the shard's seal pin", n)
+	}
+}
