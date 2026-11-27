@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Documentation (#1226): `proto.Membership.UnmarshalFrom` documents the closed `{current, previous}` read set for the Membership version byte (one member in v1.0) instead of exact equality, and a test pins that set. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
