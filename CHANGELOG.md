@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Transport (#1227): a frame header that sets a flag bit outside `FlagCompressed` and `FlagSnapshot` is refused with the new `ErrUnknownFrameFlags` instead of having its body parsed under the old meaning, and a snapshot chunk frame flagged compressed is refused as malformed. No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

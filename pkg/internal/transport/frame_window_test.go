@@ -92,7 +92,7 @@ func TestValidateFrameHeaderWindow(t *testing.T) {
 
 	t.Run("readFrameHeaderWindow honours the window it is given", func(t *testing.T) {
 		const length uint32 = 4321
-		flags := FrameFlags(0x05)
+		flags := FlagCompressed | FlagSnapshot
 		header := windowHeader(WireVersion+1, flags, length)
 
 		gotLen, gotFlags, err := readFrameHeaderWindow(bytes.NewReader(header[:]), nextBuildWindow())

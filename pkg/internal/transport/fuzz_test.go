@@ -19,6 +19,7 @@ package transport
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -68,7 +69,14 @@ func FuzzFrameHeaderRoundTrip(f *testing.F) {
 			t.Fatalf("MarshalFrame wrote %d bytes, expected %d", n, FrameHeaderSize+len(payload))
 		}
 
-		// Validate the header.
+		// Validate the header. A flag byte with an undefined bit marshals
+		// but must be refused on the way back in.
+		if flags&^(FlagCompressed|FlagSnapshot) != 0 {
+			if err := ValidateFrameHeader(buf[:FrameHeaderSize]); !errors.Is(err, ErrUnknownFrameFlags) {
+				t.Fatalf("ValidateFrameHeader with flags 0x%02X: got %v, want ErrUnknownFrameFlags", flagsByte, err)
+			}
+			return
+		}
 		if err := ValidateFrameHeader(buf[:FrameHeaderSize]); err != nil {
 			t.Fatalf("ValidateFrameHeader rejected a frame we just marshaled: %v", err)
 		}
@@ -280,6 +288,12 @@ func FuzzFrameWithPayload(f *testing.F) {
 		// Read back via ReadFrameHeader.
 		r := bytes.NewReader(buf.Bytes())
 		length, gotFlags, err := ReadFrameHeader(r)
+		if flags&^(FlagCompressed|FlagSnapshot) != 0 {
+			if !errors.Is(err, ErrUnknownFrameFlags) {
+				t.Fatalf("ReadFrameHeader with flags 0x%02X: got %v, want ErrUnknownFrameFlags", flagsByte, err)
+			}
+			return
+		}
 		if err != nil {
 			t.Fatalf("ReadFrameHeader failed: %v", err)
 		}
