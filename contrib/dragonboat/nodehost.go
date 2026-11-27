@@ -679,6 +679,20 @@ func (nh *NodeHost) effectiveConfigChangeIndex(shardID, configChangeIndex uint64
 	return configChangeIndex
 }
 
+// configChangeOpts returns the quicraft options for an add on shardID. An
+// ordered shard binds the add to its configChangeIndex even when that index
+// is 0: dragonboat refuses any index other than the current config change
+// ID, while quicraft treats an unbound 0 as "skip the check". Without the
+// binding, two operators who both read ConfigChangeID 0 could both commit
+// an add after the membership has already changed. Unordered shards pass
+// no option and keep the unbound behaviour.
+func (nh *NodeHost) configChangeOpts(shardID uint64) []quicraft.ConfigChangeOption {
+	if !nh.orderedConfigChange(shardID) {
+		return nil
+	}
+	return []quicraft.ConfigChangeOption{quicraft.WithBoundConfigChangeIndex()}
+}
+
 // removedMarkerDirName is the directory under NodeHostDir that holds one
 // marker file per permanently removed shard/replica pair. The markers make
 // the RemoveData guard survive process restarts.
@@ -1360,7 +1374,7 @@ func (nh *NodeHost) SyncRequestAddReplica(ctx context.Context, shardID, replicaI
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddNode(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddNode(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddReplicaWithIdentity is SyncRequestAddReplica carrying the node
@@ -1375,7 +1389,7 @@ func (nh *NodeHost) SyncRequestAddReplicaWithIdentity(ctx context.Context, shard
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddNonVotingWithIdentity is SyncRequestAddNonVoting carrying the
@@ -1387,7 +1401,7 @@ func (nh *NodeHost) SyncRequestAddNonVotingWithIdentity(ctx context.Context, sha
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddWitnessWithIdentity is SyncRequestAddWitness carrying the node
@@ -1399,7 +1413,7 @@ func (nh *NodeHost) SyncRequestAddWitnessWithIdentity(ctx context.Context, shard
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // NodeIdentity returns this NodeHost's stable node identity — the value
@@ -1439,7 +1453,7 @@ func (nh *NodeHost) SyncRequestAddNonVoting(ctx context.Context, shardID, replic
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddObserver(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddObserver(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddWitness adds a voting witness replica and blocks until
@@ -1451,7 +1465,7 @@ func (nh *NodeHost) SyncRequestAddWitness(ctx context.Context, shardID, replicaI
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddWitness(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddWitness(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestDeleteReplica removes a replica from the shard and blocks
@@ -1504,7 +1518,7 @@ func (nh *NodeHost) RequestAddReplicaWithIdentity(shardID, replicaID uint64, tar
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...)
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
@@ -1530,7 +1544,7 @@ func (nh *NodeHost) RequestAddNonVotingWithIdentity(shardID, replicaID uint64, t
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...)
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
@@ -1560,7 +1574,7 @@ func (nh *NodeHost) RequestAddWitnessWithIdentity(shardID, replicaID uint64, tar
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...)
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
