@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- waldb `Repair` now takes the WAL directory lock that `Open` holds, and refuses a directory a live DB has open with a `*DBOpenError` wrapping `fsutil.ErrDirLocked` before it reads or changes anything (#1243). Previously a repair run against an open directory could unlink and truncate segments under the running writer. No format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added

@@ -94,16 +94,19 @@ func TestRepair_MakesAFailClosedWALOpenableAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open after Repair: %v", err)
 	}
-	defer db.Close()
-
 	// It boots on the clean prefix, and the cost is explicit: the hard state
 	// was written above the corruption, so the repair destroyed it. This is
 	// asserted rather than glossed over — a repair that appeared to lose
 	// nothing would mean the truncation had not actually happened, and an
 	// operator has to understand that this node's newest writes are gone.
 	if _, _, err := db.ReadState(1, 1); !errors.Is(err, logdb.ErrNoState) {
+		db.Close()
 		t.Fatalf("ReadState after Repair = %v, want logdb.ErrNoState: the hard "+
 			"state sat above the truncation point and must not have survived it", err)
+	}
+	// Repair refuses a directory a live DB holds, so close it first.
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 
 	// Repair is idempotent in the sense that matters: a second run finds
