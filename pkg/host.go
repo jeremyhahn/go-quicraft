@@ -9157,7 +9157,7 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// in place; only the floor advance is left, and no later compaction would
 	// perform it, so the retry completes it instead of being refused below.
 	if done, err := h.completeRecordedImport(ctx, shardID, replicaID, header.Index, term,
-		header.OnDiskIndex); err != nil || done {
+		header.OnDiskIndex, recoveredMembership, rawHeader, r); err != nil || done {
 		return err
 	}
 
@@ -9561,7 +9561,8 @@ func (h *Host) checkImportAdvancesSnapshot(shardID, replicaID, index uint64) err
 // snapshot has the same Index, floored Term and OnDiskIndex, and the LogDB
 // still holds an entry at or below that index. Any other artifact at a
 // non-advancing index is left to checkImportAdvancesSnapshot to refuse.
-func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex uint64) (bool, error) {
+func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex uint64,
+	membership logdb.Membership) (bool, error) {
 	existing, err := h.logdb.GetSnapshot(shardID, replicaID)
 	if err != nil {
 		if errors.Is(err, logdb.ErrNoSnapshot) {
@@ -9572,11 +9573,38 @@ func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex
 	if existing.Index != index || existing.Term != term || existing.OnDiskIndex != onDiskIndex {
 		return false, nil
 	}
+	// A retry that resolves a different membership (another
+	// WithImportMembership or WithImportMemberIdentities) is a different
+	// import, not the retry of the recorded one; completing it would leave
+	// the recorded membership in place and report success for an override
+	// that was never applied. It goes down the normal path, which refuses it.
+	if !logdbMembershipEqual(existing.Membership, membership) {
+		return false, nil
+	}
 	first, _, err := h.logdb.EntryRange(shardID, replicaID)
 	if err != nil {
 		return false, err
 	}
 	return first != 0 && first <= index, nil
+}
+
+// logdbMembershipEqual reports whether a and b describe the same membership.
+// A nil map equals an empty one, since a LogDB round-trip may yield either.
+func logdbMembershipEqual(a, b logdb.Membership) bool {
+	return a.ConfigChangeID == b.ConfigChangeID &&
+		a.MaxWitnesses == b.MaxWitnesses &&
+		a.RequireFullReplicaMajority == b.RequireFullReplicaMajority &&
+		a.SessionExpiryEntries == b.SessionExpiryEntries &&
+		a.MaxTotalSessions == b.MaxTotalSessions &&
+		a.MaxResponsesPerSession == b.MaxResponsesPerSession &&
+		a.MaxSessionsPerOwner == b.MaxSessionsPerOwner &&
+		a.WireVersion == b.WireVersion &&
+		maps.Equal(a.Addresses, b.Addresses) &&
+		maps.Equal(a.Observers, b.Observers) &&
+		maps.Equal(a.Witnesses, b.Witnesses) &&
+		maps.Equal(a.Removed, b.Removed) &&
+		maps.Equal(a.Identities, b.Identities) &&
+		maps.Equal(a.RemovedIdentities, b.RemovedIdentities)
 }
 
 // completeRecordedImport finishes the retry of an import that recorded its
@@ -9585,10 +9613,25 @@ func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex
 // completing it; done is false for every other artifact, which then takes the
 // normal import path.
 func (h *Host) completeRecordedImport(ctx context.Context, shardID, replicaID, index, term,
-	onDiskIndex uint64) (done bool, err error) {
-	retry, err := h.importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex)
+	onDiskIndex uint64, membership proto.Membership, rawHeader []byte, r io.Reader) (done bool, err error) {
+	retry, err := h.importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex,
+		protoMembershipToLogDB(membership))
 	if err != nil || !retry {
 		return false, err
+	}
+	// Only the header has been read. The rest of the stream must still be the
+	// complete, trailer-verified artifact before the floor moves, or a
+	// truncated or damaged stream would complete an import a fresh one would
+	// refuse. Same bounded, ctx-aware reader stageImportedArtifact uses.
+	src := &importPayloadReader{
+		ctx: ctx,
+		r: newArtifactPayloadReader(rawHeader,
+			io.LimitReader(r, int64(config.DefaultMaxSnapshotSize)+1+snapshotArtifactTrailerSize)),
+		maxSize: config.DefaultMaxSnapshotSize,
+		shardID: shardID,
+	}
+	if _, err := io.Copy(io.Discard, src); err != nil {
+		return true, err
 	}
 	if err := ctx.Err(); err != nil {
 		return true, mapContextError(err)
