@@ -755,3 +755,221 @@ func waitForCondition(t *testing.T, within time.Duration, what string, cond func
 		}
 	}
 }
+
+// gatedProposer blocks every SyncPropose for shard 1 until release is closed
+// (or the propose context ends) and completes every other shard at once. It
+// records, per shard, the most SyncPropose calls in flight at the same time
+// and the commands proposed, in proposal order.
+type gatedProposer struct {
+	release chan struct{}
+	entered chan struct{}
+
+	mu          sync.Mutex
+	inFlight    map[uint64]int
+	maxInFlight map[uint64]int
+	cmds        map[uint64][]string
+}
+
+func newGatedProposer() *gatedProposer {
+	return &gatedProposer{
+		release:     make(chan struct{}),
+		entered:     make(chan struct{}, 16),
+		inFlight:    make(map[uint64]int),
+		maxInFlight: make(map[uint64]int),
+		cmds:        make(map[uint64][]string),
+	}
+}
+
+func (g *gatedProposer) SyncPropose(ctx context.Context, shardID uint64, data []byte) error {
+	cmds, err := DecodeBatch(data)
+	if err != nil {
+		return err
+	}
+	g.mu.Lock()
+	g.inFlight[shardID]++
+	if g.inFlight[shardID] > g.maxInFlight[shardID] {
+		g.maxInFlight[shardID] = g.inFlight[shardID]
+	}
+	for _, c := range cmds {
+		g.cmds[shardID] = append(g.cmds[shardID], string(c))
+	}
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.inFlight[shardID]--
+		g.mu.Unlock()
+	}()
+
+	if shardID != 1 {
+		return nil
+	}
+	g.entered <- struct{}{}
+	select {
+	case <-g.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g *gatedProposer) awaitEntry(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shard 1 never reached the proposer")
+	}
+}
+
+func (g *gatedProposer) maxConcurrent(shardID uint64) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.maxInFlight[shardID]
+}
+
+func (g *gatedProposer) proposed(shardID uint64) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.cmds[shardID]...)
+}
+
+func newGatedAggregator(t *testing.T, g *gatedProposer, maxBatch, queueSize int) *Aggregator {
+	t.Helper()
+	agg, err := NewAggregator(g,
+		WithConfig(Config{
+			MaxBatchSize:   maxBatch,
+			FlushInterval:  2 * time.Millisecond,
+			QueueSize:      queueSize,
+			ProposeTimeout: 30 * time.Second,
+		}),
+		WithLogger(slog.Default()),
+		WithRegistry(newTestRegistry(t)),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	return agg
+}
+
+// heldBatches reports how many batches for shardID wait behind its in-flight
+// flush.
+func heldBatches(a *Aggregator, shardID uint64) int {
+	a.shardMu.Lock()
+	defer a.shardMu.Unlock()
+	return len(a.shardHeld[shardID])
+}
+
+func awaitNilSubmit(t *testing.T, what string, ch <-chan error) {
+	t.Helper()
+	select {
+	case err := <-ch:
+		if err != nil {
+			t.Errorf("%s: Submit = %T (%v), want nil", what, err, err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s: Submit never returned", what)
+	}
+}
+
+// A flush holding a slow or leaderless shard must not stop the flush loop:
+// another shard's proposals keep flushing while it waits.
+func TestFlush_BlockedShardDoesNotStallOtherShards(t *testing.T) {
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 4, 4)
+	defer func() { _ = agg.Close() }()
+
+	blocked := make(chan error, 1)
+	go func() { blocked <- agg.Submit(context.Background(), 1, []byte("slow")) }()
+	g.awaitEntry(t)
+
+	for i := 0; i < 8; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := agg.Submit(ctx, 2, []byte{byte('a' + i)})
+		cancel()
+		if err != nil {
+			t.Fatalf("shard 2 proposal %d: Submit = %T (%v), want nil; "+
+				"shard 1's in-flight flush stalled the flush loop", i, err, err)
+		}
+	}
+
+	close(g.release)
+	awaitNilSubmit(t, "shard 1", blocked)
+}
+
+// A shard has at most one flush in flight; later batches for it are held and
+// proposed after it, in arrival order.
+func TestFlush_BusyShardHoldsLaterBatchesInOrder(t *testing.T) {
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 1, 16)
+	defer func() { _ = agg.Close() }()
+
+	results := make([]chan error, 3)
+	for i, cmd := range []string{"first", "second", "third"} {
+		results[i] = make(chan error, 1)
+		go func() { results[i] <- agg.Submit(context.Background(), 1, []byte(cmd)) }()
+		if i == 0 {
+			g.awaitEntry(t)
+			continue
+		}
+		waitForCondition(t, 5*time.Second, "the later batch was not held behind the in-flight flush", func() bool {
+			return heldBatches(agg, 1) == i
+		})
+	}
+
+	if got := g.maxConcurrent(1); got != 1 {
+		t.Errorf("shard 1 max concurrent SyncPropose = %d, want 1", got)
+	}
+	close(g.release)
+	for i, ch := range results {
+		awaitNilSubmit(t, []string{"first", "second", "third"}[i], ch)
+	}
+	if got := g.maxConcurrent(1); got != 1 {
+		t.Errorf("shard 1 max concurrent SyncPropose = %d, want 1", got)
+	}
+	got := g.proposed(1)
+	want := []string{"first", "second", "third"}
+	if len(got) != len(want) {
+		t.Fatalf("shard 1 proposed %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("shard 1 proposed %q, want %q", got, want)
+		}
+	}
+}
+
+// Close returns only after every in-flight and held shard flush has finished,
+// and those proposals get their real result, not ClosedError.
+func TestClose_WaitsForInFlightShardFlush(t *testing.T) {
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 1, 16)
+
+	first := make(chan error, 1)
+	go func() { first <- agg.Submit(context.Background(), 1, []byte("first")) }()
+	g.awaitEntry(t)
+	second := make(chan error, 1)
+	go func() { second <- agg.Submit(context.Background(), 1, []byte("second")) }()
+	waitForCondition(t, 5*time.Second, "the second batch was not held behind the in-flight flush", func() bool {
+		return heldBatches(agg, 1) == 1
+	})
+
+	closed := make(chan error, 1)
+	go func() { closed <- agg.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while a shard flush was still in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(g.release)
+	awaitNilSubmit(t, "first", first)
+	awaitNilSubmit(t, "second", second)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never returned")
+	}
+}

@@ -242,6 +242,15 @@ type Aggregator struct {
 	// otherwise hang).
 	flushDone chan struct{}
 
+	// Per-shard flush workers - protected by shardMu. A shard has a key in
+	// shardHeld exactly while its worker runs; the value holds, in arrival
+	// order, the batches flushed for that shard while its current propose is
+	// still in flight. shardWG counts running workers; flushLoop waits on it
+	// before it returns, so flushDone still means nothing more will flush.
+	shardMu   sync.Mutex
+	shardHeld map[uint64][][]*proposal
+	shardWG   sync.WaitGroup
+
 	// Metrics.
 	metrics     *aggregatorMetrics
 	metricsOnce sync.Once
