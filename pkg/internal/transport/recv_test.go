@@ -1649,6 +1649,62 @@ func TestHandleStream_ErrorExitCancelsRead(t *testing.T) {
 	}
 }
 
+// TestHandleStream_UnknownFrameFlagsIsProtocolViolation pins that a header
+// carrying an undefined flag bit resets the stream with
+// QUICStreamErrFrameRejected and counts a protocol-violation drop. Any other
+// reset code reads to the sender as connection failure and tears down a
+// healthy connection and its pooled streams.
+func TestHandleStream_UnknownFrameFlagsIsProtocolViolation(t *testing.T) {
+	rec := &dropRecorder{}
+	t1, t2, cleanup := transportPairWith(t, 42, newTestHandler(), newTestHandler(), func(c *Config) {
+		c.Metrics = rec
+	})
+	defer cleanup()
+
+	conn, err := t1.getConnection(t2.Addr().String(), "")
+	if err != nil {
+		t.Fatalf("getConnection failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("OpenStreamSync failed: %v", err)
+	}
+
+	if before := countDropsWithReason(rec, dropReasonProtocolViolation); before != 0 {
+		t.Fatalf("protocol-violation drops before the frame = %d, want 0", before)
+	}
+
+	// Valid magic, version and length; only the undefined 0x80 flag bit is
+	// wrong.
+	header := []byte{MagicByte0, MagicByte1, WireVersion, 0x80, 0x00, 0x00, 0x00, 0x00}
+	if _, err := stream.Write(header); err != nil {
+		t.Fatalf("initial write failed: %v", err)
+	}
+
+	junk := make([]byte, 1024)
+	pollUntil(t, 5*time.Second, 10*time.Millisecond, "stream writes kept succeeding: receive direction was never cancelled", func() bool {
+		_, err = stream.Write(junk)
+		return err != nil
+	})
+	var streamErr *quic.StreamError
+	if !errors.As(err, &streamErr) {
+		t.Fatalf("expected quic.StreamError from write after CancelRead, got %T: %v", err, err)
+	}
+	if streamErr.ErrorCode != QUICStreamErrFrameRejected {
+		t.Fatalf("stream error code = %d, want %d (QUICStreamErrFrameRejected)",
+			streamErr.ErrorCode, QUICStreamErrFrameRejected)
+	}
+	pollUntil(t, 5*time.Second, 10*time.Millisecond, "undefined frame flags were not counted as a protocol violation", func() bool {
+		return countDropsWithReason(rec, dropReasonProtocolViolation) >= 1
+	})
+	if got := countDropsWithReason(rec, dropReasonProtocolViolation); got != 1 {
+		t.Fatalf("protocol-violation drops = %d, want 1", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // processSnapshotHeader oversized declared header length (recv.go)
 // ---------------------------------------------------------------------------
