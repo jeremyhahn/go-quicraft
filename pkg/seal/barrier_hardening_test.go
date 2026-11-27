@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/cipher"
+	"crypto/fips140"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -583,7 +584,7 @@ func TestRequireFIPS_FailsClosedWhenUnavailable(t *testing.T) {
 	cfg.Algorithm = AlgAES256GCM
 	cfg.RequireFIPS = true
 
-	if FIPSEnabled() {
+	if fips140.Enabled() {
 		t.Skip("this binary has the FIPS module active; the unavailable case cannot be constructed here")
 	}
 	if _, err := NewBarrier(cfg); !errors.Is(err, ErrFIPSUnavailable) {
@@ -593,15 +594,64 @@ func TestRequireFIPS_FailsClosedWhenUnavailable(t *testing.T) {
 		t.Fatalf("Validate(RequireFIPS, no module) = %v, want ErrFIPSUnavailable", err)
 	}
 
-	// With the module signalled, the same config constructs.
+	// GOFIPS140 in the run-time environment does not activate the module,
+	// so it does not satisfy RequireFIPS either.
 	t.Setenv(envGOFIPS140, "on")
-	if _, err := NewBarrier(cfg); err != nil {
-		t.Fatalf("NewBarrier(RequireFIPS, module present): %v", err)
+	if _, err := NewBarrier(cfg); !errors.Is(err, ErrFIPSUnavailable) {
+		t.Fatalf("NewBarrier(RequireFIPS, GOFIPS140=on, no module) = %v, want ErrFIPSUnavailable", err)
 	}
 	// And RequireFIPS off is unaffected either way.
 	cfg.RequireFIPS = false
 	if _, err := NewBarrier(cfg); err != nil {
 		t.Fatalf("NewBarrier(RequireFIPS=false): %v", err)
+	}
+}
+
+// TestRequireFIPS_IgnoresGOFIPS140Env pins that RequireFIPS is gated on the
+// FIPS 140-3 module itself: a GOFIPS140 value in the run-time environment,
+// with the module off, must not let a RequireFIPS config validate or
+// construct.
+func TestRequireFIPS_IgnoresGOFIPS140Env(t *testing.T) {
+	if fips140.Enabled() {
+		t.Skip("this binary has the FIPS module active; the module-off case cannot be constructed here")
+	}
+	for _, v := range []string{"v1.0.0", "on"} {
+		t.Run(v, func(t *testing.T) {
+			t.Setenv(envGOFIPS140, v)
+			cfg := DefaultBarrierConfig(1)
+			cfg.Algorithm = AlgAES256GCM
+			cfg.RequireFIPS = true
+
+			if err := cfg.Validate(); !errors.Is(err, ErrFIPSUnavailable) {
+				t.Fatalf("Validate(RequireFIPS, GOFIPS140=%s, module off) = %v, want ErrFIPSUnavailable", v, err)
+			}
+			if _, err := NewBarrier(cfg); !errors.Is(err, ErrFIPSUnavailable) {
+				t.Fatalf("NewBarrier(RequireFIPS, GOFIPS140=%s, module off) = %v, want ErrFIPSUnavailable", v, err)
+			}
+
+			cfg.RequireFIPS = false
+			if _, err := NewBarrier(cfg); err != nil {
+				t.Fatalf("NewBarrier(RequireFIPS=false, GOFIPS140=%s): %v", v, err)
+			}
+		})
+	}
+}
+
+// TestRequireFIPS_AcceptsActiveModule pins that RequireFIPS is satisfied when
+// the FIPS 140-3 module is active (for example under GODEBUG=fips140=on).
+func TestRequireFIPS_AcceptsActiveModule(t *testing.T) {
+	if !fips140.Enabled() {
+		t.Skip("the FIPS module is not active in this binary; run with GODEBUG=fips140=on")
+	}
+	cfg := DefaultBarrierConfig(1)
+	cfg.Algorithm = AlgAES256GCM
+	cfg.RequireFIPS = true
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate(RequireFIPS, module active): %v", err)
+	}
+	if _, err := NewBarrier(cfg); err != nil {
+		t.Fatalf("NewBarrier(RequireFIPS, module active): %v", err)
 	}
 }
 
