@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -177,6 +178,48 @@ func TestStartShard_StopShardBeforeRegister_NoLeak(t *testing.T) {
 		if rerr != nil || addr != want {
 			t.Fatalf("restart: Resolve(%d, %d) = %q, %v; want %q", shardID, replicaID, addr, rerr, want)
 		}
+	}
+}
+
+// shardInfoCollector calls back into the host from RegisterShard, as an
+// embedder's collector may to label its series.
+type shardInfoCollector struct {
+	NoOpMetricsCollector
+	host  atomic.Pointer[Host]
+	calls atomic.Int32
+}
+
+func (c *shardInfoCollector) RegisterShard(shardID uint64) {
+	if h := c.host.Load(); h != nil {
+		_, _ = h.ShardInfo(shardID)
+		c.calls.Add(1)
+	}
+}
+
+// TestStartShard_CollectorCallsShardInfo_NoDeadlock verifies StartShard does
+// not hold a nodeState lock that ShardInfo needs while it runs the embedder's
+// RegisterShard.
+func TestStartShard_CollectorCallsShardInfo_NoDeadlock(t *testing.T) {
+	c := &shardInfoCollector{}
+	h := newMetricsLifecycleHost(t, c)
+	c.host.Store(h)
+	const shardID = 78
+	members := map[uint64]string{1: "127.0.0.1:5000"}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.StartShard(members, false, testCreateFunc, testShardConfig(shardID, 1))
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("StartShard: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("StartShard did not return within 10s: RegisterShard calling ShardInfo deadlocked")
+	}
+	if c.calls.Load() == 0 {
+		t.Fatal("collector RegisterShard was not called")
 	}
 }
 
