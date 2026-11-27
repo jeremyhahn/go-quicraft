@@ -125,3 +125,37 @@ func TestCompatFields_ValidateRefusesAnyGossipField(t *testing.T) {
 		})
 	}
 }
+
+// TestCompatFields_ValidateRefusesDefaultNodeRegistry verifies that
+// Validate and Prepare refuse DefaultNodeRegistryEnabled: quicraft never
+// runs a node registry, so the setting must fail at NewNodeHost rather
+// than at the first StartReplica with a NodeHostID target.
+func TestCompatFields_ValidateRefusesDefaultNodeRegistry(t *testing.T) {
+	ctx := context.Background()
+	checks := []struct {
+		name string
+		run  func(*NodeHostConfig) error
+	}{
+		{"Validate", (*NodeHostConfig).Validate},
+		{"Prepare", (*NodeHostConfig).Prepare},
+	}
+	for _, ck := range checks {
+		t.Run(ck.name, func(t *testing.T) {
+			cfg := compatBaseConfig(ctx, t)
+			cfg.DefaultNodeRegistryEnabled = true
+			err := ck.run(&cfg)
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("%s with DefaultNodeRegistryEnabled = %v, want *ValidationError", ck.name, err)
+			}
+			if ve.Field != "DefaultNodeRegistryEnabled" {
+				t.Errorf("ValidationError.Field = %q, want %q", ve.Field, "DefaultNodeRegistryEnabled")
+			}
+
+			cfg.DefaultNodeRegistryEnabled = false
+			if err := ck.run(&cfg); err != nil {
+				t.Errorf("%s with DefaultNodeRegistryEnabled false = %v, want nil", ck.name, err)
+			}
+		})
+	}
+}
