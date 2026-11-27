@@ -12,7 +12,7 @@ replace github.com/jeremyhahn/go-quicraft => ../..
 // The release recipe (make release-alpha / release-candidate / release) pins
 // this require to the version it cuts and tags contrib/dragonboat/<version>
 // beside the root tag, so importers resolve the parent at that version.
-require github.com/jeremyhahn/go-quicraft v0.24.2-alpha
+require github.com/jeremyhahn/go-quicraft v1.0.0-rc.1
 
 require (
 	github.com/beorn7/perks v1.0.1 // indirect

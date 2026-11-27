@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-11-25
+
 ### Added
 
 - Raft wire version window (#1218): `Host.WireWindow()` reports the host's `{current, previous}` window (`proto.DefaultWireWindow()` is the compile-time read). The Raft layer refuses every message from a peer outside the window, before the inbox, elections and the leader-exec router, as a `*WireVersionMismatchError` that matches `proto.ErrUnsupportedVersion`, logged once per peer per change. From v1.0.0-rc.1 every release that changes the wire layout bumps `WireVersion`; `make release` and `make release-candidate` enforce it with `scripts/check-wire-version.sh` against `pkg/proto/testdata/wire_layout.golden`.
