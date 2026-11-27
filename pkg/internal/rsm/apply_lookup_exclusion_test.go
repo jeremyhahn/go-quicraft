@@ -15,6 +15,7 @@
 package rsm
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync"
@@ -79,7 +80,14 @@ func (o *overlapDetectorSM) SaveSnapshot(_ context.Context, w io.Writer, _ <-cha
 	return err
 }
 
+// RecoverFromSnapshot replaces all state, so it is a writer exactly like
+// Update: it raises the same counter for its whole span.
 func (o *overlapDetectorSM) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct{}) error {
+	o.inUpdate.Add(1)
+	defer o.inUpdate.Add(-1)
+	for i := 0; i < o.spin; i++ {
+		_ = i * i
+	}
 	_, err := io.ReadAll(r)
 	return err
 }
@@ -160,5 +168,82 @@ func TestApplyExcludesLookupOnBasicTier(t *testing.T) {
 	if v := detector.violations.Load(); v != 0 {
 		t.Errorf("Update overlapped a read %d time(s); sm.StateMachine documents that "+
 			"Update and Lookup are never called concurrently", v)
+	}
+}
+
+// TestRecoverFromSnapshotExcludesLookupOnBasicTier pins the same contract for
+// snapshot recovery, which replaces all user state. It fails if
+// RecoverFromSnapshot and Lookup/GetHash can overlap on a basic-tier user
+// state machine.
+//
+// Fail-before-fix, observed: with RecoverFromSnapshot holding readGuard.RLock
+// on every tier, this reports violations. With the write lock on the basic
+// tier (the mode Apply uses) it reports none.
+func TestRecoverFromSnapshotExcludesLookupOnBasicTier(t *testing.T) {
+	detector := &overlapDetectorSM{spin: 2000}
+	createFn := func(uint64, uint64) interface{} { return detector }
+
+	machine, err := NewStateMachine(1, 1, createFn, t.TempDir(), testPolicy(100, 100, 0), nil, true)
+	if err != nil {
+		t.Fatalf("NewStateMachine = %v", err)
+	}
+	defer machine.Close()
+
+	var snap bytes.Buffer
+	if err := machine.SaveSnapshot(context.Background(), &snap, nil); err != nil {
+		t.Fatalf("SaveSnapshot = %v", err)
+	}
+	image := snap.Bytes()
+
+	const (
+		recoverRounds = 400
+		readers       = 4
+	)
+
+	var wg sync.WaitGroup
+	var reads atomic.Int64
+	stop := make(chan struct{})
+
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := machine.Lookup(context.Background(), []byte("k")); err != nil {
+					return
+				}
+				if _, _, err := machine.GetHash(); err != nil {
+					return
+				}
+				reads.Add(1)
+			}
+		}()
+	}
+
+	for i := 0; i < recoverRounds; i++ {
+		if err := machine.RecoverFromSnapshot(context.Background(), bytes.NewReader(image), nil); err != nil {
+			close(stop)
+			wg.Wait()
+			t.Fatalf("RecoverFromSnapshot round %d = %v", i+1, err)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+
+	if got := detector.inUpdate.Load(); got != 0 {
+		t.Fatalf("writer counter did not settle: %d", got)
+	}
+	if reads.Load() == 0 {
+		t.Fatal("readers never completed a read; the test proved nothing")
+	}
+	if v := detector.violations.Load(); v != 0 {
+		t.Errorf("RecoverFromSnapshot overlapped a read %d time(s); sm.StateMachine documents that "+
+			"its methods are never called concurrently", v)
 	}
 }
