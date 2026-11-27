@@ -1,5 +1,5 @@
 # ci-template: v1.61 (customized)
-# v1.61: each push to main gets its own concurrency group, main-push-<sha>, so a later push no longer cancels an earlier commit's run (handbook #144).
+# v1.61: each push to main gets its own concurrency group, main-push-<sha>, so a later push no longer cancels an earlier commit's run.
 # v1.60: a selection tie goes self-hosted; preflight and the selection go self-hosted only on a push to main or a same-repository pull request (the rule landed in #1207).
 # LOCAL against v1.60 (kept on purpose):
 # - The `Runner labels` unset-variable exemption also skips a pull_request
