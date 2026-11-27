@@ -57,6 +57,10 @@ const (
 	// hostIDFileName is the file that stores the host's unique identifier.
 	hostIDFileName = "host.id"
 
+	// hostIDTempFileName is the temporary file a new host ID is written to
+	// before it is renamed over hostIDFileName.
+	hostIDTempFileName = "host.id.tmp"
+
 	// hostIDLength is the expected length of the host ID hex string.
 	hostIDLength = 32
 

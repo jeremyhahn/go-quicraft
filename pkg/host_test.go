@@ -2427,12 +2427,114 @@ func TestLoadOrGenerateHostID_ShortContent(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	id, err := loadOrGenerateHostID(slog.Default(), dir, "")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
+	_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+	assertHostIDInitError(t, err)
+	data, readErr := os.ReadFile(idPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile failed: %v", readErr)
 	}
-	if len(id) != hostIDLength {
-		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
+	if string(data) != "abc" {
+		t.Errorf("host.id content = %q, want unchanged %q", data, "abc")
+	}
+}
+
+// assertHostIDInitError fails the test unless err is a *HostInitError
+// for the host_id field.
+func assertHostIDInitError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("loadOrGenerateHostID succeeded, want *HostInitError")
+	}
+	var initErr *HostInitError
+	if !errors.As(err, &initErr) {
+		t.Fatalf("error = %v (%T), want *HostInitError", err, err)
+	}
+	if initErr.Field != "host_id" {
+		t.Errorf("HostInitError.Field = %q, want %q", initErr.Field, "host_id")
+	}
+}
+
+func TestLoadOrGenerateHostID_ReadErrorDoesNotRegenerate(t *testing.T) {
+	t.Run("directory", func(t *testing.T) {
+		dir := t.TempDir()
+		idPath := filepath.Join(dir, hostIDFileName)
+		if err := os.Mkdir(idPath, 0o700); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+		_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+		assertHostIDInitError(t, err)
+		info, statErr := os.Stat(idPath)
+		if statErr != nil {
+			t.Fatalf("Stat failed: %v", statErr)
+		}
+		if !info.IsDir() {
+			t.Error("host.id was replaced, want the directory left in place")
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, hostIDTempFileName)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("temp file stat err = %v, want not-exist", statErr)
+		}
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("root bypasses file permissions")
+		}
+		dir := t.TempDir()
+		idPath := filepath.Join(dir, hostIDFileName)
+		const content = "0123456789abcdef0123456789abcdef"
+		// Write-only: the read fails with EACCES while a rewrite would
+		// still succeed, which is the case that used to rotate the ID.
+		if err := os.WriteFile(idPath, []byte(content), 0o200); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+		assertHostIDInitError(t, err)
+		if err := os.Chmod(idPath, hostIDFilePerms); err != nil {
+			t.Fatalf("Chmod failed: %v", err)
+		}
+		data, readErr := os.ReadFile(idPath)
+		if readErr != nil {
+			t.Fatalf("ReadFile failed: %v", readErr)
+		}
+		if string(data) != content {
+			t.Errorf("host.id content = %q, want unchanged %q", data, content)
+		}
+	})
+}
+
+func TestLoadOrGenerateHostID_PublishesViaTempFile(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		dir := t.TempDir()
+		tmpPath := filepath.Join(dir, hostIDTempFileName)
+		if stale {
+			if err := os.WriteFile(tmpPath, []byte("torn"), 0o644); err != nil {
+				t.Fatalf("WriteFile failed: %v", err)
+			}
+		}
+		id, err := loadOrGenerateHostID(slog.Default(), dir, "")
+		if err != nil {
+			t.Fatalf("stale=%v: loadOrGenerateHostID failed: %v", stale, err)
+		}
+		idPath := filepath.Join(dir, hostIDFileName)
+		data, readErr := os.ReadFile(idPath)
+		if readErr != nil {
+			t.Fatalf("stale=%v: ReadFile failed: %v", stale, readErr)
+		}
+		if string(data) != id || len(id) != hostIDLength {
+			t.Errorf("stale=%v: host.id = %q, returned %q", stale, data, id)
+		}
+		if _, hexErr := hex.DecodeString(id); hexErr != nil {
+			t.Errorf("stale=%v: id %q is not valid hex", stale, id)
+		}
+		info, statErr := os.Stat(idPath)
+		if statErr != nil {
+			t.Fatalf("stale=%v: Stat failed: %v", stale, statErr)
+		}
+		if info.Mode().Perm() != hostIDFilePerms {
+			t.Errorf("stale=%v: mode = %04o, want %04o", stale, info.Mode().Perm(), hostIDFilePerms)
+		}
+		if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("stale=%v: temp file stat err = %v, want not-exist", stale, statErr)
+		}
 	}
 }
 
@@ -2987,22 +3089,19 @@ func TestLoadOrGenerateHostID_ValidLengthInvalidHex(t *testing.T) {
 	dir := t.TempDir()
 	idPath := dir + "/host.id"
 	// Write 32-char string with invalid hex chars.
-	if err := os.WriteFile(idPath, []byte("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"), hostIDFilePerms); err != nil {
+	const content = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+	if err := os.WriteFile(idPath, []byte(content), hostIDFilePerms); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	id, err := loadOrGenerateHostID(slog.Default(), dir, "")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
+	_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+	assertHostIDInitError(t, err)
+	data, readErr := os.ReadFile(idPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile failed: %v", readErr)
 	}
-	// Should regenerate a valid ID.
-	if len(id) != hostIDLength {
-		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
-	}
-	// The new ID should be valid hex.
-	_, hexErr := hex.DecodeString(id)
-	if hexErr != nil {
-		t.Errorf("regenerated ID is not valid hex: %q", id)
+	if string(data) != content {
+		t.Errorf("host.id content = %q, want unchanged %q", data, content)
 	}
 }
 
