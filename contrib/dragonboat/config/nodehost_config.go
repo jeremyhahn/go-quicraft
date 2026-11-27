@@ -90,9 +90,10 @@ type NodeHostConfig struct {
 	NotifyCommit bool
 
 	// DefaultNodeRegistryEnabled enables dragonboat's gossip-based
-	// default node registry. NOT supported by quicraft: accepted for
-	// dragonboat API compatibility only and ignored by ToQuicraft.
-	// Quicraft resolves peers from shard membership addresses.
+	// default node registry. NOT supported by quicraft: the field is kept
+	// for dragonboat API compatibility only, and Validate rejects true
+	// rather than silently ignoring it. Quicraft resolves peers from
+	// shard membership addresses.
 	DefaultNodeRegistryEnabled bool
 
 	// RaftEventListener receives Raft protocol event notifications.
@@ -349,8 +350,9 @@ func (c *NodeHostConfig) Prepare() error {
 	return c.Validate()
 }
 
-// NodeRegistryEnabled returns true when the default node registry is
-// enabled for automatic node discovery.
+// NodeRegistryEnabled reports DefaultNodeRegistryEnabled. Quicraft never
+// runs a node registry and Validate rejects the setting, so a validated
+// config reports false.
 func (c *NodeHostConfig) NodeRegistryEnabled() bool {
 	return c.DefaultNodeRegistryEnabled
 }
@@ -386,6 +388,12 @@ func (c NodeHostConfig) Validate() error {
 	// so a non-empty GossipConfig is rejected instead of silently dropped.
 	if !c.Gossip.IsEmpty() {
 		return &ValidationError{Field: "Gossip", Message: "gossip is not supported by quicraft; GossipConfig must be empty"}
+	}
+	// The default node registry is not supported by quicraft. A
+	// configuration that enables it expects NodeHostID targets to resolve,
+	// which quicraft never does, so it is rejected instead of ignored.
+	if c.DefaultNodeRegistryEnabled {
+		return &ValidationError{Field: "DefaultNodeRegistryEnabled", Message: "the default node registry is not supported by quicraft; must be false"}
 	}
 	return nil
 }
