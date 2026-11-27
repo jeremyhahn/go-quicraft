@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Membership removals and witness-policy updates (#1242): `RequestRemoveNode` and `RequestUpdateWitnessPolicy` now compare a non-zero `configChangeIndex` on the leader's worker as well as in the Host, as the adds do, so two changes bound to the same index can no longer both commit; the later one is refused with `*StaleConfigChangeError` (`errors.Is` `ErrStaleConfigChange`). No wire or format change.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
