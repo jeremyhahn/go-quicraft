@@ -198,4 +198,18 @@ func TestAPICheckGate(t *testing.T) {
 			t.Fatalf("exit %d, want 1 reporting the removed package:\n%s", code, out)
 		}
 	})
+
+	t.Run("unlistable base fails closed", func(t *testing.T) {
+		r := newAPIGateRepo(t, "v1.0.0")
+		r.write("go.mod", apiGateModule+"\nbogus directive\n")
+		r.git("add", "go.mod")
+		r.git("commit", "-q", "-m", "unparsable go.mod")
+		r.git("tag", "-f", "v1.0.0")
+		r.write("go.mod", apiGateModule)
+		r.write("VERSION", "1.0.1\n")
+		code, out := r.run(apidiff)
+		if code != 2 || !strings.Contains(out, "cannot list") {
+			t.Fatalf("exit %d, want 2 reporting the unlistable module:\n%s", code, out)
+		}
+	})
 }
