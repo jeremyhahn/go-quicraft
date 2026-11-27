@@ -12346,7 +12346,7 @@ func writeHostIDFile(dir, id string) (err error) {
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write([]byte(id)); err != nil {
+	if _, err := f.WriteString(id); err != nil {
 		return errors.Join(err, f.Close())
 	}
 	if err := f.Sync(); err != nil {
