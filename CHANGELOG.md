@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Host ID file (#1223): `NewHost` without `HostConfig.HostID` now generates a new ID only when `host.id` does not exist. An unreadable `host.id`, or one that is not 32 hex characters, fails `NewHost` with `*HostInitError` (field `host_id`, naming the path) instead of being overwritten with a new ID; remove the file to accept a new ID. A new ID is published through an fsynced temporary file, rename and directory fsync, so a crash cannot leave a torn `host.id`. The file format is unchanged.
+
 ## [1.0.0-rc.1] - 2026-11-25
 
 ### Added
