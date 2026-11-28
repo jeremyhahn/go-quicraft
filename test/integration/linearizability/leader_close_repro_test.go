@@ -115,6 +115,11 @@ type closeSample struct {
 	tied      []string      // followers that fired on that same draw within a tick
 	gap       time.Duration // between the first two tied timeouts
 	draws     []string      // every follower timeout after the close: replica:draw@offset
+	// firstLost is set when the follower whose timeout fired first is not the
+	// replica that became leader: its campaign failed (typically its pre-vote
+	// was refused by followers that had heard from the old leader less than
+	// ElectionRTT ticks earlier) and the outage ran on to a later draw.
+	firstLost bool
 }
 
 // expectedMinTieShare is the chance that the smallest of k independent draws,
@@ -205,6 +210,7 @@ func TestRepro_LeaderCloseSplitVote(t *testing.T) {
 		if len(followers) > 0 {
 			first := followers[0]
 			s.firstDraw = first.draw
+			s.firstLost = first.replica != strconv.Itoa(newIdx+1)
 			for _, ev := range followers {
 				if ev.draw == first.draw && ev.at.Sub(first.at) < raftTick {
 					s.tied = append(s.tied, ev.replica)
@@ -215,18 +221,21 @@ func TestRepro_LeaderCloseSplitVote(t *testing.T) {
 			}
 		}
 		samples = append(samples, s)
-		t.Logf("close %d: leader node[%d] term %d -> node[%d] (+%d); outage %v; earliest draw %d tied=%v gap=%v; draws %s",
+		t.Logf("close %d: leader node[%d] term %d -> node[%d] (+%d); outage %v; earliest draw %d tied=%v gap=%v first-lost=%v; draws %s",
 			i, leaderIdx, oldTerm, newIdx, s.termDelta, s.outage.Round(time.Millisecond),
-			s.firstDraw, s.tied, s.gap, strings.Join(s.draws, " "))
+			s.firstDraw, s.tied, s.gap, s.firstLost, strings.Join(s.draws, " "))
 
 		cluster.restartNode(leaderIdx, shardID)
 		waitForCatchUp(t, cluster, shardID, leaderIdx, newIdx, failoverTimeout, func() bool { return false })
 	}
 
 	outages := make([]time.Duration, len(samples))
-	ties, splits := 0, 0
+	ties, splits, lost := 0, 0, 0
 	for i, s := range samples {
 		outages[i] = s.outage
+		if s.firstLost {
+			lost++
+		}
 		if len(s.tied) > 1 {
 			ties++
 		}
@@ -255,8 +264,8 @@ func TestRepro_LeaderCloseSplitVote(t *testing.T) {
 	t.Logf("leader-close distribution over %d closes (tick %v, ElectionRTT %d): p50 %v p95 %v max %v",
 		len(samples), raftTick, testElectionRTT, p50.Round(time.Millisecond),
 		p95.Round(time.Millisecond), worst.Round(time.Millisecond))
-	t.Logf("earliest-tick ties: %d/%d = %.2f (independent draws expect %.2f, bound %.2f); split votes (term +2 or more): %d/%d = %.2f",
-		ties, len(samples), tieShare, expected, tieBound, splits, len(samples), splitShare)
+	t.Logf("earliest-tick ties: %d/%d = %.2f (independent draws expect %.2f, bound %.2f); split votes (term +2 or more): %d/%d = %.2f; first campaigner lost: %d/%d",
+		ties, len(samples), tieShare, expected, tieBound, splits, len(samples), splitShare, lost, len(samples))
 
 	if p95 > p95Bound {
 		t.Errorf("p95 write outage after a leader close is %v, above the no-split bound %v", p95, p95Bound)
