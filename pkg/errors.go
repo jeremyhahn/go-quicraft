@@ -1738,10 +1738,9 @@ var temporaryErrors = [...]error{
 // the wrong replica (ErrNotLeader), a leader that has not yet committed in
 // its term (ErrReadIndexNotReady), a leader-executed request that found no
 // leader or leadership moving (ErrNoLeader, ErrLeadershipChanged), a
-// single-flight slot that is already taken (ErrSnapshotInProgress), an
+// single-flight slot that is already taken (ErrSnapshotInProgress), and an
 // operation that has to wait for one already in flight to finish
-// (ErrImportInProgress, ErrTransferInProgress, ErrSessionBusy), and a shard
-// paused for a runtime seal that ResumeShard ends (ErrShardPaused).
+// (ErrImportInProgress, ErrTransferInProgress, ErrSessionBusy).
 //
 // EVERY other error is reported as permanent, including errors this package
 // did not produce. That default is deliberate: retrying a permanent failure

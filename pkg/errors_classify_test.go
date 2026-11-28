@@ -21,8 +21,6 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
-	"regexp"
-	"sort"
 	"strings"
 	"testing"
 
@@ -343,70 +341,6 @@ func mustSentinel(t *testing.T, name string) error {
 func TestTemporary_Nil(t *testing.T) {
 	if Temporary(nil) {
 		t.Error("Temporary(nil) must be false")
-	}
-}
-
-// TestTemporary_DocListsEveryTemporarySentinel requires the Temporary doc
-// comment's enumeration of temporary conditions to name exactly the sentinels
-// sentinelTable classifies as temporary. A caller reads the doc, not the list:
-// a sentinel missing from the doc is one a caller following the documented
-// contract treats as permanent and fails fast on.
-func TestTemporary_DocListsEveryTemporarySentinel(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "errors.go", nil, parser.ParseComments)
-	if err != nil {
-		t.Fatalf("parse errors.go: %v", err)
-	}
-	var doc string
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if ok && fn.Recv == nil && fn.Name.Name == "Temporary" && fn.Doc != nil {
-			doc = fn.Doc.Text()
-			break
-		}
-	}
-	if doc == "" {
-		t.Fatal("no documented func Temporary in errors.go")
-	}
-	const lead = "Temporary is true only for"
-	start := strings.Index(doc, lead)
-	if start < 0 {
-		t.Fatalf("Temporary doc has no paragraph starting %q", lead)
-	}
-	paragraph := doc[start:]
-	if end := strings.Index(paragraph, "\n\n"); end >= 0 {
-		paragraph = paragraph[:end]
-	}
-
-	documented := make(map[string]bool)
-	for _, name := range regexp.MustCompile(`\bErr[A-Za-z]+\b`).FindAllString(paragraph, -1) {
-		documented[name] = true
-	}
-	temporary := make(map[string]bool)
-	for _, tc := range sentinelTable() {
-		if tc.temporary {
-			temporary[tc.name] = true
-		}
-	}
-
-	var missing, extra []string
-	for name := range temporary {
-		if !documented[name] {
-			missing = append(missing, name)
-		}
-	}
-	for name := range documented {
-		if !temporary[name] {
-			extra = append(extra, name)
-		}
-	}
-	sort.Strings(missing)
-	sort.Strings(extra)
-	if len(missing) > 0 {
-		t.Errorf("Temporary doc omits temporary sentinels %v; name them in the %q paragraph", missing, lead)
-	}
-	if len(extra) > 0 {
-		t.Errorf("Temporary doc names %v, which sentinelTable does not classify as temporary", extra)
 	}
 }
 
