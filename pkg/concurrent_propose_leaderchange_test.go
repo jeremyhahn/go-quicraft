@@ -241,11 +241,12 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 		t.Logf("SyncPropose(%s) through a follower raced a leader change: %v", key, err)
 	}
 
+	// Stop the leader as a crash would, without a hand-off. The regression
+	// needs the orphans forwarded to the stopped leader: the proposer must
+	// still name it once its host is gone. A Close that had already handed
+	// leadership off would send them to the new leader and test nothing.
+	leader.skipCloseHandoff.Store(true)
 	c.closeHost(t, leader)
-	// The regression needs the orphans forwarded to the stopped leader: the
-	// proposer must still name it once its host is gone. A Close that had
-	// already handed leadership off would send them to the new leader and
-	// test nothing.
 	if info, err := proposer.ShardInfo(concurrentProposeShard); err != nil {
 		t.Fatalf("proposer ShardInfo: %v", err)
 	} else if info.LeaderID != leaderID {

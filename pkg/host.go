@@ -3557,6 +3557,9 @@ type Host struct {
 	nodes       sync.Map     // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
 	activeNodes atomic.Int64 // tracks the number of loaded shards (replaces len(h.nodes))
 	closed      atomic.Bool  // shutdown admitted: set at the start of Close
+	// skipCloseHandoff makes Close stop without handing leadership off, as a
+	// crashed host would. Tests set it to put proposals on a departed leader.
+	skipCloseHandoff atomic.Bool
 	// closeDone is set once Close's shutdown work has completed, whether or
 	// not its barrier seals succeeded. EmergencySeal keeps sealing while
 	// closed is set but closeDone is not, because Close seals the barrier
@@ -7918,8 +7921,9 @@ func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *
 // a graceful Close stops a leader silently and the survivors sit out an
 // election timeout (and any leader lease) before they campaign. A paused
 // shard is skipped: its engine is not stepping. So is a shard with no other
-// voter: no transfer target can appear.
-func (h *Host) transferBeforeClose() {
+// voter: no transfer target can appear. ctx ends the wait early: Close
+// bounds it by ShutdownTimeout.
+func (h *Host) transferBeforeClose(ctx context.Context) {
 	if h.engine == nil {
 		return
 	}
@@ -7939,7 +7943,7 @@ func (h *Host) transferBeforeClose() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			h.transferBeforePause(context.Background(), ns, engNode, "close")
+			h.transferBeforePause(ctx, ns, engNode, "close")
 		}()
 		return true
 	})
@@ -10405,16 +10409,23 @@ func (h *Host) Close() error {
 	// well as the winner, and what publishes h.closeErr to them safely.
 	var closeErr error
 	h.stopOnce.Do(func() {
+		// ShutdownTimeout bounds the hand-off and the drain together.
+		deadline := time.Now().Add(h.cfg.ShutdownTimeout)
+
 		// Hand off leadership while the engine and transport still run, so
 		// the remaining voters do not wait out an election timeout.
-		h.transferBeforeClose()
+		if !h.skipCloseHandoff.Load() {
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			h.transferBeforeClose(ctx)
+			cancel()
+		}
 
-		// Drain in-flight work first. If drain times out, proceed with
-		// shutdown anyway — but REPORT it. A drain that timed out abandoned
-		// in-flight work, and returning nil from Close after that tells the
-		// embedding application its shutdown was clean when proposals it
-		// accepted were dropped.
-		if drainErr := h.Drain(); drainErr != nil {
+		// Drain in-flight work with what is left of the budget. If drain
+		// times out, proceed with shutdown anyway — but REPORT it. A drain
+		// that timed out abandoned in-flight work, and returning nil from
+		// Close after that tells the embedding application its shutdown was
+		// clean when proposals it accepted were dropped.
+		if drainErr := h.drainWithin(time.Until(deadline)); drainErr != nil {
 			h.logger.Warn("drain incomplete", "error", drainErr)
 			closeErr = errors.Join(closeErr, drainErr)
 		}
@@ -10641,6 +10652,12 @@ func sealOnClose(b Barrier) error {
 // After Close has completed, Drain returns ErrClosed. Close's own call to
 // Drain, made while its shutdown work runs, is unaffected.
 func (h *Host) Drain() error {
+	return h.drainWithin(h.cfg.ShutdownTimeout)
+}
+
+// drainWithin is Drain waiting at most timeout for in-flight work. Close
+// passes what its ShutdownTimeout budget has left after the hand-off.
+func (h *Host) drainWithin(timeout time.Duration) error {
 	if h.closeDone.Load() {
 		return ErrClosed
 	}
@@ -10658,14 +10675,14 @@ func (h *Host) Drain() error {
 	// the losers of the election wait here for the winner's attempt and then
 	// read the drainErr it published.
 	h.drainOnce.Do(func() {
-		h.drainErr = h.drainOnceLocked()
+		h.drainErr = h.drainOnceLocked(timeout)
 	})
 	return h.drainErr
 }
 
 // drainOnceLocked is the single drain attempt Drain elects through drainOnce.
 // It waits for pendingOps to reach zero or for ShutdownTimeout to expire.
-func (h *Host) drainOnceLocked() error {
+func (h *Host) drainOnceLocked(timeout time.Duration) error {
 	// Fast path: no pending operations.
 	if h.pendingOps.Load() <= 0 {
 		return nil
@@ -10685,7 +10702,7 @@ func (h *Host) drainOnceLocked() error {
 		return nil
 	}
 
-	timer := time.NewTimer(h.cfg.ShutdownTimeout)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
