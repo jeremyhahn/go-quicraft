@@ -99,8 +99,16 @@ func (h *harness) fatalf(format string, args ...any) {
 			h.t.Logf("replica %d log tail (%s):\n%s", r.id+1, r.logPath, logTail(r.logPath, 30))
 		}
 	}
-	h.t.Fatalf("clusterproof seed=%d: %s\nreproduce: make test-clusterproof CLUSTERPROOF_ARGS='-clusterproof.seed=%d -clusterproof.cycles=%d'",
-		h.seed, fmt.Sprintf(format, args...), h.seed, *flagCycles)
+	h.t.Fatalf("clusterproof seed=%d: %s\nreproduce: make test-clusterproof CLUSTERPROOF_ARGS='%s'",
+		h.seed, fmt.Sprintf(format, args...), reproduceArgs(h.seed))
+}
+
+// reproduceArgs is the CLUSTERPROOF_ARGS that rerun this schedule: the seed
+// and every other harness flag at its value for this run. The schedule is
+// the seed's; timing still varies between runs.
+func reproduceArgs(seed uint64) string {
+	return fmt.Sprintf("-clusterproof.seed=%d -clusterproof.cycles=%d -clusterproof.writers=%d -clusterproof.readers=%d -clusterproof.rtt-ms=%d -clusterproof.ack-before-commit=%v",
+		seed, *flagCycles, *flagWriters, *flagReaders, *flagRTT, *flagAckEarly)
 }
 
 func (h *harness) clientFail(err error) {
