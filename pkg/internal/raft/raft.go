@@ -591,6 +591,14 @@ type raft struct {
 	// PRNG for election jitter, seeded from crypto/rand.
 	rng *mathrand.Rand
 
+	// preVoteClaim records the last pre-vote this replica granted: the
+	// candidate, the prospective term, and the ticks since the grant. For
+	// preVoteClaimTicks after it, a pre-vote for the same term from any
+	// other candidate is refused (see handleVoteRequest).
+	preVoteClaimTo   uint64
+	preVoteClaimTerm uint64
+	preVoteClaimAge  int
+
 	// onCampaign is called when an election starts. Set by Peer. Nil-safe.
 	onCampaign func(shardID, replicaID, term uint64)
 
@@ -1640,6 +1648,7 @@ func stepLeader(r *raft, msg proto.Message) error {
 // tickFollower advances the follower tick. Starts an election if the
 // election timer expires.
 func tickFollower(r *raft) {
+	r.preVoteClaimAge++
 	if r.quiesce.active {
 		// In quiesce mode, use longer election timeout.
 		r.electionTick++
@@ -1683,6 +1692,7 @@ func tickFollower(r *raft) {
 // tickCandidate advances the candidate tick. Restarts the election if
 // the election timer expires.
 func tickCandidate(r *raft) {
+	r.preVoteClaimAge++
 	r.electionTick++
 	if r.electionTick >= r.randomizedElectionTimeout {
 		slog.Debug("election timeout reached",
@@ -2206,7 +2216,7 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		// exists to prevent. Safety is not at stake (one vote per term is
 		// enforced on the real-vote path); wasted elections are.
 		leaderActive := r.leaderID != noLeader && r.electionTick < r.electionTimeout
-		canVote = logOK && !leaderActive && msg.Term > r.term
+		canVote = logOK && !leaderActive && msg.Term > r.term && !r.preVoteClaimed(msg)
 	} else {
 		// For a real vote: grant if the log is up-to-date AND either this
 		// is a repeat of the vote already cast this term, or no vote has
@@ -2272,7 +2282,11 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 	}
 
 	if canVote {
-		if !isPreVote {
+		if isPreVote {
+			r.preVoteClaimTo = msg.From
+			r.preVoteClaimTerm = msg.Term
+			r.preVoteClaimAge = 0
+		} else {
 			r.vote = msg.From
 			r.electionTick = 0
 		}
@@ -2298,6 +2312,38 @@ func (r *raft) handleVoteRequest(msg proto.Message) error {
 		"granted", canVote,
 		"term", msg.Term)
 	return nil
+}
+
+// preVoteClaimTicks is how many of this replica's ticks a granted pre-vote
+// keeps other candidates for the same prospective term from receiving one.
+// Two ticks covers the claimant's pre-vote round, the persist of its new
+// term and self-vote, and the delivery of its RequestVote, including a WAL
+// sync that stalls past one tick.
+const preVoteClaimTicks = 2
+
+// preVoteClaimed reports whether a pre-vote request must be refused because
+// this replica granted a pre-vote for the same prospective term to a
+// different candidate within the last preVoteClaimTicks ticks.
+//
+// Without it, followers whose timers expire on the same tick (randomized
+// timeouts are whole ticks, so ten values at ElectionRTT 10) all pass
+// PreVote, since every quiet follower grants every pre-vote for a higher
+// term, and campaign for the same term at once. Three such candidates in a
+// five-replica group split the term, and the group waits a second
+// randomized timeout. With the claim, the first pre-candidate to reach a
+// voter holds that voter's pre-vote and the later ones fall short of a
+// quorum, so only one candidate goes on to the real vote.
+//
+// Refusing a pre-vote never affects safety or lease safety, since a pre-vote
+// grants nothing; it can only delay an election. It cannot block a retry:
+// a refused pre-candidate prospects again only after a fresh randomized
+// timeout, at least electionTimeout ticks, and the claim lasts fewer
+// (config validation requires ElectionRTT >= 5). A repeated request from
+// the claimant itself stays eligible.
+func (r *raft) preVoteClaimed(msg proto.Message) bool {
+	return r.preVoteClaimTerm == msg.Term &&
+		r.preVoteClaimTo != msg.From &&
+		r.preVoteClaimAge < preVoteClaimTicks
 }
 
 // handleVoteResp processes vote and pre-vote responses, discarding those from replicas outside the current configuration.
