@@ -232,14 +232,16 @@ func readFrameHeaderWindow(r io.Reader, w WireWindow) (length uint32, flags Fram
 }
 
 // ValidateFrameHeader validates the 8-byte frame header in buf. Checks
-// magic bytes, wire version, and payload length. Returns the appropriate
-// typed error on failure.
+// magic bytes, wire version, flag bits (only FlagCompressed and FlagSnapshot
+// are defined), and payload length. Returns the appropriate typed error on
+// failure.
 func ValidateFrameHeader(buf []byte) error {
 	return ValidateFrameHeaderWindow(buf, DefaultWireWindow())
 }
 
 // ValidateFrameHeaderWindow is ValidateFrameHeader against an explicit
-// accept set; the transport passes its own.
+// accept set; the transport passes its own. A header setting any flag bit
+// outside FlagCompressed|FlagSnapshot is refused with ErrUnknownFrameFlags.
 func ValidateFrameHeaderWindow(buf []byte, w WireWindow) error {
 	if len(buf) < FrameHeaderSize {
 		return ErrBufferTooSmall
@@ -256,6 +258,11 @@ func ValidateFrameHeaderWindow(buf []byte, w WireWindow) error {
 	// refused outright rather than misparsed.
 	if !w.AcceptsFrame(buf[2]) {
 		return ErrUnsupportedVersion
+	}
+	// An undefined bit (from a peer, or a later build that adds a flag)
+	// would have the body parsed under the old meaning; refuse it instead.
+	if FrameFlags(buf[3])&^(FlagCompressed|FlagSnapshot) != 0 {
+		return ErrUnknownFrameFlags
 	}
 	length := binary.BigEndian.Uint32(buf[4:8])
 	if length > MaxFrameSize {

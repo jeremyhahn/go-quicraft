@@ -92,7 +92,7 @@ func TestValidateFrameHeaderWindow(t *testing.T) {
 
 	t.Run("readFrameHeaderWindow honours the window it is given", func(t *testing.T) {
 		const length uint32 = 4321
-		flags := FrameFlags(0x05)
+		flags := FlagCompressed | FlagSnapshot
 		header := windowHeader(WireVersion+1, flags, length)
 
 		gotLen, gotFlags, err := readFrameHeaderWindow(bytes.NewReader(header[:]), nextBuildWindow())
@@ -108,4 +108,30 @@ func TestValidateFrameHeaderWindow(t *testing.T) {
 			t.Fatalf("WireVersion+1 under DefaultWireWindow: got %v, want ErrUnsupportedVersion", err)
 		}
 	})
+}
+
+// TestValidateFrameHeaderWindow_RefusesUndefinedFlagBits sweeps every flag
+// byte: only combinations of FlagCompressed and FlagSnapshot are accepted, and
+// a header setting any other bit is refused with ErrUnknownFrameFlags rather
+// than having its body parsed under a meaning the sender did not intend.
+func TestValidateFrameHeaderWindow_RefusesUndefinedFlagBits(t *testing.T) {
+	w := DefaultWireWindow()
+	for b := 0; b < 256; b++ {
+		header := windowHeader(WireVersion, FrameFlags(b), 10)
+		err := ValidateFrameHeaderWindow(header[:], w)
+		if b <= int(FlagCompressed|FlagSnapshot) {
+			if err != nil {
+				t.Errorf("flags 0x%02x: got %v, want nil", b, err)
+			}
+			continue
+		}
+		if !errors.Is(err, ErrUnknownFrameFlags) {
+			t.Errorf("flags 0x%02x: got %v, want ErrUnknownFrameFlags", b, err)
+		}
+	}
+
+	header := windowHeader(WireVersion, FrameFlags(0x04), 10)
+	if _, _, err := readFrameHeaderWindow(bytes.NewReader(header[:]), w); !errors.Is(err, ErrUnknownFrameFlags) {
+		t.Fatalf("readFrameHeaderWindow with flags 0x04: got %v, want ErrUnknownFrameFlags", err)
+	}
 }

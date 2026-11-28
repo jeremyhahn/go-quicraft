@@ -185,21 +185,17 @@ func TestSubmitNoCopy_QueueFullError(t *testing.T) {
 			t.Cleanup(release)
 			submit := v.of(agg)
 
-			// The first proposal fills a batch of one, so the flush loop is
-			// held inside the blocked proposer.
+			// The first proposal fills a batch of one and parks shard 1's
+			// worker inside the blocked proposer, using the shard's whole
+			// budget of one admitted-but-unfinished proposal.
 			first := submitAsync(ctx, t, submit, []byte("first"))
 			select {
 			case <-bp.entered:
 			case <-ctx.Done():
 				t.Fatal("the proposer was never called for the first proposal")
 			}
-			// The second proposal occupies the only queue slot.
-			second := submitAsync(ctx, t, submit, []byte("second"))
-			waitForCondition(t, 5*time.Second, "the second proposal never reached the queue", func() bool {
-				return len(agg.queue) == 1
-			})
 
-			err := submit(ctx, 1, []byte("third"))
+			err := submit(ctx, 1, []byte("second"))
 			var qf *QueueFullError
 			if !errors.As(err, &qf) {
 				t.Fatalf("%s at capacity = %v (%T), want *QueueFullError", v.name, err, err)
@@ -214,9 +210,6 @@ func TestSubmitNoCopy_QueueFullError(t *testing.T) {
 			release()
 			if err := awaitSubmit(ctx, t, first); err != nil {
 				t.Errorf("first submit = %v, want nil", err)
-			}
-			if err := awaitSubmit(ctx, t, second); err != nil {
-				t.Errorf("second submit = %v, want nil", err)
 			}
 		})
 	}

@@ -59,9 +59,11 @@ mkdir "$tmp/base"
 git archive --format=tar "$base" | tar -x -C "$tmp/base" || fail "cannot extract $base"
 
 # public_packages lists the module's public packages, one import path a line.
+# It returns non-zero when go list fails. The explicit return is needed: set -e
+# is suspended in a function called on the left of ||.
 public_packages() {
-	(cd "$1" && go list -f '{{if ne .Name "main"}}{{.ImportPath}}{{end}}' ./...) |
-		awk 'NF && $0 !~ /\/(internal|test)(\/|$)/' | sort
+	(cd "$1" && go list -f '{{if ne .Name "main"}}{{.ImportPath}}{{end}}' ./...) >"$tmp/raw" || return 1
+	awk 'NF && $0 !~ /\/(internal|test)(\/|$)/' "$tmp/raw" | sort
 }
 
 incompatible=0

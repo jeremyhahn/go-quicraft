@@ -452,6 +452,7 @@ func TestIsProtocolViolationCoversDecoderSentinels(t *testing.T) {
 		proto.ErrDuplicateMapKey,
 		proto.ErrUnsupportedVersion,
 		proto.ErrTooManyMessages,
+		ErrUnknownFrameFlags,
 	} {
 		if !isProtocolViolation(err) {
 			t.Fatalf("isProtocolViolation(%v) = false, want true", err)

@@ -207,8 +207,10 @@ type aggregatorMetrics struct {
 //
 // Thread safety: Submit may be called concurrently from multiple
 // goroutines. The aggregator manages its own background flush loop, which
-// flushes each shard's batch concurrently so one slow shard cannot stall
-// the others.
+// hands each shard's batch to a per-shard worker and returns to the queue
+// without waiting, so one slow shard cannot stall the others. Each shard has
+// at most one flush in flight; later batches for a busy shard are held and
+// proposed in order after it.
 type Aggregator struct {
 	cfg      Config
 	proposer Proposer
@@ -243,6 +245,31 @@ type Aggregator struct {
 	// otherwise hang).
 	flushDone chan struct{}
 
+	// Per-shard flush workers - protected by shardMu. A shard has a key in
+	// shardHeld exactly while its worker runs; the value holds, in arrival
+	// order, the batches flushed for that shard while its current propose is
+	// still in flight. shardWG counts running workers; flushLoop waits on it
+	// before it returns, so flushDone still means nothing more will flush.
+	shardMu   sync.Mutex
+	shardHeld map[uint64][][]*proposal
+	shardWG   sync.WaitGroup
+	// shardPending counts, per shard, the proposals admitted by submit whose
+	// result flushShard has not yet delivered: queued, in the current batch,
+	// held behind a busy shard, or in flight. submit refuses a shard already
+	// at QueueSize, so a shard whose propose stalls hits QueueFullError
+	// instead of accumulating held batches without bound, while every other
+	// shard keeps its own budget within the aggregate bound (totalPending).
+	// Protected by shardMu.
+	shardPending map[uint64]int
+	// totalPending is the sum of shardPending over every shard. flushLoop
+	// keeps draining the shared queue into held batches, so a per-shard
+	// limit alone would let a quorum outage across many shards accumulate
+	// QueueSize proposals per stalled shard. submit also refuses once
+	// totalPending reaches pendingLimit (QueueSize plus one batch), which
+	// bounds outstanding proposals in aggregate. Protected by shardMu.
+	totalPending int
+	pendingLimit int
+
 	// Metrics.
 	metrics     *aggregatorMetrics
 	metricsOnce sync.Once
@@ -265,12 +292,14 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 	}
 
 	a := &Aggregator{
-		cfg:       DefaultConfig(),
-		proposer:  proposer,
-		logger:    slog.Default(),
-		registry:  prometheus.DefaultRegisterer,
-		closeChan: make(chan struct{}),
-		flushDone: make(chan struct{}),
+		cfg:          DefaultConfig(),
+		proposer:     proposer,
+		logger:       slog.Default(),
+		registry:     prometheus.DefaultRegisterer,
+		closeChan:    make(chan struct{}),
+		flushDone:    make(chan struct{}),
+		shardHeld:    make(map[uint64][][]*proposal),
+		shardPending: make(map[uint64]int),
 	}
 	a.lifetimeCtx, a.lifetimeCancel = context.WithCancel(context.Background())
 
@@ -279,6 +308,7 @@ func NewAggregator(proposer Proposer, opts ...Option) (*Aggregator, error) {
 	}
 
 	a.queue = make(chan *proposal, a.cfg.QueueSize)
+	a.pendingLimit = a.cfg.QueueSize + a.cfg.MaxBatchSize
 	a.currentBatch = make([]*proposal, 0, a.cfg.MaxBatchSize)
 
 	a.initMetrics()
@@ -353,14 +383,37 @@ func (a *Aggregator) submit(ctx context.Context, shardID uint64, data []byte) er
 		resultCh: make(chan error, 1),
 	}
 
+	a.shardMu.Lock()
+	if a.shardPending[shardID] >= a.cfg.QueueSize || a.totalPending >= a.pendingLimit {
+		a.shardMu.Unlock()
+		return &QueueFullError{QueueSize: a.cfg.QueueSize}
+	}
+	a.shardPending[shardID]++
+	a.totalPending++
+	a.shardMu.Unlock()
+
 	select {
 	case a.queue <- p:
 		a.metrics.queueDepth.Set(float64(len(a.queue)))
 	default:
+		a.releasePending(shardID, 1)
 		return &QueueFullError{QueueSize: a.cfg.QueueSize}
 	}
 
 	return a.awaitResult(ctx, p)
+}
+
+// releasePending returns n admitted proposals of shardID to the shard's
+// budget, deleting the key once the shard has none outstanding.
+func (a *Aggregator) releasePending(shardID uint64, n int) {
+	a.shardMu.Lock()
+	a.totalPending -= n
+	if left := a.shardPending[shardID] - n; left > 0 {
+		a.shardPending[shardID] = left
+	} else {
+		delete(a.shardPending, shardID)
+	}
+	a.shardMu.Unlock()
 }
 
 // awaitResult blocks until p's batch reports a result, the caller's context
@@ -440,7 +493,8 @@ func (a *Aggregator) BatchLen() int {
 }
 
 // Close signals the aggregator to stop accepting new proposals, flushes
-// any remaining batched proposals, and waits for all goroutines to exit.
+// any remaining batched proposals, and waits for all goroutines to exit,
+// including every shard flush still in flight or held.
 // Close is safe to call multiple times; subsequent calls are no-ops.
 func (a *Aggregator) Close() error {
 	a.closeOnce.Do(func() {
@@ -458,7 +512,9 @@ func (a *Aggregator) Close() error {
 
 // flushLoop is the background goroutine that dequeues proposals, adds
 // them to the current batch, and triggers flushes on size threshold or
-// timer expiry.
+// timer expiry. A flush only dispatches to the shard workers, so the loop
+// never waits on a propose; on close it drains the queue, flushes, and waits
+// for the shard workers before it returns.
 func (a *Aggregator) flushLoop() {
 	defer a.wg.Done()
 	// Signal Submit's close-path waiters that no further flushing will occur.
@@ -500,6 +556,10 @@ func (a *Aggregator) flushLoop() {
 			if hasPending {
 				a.flush(flushReasonClose)
 			}
+			// Wait for every shard worker, in-flight and held batches alike,
+			// before returning: the deferred close of flushDone tells
+			// Submit's close-path waiters that nothing more will be flushed.
+			a.shardWG.Wait()
 			return
 		}
 	}
@@ -556,9 +616,10 @@ func (a *Aggregator) drainQueue() {
 	}
 }
 
-// flush takes ownership of the current batch under the lock, encodes all
-// proposals as a length-prefixed batch, submits the batch to the proposer,
-// and distributes the result to all waiting callers.
+// flush takes ownership of the current batch under the lock, groups it by
+// shard, and hands each shard's batch to that shard's worker (see
+// dispatchShard), which proposes it through flushShard and delivers the
+// result to its callers. flush does not wait for any propose.
 func (a *Aggregator) flush(reason string) {
 	a.mu.Lock()
 	batch := a.currentBatch
@@ -578,25 +639,53 @@ func (a *Aggregator) flush(reason string) {
 		shardBatches[p.shardID] = append(shardBatches[p.shardID], p)
 	}
 
-	// Flush every shard concurrently. Flushing them in sequence on the single
-	// flushLoop goroutine lets one slow or leaderless shard block every other
-	// shard's flush for the full proposal timeout, backing the queue up to
-	// QueueSize and producing QueueFullError for unrelated shards.
-	if len(shardBatches) == 1 {
-		for shardID, shardProposals := range shardBatches {
-			a.flushShard(shardID, shardProposals)
-		}
+	// Hand each shard's batch to that shard's worker and return without
+	// waiting. Waiting here, even for concurrent flushes, keeps flushLoop off
+	// the queue until the slowest shard's propose returns, so one slow or
+	// leaderless shard stalls every other shard for up to ProposeTimeout,
+	// backing the queue up to QueueSize and producing QueueFullError for
+	// unrelated shards.
+	for shardID, shardProposals := range shardBatches {
+		a.dispatchShard(shardID, shardProposals)
+	}
+}
+
+// dispatchShard gives one shard's batch to that shard's flush worker. If the
+// shard has no worker running, one is started for the batch; otherwise the
+// batch is held, as flushed, behind the batches already waiting, so a shard
+// has at most one propose in flight and its batches are proposed in order.
+func (a *Aggregator) dispatchShard(shardID uint64, proposals []*proposal) {
+	a.shardMu.Lock()
+	if held, busy := a.shardHeld[shardID]; busy {
+		a.shardHeld[shardID] = append(held, proposals)
+		a.shardMu.Unlock()
 		return
 	}
-	var wg sync.WaitGroup
-	wg.Add(len(shardBatches))
-	for shardID, shardProposals := range shardBatches {
-		go func() {
-			defer wg.Done()
-			a.flushShard(shardID, shardProposals)
-		}()
+	a.shardHeld[shardID] = nil
+	a.shardWG.Add(1)
+	a.shardMu.Unlock()
+	go a.shardWorker(shardID, proposals)
+}
+
+// shardWorker flushes proposals for shardID, then each batch held for the
+// shard in arrival order, and exits when nothing more is held.
+func (a *Aggregator) shardWorker(shardID uint64, proposals []*proposal) {
+	defer a.shardWG.Done()
+	for {
+		a.flushShard(shardID, proposals)
+
+		a.shardMu.Lock()
+		held := a.shardHeld[shardID]
+		if len(held) == 0 {
+			delete(a.shardHeld, shardID)
+			a.shardMu.Unlock()
+			return
+		}
+		proposals = held[0]
+		held[0] = nil
+		a.shardHeld[shardID] = held[1:]
+		a.shardMu.Unlock()
 	}
-	wg.Wait()
 }
 
 // flushShard encodes and submits a batch of proposals for a single shard,
@@ -613,6 +702,18 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	// replica applied it. Encode only the survivors.
 	live := a.rejectAbandoned(shardID, proposals)
 	batchLen := len(live)
+
+	// Every proposal of the batch receives exactly one result: the abandoned
+	// ones above, the live ones through finish. Each returns its slot in the
+	// shard's admission budget BEFORE its caller is woken, so a caller that
+	// resubmits at once is not refused for a slot it already gave back.
+	a.releasePending(shardID, len(proposals)-batchLen)
+	finish := func(err error) {
+		a.releasePending(shardID, batchLen)
+		for _, p := range live {
+			p.resultCh <- err
+		}
+	}
 	if batchLen == 0 {
 		// Nobody is left to receive a result, and proposing anyway would
 		// replicate a batch whose outcome no one observes while occupying the
@@ -640,9 +741,7 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 			slog.String("error", encErr.Error()),
 		)
 		flushErr := &FlushError{ShardID: shardID, Err: encErr, Indeterminate: false}
-		for _, p := range live {
-			p.resultCh <- flushErr
-		}
+		finish(flushErr)
 		return
 	}
 
@@ -653,9 +752,7 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 	if !ok {
 		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
 		flushErr := &FlushError{ShardID: shardID, Err: context.Canceled, Indeterminate: false}
-		for _, p := range live {
-			p.resultCh <- flushErr
-		}
+		finish(flushErr)
 		return
 	}
 	defer cancel()
@@ -689,17 +786,13 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 			slog.String("error", err.Error()),
 		)
 		flushErr := &FlushError{ShardID: shardID, Err: err, Indeterminate: indeterminate}
-		for _, p := range live {
-			p.resultCh <- flushErr
-		}
+		finish(flushErr)
 		return
 	}
 
 	a.metrics.batchesTotal.WithLabelValues(shardLabel, "success").Inc()
 
-	for _, p := range live {
-		p.resultCh <- nil
-	}
+	finish(nil)
 }
 
 // rejectAbandoned returns the proposals whose callers are still waiting, and

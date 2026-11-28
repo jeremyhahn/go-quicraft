@@ -426,22 +426,26 @@ func (m *Membership) MarshalTo(buf []byte) (int, error) {
 }
 
 // UnmarshalFrom reads the membership from buf and returns bytes consumed.
-// The leading version byte must be membershipFormatVersion EXACTLY: there is
-// one layout, and a byte naming any other is refused before a single field is
+// The leading version byte must be in the closed read set
+// {membershipFormatVersion, previousMembershipFormatVersion}, which has one
+// member in v1.0; a byte outside it is refused before a single field is
 // interpreted. Map counts and address lengths are validated before allocation.
 //
-// Exact equality is the same gate MessageBatch and SnapshotChunk apply to
-// BinVer, and it is what the pre-release pinning policy makes correct here too:
-// no persisted bytes from another layout are meant to exist, because dev
-// clusters are wiped rather than migrated (see the package comment). A range
-// gate would silently decode a section this build cannot interpret — the
-// version byte is the ONLY in-band discriminator, since Membership is always
-// embedded in a larger buffer and neither a length check nor a trailing-byte
-// check can tell one layout from another.
+// The read set is a set, not a range: a range gate would silently decode a
+// section this build cannot interpret, and the version byte is the ONLY
+// in-band discriminator, since Membership is always embedded in a larger
+// buffer and neither a length check nor a trailing-byte check can tell one
+// layout from another. (BinVer on MessageBatch and SnapshotChunk is gated
+// separately, by WireWindow.Accepts.) There is one decode layout, which is
+// correct only while the two constants are equal: a release that makes them
+// differ must add a per-version decode path here for the layout at
+// previousMembershipFormatVersion's offsets. TestMembershipAcceptedVersionSetPinned
+// fails until it does; see docs/compatibility/engineering.md.
 //
 // Returns an *UnsupportedMembershipVersionError (which matches
 // ErrUnsupportedVersion under errors.Is, and names both the version found and
-// the one supported) if the version byte is anything else, ErrBufferTooSmall on
+// membershipFormatVersion, the read set's one member in v1.0) if the version
+// byte is outside the read set, ErrBufferTooSmall on
 // truncated input, ErrTooManyMembershipEntries if any map count exceeds the
 // limit, or ErrAddressTooLong if any address string exceeds MaxAddressLength.
 //

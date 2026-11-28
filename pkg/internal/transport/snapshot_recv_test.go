@@ -2013,6 +2013,33 @@ func TestReceiveChunks_ChunkHeaderMismatchRejected(t *testing.T) {
 	}
 }
 
+// TestReceiveChunks_RefusesCompressedChunkFrame: the sender writes every chunk
+// frame with FlagNone, so a chunk frame flagged FlagCompressed is malformed and
+// must be refused rather than parsed as raw chunk bytes.
+func TestReceiveChunks_RefusesCompressedChunkFrame(t *testing.T) {
+	hdr := &SnapshotHeader{ShardID: 1, ReplicaID: 2, Index: 50, Term: 3, ChunkCount: 1}
+	chunks := []proto.SnapshotChunk{minimalChunk(0, hdr.ChunkCount, hdr)}
+	data := buildChunkFrames(t, chunks)
+	data[3] = byte(FlagCompressed)
+
+	handler := newTestHandler()
+	const budget = int64(1) << 20
+	sr := newSnapshotReceiver(4, budget, 0, 0, handler)
+	rec := &dropRecorder{}
+	sr.metrics = rec
+
+	reader := &testChunkReader{data: data}
+	sr.receiveChunks(reader, hdr, "", PeerAuth{}, make(chan struct{}))
+
+	if handler.snapshotCount.Load() != 0 {
+		t.Fatalf("compressed chunk frame delivered: snapshots = %d", handler.snapshotCount.Load())
+	}
+	rejects := rec.rejects()
+	if len(rejects) != 1 || rejects[0].reason != string(snapshotRejectMalformed) {
+		t.Fatalf("rejections = %+v, want one %q", rejects, snapshotRejectMalformed)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // budget-exhaustion abort observability (snapshot_recv.go rejectSnapshot)
 // ---------------------------------------------------------------------------

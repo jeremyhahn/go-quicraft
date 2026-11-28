@@ -691,7 +691,8 @@ func isProtocolViolation(err error) bool {
 		errors.Is(err, ErrBufferTooSmall),
 		errors.Is(err, ErrPeerIdentityMismatch),
 		errors.Is(err, ErrDecompressedSizeLimitExceeded),
-		errors.Is(err, ErrDecompressionMismatch):
+		errors.Is(err, ErrDecompressionMismatch),
+		errors.Is(err, ErrUnknownFrameFlags):
 		return true
 	// The decoder sentinels a malformed batch actually returns. Without them a
 	// peer sending unparseable frames tears streams down with no counter and
