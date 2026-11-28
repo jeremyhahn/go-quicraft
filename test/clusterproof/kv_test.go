@@ -45,6 +45,15 @@ type allKeys struct{}
 type kv struct {
 	mu   sync.RWMutex
 	data map[string]string
+	// applied is the log index of the last put applied; a snapshot carries
+	// it so a recovery can report which snapshot it restored.
+	applied uint64
+}
+
+// kvSnapshot is the snapshot payload.
+type kvSnapshot struct {
+	Applied uint64
+	Data    map[string]string
 }
 
 var _ sm.StateMachine = (*kv)(nil)
@@ -65,6 +74,7 @@ func (s *kv) Update(_ context.Context, entries []sm.Entry, results []sm.Result) 
 			return err
 		}
 		s.data[k] = v
+		s.applied = e.Index
 		results[i] = sm.Result{Value: uint64(len(v))}
 	}
 	return nil
@@ -94,7 +104,7 @@ type lookupResult struct {
 
 func (s *kv) SaveSnapshot(_ context.Context, w io.Writer, _ <-chan struct{}) error {
 	s.mu.RLock()
-	b, err := json.Marshal(s.data)
+	b, err := json.Marshal(kvSnapshot{Applied: s.applied, Data: s.data})
 	s.mu.RUnlock()
 	if err != nil {
 		return err
@@ -108,13 +118,18 @@ func (s *kv) RecoverFromSnapshot(_ context.Context, r io.Reader, _ <-chan struct
 	if err != nil {
 		return err
 	}
-	data := map[string]string{}
-	if err := json.Unmarshal(b, &data); err != nil {
+	var snap kvSnapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
 		return err
 	}
+	if snap.Data == nil {
+		snap.Data = map[string]string{}
+	}
 	s.mu.Lock()
-	s.data = data
+	s.data, s.applied = snap.Data, snap.Applied
 	s.mu.Unlock()
+	nodeSnap.recovered.Store(snap.Applied)
+	nodeSnap.smRecoveries.Add(1)
 	return nil
 }
 

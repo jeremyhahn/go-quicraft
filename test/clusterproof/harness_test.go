@@ -60,6 +60,10 @@ const (
 	// warmupAcks is how many writes the cluster must acknowledge before the
 	// first kill.
 	warmupAcks = 50
+	// snapWait bounds the wait, before a kill, for the victim to save a
+	// snapshot and compact its log, and after the restart for it to report
+	// the snapshot it recovered from.
+	snapWait = 2 * time.Minute
 )
 
 // replica is one replica process; start runs it again after a kill, with
@@ -242,6 +246,43 @@ func (h *harness) all(r *replica) (map[string]string, error) {
 		h.fatalf("all on replica %d: decode a 200 answer: %v", r.id+1, err)
 	}
 	return state, nil
+}
+
+// snap reads replica r's snapshot record (GET /snap).
+func (h *harness) snap(r *replica) (snapStatus, error) {
+	var s snapStatus
+	resp, err := h.do(http.MethodGet, h.url(r, "/snap", nil))
+	if err != nil {
+		return s, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return s, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return s, fmt.Errorf("snap on replica %d: %s: %s", r.id+1, resp.Status, strings.TrimSpace(string(b)))
+	}
+	return s, json.Unmarshal(b, &s)
+}
+
+// waitSnap waits, within snapWait, until replica r's snapshot record
+// satisfies ok, and fails naming want if it does not.
+func (h *harness) waitSnap(r *replica, want string, ok func(snapStatus) bool) snapStatus {
+	h.t.Helper()
+	deadline := time.Now().Add(snapWait)
+	var s snapStatus
+	var err error
+	for {
+		h.checkClients()
+		if s, err = h.snap(r); err == nil && ok(s) {
+			return s
+		}
+		if time.Now().After(deadline) {
+			h.fatalf("replica %d: no %s within %v: record %+v, err %v", r.id+1, want, snapWait, s, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // waitServing waits until replica r answers a linearizable read, which needs
@@ -579,19 +620,26 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 	for c := 1; c <= *flagCycles; c++ {
 		victim := h.reps[rng.IntN(replicas)]
 		down := downMin + time.Duration(rng.Int64N(int64(downJitter)))
+		// The kill must land on a replica that has saved a snapshot and
+		// compacted its log in this process, so the restart has to recover
+		// from a snapshot, not replay the whole log.
+		pre := h.waitSnap(victim, "a snapshot save and a log compaction before the kill",
+			func(s snapStatus) bool { return s.Created > 0 && s.Compacted > 0 })
 		before := h.puts.Load()
 		h.kill(victim)
 		time.Sleep(down)
 		h.start(victim)
 		h.waitServing(victim)
+		post := h.waitSnap(victim, "a recovery from a snapshot after the restart",
+			func(s snapStatus) bool { return s.Recovered > 0 && s.SMRecoveries > 0 })
 		n := h.converge(fmt.Sprintf("cycle %d", c), false)
 		h.checkClients()
 		during := h.puts.Load() - before
 		if during == 0 {
 			h.fatalf("cycle %d: no write was acknowledged while replica %d was killed and restarted", c, victim.id+1)
 		}
-		t.Logf("cycle %d: SIGKILLed replica %d for %v; %d writes acknowledged during the cycle; all %d acknowledged writes on every replica",
-			c, victim.id+1, down.Round(time.Millisecond), during, n)
+		t.Logf("cycle %d: SIGKILLed replica %d for %v (snapshot at index %d, log compacted through %d); recovered from snapshot index %d; %d writes acknowledged during the cycle; all %d acknowledged writes on every replica",
+			c, victim.id+1, down.Round(time.Millisecond), pre.Created, pre.Compacted, post.Recovered, during, n)
 	}
 
 	h.stop.Store(true)
