@@ -343,15 +343,10 @@ func (h *harness) converge(what string, equal bool) int {
 		for {
 			state, err := h.all(r)
 			if err == nil {
-				states[i] = state
-				if missing := missingAcks(acks, state); len(missing) > 0 {
-					n := len(missing)
-					if n > 10 {
-						missing = append(missing[:10], fmt.Sprintf("... %d more", n-10))
-					}
-					h.fatalf("%s: replica %d lost %d of %d acknowledged writes (linearizable GET /all): %s",
-						what, r.id+1, n, len(acks), strings.Join(missing, ", "))
+				if err := ackedState(acks, state); err != nil {
+					h.fatalf("%s: replica %d %v", what, r.id+1, err)
 				}
+				states[i] = state
 				break
 			}
 			if time.Now().After(deadline) {
@@ -377,17 +372,36 @@ func (h *harness) converge(what string, equal bool) int {
 }
 
 // refreshStates reads every replica's state again with fetch and stores each
-// answered read in states. An unavailable read (fetch returns an error)
-// leaves states[i] as it was.
+// answered read in states, but only once it holds every acknowledged write:
+// a read that answers without one, or with another value for one, is a stale
+// linearizable read and is returned as an error at once, not stored. An
+// unavailable read (fetch returns an error) leaves states[i] as it was.
 func refreshStates(states []map[string]string, acks map[string]string, fetch func(i int) (map[string]string, error)) error {
 	for i := range states {
 		s, err := fetch(i)
 		if err != nil {
 			continue
 		}
+		if err := ackedState(acks, s); err != nil {
+			return fmt.Errorf("replica %d %w", i+1, err)
+		}
 		states[i] = s
 	}
 	return nil
+}
+
+// ackedState reports, naming at most ten, the acknowledged writes state does
+// not hold with the acknowledged value.
+func ackedState(acks, state map[string]string) error {
+	missing := missingAcks(acks, state)
+	if len(missing) == 0 {
+		return nil
+	}
+	n := len(missing)
+	if n > 10 {
+		missing = append(missing[:10], fmt.Sprintf("... %d more", n-10))
+	}
+	return fmt.Errorf("lost %d of %d acknowledged writes (linearizable GET /all): %s", n, len(acks), strings.Join(missing, ", "))
 }
 
 // TestClusterproof_CheckerRefresh: the final convergence retry must check
