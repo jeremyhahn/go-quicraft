@@ -701,13 +701,20 @@ func (sr *snapshotReceiver) receiveChunks(stream chunkReader, hdr *SnapshotHeade
 			break
 		}
 
-		length, _, err := readFrameHeaderWindow(stream, sr.wire)
+		length, flags, err := readFrameHeaderWindow(stream, sr.wire)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				truncated = true
 				break
 			}
 			sr.rejectSnapshot(hdr, snapshotRejectIO, "chunk frame read failed", totalBytes, err)
+			return
+		}
+		// Chunk frames are always written with FlagNone; a compressed one
+		// would be parsed as raw chunk bytes, so it is malformed.
+		if flags&FlagCompressed != 0 {
+			sr.rejectSnapshot(hdr, snapshotRejectMalformed, "compressed chunk frame", totalBytes,
+				errors.New("transport: snapshot chunk frame sets FlagCompressed"))
 			return
 		}
 
