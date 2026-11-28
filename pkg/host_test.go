@@ -795,6 +795,67 @@ func TestHostClose_HandoffIsBoundedByShutdownTimeout(t *testing.T) {
 	t.Logf("Close took %v (ShutdownTimeout %v)", took, shutdownTimeout)
 }
 
+// TestHostClose_ConcurrentDrainKeepsCloseDeadline starts a Drain while
+// Close is stalled in its hand-off (followers gone, a proposal pending), so
+// that Drain wins drainOnce with its own ShutdownTimeout. Close and Drain
+// share Close's deadline: Close must still return within ShutdownTimeout
+// plus slack, not wait out the later Drain's full timer.
+func TestHostClose_ConcurrentDrainKeepsCloseDeadline(t *testing.T) {
+	const (
+		electionRTT     = 400 // 4s at transferRTTMillis
+		shutdownTimeout = 300 * time.Millisecond
+		drainAfter      = 250 * time.Millisecond
+		slack           = 150 * time.Millisecond
+	)
+	c := newCloseCluster(t, electionRTT, shutdownTimeout)
+	leaderID, _ := c.agreedLeader(30 * time.Second)
+	for i, h := range c.hosts {
+		if uint64(i+1) != leaderID {
+			if err := h.Close(); err != nil {
+				t.Fatalf("Close of follower host %d: %v", i+1, err)
+			}
+		}
+	}
+	leader := c.hosts[leaderID-1]
+	if id, _ := c.leader(int(leaderID - 1)); id != leaderID {
+		t.Skipf("host %d no longer leads (leader %d) before its Close; the hand-off is not exercised", leaderID, id)
+	}
+
+	// With no follower left the proposal cannot commit: it stays pending,
+	// so the drain waits on its timer.
+	proposed := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := leader.SyncPropose(ctx, transferShard, []byte("pending"))
+		proposed <- err
+	}()
+	if !waitUntil(5*time.Second, func() bool { return leader.pendingOps.Load() > 0 }) {
+		t.Fatal("the proposal never became pending on the leader")
+	}
+
+	start := time.Now()
+	closed := make(chan time.Duration, 1)
+	go func() {
+		_ = leader.Close() // a drain timeout is reported, not a failure here
+		closed <- time.Since(start)
+	}()
+	time.Sleep(drainAfter)
+	go func() { _ = leader.Drain() }()
+
+	select {
+	case took := <-closed:
+		if took > shutdownTimeout+slack {
+			t.Fatalf("Close took %v with a Drain started %v into its hand-off; want at most ShutdownTimeout %v + %v slack",
+				took, drainAfter, shutdownTimeout, slack)
+		}
+		t.Logf("Close took %v (ShutdownTimeout %v, Drain at %v)", took, shutdownTimeout, drainAfter)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never returned")
+	}
+	<-proposed
+}
+
 // waitForLeader waits until the engine's Raft peer for the given shard
 // becomes leader via single-node self-election. For a single-node cluster
 // the election completes within ~20ms (election timeout 10 ticks at 1ms).
