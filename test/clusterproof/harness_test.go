@@ -137,7 +137,7 @@ func (h *harness) start(r *replica) {
 	if err != nil {
 		h.t.Fatalf("open replica log: %v", err)
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestClusterproof_Node$", "-test.count=1", "-test.timeout=2h")
+	cmd := exec.CommandContext(h.t.Context(), os.Args[0], "-test.run=^TestClusterproof_Node$", "-test.count=1", "-test.timeout=2h")
 	// A race report must stop the child at once: a SIGKILLed child never
 	// reaches the exit that -race would otherwise fail.
 	gorace := "halt_on_error=1"
@@ -176,9 +176,18 @@ func (h *harness) url(r *replica, path string, q url.Values) string {
 	return u
 }
 
+// do sends one request to a replica, bound to the test's context.
+func (h *harness) do(method, u string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(h.t.Context(), method, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	return h.http.Do(req)
+}
+
 // put asks replica r to commit put(k, v); nil means acknowledged.
 func (h *harness) put(r *replica, k, v string) error {
-	resp, err := h.http.Post(h.url(r, "/put", url.Values{"k": {k}, "v": {v}}), "text/plain", nil)
+	resp, err := h.do(http.MethodPost, h.url(r, "/put", url.Values{"k": {k}, "v": {v}}))
 	if err != nil {
 		return err
 	}
@@ -193,7 +202,7 @@ func (h *harness) put(r *replica, k, v string) error {
 // get is a linearizable read of k on replica r. A non-nil error means the
 // read was not answered.
 func (h *harness) get(r *replica, k string) (string, bool, error) {
-	resp, err := h.http.Get(h.url(r, "/get", url.Values{"k": {k}}))
+	resp, err := h.do(http.MethodGet, h.url(r, "/get", url.Values{"k": {k}}))
 	if err != nil {
 		return "", false, err
 	}
@@ -214,7 +223,7 @@ func (h *harness) get(r *replica, k string) (string, bool, error) {
 
 // all is a linearizable read of replica r's whole state.
 func (h *harness) all(r *replica) (map[string]string, error) {
-	resp, err := h.http.Get(h.url(r, "/all", nil))
+	resp, err := h.do(http.MethodGet, h.url(r, "/all", nil))
 	if err != nil {
 		return nil, err
 	}

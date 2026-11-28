@@ -3,6 +3,7 @@
 package clusterproof
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -147,7 +148,7 @@ func TestClusterproof_Node(t *testing.T) {
 		}
 	}()
 
-	ln, err := net.Listen("tcp", spec.HTTPAddr)
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", spec.HTTPAddr)
 	if err != nil {
 		nodeDie("listen %s: %v", spec.HTTPAddr, err)
 	}
