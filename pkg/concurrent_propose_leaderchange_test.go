@@ -242,6 +242,16 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	}
 
 	c.closeHost(t, leader)
+	// The regression needs the orphans forwarded to the stopped leader: the
+	// proposer must still name it once its host is gone. A Close that had
+	// already handed leadership off would send them to the new leader and
+	// test nothing.
+	if info, err := proposer.ShardInfo(concurrentProposeShard); err != nil {
+		t.Fatalf("proposer ShardInfo: %v", err)
+	} else if info.LeaderID != leaderID {
+		t.Fatalf("after replica %d stopped the proposer names leader %d, not the stopped one: the orphans would not be forwarded to it",
+			leaderID, info.LeaderID)
+	}
 	const orphans = 8
 	orphanCtx, cancelOrphans := context.WithCancel(ctx)
 	defer cancelOrphans()
@@ -269,22 +279,8 @@ func TestConcurrentPropose_ProposalToStoppedFormerLeader(t *testing.T) {
 	}) {
 		t.Fatalf("the survivors never elected a leader after replica %d stopped", leaderID)
 	}
-	// A graceful Close hands leadership off, so a leader can be in place
-	// before the orphans have even been forwarded. Give them a bounded
-	// window to complete on their own against the new leader before
-	// cancelling whatever is still blocked on the stopped one.
-	grace := time.NewTimer(10 * time.Second)
-	defer grace.Stop()
+	cancelOrphans()
 	for range keys {
-		select {
-		case r := <-results:
-			out.record(r.key, r.err)
-			continue
-		case <-grace.C:
-			cancelOrphans()
-		case <-ctx.Done():
-			t.Fatal("a proposal forwarded to the stopped leader never returned")
-		}
 		select {
 		case r := <-results:
 			out.record(r.key, r.err)

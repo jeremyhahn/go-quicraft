@@ -675,6 +675,13 @@ const closeHandoffElectionRTT = 100
 // timeout.
 func newCloseHandoffCluster(t *testing.T) *transferCluster {
 	t.Helper()
+	return newCloseCluster(t, closeHandoffElectionRTT, 0)
+}
+
+// newCloseCluster is newCloseHandoffCluster with the shard's ElectionRTT and
+// the hosts' ShutdownTimeout (0 keeps the default) chosen by the caller.
+func newCloseCluster(t *testing.T, electionRTT uint64, shutdownTimeout time.Duration) *transferCluster {
+	t.Helper()
 	ca := testpki.NewCA(t)
 	leaves := ca.Leaves(t, 3)
 	c := &transferCluster{t: t}
@@ -694,6 +701,7 @@ func newCloseHandoffCluster(t *testing.T) *transferCluster {
 			RTTMillisecond:  transferRTTMillis,
 			DeploymentID:    1,
 			NoSyncWAL:       true,
+			ShutdownTimeout: shutdownTimeout,
 			TransportConfig: config.TransportConfig{MTLSConfig: leaves[i]},
 		}, WithoutEncryption())
 		if err != nil {
@@ -705,7 +713,7 @@ func newCloseHandoffCluster(t *testing.T) *transferCluster {
 	}
 	for i, h := range c.hosts {
 		scfg := testShardConfig(transferShard, uint64(i+1))
-		scfg.ElectionRTT = closeHandoffElectionRTT
+		scfg.ElectionRTT = electionRTT
 		scfg.MemberIdentities = ids
 		if err := h.StartShard(members, false, kv.NewMemoryCreateFunc(), scfg); err != nil {
 			t.Fatalf("StartShard[%d]: %v", i, err)
@@ -750,6 +758,41 @@ func TestHostClose_HandsLeadershipToAVoterBeforeStopping(t *testing.T) {
 	}
 	t.Logf("Close took %v; replica %d leads at term %d %v after Close returned",
 		closeReturned.Sub(closeStart), newID, newTerm, time.Since(closeReturned))
+}
+
+// TestHostClose_HandoffIsBoundedByShutdownTimeout closes the leader's host
+// after both followers are gone, so no transfer target can answer, with an
+// election timeout well past ShutdownTimeout. The hand-off is part of
+// Close's shutdown work, so Close must still return within ShutdownTimeout
+// (plus slack for the teardown after it), not wait out the election timeout.
+func TestHostClose_HandoffIsBoundedByShutdownTimeout(t *testing.T) {
+	const (
+		electionRTT     = 400 // 4s at transferRTTMillis
+		shutdownTimeout = 300 * time.Millisecond
+		slack           = 700 * time.Millisecond
+	)
+	c := newCloseCluster(t, electionRTT, shutdownTimeout)
+	leaderID, _ := c.agreedLeader(30 * time.Second)
+	for i, h := range c.hosts {
+		if uint64(i+1) != leaderID {
+			if err := h.Close(); err != nil {
+				t.Fatalf("Close of follower host %d: %v", i+1, err)
+			}
+		}
+	}
+	leader := c.hosts[leaderID-1]
+	if id, _ := c.leader(int(leaderID - 1)); id != leaderID {
+		t.Skipf("host %d no longer leads (leader %d) before its Close; the hand-off is not exercised", leaderID, id)
+	}
+
+	start := time.Now()
+	_ = leader.Close() // a drain timeout is reported, not a failure here
+	took := time.Since(start)
+	if took > shutdownTimeout+slack {
+		t.Fatalf("Close of the leader took %v with no transfer target; want at most ShutdownTimeout %v + %v slack",
+			took, shutdownTimeout, slack)
+	}
+	t.Logf("Close took %v (ShutdownTimeout %v)", took, shutdownTimeout)
 }
 
 // waitForLeader waits until the engine's Raft peer for the given shard
