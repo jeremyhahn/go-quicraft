@@ -174,7 +174,10 @@ INT_TEST_DIR    := ./test/integration
 # The SIGKILL acknowledged-write harness (#1301): integration-tagged, run by
 # every integration target and shard beside INT_TEST_DIR.
 CLUSTERPROOF_DIR := ./test/clusterproof
-IT_TEST_DIRS    := $(INT_TEST_DIR) $(CLUSTERPROOF_DIR)
+# The durable-by-default quorum-fsync test (#1309): integration-tagged, run by
+# every integration target and shard beside INT_TEST_DIR.
+DURABLE_DIR     := ./test/durable
+IT_TEST_DIRS    := $(INT_TEST_DIR) $(CLUSTERPROOF_DIR) $(DURABLE_DIR)
 
 # Performance comparison paths
 PERF_DIR        := ./test/performance
@@ -361,7 +364,7 @@ integration-test-e2e: docker-build-it
 .PHONY: _integration-test
 _integration-test:
 	# 900s: -p 1 shares one deadline and linearizability alone takes ~305s.
-	$(GOTEST) -tags=integration -timeout=900s -p 1 $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/...
+	$(GOTEST) -tags=integration -timeout=900s -p 1 $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/... $(DURABLE_DIR)/...
 
 .PHONY: _integration-test-raft
 _integration-test-raft:
@@ -391,7 +394,7 @@ _integration-test-linearizability:
 # deadline.
 .PHONY: ci-integration
 ci-integration:
-	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/...
+	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/... $(DURABLE_DIR)/...
 
 # Network partitions between live replicas. Needs the quicraft_netfault tag,
 # which compiles the transport's send-path drop hook in. Every test asserts
@@ -1697,7 +1700,7 @@ IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 # command, -race and serialized packages (see _integration-test). IT_PKGS is
 # the package scope; ci.yml's integration shards pass a slice of it
 # (`make it-shard-packages`).
-IT_PKGS    ?= $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/...
+IT_PKGS    ?= $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/... $(DURABLE_DIR)/...
 IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(IT_PKGS)
 # One suite in the integration image (integration-test-raft and friends): the
 # image carries no make, so the target passes the go test command itself.
