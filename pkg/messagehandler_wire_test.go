@@ -189,3 +189,68 @@ func TestHandleMessage_WireRefusalCoversLeaderExec(t *testing.T) {
 }
 
 func uitoa(v uint64) string { return strconv.FormatUint(v, 10) }
+
+// TestRefuseReceivedWireVersion_RecordsTransportErrors covers the host's
+// conversion of the transport's typed refusals into the recorded
+// *WireVersionMismatchError.
+func TestRefuseReceivedWireVersion_RecordsTransportErrors(t *testing.T) {
+	handler := &hostMessageHandler{}
+	local := proto.WireWindow{Current: 3, Previous: 2}
+	handler.refuseReceivedWireVersion("10.0.0.1:1",
+		&proto.BatchVersionError{BinVer: 7, MaxBinVer: 8, Local: local})
+	handler.refuseReceivedWireVersion("10.0.0.2:1",
+		&transport.FrameVersionError{Found: 9, Current: 4, Previous: 5})
+	handler.refuseReceivedWireVersion("10.0.0.3:1", transport.ErrInvalidMagic)
+
+	got := func(addr string) *WireVersionMismatchError {
+		v, ok := handler.recvRefusals.Load(addr)
+		if !ok {
+			return nil
+		}
+		return v.(*WireVersionMismatchError)
+	}
+	b := got("10.0.0.1:1")
+	if b == nil || b.Frame || b.Source != "10.0.0.1:1" || b.PeerBinVer != 7 || b.PeerMaxBinVer != 8 ||
+		b.Local != local || b.ShardID != 0 || b.From != 0 {
+		t.Fatalf("batch refusal recorded as %+v", b)
+	}
+	f := got("10.0.0.2:1")
+	if f == nil || !f.Frame || f.PeerFrameVersion != 9 || f.LocalFrameCurrent != 4 || f.LocalFramePrevious != 5 {
+		t.Fatalf("frame refusal recorded as %+v", f)
+	}
+	for _, r := range []*WireVersionMismatchError{b, f} {
+		if !errors.Is(r, proto.ErrUnsupportedVersion) || !strings.Contains(r.Error(), r.Source) {
+			t.Fatalf("refusal %q: not ErrUnsupportedVersion or names no source", r)
+		}
+	}
+	if got("10.0.0.3:1") != nil {
+		t.Fatal("a non-version error was recorded as a wire refusal")
+	}
+}
+
+// TestRefuseReceivedWireVersion_PastLimitStillRecords is the regression for a
+// cache that, once full, suppressed the diagnostic for every later peer: a
+// peer cycling source ports must not silence it for the next one.
+func TestRefuseReceivedWireVersion_PastLimitStillRecords(t *testing.T) {
+	handler := &hostMessageHandler{}
+	var logs bytes.Buffer
+	installDefaultLogger(t, slog.NewTextHandler(&logs, nil))
+	const marker = "peer wire version outside this host's window"
+	refusal := &transport.FrameVersionError{Found: 9, Current: 1, Previous: 1}
+
+	for i := range maxRecvRefusals + 10 {
+		handler.refuseReceivedWireVersion("10.1.0.1:"+strconv.Itoa(1000+i), refusal)
+	}
+	before := strings.Count(logs.String(), marker)
+	const fresh = "192.0.2.7:4242"
+	handler.refuseReceivedWireVersion(fresh, refusal)
+	if _, ok := handler.recvRefusals.Load(fresh); !ok {
+		t.Fatal("a new peer past the cache limit was not recorded")
+	}
+	if n := strings.Count(logs.String(), marker); n != before+1 {
+		t.Fatalf("%d refusal lines for a new peer past the cache limit, want 1", n-before)
+	}
+	if n := handler.recvRefused.Load(); n > maxRecvRefusals {
+		t.Fatalf("cache holds %d entries, bound is %d", n, maxRecvRefusals)
+	}
+}

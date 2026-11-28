@@ -4,6 +4,7 @@
 package transport
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -111,5 +113,48 @@ func TestReportWireVersionRefused_InvokesCallback(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("panicking callback not invoked")
+	}
+}
+
+// TestHandleMessageFrame_OutsideWindowInvokesCallback drives a batch outside
+// the window through the real receive path, so removing the callback from
+// handleMessageFrame fails it.
+func TestHandleMessageFrame_OutsideWindowInvokesCallback(t *testing.T) {
+	far := farWindow()
+	calls := make(chan error, 4)
+	cfg := Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+		Wire:          far,
+		OnWireVersionRefused: func(_ string, err error) {
+			calls <- err
+		},
+	}
+	tr, err := NewQUICTransport(cfg, newTestHandler(), registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	batch := proto.MessageBatch{BinVer: proto.WireVersion, MaxBinVer: proto.WireVersion, DeploymentID: 42}
+	payload := make([]byte, batch.Size())
+	if _, err := batch.MarshalTo(payload); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	ferr := tr.handleMessageFrame(nil, bytes.NewReader(payload), uint32(len(payload)), FlagNone)
+	if !errors.Is(ferr, proto.ErrUnsupportedVersion) {
+		t.Fatalf("handleMessageFrame = %v, want proto.ErrUnsupportedVersion", ferr)
+	}
+	select {
+	case got := <-calls:
+		var be *proto.BatchVersionError
+		if !errors.As(got, &be) {
+			t.Fatalf("callback error %v, want *proto.BatchVersionError", got)
+		}
+		if be.BinVer != proto.WireVersion || be.MaxBinVer != proto.WireVersion || be.Local != far.Proto {
+			t.Fatalf("callback BatchVersionError = %+v, want %d/%d against %+v",
+				*be, proto.WireVersion, proto.WireVersion, far.Proto)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnWireVersionRefused not invoked for a batch outside the window")
 	}
 }
