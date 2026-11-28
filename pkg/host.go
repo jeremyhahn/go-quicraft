@@ -7912,6 +7912,40 @@ func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *
 	}
 }
 
+// transferBeforeClose hands every shard this host leads to the reachable
+// voter with the highest replicated index (transferBeforePause, so each
+// shard waits at most its election timeout), all shards at once. Without it
+// a graceful Close stops a leader silently and the survivors sit out an
+// election timeout (and any leader lease) before they campaign. A paused
+// shard is skipped: its engine is not stepping. So is a shard with no other
+// voter: no transfer target can appear.
+func (h *Host) transferBeforeClose() {
+	if h.engine == nil {
+		return
+	}
+	var wg sync.WaitGroup
+	h.nodes.Range(func(_, value any) bool {
+		ns, ok := value.(*nodeState)
+		if !ok || ns.stopped.Load() || ns.paused.Load() || !ns.isLeader.Load() {
+			return true
+		}
+		engNode := h.engine.GetNode(ns.shardID)
+		if engNode == nil {
+			return true
+		}
+		if m, err := h.getMembershipFromPeer(ns.shardID); err != nil || len(m.Nodes) < 2 {
+			return true
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.transferBeforePause(context.Background(), ns, engNode)
+		}()
+		return true
+	})
+	wg.Wait()
+}
+
 // pauseGate serializes one shard's pause and resume transitions: the host's
 // admission flag, the leadership transfer and the engine node's flag change
 // as one step, so a ResumeShard cannot run between a PauseShard's flag and
@@ -10371,6 +10405,10 @@ func (h *Host) Close() error {
 	// well as the winner, and what publishes h.closeErr to them safely.
 	var closeErr error
 	h.stopOnce.Do(func() {
+		// Hand off leadership while the engine and transport still run, so
+		// the remaining voters do not wait out an election timeout.
+		h.transferBeforeClose()
+
 		// Drain in-flight work first. If drain times out, proceed with
 		// shutdown anyway — but REPORT it. A drain that timed out abandoned
 		// in-flight work, and returning nil from Close after that tells the
