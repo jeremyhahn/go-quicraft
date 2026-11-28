@@ -197,6 +197,18 @@ that embeds it; in this project's own stack that is
 | Your state machine | `sm.StateMachine`, `sm.ConcurrentStateMachine`, `sm.DiskStateMachine` | [state-machines](docs/state-machines/user.md) |
 | Encryption at rest | `seal.NewBarrier`, `quicraft.WithBarrier` | [seal-barrier](docs/seal-barrier/user.md) |
 
+## Durability
+
+With the default `HostConfig` and the default write mode (`writemode.Sync`), a
+write is acknowledged only after a quorum of voting members has fsynced it to
+the WAL. Every setting that acknowledges earlier is opt-in and named:
+`HostConfig.NoSyncWAL` (refused outside a `go test` binary),
+`HostConfig.NotifyCommit` (`CommittedC()` fires on local WAL persistence) and
+`writemode.WALDurable`. Tests in `pkg/config` and `pkg/writemode` fail if a
+default weakens durability or a new setting is left unclassified.
+[docs/durable-by-default/README.md](docs/durable-by-default/README.md) lists
+what each setting gives up.
+
 ## Encryption at rest
 
 Pass `quicraft.WithBarrier(barrier)` to `NewHost` and the WAL and snapshots are
