@@ -237,7 +237,9 @@ func (h *harness) all(r *replica) (map[string]string, error) {
 	}
 	state := map[string]string{}
 	if err := json.Unmarshal(b, &state); err != nil {
-		return nil, err
+		// A 200 answer is a completed read: an undecodable one is a
+		// fault of the replica, not unavailability, so it is not retried.
+		h.fatalf("all on replica %d: decode a 200 answer: %v", r.id+1, err)
 	}
 	return state, nil
 }
@@ -332,25 +334,28 @@ func (h *harness) converge(what string, equal bool) int {
 	}
 	deadline := time.Now().Add(serveWait)
 	states := make([]map[string]string, replicas)
+	// The ack set was read before any GET /all below started, and GET /all
+	// is a linearizable read: a read that answers and lacks an
+	// acknowledged write, or holds another value for it, is a stale read
+	// and fails at once. Only an unavailable read (transport error, no
+	// leader, any non-200 answer) is retried until the deadline.
 	for i, r := range h.reps {
-		var missing []string
 		for {
 			state, err := h.all(r)
 			if err == nil {
 				states[i] = state
-				if missing = missingAcks(acks, state); len(missing) == 0 {
-					break
+				if missing := missingAcks(acks, state); len(missing) > 0 {
+					n := len(missing)
+					if n > 10 {
+						missing = append(missing[:10], fmt.Sprintf("... %d more", n-10))
+					}
+					h.fatalf("%s: replica %d lost %d of %d acknowledged writes (linearizable GET /all): %s",
+						what, r.id+1, n, len(acks), strings.Join(missing, ", "))
 				}
+				break
 			}
 			if time.Now().After(deadline) {
-				if err != nil {
-					h.fatalf("%s: replica %d answered no linearizable read within %v: %v", what, r.id+1, serveWait, err)
-				}
-				if len(missing) > 10 {
-					missing = append(missing[:10], fmt.Sprintf("... %d more", len(missing)-10))
-				}
-				h.fatalf("%s: replica %d lost %d of %d acknowledged writes: %s",
-					what, r.id+1, len(missingAcks(acks, states[i])), len(acks), strings.Join(missing, ", "))
+				h.fatalf("%s: replica %d answered no linearizable read within %v: %v", what, r.id+1, serveWait, err)
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -529,7 +534,9 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 	h.wg.Wait()
 	h.checkClients()
 	n := h.converge("final", true)
-	if h.reads.Load() == 0 {
+	// With -clusterproof.readers=0 no reader runs, so there is no read to
+	// count; the acknowledged writes are still checked through GET /all.
+	if *flagReaders > 0 && h.reads.Load() == 0 {
 		h.fatalf("no linearizable read of an acknowledged write was answered")
 	}
 	t.Logf("final: %d acknowledged writes on all %d replicas, replica states identical; %d linearizable reads matched",
