@@ -3560,6 +3560,12 @@ type Host struct {
 	// skipCloseHandoff makes Close stop without handing leadership off, as a
 	// crashed host would. Tests set it to put proposals on a departed leader.
 	skipCloseHandoff atomic.Bool
+	// closeDeadline (UnixNano) is the absolute deadline Close's shutdown
+	// work runs under, stored before closeStartC is closed. A Drain already
+	// waiting when Close starts cuts its timer to it, so a Drain that won
+	// drainOnce cannot hold Close past ShutdownTimeout.
+	closeDeadline atomic.Int64
+	closeStartC   chan struct{}
 	// closeDone is set once Close's shutdown work has completed, whether or
 	// not its barrier seals succeeded. EmergencySeal keeps sealing while
 	// closed is set but closeDone is not, because Close seals the barrier
@@ -4352,6 +4358,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		keyRotStopC:        make(chan struct{}),
 		keyRotDone:         make(chan struct{}),
 		sweepStopC:         make(chan struct{}),
+		closeStartC:        make(chan struct{}),
 		sweepDone:          make(chan struct{}),
 		fsys:               options.fsys,
 		wire:               wire,
@@ -10410,7 +10417,12 @@ func (h *Host) Close() error {
 	var closeErr error
 	h.stopOnce.Do(func() {
 		// ShutdownTimeout bounds the hand-off and the drain together.
+		// A Drain already waiting adopts the deadline (drainOnceLocked).
 		deadline := time.Now().Add(h.cfg.ShutdownTimeout)
+		h.closeDeadline.Store(deadline.UnixNano())
+		if h.closeStartC != nil {
+			close(h.closeStartC)
+		}
 
 		// Hand off leadership while the engine and transport still run, so
 		// the remaining voters do not wait out an election timeout.
@@ -10702,14 +10714,26 @@ func (h *Host) drainOnceLocked(timeout time.Duration) error {
 		return nil
 	}
 
+	end := time.Now().Add(timeout)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	select {
-	case <-drainCh:
-		return nil
-	case <-timer.C:
-		return ErrShutdownTimeout
+	closeStart := h.closeStartC
+	for {
+		select {
+		case <-drainCh:
+			return nil
+		case <-timer.C:
+			return ErrShutdownTimeout
+		case <-closeStart:
+			// Close began: this drain, its own included, ends no later
+			// than Close's deadline.
+			closeStart = nil
+			if deadline := time.Unix(0, h.closeDeadline.Load()); deadline.Before(end) {
+				// Go 1.23+ timers: Reset drops any unreceived fire.
+				timer.Reset(time.Until(deadline))
+			}
+		}
 	}
 }
 

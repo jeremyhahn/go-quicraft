@@ -841,13 +841,22 @@ func TestHostClose_ConcurrentDrainKeepsCloseDeadline(t *testing.T) {
 		closed <- time.Since(start)
 	}()
 	time.Sleep(drainAfter)
-	go func() { _ = leader.Drain() }()
+	drained := make(chan time.Duration, 1)
+	go func() {
+		_ = leader.Drain()
+		drained <- time.Since(start)
+	}()
 
 	select {
 	case took := <-closed:
 		if took > shutdownTimeout+slack {
-			t.Fatalf("Close took %v with a Drain started %v into its hand-off; want at most ShutdownTimeout %v + %v slack",
-				took, drainAfter, shutdownTimeout, slack)
+			var drainTook time.Duration
+			select {
+			case drainTook = <-drained:
+			default:
+			}
+			t.Fatalf("Close took %v with a Drain started %v into its hand-off (Drain returned at %v); want at most ShutdownTimeout %v + %v slack",
+				took, drainAfter, drainTook, shutdownTimeout, slack)
 		}
 		t.Logf("Close took %v (ShutdownTimeout %v, Drain at %v)", took, shutdownTimeout, drainAfter)
 	case <-time.After(10 * time.Second):
