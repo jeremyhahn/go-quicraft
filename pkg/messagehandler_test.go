@@ -2278,13 +2278,22 @@ func TestHostMessageHandler_PendingRemovalRefusesTheMemberByEveryName(t *testing
 }
 
 // recvRefusalState reports the receive-refusal cache's entries and the count
-// its accounting holds for them.
+// its accounting holds for them: the map's length is its count, so they agree
+// by construction; the test keeps both so a separate counter cannot return.
 func recvRefusalState(h *hostMessageHandler) (entries, counted int) {
-	h.recvRefusals.Range(func(_, _ any) bool {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	for range h.recvRefusals {
 		entries++
-		return true
-	})
-	return entries, int(h.recvRefused.Load())
+	}
+	return entries, len(h.recvRefusals)
+}
+
+// recvRefusalOf returns the receive refusal recorded for remote, or nil.
+func recvRefusalOf(h *hostMessageHandler, remote string) *WireVersionMismatchError {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	return h.recvRefusals[remote]
 }
 
 // frameRefusal is a transport refusal of a peer sending frame version v.

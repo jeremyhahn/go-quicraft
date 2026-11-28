@@ -70,9 +70,12 @@ type hostMessageHandler struct {
 	// recvRefusals holds the last *WireVersionMismatchError per remote
 	// address for traffic the transport refused before the batch was parsed
 	// (transport.Config.OnWireVersionRefused), so each is logged once per
-	// change of the peer's versions. recvRefused bounds its entries.
-	recvRefusals sync.Map
-	recvRefused  atomic.Int64
+	// change of the peer's versions; maxRecvRefusals bounds its entries.
+	// Receive callbacks run concurrently across streams and connections, so
+	// recvMu covers every lookup, comparison, eviction and insertion as one
+	// step; the map's length is its count.
+	recvMu       sync.Mutex
+	recvRefusals map[string]*WireVersionMismatchError
 
 	// inflightSnapshotRecv serializes concurrent HandleSnapshot calls for the
 	// same (shard, replica, index). The snapshot directory is deterministic
@@ -297,18 +300,36 @@ func (h *hostMessageHandler) wireRefusal(shardID uint64) *WireVersionMismatchErr
 // cannot grow the map and cannot suppress the diagnostic for a later peer.
 const maxRecvRefusals = 1024
 
-// evictRecvRefusal forgets one recorded address and reports whether it did.
-func (h *hostMessageHandler) evictRecvRefusal() bool {
-	evicted := false
-	h.recvRefusals.Range(func(k, _ any) bool {
-		if _, ok := h.recvRefusals.LoadAndDelete(k); ok {
-			h.recvRefused.Add(-1)
-			evicted = true
-			return false
-		}
-		return true
-	})
-	return evicted
+// evictRecvRefusal forgets one arbitrary recorded address. recvMu is held.
+func (h *hostMessageHandler) evictRecvRefusal() {
+	for k := range h.recvRefusals {
+		delete(h.recvRefusals, k)
+		return
+	}
+}
+
+// recordRecvRefusal records refusal as remote's last receive refusal and
+// reports whether it is new or changed, so the caller logs it. Lookup,
+// comparison, eviction and insertion are one step under recvMu, so concurrent
+// callbacks can neither grow the cache past maxRecvRefusals nor both log one
+// change. At capacity an arbitrary recorded address is forgotten to make room,
+// so a full cache never silences a new peer; the forgotten one is simply
+// logged again if it is refused again.
+func (h *hostMessageHandler) recordRecvRefusal(remote string, refusal *WireVersionMismatchError) bool {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	prev, ok := h.recvRefusals[remote]
+	if ok && *prev == *refusal {
+		return false
+	}
+	if h.recvRefusals == nil {
+		h.recvRefusals = make(map[string]*WireVersionMismatchError)
+	}
+	if !ok && len(h.recvRefusals) >= maxRecvRefusals {
+		h.evictRecvRefusal()
+	}
+	h.recvRefusals[remote] = refusal
+	return true
 }
 
 // refuseReceivedWireVersion is the host's transport.Config.OnWireVersionRefused:
@@ -344,28 +365,8 @@ func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error)
 	default:
 		return
 	}
-	if prev, ok := h.recvRefusals.Load(remote); ok {
-		if *prev.(*WireVersionMismatchError) == *refusal {
-			return
-		}
-		h.recvRefusals.Store(remote, refusal)
-	} else {
-		// At capacity an arbitrary recorded address is forgotten to make
-		// room, so a full cache never silences a new peer; the forgotten one
-		// is simply logged again if it is refused again.
-		for h.recvRefused.Load() >= maxRecvRefusals {
-			if !h.evictRecvRefusal() {
-				break
-			}
-		}
-		if prev, loaded := h.recvRefusals.LoadOrStore(remote, refusal); loaded {
-			if *prev.(*WireVersionMismatchError) == *refusal {
-				return
-			}
-			h.recvRefusals.Store(remote, refusal)
-		} else {
-			h.recvRefused.Add(1)
-		}
+	if !h.recordRecvRefusal(remote, refusal) {
+		return
 	}
 	// The record above is synchronous and bounded; only the log line goes to
 	// the contained diagnostic worker, so a blocked log handler delays the
@@ -381,12 +382,12 @@ func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error)
 // receiveWireRefusal returns a refusal recorded by refuseReceivedWireVersion,
 // or nil.
 func (h *hostMessageHandler) receiveWireRefusal() *WireVersionMismatchError {
-	var refusal *WireVersionMismatchError
-	h.recvRefusals.Range(func(_, v any) bool {
-		refusal = v.(*WireVersionMismatchError)
-		return false
-	})
-	return refusal
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	for _, refusal := range h.recvRefusals {
+		return refusal
+	}
+	return nil
 }
 
 // authorizeInbound decides whether one inbound message may reach raft, and

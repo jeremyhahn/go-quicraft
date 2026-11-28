@@ -206,11 +206,7 @@ func TestRefuseReceivedWireVersion_RecordsTransportErrors(t *testing.T) {
 	handler.refuseReceivedWireVersion("10.0.0.3:1", transport.ErrInvalidMagic)
 
 	got := func(addr string) *WireVersionMismatchError {
-		v, ok := handler.recvRefusals.Load(addr)
-		if !ok {
-			return nil
-		}
-		return v.(*WireVersionMismatchError)
+		return recvRefusalOf(handler, addr)
 	}
 	b := got("10.0.0.1:1")
 	if b == nil || b.Frame || b.Source != "10.0.0.1:1" || b.PeerBinVer != 7 || b.PeerMaxBinVer != 8 || !b.HasPeerMaxBinVer ||
@@ -249,14 +245,14 @@ func TestRefuseReceivedWireVersion_PastLimitStillRecords(t *testing.T) {
 	before := strings.Count(logs.String(), marker)
 	const fresh = "192.0.2.7:4242"
 	handler.refuseReceivedWireVersion(fresh, refusal)
-	if _, ok := handler.recvRefusals.Load(fresh); !ok {
+	if recvRefusalOf(handler, fresh) == nil {
 		t.Fatal("a new peer past the cache limit was not recorded")
 	}
 	drainContainedRetrying(t)
 	if n := strings.Count(logs.String(), marker); n != before+1 {
 		t.Fatalf("%d refusal lines for a new peer past the cache limit, want 1", n-before)
 	}
-	if n := handler.recvRefused.Load(); n > maxRecvRefusals {
+	if n, _ := recvRefusalState(handler); n > maxRecvRefusals {
 		t.Fatalf("cache holds %d entries, bound is %d", n, maxRecvRefusals)
 	}
 }
@@ -307,8 +303,7 @@ func TestRefuseReceivedWireVersion_RecordsPastBlockedLogHandler(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("refuseReceivedWireVersion blocked behind a blocked log handler")
 	}
-	v, ok := handler.recvRefusals.Load(fresh)
-	if !ok || v.(*WireVersionMismatchError).Source != fresh {
+	if r := recvRefusalOf(handler, fresh); r == nil || r.Source != fresh {
 		t.Fatal("a new peer's refusal was not recorded while the log handler was blocked")
 	}
 
@@ -352,11 +347,10 @@ func TestRefuseReceivedWireVersion_ShortBatchNamesNoMaximum(t *testing.T) {
 		_, err := mb.UnmarshalFromWindow(wire[:n], proto.DefaultWireWindow())
 		addr := "10.0.1.1:" + strconv.Itoa(n)
 		handler.refuseReceivedWireVersion(addr, err)
-		v, ok := handler.recvRefusals.Load(addr)
-		if !ok {
+		r := recvRefusalOf(handler, addr)
+		if r == nil {
 			t.Fatalf("%d bytes: refusal %v not recorded", n, err)
 		}
-		r := v.(*WireVersionMismatchError)
 		msg := r.Error()
 		if !strings.Contains(msg, "wire version "+uitoa(far)) {
 			t.Fatalf("%d bytes: %q does not name BinVer %d", n, msg, far)
