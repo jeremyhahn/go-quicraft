@@ -60,6 +60,10 @@ const (
 	// warmupAcks is how many writes the cluster must acknowledge before the
 	// first kill.
 	warmupAcks = 50
+	// snapWait bounds the wait, before a kill, for the victim to save a
+	// snapshot and compact its log, and after the restart for it to report
+	// the snapshot it recovered from.
+	snapWait = 2 * time.Minute
 )
 
 // replica is one replica process; start runs it again after a kill, with
@@ -237,9 +241,48 @@ func (h *harness) all(r *replica) (map[string]string, error) {
 	}
 	state := map[string]string{}
 	if err := json.Unmarshal(b, &state); err != nil {
-		return nil, err
+		// A 200 answer is a completed read: an undecodable one is a
+		// fault of the replica, not unavailability, so it is not retried.
+		h.fatalf("all on replica %d: decode a 200 answer: %v", r.id+1, err)
 	}
 	return state, nil
+}
+
+// snap reads replica r's snapshot record (GET /snap).
+func (h *harness) snap(r *replica) (snapStatus, error) {
+	var s snapStatus
+	resp, err := h.do(http.MethodGet, h.url(r, "/snap", nil))
+	if err != nil {
+		return s, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return s, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return s, fmt.Errorf("snap on replica %d: %s: %s", r.id+1, resp.Status, strings.TrimSpace(string(b)))
+	}
+	return s, json.Unmarshal(b, &s)
+}
+
+// waitSnap waits, within snapWait, until replica r's snapshot record
+// satisfies ok, and fails naming want if it does not.
+func (h *harness) waitSnap(r *replica, want string, ok func(snapStatus) bool) snapStatus {
+	h.t.Helper()
+	deadline := time.Now().Add(snapWait)
+	var s snapStatus
+	var err error
+	for {
+		h.checkClients()
+		if s, err = h.snap(r); err == nil && ok(s) {
+			return s
+		}
+		if time.Now().After(deadline) {
+			h.fatalf("replica %d: no %s within %v: record %+v, err %v", r.id+1, want, snapWait, s, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // waitServing waits until replica r answers a linearizable read, which needs
@@ -332,25 +375,23 @@ func (h *harness) converge(what string, equal bool) int {
 	}
 	deadline := time.Now().Add(serveWait)
 	states := make([]map[string]string, replicas)
+	// The ack set was read before any GET /all below started, and GET /all
+	// is a linearizable read: a read that answers and lacks an
+	// acknowledged write, or holds another value for it, is a stale read
+	// and fails at once. Only an unavailable read (transport error, no
+	// leader, any non-200 answer) is retried until the deadline.
 	for i, r := range h.reps {
-		var missing []string
 		for {
 			state, err := h.all(r)
 			if err == nil {
-				states[i] = state
-				if missing = missingAcks(acks, state); len(missing) == 0 {
-					break
+				if err := ackedState(acks, state); err != nil {
+					h.fatalf("%s: replica %d %v", what, r.id+1, err)
 				}
+				states[i] = state
+				break
 			}
 			if time.Now().After(deadline) {
-				if err != nil {
-					h.fatalf("%s: replica %d answered no linearizable read within %v: %v", what, r.id+1, serveWait, err)
-				}
-				if len(missing) > 10 {
-					missing = append(missing[:10], fmt.Sprintf("... %d more", len(missing)-10))
-				}
-				h.fatalf("%s: replica %d lost %d of %d acknowledged writes: %s",
-					what, r.id+1, len(missingAcks(acks, states[i])), len(acks), strings.Join(missing, ", "))
+				h.fatalf("%s: replica %d answered no linearizable read within %v: %v", what, r.id+1, serveWait, err)
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -364,13 +405,82 @@ func (h *harness) converge(what string, equal bool) int {
 				what, len(states[0]), len(states[1]), len(states[2]))
 		}
 		time.Sleep(100 * time.Millisecond)
-		for i, r := range h.reps {
-			if s, err := h.all(r); err == nil {
-				states[i] = s
-			}
+		if err := refreshStates(states, acks, func(i int) (map[string]string, error) { return h.all(h.reps[i]) }); err != nil {
+			h.fatalf("%s: %v", what, err)
 		}
 	}
 	return len(acks)
+}
+
+// refreshStates reads every replica's state again with fetch and stores each
+// answered read in states, but only once it holds every acknowledged write:
+// a read that answers without one, or with another value for one, is a stale
+// linearizable read and is returned as an error at once, not stored. An
+// unavailable read (fetch returns an error) leaves states[i] as it was.
+func refreshStates(states []map[string]string, acks map[string]string, fetch func(i int) (map[string]string, error)) error {
+	for i := range states {
+		s, err := fetch(i)
+		if err != nil {
+			continue
+		}
+		if err := ackedState(acks, s); err != nil {
+			return fmt.Errorf("replica %d %w", i+1, err)
+		}
+		states[i] = s
+	}
+	return nil
+}
+
+// ackedState reports, naming at most ten, the acknowledged writes state does
+// not hold with the acknowledged value.
+func ackedState(acks, state map[string]string) error {
+	missing := missingAcks(acks, state)
+	if len(missing) == 0 {
+		return nil
+	}
+	n := len(missing)
+	if n > 10 {
+		missing = append(missing[:10], fmt.Sprintf("... %d more", n-10))
+	}
+	return fmt.Errorf("lost %d of %d acknowledged writes (linearizable GET /all): %s", n, len(acks), strings.Join(missing, ", "))
+}
+
+// TestClusterproof_CheckerRefresh: the final convergence retry must check
+// every answered replacement state against the acknowledgement set. A read
+// that lacks an acknowledged write, or holds another value for it, fails at
+// once and is not stored; an unavailable read keeps the previous state.
+func TestClusterproof_CheckerRefresh(t *testing.T) {
+	acks := map[string]string{"a": "1", "b": "2"}
+	good := map[string]string{"a": "1", "b": "2"}
+	states := []map[string]string{good, good, good}
+	fetch := func(i int) (map[string]string, error) {
+		switch i {
+		case 0:
+			return map[string]string{"a": "1", "b": "2", "c": "3"}, nil
+		case 1:
+			return nil, fmt.Errorf("unavailable")
+		default:
+			return map[string]string{"a": "1"}, nil
+		}
+	}
+	err := refreshStates(states, acks, fetch)
+	if err == nil || !lostAcksRE.MatchString(err.Error()) || !strings.Contains(err.Error(), "replica 3") {
+		t.Fatalf("refreshStates with a stale replica 3 = %v, want replica 3 lost acknowledged writes", err)
+	}
+	if !maps.Equal(states[2], good) {
+		t.Fatalf("refreshStates stored the stale state %v", states[2])
+	}
+	if !maps.Equal(states[1], good) {
+		t.Fatalf("refreshStates replaced an unavailable replica's state with %v", states[1])
+	}
+
+	wrong := func(int) (map[string]string, error) { return map[string]string{"a": "1", "b": "9"}, nil }
+	if err := refreshStates([]map[string]string{good}, acks, wrong); err == nil || !strings.Contains(err.Error(), `holds "9"`) {
+		t.Fatalf("refreshStates with a wrong acknowledged value = %v, want a failure naming it", err)
+	}
+	if err := refreshStates(states, acks, func(int) (map[string]string, error) { return good, nil }); err != nil {
+		t.Fatalf("refreshStates with complete states = %v", err)
+	}
 }
 
 // logTail returns the last n lines of a file, for a failure report.
@@ -510,26 +620,35 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 	for c := 1; c <= *flagCycles; c++ {
 		victim := h.reps[rng.IntN(replicas)]
 		down := downMin + time.Duration(rng.Int64N(int64(downJitter)))
+		// The kill must land on a replica that has saved a snapshot and
+		// compacted its log in this process, so the restart has to recover
+		// from a snapshot, not replay the whole log.
+		pre := h.waitSnap(victim, "a snapshot save and a log compaction before the kill",
+			func(s snapStatus) bool { return s.Created > 0 && s.Compacted > 0 })
 		before := h.puts.Load()
 		h.kill(victim)
 		time.Sleep(down)
 		h.start(victim)
 		h.waitServing(victim)
+		post := h.waitSnap(victim, "a recovery from a snapshot after the restart",
+			func(s snapStatus) bool { return s.Recovered > 0 && s.SMRecoveries > 0 })
 		n := h.converge(fmt.Sprintf("cycle %d", c), false)
 		h.checkClients()
 		during := h.puts.Load() - before
 		if during == 0 {
 			h.fatalf("cycle %d: no write was acknowledged while replica %d was killed and restarted", c, victim.id+1)
 		}
-		t.Logf("cycle %d: SIGKILLed replica %d for %v; %d writes acknowledged during the cycle; all %d acknowledged writes on every replica",
-			c, victim.id+1, down.Round(time.Millisecond), during, n)
+		t.Logf("cycle %d: SIGKILLed replica %d for %v (snapshot at index %d, log compacted through %d); recovered from snapshot index %d; %d writes acknowledged during the cycle; all %d acknowledged writes on every replica",
+			c, victim.id+1, down.Round(time.Millisecond), pre.Created, pre.Compacted, post.Recovered, during, n)
 	}
 
 	h.stop.Store(true)
 	h.wg.Wait()
 	h.checkClients()
 	n := h.converge("final", true)
-	if h.reads.Load() == 0 {
+	// With -clusterproof.readers=0 no reader runs, so there is no read to
+	// count; the acknowledged writes are still checked through GET /all.
+	if *flagReaders > 0 && h.reads.Load() == 0 {
 		h.fatalf("no linearizable read of an acknowledged write was answered")
 	}
 	t.Logf("final: %d acknowledged writes on all %d replicas, replica states identical; %d linearizable reads matched",

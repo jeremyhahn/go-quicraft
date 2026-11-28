@@ -171,6 +171,10 @@ PKG_CRYPTO      := ./pkg/crypto/...
 
 # Integration test paths
 INT_TEST_DIR    := ./test/integration
+# The SIGKILL acknowledged-write harness (#1301): integration-tagged, run by
+# every integration target and shard beside INT_TEST_DIR.
+CLUSTERPROOF_DIR := ./test/clusterproof
+IT_TEST_DIRS    := $(INT_TEST_DIR) $(CLUSTERPROOF_DIR)
 
 # Performance comparison paths
 PERF_DIR        := ./test/performance
@@ -313,7 +317,7 @@ test-crypto:
 # CLUSTERPROOF_ARGS='-clusterproof.cycles=50 -clusterproof.seed=7'.
 .PHONY: test-clusterproof
 test-clusterproof:
-	$(GOTEST) -tags=integration -timeout=600s ./test/clusterproof/... $(if $(CLUSTERPROOF_ARGS),-args $(CLUSTERPROOF_ARGS))
+	$(GOTEST) -tags=integration -timeout=600s $(CLUSTERPROOF_DIR)/... $(if $(CLUSTERPROOF_ARGS),-args $(CLUSTERPROOF_ARGS))
 
 # ============================================================================
 # Integration tests (always run in devcontainer)
@@ -357,7 +361,7 @@ integration-test-e2e: docker-build-it
 .PHONY: _integration-test
 _integration-test:
 	# 900s: -p 1 shares one deadline and linearizability alone takes ~305s.
-	$(GOTEST) -tags=integration -timeout=900s -p 1 $(INT_TEST_DIR)/...
+	$(GOTEST) -tags=integration -timeout=900s -p 1 $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/...
 
 .PHONY: _integration-test-raft
 _integration-test-raft:
@@ -387,7 +391,7 @@ _integration-test-linearizability:
 # deadline.
 .PHONY: ci-integration
 ci-integration:
-	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/...
+	$(GO) test -race -count=1 -tags=integration -timeout=1800s -p 1 $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/...
 
 # Network partitions between live replicas. Needs the quicraft_netfault tag,
 # which compiles the transport's send-path drop hook in. Every test asserts
@@ -945,13 +949,13 @@ shard-packages:
 	printf '%s\n' "$$pkgs"
 
 # it-shard-packages prints shard SHARD of SHARDS of the integration packages
-# (every directory under INT_TEST_DIR with a test file), one per line, for
+# (every directory under IT_TEST_DIRS with a test file), one per line, for
 # ci.yml's integration shards to pass as IT_PKGS. It reads the tree, not go
 # list, so the runner needs no Go toolchain: the suite runs in the image.
 .PHONY: it-shard-packages
 it-shard-packages:
 	@$(check_shard); \
-	dirs=$$(find $(INT_TEST_DIR) -name '*_test.go' -printf '%h\n' | LC_ALL=C sort -u | while read -r d; do printf '%s %s\n' "$$d" "$$d"; done); \
+	dirs=$$(find $(IT_TEST_DIRS) -name '*_test.go' -printf '%h\n' | LC_ALL=C sort -u | while read -r d; do printf '%s %s\n' "$$d" "$$d"; done); \
 	pkgs=$$(printf '%s\n' "$$dirs" | $(shard_deal)); \
 	if [ -z "$$pkgs" ]; then echo "FAIL: $@: shard $(SHARD) of $(SHARDS) holds no package"; exit 1; fi; \
 	printf '%s\n' "$$pkgs"
@@ -1693,7 +1697,7 @@ IT_PROJECT ?= go-quicraft-it-$(DOCKER_TAG)
 # command, -race and serialized packages (see _integration-test). IT_PKGS is
 # the package scope; ci.yml's integration shards pass a slice of it
 # (`make it-shard-packages`).
-IT_PKGS    ?= $(INT_TEST_DIR)/...
+IT_PKGS    ?= $(INT_TEST_DIR)/... $(CLUSTERPROOF_DIR)/...
 IT_CMD     ?= go test -race -count=1 -tags=integration$(if $(strip $(GO_BUILD_TAGS)),$(comma)$(GO_TAGS_CSV)) -timeout=1800s -p 1 $(IT_PKGS)
 # One suite in the integration image (integration-test-raft and friends): the
 # image carries no make, so the target passes the go test command itself.

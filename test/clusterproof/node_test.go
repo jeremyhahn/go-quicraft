@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -102,6 +103,27 @@ func shardConfig(replicaID uint64, ids map[uint64]string) config.Config {
 	return c
 }
 
+// snapStatus is a replica process's snapshot record since it started, as
+// GET /snap answers it: the index of its latest snapshot save (Created) and
+// of its latest log compaction (Compacted), from the Host's events, and the
+// applied index carried by the snapshot its state machine restored
+// (Recovered), with SMRecoveries counting the state machine's
+// RecoverFromSnapshot calls. The Host raises no event for a restart's
+// recovery from its own snapshot, so the state machine reports it. A zero
+// index means no such event yet.
+type snapStatus struct {
+	Created      uint64
+	Compacted    uint64
+	Recovered    uint64
+	SMRecoveries uint64
+}
+
+// nodeSnap is this replica process's snapshot record, set by the Host's
+// event listener and by the state machine.
+var nodeSnap struct {
+	created, compacted, recovered, smRecoveries atomic.Uint64
+}
+
 // nodeDie reports a fatal child error on stderr (the child's log) and exits.
 func nodeDie(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "clusterproof node: FATAL: "+format+"\n", args...)
@@ -127,8 +149,12 @@ func TestClusterproof_Node(t *testing.T) {
 	if err != nil {
 		nodeDie("load mTLS: %v", err)
 	}
-	h, err := quicraft.NewHost(hostConfig(spec.RaftAddr, spec.WALDir, spec.NodeHostDir, spec.RTTMillisecond, mtls),
-		quicraft.WithoutEncryption())
+	cfg := hostConfig(spec.RaftAddr, spec.WALDir, spec.NodeHostDir, spec.RTTMillisecond, mtls)
+	cfg.EventListener = &config.EventListener{
+		OnSnapshotCreated: func(i config.SnapshotInfo) { nodeSnap.created.Store(i.Index) },
+		OnLogCompacted:    func(i config.EventShardInfo) { nodeSnap.compacted.Store(i.Index) },
+	}
+	h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 	if err != nil {
 		nodeDie("NewHost: %v", err)
 	}
@@ -156,13 +182,14 @@ func TestClusterproof_Node(t *testing.T) {
 	nodeDie("serve: %v", srv.Serve(ln))
 }
 
-// nodeHandler serves the harness's three requests:
+// nodeHandler serves the harness's four requests:
 //
 //	POST /put?k=K&v=V  commits put(K, V) through this replica; 200 only once
 //	                   the entry is committed and applied
 //	GET  /get?k=K      a linearizable read of K: 200 with the value, 404 when
 //	                   K is absent
 //	GET  /all          a linearizable read of the whole state, as JSON
+//	GET  /snap         this process's snapshot record (snapStatus), as JSON
 //
 // Any error is a 503 with the error text; the harness never counts one as an
 // acknowledgement.
@@ -212,6 +239,19 @@ func nodeHandler(h *quicraft.Host) http.Handler {
 			return
 		}
 		b, err := json.Marshal(data)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(b)
+	})
+	mux.HandleFunc("GET /snap", func(w http.ResponseWriter, _ *http.Request) {
+		b, err := json.Marshal(snapStatus{
+			Created:      nodeSnap.created.Load(),
+			Compacted:    nodeSnap.compacted.Load(),
+			Recovered:    nodeSnap.recovered.Load(),
+			SMRecoveries: nodeSnap.smRecoveries.Load(),
+		})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

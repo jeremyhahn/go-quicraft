@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -137,5 +139,50 @@ func TestClusterproof_Checker(t *testing.T) {
 	want := []string{"b (absent)", `c (holds "9", acknowledged "3")`}
 	if fmt.Sprint(m) != fmt.Sprint(want) {
 		t.Fatalf("missingAcks = %v, want %v", m, want)
+	}
+}
+
+// lostAcksRE matches the checker's report of acknowledged writes missing
+// from a replica's linearizable GET /all.
+var lostAcksRE = regexp.MustCompile(`lost \d+ of \d+ acknowledged writes`)
+
+// TestClusterproof_CheckerReadersZero runs the SIGKILL harness, as a child
+// test process, with -clusterproof.readers=0. The baseline must pass: with
+// no readers there are no linearizable reads to count. The negative
+// injection (-clusterproof.ack-before-commit) must fail, and on the
+// acknowledged writes the checker finds missing, not on anything else.
+func TestClusterproof_CheckerReadersZero(t *testing.T) {
+	if os.Getenv(nodeChildEnv) == "1" {
+		t.Skip("replica process")
+	}
+	run := func(ackEarly bool) (string, error) {
+		cmd := exec.CommandContext(t.Context(), os.Args[0],
+			"-test.run=^TestClusterproof_SIGKILL$", "-test.count=1", "-test.timeout=10m",
+			"-clusterproof.readers=0", "-clusterproof.cycles=2", "-clusterproof.seed=1301",
+			fmt.Sprintf("-clusterproof.ack-before-commit=%v", ackEarly))
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	tail := func(s string) string {
+		if len(s) > 4096 {
+			return "..." + s[len(s)-4096:]
+		}
+		return s
+	}
+
+	out, err := run(false)
+	if err != nil {
+		t.Fatalf("readers=0 baseline failed: %v\n%s", err, tail(out))
+	}
+
+	out, err = run(true)
+	if err == nil {
+		t.Fatalf("readers=0 negative injection passed, want a failure on missing acknowledgements\n%s", tail(out))
+	}
+	if !lostAcksRE.MatchString(out) {
+		t.Fatalf("readers=0 negative injection failed, but not on missing acknowledgements: %v\n%s", err, tail(out))
+	}
+	if strings.Contains(out, "no linearizable read") {
+		t.Fatalf("readers=0 negative injection failed on the reads assertion\n%s", tail(out))
 	}
 }
