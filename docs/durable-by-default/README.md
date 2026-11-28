@@ -31,21 +31,15 @@ the modes.
 
 ## Tests
 
-- `pkg/config/durable_default_test.go`
-  - `TestHostConfig_DefaultIsQuorumDurable` fails if the zero
-    `HostConfig`, the `HostConfig` after `SetDefaults`, or the tests'
-    valid `HostConfig` enables a durability-weakening bool or carries a
-    `writemode.Mode` that does not require a quorum.
-  - `TestHostConfig_EveryBoolIsClassified` uses reflection to list every
-    `bool` reachable from `HostConfig` through the package's own structs. It
-    fails if any of them is missing from both `durabilityWeakeningFields`
-    and `durabilityNeutralFields`. A new setting therefore cannot ship
-    until someone has decided whether it weakens durability. A weakening
-    setting must also default to off.
-- `pkg/writemode/default_test.go`
-  - `TestDefaultMode_IsQuorumDurable` pins the zero and unset mode.
-  - `TestNonQuorumModes_AreOptIn` fails if a mode or alias that skips the
-    quorum is not in the opt-in lists.
+The row is in progress. The tests that enforce these defaults were part of
+#1306. They were reverted with it after main went red, and they come back with
+the re-land of #1303:
 
-When you add an opt-in setting, add it to the lists in those tests and to the
-table above.
+- A `HostConfig` test that fails if the zero `HostConfig`, or the
+  `HostConfig` after `SetDefaults`, enables a setting that weakens durability.
+  It also fails if any `bool` reachable from `HostConfig` has not been
+  classified as weakening or neutral.
+- A `writemode` test that pins the zero and unset mode to `Sync`. It also
+  fails if a mode or alias that skips the quorum is not in the opt-in lists.
+
+When you add an opt-in setting, add it to the table above.
