@@ -7854,7 +7854,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 	// leadership transfer.
 	ns.pauseGate.lock(nil)
 	if !ns.paused.Swap(true) && ns.isLeader.Load() {
-		h.transferBeforePause(ctx, ns, engNode)
+		h.transferBeforePause(ctx, ns, engNode, "pause")
 	}
 	h.engine.BeginPause(engNode)
 	ns.pauseGate.unlock()
@@ -7873,7 +7873,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 // timeout, for this replica to step down. With no voter to hand to it waits
 // out the timeout; PauseShard proceeds either way. The engine node is not paused
 // yet, so the step worker still runs the transfer.
-func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *engine.Node) {
+func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *engine.Node, before string) {
 	timeout := time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -7890,7 +7890,7 @@ func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *
 				if engNode.DeliverLocal(msg) {
 					h.engine.NotifyWork(ns.shardID)
 					requested = true
-					h.logger.Info("leader transfer before pause",
+					h.logger.Info("leader transfer before "+before,
 						"shard_id", ns.shardID,
 						"target_replica_id", target,
 					)
@@ -7902,7 +7902,7 @@ func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *
 			return
 		case <-deadline.C:
 			if requested {
-				h.logger.Warn("leader transfer before pause did not finish; pausing",
+				h.logger.Warn("leader transfer before "+before+" did not finish; proceeding",
 					"shard_id", ns.shardID,
 				)
 			}
@@ -7939,7 +7939,7 @@ func (h *Host) transferBeforeClose() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			h.transferBeforePause(context.Background(), ns, engNode)
+			h.transferBeforePause(context.Background(), ns, engNode, "close")
 		}()
 		return true
 	})
