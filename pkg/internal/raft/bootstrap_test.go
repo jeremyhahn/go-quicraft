@@ -495,6 +495,59 @@ func TestReconstructMembership_UnsupportedWireVersionIsFatal(t *testing.T) {
 		}
 	})
 
+	// #1248: the out-of-window change arrives after an accepted change, so the
+	// fold has already moved past the founding membership when it faults.
+	t.Run("wire version outside window after accepted change", func(t *testing.T) {
+		addNode := configChangeEntry(t, 2, proto.ConfigChange{
+			Type: proto.AddNode, ReplicaID: 4, Address: "d",
+		})
+		wire := configChangeEntry(t, 3, proto.ConfigChange{
+			Type: proto.UpdateWireVersion, WireVersion: proto.WireVersion + 1,
+		})
+
+		// Precondition: the AddNode is accepted by the recovery fold.
+		before, err := ReconstructMembership([]proto.Entry{founding, addNode})
+		if err != nil {
+			t.Fatalf("ReconstructMembership(founding, AddNode): %v", err)
+		}
+		if _, ok := before.Addresses[4]; !ok {
+			t.Fatalf("precondition: AddNode was not accepted, membership %+v", before)
+		}
+
+		entries := []proto.Entry{founding, addNode, wire}
+		got, err := ReconstructMembership(entries)
+		if !errors.Is(err, proto.ErrUnsupportedVersion) {
+			t.Fatalf("got err %v, want ErrUnsupportedVersion: the runtime path "+
+				"faults the shard on this entry, so recovery must too", err)
+		}
+		if errors.Is(err, ErrCorruptConfigEntry) {
+			t.Fatalf("err %v matches ErrCorruptConfigEntry: the entry decodes", err)
+		}
+		if !reflect.DeepEqual(got, proto.Membership{}) {
+			t.Fatalf("got membership %+v alongside the error, want the zero value", got)
+		}
+
+		// Runtime parity: the commit path folds the same entries to the same
+		// decision — founding and AddNode applied, the wire change fatal.
+		p := newTestPeer(t, testConfigWithID(1, 1), proto.State{}, proto.Membership{
+			Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
+		})
+		for _, e := range entries[:2] {
+			if applied, err := p.applyMembershipEntry(e); !applied || err != nil {
+				t.Fatalf("runtime refused entry %d (applied=%v err=%v), recovery accepted it",
+					e.Index, applied, err)
+			}
+		}
+		applied, err := p.applyMembershipEntry(wire)
+		if applied || !errors.Is(err, proto.ErrUnsupportedVersion) {
+			t.Fatalf("runtime on the wire change: applied=%v err=%v, want the "+
+				"ErrUnsupportedVersion recovery returned", applied, err)
+		}
+		if errors.Is(err, ErrCorruptConfigEntry) {
+			t.Fatalf("runtime err %v matches ErrCorruptConfigEntry, recovery's does not", err)
+		}
+	})
+
 	t.Run("ordinary refusal is skipped", func(t *testing.T) {
 		entries := []proto.Entry{founding, {
 			Index: 2, Term: 1, Type: proto.EntryConfigChange,
