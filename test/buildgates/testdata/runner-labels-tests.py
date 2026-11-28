@@ -556,7 +556,7 @@ def every_job(head):
 # Its other ci.yml jobs stay on ubuntu-latest on every event.
 SELECTION_JOBS = {"preflight", "row", "lint", "image", "lint-gates", "integration", "soak", "ci-gate",
                   "unit", "coverage", "netfault", "errfs", "zero-rtt", "cross-arch", "modules",
-                  "contrib-dragonboat", "fips"}
+                  "contrib-dragonboat", "fips", "clusterproof"}  # LOCAL (#1302): clusterproof
 
 
 def selection_case(label, head, want):

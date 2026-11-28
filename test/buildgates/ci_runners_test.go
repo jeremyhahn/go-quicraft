@@ -79,6 +79,7 @@ var ciRunnerSelection = map[string]string{
 	"integration":        dockerRunsOn,
 	"soak":               dockerRunsOn,
 	"netfault":           dockerRunsOn,
+	"clusterproof":       dockerRunsOn, // LOCAL (#1302)
 	"errfs":              dockerRunsOn,
 	"zero-rtt":           dockerRunsOn,
 	"cross-arch":         dockerRunsOn,

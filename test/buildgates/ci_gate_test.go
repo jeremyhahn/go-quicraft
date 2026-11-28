@@ -285,6 +285,16 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 	if tiers["lint-gates"] != "scoped" {
 		t.Errorf("%s checks lint-gates as %q; want scoped (ci-template v1.30)", gateJobName, tiers["lint-gates"])
 	}
+	// LOCAL (#1302): the chaos harness is a required, path-scoped job.
+	if tiers["clusterproof"] != "clusterproof" {
+		t.Errorf("%s checks clusterproof as %q; want clusterproof (#1302)", gateJobName, tiers["clusterproof"])
+	}
+	if !regexp.MustCompile(`(?m)^    needs: \[[^\]]*\bclusterproof\b[^\]]*\]$`).MatchString(body) {
+		t.Errorf("no job needs clusterproof; %s must (#1302)", gateJobName)
+	}
+	if !strings.Contains(body, "make test-clusterproof") {
+		t.Errorf("ci.yml does not run make test-clusterproof (#1302)")
+	}
 
 	for _, j := range ciJobs(t, body) {
 		if j == gateJobName || outsideGate[j] {
@@ -310,6 +320,13 @@ func TestCIGateTiersMatchTheJobs(t *testing.T) {
 			// A scoped job skips when no file matches LINT_GATES_PATTERN.
 			if !strings.Contains(cond, "needs.preflight.outputs.lint_gates != 'false'") {
 				t.Errorf("job %q is tagged scoped in %s but its `if:` does not test lint_gates", j, gateJobName)
+			}
+		case "clusterproof":
+			// LOCAL (#1302): the clusterproof job skips on a docs-only PR
+			// and when no changed file matches CLUSTERPROOF_PATTERN.
+			if !strings.Contains(cond, "needs.preflight.outputs.clusterproof == 'true'") ||
+				!strings.Contains(cond, "needs.preflight.outputs.docs_only != 'true'") {
+				t.Errorf("job %q is tagged clusterproof in %s but its `if:` does not test clusterproof and docs_only", j, gateJobName)
 			}
 		case "pull":
 			// The Row job runs on a non-draft pull request only.
