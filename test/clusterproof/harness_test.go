@@ -369,13 +369,63 @@ func (h *harness) converge(what string, equal bool) int {
 				what, len(states[0]), len(states[1]), len(states[2]))
 		}
 		time.Sleep(100 * time.Millisecond)
-		for i, r := range h.reps {
-			if s, err := h.all(r); err == nil {
-				states[i] = s
-			}
+		if err := refreshStates(states, acks, func(i int) (map[string]string, error) { return h.all(h.reps[i]) }); err != nil {
+			h.fatalf("%s: %v", what, err)
 		}
 	}
 	return len(acks)
+}
+
+// refreshStates reads every replica's state again with fetch and stores each
+// answered read in states. An unavailable read (fetch returns an error)
+// leaves states[i] as it was.
+func refreshStates(states []map[string]string, acks map[string]string, fetch func(i int) (map[string]string, error)) error {
+	for i := range states {
+		s, err := fetch(i)
+		if err != nil {
+			continue
+		}
+		states[i] = s
+	}
+	return nil
+}
+
+// TestClusterproof_CheckerRefresh: the final convergence retry must check
+// every answered replacement state against the acknowledgement set. A read
+// that lacks an acknowledged write, or holds another value for it, fails at
+// once and is not stored; an unavailable read keeps the previous state.
+func TestClusterproof_CheckerRefresh(t *testing.T) {
+	acks := map[string]string{"a": "1", "b": "2"}
+	good := map[string]string{"a": "1", "b": "2"}
+	states := []map[string]string{good, good, good}
+	fetch := func(i int) (map[string]string, error) {
+		switch i {
+		case 0:
+			return map[string]string{"a": "1", "b": "2", "c": "3"}, nil
+		case 1:
+			return nil, fmt.Errorf("unavailable")
+		default:
+			return map[string]string{"a": "1"}, nil
+		}
+	}
+	err := refreshStates(states, acks, fetch)
+	if err == nil || !lostAcksRE.MatchString(err.Error()) || !strings.Contains(err.Error(), "replica 3") {
+		t.Fatalf("refreshStates with a stale replica 3 = %v, want replica 3 lost acknowledged writes", err)
+	}
+	if !maps.Equal(states[2], good) {
+		t.Fatalf("refreshStates stored the stale state %v", states[2])
+	}
+	if !maps.Equal(states[1], good) {
+		t.Fatalf("refreshStates replaced an unavailable replica's state with %v", states[1])
+	}
+
+	wrong := func(int) (map[string]string, error) { return map[string]string{"a": "1", "b": "9"}, nil }
+	if err := refreshStates([]map[string]string{good}, acks, wrong); err == nil || !strings.Contains(err.Error(), `holds "9"`) {
+		t.Fatalf("refreshStates with a wrong acknowledged value = %v, want a failure naming it", err)
+	}
+	if err := refreshStates(states, acks, func(int) (map[string]string, error) { return good, nil }); err != nil {
+		t.Fatalf("refreshStates with complete states = %v", err)
+	}
 }
 
 // logTail returns the last n lines of a file, for a failure report.
