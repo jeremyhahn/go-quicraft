@@ -2024,7 +2024,7 @@ Source: `pkg/config/hostconfig.go`.
 | `RTTMillisecond` | `uint64` | `200` | estimated round-trip time in ms; 1 to 60000 |
 | `DeploymentID` | `uint64` | required, non-zero | cluster identity token. Not cryptographic; use a separate CA per cluster for cryptographic isolation |
 | `AllowZeroDeploymentID` | `bool` | `false` | permits `DeploymentID == 0`, for development and tests |
-| `HostID` | `string` | `""` | when empty, the ID in `NodeHostDir/host.id` is used; if that file is absent or malformed, a random 128-bit hex ID is generated and written there |
+| `HostID` | `string` | `""` | when empty, the ID in `NodeHostDir/host.id` is used; if that file is absent, a random 128-bit hex ID is generated and published there; an unreadable or malformed file fails `NewHost` with `*HostInitError` |
 | `NumWorkers` | `uint64` | `runtime.NumCPU()` | workers per tier |
 | `MaxApplyWorkers` | `int` | `runtime.NumCPU()` | concurrent per-shard apply goroutines |
 | `CommitCBufferSize` | `int` | `64` | commit channel buffer per worker |
