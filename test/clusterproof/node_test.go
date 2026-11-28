@@ -118,10 +118,61 @@ type snapStatus struct {
 	SMRecoveries uint64
 }
 
-// nodeSnap is this replica process's snapshot record, set by the Host's
-// event listener and by the state machine.
-var nodeSnap struct {
+// snapRecord is a replica process's snapshot record, set by the Host's event
+// listener and by the state machine.
+type snapRecord struct {
 	created, compacted, recovered, smRecoveries atomic.Uint64
+}
+
+// nodeSnap is this replica process's snapshot record.
+var nodeSnap snapRecord
+
+// listener is the Host event listener that fills the record. Compacted comes
+// from OnLogDBCompacted, which fires only once the LogDB removed the
+// compacted entries; OnLogCompacted fires when the in-memory log reader
+// advances, even if the LogDB step then fails, so it is not recorded.
+func (s *snapRecord) listener() *config.EventListener {
+	return &config.EventListener{
+		OnSnapshotCreated: func(i config.SnapshotInfo) { s.created.Store(i.Index) },
+		OnLogDBCompacted:  func(i config.EventShardInfo) { s.compacted.Store(i.Index) },
+	}
+}
+
+// status is the record as GET /snap answers it.
+func (s *snapRecord) status() snapStatus {
+	return snapStatus{
+		Created:      s.created.Load(),
+		Compacted:    s.compacted.Load(),
+		Recovered:    s.recovered.Load(),
+		SMRecoveries: s.smRecoveries.Load(),
+	}
+}
+
+// preKillReady is the guard a victim's record must pass before the kill: a
+// snapshot saved and the LogDB compacted in this process.
+func preKillReady(s snapStatus) bool { return s.Created > 0 && s.Compacted > 0 }
+
+// TestClusterproof_CheckerCompaction: only a LogDB compaction
+// (OnLogDBCompacted) satisfies the pre-kill guard. OnLogCompacted fires when
+// the in-memory log reader advances even if the LogDB step then fails, so a
+// reader-only compaction must not count.
+func TestClusterproof_CheckerCompaction(t *testing.T) {
+	var rec snapRecord
+	l := rec.listener()
+	l.OnSnapshotCreated(config.SnapshotInfo{Index: 10})
+	if l.OnLogCompacted != nil {
+		l.OnLogCompacted(config.EventShardInfo{Index: 10})
+	}
+	if s := rec.status(); preKillReady(s) {
+		t.Fatalf("reader-only compaction satisfied the pre-kill guard: record %+v", s)
+	}
+	if l.OnLogDBCompacted == nil {
+		t.Fatal("the listener does not record OnLogDBCompacted")
+	}
+	l.OnLogDBCompacted(config.EventShardInfo{Index: 10})
+	if s := rec.status(); !preKillReady(s) || s.Compacted != 10 {
+		t.Fatalf("LogDB compaction through 10 left record %+v, want the pre-kill guard satisfied", s)
+	}
 }
 
 // nodeDie reports a fatal child error on stderr (the child's log) and exits.
@@ -150,10 +201,7 @@ func TestClusterproof_Node(t *testing.T) {
 		nodeDie("load mTLS: %v", err)
 	}
 	cfg := hostConfig(spec.RaftAddr, spec.WALDir, spec.NodeHostDir, spec.RTTMillisecond, mtls)
-	cfg.EventListener = &config.EventListener{
-		OnSnapshotCreated: func(i config.SnapshotInfo) { nodeSnap.created.Store(i.Index) },
-		OnLogCompacted:    func(i config.EventShardInfo) { nodeSnap.compacted.Store(i.Index) },
-	}
+	cfg.EventListener = nodeSnap.listener()
 	h, err := quicraft.NewHost(cfg, quicraft.WithoutEncryption())
 	if err != nil {
 		nodeDie("NewHost: %v", err)
@@ -246,12 +294,7 @@ func nodeHandler(h *quicraft.Host) http.Handler {
 		_, _ = w.Write(b)
 	})
 	mux.HandleFunc("GET /snap", func(w http.ResponseWriter, _ *http.Request) {
-		b, err := json.Marshal(snapStatus{
-			Created:      nodeSnap.created.Load(),
-			Compacted:    nodeSnap.compacted.Load(),
-			Recovered:    nodeSnap.recovered.Load(),
-			SMRecoveries: nodeSnap.smRecoveries.Load(),
-		})
+		b, err := json.Marshal(nodeSnap.status())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

@@ -13,6 +13,7 @@ package clusterproof
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -73,8 +74,88 @@ type replica struct {
 	spec     nodeSpec
 	specPath string
 	logPath  string
-	cmd      *exec.Cmd
-	exited   chan struct{}
+	proc     *proc // the current process, nil before the first start
+}
+
+// proc is one replica process and how it ended.
+type proc struct {
+	cmd    *exec.Cmd
+	exited chan struct{} // closed once cmd.Wait has returned
+	// killed is set before the harness sends SIGKILL (h.kill, or the test
+	// context's cancel at the end); only an exit by that signal is expected.
+	killed atomic.Bool
+	err    error // cmd.Wait's result, set before exited is closed
+}
+
+// startProc starts cmd, closes logFile (when not nil) once it has exited,
+// and records its exit status.
+func startProc(cmd *exec.Cmd, logFile *os.File) (*proc, error) {
+	p := &proc{cmd: cmd, exited: make(chan struct{})}
+	cmd.Cancel = func() error {
+		p.killed.Store(true)
+		return cmd.Process.Kill()
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	go func() {
+		p.err = cmd.Wait()
+		if logFile != nil {
+			logFile.Close()
+		}
+		close(p.exited)
+	}()
+	return p, nil
+}
+
+// kill SIGKILLs the process, waits for it to be gone and returns exitFault.
+func (p *proc) kill() error {
+	select {
+	case <-p.exited:
+		// Already gone on its own: the SIGKILL below would not be what
+		// ended it.
+		return p.exitFault()
+	default:
+	}
+	p.killed.Store(true)
+	if err := p.cmd.Process.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("SIGKILL: %w", err)
+	}
+	<-p.exited
+	return p.exitFault()
+}
+
+// exitFault is nil while the process runs and after an exit by the SIGKILL
+// the harness sent; any other exit is a fault.
+func (p *proc) exitFault() error {
+	select {
+	case <-p.exited:
+	default:
+		return nil
+	}
+	var ee *exec.ExitError
+	if p.killed.Load() && errors.As(p.err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
+			return nil
+		}
+	}
+	if p.err == nil {
+		return errors.New("exited unexpectedly: exit status 0")
+	}
+	return fmt.Errorf("exited unexpectedly: %w", p.err)
+}
+
+// replicaExits is the first replica process exit that is a fault.
+func (h *harness) replicaExits() error {
+	for _, r := range h.reps {
+		if r == nil || r.proc == nil {
+			continue
+		}
+		if err := r.proc.exitFault(); err != nil {
+			return fmt.Errorf("replica %d %w", r.id+1, err)
+		}
+	}
+	return nil
 }
 
 // harness owns the replica processes and the clients.
@@ -131,6 +212,9 @@ func (h *harness) checkClients() {
 	if err != nil {
 		h.fatalf("%v", err)
 	}
+	if err := h.replicaExits(); err != nil {
+		h.fatalf("%v", err)
+	}
 }
 
 // start runs replica r's process and returns once it has been started; the
@@ -150,26 +234,21 @@ func (h *harness) start(r *replica) {
 	}
 	cmd.Env = append(os.Environ(), nodeChildEnv+"=1", nodeSpecEnv+"="+r.specPath, "GORACE="+gorace)
 	cmd.Stdout, cmd.Stderr = logFile, logFile
-	if err := cmd.Start(); err != nil {
+	p, err := startProc(cmd, logFile)
+	if err != nil {
 		logFile.Close()
 		h.t.Fatalf("start replica %d: %v", r.id+1, err)
 	}
-	exited := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		logFile.Close()
-		close(exited)
-	}()
-	r.cmd, r.exited = cmd, exited
+	r.proc = p
 }
 
-// kill SIGKILLs replica r and waits for the process to be gone.
+// kill SIGKILLs replica r and waits for the process to be gone; a process
+// that had already exited some other way fails the test.
 func (h *harness) kill(r *replica) {
 	h.t.Helper()
-	if err := r.cmd.Process.Signal(syscall.SIGKILL); err != nil {
-		h.fatalf("SIGKILL replica %d: %v", r.id+1, err)
+	if err := r.proc.kill(); err != nil {
+		h.fatalf("kill replica %d: %v", r.id+1, err)
 	}
-	<-r.exited
 }
 
 func (h *harness) url(r *replica, path string, q url.Values) string {
@@ -293,8 +372,8 @@ func (h *harness) waitServing(r *replica) {
 	var err error
 	for time.Now().Before(deadline) {
 		select {
-		case <-r.exited:
-			h.fatalf("replica %d exited before it served", r.id+1)
+		case <-r.proc.exited:
+			h.fatalf("replica %d exited before it served: %v", r.id+1, r.proc.err)
 		default:
 		}
 		if _, _, err = h.get(r, "probe"); err == nil {
@@ -483,6 +562,44 @@ func TestClusterproof_CheckerRefresh(t *testing.T) {
 	}
 }
 
+// TestClusterproof_CheckerExit: a replica process that exits other than by
+// the SIGKILL the harness sent (a clean exit, an exit code, a signal the
+// harness did not send) fails the harness; a running replica and one the
+// harness SIGKILLed do not.
+func TestClusterproof_CheckerExit(t *testing.T) {
+	sh := func(script string) *proc {
+		t.Helper()
+		p, err := startProc(exec.CommandContext(t.Context(), "/bin/sh", "-c", script), nil)
+		if err != nil {
+			t.Fatalf("start %q: %v", script, err)
+		}
+		t.Cleanup(func() { _ = p.kill() })
+		return p
+	}
+	h := &harness{t: t}
+	for i := range replicas {
+		h.reps[i] = &replica{id: i, proc: sh("exec sleep 60")}
+	}
+	if err := h.reps[0].proc.kill(); err != nil {
+		t.Fatalf("a harness SIGKILL is a fault: %v", err)
+	}
+	if err := h.replicaExits(); err != nil {
+		t.Fatalf("running and harness-killed replicas = %v, want nil", err)
+	}
+	for _, script := range []string{"exit 0", "exit 3", "kill -9 $$"} {
+		p := sh(script)
+		<-p.exited
+		h.reps[2].proc = p
+		err := h.replicaExits()
+		if err == nil || !strings.Contains(err.Error(), "replica 3") {
+			t.Fatalf("replica exit by %q = %v, want a fault naming replica 3", script, err)
+		}
+		if err := p.kill(); err == nil {
+			t.Fatalf("SIGKILL after the exit by %q hid it", script)
+		}
+	}
+}
+
 // logTail returns the last n lines of a file, for a failure report.
 func logTail(path string, n int) string {
 	b, err := os.ReadFile(path)
@@ -586,12 +703,14 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 	t.Cleanup(func() {
 		h.stop.Store(true)
 		h.wg.Wait()
+		// The test context is cancelled before cleanup runs and its
+		// cancel SIGKILLs every replica still up (and marks it killed),
+		// so any fault left here is an exit the harness did not cause,
+		// one after the final GET /all included.
 		for _, r := range h.reps {
-			select {
-			case <-r.exited:
-			default:
-				_ = r.cmd.Process.Kill()
-				<-r.exited
+			if err := r.proc.kill(); err != nil {
+				t.Errorf("clusterproof seed=%d: replica %d %v\nreplica log tail (%s):\n%s",
+					seed, r.id+1, err, r.logPath, logTail(r.logPath, 30))
 			}
 		}
 	})
@@ -624,7 +743,7 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 		// compacted its log in this process, so the restart has to recover
 		// from a snapshot, not replay the whole log.
 		pre := h.waitSnap(victim, "a snapshot save and a log compaction before the kill",
-			func(s snapStatus) bool { return s.Created > 0 && s.Compacted > 0 })
+			preKillReady)
 		before := h.puts.Load()
 		h.kill(victim)
 		time.Sleep(down)
@@ -646,6 +765,7 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 	h.wg.Wait()
 	h.checkClients()
 	n := h.converge("final", true)
+	h.checkClients()
 	// With -clusterproof.readers=0 no reader runs, so there is no read to
 	// count; the acknowledged writes are still checked through GET /all.
 	if *flagReaders > 0 && h.reads.Load() == 0 {

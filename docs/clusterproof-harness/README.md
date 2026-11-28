@@ -39,8 +39,13 @@ varies between runs).
    parent drives: `POST /put` commits a write through that replica (a
    follower forwards to the leader), `GET /get` and `GET /all` are
    linearizable `SyncRead`s, and `GET /snap` reports the index of the
-   replica's last saved snapshot, of its last log compaction, and of the
-   snapshot its state machine last recovered from.
+   replica's last saved snapshot, of its last LogDB compaction
+   (`OnLogDBCompacted`; `OnLogCompacted` alone, which fires when only the
+   in-memory log reader advanced, does not count), and of the snapshot its
+   state machine last recovered from. The parent keeps each replica
+   process's exit status: an exit other than by a SIGKILL the parent sent
+   fails the run, whenever the parent sees it, after the final `GET /all`
+   included.
 2. Writers put unique keys to random replicas, the dead one included. A
    write counts as acknowledged only after the replica answered it
    committed and the writer appended it to the ack log and fsynced the log.
