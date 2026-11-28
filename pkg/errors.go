@@ -1800,6 +1800,11 @@ func (e *MaybeAppliedError) Error() string {
 // Unwrap returns the wrapped error.
 func (e *MaybeAppliedError) Unwrap() error { return e.Err }
 
+// MaybeApplied always returns true. It is a structural marker that lets
+// packages which cannot import this one (pkg/batch) recognise a
+// MaybeAppliedError via errors.As on an interface{ MaybeApplied() bool }.
+func (e *MaybeAppliedError) MaybeApplied() bool { return true }
+
 // MaybeApplied reports whether err's request had been delivered to Raft before
 // it failed, so the entry may still commit and apply.
 //
