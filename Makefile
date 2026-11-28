@@ -1717,6 +1717,15 @@ IT_WALSYNC_RUN = \
 	$(if $(IT_WALSYNC_E2E),[ $$status -ne 0 ] || echo "==> WAL-sync mode: $(IT_WALSYNC_E2E) -run Partition"; \
 	[ $$status -ne 0 ] || $(IT_WALSYNC_COMPOSE) -run 'Partition' $(IT_WALSYNC_E2E) || status=$$?;)
 
+# durable-by-default (#1303, #1309): a three-replica shard with the default
+# HostConfig and write mode, two followers' WAL fsync held; the write is
+# acknowledged only once one of them fsyncs. Same hardened compose service
+# and teardown as integration-test-raft.
+.PHONY: integration-test-durable-by-default
+integration-test-durable-by-default: docker-build-it
+	@echo "==> Running durable-by-default integration tests in $(IT_IMAGE)..."
+	@$(call IT_SUITE_RUN,600s,./test/durable/...)
+
 .PHONY: integration-test-walsync
 integration-test-walsync: $(if $(strip $(IT_WALSYNC_LIN)$(IT_WALSYNC_E2E)),docker-build-it)
 	@$(if $(strip $(IT_WALSYNC_LIN)$(IT_WALSYNC_E2E)),status=0; $(IT_WALSYNC_RUN) \
@@ -1856,6 +1865,7 @@ help:
 	@echo "Integration Tests (run in devcontainer automatically):"
 	@echo "  integration-test            Run all integration tests in devcontainer"
 	@echo "  integration-test-walsync    Linearizability + e2e Partition with WAL fsync on"
+	@echo "  integration-test-durable-by-default  Default config acks only after quorum fsync"
 	@echo "  integration-test-raft       Run raft integration tests in devcontainer"
 	@echo "  integration-test-host       Run Host API tests in devcontainer"
 	@echo "  integration-test-e2e        Run E2E multi-node cluster tests in devcontainer"

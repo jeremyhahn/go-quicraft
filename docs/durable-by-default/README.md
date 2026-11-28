@@ -46,6 +46,14 @@ the modes.
   - `TestDefaultMode_IsQuorumDurable` pins the zero and unset mode.
   - `TestNonQuorumModes_AreOptIn` fails if a mode or alias that skips the
     quorum is not in the opt-in lists.
+- `test/durable/durable_test.go` (`make integration-test-durable-by-default`)
+  - `TestDefaultWriteAcknowledgedOnlyAfterQuorumFsync` starts three
+    replicas with the default `HostConfig` and write mode, then holds the
+    WAL fsync on both followers. The write is not acknowledged even though
+    the leader has fsynced it and both followers are blocked in its fsync.
+    When one follower's fsync is released, which makes a quorum of two, the
+    write completes. The test acknowledges the write the way the default mode
+    does, so it fails if the default becomes `writemode.WALDurable`.
 
 When you add an opt-in setting, add it to the lists in those tests and to the
 table above.
