@@ -55,9 +55,9 @@ the modes.
     write completes. The test acknowledges the write the way the default mode
     does, so it fails if the default becomes `writemode.WALDurable`.
   - CI runs it: `test/durable` is in `IT_TEST_DIRS` (the integration shards)
-    and `IT_PKGS` (`make integration-test`), and the untagged
-    `TestDurableSuiteInIntegrationGate` in `test/durable/gate_test.go` fails
-    if it drops out of either.
+    and `IT_PKGS` (`make integration-test`), and
+    `TestDurableSuiteInIntegrationGate` in `test/buildgates/durable_gate_test.go`
+    fails if it drops out of either or its make target goes.
 
 When you add an opt-in setting, add it to the lists in those tests and to the
 table above.
