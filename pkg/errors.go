@@ -1359,6 +1359,10 @@ type WireVersionMismatchError struct {
 	PeerBinVer uint64
 	// PeerMaxBinVer is the newest wire version the peer advertises it reads.
 	PeerMaxBinVer uint64
+	// HasPeerMaxBinVer is true when PeerMaxBinVer was read from the peer's
+	// batch header; a payload too short to carry it leaves it false, and
+	// Error then names no maximum.
+	HasPeerMaxBinVer bool
 	// Local is this host's wire window.
 	Local proto.WireWindow
 

@@ -254,3 +254,43 @@ func TestRefuseReceivedWireVersion_PastLimitStillRecords(t *testing.T) {
 		t.Fatalf("cache holds %d entries, bound is %d", n, maxRecvRefusals)
 	}
 }
+
+// TestRefuseReceivedWireVersion_ShortBatchNamesNoMaximum feeds the host the
+// refusal of an unsupported-version batch payload of 8 to 31 bytes, too short
+// to carry MaxBinVer: the recorded diagnostic names BinVer and never invents
+// a maximum the peer did not send. A full-header refusal still names it.
+func TestRefuseReceivedWireVersion_ShortBatchNamesNoMaximum(t *testing.T) {
+	const far = proto.WireVersion + 2
+	full := proto.MessageBatch{BinVer: far, MaxBinVer: far + 1}
+	wire := make([]byte, full.Size())
+	if _, err := full.MarshalTo(wire); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	const fixed = 32
+	for n := 8; n <= fixed; n++ {
+		handler := &hostMessageHandler{}
+		var mb proto.MessageBatch
+		_, err := mb.UnmarshalFromWindow(wire[:n], proto.DefaultWireWindow())
+		addr := "10.0.1.1:" + strconv.Itoa(n)
+		handler.refuseReceivedWireVersion(addr, err)
+		v, ok := handler.recvRefusals.Load(addr)
+		if !ok {
+			t.Fatalf("%d bytes: refusal %v not recorded", n, err)
+		}
+		r := v.(*WireVersionMismatchError)
+		msg := r.Error()
+		if !strings.Contains(msg, "wire version "+uitoa(far)) {
+			t.Fatalf("%d bytes: %q does not name BinVer %d", n, msg, far)
+		}
+		hasMax := n == fixed
+		if r.HasPeerMaxBinVer != hasMax {
+			t.Fatalf("%d bytes: HasPeerMaxBinVer = %v, want %v", n, r.HasPeerMaxBinVer, hasMax)
+		}
+		if got := strings.Contains(msg, "reads up to"); got != hasMax {
+			t.Fatalf("%d bytes: %q names a maximum = %v, want %v", n, msg, got, hasMax)
+		}
+		if hasMax && !strings.Contains(msg, "reads up to "+uitoa(far+1)) {
+			t.Fatalf("full header: %q does not name MaxBinVer %d", msg, far+1)
+		}
+	}
+}
