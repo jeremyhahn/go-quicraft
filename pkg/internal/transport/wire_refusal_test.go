@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/registry"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
 
@@ -113,6 +114,32 @@ func TestReportWireVersionRefused_InvokesCallback(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("panicking callback not invoked")
+	}
+}
+
+// TestReportWireVersionRefused_RecordsPastBlockedLogWorker is the regression
+// for a refusal callback queued on the process-wide diagnostic worker: with
+// that worker held by a blocked log write, a new peer's refusal must still
+// reach the callback before reportWireVersionRefused returns.
+func TestReportWireVersionRefused_RecordsPastBlockedLogWorker(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	supervise.LogContained(func() {
+		close(started)
+		<-release
+	})
+	defer close(release)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the diagnostic worker did not start the blocking entry")
+	}
+
+	var got error
+	tr := &QUICTransport{cfg: Config{OnWireVersionRefused: func(_ string, err error) { got = err }}}
+	frameErr := &FrameVersionError{Found: 9, Current: 1, Previous: 1}
+	tr.reportWireVersionRefused(nil, frameErr)
+	if got != frameErr {
+		t.Fatalf("refusal recorded as %v while the log worker was blocked, want %v at once", got, frameErr)
 	}
 }
 
