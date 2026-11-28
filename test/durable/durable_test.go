@@ -17,6 +17,7 @@
 package durable_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -28,6 +29,7 @@ import (
 
 	quicraft "github.com/jeremyhahn/go-quicraft/pkg"
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
+	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 	"github.com/jeremyhahn/go-quicraft/pkg/writemode"
@@ -52,26 +54,36 @@ const (
 // acknowledges before a quorum fsync (writemode.WALDurable) fails the test.
 var defaultMode writemode.Mode
 
-// holdFS is a waldb.FS that, while held, blocks every Sync of a file it
-// opened until it is released. It models a replica whose disk has not yet
-// made a write durable: the bytes are written, the fsync has not returned.
+// holdFS is a waldb.FS that, while held, blocks the Syncs of the one
+// SaveState that carries the held proposal's entry until it is released. It
+// models a replica whose disk has not yet made that write durable: the bytes
+// are written, the fsync has not returned. Every other Sync (warm-up commit
+// index, hard-state-only SaveStates, segment housekeeping) passes through, so
+// a blocked Sync is always the held entry's.
 type holdFS struct {
 	waldb.FS
 
 	mu      sync.Mutex
 	held    bool
+	payload []byte // command of the held proposal
 	release chan struct{}
-	waiting atomic.Int64 // Syncs currently blocked
+
+	inHeld  atomic.Int64  // SaveStates carrying the held entry, in flight
+	waiting atomic.Int64  // Syncs of such a SaveState currently blocked
+	index   atomic.Uint64 // log index of the held entry, once seen
+	saved   atomic.Bool   // the SaveState carrying the held entry returned
 }
 
 func newHoldFS() *holdFS { return &holdFS{FS: waldb.DefaultFS()} }
 
-// hold makes every later Sync block until unhold.
-func (h *holdFS) hold() {
+// hold makes the Syncs of a later SaveState that carries an entry whose
+// command is payload block until unhold.
+func (h *holdFS) hold(payload []byte) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if !h.held {
 		h.held = true
+		h.payload = payload
 		h.release = make(chan struct{})
 	}
 }
@@ -86,16 +98,58 @@ func (h *holdFS) unhold() {
 	}
 }
 
+// match reports whether updates carry the held proposal's entry, recording
+// its index.
+func (h *holdFS) match(updates []logdb.Update) bool {
+	h.mu.Lock()
+	payload := h.payload
+	h.mu.Unlock()
+	if payload == nil {
+		return false
+	}
+	for _, u := range updates {
+		if u.ShardID != shardID {
+			continue
+		}
+		for _, e := range u.Entries {
+			if bytes.Equal(e.Cmd, payload) {
+				h.index.Store(e.Index)
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (h *holdFS) gate() {
 	h.mu.Lock()
 	held, release := h.held, h.release
 	h.mu.Unlock()
-	if !held {
+	if !held || h.inHeld.Load() == 0 {
 		return
 	}
 	h.waiting.Add(1)
 	<-release
 	h.waiting.Add(-1)
+}
+
+// holdDB is the replica's WAL with the held-entry barrier: a SaveState that
+// carries the held proposal's entry has its Syncs gated by fs; every other
+// SaveState passes straight through.
+type holdDB struct {
+	*waldb.DB
+	fs *holdFS
+}
+
+func (d *holdDB) SaveState(updates []logdb.Update) error {
+	if !d.fs.match(updates) {
+		return d.DB.SaveState(updates)
+	}
+	d.fs.inHeld.Add(1)
+	err := d.DB.SaveState(updates)
+	d.fs.inHeld.Add(-1)
+	d.fs.saved.Store(true)
+	return err
 }
 
 func (h *holdFS) OpenFile(name string, flag int, perm fs.FileMode) (waldb.File, error) {
@@ -158,7 +212,7 @@ type node struct {
 
 // startCluster starts three hosts with the default HostConfig: only the
 // fields a host cannot start without are set, and NoSyncWAL is left false.
-// Each host's WAL goes through its own holdFS.
+// Each host's WAL goes through its own holdFS and holdDB.
 func startCluster(t *testing.T, mode writemode.Mode) []*node {
 	t.Helper()
 	ca := testpki.NewCA(t)
@@ -188,7 +242,7 @@ func startCluster(t *testing.T, mode writemode.Mode) []*node {
 		if err != nil {
 			t.Fatalf("waldb.Open[%d]: %v", i, err)
 		}
-		h, err := quicraft.NewHost(cfg, quicraft.WithLogDB(db), quicraft.WithoutEncryption())
+		h, err := quicraft.NewHost(cfg, quicraft.WithLogDB(&holdDB{DB: db, fs: hfs}), quicraft.WithoutEncryption())
 		if err != nil {
 			_ = db.Close()
 			t.Fatalf("NewHost[%d]: %v", i, err)
@@ -302,14 +356,17 @@ func TestDefaultWriteAcknowledgedOnlyAfterQuorumFsync(t *testing.T) {
 			followers = append(followers, n)
 		}
 	}
+	held := []byte("durable-held-proposal")
 	for _, f := range followers {
-		f.fs.hold()
+		f.fs.hold(held)
 	}
 
-	done := acknowledge(ctx, t, nodes[leader].host, defaultMode, []byte("held"))
+	done := acknowledge(ctx, t, nodes[leader].host, defaultMode, held)
 
-	// Both followers must have received the write and be blocked in its
-	// fsync: the only thing missing for a quorum is durability.
+	// Both followers must have received the held write and be blocked in
+	// the fsync of the SaveState that carries its entry: the only thing
+	// missing for a quorum is durability. No other Sync is held, so a
+	// blocked Sync here is that entry's.
 	deadline := time.Now().Add(ackTimeout)
 	for followers[0].fs.waiting.Load() == 0 || followers[1].fs.waiting.Load() == 0 {
 		if time.Now().After(deadline) {
@@ -317,15 +374,19 @@ func TestDefaultWriteAcknowledgedOnlyAfterQuorumFsync(t *testing.T) {
 		}
 		select {
 		case err := <-done:
-			t.Fatalf("write acknowledged (err=%v) before any follower reached its fsync", err)
+			t.Fatalf("write acknowledged (err=%v) before both followers reached its fsync", err)
 		case <-time.After(5 * time.Millisecond):
 		}
+	}
+	index := followers[0].fs.index.Load()
+	if other := followers[1].fs.index.Load(); index == 0 || other != index {
+		t.Fatalf("the followers hold different entries: index %d and %d", index, other)
 	}
 
 	select {
 	case err := <-done:
-		t.Fatalf("write acknowledged (err=%v) while only the leader had fsynced it: "+
-			"the default acknowledges before a quorum fsync", err)
+		t.Fatalf("write acknowledged (err=%v) while only the leader had fsynced entry %d: "+
+			"the default acknowledges before a quorum fsync", err, index)
 	case <-time.After(holdWindow):
 	}
 
@@ -342,6 +403,14 @@ func TestDefaultWriteAcknowledgedOnlyAfterQuorumFsync(t *testing.T) {
 		}
 	case <-time.After(ackTimeout):
 		t.Fatal("write not acknowledged after a quorum fsynced it")
+	}
+	// The ack came from the released follower's completed fsync of the held
+	// entry, not from the follower that is still held.
+	if !followers[0].fs.saved.Load() {
+		t.Fatalf("write acknowledged before the released follower's fsync of entry %d completed", index)
+	}
+	if followers[1].fs.saved.Load() || followers[1].fs.waiting.Load() == 0 {
+		t.Fatalf("the held follower's fsync of entry %d returned while it was held", index)
 	}
 	followers[1].fs.unhold()
 }
