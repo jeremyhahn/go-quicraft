@@ -119,7 +119,7 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 // UnmarshalFromWindow is UnmarshalFrom against an explicit accept set. The
 // transport passes its host's window; UnmarshalFrom passes this build's.
 func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, error) {
-	if len(buf) < messageBatchFixedSize {
+	if len(buf) < 8 {
 		return 0, ErrBufferTooSmall
 	}
 	mb.BinVer = getUint64(buf[0:])
@@ -129,9 +129,18 @@ func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, erro
 	// clear signal instead of being misparsed. Correct here because
 	// MessageBatch is transport-only: a batch lives for one frame and is
 	// never persisted, so a rejection costs one connection rather than
-	// stranding data at rest.
+	// stranding data at rest. The gate runs as soon as BinVer is present, so
+	// a peer outside the window is named even when its payload is shorter
+	// than this build's fixed header; MaxBinVer is read only from a
+	// complete one.
 	if !w.Accepts(mb.BinVer) {
-		return 0, ErrUnsupportedVersion
+		if len(buf) < messageBatchFixedSize {
+			return 0, &BatchVersionError{BinVer: mb.BinVer, Local: w}
+		}
+		return 0, &BatchVersionError{BinVer: mb.BinVer, MaxBinVer: getUint64(buf[24:]), HasMaxBinVer: true, Local: w}
+	}
+	if len(buf) < messageBatchFixedSize {
+		return 0, ErrBufferTooSmall
 	}
 	mb.DeploymentID = getUint64(buf[8:])
 	mb.SourceEpoch = getUint64(buf[16:])

@@ -28,6 +28,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -65,6 +66,16 @@ type hostMessageHandler struct {
 	// entries, so a host with none pays no map lookup to clear one.
 	wireRefusals sync.Map
 	wireRefused  atomic.Int64
+
+	// recvRefusals holds the last *WireVersionMismatchError per remote
+	// address for traffic the transport refused before the batch was parsed
+	// (transport.Config.OnWireVersionRefused), so each is logged once per
+	// change of the peer's versions; maxRecvRefusals bounds its entries.
+	// Receive callbacks run concurrently across streams and connections, so
+	// recvMu covers every lookup, comparison, eviction and insertion as one
+	// step; the map's length is its count.
+	recvMu       sync.Mutex
+	recvRefusals map[string]*WireVersionMismatchError
 
 	// inflightSnapshotRecv serializes concurrent HandleSnapshot calls for the
 	// same (shard, replica, index). The snapshot directory is deterministic
@@ -235,11 +246,12 @@ func (h *hostMessageHandler) wireInteroperates(batch proto.MessageBatch) (proto.
 // once rather than once per batch.
 func (h *hostMessageHandler) refuseWireVersion(msg *proto.Message, batch proto.MessageBatch, local proto.WireWindow) {
 	refusal := &WireVersionMismatchError{
-		ShardID:       msg.ShardID,
-		From:          msg.From,
-		PeerBinVer:    batch.BinVer,
-		PeerMaxBinVer: batch.MaxBinVer,
-		Local:         local,
+		ShardID:          msg.ShardID,
+		From:             msg.From,
+		PeerBinVer:       batch.BinVer,
+		PeerMaxBinVer:    batch.MaxBinVer,
+		HasPeerMaxBinVer: true,
+		Local:            local,
 	}
 	key := wireRefusalKey{shardID: msg.ShardID, from: msg.From}
 	prev, loaded := h.wireRefusals.Swap(key, refusal)
@@ -281,6 +293,101 @@ func (h *hostMessageHandler) wireRefusal(shardID uint64) *WireVersionMismatchErr
 		return false
 	})
 	return refusal
+}
+
+// maxRecvRefusals bounds recvRefusals: recording a new remote address at the
+// bound first evicts another one (evictRecvRefusal), so a flood of addresses
+// cannot grow the map and cannot suppress the diagnostic for a later peer.
+const maxRecvRefusals = 1024
+
+// evictRecvRefusal forgets one arbitrary recorded address. recvMu is held.
+func (h *hostMessageHandler) evictRecvRefusal() {
+	for k := range h.recvRefusals {
+		delete(h.recvRefusals, k)
+		return
+	}
+}
+
+// recordRecvRefusal records refusal as remote's last receive refusal and
+// reports whether it is new or changed, so the caller logs it. Lookup,
+// comparison, eviction and insertion are one step under recvMu, so concurrent
+// callbacks can neither grow the cache past maxRecvRefusals nor both log one
+// change. At capacity an arbitrary recorded address is forgotten to make room,
+// so a full cache never silences a new peer; the forgotten one is simply
+// logged again if it is refused again.
+func (h *hostMessageHandler) recordRecvRefusal(remote string, refusal *WireVersionMismatchError) bool {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	prev, ok := h.recvRefusals[remote]
+	if ok && *prev == *refusal {
+		return false
+	}
+	if h.recvRefusals == nil {
+		h.recvRefusals = make(map[string]*WireVersionMismatchError)
+	}
+	if !ok && len(h.recvRefusals) >= maxRecvRefusals {
+		h.evictRecvRefusal()
+	}
+	h.recvRefusals[remote] = refusal
+	return true
+}
+
+// refuseReceivedWireVersion is the host's transport.Config.OnWireVersionRefused:
+// the transport refused a frame (*transport.FrameVersionError) or a batch
+// (*proto.BatchVersionError) from remote because its version is outside this
+// host's window, before any message reached HandleMessage. It records the
+// refusal as a *WireVersionMismatchError naming both sides' versions and
+// logs it once per (remote, advertised versions), as refuseWireVersion does
+// for refusals at the Raft layer. It runs on the transport's receive
+// goroutine: the record and its dedup are synchronous and bounded, and only
+// the log line is queued on supervise.LogContained, so a full or stalled
+// diagnostic queue can delay or drop the line but never the record.
+func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error) {
+	refusal := &WireVersionMismatchError{Source: remote, Local: proto.DefaultWireWindow()}
+	if h.host != nil {
+		refusal.Local = h.host.WireWindow()
+	}
+	var frameErr *transport.FrameVersionError
+	var batchErr *proto.BatchVersionError
+	switch {
+	case errors.As(err, &frameErr):
+		refusal.Frame = true
+		refusal.PeerFrameVersion = frameErr.Found
+		refusal.LocalFrameCurrent = frameErr.Current
+		refusal.LocalFramePrevious = frameErr.Previous
+	case errors.As(err, &batchErr):
+		refusal.PeerBinVer = batchErr.BinVer
+		if batchErr.HasMaxBinVer {
+			refusal.PeerMaxBinVer = batchErr.MaxBinVer
+			refusal.HasPeerMaxBinVer = true
+		}
+		refusal.Local = batchErr.Local
+	default:
+		return
+	}
+	if !h.recordRecvRefusal(remote, refusal) {
+		return
+	}
+	// The record above is synchronous and bounded; only the log line goes to
+	// the contained diagnostic worker, so a blocked log handler delays the
+	// line, never the record.
+	supervise.LogContained(func() {
+		slog.Warn("refused inbound traffic: peer wire version outside this host's window",
+			"source", remote,
+			"error", refusal,
+		)
+	})
+}
+
+// receiveWireRefusal returns a refusal recorded by refuseReceivedWireVersion,
+// or nil.
+func (h *hostMessageHandler) receiveWireRefusal() *WireVersionMismatchError {
+	h.recvMu.Lock()
+	defer h.recvMu.Unlock()
+	for _, refusal := range h.recvRefusals {
+		return refusal
+	}
+	return nil
 }
 
 // authorizeInbound decides whether one inbound message may reach raft, and

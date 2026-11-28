@@ -403,6 +403,29 @@ type DialIdentityError struct {
 	Presented string
 }
 
+// FrameVersionError is ValidateFrameHeaderWindow's refusal of a frame whose
+// version byte is not a member of the local frame window. It names the
+// version found and the window it was read against.
+//
+// errors.Is(err, ErrUnsupportedVersion) is true.
+type FrameVersionError struct {
+	// Found is the frame version byte the peer sent.
+	Found byte
+	// Current and Previous are the local frame window.
+	Current, Previous byte
+}
+
+// Error names both sides' versions.
+func (e *FrameVersionError) Error() string {
+	return fmt.Sprintf("transport: frame version %d is outside the local frame window {current %d, previous %d}: %v",
+		e.Found, e.Current, e.Previous, ErrUnsupportedVersion)
+}
+
+// Is reports whether target is ErrUnsupportedVersion.
+func (e *FrameVersionError) Is(target error) bool {
+	return target == ErrUnsupportedVersion
+}
+
 // Error returns a human-readable description of the refusal.
 func (e *DialIdentityError) Error() string {
 	return fmt.Sprintf("transport: dialed peer presents node identity %q, which membership binds to no replica at this address", e.Presented)

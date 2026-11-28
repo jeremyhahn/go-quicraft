@@ -16,12 +16,15 @@ package quicraft
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -112,7 +115,7 @@ func TestHandleMessage_WireWindowRefusal(t *testing.T) {
 				t.Fatalf("errors.Is(%v, ErrUnsupportedVersion) = false", err)
 			}
 			want := WireVersionMismatchError{ShardID: wireTestShard, From: 2,
-				PeerBinVer: tc.binVer, PeerMaxBinVer: tc.maxBinVer, Local: local}
+				PeerBinVer: tc.binVer, PeerMaxBinVer: tc.maxBinVer, HasPeerMaxBinVer: true, Local: local}
 			if *refusal != want {
 				t.Fatalf("refusal = %+v, want %+v", *refusal, want)
 			}
@@ -189,3 +192,178 @@ func TestHandleMessage_WireRefusalCoversLeaderExec(t *testing.T) {
 }
 
 func uitoa(v uint64) string { return strconv.FormatUint(v, 10) }
+
+// TestRefuseReceivedWireVersion_RecordsTransportErrors covers the host's
+// conversion of the transport's typed refusals into the recorded
+// *WireVersionMismatchError.
+func TestRefuseReceivedWireVersion_RecordsTransportErrors(t *testing.T) {
+	handler := &hostMessageHandler{}
+	local := proto.WireWindow{Current: 3, Previous: 2}
+	handler.refuseReceivedWireVersion("10.0.0.1:1",
+		&proto.BatchVersionError{BinVer: 7, MaxBinVer: 8, HasMaxBinVer: true, Local: local})
+	handler.refuseReceivedWireVersion("10.0.0.2:1",
+		&transport.FrameVersionError{Found: 9, Current: 4, Previous: 5})
+	handler.refuseReceivedWireVersion("10.0.0.3:1", transport.ErrInvalidMagic)
+
+	got := func(addr string) *WireVersionMismatchError {
+		return recvRefusalOf(handler, addr)
+	}
+	b := got("10.0.0.1:1")
+	if b == nil || b.Frame || b.Source != "10.0.0.1:1" || b.PeerBinVer != 7 || b.PeerMaxBinVer != 8 || !b.HasPeerMaxBinVer ||
+		b.Local != local || b.ShardID != 0 || b.From != 0 {
+		t.Fatalf("batch refusal recorded as %+v", b)
+	}
+	f := got("10.0.0.2:1")
+	if f == nil || !f.Frame || f.PeerFrameVersion != 9 || f.LocalFrameCurrent != 4 || f.LocalFramePrevious != 5 {
+		t.Fatalf("frame refusal recorded as %+v", f)
+	}
+	for _, r := range []*WireVersionMismatchError{b, f} {
+		if !errors.Is(r, proto.ErrUnsupportedVersion) || !strings.Contains(r.Error(), r.Source) {
+			t.Fatalf("refusal %q: not ErrUnsupportedVersion or names no source", r)
+		}
+	}
+	if got("10.0.0.3:1") != nil {
+		t.Fatal("a non-version error was recorded as a wire refusal")
+	}
+}
+
+// TestRefuseReceivedWireVersion_PastLimitStillRecords is the regression for a
+// cache that, once full, suppressed the diagnostic for every later peer: a
+// peer cycling source ports must not silence it for the next one.
+func TestRefuseReceivedWireVersion_PastLimitStillRecords(t *testing.T) {
+	awaitContainedDiagnostics(t)
+	handler := &hostMessageHandler{}
+	var logs bytes.Buffer
+	installDefaultLogger(t, slog.NewTextHandler(&logs, nil))
+	const marker = "peer wire version outside this host's window"
+	refusal := &transport.FrameVersionError{Found: 9, Current: 1, Previous: 1}
+
+	for i := range maxRecvRefusals + 10 {
+		handler.refuseReceivedWireVersion("10.1.0.1:"+strconv.Itoa(1000+i), refusal)
+	}
+	drainContainedRetrying(t)
+	before := strings.Count(logs.String(), marker)
+	const fresh = "192.0.2.7:4242"
+	handler.refuseReceivedWireVersion(fresh, refusal)
+	if recvRefusalOf(handler, fresh) == nil {
+		t.Fatal("a new peer past the cache limit was not recorded")
+	}
+	drainContainedRetrying(t)
+	if n := strings.Count(logs.String(), marker); n != before+1 {
+		t.Fatalf("%d refusal lines for a new peer past the cache limit, want 1", n-before)
+	}
+	if n, _ := recvRefusalState(handler); n > maxRecvRefusals {
+		t.Fatalf("cache holds %d entries, bound is %d", n, maxRecvRefusals)
+	}
+}
+
+// drainContainedRetrying is awaitContainedDiagnostics for a test that may
+// have filled the bounded diagnostic queue: a sentinel submitted while it is
+// full is dropped, so it is resubmitted until one runs.
+func drainContainedRetrying(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ran := make(chan struct{})
+		supervise.LogContained(func() { close(ran) })
+		select {
+		case <-ran:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("the contained-diagnostics queue did not drain")
+}
+
+// TestRefuseReceivedWireVersion_RecordsPastBlockedLogHandler: with the slog
+// handler blocked, refusing a new peer still records its
+// *WireVersionMismatchError at once on the calling goroutine; only the log
+// line waits, and it is written once the handler is released.
+func TestRefuseReceivedWireVersion_RecordsPastBlockedLogHandler(t *testing.T) {
+	awaitContainedDiagnostics(t)
+	var logs bytes.Buffer
+	release := make(chan struct{})
+	installDefaultLogger(t, &gatedHandler{gate: release, next: slog.NewTextHandler(&logs, nil)})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+
+	handler := &hostMessageHandler{}
+	const fresh = "192.0.2.9:4242"
+	returned := make(chan struct{})
+	go func() {
+		handler.refuseReceivedWireVersion(fresh, &transport.FrameVersionError{Found: 9, Current: 1, Previous: 1})
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("refuseReceivedWireVersion blocked behind a blocked log handler")
+	}
+	if r := recvRefusalOf(handler, fresh); r == nil || r.Source != fresh {
+		t.Fatal("a new peer's refusal was not recorded while the log handler was blocked")
+	}
+
+	close(release)
+	released = true
+	awaitContainedDiagnostics(t)
+	if n := strings.Count(logs.String(), "peer wire version outside this host's window"); n != 1 {
+		t.Fatalf("%d refusal lines after the log handler was released, want 1", n)
+	}
+}
+
+// gatedHandler holds every record until gate is closed, then forwards it.
+type gatedHandler struct {
+	gate <-chan struct{}
+	next slog.Handler
+}
+
+func (h *gatedHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *gatedHandler) Handle(ctx context.Context, r slog.Record) error {
+	<-h.gate
+	return h.next.Handle(ctx, r)
+}
+func (h *gatedHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *gatedHandler) WithGroup(string) slog.Handler      { return h }
+
+// TestRefuseReceivedWireVersion_ShortBatchNamesNoMaximum feeds the host the
+// refusal of an unsupported-version batch payload of 8 to 31 bytes, too short
+// to carry MaxBinVer: the recorded diagnostic names BinVer and never invents
+// a maximum the peer did not send. A full-header refusal still names it.
+func TestRefuseReceivedWireVersion_ShortBatchNamesNoMaximum(t *testing.T) {
+	const far = proto.WireVersion + 2
+	full := proto.MessageBatch{BinVer: far, MaxBinVer: far + 1}
+	wire := make([]byte, full.Size())
+	if _, err := full.MarshalTo(wire); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	const fixed = 32
+	for n := 8; n <= fixed; n++ {
+		handler := &hostMessageHandler{}
+		var mb proto.MessageBatch
+		_, err := mb.UnmarshalFromWindow(wire[:n], proto.DefaultWireWindow())
+		addr := "10.0.1.1:" + strconv.Itoa(n)
+		handler.refuseReceivedWireVersion(addr, err)
+		r := recvRefusalOf(handler, addr)
+		if r == nil {
+			t.Fatalf("%d bytes: refusal %v not recorded", n, err)
+		}
+		msg := r.Error()
+		if !strings.Contains(msg, "wire version "+uitoa(far)) {
+			t.Fatalf("%d bytes: %q does not name BinVer %d", n, msg, far)
+		}
+		hasMax := n == fixed
+		if r.HasPeerMaxBinVer != hasMax {
+			t.Fatalf("%d bytes: HasPeerMaxBinVer = %v, want %v", n, r.HasPeerMaxBinVer, hasMax)
+		}
+		if got := strings.Contains(msg, "reads up to"); got != hasMax {
+			t.Fatalf("%d bytes: %q names a maximum = %v, want %v", n, msg, got, hasMax)
+		}
+		if hasMax && !strings.Contains(msg, "reads up to "+uitoa(far+1)) {
+			t.Fatalf("full header: %q does not name MaxBinVer %d", msg, far+1)
+		}
+	}
+}

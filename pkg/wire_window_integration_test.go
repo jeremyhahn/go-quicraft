@@ -152,7 +152,7 @@ func TestWireWindow_SameWindowElectsAndReplicates(t *testing.T) {
 func TestWireWindow_PeerOutsideWindowIsRefused(t *testing.T) {
 	far := farBuildWire()
 	c := newWireWindowPair(t, transport.WireWindow{}, far)
-	a, b := c.nodes[0].host, c.nodes[1].host
+	b := c.nodes[1].host
 	if got := b.WireWindow(); got != far.Proto {
 		t.Fatalf("emulating host's WireWindow() = %+v, want %+v", got, far.Proto)
 	}
@@ -166,48 +166,59 @@ func TestWireWindow_PeerOutsideWindowIsRefused(t *testing.T) {
 		}
 	}
 
-	// The batch the far build stamps on this shard's traffic: the window's
-	// Previous until the shard commits a switch, advertising its Current.
-	// It reaches host 1's Raft layer through host 1's own handler, on host
-	// 1's engine, from a connection authenticated as host 2.
-	capEng := &capturingEngineDeliverer{engineDeliverer: a.engine}
-	handler := &hostMessageHandler{engine: capEng, host: a}
-	peer := transport.PeerAuth{
-		Identity:          b.NodeIdentity(),
-		AuthorizesAddress: func(addr string) bool { return addr == b.RaftAddress() },
-	}
-	batch := proto.MessageBatch{
-		BinVer:        far.Proto.Previous,
-		MaxBinVer:     far.Proto.Current,
-		DeploymentID:  1,
-		SourceAddress: b.RaftAddress(),
-		Requests: []proto.Message{
-			{ShardID: wwShard, From: 2, To: 1, Type: proto.RequestVote, Term: 1 << 20},
-		},
-	}
-	if err := handler.HandleMessage(batch, peer); err != nil {
-		t.Fatalf("HandleMessage: %v", err)
-	}
-	refusal := handler.wireRefusal(wwShard)
-	if refusal == nil {
-		t.Fatal("the far build's RequestVote was not refused at the Raft layer")
-	}
-	var err error = refusal
-	if !errors.Is(err, proto.ErrUnsupportedVersion) {
-		t.Fatalf("errors.Is(%v, ErrUnsupportedVersion) = false", err)
-	}
-	msg := err.Error()
-	for _, v := range []uint64{far.Proto.Previous, far.Proto.Current, proto.WireVersion} {
-		if !strings.Contains(msg, strconv.FormatUint(v, 10)) {
-			t.Fatalf("refusal %q does not name version %d", msg, v)
+	// Each host's INSTALLED handler, fed only by the traffic its transport
+	// actually received from the other, must have recorded a refusal that
+	// names the peer's version and this host's own window. Nothing is
+	// injected: the far build's frames are refused on the receive path.
+	windows := []transport.WireWindow{transport.DefaultWireWindow(), far}
+	for i, n := range c.nodes {
+		local, peer := windows[i], windows[1-i]
+		h := n.host.msgHandler
+		if h == nil {
+			t.Fatalf("host %d has no installed message handler", i+1)
 		}
-	}
-	if refusal.Local != a.WireWindow() || refusal.PeerBinVer != far.Proto.Previous ||
-		refusal.PeerMaxBinVer != far.Proto.Current {
-		t.Fatalf("refusal = %+v, want peer %d/%d against %+v",
-			*refusal, far.Proto.Previous, far.Proto.Current, a.WireWindow())
-	}
-	if n := deliveredCount(capEng); n != 0 {
-		t.Fatalf("%d refused messages reached host 1's shard inbox", n)
+		var refusal *WireVersionMismatchError
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+			if refusal = h.receiveWireRefusal(); refusal != nil {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if refusal == nil {
+			t.Fatalf("host %d recorded no wire-version refusal from the traffic it received", i+1)
+		}
+		var err error = refusal
+		if !errors.Is(err, proto.ErrUnsupportedVersion) {
+			t.Fatalf("host %d: errors.Is(%v, ErrUnsupportedVersion) = false", i+1, err)
+		}
+		var want []uint64
+		if refusal.Frame {
+			if !peer.AcceptsFrame(refusal.PeerFrameVersion) {
+				t.Fatalf("host %d: refused frame version %d is not the peer's (%+v)",
+					i+1, refusal.PeerFrameVersion, peer)
+			}
+			if refusal.LocalFrameCurrent != local.FrameCurrent || refusal.LocalFramePrevious != local.FramePrevious {
+				t.Fatalf("host %d: refusal names frame window {%d, %d}, want {%d, %d}", i+1,
+					refusal.LocalFrameCurrent, refusal.LocalFramePrevious, local.FrameCurrent, local.FramePrevious)
+			}
+			want = []uint64{uint64(refusal.PeerFrameVersion), uint64(local.FrameCurrent), uint64(local.FramePrevious)}
+		} else {
+			if !peer.Proto.Accepts(refusal.PeerBinVer) {
+				t.Fatalf("host %d: refused batch version %d is not the peer's (%+v)", i+1, refusal.PeerBinVer, peer.Proto)
+			}
+			if refusal.Local != local.Proto {
+				t.Fatalf("host %d: refusal names window %+v, want %+v", i+1, refusal.Local, local.Proto)
+			}
+			want = []uint64{refusal.PeerBinVer, local.Proto.Current, local.Proto.Previous}
+		}
+		msg := err.Error()
+		for _, v := range want {
+			if !strings.Contains(msg, strconv.FormatUint(v, 10)) {
+				t.Fatalf("host %d: refusal %q does not name version %d", i+1, msg, v)
+			}
+		}
+		if refusal.Source == "" {
+			t.Fatalf("host %d: refusal %q names no source peer", i+1, msg)
+		}
 	}
 }

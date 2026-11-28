@@ -149,3 +149,37 @@ func (e *UnsupportedMembershipVersionError) Error() string {
 func (e *UnsupportedMembershipVersionError) Is(target error) bool {
 	return target == ErrUnsupportedVersion
 }
+
+// BatchVersionError is MessageBatch.UnmarshalFromWindow's refusal of a batch
+// whose BinVer is not a member of the local wire window. It names the
+// versions the peer stamped and advertised and the window it was read
+// against, so a refusal on the receive path can say which side is which.
+//
+// errors.Is(err, ErrUnsupportedVersion) is true.
+type BatchVersionError struct {
+	// BinVer is the wire version stamped on the batch.
+	BinVer uint64
+	// MaxBinVer is the newest wire version the peer advertises it reads.
+	MaxBinVer uint64
+	// HasMaxBinVer is true when MaxBinVer was read from a complete batch
+	// header; a payload too short to carry it leaves it false, and Error
+	// then names no maximum.
+	HasMaxBinVer bool
+	// Local is the window the batch was read against.
+	Local WireWindow
+}
+
+// Error names both sides' versions.
+func (e *BatchVersionError) Error() string {
+	if !e.HasMaxBinVer {
+		return fmt.Sprintf("proto: batch wire version %d is outside the local window {current %d, previous %d}: %v",
+			e.BinVer, e.Local.Current, e.Local.Previous, ErrUnsupportedVersion)
+	}
+	return fmt.Sprintf("proto: batch wire version %d (peer reads up to %d) is outside the local window {current %d, previous %d}: %v",
+		e.BinVer, e.MaxBinVer, e.Local.Current, e.Local.Previous, ErrUnsupportedVersion)
+}
+
+// Is reports whether target is ErrUnsupportedVersion.
+func (e *BatchVersionError) Is(target error) bool {
+	return target == ErrUnsupportedVersion
+}
