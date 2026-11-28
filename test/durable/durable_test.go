@@ -58,8 +58,9 @@ var defaultMode writemode.Mode
 // SaveState that carries the held proposal's entry until it is released. It
 // models a replica whose disk has not yet made that write durable: the bytes
 // are written, the fsync has not returned. Every other Sync (warm-up commit
-// index, hard-state-only SaveStates, segment housekeeping) passes through, so
-// a blocked Sync is always the held entry's.
+// index, hard-state-only SaveStates) passes through. The WAL syncs inline
+// under its shard lock, so with one shard a Sync blocked while that SaveState
+// is in flight is that SaveState's.
 type holdFS struct {
 	waldb.FS
 
