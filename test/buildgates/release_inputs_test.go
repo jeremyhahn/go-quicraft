@@ -631,6 +631,64 @@ func TestReleaseCandidateCutsAnRcTag(t *testing.T) {
 	}
 }
 
+// TestReleaseRefusesAnExistingLockstepTag plants one of the lockstep tags the
+// release creates beside the root tag (test/performance/<version> and
+// contrib/dragonboat/<version>), locally or on the remote alone, in a fixture
+// that would otherwise cut and publish the release. The recipe must refuse
+// before VERSION is written: a refusal at `tag -a` or at the push would leave
+// a release commit and root tag behind that the next run refuses as its own
+// duplicate.
+func TestReleaseRefusesAnExistingLockstepTag(t *testing.T) {
+	const maintainer = "release@example.invalid"
+	key, pub := newSigningKey(t)
+	signers := writeSigners(t, maintainer+" "+pub)
+
+	for _, tc := range []struct {
+		name   string
+		prefix string
+		remote bool // planted on the remote only, not in the checkout
+	}{
+		{"local test/performance", "test/performance/", false},
+		{"remote test/performance", "test/performance/", true},
+		{"remote contrib/dragonboat", "contrib/dragonboat/", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReleaseFixture(t, true)
+			tag := tc.prefix + f.release
+			f.git("tag", tag)
+			if tc.remote {
+				f.git("push", "-q", fixtureRemote, "refs/tags/"+tag)
+				f.git("tag", "-d", tag)
+			}
+			f.signWith(maintainer, key, true, true)
+			f.pushMain() // releaseAlpha pushes main first; the snapshot below must include it
+			versionBefore := f.version()
+			headBefore := f.git("rev-parse", "HEAD")
+			refsBefore := f.remoteRefs()
+
+			out, err := f.releaseAlpha("RELEASE_ALLOWED_SIGNERS=" + signers)
+			if err == nil {
+				t.Fatalf("release-alpha SUCCEEDED with %s already present:\n%s", tag, out)
+			}
+			if !strings.Contains(out, "already exists") || !strings.Contains(out, tag) {
+				t.Errorf("the refusal does not name %s as already existing:\n%s", tag, out)
+			}
+			if got := f.version(); got != versionBefore {
+				t.Errorf("a refused release rewrote VERSION: %q -> %q", versionBefore, got)
+			}
+			if got := f.git("rev-parse", "HEAD"); got != headBefore {
+				t.Errorf("a refused release moved HEAD: %s -> %s", strings.TrimSpace(headBefore), strings.TrimSpace(got))
+			}
+			if strings.TrimSpace(f.git("tag", "-l", f.release)) != "" {
+				t.Errorf("a refused release created the root tag %s", f.release)
+			}
+			if got := f.remoteRefs(); got != refsBefore {
+				t.Errorf("a refused release changed the remote:\nbefore:\n%s\nafter:\n%s", refsBefore, got)
+			}
+		})
+	}
+}
+
 // TestReleaseRefusesALocalMainTheRemoteDoesNotHold cuts a release from a local
 // main one commit ahead of the release remote's main (#1251). The recipe
 // checked only that the release commit sits on the local main, so the atomic
