@@ -46,6 +46,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 // ---------------------------------------------------------------------------
@@ -662,6 +664,206 @@ func testShardConfigWithIdentities(h *Host, shardID, replicaID uint64, members m
 		c.MemberIdentities[replicaID] = h.NodeIdentity()
 	}
 	return c
+}
+
+// closeHandoffElectionRTT is the election timeout, in ticks, of the close
+// hand-off cluster: one second at transferRTTMillis, long enough that an
+// ordinary election (which waits at least one timeout after the last
+// heartbeat) is told apart from a hand-off (a few round trips).
+const closeHandoffElectionRTT = 100
+
+// newCloseHandoffCluster is newTransferCluster with a one-second election
+// timeout.
+func newCloseHandoffCluster(t *testing.T) *transferCluster {
+	t.Helper()
+	return newCloseCluster(t, closeHandoffElectionRTT, 0)
+}
+
+// newCloseCluster is newCloseHandoffCluster with the shard's ElectionRTT and
+// the hosts' ShutdownTimeout (0 keeps the default) chosen by the caller.
+func newCloseCluster(t *testing.T, electionRTT uint64, shutdownTimeout time.Duration) *transferCluster {
+	t.Helper()
+	ca := testpki.NewCA(t)
+	leaves := ca.Leaves(t, 3)
+	c := &transferCluster{t: t}
+	t.Cleanup(func() {
+		for _, h := range c.hosts {
+			h.Close()
+		}
+	})
+	members := make(map[uint64]string, 3)
+	ids := make(map[uint64]string, 3)
+	for i := range 3 {
+		h, err := NewHost(config.HostConfig{
+			WALDir:          t.TempDir(),
+			NodeHostDir:     t.TempDir(),
+			RaftAddress:     "127.0.0.1:0",
+			ListenAddress:   "127.0.0.1:0",
+			RTTMillisecond:  transferRTTMillis,
+			DeploymentID:    1,
+			NoSyncWAL:       true,
+			ShutdownTimeout: shutdownTimeout,
+			TransportConfig: config.TransportConfig{MTLSConfig: leaves[i]},
+		}, WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost[%d]: %v", i, err)
+		}
+		c.hosts = append(c.hosts, h)
+		members[uint64(i+1)] = h.RaftAddress()
+		ids[uint64(i+1)] = h.NodeIdentity()
+	}
+	for i, h := range c.hosts {
+		scfg := testShardConfig(transferShard, uint64(i+1))
+		scfg.ElectionRTT = electionRTT
+		scfg.MemberIdentities = ids
+		if err := h.StartShard(members, false, kv.NewMemoryCreateFunc(), scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	return c
+}
+
+// TestHostClose_HandsLeadershipToAVoterBeforeStopping closes the leader's
+// host and requires a surviving voter to lead at a higher term within half
+// an election timeout of Close returning. Without a hand-off the survivors
+// wait at least a full election timeout after the last heartbeat before
+// they campaign; with one, Close has already moved leadership.
+func TestHostClose_HandsLeadershipToAVoterBeforeStopping(t *testing.T) {
+	c := newCloseHandoffCluster(t)
+	electionTimeout := time.Duration(closeHandoffElectionRTT) * transferRTTMillis * time.Millisecond
+	leaderID, term := c.agreedLeader(30 * time.Second)
+
+	closeStart := time.Now()
+	if err := c.hosts[leaderID-1].Close(); err != nil {
+		t.Fatalf("Close of leader host %d: %v", leaderID, err)
+	}
+	closeReturned := time.Now()
+
+	bound := electionTimeout / 2
+	var newID, newTerm uint64
+	if !waitUntil(bound, func() bool {
+		for i := range c.hosts {
+			if uint64(i+1) == leaderID {
+				continue
+			}
+			id, tm := c.leader(i)
+			if id != 0 && id != leaderID && tm > term {
+				newID, newTerm = id, tm
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no surviving voter led within %v of Close returning (Close took %v; old leader %d term %d): leadership was not handed off",
+			bound, closeReturned.Sub(closeStart), leaderID, term)
+	}
+	t.Logf("Close took %v; replica %d leads at term %d %v after Close returned",
+		closeReturned.Sub(closeStart), newID, newTerm, time.Since(closeReturned))
+}
+
+// TestHostClose_HandoffIsBoundedByShutdownTimeout closes the leader's host
+// after both followers are gone, so no transfer target can answer, with an
+// election timeout well past ShutdownTimeout. The hand-off is part of
+// Close's shutdown work, so Close must still return within ShutdownTimeout
+// (plus slack for the teardown after it), not wait out the election timeout.
+func TestHostClose_HandoffIsBoundedByShutdownTimeout(t *testing.T) {
+	const (
+		electionRTT     = 400 // 4s at transferRTTMillis
+		shutdownTimeout = 300 * time.Millisecond
+		slack           = 700 * time.Millisecond
+	)
+	c := newCloseCluster(t, electionRTT, shutdownTimeout)
+	leaderID, _ := c.agreedLeader(30 * time.Second)
+	for i, h := range c.hosts {
+		if uint64(i+1) != leaderID {
+			if err := h.Close(); err != nil {
+				t.Fatalf("Close of follower host %d: %v", i+1, err)
+			}
+		}
+	}
+	leader := c.hosts[leaderID-1]
+	if id, _ := c.leader(int(leaderID - 1)); id != leaderID {
+		t.Skipf("host %d no longer leads (leader %d) before its Close; the hand-off is not exercised", leaderID, id)
+	}
+
+	start := time.Now()
+	_ = leader.Close() // a drain timeout is reported, not a failure here
+	took := time.Since(start)
+	if took > shutdownTimeout+slack {
+		t.Fatalf("Close of the leader took %v with no transfer target; want at most ShutdownTimeout %v + %v slack",
+			took, shutdownTimeout, slack)
+	}
+	t.Logf("Close took %v (ShutdownTimeout %v)", took, shutdownTimeout)
+}
+
+// TestHostClose_ConcurrentDrainKeepsCloseDeadline starts a Drain while
+// Close is stalled in its hand-off (followers gone, a proposal pending), so
+// that Drain wins drainOnce with its own ShutdownTimeout. Close and Drain
+// share Close's deadline: Close must still return within ShutdownTimeout
+// plus slack, not wait out the later Drain's full timer.
+func TestHostClose_ConcurrentDrainKeepsCloseDeadline(t *testing.T) {
+	const (
+		electionRTT     = 400 // 4s at transferRTTMillis
+		shutdownTimeout = 300 * time.Millisecond
+		drainAfter      = 250 * time.Millisecond
+		slack           = 150 * time.Millisecond
+	)
+	c := newCloseCluster(t, electionRTT, shutdownTimeout)
+	leaderID, _ := c.agreedLeader(30 * time.Second)
+	for i, h := range c.hosts {
+		if uint64(i+1) != leaderID {
+			if err := h.Close(); err != nil {
+				t.Fatalf("Close of follower host %d: %v", i+1, err)
+			}
+		}
+	}
+	leader := c.hosts[leaderID-1]
+	if id, _ := c.leader(int(leaderID - 1)); id != leaderID {
+		t.Skipf("host %d no longer leads (leader %d) before its Close; the hand-off is not exercised", leaderID, id)
+	}
+
+	// With no follower left the proposal cannot commit: it stays pending,
+	// so the drain waits on its timer.
+	proposed := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := leader.SyncPropose(ctx, transferShard, []byte("pending"))
+		proposed <- err
+	}()
+	if !waitUntil(5*time.Second, func() bool { return leader.pendingOps.Load() > 0 }) {
+		t.Fatal("the proposal never became pending on the leader")
+	}
+
+	start := time.Now()
+	closed := make(chan time.Duration, 1)
+	go func() {
+		_ = leader.Close() // a drain timeout is reported, not a failure here
+		closed <- time.Since(start)
+	}()
+	time.Sleep(drainAfter)
+	drained := make(chan time.Duration, 1)
+	go func() {
+		_ = leader.Drain()
+		drained <- time.Since(start)
+	}()
+
+	select {
+	case took := <-closed:
+		if took > shutdownTimeout+slack {
+			var drainTook time.Duration
+			select {
+			case drainTook = <-drained:
+			default:
+			}
+			t.Fatalf("Close took %v with a Drain started %v into its hand-off (Drain returned at %v); want at most ShutdownTimeout %v + %v slack",
+				took, drainAfter, drainTook, shutdownTimeout, slack)
+		}
+		t.Logf("Close took %v (ShutdownTimeout %v, Drain at %v)", took, shutdownTimeout, drainAfter)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never returned")
+	}
+	<-proposed
 }
 
 // waitForLeader waits until the engine's Raft peer for the given shard
