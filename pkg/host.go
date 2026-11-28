@@ -59,6 +59,10 @@ const (
 	// hostIDFileName is the file that stores the host's unique identifier.
 	hostIDFileName = "host.id"
 
+	// hostIDTempFileName is the temporary file a new host ID is written to
+	// before it is renamed over hostIDFileName.
+	hostIDTempFileName = "host.id.tmp"
+
 	// hostIDLength is the expected length of the host ID hex string.
 	hostIDLength = 32
 
@@ -12650,9 +12654,13 @@ func (h *Host) buildNotLeaderError(ns *nodeState) error {
 	}
 }
 
-// loadOrGenerateHostID loads an existing host ID from disk or generates a
-// new one. If overrideID is non-empty, it is used as-is. The logger is
-// used for warnings about insecure file permissions or invalid formats.
+// loadOrGenerateHostID loads the host ID from dir/host.id, or generates a
+// new one when that file does not exist. If overrideID is non-empty, it is
+// used as-is. A new ID is published through writeHostIDFile. Any other read
+// error, and a file that is not hostIDLength hex characters, returns a
+// *HostInitError naming the path; the file is never overwritten, so the
+// host ID does not silently rotate. The logger is used for warnings about
+// insecure file permissions.
 func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, error) {
 	if overrideID != "" {
 		return overrideID, nil
@@ -12664,42 +12672,100 @@ func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, 
 	data, err := os.ReadFile(idPath)
 	if err == nil {
 		id := string(data)
-		if len(id) == hostIDLength {
-			// Validate hex encoding.
-			if _, err := hex.DecodeString(id); err == nil {
-				// Check file permissions.
-				info, statErr := os.Stat(idPath)
-				if statErr == nil && info.Mode().Perm() != hostIDFilePerms {
-					logger.Warn("host ID file has insecure permissions",
-						"current", fmt.Sprintf("%04o", info.Mode().Perm()),
-						"expected", fmt.Sprintf("%04o", hostIDFilePerms),
-					)
-					if chmodErr := os.Chmod(idPath, hostIDFilePerms); chmodErr != nil {
-						logger.Warn("failed to fix host ID file permissions",
-							"path", idPath,
-							"error", chmodErr,
-						)
-					}
-				}
-				return id, nil
+		if len(id) != hostIDLength {
+			return "", &HostInitError{Field: "host_id", Err: fmt.Errorf(
+				"host ID file %s has length %d, want %d", idPath, len(id), hostIDLength)}
+		}
+		if _, hexErr := hex.DecodeString(id); hexErr != nil {
+			return "", &HostInitError{Field: "host_id", Err: fmt.Errorf(
+				"host ID file %s is not valid hex: %w", idPath, hexErr)}
+		}
+		// Check file permissions.
+		info, statErr := os.Stat(idPath)
+		if statErr == nil && info.Mode().Perm() != hostIDFilePerms {
+			logger.Warn("host ID file has insecure permissions",
+				"current", fmt.Sprintf("%04o", info.Mode().Perm()),
+				"expected", fmt.Sprintf("%04o", hostIDFilePerms),
+			)
+			if chmodErr := os.Chmod(idPath, hostIDFilePerms); chmodErr != nil {
+				logger.Warn("failed to fix host ID file permissions",
+					"path", idPath,
+					"error", chmodErr,
+				)
 			}
 		}
-		// Invalid format: regenerate.
-		logger.Warn("host ID file has invalid format, regenerating", "path", idPath)
+		return id, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", &HostInitError{Field: "host_id", Err: fmt.Errorf(
+			"read host ID file %s: %w", idPath, err)}
 	}
 
-	// Generate new ID.
+	// No ID yet: generate one.
 	buf := make([]byte, hostIDLength/2)
 	if _, err := rand.Read(buf); err != nil {
 		return "", &HostInitError{Field: "host_id", Err: err}
 	}
 	id := hex.EncodeToString(buf)
 
-	if err := os.WriteFile(idPath, []byte(id), hostIDFilePerms); err != nil {
+	if err := writeHostIDFile(dir, id); err != nil {
 		return "", &HostInitError{Field: "host_id", Err: err}
 	}
 
 	return id, nil
+}
+
+// writeHostIDFile publishes id as dir/host.id durably: it writes a temp
+// file with hostIDFilePerms, fsyncs it, renames it over host.id and
+// fsyncs dir, so a crash leaves either no host.id or a complete one. The
+// temp file is removed if any step fails.
+func writeHostIDFile(dir, id string) (err error) {
+	tmp := filepath.Join(dir, hostIDTempFileName)
+	defer func() {
+		if err != nil {
+			if rmErr := os.Remove(tmp); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+				err = errors.Join(err, rmErr)
+			}
+		}
+	}()
+	// A stale temp file from an earlier crash keeps its own mode through
+	// O_TRUNC, so remove it to create the temp file with hostIDFilePerms.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f, err := hostIDFileOps.openFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hostIDFilePerms)
+	if err != nil {
+		return err
+	}
+	if _, err := hostIDFileOps.write(f, id); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if err := hostIDFileOps.sync(f); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := hostIDFileOps.rename(tmp, filepath.Join(dir, hostIDFileName)); err != nil {
+		return err
+	}
+	return hostIDFileOps.syncDir(dir)
+}
+
+// hostIDFileOps holds the filesystem steps writeHostIDFile publishes a host
+// ID through. Tests replace it to record the step order and inject failures.
+var hostIDFileOps = struct {
+	openFile func(name string, flag int, perm os.FileMode) (*os.File, error)
+	write    func(f *os.File, s string) (int, error)
+	sync     func(f *os.File) error
+	rename   func(oldpath, newpath string) error
+	syncDir  func(dir string) error
+}{
+	openFile: os.OpenFile,
+	write:    (*os.File).WriteString,
+	sync:     (*os.File).Sync,
+	rename:   os.Rename,
+	syncDir:  fsutil.SyncDir,
 }
 
 // buildTransportConfig maps a HostConfig into the internal
