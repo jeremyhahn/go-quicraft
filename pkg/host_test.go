@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +46,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 // ---------------------------------------------------------------------------
@@ -661,6 +664,206 @@ func testShardConfigWithIdentities(h *Host, shardID, replicaID uint64, members m
 		c.MemberIdentities[replicaID] = h.NodeIdentity()
 	}
 	return c
+}
+
+// closeHandoffElectionRTT is the election timeout, in ticks, of the close
+// hand-off cluster: one second at transferRTTMillis, long enough that an
+// ordinary election (which waits at least one timeout after the last
+// heartbeat) is told apart from a hand-off (a few round trips).
+const closeHandoffElectionRTT = 100
+
+// newCloseHandoffCluster is newTransferCluster with a one-second election
+// timeout.
+func newCloseHandoffCluster(t *testing.T) *transferCluster {
+	t.Helper()
+	return newCloseCluster(t, closeHandoffElectionRTT, 0)
+}
+
+// newCloseCluster is newCloseHandoffCluster with the shard's ElectionRTT and
+// the hosts' ShutdownTimeout (0 keeps the default) chosen by the caller.
+func newCloseCluster(t *testing.T, electionRTT uint64, shutdownTimeout time.Duration) *transferCluster {
+	t.Helper()
+	ca := testpki.NewCA(t)
+	leaves := ca.Leaves(t, 3)
+	c := &transferCluster{t: t}
+	t.Cleanup(func() {
+		for _, h := range c.hosts {
+			h.Close()
+		}
+	})
+	members := make(map[uint64]string, 3)
+	ids := make(map[uint64]string, 3)
+	for i := range 3 {
+		h, err := NewHost(config.HostConfig{
+			WALDir:          t.TempDir(),
+			NodeHostDir:     t.TempDir(),
+			RaftAddress:     "127.0.0.1:0",
+			ListenAddress:   "127.0.0.1:0",
+			RTTMillisecond:  transferRTTMillis,
+			DeploymentID:    1,
+			NoSyncWAL:       true,
+			ShutdownTimeout: shutdownTimeout,
+			TransportConfig: config.TransportConfig{MTLSConfig: leaves[i]},
+		}, WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost[%d]: %v", i, err)
+		}
+		c.hosts = append(c.hosts, h)
+		members[uint64(i+1)] = h.RaftAddress()
+		ids[uint64(i+1)] = h.NodeIdentity()
+	}
+	for i, h := range c.hosts {
+		scfg := testShardConfig(transferShard, uint64(i+1))
+		scfg.ElectionRTT = electionRTT
+		scfg.MemberIdentities = ids
+		if err := h.StartShard(members, false, kv.NewMemoryCreateFunc(), scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	return c
+}
+
+// TestHostClose_HandsLeadershipToAVoterBeforeStopping closes the leader's
+// host and requires a surviving voter to lead at a higher term within half
+// an election timeout of Close returning. Without a hand-off the survivors
+// wait at least a full election timeout after the last heartbeat before
+// they campaign; with one, Close has already moved leadership.
+func TestHostClose_HandsLeadershipToAVoterBeforeStopping(t *testing.T) {
+	c := newCloseHandoffCluster(t)
+	electionTimeout := time.Duration(closeHandoffElectionRTT) * transferRTTMillis * time.Millisecond
+	leaderID, term := c.agreedLeader(30 * time.Second)
+
+	closeStart := time.Now()
+	if err := c.hosts[leaderID-1].Close(); err != nil {
+		t.Fatalf("Close of leader host %d: %v", leaderID, err)
+	}
+	closeReturned := time.Now()
+
+	bound := electionTimeout / 2
+	var newID, newTerm uint64
+	if !waitUntil(bound, func() bool {
+		for i := range c.hosts {
+			if uint64(i+1) == leaderID {
+				continue
+			}
+			id, tm := c.leader(i)
+			if id != 0 && id != leaderID && tm > term {
+				newID, newTerm = id, tm
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no surviving voter led within %v of Close returning (Close took %v; old leader %d term %d): leadership was not handed off",
+			bound, closeReturned.Sub(closeStart), leaderID, term)
+	}
+	t.Logf("Close took %v; replica %d leads at term %d %v after Close returned",
+		closeReturned.Sub(closeStart), newID, newTerm, time.Since(closeReturned))
+}
+
+// TestHostClose_HandoffIsBoundedByShutdownTimeout closes the leader's host
+// after both followers are gone, so no transfer target can answer, with an
+// election timeout well past ShutdownTimeout. The hand-off is part of
+// Close's shutdown work, so Close must still return within ShutdownTimeout
+// (plus slack for the teardown after it), not wait out the election timeout.
+func TestHostClose_HandoffIsBoundedByShutdownTimeout(t *testing.T) {
+	const (
+		electionRTT     = 400 // 4s at transferRTTMillis
+		shutdownTimeout = 300 * time.Millisecond
+		slack           = 700 * time.Millisecond
+	)
+	c := newCloseCluster(t, electionRTT, shutdownTimeout)
+	leaderID, _ := c.agreedLeader(30 * time.Second)
+	for i, h := range c.hosts {
+		if uint64(i+1) != leaderID {
+			if err := h.Close(); err != nil {
+				t.Fatalf("Close of follower host %d: %v", i+1, err)
+			}
+		}
+	}
+	leader := c.hosts[leaderID-1]
+	if id, _ := c.leader(int(leaderID - 1)); id != leaderID {
+		t.Skipf("host %d no longer leads (leader %d) before its Close; the hand-off is not exercised", leaderID, id)
+	}
+
+	start := time.Now()
+	_ = leader.Close() // a drain timeout is reported, not a failure here
+	took := time.Since(start)
+	if took > shutdownTimeout+slack {
+		t.Fatalf("Close of the leader took %v with no transfer target; want at most ShutdownTimeout %v + %v slack",
+			took, shutdownTimeout, slack)
+	}
+	t.Logf("Close took %v (ShutdownTimeout %v)", took, shutdownTimeout)
+}
+
+// TestHostClose_ConcurrentDrainKeepsCloseDeadline starts a Drain while
+// Close is stalled in its hand-off (followers gone, a proposal pending), so
+// that Drain wins drainOnce with its own ShutdownTimeout. Close and Drain
+// share Close's deadline: Close must still return within ShutdownTimeout
+// plus slack, not wait out the later Drain's full timer.
+func TestHostClose_ConcurrentDrainKeepsCloseDeadline(t *testing.T) {
+	const (
+		electionRTT     = 400 // 4s at transferRTTMillis
+		shutdownTimeout = 300 * time.Millisecond
+		drainAfter      = 250 * time.Millisecond
+		slack           = 150 * time.Millisecond
+	)
+	c := newCloseCluster(t, electionRTT, shutdownTimeout)
+	leaderID, _ := c.agreedLeader(30 * time.Second)
+	for i, h := range c.hosts {
+		if uint64(i+1) != leaderID {
+			if err := h.Close(); err != nil {
+				t.Fatalf("Close of follower host %d: %v", i+1, err)
+			}
+		}
+	}
+	leader := c.hosts[leaderID-1]
+	if id, _ := c.leader(int(leaderID - 1)); id != leaderID {
+		t.Skipf("host %d no longer leads (leader %d) before its Close; the hand-off is not exercised", leaderID, id)
+	}
+
+	// With no follower left the proposal cannot commit: it stays pending,
+	// so the drain waits on its timer.
+	proposed := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := leader.SyncPropose(ctx, transferShard, []byte("pending"))
+		proposed <- err
+	}()
+	if !waitUntil(5*time.Second, func() bool { return leader.pendingOps.Load() > 0 }) {
+		t.Fatal("the proposal never became pending on the leader")
+	}
+
+	start := time.Now()
+	closed := make(chan time.Duration, 1)
+	go func() {
+		_ = leader.Close() // a drain timeout is reported, not a failure here
+		closed <- time.Since(start)
+	}()
+	time.Sleep(drainAfter)
+	drained := make(chan time.Duration, 1)
+	go func() {
+		_ = leader.Drain()
+		drained <- time.Since(start)
+	}()
+
+	select {
+	case took := <-closed:
+		if took > shutdownTimeout+slack {
+			var drainTook time.Duration
+			select {
+			case drainTook = <-drained:
+			default:
+			}
+			t.Fatalf("Close took %v with a Drain started %v into its hand-off (Drain returned at %v); want at most ShutdownTimeout %v + %v slack",
+				took, drainAfter, drainTook, shutdownTimeout, slack)
+		}
+		t.Logf("Close took %v (ShutdownTimeout %v, Drain at %v)", took, shutdownTimeout, drainAfter)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never returned")
+	}
+	<-proposed
 }
 
 // waitForLeader waits until the engine's Raft peer for the given shard
@@ -2427,12 +2630,251 @@ func TestLoadOrGenerateHostID_ShortContent(t *testing.T) {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
+	_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+	assertHostIDInitError(t, err)
+	data, readErr := os.ReadFile(idPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile failed: %v", readErr)
+	}
+	if string(data) != "abc" {
+		t.Errorf("host.id content = %q, want unchanged %q", data, "abc")
+	}
+}
+
+// assertHostIDInitError fails the test unless err is a *HostInitError
+// for the host_id field.
+func assertHostIDInitError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("loadOrGenerateHostID succeeded, want *HostInitError")
+	}
+	var initErr *HostInitError
+	if !errors.As(err, &initErr) {
+		t.Fatalf("error = %v (%T), want *HostInitError", err, err)
+	}
+	if initErr.Field != "host_id" {
+		t.Errorf("HostInitError.Field = %q, want %q", initErr.Field, "host_id")
+	}
+}
+
+func TestLoadOrGenerateHostID_ReadErrorDoesNotRegenerate(t *testing.T) {
+	t.Run("directory", func(t *testing.T) {
+		dir := t.TempDir()
+		idPath := filepath.Join(dir, hostIDFileName)
+		if err := os.Mkdir(idPath, 0o700); err != nil {
+			t.Fatalf("Mkdir failed: %v", err)
+		}
+		_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+		assertHostIDInitError(t, err)
+		info, statErr := os.Stat(idPath)
+		if statErr != nil {
+			t.Fatalf("Stat failed: %v", statErr)
+		}
+		if !info.IsDir() {
+			t.Error("host.id was replaced, want the directory left in place")
+		}
+		if _, statErr := os.Stat(filepath.Join(dir, hostIDTempFileName)); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("temp file stat err = %v, want not-exist", statErr)
+		}
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("root bypasses file permissions")
+		}
+		dir := t.TempDir()
+		idPath := filepath.Join(dir, hostIDFileName)
+		const content = "0123456789abcdef0123456789abcdef"
+		// Write-only: the read fails with EACCES while a rewrite would
+		// still succeed, which is the case that used to rotate the ID.
+		if err := os.WriteFile(idPath, []byte(content), 0o200); err != nil {
+			t.Fatalf("WriteFile failed: %v", err)
+		}
+		_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+		assertHostIDInitError(t, err)
+		if err := os.Chmod(idPath, hostIDFilePerms); err != nil {
+			t.Fatalf("Chmod failed: %v", err)
+		}
+		data, readErr := os.ReadFile(idPath)
+		if readErr != nil {
+			t.Fatalf("ReadFile failed: %v", readErr)
+		}
+		if string(data) != content {
+			t.Errorf("host.id content = %q, want unchanged %q", data, content)
+		}
+	})
+}
+
+func TestLoadOrGenerateHostID_PublishesViaTempFile(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		dir := t.TempDir()
+		tmpPath := filepath.Join(dir, hostIDTempFileName)
+		if stale {
+			if err := os.WriteFile(tmpPath, []byte("torn"), 0o644); err != nil {
+				t.Fatalf("WriteFile failed: %v", err)
+			}
+		}
+		id, err := loadOrGenerateHostID(slog.Default(), dir, "")
+		if err != nil {
+			t.Fatalf("stale=%v: loadOrGenerateHostID failed: %v", stale, err)
+		}
+		idPath := filepath.Join(dir, hostIDFileName)
+		data, readErr := os.ReadFile(idPath)
+		if readErr != nil {
+			t.Fatalf("stale=%v: ReadFile failed: %v", stale, readErr)
+		}
+		if string(data) != id || len(id) != hostIDLength {
+			t.Errorf("stale=%v: host.id = %q, returned %q", stale, data, id)
+		}
+		if _, hexErr := hex.DecodeString(id); hexErr != nil {
+			t.Errorf("stale=%v: id %q is not valid hex", stale, id)
+		}
+		info, statErr := os.Stat(idPath)
+		if statErr != nil {
+			t.Fatalf("stale=%v: Stat failed: %v", stale, statErr)
+		}
+		if info.Mode().Perm() != hostIDFilePerms {
+			t.Errorf("stale=%v: mode = %04o, want %04o", stale, info.Mode().Perm(), hostIDFilePerms)
+		}
+		if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("stale=%v: temp file stat err = %v, want not-exist", stale, statErr)
+		}
+	}
+}
+
+// swapHostIDFileOps replaces the host ID publication seam for one test and
+// restores the defaults when the test ends. Tests using it must not run in
+// parallel.
+func swapHostIDFileOps(t *testing.T) {
+	t.Helper()
+	saved := hostIDFileOps
+	t.Cleanup(func() { hostIDFileOps = saved })
+}
+
+func TestWriteHostIDFile_DurableOrder(t *testing.T) {
+	swapHostIDFileOps(t)
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, hostIDTempFileName)
+	idPath := filepath.Join(dir, hostIDFileName)
+
+	var steps []string
+	var syncedContents, renamedContents, publishedContents string
+	defaults := hostIDFileOps
+	hostIDFileOps.openFile = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		steps = append(steps, "open")
+		return defaults.openFile(name, flag, perm)
+	}
+	hostIDFileOps.write = func(f *os.File, s string) (int, error) {
+		steps = append(steps, "write")
+		return defaults.write(f, s)
+	}
+	hostIDFileOps.sync = func(f *os.File) error {
+		if err := defaults.sync(f); err != nil {
+			return err
+		}
+		steps = append(steps, "sync")
+		data, err := os.ReadFile(tmpPath)
+		if err != nil {
+			t.Errorf("read temp file after sync: %v", err)
+		}
+		syncedContents = string(data)
+		return nil
+	}
+	hostIDFileOps.rename = func(oldpath, newpath string) error {
+		steps = append(steps, "rename")
+		if oldpath != tmpPath || newpath != idPath {
+			t.Errorf("rename(%q, %q), want (%q, %q)", oldpath, newpath, tmpPath, idPath)
+		}
+		data, err := os.ReadFile(oldpath)
+		if err != nil {
+			t.Errorf("read temp file before rename: %v", err)
+		}
+		renamedContents = string(data)
+		if _, statErr := os.Stat(newpath); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("host.id exists before rename: stat err = %v", statErr)
+		}
+		return defaults.rename(oldpath, newpath)
+	}
+	hostIDFileOps.syncDir = func(d string) error {
+		steps = append(steps, "syncDir")
+		if d != dir {
+			t.Errorf("syncDir(%q), want %q", d, dir)
+		}
+		data, err := os.ReadFile(idPath)
+		if err != nil {
+			t.Errorf("read host.id before directory sync: %v", err)
+		}
+		publishedContents = string(data)
+		return defaults.syncDir(d)
+	}
+
 	id, err := loadOrGenerateHostID(slog.Default(), dir, "")
 	if err != nil {
 		t.Fatalf("loadOrGenerateHostID failed: %v", err)
 	}
-	if len(id) != hostIDLength {
-		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
+	want := []string{"open", "write", "sync", "rename", "syncDir"}
+	if !slices.Equal(steps, want) {
+		t.Fatalf("steps = %v, want %v", steps, want)
+	}
+	if syncedContents != id {
+		t.Errorf("temp file contents at sync = %q, want %q", syncedContents, id)
+	}
+	if renamedContents != id {
+		t.Errorf("temp file contents at rename = %q, want %q", renamedContents, id)
+	}
+	if publishedContents != id {
+		t.Errorf("host.id contents at directory sync = %q, want %q", publishedContents, id)
+	}
+	if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("temp file stat err = %v, want not-exist", statErr)
+	}
+}
+
+func TestWriteHostIDFile_StepFailure(t *testing.T) {
+	injected := errors.New("injected host ID step failure")
+	tests := []struct {
+		name          string
+		inject        func()
+		publishedWant bool
+	}{
+		{name: "open", inject: func() {
+			hostIDFileOps.openFile = func(string, int, os.FileMode) (*os.File, error) { return nil, injected }
+		}},
+		{name: "write", inject: func() {
+			hostIDFileOps.write = func(*os.File, string) (int, error) { return 0, injected }
+		}},
+		{name: "sync", inject: func() {
+			hostIDFileOps.sync = func(*os.File) error { return injected }
+		}},
+		{name: "rename", inject: func() {
+			hostIDFileOps.rename = func(string, string) error { return injected }
+		}},
+		{name: "syncDir", publishedWant: true, inject: func() {
+			hostIDFileOps.syncDir = func(string) error { return injected }
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			swapHostIDFileOps(t)
+			tc.inject()
+			dir := t.TempDir()
+			_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+			assertHostIDInitError(t, err)
+			if !errors.Is(err, injected) {
+				t.Errorf("error = %v, want it to wrap the injected error", err)
+			}
+			tmpPath := filepath.Join(dir, hostIDTempFileName)
+			if _, statErr := os.Stat(tmpPath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("temp file stat err = %v, want not-exist", statErr)
+			}
+			_, statErr := os.Stat(filepath.Join(dir, hostIDFileName))
+			if tc.publishedWant {
+				if statErr != nil {
+					t.Errorf("host.id stat err = %v, want published file", statErr)
+				}
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				t.Errorf("host.id stat err = %v, want not-exist", statErr)
+			}
+		})
 	}
 }
 
@@ -2987,22 +3429,19 @@ func TestLoadOrGenerateHostID_ValidLengthInvalidHex(t *testing.T) {
 	dir := t.TempDir()
 	idPath := dir + "/host.id"
 	// Write 32-char string with invalid hex chars.
-	if err := os.WriteFile(idPath, []byte("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"), hostIDFilePerms); err != nil {
+	const content = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+	if err := os.WriteFile(idPath, []byte(content), hostIDFilePerms); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
 
-	id, err := loadOrGenerateHostID(slog.Default(), dir, "")
-	if err != nil {
-		t.Fatalf("loadOrGenerateHostID failed: %v", err)
+	_, err := loadOrGenerateHostID(slog.Default(), dir, "")
+	assertHostIDInitError(t, err)
+	data, readErr := os.ReadFile(idPath)
+	if readErr != nil {
+		t.Fatalf("ReadFile failed: %v", readErr)
 	}
-	// Should regenerate a valid ID.
-	if len(id) != hostIDLength {
-		t.Errorf("id length = %d, want %d", len(id), hostIDLength)
-	}
-	// The new ID should be valid hex.
-	_, hexErr := hex.DecodeString(id)
-	if hexErr != nil {
-		t.Errorf("regenerated ID is not valid hex: %q", id)
+	if string(data) != content {
+		t.Errorf("host.id content = %q, want unchanged %q", data, content)
 	}
 }
 

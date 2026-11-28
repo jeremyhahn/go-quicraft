@@ -59,6 +59,10 @@ const (
 	// hostIDFileName is the file that stores the host's unique identifier.
 	hostIDFileName = "host.id"
 
+	// hostIDTempFileName is the temporary file a new host ID is written to
+	// before it is renamed over hostIDFileName.
+	hostIDTempFileName = "host.id.tmp"
+
 	// hostIDLength is the expected length of the host ID hex string.
 	hostIDLength = 32
 
@@ -3557,6 +3561,15 @@ type Host struct {
 	nodes       sync.Map     // map[uint64]*nodeState — lock-free reads for StaleRead/QueryLocalNode
 	activeNodes atomic.Int64 // tracks the number of loaded shards (replaces len(h.nodes))
 	closed      atomic.Bool  // shutdown admitted: set at the start of Close
+	// skipCloseHandoff makes Close stop without handing leadership off, as a
+	// crashed host would. Tests set it to put proposals on a departed leader.
+	skipCloseHandoff atomic.Bool
+	// closeDeadline (UnixNano) is the absolute deadline Close's shutdown
+	// work runs under, stored before closeStartC is closed. A Drain already
+	// waiting when Close starts cuts its timer to it, so a Drain that won
+	// drainOnce cannot hold Close past ShutdownTimeout.
+	closeDeadline atomic.Int64
+	closeStartC   chan struct{}
 	// closeDone is set once Close's shutdown work has completed, whether or
 	// not its barrier seals succeeded. EmergencySeal keeps sealing while
 	// closed is set but closeDone is not, because Close seals the barrier
@@ -4349,6 +4362,7 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		keyRotStopC:        make(chan struct{}),
 		keyRotDone:         make(chan struct{}),
 		sweepStopC:         make(chan struct{}),
+		closeStartC:        make(chan struct{}),
 		sweepDone:          make(chan struct{}),
 		fsys:               options.fsys,
 		wire:               wire,
@@ -7854,7 +7868,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 	// leadership transfer.
 	ns.pauseGate.lock(nil)
 	if !ns.paused.Swap(true) && ns.isLeader.Load() {
-		h.transferBeforePause(ctx, ns, engNode)
+		h.transferBeforePause(ctx, ns, engNode, "pause")
 	}
 	h.engine.BeginPause(engNode)
 	ns.pauseGate.unlock()
@@ -7873,7 +7887,7 @@ func (h *Host) PauseShard(ctx context.Context, shardID uint64) error {
 // timeout, for this replica to step down. With no voter to hand to it waits
 // out the timeout; PauseShard proceeds either way. The engine node is not paused
 // yet, so the step worker still runs the transfer.
-func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *engine.Node) {
+func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *engine.Node, before string) {
 	timeout := time.Duration(ns.cfg.ElectionRTT*h.cfg.RTTMillisecond) * time.Millisecond
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -7890,7 +7904,7 @@ func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *
 				if engNode.DeliverLocal(msg) {
 					h.engine.NotifyWork(ns.shardID)
 					requested = true
-					h.logger.Info("leader transfer before pause",
+					h.logger.Info("leader transfer before "+before,
 						"shard_id", ns.shardID,
 						"target_replica_id", target,
 					)
@@ -7902,7 +7916,7 @@ func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *
 			return
 		case <-deadline.C:
 			if requested {
-				h.logger.Warn("leader transfer before pause did not finish; pausing",
+				h.logger.Warn("leader transfer before "+before+" did not finish; proceeding",
 					"shard_id", ns.shardID,
 				)
 			}
@@ -7910,6 +7924,41 @@ func (h *Host) transferBeforePause(ctx context.Context, ns *nodeState, engNode *
 		case <-tick.C:
 		}
 	}
+}
+
+// transferBeforeClose hands every shard this host leads to the reachable
+// voter with the highest replicated index (transferBeforePause, so each
+// shard waits at most its election timeout), all shards at once. Without it
+// a graceful Close stops a leader silently and the survivors sit out an
+// election timeout (and any leader lease) before they campaign. A paused
+// shard is skipped: its engine is not stepping. So is a shard with no other
+// voter: no transfer target can appear. ctx ends the wait early: Close
+// bounds it by ShutdownTimeout.
+func (h *Host) transferBeforeClose(ctx context.Context) {
+	if h.engine == nil {
+		return
+	}
+	var wg sync.WaitGroup
+	h.nodes.Range(func(_, value any) bool {
+		ns, ok := value.(*nodeState)
+		if !ok || ns.stopped.Load() || ns.paused.Load() || !ns.isLeader.Load() {
+			return true
+		}
+		engNode := h.engine.GetNode(ns.shardID)
+		if engNode == nil {
+			return true
+		}
+		if m, err := h.getMembershipFromPeer(ns.shardID); err != nil || len(m.Nodes) < 2 {
+			return true
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.transferBeforePause(ctx, ns, engNode, "close")
+		}()
+		return true
+	})
+	wg.Wait()
 }
 
 // pauseGate serializes one shard's pause and resume transitions: the host's
@@ -10371,12 +10420,28 @@ func (h *Host) Close() error {
 	// well as the winner, and what publishes h.closeErr to them safely.
 	var closeErr error
 	h.stopOnce.Do(func() {
-		// Drain in-flight work first. If drain times out, proceed with
-		// shutdown anyway — but REPORT it. A drain that timed out abandoned
-		// in-flight work, and returning nil from Close after that tells the
-		// embedding application its shutdown was clean when proposals it
-		// accepted were dropped.
-		if drainErr := h.Drain(); drainErr != nil {
+		// ShutdownTimeout bounds the hand-off and the drain together.
+		// A Drain already waiting adopts the deadline (drainOnceLocked).
+		deadline := time.Now().Add(h.cfg.ShutdownTimeout)
+		h.closeDeadline.Store(deadline.UnixNano())
+		if h.closeStartC != nil {
+			close(h.closeStartC)
+		}
+
+		// Hand off leadership while the engine and transport still run, so
+		// the remaining voters do not wait out an election timeout.
+		if !h.skipCloseHandoff.Load() {
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			h.transferBeforeClose(ctx)
+			cancel()
+		}
+
+		// Drain in-flight work with what is left of the budget. If drain
+		// times out, proceed with shutdown anyway — but REPORT it. A drain
+		// that timed out abandoned in-flight work, and returning nil from
+		// Close after that tells the embedding application its shutdown was
+		// clean when proposals it accepted were dropped.
+		if drainErr := h.drainWithin(time.Until(deadline)); drainErr != nil {
 			h.logger.Warn("drain incomplete", "error", drainErr)
 			closeErr = errors.Join(closeErr, drainErr)
 		}
@@ -10603,6 +10668,12 @@ func sealOnClose(b Barrier) error {
 // After Close has completed, Drain returns ErrClosed. Close's own call to
 // Drain, made while its shutdown work runs, is unaffected.
 func (h *Host) Drain() error {
+	return h.drainWithin(h.cfg.ShutdownTimeout)
+}
+
+// drainWithin is Drain waiting at most timeout for in-flight work. Close
+// passes what its ShutdownTimeout budget has left after the hand-off.
+func (h *Host) drainWithin(timeout time.Duration) error {
 	if h.closeDone.Load() {
 		return ErrClosed
 	}
@@ -10620,14 +10691,14 @@ func (h *Host) Drain() error {
 	// the losers of the election wait here for the winner's attempt and then
 	// read the drainErr it published.
 	h.drainOnce.Do(func() {
-		h.drainErr = h.drainOnceLocked()
+		h.drainErr = h.drainOnceLocked(timeout)
 	})
 	return h.drainErr
 }
 
 // drainOnceLocked is the single drain attempt Drain elects through drainOnce.
 // It waits for pendingOps to reach zero or for ShutdownTimeout to expire.
-func (h *Host) drainOnceLocked() error {
+func (h *Host) drainOnceLocked(timeout time.Duration) error {
 	// Fast path: no pending operations.
 	if h.pendingOps.Load() <= 0 {
 		return nil
@@ -10647,14 +10718,26 @@ func (h *Host) drainOnceLocked() error {
 		return nil
 	}
 
-	timer := time.NewTimer(h.cfg.ShutdownTimeout)
+	end := time.Now().Add(timeout)
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	select {
-	case <-drainCh:
-		return nil
-	case <-timer.C:
-		return ErrShutdownTimeout
+	closeStart := h.closeStartC
+	for {
+		select {
+		case <-drainCh:
+			return nil
+		case <-timer.C:
+			return ErrShutdownTimeout
+		case <-closeStart:
+			// Close began: this drain, its own included, ends no later
+			// than Close's deadline.
+			closeStart = nil
+			if deadline := time.Unix(0, h.closeDeadline.Load()); deadline.Before(end) {
+				// Go 1.23+ timers: Reset drops any unreceived fire.
+				timer.Reset(time.Until(deadline))
+			}
+		}
 	}
 }
 
@@ -12650,9 +12733,13 @@ func (h *Host) buildNotLeaderError(ns *nodeState) error {
 	}
 }
 
-// loadOrGenerateHostID loads an existing host ID from disk or generates a
-// new one. If overrideID is non-empty, it is used as-is. The logger is
-// used for warnings about insecure file permissions or invalid formats.
+// loadOrGenerateHostID loads the host ID from dir/host.id, or generates a
+// new one when that file does not exist. If overrideID is non-empty, it is
+// used as-is. A new ID is published through writeHostIDFile. Any other read
+// error, and a file that is not hostIDLength hex characters, returns a
+// *HostInitError naming the path; the file is never overwritten, so the
+// host ID does not silently rotate. The logger is used for warnings about
+// insecure file permissions.
 func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, error) {
 	if overrideID != "" {
 		return overrideID, nil
@@ -12664,42 +12751,100 @@ func loadOrGenerateHostID(logger *slog.Logger, dir, overrideID string) (string, 
 	data, err := os.ReadFile(idPath)
 	if err == nil {
 		id := string(data)
-		if len(id) == hostIDLength {
-			// Validate hex encoding.
-			if _, err := hex.DecodeString(id); err == nil {
-				// Check file permissions.
-				info, statErr := os.Stat(idPath)
-				if statErr == nil && info.Mode().Perm() != hostIDFilePerms {
-					logger.Warn("host ID file has insecure permissions",
-						"current", fmt.Sprintf("%04o", info.Mode().Perm()),
-						"expected", fmt.Sprintf("%04o", hostIDFilePerms),
-					)
-					if chmodErr := os.Chmod(idPath, hostIDFilePerms); chmodErr != nil {
-						logger.Warn("failed to fix host ID file permissions",
-							"path", idPath,
-							"error", chmodErr,
-						)
-					}
-				}
-				return id, nil
+		if len(id) != hostIDLength {
+			return "", &HostInitError{Field: "host_id", Err: fmt.Errorf(
+				"host ID file %s has length %d, want %d", idPath, len(id), hostIDLength)}
+		}
+		if _, hexErr := hex.DecodeString(id); hexErr != nil {
+			return "", &HostInitError{Field: "host_id", Err: fmt.Errorf(
+				"host ID file %s is not valid hex: %w", idPath, hexErr)}
+		}
+		// Check file permissions.
+		info, statErr := os.Stat(idPath)
+		if statErr == nil && info.Mode().Perm() != hostIDFilePerms {
+			logger.Warn("host ID file has insecure permissions",
+				"current", fmt.Sprintf("%04o", info.Mode().Perm()),
+				"expected", fmt.Sprintf("%04o", hostIDFilePerms),
+			)
+			if chmodErr := os.Chmod(idPath, hostIDFilePerms); chmodErr != nil {
+				logger.Warn("failed to fix host ID file permissions",
+					"path", idPath,
+					"error", chmodErr,
+				)
 			}
 		}
-		// Invalid format: regenerate.
-		logger.Warn("host ID file has invalid format, regenerating", "path", idPath)
+		return id, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", &HostInitError{Field: "host_id", Err: fmt.Errorf(
+			"read host ID file %s: %w", idPath, err)}
 	}
 
-	// Generate new ID.
+	// No ID yet: generate one.
 	buf := make([]byte, hostIDLength/2)
 	if _, err := rand.Read(buf); err != nil {
 		return "", &HostInitError{Field: "host_id", Err: err}
 	}
 	id := hex.EncodeToString(buf)
 
-	if err := os.WriteFile(idPath, []byte(id), hostIDFilePerms); err != nil {
+	if err := writeHostIDFile(dir, id); err != nil {
 		return "", &HostInitError{Field: "host_id", Err: err}
 	}
 
 	return id, nil
+}
+
+// writeHostIDFile publishes id as dir/host.id durably: it writes a temp
+// file with hostIDFilePerms, fsyncs it, renames it over host.id and
+// fsyncs dir, so a crash leaves either no host.id or a complete one. The
+// temp file is removed if any step fails.
+func writeHostIDFile(dir, id string) (err error) {
+	tmp := filepath.Join(dir, hostIDTempFileName)
+	defer func() {
+		if err != nil {
+			if rmErr := os.Remove(tmp); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+				err = errors.Join(err, rmErr)
+			}
+		}
+	}()
+	// A stale temp file from an earlier crash keeps its own mode through
+	// O_TRUNC, so remove it to create the temp file with hostIDFilePerms.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f, err := hostIDFileOps.openFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, hostIDFilePerms)
+	if err != nil {
+		return err
+	}
+	if _, err := hostIDFileOps.write(f, id); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if err := hostIDFileOps.sync(f); err != nil {
+		return errors.Join(err, f.Close())
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := hostIDFileOps.rename(tmp, filepath.Join(dir, hostIDFileName)); err != nil {
+		return err
+	}
+	return hostIDFileOps.syncDir(dir)
+}
+
+// hostIDFileOps holds the filesystem steps writeHostIDFile publishes a host
+// ID through. Tests replace it to record the step order and inject failures.
+var hostIDFileOps = struct {
+	openFile func(name string, flag int, perm os.FileMode) (*os.File, error)
+	write    func(f *os.File, s string) (int, error)
+	sync     func(f *os.File) error
+	rename   func(oldpath, newpath string) error
+	syncDir  func(dir string) error
+}{
+	openFile: os.OpenFile,
+	write:    (*os.File).WriteString,
+	sync:     (*os.File).Sync,
+	rename:   os.Rename,
+	syncDir:  fsutil.SyncDir,
 }
 
 // buildTransportConfig maps a HostConfig into the internal
