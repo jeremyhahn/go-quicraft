@@ -15,7 +15,11 @@
 package quicraft
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2270,5 +2274,137 @@ func TestHostMessageHandler_PendingRemovalRefusesTheMemberByEveryName(t *testing
 	var authErr *UnauthorizedMessageError
 	if err := handler.HandleSnapshot(chunks, certCoveringAs(memberID, memberAddr)); !errors.As(err, &authErr) {
 		t.Fatalf("HandleSnapshot from a member with a pending removal = %v, want *UnauthorizedMessageError", err)
+	}
+}
+
+// recvRefusalState reports the receive-refusal cache's entries and the count
+// its accounting holds for them.
+func recvRefusalState(h *hostMessageHandler) (entries, counted int) {
+	h.recvRefusals.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	return entries, int(h.recvRefused.Load())
+}
+
+// frameRefusal is a transport refusal of a peer sending frame version v.
+func frameRefusal(v int) error {
+	return &transport.FrameVersionError{Found: byte(v), Current: 1, Previous: 1}
+}
+
+// TestRefuseReceivedWireVersion_ConcurrentBoundAndAccounting drives the
+// receive-refusal cache from many goroutines at once, as concurrent streams
+// and connections do, with distinct and repeated remotes and changing
+// versions. The cache must never hold more than maxRecvRefusals entries, and
+// its accounting must match what it holds.
+func TestRefuseReceivedWireVersion_ConcurrentBoundAndAccounting(t *testing.T) {
+	awaitContainedDiagnostics(t)
+	installDefaultLogger(t, slog.NewTextHandler(io.Discard, nil))
+	defer awaitContainedDiagnostics(t)
+
+	handler := &hostMessageHandler{}
+	const (
+		goroutines = 16
+		calls      = 4000
+		pool       = 2 * maxRecvRefusals
+	)
+	var wg sync.WaitGroup
+	var over atomic.Int64
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range calls {
+				idx := (g*7919 + i*31) % pool
+				handler.refuseReceivedWireVersion(
+					fmt.Sprintf("10.2.%d.%d:1", idx/256, idx%256),
+					frameRefusal(2+(g+i)%3))
+				if i%64 == 0 {
+					if n, _ := recvRefusalState(handler); n > maxRecvRefusals {
+						over.Store(int64(n))
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if n := over.Load(); n > 0 {
+		t.Fatalf("cache held %d entries during the run, bound is %d", n, maxRecvRefusals)
+	}
+	entries, counted := recvRefusalState(handler)
+	if entries > maxRecvRefusals {
+		t.Fatalf("cache holds %d entries, bound is %d", entries, maxRecvRefusals)
+	}
+	if counted != entries {
+		t.Fatalf("cache accounts %d entries but holds %d", counted, entries)
+	}
+}
+
+// refusalLogCounter counts refusal log lines per (remote, peer frame version).
+type refusalLogCounter struct {
+	mu    sync.Mutex
+	lines map[string]int
+}
+
+func (c *refusalLogCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *refusalLogCounter) Handle(_ context.Context, r slog.Record) error {
+	r.Attrs(func(a slog.Attr) bool {
+		if w, ok := a.Value.Any().(*WireVersionMismatchError); ok && a.Key == "error" {
+			c.mu.Lock()
+			c.lines[fmt.Sprintf("%s/%d", w.Source, w.PeerFrameVersion)]++
+			c.mu.Unlock()
+		}
+		return true
+	})
+	return nil
+}
+
+func (c *refusalLogCounter) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+func (c *refusalLogCounter) WithGroup(string) slog.Handler { return c }
+
+// TestRefuseReceivedWireVersion_ConcurrentLogsOncePerVersion has many
+// goroutines report the same remotes at once, phase after phase of a changed
+// peer version: each (remote, version) is logged exactly once.
+func TestRefuseReceivedWireVersion_ConcurrentLogsOncePerVersion(t *testing.T) {
+	awaitContainedDiagnostics(t)
+	counter := &refusalLogCounter{lines: make(map[string]int)}
+	installDefaultLogger(t, counter)
+
+	handler := &hostMessageHandler{}
+	const (
+		goroutines = 16
+		remotes    = 32
+	)
+	for version := 2; version <= 9; version++ {
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for g := range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				for r := range remotes {
+					idx := (r + g) % remotes
+					handler.refuseReceivedWireVersion(
+						fmt.Sprintf("10.3.0.%d:1", idx), frameRefusal(version))
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		awaitContainedDiagnostics(t)
+	}
+
+	counter.mu.Lock()
+	defer counter.mu.Unlock()
+	for version := 2; version <= 9; version++ {
+		for r := range remotes {
+			key := fmt.Sprintf("10.3.0.%d:1/%d", r, version)
+			if n := counter.lines[key]; n != 1 {
+				t.Errorf("%s logged %d times, want 1", key, n)
+			}
+		}
 	}
 }
