@@ -127,11 +127,14 @@ type snapRecord struct {
 // nodeSnap is this replica process's snapshot record.
 var nodeSnap snapRecord
 
-// listener is the Host event listener that fills the record.
+// listener is the Host event listener that fills the record. Compacted comes
+// from OnLogDBCompacted, which fires only once the LogDB removed the
+// compacted entries; OnLogCompacted fires when the in-memory log reader
+// advances, even if the LogDB step then fails, so it is not recorded.
 func (s *snapRecord) listener() *config.EventListener {
 	return &config.EventListener{
 		OnSnapshotCreated: func(i config.SnapshotInfo) { s.created.Store(i.Index) },
-		OnLogCompacted:    func(i config.EventShardInfo) { s.compacted.Store(i.Index) },
+		OnLogDBCompacted:  func(i config.EventShardInfo) { s.compacted.Store(i.Index) },
 	}
 }
 

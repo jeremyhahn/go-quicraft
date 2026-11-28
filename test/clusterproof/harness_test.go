@@ -99,7 +99,7 @@ func startProc(cmd *exec.Cmd, logFile *os.File) (*proc, error) {
 		return nil, err
 	}
 	go func() {
-		_ = cmd.Wait()
+		p.err = cmd.Wait()
 		if logFile != nil {
 			logFile.Close()
 		}
@@ -128,7 +128,21 @@ func (p *proc) kill() error {
 // exitFault is nil while the process runs and after an exit by the SIGKILL
 // the harness sent; any other exit is a fault.
 func (p *proc) exitFault() error {
-	return nil
+	select {
+	case <-p.exited:
+	default:
+		return nil
+	}
+	var ee *exec.ExitError
+	if p.killed.Load() && errors.As(p.err, &ee) {
+		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() && ws.Signal() == syscall.SIGKILL {
+			return nil
+		}
+	}
+	if p.err == nil {
+		return errors.New("exited unexpectedly: exit status 0")
+	}
+	return fmt.Errorf("exited unexpectedly: %w", p.err)
 }
 
 // replicaExits is the first replica process exit that is a fault.
@@ -196,6 +210,9 @@ func (h *harness) checkClients() {
 	err := h.clientErr
 	h.failMu.Unlock()
 	if err != nil {
+		h.fatalf("%v", err)
+	}
+	if err := h.replicaExits(); err != nil {
 		h.fatalf("%v", err)
 	}
 }
@@ -686,8 +703,15 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 	t.Cleanup(func() {
 		h.stop.Store(true)
 		h.wg.Wait()
+		// The test context is cancelled before cleanup runs and its
+		// cancel SIGKILLs every replica still up (and marks it killed),
+		// so any fault left here is an exit the harness did not cause,
+		// one after the final GET /all included.
 		for _, r := range h.reps {
-			_ = r.proc.kill()
+			if err := r.proc.kill(); err != nil {
+				t.Errorf("clusterproof seed=%d: replica %d %v\nreplica log tail (%s):\n%s",
+					seed, r.id+1, err, r.logPath, logTail(r.logPath, 30))
+			}
 		}
 	})
 	for _, r := range h.reps {
@@ -741,6 +765,7 @@ func TestClusterproof_SIGKILL(t *testing.T) {
 	h.wg.Wait()
 	h.checkClients()
 	n := h.converge("final", true)
+	h.checkClients()
 	// With -clusterproof.readers=0 no reader runs, so there is no read to
 	// count; the acknowledged writes are still checked through GET /all.
 	if *flagReaders > 0 && h.reads.Load() == 0 {
