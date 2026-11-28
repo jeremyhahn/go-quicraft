@@ -264,7 +264,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The short version:
 make test      # unit tests, race detector on
 make ci        # format, vet, lint, security scans, build, unit tests
 make ci-full   # ci plus the integration, fault-injection, fuzz and FIPS suites
+make test-clusterproof  # three replica processes, SIGKILLed at random; no acknowledged write lost
 ```
+
+`make test-clusterproof` is the crash harness of
+[docs/clusterproof-harness/](docs/clusterproof-harness/README.md): a failure
+prints its seed, and `CLUSTERPROOF_ARGS='-clusterproof.seed=<seed>'` replays it.
 
 Report security issues privately as described in [SECURITY.md](SECURITY.md).
 

@@ -319,6 +319,11 @@ test-crypto:
 test-clusterproof:
 	$(GOTEST) -tags=integration -timeout=600s $(CLUSTERPROOF_DIR)/... $(if $(CLUSTERPROOF_ARGS),-args $(CLUSTERPROOF_ARGS))
 
+# integration-test-clusterproof-harness: the SPEC row's feature target; the
+# harness runs its replicas as host processes, so it needs no container.
+.PHONY: integration-test-clusterproof-harness
+integration-test-clusterproof-harness: test-clusterproof
+
 # ============================================================================
 # Integration tests (always run in devcontainer)
 # ============================================================================
