@@ -138,14 +138,15 @@ func TestMembershipVersionNotDerivedFromWireVersion(t *testing.T) {
 	}
 }
 
-// TestMembershipVersionExactMatch exercises the decode gate: the one supported
-// version decodes, EVERY other byte value is refused with the typed error, and
-// the message names both the version found and the version supported.
+// TestMembershipVersionExactMatch exercises the decode gate: every version in
+// the closed read set {membershipFormatVersion, previousMembershipFormatVersion}
+// decodes, EVERY other byte value is refused with the typed error, and the
+// message names both the version found and the version supported.
 //
-// Exact equality is what the pinning policy buys. There is no window to widen
-// and no earlier layout to fall back to, so a section stamped with anything
-// else was written by a binary built from a different pre-release commit and
-// must be refused rather than read at this layout's offsets.
+// The read set is a set, not a range, and has one member in v1.0. A section
+// stamped with any byte outside it was written by a binary this build cannot
+// interpret and must be refused rather than read at this layout's offsets.
+// TestMembershipAcceptedVersionSetPinned pins the set's contents.
 func TestMembershipVersionExactMatch(t *testing.T) {
 	m := Membership{
 		ConfigChangeID:             9,
@@ -197,6 +198,50 @@ func TestMembershipVersionExactMatch(t *testing.T) {
 	for _, want := range []string{"7", strconv.Itoa(int(membershipFormatVersion))} {
 		if !strings.Contains(err, want) {
 			t.Fatalf("error %q does not name %q", err, want)
+		}
+	}
+}
+
+// TestMembershipAcceptedVersionSetPinned pins the Membership read set. The
+// decoder has one layout, so the set {membershipFormatVersion,
+// previousMembershipFormatVersion} is correct only while the two constants are
+// equal: once a release makes them differ, a section stamped with the previous
+// version would be decoded at the current layout's offsets. That release must
+// add a per-version decode path in UnmarshalFrom and update this test (see
+// docs/compatibility/engineering.md).
+func TestMembershipAcceptedVersionSetPinned(t *testing.T) {
+	var accepted []uint8
+	for v := 0; v <= 0xFF; v++ {
+		if acceptsMembershipFormatVersion(uint8(v)) {
+			accepted = append(accepted, uint8(v))
+		}
+	}
+	if len(accepted) != 1 || accepted[0] != membershipV1 {
+		t.Fatalf("accepted Membership versions = %v, want exactly [%d]", accepted, membershipV1)
+	}
+
+	if previousMembershipFormatVersion != membershipFormatVersion {
+		t.Fatalf("previousMembershipFormatVersion (%d) != membershipFormatVersion (%d): "+
+			"UnmarshalFrom has one layout; a release that makes them differ must add a "+
+			"per-version decode path in UnmarshalFrom (the layout at "+
+			"previousMembershipFormatVersion's offsets) and update this test",
+			previousMembershipFormatVersion, membershipFormatVersion)
+	}
+
+	m := Membership{
+		ConfigChangeID: 3,
+		Addresses:      map[uint64]string{1: "n1:9000"},
+	}
+	buf := make([]byte, m.Size())
+	if _, err := m.MarshalTo(buf); err != nil {
+		t.Fatalf("MarshalTo: %v", err)
+	}
+	for _, version := range accepted {
+		probe := append([]byte{}, buf...)
+		probe[0] = version
+		var got Membership
+		if _, err := got.UnmarshalFrom(probe); err != nil {
+			t.Fatalf("UnmarshalFrom(version %d): unexpected error %v", version, err)
 		}
 	}
 }
