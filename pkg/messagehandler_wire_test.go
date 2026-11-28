@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 )
@@ -244,20 +245,38 @@ func TestRefuseReceivedWireVersion_PastLimitStillRecords(t *testing.T) {
 	for i := range maxRecvRefusals + 10 {
 		handler.refuseReceivedWireVersion("10.1.0.1:"+strconv.Itoa(1000+i), refusal)
 	}
-	awaitContainedDiagnostics(t)
+	drainContainedRetrying(t)
 	before := strings.Count(logs.String(), marker)
 	const fresh = "192.0.2.7:4242"
 	handler.refuseReceivedWireVersion(fresh, refusal)
 	if _, ok := handler.recvRefusals.Load(fresh); !ok {
 		t.Fatal("a new peer past the cache limit was not recorded")
 	}
-	awaitContainedDiagnostics(t)
+	drainContainedRetrying(t)
 	if n := strings.Count(logs.String(), marker); n != before+1 {
 		t.Fatalf("%d refusal lines for a new peer past the cache limit, want 1", n-before)
 	}
 	if n := handler.recvRefused.Load(); n > maxRecvRefusals {
 		t.Fatalf("cache holds %d entries, bound is %d", n, maxRecvRefusals)
 	}
+}
+
+// drainContainedRetrying is awaitContainedDiagnostics for a test that may
+// have filled the bounded diagnostic queue: a sentinel submitted while it is
+// full is dropped, so it is resubmitted until one runs.
+func drainContainedRetrying(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		ran := make(chan struct{})
+		supervise.LogContained(func() { close(ran) })
+		select {
+		case <-ran:
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("the contained-diagnostics queue did not drain")
 }
 
 // TestRefuseReceivedWireVersion_RecordsPastBlockedLogHandler: with the slog

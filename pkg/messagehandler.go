@@ -28,6 +28,7 @@ import (
 
 	"github.com/jeremyhahn/go-quicraft/pkg/config"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/engine"
+	"github.com/jeremyhahn/go-quicraft/pkg/internal/supervise"
 	"github.com/jeremyhahn/go-quicraft/pkg/internal/transport"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -316,7 +317,10 @@ func (h *hostMessageHandler) evictRecvRefusal() bool {
 // host's window, before any message reached HandleMessage. It records the
 // refusal as a *WireVersionMismatchError naming both sides' versions and
 // logs it once per (remote, advertised versions), as refuseWireVersion does
-// for refusals at the Raft layer.
+// for refusals at the Raft layer. It runs on the transport's receive
+// goroutine: the record and its dedup are synchronous and bounded, and only
+// the log line is queued on supervise.LogContained, so a full or stalled
+// diagnostic queue can delay or drop the line but never the record.
 func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error) {
 	refusal := &WireVersionMismatchError{Source: remote, Local: proto.DefaultWireWindow()}
 	if h.host != nil {
@@ -363,10 +367,15 @@ func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error)
 			h.recvRefused.Add(1)
 		}
 	}
-	slog.Warn("refused inbound traffic: peer wire version outside this host's window",
-		"source", remote,
-		"error", refusal,
-	)
+	// The record above is synchronous and bounded; only the log line goes to
+	// the contained diagnostic worker, so a blocked log handler delays the
+	// line, never the record.
+	supervise.LogContained(func() {
+		slog.Warn("refused inbound traffic: peer wire version outside this host's window",
+			"source", remote,
+			"error", refusal,
+		)
+	})
 }
 
 // receiveWireRefusal returns a refusal recorded by refuseReceivedWireVersion,

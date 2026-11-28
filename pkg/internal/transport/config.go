@@ -448,10 +448,12 @@ type Config struct {
 	// message batch refused because its version is outside Wire: remote is
 	// the connection's remote address and err is a *FrameVersionError or a
 	// *proto.BatchVersionError naming the peer's and the local versions. It
-	// is called in addition to the protocol-violation accounting, off the
-	// receive goroutine and panic-contained (supervise.LogContained), so a
-	// slow or panicking callback cannot hold or tear down a stream. Nil is a
-	// no-op.
+	// is called in addition to the protocol-violation accounting, on the
+	// receive goroutine and panic-contained, so the refusal is recorded at
+	// once even when the shared diagnostic queue is full or stalled. It must
+	// be bounded and non-blocking: record synchronously and hand any log
+	// line to supervise.LogContained. A panic in it cannot tear down a
+	// stream. Nil is a no-op.
 	OnWireVersionRefused func(remote string, err error)
 
 	// EventListener holds optional event callbacks for connection and
