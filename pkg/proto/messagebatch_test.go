@@ -181,6 +181,9 @@ func TestMessageBatchShortPayloadOutsideWindowIsTyped(t *testing.T) {
 		if full && be.MaxBinVer != far {
 			t.Fatalf("full header: MaxBinVer = %d, want %d", be.MaxBinVer, far)
 		}
+		if be.HasMaxBinVer != full {
+			t.Fatalf("%d bytes: HasMaxBinVer = %v, want %v", n, be.HasMaxBinVer, full)
+		}
 		if !full && be.MaxBinVer != 0 {
 			t.Fatalf("%d bytes: MaxBinVer = %d read from a short header", n, be.MaxBinVer)
 		}

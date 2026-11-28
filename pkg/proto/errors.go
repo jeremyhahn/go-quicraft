@@ -161,12 +161,20 @@ type BatchVersionError struct {
 	BinVer uint64
 	// MaxBinVer is the newest wire version the peer advertises it reads.
 	MaxBinVer uint64
+	// HasMaxBinVer is true when MaxBinVer was read from a complete batch
+	// header; a payload too short to carry it leaves it false, and Error
+	// then names no maximum.
+	HasMaxBinVer bool
 	// Local is the window the batch was read against.
 	Local WireWindow
 }
 
 // Error names both sides' versions.
 func (e *BatchVersionError) Error() string {
+	if !e.HasMaxBinVer {
+		return fmt.Sprintf("proto: batch wire version %d is outside the local window {current %d, previous %d}: %v",
+			e.BinVer, e.Local.Current, e.Local.Previous, ErrUnsupportedVersion)
+	}
 	return fmt.Sprintf("proto: batch wire version %d (peer reads up to %d) is outside the local window {current %d, previous %d}: %v",
 		e.BinVer, e.MaxBinVer, e.Local.Current, e.Local.Previous, ErrUnsupportedVersion)
 }

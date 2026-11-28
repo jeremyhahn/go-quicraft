@@ -112,7 +112,7 @@ func TestHandleMessage_WireWindowRefusal(t *testing.T) {
 				t.Fatalf("errors.Is(%v, ErrUnsupportedVersion) = false", err)
 			}
 			want := WireVersionMismatchError{ShardID: wireTestShard, From: 2,
-				PeerBinVer: tc.binVer, PeerMaxBinVer: tc.maxBinVer, Local: local}
+				PeerBinVer: tc.binVer, PeerMaxBinVer: tc.maxBinVer, HasPeerMaxBinVer: true, Local: local}
 			if *refusal != want {
 				t.Fatalf("refusal = %+v, want %+v", *refusal, want)
 			}
@@ -197,7 +197,7 @@ func TestRefuseReceivedWireVersion_RecordsTransportErrors(t *testing.T) {
 	handler := &hostMessageHandler{}
 	local := proto.WireWindow{Current: 3, Previous: 2}
 	handler.refuseReceivedWireVersion("10.0.0.1:1",
-		&proto.BatchVersionError{BinVer: 7, MaxBinVer: 8, Local: local})
+		&proto.BatchVersionError{BinVer: 7, MaxBinVer: 8, HasMaxBinVer: true, Local: local})
 	handler.refuseReceivedWireVersion("10.0.0.2:1",
 		&transport.FrameVersionError{Found: 9, Current: 4, Previous: 5})
 	handler.refuseReceivedWireVersion("10.0.0.3:1", transport.ErrInvalidMagic)
@@ -210,7 +210,7 @@ func TestRefuseReceivedWireVersion_RecordsTransportErrors(t *testing.T) {
 		return v.(*WireVersionMismatchError)
 	}
 	b := got("10.0.0.1:1")
-	if b == nil || b.Frame || b.Source != "10.0.0.1:1" || b.PeerBinVer != 7 || b.PeerMaxBinVer != 8 ||
+	if b == nil || b.Frame || b.Source != "10.0.0.1:1" || b.PeerBinVer != 7 || b.PeerMaxBinVer != 8 || !b.HasPeerMaxBinVer ||
 		b.Local != local || b.ShardID != 0 || b.From != 0 {
 		t.Fatalf("batch refusal recorded as %+v", b)
 	}

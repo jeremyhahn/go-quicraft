@@ -242,11 +242,12 @@ func (h *hostMessageHandler) wireInteroperates(batch proto.MessageBatch) (proto.
 // once rather than once per batch.
 func (h *hostMessageHandler) refuseWireVersion(msg *proto.Message, batch proto.MessageBatch, local proto.WireWindow) {
 	refusal := &WireVersionMismatchError{
-		ShardID:       msg.ShardID,
-		From:          msg.From,
-		PeerBinVer:    batch.BinVer,
-		PeerMaxBinVer: batch.MaxBinVer,
-		Local:         local,
+		ShardID:          msg.ShardID,
+		From:             msg.From,
+		PeerBinVer:       batch.BinVer,
+		PeerMaxBinVer:    batch.MaxBinVer,
+		HasPeerMaxBinVer: true,
+		Local:            local,
 	}
 	key := wireRefusalKey{shardID: msg.ShardID, from: msg.From}
 	prev, loaded := h.wireRefusals.Swap(key, refusal)
@@ -331,7 +332,10 @@ func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error)
 		refusal.LocalFramePrevious = frameErr.Previous
 	case errors.As(err, &batchErr):
 		refusal.PeerBinVer = batchErr.BinVer
-		refusal.PeerMaxBinVer = batchErr.MaxBinVer
+		if batchErr.HasMaxBinVer {
+			refusal.PeerMaxBinVer = batchErr.MaxBinVer
+			refusal.HasPeerMaxBinVer = true
+		}
 		refusal.Local = batchErr.Local
 	default:
 		return

@@ -1388,14 +1388,16 @@ func (e *WireVersionMismatchError) Error() string {
 			"outside this host's frame window {current %d, previous %d}",
 			e.Source, e.PeerFrameVersion, e.LocalFrameCurrent, e.LocalFramePrevious)
 	}
-	if e.Source != "" && e.ShardID == 0 && e.From == 0 {
-		return fmt.Sprintf("quicraft: peer %s speaks wire version %d (reads up to %d), "+
-			"outside this host's wire window {current %d, previous %d}",
-			e.Source, e.PeerBinVer, e.PeerMaxBinVer, e.Local.Current, e.Local.Previous)
+	speaks := fmt.Sprintf("speaks wire version %d", e.PeerBinVer)
+	if e.HasPeerMaxBinVer {
+		speaks += fmt.Sprintf(" (reads up to %d)", e.PeerMaxBinVer)
 	}
-	return fmt.Sprintf("quicraft: shard %d replica %d speaks wire version %d (reads up to %d), "+
-		"outside this host's wire window {current %d, previous %d}",
-		e.ShardID, e.From, e.PeerBinVer, e.PeerMaxBinVer, e.Local.Current, e.Local.Previous)
+	if e.Source != "" && e.ShardID == 0 && e.From == 0 {
+		return fmt.Sprintf("quicraft: peer %s %s, outside this host's wire window {current %d, previous %d}",
+			e.Source, speaks, e.Local.Current, e.Local.Previous)
+	}
+	return fmt.Sprintf("quicraft: shard %d replica %d %s, outside this host's wire window {current %d, previous %d}",
+		e.ShardID, e.From, speaks, e.Local.Current, e.Local.Previous)
 }
 
 // Is reports whether target is proto.ErrUnsupportedVersion.
