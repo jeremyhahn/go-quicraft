@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"math"
@@ -1566,6 +1567,43 @@ func openVerifiedSnapshotFile(fsys snapshotFS, dataPath string) (*verifiedSnapsh
 		snapshotFile: f,
 		verifier:     engine.NewSnapshotDataVerifier(filepath.Dir(dataPath)),
 	}, nil
+}
+
+// openExportSnapshotFile opens the data file of the snapshot snap records for
+// shardID/replicaID. ErrSnapshotNotFound means the file does not exist: when
+// the open reports fs.ErrNotExist the record is read once more, because
+// snapshot GC may have removed the file after a newer snapshot was recorded,
+// and the open is retried once against a different, valid record. Every
+// other open error, and an error from the re-read, is returned wrapped. It
+// returns the opened file, the record it belongs to and its data path.
+func (h *Host) openExportSnapshotFile(
+	shardID, replicaID uint64, snap logdb.Snapshot,
+) (*verifiedSnapshotFile, logdb.Snapshot, string, error) {
+	dataPath := filepath.Join(snap.Filepath, "snapshot.dat")
+	f, err := openVerifiedSnapshotFile(h.snapshotFsys(), dataPath)
+	if err == nil {
+		return f, snap, dataPath, nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, snap, dataPath, fmt.Errorf("quicraft: open snapshot %s: %w", dataPath, err)
+	}
+	latest, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil {
+		return nil, snap, dataPath, fmt.Errorf("quicraft: open snapshot %s: %w", dataPath, err)
+	}
+	if latest.Index == 0 || latest.Filepath == "" ||
+		(latest.Index == snap.Index && latest.Filepath == snap.Filepath) {
+		return nil, snap, dataPath, ErrSnapshotNotFound
+	}
+	dataPath = filepath.Join(latest.Filepath, "snapshot.dat")
+	f, err = openVerifiedSnapshotFile(h.snapshotFsys(), dataPath)
+	if err == nil {
+		return f, latest, dataPath, nil
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, latest, dataPath, ErrSnapshotNotFound
+	}
+	return nil, latest, dataPath, fmt.Errorf("quicraft: open snapshot %s: %w", dataPath, err)
 }
 
 // Read reads from the file and adds what it read to the running hash.
@@ -8378,6 +8416,12 @@ func (e *SnapshotArtifactError) Unwrap() error { return e.Err }
 // an artifact without a valid trailer — so what w received on an error can
 // never be imported, even by a caller that ignored the error. It is still not
 // an artifact and should be discarded.
+//
+// ErrSnapshotNotFound means no snapshot is recorded or its data file does not
+// exist. If snapshot GC removed the file between the lookup and the open, the
+// lookup is repeated once and a newer recorded snapshot is exported instead.
+// Any other filesystem error from opening the file is returned wrapped, so a
+// permission, descriptor-limit or I/O failure is not mistaken for "none".
 func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) error {
 	if h.closed.Load() {
 		return ErrClosed
@@ -8405,10 +8449,9 @@ func (h *Host) ExportSnapshot(ctx context.Context, shardID uint64, w io.Writer) 
 		return ErrSnapshotNotFound
 	}
 
-	dataPath := filepath.Join(snapDir, "snapshot.dat")
-	f, err := openVerifiedSnapshotFile(h.snapshotFsys(), dataPath)
+	f, logdbSnap, dataPath, err := h.openExportSnapshotFile(shardID, ns.replicaID, logdbSnap)
 	if err != nil {
-		return ErrSnapshotNotFound
+		return err
 	}
 	defer func() {
 		if closeErr := f.Close(); closeErr != nil {
