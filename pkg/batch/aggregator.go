@@ -199,8 +199,9 @@ type aggregatorMetrics struct {
 //
 // Delivery semantics: AT-LEAST-ONCE. The aggregator proposes a raw encoded
 // batch with no client session, so it has no at-most-once path. A flush that
-// fails with FlushError.Indeterminate set (proposer timeout or cancellation)
-// may nonetheless commit and apply; retrying such a batch applies every
+// fails with FlushError.Indeterminate set (proposer timeout or cancellation,
+// or the proposer reported the proposal may already be applied
+// (quicraft.MaybeApplied)) may nonetheless commit and apply; retrying such a batch applies every
 // command in it a second time. Callers needing exactly-once semantics must
 // make their commands idempotent or propose through a session instead.
 //
@@ -246,6 +247,12 @@ type Aggregator struct {
 	metrics     *aggregatorMetrics
 	metricsOnce sync.Once
 }
+
+// maybeAppliedMarker matches a proposer error that reports the proposal may
+// already be applied (*quicraft.MaybeAppliedError). It is matched
+// structurally because pkg/batch must not import the root package: the
+// root package's tests import pkg/batch.
+type maybeAppliedMarker interface{ MaybeApplied() bool }
 
 // NewAggregator creates a batch aggregator that groups proposals and
 // flushes them through the given Proposer. It starts a background
@@ -403,12 +410,15 @@ func (a *Aggregator) awaitResult(ctx context.Context, p *proposal) error {
 			return err
 		case <-ctx.Done():
 			// Same drain-first rule as above: a result already delivered beats
-			// the context error it tied with.
+			// the context error it tied with. Otherwise INDETERMINATE, as in
+			// the first branch: the proposal is in the queue or currentBatch,
+			// and flushLoop's close branch drains and proposes it, so the
+			// batch may still commit.
 			select {
 			case err := <-p.resultCh:
 				return err
 			default:
-				return ctx.Err()
+				return &FlushError{ShardID: p.shardID, Err: ctx.Err(), Indeterminate: true}
 			}
 		case <-a.flushDone:
 			select {
@@ -661,10 +671,16 @@ func (a *Aggregator) flushShard(shardID uint64, proposals []*proposal) {
 		// the entry may already be replicated and will apply. Reporting it as
 		// a definite failure would tell the caller a committed write failed,
 		// and a blind retry would duplicate the whole batch. Flag the outcome
-		// as indeterminate so the caller can distinguish the two.
+		// as indeterminate so the caller can distinguish the two. The same
+		// holds when the proposer reports the proposal may already be applied
+		// (quicraft.MaybeApplied): the host wraps every failure after hand-off
+		// to Raft (leader change, shard stop, persist failure) that way, often
+		// around an error that is not a context error.
+		var m maybeAppliedMarker
 		indeterminate := errors.Is(err, context.DeadlineExceeded) ||
 			errors.Is(err, context.Canceled) ||
-			ctx.Err() != nil
+			ctx.Err() != nil ||
+			(errors.As(err, &m) && m.MaybeApplied())
 		a.metrics.batchesTotal.WithLabelValues(shardLabel, "failed").Inc()
 		a.logger.Warn("batch flush failed",
 			slog.Uint64("shard_id", shardID),

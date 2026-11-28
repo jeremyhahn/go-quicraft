@@ -20,9 +20,14 @@ import qcSM "github.com/jeremyhahn/go-quicraft/pkg/sm"
 // sm.CreateFunc. The returned factory creates regularAdapter instances
 // that translate between dragonboat's single-entry Update convention and
 // quicraft's batch Update interface.
+// A nil create result is returned as nil, so the host refuses it with
+// ErrInvalidSMType at start instead of panicking on first use.
 func WrapCreateFunc(f CreateStateMachineFunc) qcSM.CreateFunc {
 	return func(shardID, replicaID uint64) interface{} {
 		inner := f(shardID, replicaID)
+		if inner == nil {
+			return nil
+		}
 		return &regularAdapter{inner: inner}
 	}
 }
@@ -30,9 +35,14 @@ func WrapCreateFunc(f CreateStateMachineFunc) qcSM.CreateFunc {
 // WrapConcurrentCreateFunc wraps a dragonboat CreateConcurrentStateMachineFunc
 // as a quicraft sm.CreateFunc. The returned factory creates concurrentAdapter
 // instances that translate between the two batch-entry representations.
+// A nil create result is returned as nil, so the host refuses it with
+// ErrInvalidSMType at start instead of panicking on first use.
 func WrapConcurrentCreateFunc(f CreateConcurrentStateMachineFunc) qcSM.CreateFunc {
 	return func(shardID, replicaID uint64) interface{} {
 		inner := f(shardID, replicaID)
+		if inner == nil {
+			return nil
+		}
 		return &concurrentAdapter{inner: inner}
 	}
 }
@@ -40,9 +50,14 @@ func WrapConcurrentCreateFunc(f CreateConcurrentStateMachineFunc) qcSM.CreateFun
 // WrapOnDiskCreateFunc wraps a dragonboat CreateOnDiskStateMachineFunc
 // as a quicraft sm.CreateFunc. The returned factory creates diskAdapter
 // instances that translate between the on-disk state machine representations.
+// A nil create result is returned as nil, so the host refuses it with
+// ErrInvalidSMType at start instead of panicking on first use.
 func WrapOnDiskCreateFunc(f CreateOnDiskStateMachineFunc) qcSM.CreateFunc {
 	return func(shardID, replicaID uint64) interface{} {
 		inner := f(shardID, replicaID)
+		if inner == nil {
+			return nil
+		}
 		return &diskAdapter{inner: inner}
 	}
 }

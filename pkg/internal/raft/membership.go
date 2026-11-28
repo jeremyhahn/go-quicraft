@@ -872,15 +872,17 @@ func handleAddWitness(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
-// ErrStaleConfigChange is returned by the add validators when a bound change
+// ErrStaleConfigChange is returned by the add, remove and witness-policy
+// validators when a bound change
 // (a non-zero ConfigChangeID, or ConfigChangeID 0 with
 // MustMatchConfigChangeID set) names a configuration other than the current
 // one: another membership change committed after the caller read the index.
 var ErrStaleConfigChange = errors.New("raft: stale config change")
 
-// checkConfigChangeBound refuses a bound add whose ConfigChangeID is not the
-// current one. It runs on the leader's worker, after the Host's early check,
-// so a change that committed between the two is caught here. An unbound add
+// checkConfigChangeBound refuses a bound membership change (add, remove or
+// witness-policy update) whose ConfigChangeID is not the current one. It runs
+// on the leader's worker, after the Host's early check, so a change that
+// committed between the two is caught here. An unbound change
 // (ConfigChangeID 0 without MustMatchConfigChangeID) is not checked.
 func checkConfigChangeBound(m *membership, cc proto.ConfigChange) error {
 	if cc.ConfigChangeID == 0 && !cc.MustMatchConfigChangeID {
@@ -892,7 +894,8 @@ func checkConfigChangeBound(m *membership, cc proto.ConfigChange) error {
 	return nil
 }
 
-// StaleConfigChangeError is the add validators' refusal of a bound change:
+// StaleConfigChangeError is the membership validators' refusal of a bound
+// add, remove or witness-policy change:
 // Got is the ConfigChangeID the change was checked against, Expected the
 // membership's current one. It matches ErrStaleConfigChange with errors.Is.
 type StaleConfigChangeError struct {
@@ -950,6 +953,9 @@ func validateAddNode(m *membership, cc proto.ConfigChange) error {
 // the RequireFullReplicaMajority policy violation when removing a full
 // replica would leave the remaining full replicas unable to form a quorum.
 func validateRemoveNode(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if !m.isMember(cc.ReplicaID) {
 		return ErrNodeNotFound
 	}
@@ -1055,6 +1061,9 @@ func handleUpdateWitnessPolicy(m *membership, cc proto.ConfigChange) error {
 // against a baseline the membership never met). Operators must reshape the
 // membership first, then tighten the policy.
 func validateUpdateWitnessPolicy(m *membership, cc proto.ConfigChange) error {
+	if err := checkConfigChangeBound(m, cc); err != nil {
+		return err
+	}
 	if cc.MaxWitnesses > 0 && uint64(len(m.witnesses)) > cc.MaxWitnesses {
 		return ErrTooManyWitnesses
 	}

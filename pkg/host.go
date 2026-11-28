@@ -50,6 +50,7 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/waldb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
+	"github.com/jeremyhahn/go-quicraft/pkg/seal"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
 )
 
@@ -1683,9 +1684,14 @@ type nodeState struct {
 	// takes no lock for it.
 	leaderlessSince atomic.Int64
 
-	health      atomic.Uint32 // stores ShardHealth as uint32
-	nodes       map[uint64]string
-	nodesMu     sync.RWMutex
+	health  atomic.Uint32 // stores ShardHealth as uint32
+	nodes   map[uint64]string
+	nodesMu sync.RWMutex
+	// lifecycleMu orders StartShard's metrics/registry registration with
+	// teardownShard's removal of the same. It is held across embedder code
+	// (MetricsCollector.RegisterShard), so it must never be nodesMu: a
+	// collector that calls back into ShardInfo takes nodesMu.RLock.
+	lifecycleMu sync.Mutex
 	requestPool *sync.Pool
 	stopped     atomic.Bool
 	rsm         *rsm.StateMachine // for local reads (Lookup)
@@ -4350,6 +4356,19 @@ func NewHost(cfg config.HostConfig, opts ...HostOption) (*Host, error) {
 		h.cfg.RaftAddress = cfg.RaftAddress
 	}
 
+	// Recover an exhausted invocation budget before any shard can write the
+	// WAL. A host restarted with a full known-epoch set is refused rotation
+	// by Unseal, which seeds the invocation counter at its limit, so every
+	// encrypted write fails until a purge-and-rotate runs. The loop below
+	// would only do that on its first threshold tick (30 s away), and a
+	// shard's first WAL write before it fails the shard. rotateBarrierKey
+	// purges under the configured retention and retries once. No shard is
+	// loaded yet, so the safe floor comes from the LogDB alone.
+	if options.barrier != nil && !options.barrier.IsSealed() && options.barrier.ShouldRotateKey() {
+		h.logger.Info("invocation budget exhausted at startup, rotating before shards start")
+		h.rotateBarrierKey(context.Background())
+	}
+
 	// Start the key rotation loop whenever a barrier is configured. With
 	// KeyRotationInterval == 0 scheduled rotation is disabled, but the
 	// invocation-threshold check must still run: it is what rotates the
@@ -5688,6 +5707,10 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 	// teardown and owns it; this call must not tear the shard down a second
 	// time. It must still UNDO its own publication into the engine, because the
 	// claimant's UnloadNode ran before LoadNode and could not have removed it.
+	//
+	// A StopShard that claims teardown after this check is handled by the
+	// metrics and registry registration below, which runs under ns.nodesMu
+	// and re-checks ns.stopped there.
 	if h.closed.Load() || h.draining.Load() || ns.stopped.Load() {
 		if ns.stopped.CompareAndSwap(false, true) {
 			// ErrClosed is the caller's answer here — the shard never became
@@ -5705,15 +5728,26 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 		return ErrClosed
 	}
 
-	// Pre-bind metrics for this shard to avoid expensive label lookups
-	// in hot paths. This must be called before any metrics are recorded.
-	if h.metrics != nil {
-		h.metrics.RegisterShard(cfg.ShardID)
+	if hook := testHookStartShardBeforeRegister; hook != nil {
+		hook(cfg.ShardID)
 	}
 
-	// Register all members in the registry for address resolution.
-	for replicaID, addr := range effectiveNodes {
-		h.registry.Register(cfg.ShardID, replicaID, addr)
+	// Register metrics and member addresses under ns.lifecycleMu, and only
+	// while the shard is not stopped. A StopShard that claims teardown AFTER
+	// the check above would otherwise run its registry Remove loop and
+	// UnregisterShard before this registration, leaving metric series and
+	// member addresses behind for a shard that no longer exists. Teardown
+	// takes ns.lifecycleMu only after its ns.stopped CAS, so either the CAS
+	// came first and the re-check below sees it, or teardown's removal runs
+	// after this unlock and removes what was registered here. The lock is
+	// not ns.nodesMu: RegisterShard is embedder code and may call ShardInfo,
+	// which takes ns.nodesMu. On the stopped path the claimant owns the
+	// shard: the check above saw stopped false, so its UnloadNode runs after
+	// LoadNode and there is nothing to undo.
+	if !h.registerStartedShard(ns, cfg.ShardID, effectiveNodes) {
+		h.logger.Warn("shard start aborted: host is closing or the shard was stopped",
+			"shard_id", cfg.ShardID, "replica_id", cfg.ReplicaID)
+		return ErrClosed
 	}
 
 	// Notify the engine that this shard has work so the Raft peer
@@ -5738,6 +5772,35 @@ func (h *Host) StartShard(members map[uint64]string, join bool, create sm.Create
 
 	return nil
 }
+
+// registerStartedShard registers the shard's metrics and member addresses
+// under ns.lifecycleMu, and only while ns is not stopped. It reports false,
+// registering nothing, when ns is stopped. The lock is released with defer:
+// RegisterShard is embedder code, and a runtime.Goexit there passes
+// safeMetricsCollector's recover, so an ordinary unlock would leave
+// lifecycleMu held and block teardownShard's barrier forever.
+func (h *Host) registerStartedShard(ns *nodeState, shardID uint64, members map[uint64]string) bool {
+	ns.lifecycleMu.Lock()
+	defer ns.lifecycleMu.Unlock()
+	if ns.stopped.Load() {
+		return false
+	}
+	// Pre-bind metrics for this shard to avoid expensive label lookups
+	// in hot paths. This must be called before any metrics are recorded.
+	if h.metrics != nil {
+		h.metrics.RegisterShard(shardID)
+	}
+	// Register all members in the registry for address resolution.
+	for replicaID, addr := range members {
+		h.registry.Register(shardID, replicaID, addr)
+	}
+	return true
+}
+
+// testHookStartShardBeforeRegister, when non-nil, is called by StartShard
+// after its Close/StopShard TOCTOU check and immediately before it registers
+// the shard's metrics and member addresses. Tests only.
+var testHookStartShardBeforeRegister func(shardID uint64)
 
 // logRecoveryClamp reports, on the Host's logger, a recovered commit index the
 // raft log clamped down to what the recovered log actually holds (see
@@ -5908,6 +5971,13 @@ func (h *Host) teardownShard(ns *nodeState, shardID uint64, pendingErr error) er
 	// the removal AFTER h.nodes.Delete opened exactly that window: the restart
 	// pre-registers the members, and the still-running teardown's registry
 	// removal black-holes the leader's Replicate traffic to them.
+	//
+	// Take and release ns.lifecycleMu first: ns.stopped is already set, so a
+	// StartShard registration in flight completes before the removal below,
+	// and any later one sees stopped and registers nothing.
+	ns.lifecycleMu.Lock()
+	//nolint:staticcheck // SA2001: empty critical section is the barrier.
+	ns.lifecycleMu.Unlock()
 	ns.nodesMu.RLock()
 	for replicaID := range ns.nodes {
 		h.registry.Remove(shardID, replicaID)
@@ -9146,6 +9216,21 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	}
 	defer release()
 
+	// Term is floored at 1 (the minimum valid term) so the Raft engine never
+	// treats the imported snapshot as uninitialized. It is computed here, once,
+	// because the retry check below, the staged snapshot.meta and the LogDB
+	// record must all describe this snapshot identically.
+	term := max(header.Term, 1)
+
+	// The retry of an import that recorded this very snapshot and then failed
+	// while advancing the log floor. The snapshot and its directory are already
+	// in place; only the floor advance is left, and no later compaction would
+	// perform it, so the retry completes it instead of being refused below.
+	if done, err := h.completeRecordedImport(ctx, shardID, replicaID, header.Index, term,
+		header.OnDiskIndex, recoveredMembership, rawHeader, r, opts); err != nil || done {
+		return err
+	}
+
 	// Refuse an artifact that does not ADVANCE the shard's recorded snapshot,
 	// before the tree is touched. Every production LogDB refuses such a save
 	// with logdb.ErrSnapshotOutOfDate, so deferring the check to the final
@@ -9198,15 +9283,6 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	stageDir, tempErr := fsys.MkdirTemp(stageParent, importStageDirPattern)
 	if tempErr != nil {
 		return tempErr
-	}
-
-	// Term is floored at 1 (the minimum valid term) so the Raft engine never
-	// treats the imported snapshot as uninitialized. It is computed here, once,
-	// because the staged snapshot.meta and the LogDB record below must describe
-	// this snapshot identically.
-	term := header.Term
-	if term == 0 {
-		term = 1
 	}
 
 	fileSize, epoch, unpin, stageErr := h.stageImportedArtifact(
@@ -9328,6 +9404,15 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 
 	h.gcShardSnapshots(snapBaseDir, shardID, replicaID)
 
+	return h.finishImportLogFloor(shardID, replicaID, header.Index, snapDir)
+}
+
+// advanceImportLogFloor advances the log compaction floor of a stopped shard
+// to the index of the snapshot an import has just recorded, removing every
+// entry at or below it. ImportSnapshot calls it after SaveSnapshot, and again
+// on the retry of an import whose earlier attempt recorded the snapshot but
+// failed here.
+func (h *Host) advanceImportLogFloor(shardID, replicaID, index uint64) error {
 	// Advance the log compaction floor to the imported snapshot index, removing
 	// every entry at or below it.
 	//
@@ -9355,7 +9440,12 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// no follower depending on its pre-snapshot log tail (a follower behind the
 	// snapshot is caught up via InstallSnapshot), so entries below the imported
 	// snapshot index serve no purpose.
-	if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, header.Index); rmErr != nil {
+	//
+	// A failure here is returned: the snapshot is recorded but the floor is not
+	// advanced, and no later compaction would advance it. The operator's retry
+	// of the same artifact is recognised by importAwaitsLogFloor and completes
+	// this step.
+	if rmErr := h.logdb.RemoveEntriesTo(shardID, replicaID, index); rmErr != nil {
 		return rmErr
 	}
 	// Compact only garbage-collects segments the marker RemoveEntriesTo just
@@ -9363,8 +9453,8 @@ func (h *Host) ImportSnapshot(ctx context.Context, shardID uint64, r io.Reader, 
 	// and durable: the snapshot is recorded and the compaction floor is set. A
 	// failure here reclaims no space but loses no correctness — and returning it
 	// would report a successful restore as failed, with no way to retry, because
-	// the snapshot index and directory now exist (a re-import of the same artifact
-	// is refused). Log it for the operator instead.
+	// the floor is already advanced (a re-import of the same artifact is then
+	// refused as out of date). Log it for the operator instead.
 	if compactErr := h.logdb.Compact(shardID, replicaID); compactErr != nil {
 		h.logger.Warn("imported snapshot recorded and log floor advanced, but WAL "+
 			"segment garbage collection failed; the restore is complete and the "+
@@ -9533,6 +9623,226 @@ func (h *Host) checkImportAdvancesSnapshot(shardID, replicaID, index uint64) err
 		Index:     index,
 		Recorded:  existing.Index,
 	}
+}
+
+// importAwaitsLogFloor reports whether an import of the snapshot (index, term,
+// onDiskIndex) is the retry of an earlier import that recorded this same
+// snapshot and then failed while advancing the log floor: the recorded
+// snapshot has the same Index, floored Term and OnDiskIndex, and the LogDB
+// still holds an entry at or below that index. Any other artifact at a
+// non-advancing index is left to checkImportAdvancesSnapshot to refuse.
+func (h *Host) importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex uint64,
+	membership logdb.Membership) (snapDir string, pending []byte, err error) {
+	existing, err := h.logdb.GetSnapshot(shardID, replicaID)
+	if err != nil {
+		if errors.Is(err, logdb.ErrNoSnapshot) {
+			return "", nil, nil
+		}
+		return "", nil, err
+	}
+	if existing.Index != index || existing.Term != term || existing.OnDiskIndex != onDiskIndex {
+		return "", nil, nil
+	}
+	// A retry that resolves a different membership (another
+	// WithImportMembership or WithImportMemberIdentities) is a different
+	// import, not the retry of the recorded one; completing it would leave
+	// the recorded membership in place and report success for an override
+	// that was never applied. It goes down the normal path, which refuses it.
+	if !logdbMembershipEqual(existing.Membership, membership) {
+		return "", nil, nil
+	}
+	// The pending floor advance is recorded explicitly, in the snapshot's own
+	// directory, by the import that published it, and cleared once the floor
+	// has moved. The log itself cannot say: a bootstrap-only shard has no
+	// entry, and a log already compacted past the index has none below it,
+	// yet either may still have the advance pending.
+	pending, err = readImportFloorPending(h.snapshotFsys(), existing.Filepath)
+	if err != nil {
+		return "", nil, err
+	}
+	return existing.Filepath, pending, nil
+}
+
+// logdbMembershipEqual reports whether a and b describe the same membership.
+// A nil map equals an empty one, since a LogDB round-trip may yield either.
+func logdbMembershipEqual(a, b logdb.Membership) bool {
+	return a.ConfigChangeID == b.ConfigChangeID &&
+		a.MaxWitnesses == b.MaxWitnesses &&
+		a.RequireFullReplicaMajority == b.RequireFullReplicaMajority &&
+		a.SessionExpiryEntries == b.SessionExpiryEntries &&
+		a.MaxTotalSessions == b.MaxTotalSessions &&
+		a.MaxResponsesPerSession == b.MaxResponsesPerSession &&
+		a.MaxSessionsPerOwner == b.MaxSessionsPerOwner &&
+		a.WireVersion == b.WireVersion &&
+		maps.Equal(a.Addresses, b.Addresses) &&
+		maps.Equal(a.Observers, b.Observers) &&
+		maps.Equal(a.Witnesses, b.Witnesses) &&
+		maps.Equal(a.Removed, b.Removed) &&
+		maps.Equal(a.Identities, b.Identities) &&
+		maps.Equal(a.RemovedIdentities, b.RemovedIdentities)
+}
+
+// completeRecordedImport finishes the retry of an import that recorded its
+// snapshot and then failed while advancing the log floor (importAwaitsLogFloor).
+// done reports that the artifact was such a retry and err the outcome of
+// completing it; done is false for every other artifact, which then takes the
+// normal import path.
+func (h *Host) completeRecordedImport(ctx context.Context, shardID, replicaID, index, term,
+	onDiskIndex uint64, membership proto.Membership, rawHeader []byte, r io.Reader,
+	opts []ImportOption) (done bool, err error) {
+	snapDir, pending, err := h.importAwaitsLogFloor(shardID, replicaID, index, term, onDiskIndex,
+		protoMembershipToLogDB(membership))
+	if err != nil || pending == nil {
+		return false, err
+	}
+	// The retry must declare the layout a fresh import would accept, and that
+	// layout must place the snapshot where the recorded import put it. A
+	// contradictory WithImportDataDir is refused here as the normal path
+	// refuses it, rather than completing an import under a layout it never
+	// used. importSnapshotDir itself refuses a declaration that contradicts
+	// the bootstrap record, and one that is missing when there is none.
+	_, wantDir, err := h.importSnapshotDir(shardID, replicaID, index, opts)
+	if err != nil {
+		return true, err
+	}
+	if filepath.Clean(wantDir) != filepath.Clean(snapDir) {
+		var iopts importOptions
+		for _, opt := range opts {
+			opt(&iopts)
+		}
+		// No bootstrap record states the layout, so the recorded snapshot
+		// directory is the only record of it.
+		return true, &ImportDataDirMismatchError{
+			ShardID:   shardID,
+			ReplicaID: replicaID,
+			Declared:  iopts.dataDir,
+			Recorded:  snapDir,
+		}
+	}
+	// Only the header has been read. The rest of the stream must still be the
+	// complete, trailer-verified artifact before the floor moves, or a
+	// truncated or damaged stream would complete an import a fresh one would
+	// refuse. Same bounded, ctx-aware reader stageImportedArtifact uses.
+	tail := &artifactTailReader{r: r}
+	src := &importPayloadReader{
+		ctx: ctx,
+		r: newArtifactPayloadReader(rawHeader,
+			io.LimitReader(tail, int64(config.DefaultMaxSnapshotSize)+1+snapshotArtifactTrailerSize)),
+		maxSize: config.DefaultMaxSnapshotSize,
+		shardID: shardID,
+	}
+	if _, err := io.Copy(io.Discard, src); err != nil {
+		return true, err
+	}
+	if err := ctx.Err(); err != nil {
+		return true, mapContextError(err)
+	}
+	// A verified stream proves only that it is A sound artifact. It is the
+	// retry of THE recorded one only if its trailer — the length and hash
+	// over header and payload — is the one the recorded import verified. Any
+	// other artifact at this index is refused exactly as the normal path
+	// refuses an import that does not advance the recorded snapshot.
+	if !bytesEqual(tail.trailer(), pending) {
+		if refuse := h.checkImportAdvancesSnapshot(shardID, replicaID, index); refuse != nil {
+			return true, refuse
+		}
+		return true, &SnapshotArtifactError{Reason: "artifact differs from the recorded import it retries"}
+	}
+	return true, h.finishImportLogFloor(shardID, replicaID, index, snapDir)
+}
+
+// importFloorPendingFile is the marker an import writes into the snapshot
+// directory it publishes, holding the verified artifact trailer. Its presence
+// means the floor advance is still pending; finishImportLogFloor removes it.
+const importFloorPendingFile = "import.floor-pending"
+
+// artifactTailReader passes r through and keeps the last
+// snapshotArtifactTrailerSize bytes read from it: once the payload reader has
+// verified the stream to its end, that tail is the artifact's trailer.
+type artifactTailReader struct {
+	r    io.Reader
+	tail []byte
+}
+
+// Read reads from the source and records the trailing bytes.
+func (a *artifactTailReader) Read(p []byte) (int, error) {
+	n, err := a.r.Read(p)
+	if n > 0 {
+		a.tail = append(a.tail, p[:n]...)
+		if extra := len(a.tail) - snapshotArtifactTrailerSize; extra > 0 {
+			a.tail = a.tail[:copy(a.tail, a.tail[extra:])]
+		}
+	}
+	return n, err
+}
+
+// trailer returns the last snapshotArtifactTrailerSize bytes read.
+func (a *artifactTailReader) trailer() []byte { return a.tail }
+
+// writeImportFloorPending records trailer as dir's pending floor marker.
+func writeImportFloorPending(fsys snapshotFS, dir string, trailer []byte) error {
+	f, err := fsys.OpenFile(filepath.Join(dir, importFloorPendingFile),
+		os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := f.Write(trailer)
+	if writeErr == nil {
+		writeErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+// readImportFloorPending returns dir's pending floor marker, or nil when the
+// floor advance is not pending. A marker of the wrong size fails closed.
+func readImportFloorPending(fsys snapshotFS, dir string) ([]byte, error) {
+	f, err := fsys.Open(filepath.Join(dir, importFloorPendingFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	b, readErr := io.ReadAll(io.LimitReader(f, snapshotArtifactTrailerSize+1))
+	_ = f.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if len(b) != snapshotArtifactTrailerSize {
+		return nil, &SnapshotArtifactError{Reason: "malformed pending import floor marker in " + dir}
+	}
+	return b, nil
+}
+
+// finishImportLogFloor advances the log floor and then clears the pending
+// marker. Only a failed floor advance is returned; once the floor is durable a
+// failed marker removal or directory fsync is logged and the import succeeds.
+func (h *Host) finishImportLogFloor(shardID, replicaID, index uint64, snapDir string) error {
+	if err := h.advanceImportLogFloor(shardID, replicaID, index); err != nil {
+		return err
+	}
+	// The floor is durable: the import is complete. Clearing the marker is
+	// cleanup, and a failure in it must not be reported as a failed import.
+	// Once the marker is gone a retry has nothing to complete and is refused
+	// as out of date, so an error here would leave a finished import reported
+	// as failed with no retry that succeeds. A marker that survives only makes
+	// a retry re-run the floor advance, which is idempotent.
+	fsys := h.snapshotFsys()
+	if err := fsys.Remove(filepath.Join(snapDir, importFloorPendingFile)); err != nil && !os.IsNotExist(err) {
+		slog.Warn("quicraft: snapshot import complete but its floor-pending marker was not removed",
+			"shard", shardID, "replica", replicaID, "dir", snapDir, "error", err)
+		return nil
+	}
+	if err := syncDir(fsys, snapDir); err != nil {
+		slog.Warn("quicraft: snapshot import complete but its directory fsync after the "+
+			"marker removal failed",
+			"shard", shardID, "replica", replicaID, "dir", snapDir, "error", err)
+	}
+	return nil
 }
 
 // importSnapshotDir resolves the canonical on-disk directory an imported
@@ -9767,8 +10077,9 @@ func (h *Host) stageImportedArtifact(
 		return 0, 0, unpin, ErrSnapshotBarrierSealed
 	}
 	dataPath := filepath.Join(stageDir, "snapshot.dat")
+	tail := &artifactTailReader{r: r}
 	epoch, pinned, writeErr := h.writeImportedSnapshotData(ctx, fsys, shardID, replicaID, header.Index,
-		dataPath, rawHeader, r, importBarrier)
+		dataPath, rawHeader, tail, importBarrier)
 	if writeErr != nil {
 		// Do not leave a partial (possibly multi-gigabyte) artifact behind
 		// for an import that will never be recorded in LogDB.
@@ -9782,6 +10093,12 @@ func (h *Host) stageImportedArtifact(
 		for _, e := range pinned {
 			importBarrier.DeregisterInFlightEpoch(e)
 		}
+	}
+	// The verified trailer marks the floor advance pending until
+	// finishImportLogFloor clears it; the retry must reproduce it.
+	if markErr := writeImportFloorPending(fsys, stageDir, tail.trailer()); markErr != nil {
+		discardImportDir(fsys, shardID, stageDir)
+		return 0, 0, unpin, markErr
 	}
 
 	// Write the snapshot metadata file beside the artifact, recording the epoch
@@ -10607,6 +10924,17 @@ func (h *Host) rotateBarrierKey(ctx context.Context) {
 		return
 	}
 	newEpoch, err := h.barrier.Rotate(ctx)
+	if err != nil && errors.Is(err, seal.ErrKnownEpochsExhausted) {
+		// A host restarted with a full known-epoch set refuses every
+		// rotation, and the retention purge below only runs after a
+		// successful one, so the set would never shrink. Purge under the
+		// configured retention (clamped to the global safe floor, exactly
+		// as after a rotation) and retry once when that freed an epoch.
+		// Without retention, or with nothing purgeable, the refusal stands.
+		if h.purgeRetainedEpochs(ctx, h.barrier.CurrentEpoch()) > 0 {
+			newEpoch, err = h.barrier.Rotate(ctx)
+		}
+	}
 	if err != nil && endedBy(ctx, err) {
 		// The host is closing and cancelled the rotation. Nothing was
 		// persisted, the current epoch stays active, and the misconfiguration
@@ -10629,58 +10957,70 @@ func (h *Host) rotateBarrierKey(ctx context.Context) {
 		return
 	}
 	h.logger.Info("key rotation completed", "epoch", newEpoch)
+	h.purgeRetainedEpochs(ctx, newEpoch)
+}
 
-	if h.cfg.MaxRetainedEpochs > 0 && newEpoch > h.cfg.MaxRetainedEpochs {
-		purgeThreshold := newEpoch - h.cfg.MaxRetainedEpochs
-
-		// Clamp the retention-based threshold to the GLOBAL safe-purge
-		// floor: the minimum epoch still needed by ANY shard's retained
-		// encrypted snapshot or any live WAL record. Without this clamp,
-		// rotation alone could purge a DEK still required to decrypt a
-		// persisted snapshot or WAL, permanently bricking encrypted data.
-		//
-		// Fail safe: when the floor cannot be determined (errors scanning
-		// snapshot dirs / MinLiveEpoch error, or nothing encrypted is
-		// retained), skip purging entirely rather than purge on uncertainty.
-		safeFloor, ok := h.engine.GlobalSafePurgeFloor()
-		if !ok {
-			h.logger.Debug("epoch purge after rotation skipped: global safe floor unknown",
-				"purge_threshold", purgeThreshold,
-			)
-			return
-		}
-		purgeFloor := purgeThreshold
-		if safeFloor < purgeFloor {
-			purgeFloor = safeFloor
-		}
-
-		purged, purgeErr := h.barrier.PurgeEpochsBefore(ctx, purgeFloor)
-		if purgeErr != nil && endedBy(ctx, purgeErr) {
-			// The host is closing and cancelled the purge before anything was
-			// persisted or dropped; the next rotation after a restart purges
-			// again.
-			h.logger.Debug("epoch purge after rotation abandoned: host is closing",
-				"purge_floor", purgeFloor,
-				"error", purgeErr,
-			)
-			return
-		}
-		if purgeErr != nil {
-			h.logger.Error("epoch purge after rotation failed",
-				"purge_floor", purgeFloor,
-				"retention_threshold", purgeThreshold,
-				"global_safe_floor", safeFloor,
-				"error", purgeErr,
-			)
-		} else if purged > 0 {
-			h.logger.Info("purged old encryption epochs",
-				"purged", purged,
-				"purge_floor", purgeFloor,
-				"retention_threshold", purgeThreshold,
-				"global_safe_floor", safeFloor,
-			)
-		}
+// purgeRetainedEpochs purges the epochs older than the MaxRetainedEpochs
+// window ending at epoch, clamped to the global safe-purge floor, and returns
+// how many epochs it dropped. It does nothing (returns 0) without retention
+// configured, when epoch is still inside the window, or when the floor is
+// unknown.
+func (h *Host) purgeRetainedEpochs(ctx context.Context, epoch uint64) int {
+	if h.cfg.MaxRetainedEpochs == 0 || epoch <= h.cfg.MaxRetainedEpochs {
+		return 0
 	}
+	purgeThreshold := epoch - h.cfg.MaxRetainedEpochs
+
+	// Clamp the retention-based threshold to the GLOBAL safe-purge
+	// floor: the minimum epoch still needed by ANY shard's retained
+	// encrypted snapshot or any live WAL record. Without this clamp,
+	// rotation alone could purge a DEK still required to decrypt a
+	// persisted snapshot or WAL, permanently bricking encrypted data.
+	//
+	// Fail safe: when the floor cannot be determined (errors scanning
+	// snapshot dirs / MinLiveEpoch error, or nothing encrypted is
+	// retained), skip purging entirely rather than purge on uncertainty.
+	safeFloor, ok := h.engine.GlobalSafePurgeFloor()
+	if !ok {
+		h.logger.Debug("epoch purge after rotation skipped: global safe floor unknown",
+			"purge_threshold", purgeThreshold,
+		)
+		return 0
+	}
+	purgeFloor := purgeThreshold
+	if safeFloor < purgeFloor {
+		purgeFloor = safeFloor
+	}
+
+	purged, purgeErr := h.barrier.PurgeEpochsBefore(ctx, purgeFloor)
+	if purgeErr != nil && endedBy(ctx, purgeErr) {
+		// The host is closing and cancelled the purge before anything was
+		// persisted or dropped; the next rotation after a restart purges
+		// again.
+		h.logger.Debug("epoch purge after rotation abandoned: host is closing",
+			"purge_floor", purgeFloor,
+			"error", purgeErr,
+		)
+		return 0
+	}
+	if purgeErr != nil {
+		h.logger.Error("epoch purge after rotation failed",
+			"purge_floor", purgeFloor,
+			"retention_threshold", purgeThreshold,
+			"global_safe_floor", safeFloor,
+			"error", purgeErr,
+		)
+		return 0
+	}
+	if purged > 0 {
+		h.logger.Info("purged old encryption epochs",
+			"purged", purged,
+			"purge_floor", purgeFloor,
+			"retention_threshold", purgeThreshold,
+			"global_safe_floor", safeFloor,
+		)
+	}
+	return purged
 }
 
 // pendingSweepLoop periodically scans all node states and completes

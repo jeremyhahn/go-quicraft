@@ -101,7 +101,9 @@ type FlushError struct {
 
 	// Indeterminate reports that the outcome of the proposal is UNKNOWN
 	// rather than a definite rejection: the proposer timed out or was
-	// canceled, so the batch may already be replicated and may still apply.
+	// canceled, or the proposer reported the proposal may already be
+	// applied (quicraft.MaybeApplied), so the batch may already be
+	// replicated and may still apply.
 	// A caller that retries an indeterminate flush must be prepared for the
 	// batch to be applied twice — the aggregator has no session/at-most-once
 	// path (see the Aggregator doc comment).

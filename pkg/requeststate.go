@@ -314,6 +314,19 @@ func awaitResult(ctx context.Context, rs *RequestState) (RequestResult, error) {
 	}
 }
 
+// Wait blocks until the request completes or ctx ends, and returns the
+// request's result and error. When ctx ends first, the lost wait is
+// classified from the request, as every synchronous host call classifies it:
+// a request its node's queue closed on before the step worker took it can
+// never reach Raft, so the error is a definite ErrTimeout (deadline) or
+// ErrCanceled (cancellation); a request that may have been handed off reports
+// the same sentinel inside *MaybeAppliedError. Callers that submit with an
+// asynchronous call (ProposeWithSession, CloseSession) and wait themselves use
+// Wait so that a lost wait keeps that distinction.
+func (rs *RequestState) Wait(ctx context.Context) (RequestResult, error) {
+	return awaitResult(ctx, rs)
+}
+
 // ResultC returns a read-only channel that receives the result when the
 // request completes. Returns nil if the RequestState has been released.
 // The channel receives exactly one value.

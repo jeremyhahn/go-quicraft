@@ -116,7 +116,10 @@ type RepairResult struct {
 // It is the documented exit from ErrMidSegmentCorruption,
 // ErrNonFinalSegmentCorruption, ErrAcknowledgedDataLost and
 // ErrRecordSequenceRegression. It must be run with the database CLOSED — no
-// process may hold the directory — and the node it belongs to should be treated
+// process may hold the directory. This is enforced: Repair takes the same
+// directory lock Open holds for the life of a DB, and refuses a directory a
+// live DB has open with a *DBOpenError wrapping fsutil.ErrDirLocked, before it
+// reads or changes anything. The node it belongs to should be treated
 // as having lost its most recent writes until it has caught up from its peers.
 // On a single-node deployment there is nothing to catch up from and the loss is
 // final.
@@ -134,6 +137,22 @@ func Repair(dir string, target RepairTarget, opts ...Option) (RepairResult, erro
 	}
 	if target.ShardIndex < 0 || target.ShardIndex >= DefaultShardCount {
 		return RepairResult{}, ErrRepairShardOutOfRange
+	}
+	// Take the directory lock Open holds. A repair under a live writer would
+	// unlink and truncate segments that writer keeps appending to at its old
+	// offsets, and the next restart would replay a log with a hole where
+	// acknowledged writes were.
+	if locker, ok := o.fs.(DirLocker); ok {
+		lock, err := locker.LockDir(dir, walLockFilename)
+		if err != nil {
+			return RepairResult{}, &DBOpenError{Dir: dir, Err: err}
+		}
+		defer func() {
+			if err := lock.Close(); err != nil {
+				slog.Debug("waldb: releasing the directory lock after a repair failed",
+					"dir", dir, "error", err)
+			}
+		}()
 	}
 	// Hold the repair to the same geometry rule Open enforces. A repair run
 	// under the wrong block size scans a grid the segment was not written on,

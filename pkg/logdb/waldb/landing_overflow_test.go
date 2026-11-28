@@ -29,6 +29,17 @@ func (b oversizeEnvelopeBarrier) EncryptWithContext(dst, plaintext, contextAAD [
 	return append(ct, make([]byte, oversizeEnvelopeTail)...), nil
 }
 
+// EncryptWithEpochPinnedContext is the seal writeRecord uses when the barrier
+// can pin a seal epoch; it carries the same oversize envelope, or the promoted
+// method would seal a normal-sized record and the overflow path would never run.
+func (b oversizeEnvelopeBarrier) EncryptWithEpochPinnedContext(dst, plaintext, contextAAD []byte) ([]byte, uint64, error) {
+	ct, epoch, err := b.Barrier.EncryptWithEpochPinnedContext(dst, plaintext, contextAAD)
+	if err != nil {
+		return nil, 0, err
+	}
+	return append(ct, make([]byte, oversizeEnvelopeTail)...), epoch, nil
+}
+
 func (b oversizeEnvelopeBarrier) DecryptWithContext(dst, ciphertext, contextAAD []byte) ([]byte, error) {
 	if len(ciphertext) < oversizeEnvelopeTail {
 		return nil, errors.New("oversizeEnvelopeBarrier: ciphertext shorter than its tail")

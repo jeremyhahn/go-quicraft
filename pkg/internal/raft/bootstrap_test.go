@@ -16,6 +16,8 @@ package raft
 
 import (
 	"bytes"
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
@@ -455,4 +457,57 @@ func TestInitialMembershipOutsideBootstrapIndexIsRefused(t *testing.T) {
 		t.Fatalf("the founding entry at the bootstrap index was refused "+
 			"(applied=%v err=%v)", applied, err)
 	}
+}
+
+// TestReconstructMembership_UnsupportedWireVersionIsFatal pins that recovery
+// reaches the runtime commit path's decision for a committed wire-version
+// switch this build cannot read: fatal, not silently skipped. Every other
+// deterministic refusal is still skipped, as at runtime.
+func TestReconstructMembership_UnsupportedWireVersionIsFatal(t *testing.T) {
+	founding, err := BuildInitialMembershipEntry(proto.Membership{
+		Addresses: map[uint64]string{1: "a", 2: "b", 3: "c"},
+	})
+	if err != nil {
+		t.Fatalf("BuildInitialMembershipEntry: %v", err)
+	}
+	foundingOnly, err := ReconstructMembership([]proto.Entry{founding})
+	if err != nil {
+		t.Fatalf("ReconstructMembership(founding): %v", err)
+	}
+
+	t.Run("wire version outside window", func(t *testing.T) {
+		entries := []proto.Entry{founding, {
+			Index: 2, Term: 1, Type: proto.EntryConfigChange,
+			Cmd: marshalConfigChange(t, proto.ConfigChange{
+				Type: proto.UpdateWireVersion, WireVersion: proto.WireVersion + 1,
+			}),
+		}}
+		got, err := ReconstructMembership(entries)
+		if !errors.Is(err, proto.ErrUnsupportedVersion) {
+			t.Fatalf("got err %v, want ErrUnsupportedVersion: the runtime path "+
+				"faults the shard on this entry, so recovery must too", err)
+		}
+		if errors.Is(err, ErrCorruptConfigEntry) {
+			t.Fatalf("err %v matches ErrCorruptConfigEntry: the entry decodes", err)
+		}
+		if !reflect.DeepEqual(got, proto.Membership{}) {
+			t.Fatalf("got membership %+v alongside the error, want the zero value", got)
+		}
+	})
+
+	t.Run("ordinary refusal is skipped", func(t *testing.T) {
+		entries := []proto.Entry{founding, {
+			Index: 2, Term: 1, Type: proto.EntryConfigChange,
+			Cmd: marshalConfigChange(t, proto.ConfigChange{
+				Type: proto.RemoveNode, ReplicaID: 98,
+			}),
+		}}
+		got, err := ReconstructMembership(entries)
+		if err != nil {
+			t.Fatalf("removing a non-member must be skipped, got err %v", err)
+		}
+		if !reflect.DeepEqual(got, foundingOnly) {
+			t.Fatalf("got membership %+v, want the founding membership %+v", got, foundingOnly)
+		}
+	})
 }

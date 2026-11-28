@@ -232,16 +232,12 @@ type SnapshotOption struct {
 	Exported bool
 }
 
-// Validate checks that the SnapshotOption fields are consistent and
-// valid. CompactionOverhead and CompactionIndex are mutually exclusive:
-// setting both is an error. Additionally, setting CompactionIndex when
-// OverrideCompactionOverhead is true is always rejected because quicraft
-// does not support index-based compaction.
+// Validate checks that the SnapshotOption fields are valid. Any non-zero
+// CompactionIndex is refused with *CompactionIndexNotSupportedError
+// (errors.Is ErrInvalidOption), whatever the other fields hold, because
+// quicraft does not support index-based compaction.
 func (o SnapshotOption) Validate() error {
-	if o.CompactionOverhead > 0 && o.CompactionIndex > 0 {
-		return &CompactionIndexNotSupportedError{}
-	}
-	if o.OverrideCompactionOverhead && o.CompactionIndex > 0 {
+	if o.CompactionIndex > 0 {
 		return &CompactionIndexNotSupportedError{}
 	}
 	return nil
@@ -679,6 +675,20 @@ func (nh *NodeHost) effectiveConfigChangeIndex(shardID, configChangeIndex uint64
 	return configChangeIndex
 }
 
+// configChangeOpts returns the quicraft options for an add on shardID. An
+// ordered shard binds the add to its configChangeIndex even when that index
+// is 0: dragonboat refuses any index other than the current config change
+// ID, while quicraft treats an unbound 0 as "skip the check". Without the
+// binding, two operators who both read ConfigChangeID 0 could both commit
+// an add after the membership has already changed. Unordered shards pass
+// no option and keep the unbound behaviour.
+func (nh *NodeHost) configChangeOpts(shardID uint64) []quicraft.ConfigChangeOption {
+	if !nh.orderedConfigChange(shardID) {
+		return nil
+	}
+	return []quicraft.ConfigChangeOption{quicraft.WithBoundConfigChangeIndex()}
+}
+
 // removedMarkerDirName is the directory under NodeHostDir that holds one
 // marker file per permanently removed shard/replica pair. The markers make
 // the RemoveData guard survive process restarts.
@@ -808,6 +818,11 @@ func (nh *NodeHost) StopReplica(shardID, replicaID uint64) error {
 // SyncPropose makes a synchronous proposal through Raft consensus.
 // For no-op sessions, the simpler SyncPropose path is used. For tracked
 // sessions, SyncProposeWithSession handles at-most-once semantics.
+//
+// A context that ends after the proposal was handed to the host is
+// reported with quicraft.MaybeApplied true (a *quicraft.MaybeAppliedError
+// wrapping ErrTimeout or ErrCanceled) for both session kinds: the entry
+// may still commit and apply.
 func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, cmd []byte) (dbSM.Result, error) {
 	if err := checkContextDeadline(ctx); err != nil {
 		return dbSM.Result{}, err
@@ -848,18 +863,21 @@ func (nh *NodeHost) SyncPropose(ctx context.Context, session *dbClient.Session, 
 	}
 	defer rs.Release()
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return dbSM.Result{}, translateError(result.Err)
-		}
-		return dbSM.Result{Value: result.Value, Data: result.Data}, nil
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return dbSM.Result{}, ErrTimeout
-		}
-		return dbSM.Result{}, ErrCanceled
+	// The host classifies a lost wait from the request, as the no-op
+	// session path's SyncPropose does: maybe-applied once the proposal may
+	// have been handed off, definite when its queue closed before hand-off.
+	result, err := waitRequest(ctx, rs)
+	if err != nil {
+		return dbSM.Result{}, translateError(err)
 	}
+	return dbSM.Result{Value: result.Value, Data: result.Data}, nil
+}
+
+// waitRequest waits for a request the adapter submitted asynchronously. It
+// is RequestState.Wait, which classifies a lost wait from the request; tests
+// replace it to drive a classification the public API cannot stage.
+var waitRequest = func(ctx context.Context, rs *quicraft.RequestState) (quicraft.RequestResult, error) {
+	return rs.Wait(ctx)
 }
 
 // SyncRead performs a linearizable read via ReadIndex + Lookup.
@@ -910,7 +928,10 @@ func (nh *NodeHost) SyncGetSession(ctx context.Context, shardID uint64) (*dbClie
 
 // SyncCloseSession closes a client session by proposing unregistration
 // through Raft consensus. Blocks until the session is closed or the
-// context is canceled.
+// context is canceled. A context that ends after the request was handed
+// to the host is reported with quicraft.MaybeApplied true (a
+// *quicraft.MaybeAppliedError wrapping ErrTimeout or ErrCanceled): the
+// unregistration may still apply.
 func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) error {
 	if err := checkContextDeadline(ctx); err != nil {
 		return err
@@ -922,18 +943,14 @@ func (nh *NodeHost) SyncCloseSession(ctx context.Context, cs *dbClient.Session) 
 	}
 	defer rs.Release()
 
-	select {
-	case result := <-rs.ResultC():
-		if result.Err != nil {
-			return translateError(result.Err)
-		}
-		return validateCloseSessionResult(result.Value, cs.ClientID())
-	case <-ctx.Done():
-		if ctx.Err() == context.DeadlineExceeded {
-			return ErrTimeout
-		}
-		return ErrCanceled
+	// The host classifies a lost wait from the request: maybe-applied once
+	// the close may have been handed off, definite when its queue closed
+	// before hand-off.
+	result, err := waitRequest(ctx, rs)
+	if err != nil {
+		return translateError(err)
 	}
+	return validateCloseSessionResult(result.Value, cs.ClientID())
 }
 
 // requireNoOPSessionOnDisk enforces dragonboat's rule that replicas backed
@@ -1360,7 +1377,7 @@ func (nh *NodeHost) SyncRequestAddReplica(ctx context.Context, shardID, replicaI
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddNode(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddNode(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddReplicaWithIdentity is SyncRequestAddReplica carrying the node
@@ -1375,7 +1392,7 @@ func (nh *NodeHost) SyncRequestAddReplicaWithIdentity(ctx context.Context, shard
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddNonVotingWithIdentity is SyncRequestAddNonVoting carrying the
@@ -1387,7 +1404,7 @@ func (nh *NodeHost) SyncRequestAddNonVotingWithIdentity(ctx context.Context, sha
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddWitnessWithIdentity is SyncRequestAddWitness carrying the node
@@ -1399,7 +1416,7 @@ func (nh *NodeHost) SyncRequestAddWitnessWithIdentity(ctx context.Context, shard
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // NodeIdentity returns this NodeHost's stable node identity — the value
@@ -1439,7 +1456,7 @@ func (nh *NodeHost) SyncRequestAddNonVoting(ctx context.Context, shardID, replic
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddObserver(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddObserver(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestAddWitness adds a voting witness replica and blocks until
@@ -1451,7 +1468,7 @@ func (nh *NodeHost) SyncRequestAddWitness(ctx context.Context, shardID, replicaI
 	if !dbConfig.IsValidAddress(target) {
 		return ErrInvalidAddress
 	}
-	return translateError(nh.host.SyncRequestAddWitness(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex)))
+	return translateError(nh.host.SyncRequestAddWitness(ctx, shardID, replicaID, target, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...))
 }
 
 // SyncRequestDeleteReplica removes a replica from the shard and blocks
@@ -1504,7 +1521,7 @@ func (nh *NodeHost) RequestAddReplicaWithIdentity(shardID, replicaID uint64, tar
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddNodeWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...)
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
@@ -1530,7 +1547,7 @@ func (nh *NodeHost) RequestAddNonVotingWithIdentity(shardID, replicaID uint64, t
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddObserverWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...)
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
@@ -1560,7 +1577,7 @@ func (nh *NodeHost) RequestAddWitnessWithIdentity(shardID, replicaID uint64, tar
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
-	rs, err := nh.host.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex))
+	rs, err := nh.host.RequestAddWitnessWithIdentity(ctx, shardID, replicaID, target, identity, nh.effectiveConfigChangeIndex(shardID, configChangeIndex), nh.configChangeOpts(shardID)...)
 	if err != nil {
 		cancel()
 		return nil, translateError(err)
