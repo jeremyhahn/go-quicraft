@@ -13,6 +13,8 @@
 #   jobs it cannot read by lines (a quoted or flow-style jobs key, a job
 #   that is not a block mapping, an explicit or merge key, an alias, anchor
 #   or tag, no or two jobs keys), so such a workflow never gets its OK.
+# - LOCAL (#1250): DOCS_TESTED_PATTERN; a PR changing markdown a _test.go
+#   reads is not docs-only, so the unit jobs that read it run.
 # HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
 # waiver on its runs-on line that names its category and a reason:
 # `# self-hosted: hardware: <reason>` (the job needs specific hardware), or
@@ -662,6 +664,8 @@ env:
   # v1.24: the files a docs-only PR may touch. CUSTOMIZE: narrow it
   # in a repo that embeds or generates from docs/ (go:embed, OpenAPI, protos).
   DOCS_ONLY_PATTERN: '(\.md$|^docs/)'
+  # LOCAL (#1250): markdown a _test.go reads is not docs-only (pkg/metrics_documented_test.go, contrib/dragonboat/readme_table_test.go).
+  DOCS_TESTED_PATTERN: '(^docs/observability/|^docs/multi-group-host/api\.md$|^contrib/dragonboat/README\.md$)'
   # v1.30 (fix 3): a PR runs the lint-gates job only when a changed file
   # matches this extended regex. CUSTOMIZE: narrow it to what the repository's
   # lint-gates read (scripts, workflows, generated code, go.mod). The default
@@ -1893,7 +1897,9 @@ jobs:
           docs_only=false lint_gates=true
           if [ "$EVENT" = pull_request ] && [ "$CI_FULL_LABEL" != true ]; then
             if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
-              if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN"; then
+              # LOCAL (#1250): a changed file a test reads (DOCS_TESTED_PATTERN) keeps docs_only false.
+              if ! printf '%s\n' "$files" | grep -qvE "$DOCS_ONLY_PATTERN" &&
+                ! printf '%s\n' "$files" | grep -qE "$DOCS_TESTED_PATTERN"; then
                 docs_only=true
               fi
               printf '%s\n' "$files" | grep -qE "$LINT_GATES_PATTERN" || lint_gates=false
