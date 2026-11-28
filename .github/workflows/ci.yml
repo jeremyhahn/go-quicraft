@@ -13,6 +13,11 @@
 #   jobs it cannot read by lines (a quoted or flow-style jobs key, a job
 #   that is not a block mapping, an explicit or merge key, an alias, anchor
 #   or tag, no or two jobs keys), so such a workflow never gets its OK.
+# - LOCAL (#1302): the clusterproof job (make test-clusterproof, the
+#   three-process SIGKILL harness) runs on every push to main and on a pull
+#   request whose changed files match CLUSTERPROOF_PATTERN (preflight's
+#   clusterproof output); CI Gate checks it as `clusterproof`, skipped only
+#   when not selected. A failing run uploads the harness log.
 # - LOCAL (#1250): DOCS_TESTED_PATTERN; a PR changing markdown a _test.go
 #   reads is not docs-only, so the unit jobs that read it run.
 # HOSTED FIRST: every job runs on ubuntu-latest. A job leaves it only with a
@@ -671,6 +676,9 @@ env:
   # lint-gates read (scripts, workflows, generated code, go.mod). The default
   # matches every file, so lint-gates runs on every PR.
   LINT_GATES_PATTERN: '.'
+  # LOCAL (#1302): a PR runs the clusterproof job only when a changed file
+  # matches: the Raft core, the WAL, the transport or the harness itself.
+  CLUSTERPROOF_PATTERN: '^(pkg/internal/raft/|pkg/logdb/|pkg/internal/transport/|test/clusterproof/)'
   # v1.26.1 (Tenant Agent m1128 (9)): the repository's releasability test, which
   # a docs-only PR still runs because make coverage skips on it. CUSTOMIZE: the
   # `go test` arguments, package and -run pattern (for example
@@ -763,6 +771,7 @@ jobs:
     outputs:
       docs_only: ${{ steps.diff.outputs.docs_only }}
       lint_gates: ${{ steps.diff.outputs.lint_gates }}   # v1.30
+      clusterproof: ${{ steps.diff.outputs.clusterproof }}   # LOCAL (#1302)
       verdict: ${{ steps.guard.outputs.verdict }}
       proof: ${{ steps.guard.outputs.proof }}   # v1.30
       # v1.48 (ruling 1024): runs-on JSON for the two hosted-capable classes,
@@ -1895,6 +1904,7 @@ jobs:
           # PR keeps both scopes off. LOCAL: the template's CI_FULL_LABEL is
           # CI_FULL_TIER here, which on a PR is exactly the ci:full label.
           docs_only=false lint_gates=true
+          clusterproof=true   # LOCAL (#1302): off only on a PR whose files all miss CLUSTERPROOF_PATTERN
           if [ "$EVENT" = pull_request ] && [ "$CI_FULL_LABEL" != true ]; then
             if files=$(git diff --name-only --no-renames "$BASE...$HEAD") && [ -n "$files" ]; then
               # LOCAL (#1250): a changed file a test reads (DOCS_TESTED_PATTERN) keeps docs_only false.
@@ -1903,12 +1913,17 @@ jobs:
                 docs_only=true
               fi
               printf '%s\n' "$files" | grep -qE "$LINT_GATES_PATTERN" || lint_gates=false
+              printf '%s\n' "$files" | grep -qE "$CLUSTERPROOF_PATTERN" || clusterproof=false   # LOCAL (#1302)
               printf '%s\n' "$files"
             fi
           fi
-          echo "docs only: $docs_only; lint-gates: $lint_gates"
-          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
-          echo "lint_gates=$lint_gates" >> "$GITHUB_OUTPUT"
+          echo "docs only: $docs_only; lint-gates: $lint_gates; clusterproof: $clusterproof"
+          # LOCAL (#1302): one redirect for the three outputs (clusterproof added).
+          {
+            echo "docs_only=$docs_only"
+            echo "lint_gates=$lint_gates"
+            echo "clusterproof=$clusterproof"
+          } >> "$GITHUB_OUTPUT"
 
       - name: No direct go-objstore import outside the storage seam
         run: |
@@ -3055,6 +3070,94 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/gomodauth.env"
 
+  # LOCAL (#1302): three replica processes, a random one SIGKILLed and
+  # restarted each cycle under concurrent writes; the job fails if any
+  # acknowledged write is missing from a replica. Every push to main; a PR
+  # only when it changes the Raft core, the WAL, the transport or the harness
+  # (CLUSTERPROOF_PATTERN), and CI Gate passes the skip only then.
+  clusterproof:
+    name: Cluster proof [three-process SIGKILL harness, toolchain image]
+    runs-on: ${{ github.server_url == 'https://github.com' && fromJSON(needs.preflight.outputs.runner_docker) || 'bigdisk' }}   # the preflight runner selection, as netfault
+    if: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ci/deps-bump') && !github.event.pull_request.draft && needs.preflight.outputs.verdict == 'run' && needs.preflight.outputs.docs_only != 'true' && needs.preflight.outputs.clusterproof == 'true' }}
+    needs: [image, preflight]
+    timeout-minutes: 60      # a cold toolchain image build, then the 600 s harness
+    env:
+      CI_STACK_PREFIX: ${{ github.event.repository.name }}-ci-
+      CI_CACHE_CLASS: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && 'main' || 'pr' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Mask the forge credentials
+        run: |
+          for v in GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+            val=${!v:-}
+            [ -n "$val" ] || continue
+            echo "::add-mask::$val"
+            case $val in *://*:*@*) t=${val#*://}; t=${t%%@*}; echo "::add-mask::${t#*:}" ;; esac
+          done
+
+      - name: Free runner disk
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h /
+
+      - name: Reap stale CI stacks
+        run: scripts/reap-stale-ci-stacks.sh "$CI_STACK_PREFIX"
+
+      - name: Tune QUIC UDP buffers
+        run: |
+          sudo -n sysctl -w net.core.rmem_max=7340032 net.core.wmem_max=7340032 \
+            || echo "::warning::could not raise the UDP buffer limits; quic-go runs with the kernel default"
+
+      - name: Pull the toolchain image from the registry cache
+        run: scripts/ci-image-cache.sh pull || true
+
+      - name: Build the toolchain image
+        run: |
+          ( umask 077; : > "$RUNNER_TEMP/gomodauth.env"
+            for v in GOPRIVATE GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+              if [ -n "${!v:-}" ]; then printf '%s=%s\n' "$v" "${!v}" >> "$RUNNER_TEMP/gomodauth.env"; fi
+            done )
+          bp=
+          if [ -n "${DEVCACHE_GOPROXY:-}" ] && curl -s -o /dev/null --max-time 5 "$DEVCACHE_GOPROXY/"; then
+            bp="GO_BUILD_PROXY=$DEVCACHE_GOPROXY|https://proxy.golang.org"
+          fi
+          make docker-build-toolchain ${bp:+"$bp"} MODULE_ENV_FILE="$RUNNER_TEMP/gomodauth.env"
+          rm -f "$RUNNER_TEMP/gomodauth.env"
+          echo "TOOLCHAIN_IMAGE=$(make -s toolchain-image)" >> "$GITHUB_ENV"
+
+      # The harness log carries the seed and the reproduce line of a failure.
+      - name: make test-clusterproof
+        if: ${{ !cancelled() && env.TOOLCHAIN_IMAGE != '' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          scripts/in-toolchain-image.sh "$TOOLCHAIN_IMAGE" make test-clusterproof 2>&1 | tee "$RUNNER_TEMP/clusterproof.log"
+
+      - name: Upload the harness log (Gitea)
+        if: ${{ failure() && github.server_url != 'https://github.com' }}
+        uses: actions/upload-artifact@c6a366c94c3e0affe28c06c8df20a878f24da3cf # v3.2.2
+        with:
+          name: clusterproof-log
+          path: ${{ runner.temp }}/clusterproof.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload the harness log
+        if: ${{ failure() && github.server_url == 'https://github.com' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: clusterproof-log
+          path: ${{ runner.temp }}/clusterproof.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Tear down
+        if: always()
+        run: rm -f "$RUNNER_TEMP/gomodauth.env"
+
   # The WAL under injected I/O failures.
   errfs:
     name: ErrorFS injection [build tag quicraft_errfs, toolchain image]
@@ -3764,7 +3867,8 @@ jobs:
     # CUSTOMIZE: the repo's job list. Add every CUSTOMIZE job here AND as a
     # check line below; remove none of the template's jobs. v1.30: lint
     # joins; publish-images is the one job outside the gate (see its comment).
-    needs: [preflight, row, lint, image, unit, coverage, lint-gates, integration, soak, netfault, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips, signatures]
+    # LOCAL (#1302): clusterproof joins the needs.
+    needs: [preflight, row, lint, image, unit, coverage, lint-gates, integration, soak, netfault, clusterproof, errfs, zero-rtt, fuzz-seeds, cross-arch, modules, contrib-dragonboat, fips, signatures]
     steps:
       - name: Fail closed on any non-success
         env:
@@ -3785,6 +3889,8 @@ jobs:
           PROOF: ${{ needs.preflight.outputs.proof }}
           DOCS_ONLY: ${{ needs.preflight.outputs.docs_only == 'true' }}
           LINT_GATES_SEL: ${{ needs.preflight.outputs.lint_gates != 'false' }}
+          # LOCAL (#1302): a `clusterproof` job skips when no file matched CLUSTERPROOF_PATTERN.
+          CLUSTERPROOF_SEL: ${{ needs.preflight.outputs.clusterproof != 'false' }}
           # v1.55: the Row job runs on pull_request only (a `pull` job).
           PULL: ${{ github.event_name == 'pull_request' }}
         run: |
@@ -3804,6 +3910,10 @@ jobs:
                   echo "SKIP $1 (docs-only pull request)"
                 elif [ "$3" = scoped ] && [ "${LINT_GATES_SEL}" != true ]; then
                   echo "SKIP $1 (no changed file matches LINT_GATES_PATTERN)"
+                elif [ "$3" = clusterproof ] && [ "${DOCS_ONLY}" = true ]; then   # LOCAL (#1302)
+                  echo "SKIP $1 (docs-only pull request)"
+                elif [ "$3" = clusterproof ] && [ "${CLUSTERPROOF_SEL}" != true ]; then   # LOCAL (#1302)
+                  echo "SKIP $1 (no changed file matches CLUSTERPROOF_PATTERN)"
                 elif [ "$3" = full ] && [ "${FULL_TIER}" != true ]; then
                   echo "SKIP $1 (full tier not selected)"
                 elif [ "$3" = pull ] && [ "${PULL}" != true ]; then
@@ -3843,6 +3953,8 @@ jobs:
           check signatures  "${{ needs.signatures.result }}" pr
           # >>> CUSTOMIZE (go-quicraft)
           check netfault    "${{ needs.netfault.result }}" code
+          # LOCAL (#1302): path-scoped on a pull request.
+          check clusterproof "${{ needs.clusterproof.result }}" clusterproof
           check errfs       "${{ needs.errfs.result }}" code
           check zero-rtt    "${{ needs.zero-rtt.result }}" code
           check fuzz-seeds  "${{ needs.fuzz-seeds.result }}" nightly
