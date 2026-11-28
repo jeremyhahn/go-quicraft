@@ -14,6 +14,8 @@
 
 package proto
 
+import "fmt"
+
 // MessageBatch is a batch of Raft messages for transport. One batch per
 // network frame. The wire format is:
 //
@@ -119,7 +121,7 @@ func (mb *MessageBatch) UnmarshalFrom(buf []byte) (int, error) {
 // UnmarshalFromWindow is UnmarshalFrom against an explicit accept set. The
 // transport passes its host's window; UnmarshalFrom passes this build's.
 func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, error) {
-	if len(buf) < messageBatchFixedSize {
+	if len(buf) < 8 {
 		return 0, ErrBufferTooSmall
 	}
 	mb.BinVer = getUint64(buf[0:])
@@ -129,9 +131,18 @@ func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, erro
 	// clear signal instead of being misparsed. Correct here because
 	// MessageBatch is transport-only: a batch lives for one frame and is
 	// never persisted, so a rejection costs one connection rather than
-	// stranding data at rest.
+	// stranding data at rest. The gate runs as soon as BinVer is present, so
+	// a peer outside the window is named even when its payload is shorter
+	// than this build's fixed header; MaxBinVer is read only from a
+	// complete one.
 	if !w.Accepts(mb.BinVer) {
+		if len(buf) < messageBatchFixedSize {
+			return 0, &shortBatchVersionError{&BatchVersionError{BinVer: mb.BinVer, Local: w}}
+		}
 		return 0, &BatchVersionError{BinVer: mb.BinVer, MaxBinVer: getUint64(buf[24:]), Local: w}
+	}
+	if len(buf) < messageBatchFixedSize {
+		return 0, ErrBufferTooSmall
 	}
 	mb.DeploymentID = getUint64(buf[8:])
 	mb.SourceEpoch = getUint64(buf[16:])
@@ -180,6 +191,24 @@ func (mb *MessageBatch) UnmarshalFromWindow(buf []byte, w WireWindow) (int, erro
 		mb.Requests = mb.Requests[:0]
 	}
 	return offset, nil
+}
+
+// shortBatchVersionError is a *BatchVersionError for a payload too short to
+// carry MaxBinVer: its message names BinVer and the local window only, and
+// errors.As still finds the wrapped *BatchVersionError.
+type shortBatchVersionError struct {
+	*BatchVersionError
+}
+
+// Error names the batch's BinVer and the local window, not MaxBinVer.
+func (e *shortBatchVersionError) Error() string {
+	return fmt.Sprintf("proto: batch wire version %d is outside the local window {current %d, previous %d}: %v",
+		e.BinVer, e.Local.Current, e.Local.Previous, ErrUnsupportedVersion)
+}
+
+// Unwrap returns the wrapped *BatchVersionError.
+func (e *shortBatchVersionError) Unwrap() error {
+	return e.BatchVersionError
 }
 
 // exceedsMaxBatchSize reports whether a decode that has consumed offset bytes
