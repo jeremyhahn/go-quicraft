@@ -264,7 +264,7 @@ func TestFlush_AllCallersCanceledSkipsPropose(t *testing.T) {
 			if flushErr.Indeterminate {
 				t.Errorf("proposal %d: a batch that was never proposed is a definite failure", i)
 			}
-		default:
+		case <-time.After(5 * time.Second):
 			t.Errorf("proposal %d: no result delivered", i)
 		}
 	}

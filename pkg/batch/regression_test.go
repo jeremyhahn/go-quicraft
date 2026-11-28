@@ -755,3 +755,345 @@ func waitForCondition(t *testing.T, within time.Duration, what string, cond func
 		}
 	}
 }
+
+// gatedProposer blocks every SyncPropose for shard 1 until release is closed
+// (or the propose context ends) and completes every other shard at once. It
+// records, per shard, the most SyncPropose calls in flight at the same time
+// and the commands proposed, in proposal order.
+type gatedProposer struct {
+	release chan struct{}
+	entered chan struct{}
+
+	mu          sync.Mutex
+	inFlight    map[uint64]int
+	maxInFlight map[uint64]int
+	cmds        map[uint64][]string
+}
+
+func newGatedProposer() *gatedProposer {
+	return &gatedProposer{
+		release:     make(chan struct{}),
+		entered:     make(chan struct{}, 16),
+		inFlight:    make(map[uint64]int),
+		maxInFlight: make(map[uint64]int),
+		cmds:        make(map[uint64][]string),
+	}
+}
+
+func (g *gatedProposer) SyncPropose(ctx context.Context, shardID uint64, data []byte) error {
+	cmds, err := DecodeBatch(data)
+	if err != nil {
+		return err
+	}
+	g.mu.Lock()
+	g.inFlight[shardID]++
+	if g.inFlight[shardID] > g.maxInFlight[shardID] {
+		g.maxInFlight[shardID] = g.inFlight[shardID]
+	}
+	for _, c := range cmds {
+		g.cmds[shardID] = append(g.cmds[shardID], string(c))
+	}
+	g.mu.Unlock()
+	defer func() {
+		g.mu.Lock()
+		g.inFlight[shardID]--
+		g.mu.Unlock()
+	}()
+
+	if shardID != 1 {
+		return nil
+	}
+	g.entered <- struct{}{}
+	select {
+	case <-g.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (g *gatedProposer) awaitEntry(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shard 1 never reached the proposer")
+	}
+}
+
+func (g *gatedProposer) maxConcurrent(shardID uint64) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.maxInFlight[shardID]
+}
+
+func (g *gatedProposer) proposed(shardID uint64) []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.cmds[shardID]...)
+}
+
+func newGatedAggregator(t *testing.T, g *gatedProposer, maxBatch, queueSize int) *Aggregator {
+	t.Helper()
+	agg, err := NewAggregator(g,
+		WithConfig(Config{
+			MaxBatchSize:   maxBatch,
+			FlushInterval:  2 * time.Millisecond,
+			QueueSize:      queueSize,
+			ProposeTimeout: 30 * time.Second,
+		}),
+		WithLogger(slog.Default()),
+		WithRegistry(newTestRegistry(t)),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	return agg
+}
+
+// heldBatches reports how many batches for shardID wait behind its in-flight
+// flush.
+func heldBatches(a *Aggregator, shardID uint64) int {
+	a.shardMu.Lock()
+	defer a.shardMu.Unlock()
+	return len(a.shardHeld[shardID])
+}
+
+func awaitNilSubmit(t *testing.T, what string, ch <-chan error) {
+	t.Helper()
+	select {
+	case err := <-ch:
+		if err != nil {
+			t.Errorf("%s: Submit = %T (%v), want nil", what, err, err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s: Submit never returned", what)
+	}
+}
+
+// A flush holding a slow or leaderless shard must not stop the flush loop:
+// another shard's proposals keep flushing while it waits.
+func TestFlush_BlockedShardDoesNotStallOtherShards(t *testing.T) {
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 4, 4)
+	defer func() { _ = agg.Close() }()
+
+	blocked := make(chan error, 1)
+	go func() { blocked <- agg.Submit(context.Background(), 1, []byte("slow")) }()
+	g.awaitEntry(t)
+
+	for i := 0; i < 8; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := agg.Submit(ctx, 2, []byte{byte('a' + i)})
+		cancel()
+		if err != nil {
+			t.Fatalf("shard 2 proposal %d: Submit = %T (%v), want nil; "+
+				"shard 1's in-flight flush stalled the flush loop", i, err, err)
+		}
+	}
+
+	close(g.release)
+	awaitNilSubmit(t, "shard 1", blocked)
+}
+
+// A shard has at most one flush in flight; later batches for it are held and
+// proposed after it, in arrival order.
+func TestFlush_BusyShardHoldsLaterBatchesInOrder(t *testing.T) {
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 1, 16)
+	defer func() { _ = agg.Close() }()
+
+	results := make([]chan error, 3)
+	for i, cmd := range []string{"first", "second", "third"} {
+		results[i] = make(chan error, 1)
+		go func() { results[i] <- agg.Submit(context.Background(), 1, []byte(cmd)) }()
+		if i == 0 {
+			g.awaitEntry(t)
+			continue
+		}
+		waitForCondition(t, 5*time.Second, "the later batch was not held behind the in-flight flush", func() bool {
+			return heldBatches(agg, 1) == i
+		})
+	}
+
+	if got := g.maxConcurrent(1); got != 1 {
+		t.Errorf("shard 1 max concurrent SyncPropose = %d, want 1", got)
+	}
+	close(g.release)
+	for i, ch := range results {
+		awaitNilSubmit(t, []string{"first", "second", "third"}[i], ch)
+	}
+	if got := g.maxConcurrent(1); got != 1 {
+		t.Errorf("shard 1 max concurrent SyncPropose = %d, want 1", got)
+	}
+	got := g.proposed(1)
+	want := []string{"first", "second", "third"}
+	if len(got) != len(want) {
+		t.Fatalf("shard 1 proposed %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("shard 1 proposed %q, want %q", got, want)
+		}
+	}
+}
+
+// Close returns only after every in-flight and held shard flush has finished,
+// and those proposals get their real result, not ClosedError.
+func TestClose_WaitsForInFlightShardFlush(t *testing.T) {
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 1, 16)
+
+	first := make(chan error, 1)
+	go func() { first <- agg.Submit(context.Background(), 1, []byte("first")) }()
+	g.awaitEntry(t)
+	second := make(chan error, 1)
+	go func() { second <- agg.Submit(context.Background(), 1, []byte("second")) }()
+	waitForCondition(t, 5*time.Second, "the second batch was not held behind the in-flight flush", func() bool {
+		return heldBatches(agg, 1) == 1
+	})
+
+	closed := make(chan error, 1)
+	go func() { closed <- agg.Close() }()
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned (%v) while a shard flush was still in flight", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(g.release)
+	awaitNilSubmit(t, "first", first)
+	awaitNilSubmit(t, "second", second)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close never returned")
+	}
+}
+
+// TestSubmit_BlockedShardReturnsQueueFull proves that a shard whose propose
+// stalls cannot accumulate proposals without bound. Flush hands a busy
+// shard's later batches to its worker without waiting, so the shared queue
+// keeps draining; the shard's own budget of QueueSize admitted-but-unfinished
+// proposals is what must push back with QueueFullError. Callers that give up
+// still count until their proposal is resolved, because the proposal and its
+// buffer stay held until then. Another shard keeps its own budget.
+func TestSubmit_BlockedShardReturnsQueueFull(t *testing.T) {
+	const queueSize = 4
+	g := newGatedProposer()
+	agg := newGatedAggregator(t, g, 1, queueSize)
+	defer func() {
+		close(g.release)
+		_ = agg.Close()
+	}()
+
+	parked := make(chan error, 1)
+	go func() { parked <- agg.Submit(context.Background(), 1, []byte("parked")) }()
+	g.awaitEntry(t)
+
+	var qfe *QueueFullError
+	rejectedAt := -1
+	for i := 0; i < 4*queueSize; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		err := agg.Submit(ctx, 1, []byte{byte(i)})
+		cancel()
+		if errors.As(err, &qfe) {
+			rejectedAt = i
+			break
+		}
+		if err == nil {
+			t.Fatalf("Submit %d to the blocked shard succeeded", i)
+		}
+	}
+	if rejectedAt < 0 {
+		t.Fatalf("%d submissions to a blocked shard never returned QueueFullError", 4*queueSize)
+	}
+	if rejectedAt >= queueSize {
+		t.Errorf("QueueFullError after %d submissions, want fewer than QueueSize (%d)", rejectedAt, queueSize)
+	}
+	if qfe.QueueSize != queueSize {
+		t.Errorf("QueueFullError.QueueSize = %d, want %d", qfe.QueueSize, queueSize)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := agg.Submit(ctx, 2, []byte("other-shard")); err != nil {
+		t.Fatalf("Submit to shard 2 while shard 1 is full = %v, want nil", err)
+	}
+}
+
+// stallAllProposer blocks every shard's propose until release is closed,
+// ignoring the propose context, modelling a quorum outage that affects many
+// shards at once.
+type stallAllProposer struct {
+	release chan struct{}
+}
+
+func (s *stallAllProposer) SyncPropose(_ context.Context, _ uint64, _ []byte) error {
+	<-s.release
+	return nil
+}
+
+// TestSubmit_ManyStalledShardsBoundedInAggregate checks that the admission
+// budget is global as well as per shard: with every shard stalled, flushLoop
+// keeps draining the shared queue into held batches, so a per-shard limit
+// alone lets outstanding proposals grow to QueueSize times the number of
+// stalled shards. Submit must return QueueFullError once about QueueSize
+// plus one batch are outstanding in total.
+func TestSubmit_ManyStalledShardsBoundedInAggregate(t *testing.T) {
+	const (
+		queueSize = 4
+		maxBatch  = 1
+		shards    = 8
+	)
+	s := &stallAllProposer{release: make(chan struct{})}
+	agg, err := NewAggregator(s,
+		WithConfig(Config{
+			MaxBatchSize:   maxBatch,
+			FlushInterval:  2 * time.Millisecond,
+			QueueSize:      queueSize,
+			ProposeTimeout: 30 * time.Second,
+		}),
+		WithLogger(slog.Default()),
+		WithRegistry(newTestRegistry(t)),
+	)
+	if err != nil {
+		t.Fatalf("NewAggregator: %v", err)
+	}
+	defer func() {
+		close(s.release)
+		_ = agg.Close()
+	}()
+
+	admitted := 0
+	sawFull := false
+	for shard := uint64(1); shard <= shards; shard++ {
+		for i := 0; i < queueSize; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			err := agg.Submit(ctx, shard, []byte{byte(shard), byte(i)})
+			cancel()
+			var qfe *QueueFullError
+			if errors.As(err, &qfe) {
+				sawFull = true
+				if qfe.QueueSize != queueSize {
+					t.Errorf("QueueFullError.QueueSize = %d, want %d", qfe.QueueSize, queueSize)
+				}
+				continue
+			}
+			if err == nil {
+				t.Fatalf("Submit to stalled shard %d succeeded", shard)
+			}
+			admitted++
+		}
+	}
+	if !sawFull {
+		t.Fatalf("%d submissions across %d stalled shards never returned QueueFullError", shards*queueSize, shards)
+	}
+	if limit := queueSize + maxBatch; admitted > limit {
+		t.Errorf("admitted %d proposals across %d stalled shards, want at most %d (QueueSize + one batch)",
+			admitted, shards, limit)
+	}
+}

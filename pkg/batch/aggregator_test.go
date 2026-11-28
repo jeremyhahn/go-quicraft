@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // mockProposeCall records a single SyncPropose invocation.
@@ -321,7 +322,7 @@ func TestSubmit_QueueFull(t *testing.T) {
 		_ = agg.Close()
 	}()
 
-	// The first proposal reaches the proposer and parks the flush goroutine.
+	// The first proposal reaches the proposer and parks shard 1's worker.
 	go func() { _ = agg.Submit(context.Background(), 1, []byte("parks-the-loop")) }()
 	select {
 	case <-blocking.entered:
@@ -329,14 +330,15 @@ func TestSubmit_QueueFull(t *testing.T) {
 		t.Fatal("the first proposal never reached the proposer")
 	}
 
-	// Fill the queue exactly. Nothing drains it while the flush goroutine is
-	// parked, so each of these stays enqueued and its caller blocks.
-	for i := range queueSize {
+	// Fill shard 1's budget, one at a time. Flush hands each batch to the
+	// busy shard's worker without waiting, so these are held behind the
+	// parked propose rather than left on the queue; each caller blocks.
+	for i := 1; i < queueSize; i++ {
 		go func() { _ = agg.Submit(context.Background(), 1, []byte{byte(i)}) }()
+		waitForCondition(t, 10*time.Second, "the proposal was never handed to the busy shard", func() bool {
+			return testutil.ToFloat64(agg.metrics.flushReasonTotal.WithLabelValues(flushReasonSize)) == float64(i+1)
+		})
 	}
-	waitForCondition(t, 10*time.Second, "the queue never reached capacity", func() bool {
-		return len(agg.queue) == queueSize
-	})
 
 	// One more must be rejected outright, not blocked and not silently accepted.
 	done := make(chan error, 1)
