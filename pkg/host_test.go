@@ -45,6 +45,8 @@ import (
 	"github.com/jeremyhahn/go-quicraft/pkg/logdb/memdb"
 	"github.com/jeremyhahn/go-quicraft/pkg/proto"
 	"github.com/jeremyhahn/go-quicraft/pkg/sm"
+	"github.com/jeremyhahn/go-quicraft/pkg/sm/kv"
+	"github.com/jeremyhahn/go-quicraft/test/testpki"
 )
 
 // ---------------------------------------------------------------------------
@@ -661,6 +663,93 @@ func testShardConfigWithIdentities(h *Host, shardID, replicaID uint64, members m
 		c.MemberIdentities[replicaID] = h.NodeIdentity()
 	}
 	return c
+}
+
+// closeHandoffElectionRTT is the election timeout, in ticks, of the close
+// hand-off cluster: one second at transferRTTMillis, long enough that an
+// ordinary election (which waits at least one timeout after the last
+// heartbeat) is told apart from a hand-off (a few round trips).
+const closeHandoffElectionRTT = 100
+
+// newCloseHandoffCluster is newTransferCluster with a one-second election
+// timeout.
+func newCloseHandoffCluster(t *testing.T) *transferCluster {
+	t.Helper()
+	ca := testpki.NewCA(t)
+	leaves := ca.Leaves(t, 3)
+	c := &transferCluster{t: t}
+	t.Cleanup(func() {
+		for _, h := range c.hosts {
+			h.Close()
+		}
+	})
+	members := make(map[uint64]string, 3)
+	ids := make(map[uint64]string, 3)
+	for i := range 3 {
+		h, err := NewHost(config.HostConfig{
+			WALDir:          t.TempDir(),
+			NodeHostDir:     t.TempDir(),
+			RaftAddress:     "127.0.0.1:0",
+			ListenAddress:   "127.0.0.1:0",
+			RTTMillisecond:  transferRTTMillis,
+			DeploymentID:    1,
+			NoSyncWAL:       true,
+			TransportConfig: config.TransportConfig{MTLSConfig: leaves[i]},
+		}, WithoutEncryption())
+		if err != nil {
+			t.Fatalf("NewHost[%d]: %v", i, err)
+		}
+		c.hosts = append(c.hosts, h)
+		members[uint64(i+1)] = h.RaftAddress()
+		ids[uint64(i+1)] = h.NodeIdentity()
+	}
+	for i, h := range c.hosts {
+		scfg := testShardConfig(transferShard, uint64(i+1))
+		scfg.ElectionRTT = closeHandoffElectionRTT
+		scfg.MemberIdentities = ids
+		if err := h.StartShard(members, false, kv.NewMemoryCreateFunc(), scfg); err != nil {
+			t.Fatalf("StartShard[%d]: %v", i, err)
+		}
+	}
+	return c
+}
+
+// TestHostClose_HandsLeadershipToAVoterBeforeStopping closes the leader's
+// host and requires a surviving voter to lead at a higher term within half
+// an election timeout of Close returning. Without a hand-off the survivors
+// wait at least a full election timeout after the last heartbeat before
+// they campaign; with one, Close has already moved leadership.
+func TestHostClose_HandsLeadershipToAVoterBeforeStopping(t *testing.T) {
+	c := newCloseHandoffCluster(t)
+	electionTimeout := time.Duration(closeHandoffElectionRTT) * transferRTTMillis * time.Millisecond
+	leaderID, term := c.agreedLeader(30 * time.Second)
+
+	closeStart := time.Now()
+	if err := c.hosts[leaderID-1].Close(); err != nil {
+		t.Fatalf("Close of leader host %d: %v", leaderID, err)
+	}
+	closeReturned := time.Now()
+
+	bound := electionTimeout / 2
+	var newID, newTerm uint64
+	if !waitUntil(bound, func() bool {
+		for i := range c.hosts {
+			if uint64(i+1) == leaderID {
+				continue
+			}
+			id, tm := c.leader(i)
+			if id != 0 && id != leaderID && tm > term {
+				newID, newTerm = id, tm
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("no surviving voter led within %v of Close returning (Close took %v; old leader %d term %d): leadership was not handed off",
+			bound, closeReturned.Sub(closeStart), leaderID, term)
+	}
+	t.Logf("Close took %v; replica %d leads at term %d %v after Close returned",
+		closeReturned.Sub(closeStart), newID, newTerm, time.Since(closeReturned))
 }
 
 // waitForLeader waits until the engine's Raft peer for the given shard
