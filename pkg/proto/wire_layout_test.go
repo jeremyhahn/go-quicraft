@@ -15,14 +15,15 @@
 package proto
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -32,53 +33,143 @@ var updateWireLayout = flag.Bool("update", false, "rewrite testdata/wire_layout.
 
 const wireLayoutGolden = "testdata/wire_layout.golden"
 
-// wireLayout describes every struct type reachable from MessageBatch and
-// SnapshotChunk: one line per type, naming each field, its type and its
-// position, sorted by type name. Any change to the layout of the wire
-// changes it.
-func wireLayout() []string {
-	seen := make(map[reflect.Type]bool)
-	var lines []string
-	var walk func(t reflect.Type)
-	walk = func(t reflect.Type) {
-		switch t.Kind() {
-		case reflect.Pointer, reflect.Slice, reflect.Array:
-			walk(t.Elem())
-			return
-		case reflect.Map:
-			walk(t.Key())
-			walk(t.Elem())
-			return
-		case reflect.Struct:
-		default:
-			return
-		}
-		if seen[t] {
-			return
-		}
-		seen[t] = true
-		fields := make([]string, t.NumField())
-		for i := range t.NumField() {
-			f := t.Field(i)
-			fields[i] = fmt.Sprintf("%d %s %s", i, f.Name, f.Type.String())
-			walk(f.Type)
-		}
-		lines = append(lines, fmt.Sprintf("%s{%s}", t.String(), strings.Join(fields, "; ")))
+// wireFixture is one encoded value the wire layout fingerprint covers.
+type wireFixture struct {
+	name  string
+	value interface {
+		Size() int
+		MarshalTo(buf []byte) (int, error)
 	}
-	walk(reflect.TypeFor[MessageBatch]())
-	walk(reflect.TypeFor[SnapshotChunk]())
-	sort.Strings(lines)
-	return lines
 }
+
+// wireFingerprintFixtures returns one MessageBatch and one SnapshotChunk that
+// together set every serialized field of every type the wire carries
+// (Message, Entry, Snapshot, Membership with its maps and session policy,
+// SnapshotFile) to a distinct non-zero value. Message.Origin stays zero: it
+// never crosses the wire. TestWireFingerprintFixturesComplete enforces this.
+func wireFingerprintFixtures() []wireFixture {
+	membership := func(base uint64) Membership {
+		return Membership{
+			ConfigChangeID:             base + 1,
+			MaxWitnesses:               base + 2,
+			RequireFullReplicaMajority: true,
+			SessionExpiryEntries:       base + 3,
+			MaxTotalSessions:           base + 4,
+			MaxResponsesPerSession:     base + 5,
+			MaxSessionsPerOwner:        base + 6,
+			// Synthetic, never 0 or 1: a version equal to a boolean's
+			// encoding would hide a swap with RequireFullReplicaMajority.
+			// The fixture is never decoded, so no version gate applies.
+			WireVersion:       base + 7,
+			Addresses:         map[uint64]string{base + 11: fmt.Sprintf("addr-a-%d:1", base), base + 12: fmt.Sprintf("addr-b-%d:2", base)},
+			Observers:         map[uint64]string{base + 13: fmt.Sprintf("obs-c-%d:3", base)},
+			Witnesses:         map[uint64]string{base + 14: fmt.Sprintf("wit-d-%d:4", base)},
+			Removed:           map[uint64]bool{base + 15: true},
+			Identities:        map[uint64]string{base + 11: fmt.Sprintf("id-a-%d", base), base + 12: fmt.Sprintf("id-b-%d", base)},
+			RemovedIdentities: map[uint64]string{base + 15: fmt.Sprintf("id-e-%d", base)},
+		}
+	}
+	batch := &MessageBatch{
+		// Synthetic versions, distinct from each other and from every
+		// boolean encoding, so a swap of any two of these offsets moves the
+		// fingerprint; the fixture is never decoded against a window.
+		BinVer:        7,
+		DeploymentID:  101,
+		SourceEpoch:   102,
+		MaxBinVer:     103,
+		SourceAddress: "source:9",
+		Requests: []Message{{
+			Type:      Replicate,
+			From:      111,
+			To:        112,
+			ShardID:   113,
+			ReplicaID: 114,
+			Term:      115,
+			LogTerm:   116,
+			LogIndex:  117,
+			Commit:    118,
+			Reject:    true,
+			Hint:      119,
+			Snapshot: Snapshot{
+				ShardID:     121,
+				ReplicaID:   122,
+				Index:       123,
+				Term:        124,
+				Membership:  membership(200),
+				Filepath:    "snap/path",
+				FileSize:    125,
+				OnDiskIndex: 126,
+				Epoch:       127,
+				Compression: 4,
+			},
+			Entries: []Entry{
+				{Term: 131, Index: 132, Type: EntryEncodedEntry, Key: 133, ClientID: 134,
+					SeriesID: 135, RespondedTo: 136, OwnerID: 137, Cmd: []byte("cmd-one")},
+				{Term: 141, Index: 142, Type: EntryEncodedEntry | EntryCompressFlag, Key: 143, ClientID: 144,
+					SeriesID: 145, RespondedTo: 146, OwnerID: 147, Cmd: []byte("cmd-two")},
+			},
+		}},
+	}
+	data := []byte("chunk-data-bytes")
+	chunk := &SnapshotChunk{
+		ShardID:        301,
+		ReplicaID:      302,
+		From:           303,
+		Index:          304,
+		Term:           305,
+		ChunkID:        306,
+		ChunkCount:     307,
+		ChunkSize:      uint64(len(data)),
+		FileSize:       308,
+		Filepath:       "chunk/path",
+		FileChunkID:    309,
+		FileChunkCount: 310,
+		HasFileInfo:    true,
+		FileInfo: SnapshotFile{
+			Filepath: "file/path",
+			FileSize: 311,
+			FileID:   312,
+			Metadata: []byte("file-meta"),
+		},
+		Membership:   membership(400),
+		OnDiskIndex:  313,
+		DeploymentID: 314,
+		BinVer:       9, // synthetic; distinct from HasFileInfo's encoding
+		Epoch:        315,
+		Data:         data,
+	}
+	// The batch's Message sets Reject and a non-empty Snapshot, so Reject
+	// and the derived HasSnapshot flag both encode as 1 there. This one
+	// sets Reject with an empty Snapshot and no entries, so the two flags
+	// differ and a swap of their offsets moves the fingerprint. It is
+	// partial by design and so exempt from the completeness walk.
+	flags := &Message{
+		Type:      ReplicateResp,
+		From:      511,
+		To:        512,
+		ShardID:   513,
+		ReplicaID: 514,
+		Term:      515,
+		LogTerm:   516,
+		LogIndex:  517,
+		Commit:    518,
+		Reject:    true,
+		Hint:      519,
+	}
+	return []wireFixture{{"MessageBatch", batch}, {"SnapshotChunk", chunk}, {wireFlagsFixture, flags}}
+}
+
+// wireFlagsFixture names the partial Message fixture whose Reject and
+// HasSnapshot flags differ; TestWireFingerprintFixturesComplete skips it.
+const wireFlagsFixture = "Message"
 
 // wireLayoutGoldenContent is the golden file this build would write.
 func wireLayoutGoldenContent() string {
-	sum := sha256.Sum256([]byte(strings.Join(wireLayout(), "\n")))
-	return fmt.Sprintf("# Raft wire layout fingerprint: every type reachable from MessageBatch and\n"+
-		"# SnapshotChunk, by reflection. Regenerate with\n"+
+	return fmt.Sprintf("# Raft wire layout fingerprint: SHA-256 of the encoded MessageBatch,\n"+
+		"# SnapshotChunk and Message fixtures in wire_layout_test.go. Regenerate with\n"+
 		"#   go test ./pkg/proto/ -run TestWireLayoutGolden -update\n"+
 		"# and, from v1.0.0-rc.1 on, bump WireVersion in the same release when it moves.\n"+
-		"version %d\nsha256 %s\n", WireVersion, hex.EncodeToString(sum[:]))
+		"version %d\nderivation encoded-fixtures\nsha256 %s\n", WireVersion, wireFingerprintWith(nil))
 }
 
 // TestWireLayoutGolden is the release gate's source of truth: the golden
@@ -111,14 +202,257 @@ func TestWireLayoutGolden(t *testing.T) {
 	}
 }
 
-// TestWireLayoutCoversEmbeddedTypes: the walk reaches the persisted types the
-// wire embeds, so their layout changes move the fingerprint too.
-func TestWireLayoutCoversEmbeddedTypes(t *testing.T) {
-	layout := strings.Join(wireLayout(), "\n")
-	for _, name := range []string{"proto.MessageBatch{", "proto.SnapshotChunk{", "proto.Message{",
-		"proto.Entry{", "proto.Snapshot{", "proto.Membership{"} {
-		if !strings.Contains(layout, name) {
-			t.Errorf("wire layout does not cover %s", strings.TrimSuffix(name, "{"))
+// TestWireFingerprintFixturesComplete: every exported field of every struct,
+// map and slice reachable from the fixtures is non-zero, and the uint64 leaves
+// are pairwise distinct, so a swap of any two fields moves the encoded bytes.
+func TestWireFingerprintFixturesComplete(t *testing.T) {
+	// Not serialized, so it must stay zero and is not required to be set.
+	excluded := map[string]string{
+		"Message.Origin": "never crosses the wire; set only on the receive or inject path",
+	}
+	// Every encoded leaf, whatever its kind, holds a value no other leaf
+	// holds, so a swap of any two encoder offsets moves the fingerprint.
+	// Version fields get no exemption: they carry synthetic values. A true
+	// boolean encodes as the integer 1, so it is compared with the
+	// integers; two booleans may share that encoding only when they sit in
+	// different structs, where no single encoder can swap them.
+	type numLeaf struct {
+		path, owner string
+		isBool      bool
+	}
+	nums := make(map[uint64]numLeaf)
+	strs := make(map[string]string)
+	addNum := func(path, owner string, v uint64, isBool bool) {
+		if prev, dup := nums[v]; dup && (!isBool || !prev.isBool || prev.owner == owner) {
+			t.Errorf("%s and %s both encode %d", prev.path, path, v)
+			return
+		}
+		nums[v] = numLeaf{path, owner, isBool}
+	}
+	addStr := func(path, s string) {
+		if prev, dup := strs[s]; dup {
+			t.Errorf("%s and %s both hold %q", prev, path, s)
+			return
+		}
+		strs[s] = path
+	}
+	var walk func(path, owner string, v reflect.Value)
+	walk = func(path, owner string, v reflect.Value) {
+		switch v.Kind() {
+		case reflect.Pointer:
+			walk(path, owner, v.Elem())
+		case reflect.Struct:
+			typ := v.Type()
+			for i := range typ.NumField() {
+				f := typ.Field(i)
+				if !f.IsExported() {
+					continue
+				}
+				key := typ.Name() + "." + f.Name
+				fv := v.Field(i)
+				fpath := path + "." + f.Name
+				if _, ok := excluded[key]; ok {
+					if !fv.IsZero() {
+						t.Errorf("%s: excluded field is set", fpath)
+					}
+					continue
+				}
+				if fv.IsZero() {
+					t.Errorf("%s: zero; every serialized field must be set", fpath)
+					continue
+				}
+				walk(fpath, path, fv)
+			}
+		case reflect.Bool:
+			if !v.Bool() {
+				t.Errorf("%s: false; a set boolean must be true", path)
+				return
+			}
+			addNum(path, owner, 1, true)
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			addNum(path, owner, v.Uint(), false)
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			addNum(path, owner, uint64(v.Int()), false)
+		case reflect.String:
+			addStr(path, v.String())
+		case reflect.Slice:
+			if v.Type().Elem().Kind() == reflect.Uint8 {
+				addStr(path, string(v.Bytes()))
+				return
+			}
+			for i := range v.Len() {
+				walk(fmt.Sprintf("%s[%d]", path, i), path, v.Index(i))
+			}
+		case reflect.Map:
+			for _, k := range v.MapKeys() {
+				walk(fmt.Sprintf("%s[%v]", path, k), path, v.MapIndex(k))
+			}
+		default:
+			t.Errorf("%s: unhandled kind %s", path, v.Kind())
+		}
+	}
+	for _, f := range wireFingerprintFixtures() {
+		if f.name == wireFlagsFixture {
+			m, ok := f.value.(*Message)
+			if !ok || m.Reject == !m.Snapshot.IsEmpty() {
+				t.Errorf("%s: Reject and HasSnapshot must encode differently", f.name)
+			}
+			continue
+		}
+		walk(f.name, "", reflect.ValueOf(f.value))
+	}
+}
+
+// TestWireFingerprintIgnoresOrigin: Message.Origin is not serialized, so
+// setting it leaves the fingerprint unchanged.
+func TestWireFingerprintIgnoresOrigin(t *testing.T) {
+	fixtures := wireFingerprintFixtures()
+	batch, ok := fixtures[0].value.(*MessageBatch)
+	if !ok {
+		t.Fatalf("fixture 0 is %T, want *MessageBatch", fixtures[0].value)
+	}
+	batch.Requests[0].Origin = OriginLocal
+	if got, want := wireFingerprintOf(fixtures, nil), wireFingerprintWith(nil); got != want {
+		t.Fatalf("fingerprint moved with Origin set: %s != %s", got, want)
+	}
+}
+
+// wireFingerprintWith returns the wire layout fingerprint, applying mutate to
+// each fixture's encoded bytes first when it is non-nil.
+func wireFingerprintWith(mutate func(name string, b []byte) []byte) string {
+	return wireFingerprintOf(wireFingerprintFixtures(), mutate)
+}
+
+// wireFingerprintOf hashes, per fixture in order, its name, its encoded
+// length and its MarshalTo bytes (after mutate when it is non-nil).
+func wireFingerprintOf(fixtures []wireFixture, mutate func(name string, b []byte) []byte) string {
+	h := sha256.New()
+	for _, f := range fixtures {
+		buf := make([]byte, f.value.Size())
+		n, err := f.value.MarshalTo(buf)
+		if err != nil {
+			panic(fmt.Sprintf("wire fingerprint fixture %s: %v", f.name, err))
+		}
+		b := buf[:n]
+		if mutate != nil {
+			b = mutate(f.name, b)
+		}
+		var hdr [8]byte
+		binary.BigEndian.PutUint64(hdr[:], uint64(len(b)))
+		h.Write([]byte(f.name))
+		h.Write([]byte{0})
+		h.Write(hdr[:])
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// swapWireRange returns a copy of b with the n-byte ranges at i and j swapped.
+func swapWireRange(b []byte, i, j, n int) []byte {
+	out := append([]byte(nil), b...)
+	copy(out[i:i+n], b[j:j+n])
+	copy(out[j:j+n], b[i:i+n])
+	return out
+}
+
+// wireUint64Offset returns the offset of the one little-endian eight-byte
+// encoding of v in b, so a mutation can find a field by its distinct fixture
+// value. It panics unless v occurs exactly once.
+func wireUint64Offset(b []byte, v uint64) int {
+	var enc [8]byte
+	binary.LittleEndian.PutUint64(enc[:], v)
+	i := bytes.Index(b, enc[:])
+	if i < 0 || bytes.Contains(b[i+1:], enc[:]) {
+		panic(fmt.Sprintf("wire fixture value %d does not occur exactly once", v))
+	}
+	return i
+}
+
+// insertWireZeros returns a copy of b with n zero bytes inserted at off.
+func insertWireZeros(b []byte, off, n int) []byte {
+	out := make([]byte, 0, len(b)+n)
+	out = append(out, b[:off]...)
+	out = append(out, make([]byte, n)...)
+	return append(out, b[off:]...)
+}
+
+// TestWireFingerprintCatchesEncodingOnlyChange: a change to the encoded bytes
+// that leaves every Go struct untouched (field order, field width) moves the
+// fingerprint.
+func TestWireFingerprintCatchesEncodingOnlyChange(t *testing.T) {
+	golden, err := os.ReadFile(wireLayoutGolden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded string
+	for _, l := range strings.Split(string(golden), "\n") {
+		if s, ok := strings.CutPrefix(l, "sha256 "); ok {
+			recorded = s
+		}
+	}
+	base := wireFingerprintWith(nil)
+	mutations := []struct {
+		name   string
+		mutate func(name string, b []byte) []byte
+	}{
+		{"swap MessageBatch DeploymentID and SourceEpoch", func(name string, b []byte) []byte {
+			if name != "MessageBatch" {
+				return b
+			}
+			return swapWireRange(b, 8, 16, 8)
+		}},
+		{"swap MessageBatch BinVer and MaxBinVer", func(name string, b []byte) []byte {
+			if name != "MessageBatch" {
+				return b
+			}
+			return swapWireRange(b, 0, 24, 8)
+		}},
+		{"widen MessageBatch DeploymentID to 12 bytes", func(name string, b []byte) []byte {
+			if name != "MessageBatch" {
+				return b
+			}
+			return insertWireZeros(b, 16, 4)
+		}},
+		{"swap SnapshotChunk ShardID and ReplicaID", func(name string, b []byte) []byte {
+			if name != "SnapshotChunk" {
+				return b
+			}
+			return swapWireRange(b, 0, 8, 8)
+		}},
+		{"swap Membership RequireFullReplicaMajority and WireVersion", func(name string, b []byte) []byte {
+			if name != "SnapshotChunk" {
+				return b
+			}
+			// The chunk's Membership starts one format byte before its
+			// ConfigChangeID (base 400 + 1).
+			m := wireUint64Offset(b, 401) - 1
+			return swapWireRange(b, m+17, m+wireVersionOffset, 8)
+		}},
+		{"swap SnapshotChunk HasFileInfo and BinVer", func(name string, b []byte) []byte {
+			if name != "SnapshotChunk" {
+				return b
+			}
+			// HasFileInfo follows FileChunkCount (310); BinVer precedes
+			// Epoch (315).
+			return swapWireRange(b, wireUint64Offset(b, 310)+8, wireUint64Offset(b, 315)-8, 8)
+		}},
+		{"swap Message Reject and HasSnapshot", func(name string, b []byte) []byte {
+			if name != wireFlagsFixture {
+				return b
+			}
+			// Reject precedes Hint (519); with no entries, HasSnapshot
+			// follows Hint and the 4-byte entries count.
+			h := wireUint64Offset(b, 519)
+			return swapWireRange(b, h-8, h+12, 8)
+		}},
+	}
+	for _, m := range mutations {
+		got := wireFingerprintWith(m.mutate)
+		if got == base {
+			t.Errorf("%s: fingerprint unchanged from the unmutated encoding", m.name)
+		}
+		if got == recorded {
+			t.Errorf("%s: fingerprint equals the recorded golden", m.name)
 		}
 	}
 }

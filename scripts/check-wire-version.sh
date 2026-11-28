@@ -5,13 +5,24 @@
 # check-wire-version.sh <last-release-tag>
 #
 # Release gate for the Raft wire version. pkg/proto/testdata/wire_layout.golden
-# records a fingerprint of every type reachable from MessageBatch and
-# SnapshotChunk together with the WireVersion it was recorded at. When the
+# records a fingerprint of the encoded MessageBatch and SnapshotChunk fixtures,
+# how it was derived and the WireVersion it was recorded at. When the
 # fingerprint differs between <last-release-tag> and HEAD while the version line
 # did not move, the wire layout changed without a WireVersion bump: fail.
+#
+# One exception: the one-time move of the fingerprint derivation to
+# encoded-fixtures. Fingerprints across that move are not comparable, so the
+# gate passes it only for the exact verified pair below (the v1.0.0-rc.1
+# baseline, recorded without a derivation line, to the first encoded-fixtures
+# fingerprint), with the version unchanged and the pinned encoded fixtures in
+# pkg/proto/testdata/golden/ unchanged since the tag. Any other fingerprint
+# change without a WireVersion bump fails, including a later encoding change
+# with a regenerated fingerprint.
 set -euo pipefail
 
 golden=pkg/proto/testdata/wire_layout.golden
+migration_from=fbdf0062f194b1a5a23a19f06cf316c4193fcaacd5313f31d175ea347662b899
+migration_to=28b9142a380d437c1f2efd5ed388bcbd0bfce5ce5fe7e6f302a71be6cad62a36
 
 if [ $# -ne 1 ] || [ -z "$1" ]; then
 	echo "usage: $0 <last-release-tag>" >&2
@@ -37,6 +48,17 @@ line() { printf '%s\n' "$1" | grep -m 1 "^$2 " || true; }
 
 if [ "$old" = "$new" ]; then
 	echo "check-wire-version: wire layout unchanged since $tag ($(line "$new" version))"
+	exit 0
+fi
+if [ "$(line "$old" derivation)" = "" ] &&
+	[ "$(line "$old" sha256)" = "sha256 $migration_from" ] &&
+	[ "$(line "$new" derivation)" = "derivation encoded-fixtures" ] &&
+	[ "$(line "$new" sha256)" = "sha256 $migration_to" ] &&
+	[ "$(line "$old" version)" = "$(line "$new" version)" ] &&
+	git diff --quiet "$tag" HEAD -- pkg/proto/testdata/golden/; then
+	echo "check-wire-version: fingerprint derivation changed since $tag" \
+		"('$(line "$old" derivation)' -> '$(line "$new" derivation)'), pkg/proto/testdata/golden/" \
+		"unchanged ($(line "$new" version))"
 	exit 0
 fi
 if [ "$(line "$old" version)" = "$(line "$new" version)" ]; then
