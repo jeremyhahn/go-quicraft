@@ -290,10 +290,24 @@ func (h *hostMessageHandler) wireRefusal(shardID uint64) *WireVersionMismatchErr
 	return refusal
 }
 
-// maxRecvRefusals bounds recvRefusals: past it a refusal from a new remote
-// address is not recorded or logged here (the transport still counts it as a
-// protocol violation), so a flood of addresses cannot grow the map.
+// maxRecvRefusals bounds recvRefusals: recording a new remote address at the
+// bound first evicts another one (evictRecvRefusal), so a flood of addresses
+// cannot grow the map and cannot suppress the diagnostic for a later peer.
 const maxRecvRefusals = 1024
+
+// evictRecvRefusal forgets one recorded address and reports whether it did.
+func (h *hostMessageHandler) evictRecvRefusal() bool {
+	evicted := false
+	h.recvRefusals.Range(func(k, _ any) bool {
+		if _, ok := h.recvRefusals.LoadAndDelete(k); ok {
+			h.recvRefused.Add(-1)
+			evicted = true
+			return false
+		}
+		return true
+	})
+	return evicted
+}
 
 // refuseReceivedWireVersion is the host's transport.Config.OnWireVersionRefused:
 // the transport refused a frame (*transport.FrameVersionError) or a batch
@@ -328,16 +342,21 @@ func (h *hostMessageHandler) refuseReceivedWireVersion(remote string, err error)
 		}
 		h.recvRefusals.Store(remote, refusal)
 	} else {
-		if h.recvRefused.Add(1) > maxRecvRefusals {
-			h.recvRefused.Add(-1)
-			return
+		// At capacity an arbitrary recorded address is forgotten to make
+		// room, so a full cache never silences a new peer; the forgotten one
+		// is simply logged again if it is refused again.
+		for h.recvRefused.Load() >= maxRecvRefusals {
+			if !h.evictRecvRefusal() {
+				break
+			}
 		}
 		if prev, loaded := h.recvRefusals.LoadOrStore(remote, refusal); loaded {
-			h.recvRefused.Add(-1)
 			if *prev.(*WireVersionMismatchError) == *refusal {
 				return
 			}
 			h.recvRefusals.Store(remote, refusal)
+		} else {
+			h.recvRefused.Add(1)
 		}
 	}
 	slog.Warn("refused inbound traffic: peer wire version outside this host's window",
