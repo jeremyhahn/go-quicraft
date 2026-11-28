@@ -11866,6 +11866,9 @@ func (h *Host) SyncRequestSnapshot(ctx context.Context, shardID uint64, opt Snap
 // stopped on this host before calling RemoveData. This is used to clean up
 // persistent state after a node has been permanently removed from a shard; a
 // replica that is to rejoin does so under a new replica ID, as Raft requires.
+// A RemoveData racing a StopShard of the same replica is refused with
+// ErrShardNotReady until StopShard's teardown has unloaded the node; the
+// caller retries.
 func (h *Host) RemoveData(shardID, replicaID uint64) error {
 	if h.closed.Load() {
 		return ErrClosed
@@ -11896,7 +11899,13 @@ func (h *Host) RemoveData(shardID, replicaID uint64) error {
 					ExpectedType: "*nodeState",
 					ActualValue:  v,
 				})
-		} else if !ns.stopped.Load() && ns.replicaID == replicaID {
+		} else if ns.replicaID == replicaID {
+			if ns.stopped.Load() {
+				// StopShard claimed the node but teardown has not yet
+				// unloaded it: the commit worker may still save state for
+				// it, which would re-create removed data. Transient.
+				return ErrShardNotReady
+			}
 			return &ShardNotStoppedError{ShardID: shardID, ReplicaID: replicaID}
 		}
 	}
