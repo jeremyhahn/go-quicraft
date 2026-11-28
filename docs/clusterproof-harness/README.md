@@ -35,23 +35,30 @@ varies between runs).
 1. Three replica processes. Each is the test binary re-executed as
    `TestClusterproof_Node`: one `Host` with mutual TLS and the WAL fsync on
    (`NoSyncWAL` false), a three-voter shard of a last-write-wins KV state
-   machine (snapshot every 500 entries, so restarts recover from a snapshot
-   and a compacted log), and a loopback HTTP server the parent drives:
-   `POST /put` commits a write through that replica (a follower forwards to
-   the leader), `GET /get` and `GET /all` are linearizable `SyncRead`s.
+   machine (snapshot every 500 entries), and a loopback HTTP server the
+   parent drives: `POST /put` commits a write through that replica (a
+   follower forwards to the leader), `GET /get` and `GET /all` are
+   linearizable `SyncRead`s, and `GET /snap` reports the index of the
+   replica's last saved snapshot, of its last log compaction, and of the
+   snapshot its state machine last recovered from.
 2. Writers put unique keys to random replicas, the dead one included. A
    write counts as acknowledged only after the replica answered it
    committed and the writer appended it to the ack log and fsynced the log.
 3. Readers pick an acknowledged write and read it through a random replica;
    a read that answers must return the acknowledged value.
-4. Each cycle SIGKILLs a random replica, keeps it down for 300 ms to 1.5 s
-   while the writers continue, restarts it on the same WAL and NodeHost
-   directories, and waits until it serves a linearizable read. The checker
+4. Each cycle picks a random replica and, through `GET /snap`, waits up
+   to 2 min until it has saved a snapshot and compacted its log. It then
+   SIGKILLs that replica, keeps it down for 300 ms to 1.5 s while the
+   writers continue, restarts it on the same WAL and NodeHost directories,
+   and waits until it serves a linearizable read and `GET /snap` reports a
+   recovery from a snapshot with a non-zero index; either wait timing out
+   fails the run. The cycle log line prints the three indices. The checker
    then reads the ack log back from disk and, after that, reads each
    replica's state through `GET /all`. That read is linearizable, so an
    answer that lacks an acknowledged write or holds another value for it
    is a stale read and fails at once; only an unavailable read (transport
-   error, no leader) is retried, for up to 60 s. The checker also requires
+   error, no leader) is retried, for up to 60 s, and every retried answer
+   is checked the same way before it is kept. The checker also requires
    that the cluster acknowledged writes during the cycle.
 5. At the end the clients stop, every acknowledged write must be on every
    replica, and the three replicas' states must be identical. With readers
