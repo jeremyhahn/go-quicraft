@@ -307,6 +307,14 @@ test-batch:
 test-crypto:
 	$(call run-tests,$(PKG_CRYPTO))
 
+# test-clusterproof: three replica processes, a random one SIGKILLed and
+# restarted per cycle under concurrent writes; every acknowledged write must
+# be on every replica (#1301). Flags via CLUSTERPROOF_ARGS, e.g.
+# CLUSTERPROOF_ARGS='-clusterproof.cycles=50 -clusterproof.seed=7'.
+.PHONY: test-clusterproof
+test-clusterproof:
+	$(GOTEST) -tags=integration -timeout=600s ./test/clusterproof/... $(if $(CLUSTERPROOF_ARGS),-args $(CLUSTERPROOF_ARGS))
+
 # ============================================================================
 # Integration tests (always run in devcontainer)
 # ============================================================================
