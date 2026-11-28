@@ -158,3 +158,42 @@ func TestHandleMessageFrame_OutsideWindowInvokesCallback(t *testing.T) {
 		t.Fatal("OnWireVersionRefused not invoked for a batch outside the window")
 	}
 }
+
+// TestHandleMessageFrame_ShortPayloadOutsideWindowInvokesCallback: a payload
+// shorter than the batch's fixed header still carries a BinVer once eight
+// bytes are present, and an unsupported one is reported to
+// OnWireVersionRefused rather than lost as a short buffer.
+func TestHandleMessageFrame_ShortPayloadOutsideWindowInvokesCallback(t *testing.T) {
+	far := farWindow()
+	calls := make(chan error, 64)
+	cfg := Config{
+		ListenAddress: ":0",
+		DeploymentID:  42,
+		MTLSConfig:    testMTLSConfig(t),
+		Wire:          far,
+		OnWireVersionRefused: func(_ string, err error) {
+			calls <- err
+		},
+	}
+	tr, err := NewQUICTransport(cfg, newTestHandler(), registry.NewRegistry())
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	for n := 8; n < 32; n++ {
+		payload := make([]byte, n)
+		binary.LittleEndian.PutUint64(payload, proto.WireVersion)
+		ferr := tr.handleMessageFrame(nil, bytes.NewReader(payload), uint32(n), FlagNone)
+		if !errors.Is(ferr, proto.ErrUnsupportedVersion) {
+			t.Fatalf("%d bytes: handleMessageFrame = %v, want proto.ErrUnsupportedVersion", n, ferr)
+		}
+		select {
+		case got := <-calls:
+			var be *proto.BatchVersionError
+			if !errors.As(got, &be) || be.BinVer != proto.WireVersion || be.Local != far.Proto {
+				t.Fatalf("%d bytes: callback error %v, want BatchVersionError for BinVer %d", n, got, proto.WireVersion)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d bytes: OnWireVersionRefused not invoked", n)
+		}
+	}
+}

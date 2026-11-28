@@ -18,6 +18,8 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -127,11 +129,64 @@ func TestMessageBatchBufferTooSmallMarshal(t *testing.T) {
 }
 
 func TestMessageBatchBufferTooSmallUnmarshal(t *testing.T) {
-	buf := make([]byte, messageBatchFixedSize-1)
-	var mb MessageBatch
-	_, err := mb.UnmarshalFrom(buf)
-	if !errors.Is(err, ErrBufferTooSmall) {
-		t.Fatalf("UnmarshalFrom: got %v, want ErrBufferTooSmall", err)
+	// A supported BinVer with a short fixed header is a truncated batch.
+	for n := 8; n < messageBatchFixedSize; n++ {
+		buf := make([]byte, n)
+		putUint64(buf[0:], WireVersion)
+		var mb MessageBatch
+		if _, err := mb.UnmarshalFrom(buf); !errors.Is(err, ErrBufferTooSmall) {
+			t.Fatalf("UnmarshalFrom(%d bytes, supported BinVer): got %v, want ErrBufferTooSmall", n, err)
+		}
+	}
+	// Fewer than eight bytes carry no BinVer at all.
+	for n := 0; n < 8; n++ {
+		var mb MessageBatch
+		if _, err := mb.UnmarshalFrom(make([]byte, n)); !errors.Is(err, ErrBufferTooSmall) {
+			t.Fatalf("UnmarshalFrom(%d bytes): got %v, want ErrBufferTooSmall", n, err)
+		}
+	}
+}
+
+// TestMessageBatchShortPayloadOutsideWindowIsTyped: once the eight BinVer
+// bytes are present, a version outside the window is refused as a
+// *BatchVersionError even when the rest of the fixed header is missing, so
+// the receive path can still report which version the peer spoke. MaxBinVer
+// is read and named only from a complete header.
+func TestMessageBatchShortPayloadOutsideWindowIsTyped(t *testing.T) {
+	w := DefaultWireWindow()
+	const far = WireVersion + 2
+	for n := 8; n <= messageBatchFixedSize; n++ {
+		buf := make([]byte, n)
+		putUint64(buf[0:], far)
+		if n == messageBatchFixedSize {
+			putUint64(buf[24:], far)
+		}
+		var mb MessageBatch
+		_, err := mb.UnmarshalFromWindow(buf, w)
+		var be *BatchVersionError
+		if !errors.As(err, &be) {
+			t.Fatalf("UnmarshalFromWindow(%d bytes, BinVer %d) = %v, want *BatchVersionError", n, far, err)
+		}
+		if !errors.Is(err, ErrUnsupportedVersion) || errors.Is(err, ErrBufferTooSmall) {
+			t.Fatalf("%d bytes: %v must be ErrUnsupportedVersion only", n, err)
+		}
+		if be.BinVer != far || be.Local != w {
+			t.Fatalf("%d bytes: BatchVersionError = %+v, want BinVer %d against %+v", n, *be, far, w)
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, strconv.FormatUint(far, 10)) {
+			t.Fatalf("%d bytes: %q does not name BinVer %d", n, msg, far)
+		}
+		full := n == messageBatchFixedSize
+		if full && be.MaxBinVer != far {
+			t.Fatalf("full header: MaxBinVer = %d, want %d", be.MaxBinVer, far)
+		}
+		if !full && be.MaxBinVer != 0 {
+			t.Fatalf("%d bytes: MaxBinVer = %d read from a short header", n, be.MaxBinVer)
+		}
+		if got := strings.Contains(msg, "reads up to"); got != full {
+			t.Fatalf("%d bytes: %q names MaxBinVer = %v, want %v", n, msg, got, full)
+		}
 	}
 }
 
